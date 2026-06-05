@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.core.config import get_settings
+from app.db.schema import ensure_schema
 from app.db.session import DatabasePool
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,10 @@ def create_app(
         try:
             await pool.connect()
             app.state.pool = pool  # type: ignore[attr-defined]
+
+            # Ensure the database schema is current (idempotent)
+            if pool.pool is not None:
+                await ensure_schema(pool.pool)
         except Exception:
             logger.warning(
                 "Postgres unavailable — starting without database pool",
