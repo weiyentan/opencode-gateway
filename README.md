@@ -306,6 +306,18 @@ mypy app/ tests/                 # Type checking (strict mode)
 
 ---
 
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on setting up the project, running tests, code style, and the pull request workflow.
+
+---
+
 ## Related Documentation
 
 - **[Domain Language Glossary](CONTEXT.md)** — Precise definitions of all domain terms, key relationships, and example dialogues. Read this first to ensure consistent terminology.
