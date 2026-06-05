@@ -76,4 +76,9 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    from app.api.health import router as health_router
+
+    app.include_router(health_router)
+
     return app
