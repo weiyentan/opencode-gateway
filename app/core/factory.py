@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
-
-from app.core.config import Settings
 
 
 def create_app(
@@ -20,12 +18,11 @@ def create_app(
     Accepts optional startup/shutdown callbacks that are invoked inside
     an ``@asynccontextmanager`` lifespan handler.
     """
-    settings = Settings()
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for hook in startup_hooks:
             hook()
         yield
