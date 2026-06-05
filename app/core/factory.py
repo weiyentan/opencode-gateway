@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+
+from app.core.config import get_settings
+from app.db.session import DatabasePool
+
+logger = logging.getLogger(__name__)
+
+
+async def _invoke_hook(hook: Callable[[], Any]) -> None:
+    """Run a hook, awaiting it if it is a coroutine function, calling it if sync."""
+    if asyncio.iscoroutinefunction(hook):
+        await hook()
+    else:
+        hook()
 
 
 def create_app(
@@ -16,18 +31,45 @@ def create_app(
     """Build the FastAPI Gateway application.
 
     Accepts optional startup/shutdown callbacks that are invoked inside
-    an ``@asynccontextmanager`` lifespan handler.
+    an ``@asynccontextmanager`` lifespan handler.  The callbacks may be
+    either synchronous or asynchronous.
+
+    The application also initialises a Postgres connection pool on
+    startup and closes it on shutdown.  If Postgres is unreachable the
+    app logs a warning and continues without a pool.
     """
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # --- user-provided startup hooks ---
         for hook in startup_hooks:
-            hook()
+            await _invoke_hook(hook)
+
+        # --- Postgres pool ---
+        settings = get_settings()
+        pool = DatabasePool(settings)
+        try:
+            await pool.connect()
+            app.state.pool = pool  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning(
+                "Postgres unavailable — starting without database pool",
+                exc_info=True,
+            )
+            app.state.pool = None  # type: ignore[attr-defined]
+
         yield
+
+        # --- Postgres pool shutdown ---
+        db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]
+        if db_pool is not None:
+            await db_pool.close()
+
+        # --- user-provided shutdown hooks ---
         for hook in shutdown_hooks:
-            hook()
+            await _invoke_hook(hook)
 
     app = FastAPI(
         title="OpenCode Gateway",
