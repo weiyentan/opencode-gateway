@@ -1,0 +1,17 @@
+# OpenCode Workflow Configuration
+# Controls how to-issues and develop-loop interact with your issue tracker.
+
+issue_tracker: github
+
+# GitHub repository in owner/repo format
+# gh uses the current git repo's remote to determine this automatically
+# if not set, but you can specify it here for clarity.
+github_repo: weiyentan/opencode-gateway
+
+labels:
+  # Used by to-issues when creating issues
+  afk: afk
+  hitl: hitl
+  todo: "status:todo"
+  in_progress: "status:in-progress"
+  done: "status:done"
