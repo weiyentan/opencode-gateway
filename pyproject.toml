@@ -1,0 +1,19 @@
+[project]
+name = "opencode-gateway"
+version = "0.1.0"
+description = "OpenCode Gateway — portable execution control plane for headless OpenCode"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
