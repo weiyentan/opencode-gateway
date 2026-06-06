@@ -48,7 +48,7 @@ _FETCH_COLS = (
 async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: ignore[no-untyped-def]
     """Fetch a single job row by ID."""
     return await conn.fetchrow(
-        f"SELECT {_FETCH_COLS} FROM jobs WHERE id = $1",
+        f"SELECT {_FETCH_COLS} FROM gateway_jobs WHERE id = $1",
         job_id,
     )
 
@@ -64,7 +64,7 @@ async def create_job(
 
     # 1. Insert the job record in pending state
     await conn.execute(
-        "INSERT INTO jobs (id, repo_url, task_summary, status, executor_type) "
+        "INSERT INTO gateway_jobs (id, repo_url, task_summary, status, executor_type) "
         "VALUES ($1, $2, $3, 'pending', $4)",
         job_id,
         str(body.repo_url),
@@ -74,7 +74,7 @@ async def create_job(
 
     # 2. Transition to running and dispatch to executor
     await conn.execute(
-        "UPDATE jobs SET status = 'running', updated_at = $2 WHERE id = $1",
+        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
         job_id,
         datetime.now(timezone.utc),
     )
@@ -97,7 +97,7 @@ async def create_job(
         # 4. Mark completed
         now = datetime.now(timezone.utc)
         await conn.execute(
-            "UPDATE jobs SET status = 'completed', updated_at = $2, completed_at = $3 "
+            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, completed_at = $3 "
             "WHERE id = $1",
             job_id,
             now,
@@ -106,7 +106,7 @@ async def create_job(
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
         await conn.execute(
-            "UPDATE jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),
         )

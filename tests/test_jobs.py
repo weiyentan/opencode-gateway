@@ -24,7 +24,7 @@ def _mock_row(data: dict):
 
 
 def _make_job_row(job_id, repo_url, task_summary, status="pending", *, completed_at=None):
-    """Return a dict representing a jobs table row."""
+    """Return a dict representing a gateway_jobs table row."""
     now = datetime.now(timezone.utc)
     return {
         "id": job_id,
@@ -212,12 +212,12 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE jobs SET status = 'completed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
                 row_data["status"] = "completed"
                 row_data["completed_at"] = datetime.now(timezone.utc)
-            elif "UPDATE jobs SET status = 'failed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -263,12 +263,12 @@ class TestJobDispatch:
         async def _execute(sql, *args):
             execute_calls.append(sql)
             # Update row_data.status based on UPDATE statements
-            if "UPDATE jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE jobs SET status = 'completed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
                 row_data["status"] = "completed"
                 row_data["completed_at"] = datetime.now(timezone.utc)
-            elif "UPDATE jobs SET status = 'failed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -289,7 +289,7 @@ class TestJobDispatch:
         assert response.json()["status"] == "completed"
 
         # Verify status transition updates happened
-        update_statements = [s for s in execute_calls if "UPDATE jobs" in s]
+        update_statements = [s for s in execute_calls if "UPDATE gateway_jobs" in s]
         assert len(update_statements) >= 2  # pending→running, running→completed
 
     @pytest.mark.asyncio
@@ -307,9 +307,9 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE jobs SET status = 'failed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -352,12 +352,12 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE jobs SET status = 'completed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
                 row_data["status"] = "completed"
                 row_data["completed_at"] = datetime.now(timezone.utc)
-            elif "UPDATE jobs SET status = 'failed'" in sql:
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)

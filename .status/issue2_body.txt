@@ -1,0 +1,30 @@
+## What to build
+
+A minimal FastAPI application that starts, loads configuration from Pydantic settings, connects to Postgres, and exposes a health check endpoint. This is the foundation that all other slices build on.
+
+The health endpoint should return basic version and database connectivity status.
+
+## Acceptance criteria
+
+- [ ] FastAPI app starts and listens on a configurable port
+- [ ] Pydantic settings load from environment variables / config file
+- [ ] Postgres connection pool initializes on startup and closes on shutdown
+- [ ] GET /health returns 200 with {"status": "ok", "version": "...", "database": "connected"}
+- [ ] Database health check returns "disconnected" (not a crash) if Postgres is unreachable
+- [ ] Configuration uses environment variables with sensible defaults for local dev
+- [ ] Project structure follows the PRD layout (app/api, app/core, app/db, app/executors, app/opencode)
+
+## Blocked by
+
+None - can start immediately
+
+---
+
+## Child Issues
+
+These are tracked in the [OpenCode Gateway project](https://github.com/users/weiyentan/projects/3).
+
+- [ ] #15 FastAPI app skeleton with PRD project structure
+- [ ] #16 Pydantic settings with environment variable loading
+- [ ] #17 Postgres connection pool lifecycle
+- [ ] #18 Health endpoint with database connectivity check
