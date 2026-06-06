@@ -189,17 +189,71 @@ class TestJobModelFields:
         assert actual_fields == expected_fields
 
 
+class TestJobStatusEnum:
+    """Tests for the JobStatus enum used on the Job model."""
+
+    def test_job_status_enum_has_expected_values(self):
+        """JobStatus enum should define pending, running, completed, failed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.PENDING.value == "pending"
+        assert JobStatus.RUNNING.value == "running"
+        assert JobStatus.COMPLETED.value == "completed"
+        assert JobStatus.FAILED.value == "failed"
+
+    def test_job_rejects_invalid_status(self):
+        """Job should reject a status not in the JobStatus enum."""
+        from app.core.models.job import Job
+
+        now = datetime.now(timezone.utc)
+        with pytest.raises(ValidationError):
+            Job(
+                id=uuid4(),
+                status="done",
+                repo_url="https://github.com/example/repo.git",
+                task_summary="Fix bug",
+                executor_type="awx",
+                created_at=now,
+                updated_at=now,
+            )
+
+    def test_job_accepts_valid_statuses(self):
+        """Job should accept all valid JobStatus values."""
+        from app.core.models.job import Job, JobStatus
+
+        now = datetime.now(timezone.utc)
+        for status in JobStatus:
+            job = Job(
+                id=uuid4(),
+                status=status,
+                repo_url="https://github.com/example/repo.git",
+                task_summary="Fix bug",
+                executor_type="awx",
+                created_at=now,
+                updated_at=now,
+            )
+            assert job.status == status
+
+    def test_job_status_is_string_enum(self):
+        """JobStatus should be a string enum."""
+        from app.core.models.job import JobStatus
+        from enum import Enum
+
+        assert issubclass(JobStatus, str)
+        assert issubclass(JobStatus, Enum)
+
+
 class TestJobModelSerialization:
     """Tests that Job can be serialized and deserialized."""
 
     def test_job_model_dump_roundtrip(self):
         """Job.model_dump() should produce dict that can be used to construct a new Job."""
-        from app.core.models.job import Job
+        from app.core.models.job import Job, JobStatus
 
         now = datetime.now(timezone.utc)
         job = Job(
             id=uuid4(),
-            status="done",
+            status=JobStatus.COMPLETED,
             repo_url="https://github.com/example/repo.git",
             task_summary="Complete refactor",
             executor_type="awx",
@@ -218,12 +272,12 @@ class TestJobModelSerialization:
 
     def test_job_model_dump_json_produces_valid_json(self):
         """Job.model_dump_json() should produce valid JSON with UUID/datetime serialized."""
-        from app.core.models.job import Job
+        from app.core.models.job import Job, JobStatus
 
         now = datetime.now(timezone.utc)
         job = Job(
             id=uuid4(),
-            status="pending",
+            status=JobStatus.PENDING,
             repo_url="https://github.com/example/repo.git",
             task_summary="Test task",
             executor_type="awx",
