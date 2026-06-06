@@ -1,6 +1,6 @@
 """Tests for the database connection pool lifecycle."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -133,12 +133,25 @@ class TestGetSessionDependency:
 class TestLifespanIntegration:
     """Tests for the pool lifecycle wired into the FastAPI lifespan."""
 
+    @staticmethod
+    def _make_acquirable_pool() -> AsyncMock:
+        """Return a mock asyncpg.Pool whose acquire() supports async with."""
+        mock_conn = AsyncMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        mock_pool = AsyncMock()
+        # acquire() is NOT a coroutine — it returns an async context manager
+        mock_pool.acquire = MagicMock(return_value=mock_ctx)
+        return mock_pool
+
     @pytest.mark.asyncio
     async def test_pool_set_on_app_state_during_startup(self):
         """After lifespan startup, app.state.pool should be a connected DatabasePool."""
         from app.core.factory import create_app
 
-        mock_pool = AsyncMock()
+        mock_pool = self._make_acquirable_pool()
         mock_create_pool = AsyncMock(return_value=mock_pool)
         with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
             app = create_app()
@@ -151,7 +164,7 @@ class TestLifespanIntegration:
         """After lifespan shutdown, the pool should be closed."""
         from app.core.factory import create_app
 
-        mock_pool = AsyncMock()
+        mock_pool = self._make_acquirable_pool()
         mock_create_pool = AsyncMock(return_value=mock_pool)
         with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
             app = create_app()

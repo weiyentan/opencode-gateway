@@ -4,6 +4,13 @@
 
 OpenCode Gateway fills the orchestration gap that OpenCode itself does not address. It coordinates the full lifecycle of headless coding sessions — submitting jobs, managing Runner VMs via executor plugins, tracking state in PostgreSQL, and surfacing results through a clean REST API. Platform engineers and agent orchestrators (like Paperclip) use the Gateway to run OpenCode at scale within automation pipelines, without managing infrastructure directly.
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+  <img src="https://img.shields.io/badge/status-early--development-orange.svg" alt="Status: Early Development">
+  <img src="https://img.shields.io/badge/framework-FastAPI-teal.svg" alt="FastAPI">
+</p>
+
 ---
 
 ## Architecture Overview
@@ -303,6 +310,18 @@ mypy app/ tests/                 # Type checking (strict mode)
 | [0002](docs/adr/0002-executor-plugin-interface.md) | Executor Plugin Interface | Defines a six-method async abstract interface with typed Pydantic models for executor plugins. Concrete implementations: AWX (production), local shell (development), with SSH and Kubernetes as future options. |
 | [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | PostgreSQL is the single source of truth for port allocation (range 4100–4199). The Gateway selects an available port atomically via the database, not through the executor or Runner VM. |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | The Gateway must never store or transmit SSH keys or Runner VM credentials. The executor plugin (AWX) owns all infrastructure secrets. The Gateway authenticates to AWX via an API token only. |
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on setting up the project, running tests, code style, and the pull request workflow.
 
 ---
 
