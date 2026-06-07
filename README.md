@@ -21,7 +21,7 @@ The Gateway is built as four layered concerns, each in its own package:
 |-------|----------|----------------|
 | **API Layer** | `app/api/` | REST endpoints for jobs, runners, workspaces, observations, and approvals. API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), policy module for pre-flight checks (disk pressure, runner health, concurrent job limits), and a background scheduler for periodic cleanup and observation polling. |
-| **Executor Plugin Interface** | `app/executors/` | Abstract async base class defining six methods: `create_workspace`, `start_opencode`, `stop_opencode`, `restart_opencode`, `collect_state`, `cleanup_workspace`. MVPs: **AWX** for production, **local executor** for development. Design documented in [ADR 0002](docs/adr/0002-executor-plugin-interface.md). |
+| **Executor Plugin Interface** | `app/executors/` | Abstract async base class defining six methods (`create_workspace`, `start_opencode`, `stop_opencode`, `restart_opencode`, `collect_state`, `cleanup_workspace`), typed Pydantic models, and a registry (`EXECUTOR_REGISTRY`) mapping executor type names to implementation classes. The factory (`factory.py`) resolves the active executor from the `GATEWAY_EXECUTOR_TYPE` config via the registry. MVPs: **local executor** (default, shipping), **AWX** (planned). Design documented in [ADR 0002](docs/adr/0002-executor-plugin-interface.md). |
 | **OpenCode Serve Client** | `app/opencode/` | `httpx`-based wrapper for the OpenCode Serve REST API: health checks, session CRUD, task submission, diff retrieval, and abort. |
 
 ### Interaction Flow
@@ -124,6 +124,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_PASSWORD` | *(empty)* | Database password |
 | `GATEWAY_DATABASE_MIN_CONNECTIONS` | `2` | asyncpg pool minimum size |
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
+| `GATEWAY_EXECUTOR_TYPE` | `local` | Executor plugin type (`local`, `awx`, etc.) — looked up in `EXECUTOR_REGISTRY` |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
@@ -256,8 +257,11 @@ opencode-gateway/
 │   │   ├── __init__.py
 │   │   └── session.py            # DatabasePool (asyncpg wrapper)
 │   ├── executors/
-│   │   ├── __init__.py           # Stub — will hold ExecutorPlugin ABC
-│   │   └── ...                   # Future: base.py, local.py, awx.py
+│   │   ├── __init__.py           # ExecutorPlugin ABC, EXECUTOR_REGISTRY, model exports
+│   │   ├── factory.py            # get_executor() — config-driven registry lookup
+│   │   ├── local.py              # LocalExecutor (default, shell-based)
+│   │   ├── models.py             # Pydantic request/response models
+│   │   └── ...                   # Future: awx.py, ssh.py
 │   └── opencode/
 │       ├── __init__.py           # Stub — will hold httpx client
 │       └── ...                   # Future: client.py, models.py
@@ -297,7 +301,7 @@ mypy app/ tests/                 # Type checking (strict mode)
 - **Async-first** — All I/O uses `async`/`await`: `asyncpg` for database, `httpx` for HTTP clients, `asyncio` for background scheduling.
 - **Pydantic at every boundary** — Settings use `pydantic-settings`, API responses use Pydantic models, and the executor plugin interface uses typed Pydantic request/response objects.
 - **Dependency injection** — FastAPI `Depends()` for database sessions (`get_session`) and settings (`get_settings`), making test overrides trivial.
-- **Stub-first development** — `executors/` and `opencode/` packages exist as stubs with docstrings describing future contents, enabling incremental implementation.
+- **Stub-first development** — `opencode/` package exists as a stub with docstrings describing future contents, enabling incremental implementation. (The `executors/` package is fully implemented with plugin registry, factory, and local executor.)
 - **ADR-driven decisions** — Every significant architectural choice is documented as an ADR before code is written.
 
 ---
