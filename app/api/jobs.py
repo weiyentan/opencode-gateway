@@ -157,13 +157,14 @@ async def approve_job(
     approval_id = uuid.uuid4()
     await conn.execute(
         "INSERT INTO approvals "
-        "(id, job_id, requested_by, requested_action, approved_by, "
+        "(id, job_id, requested_by, requested_action, approval_type, approved_by, "
         "status, created_at, decided_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         approval_id,
         job_id,
         "system",
         "run_job",
+        "manual",
         "api",
         "approved",
         now,
@@ -211,13 +212,14 @@ async def reject_job(
     approval_id = uuid.uuid4()
     await conn.execute(
         "INSERT INTO approvals "
-        "(id, job_id, requested_by, requested_action, approved_by, "
+        "(id, job_id, requested_by, requested_action, approval_type, approved_by, "
         "status, created_at, decided_at) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         approval_id,
         job_id,
         "system",
         "run_job",
+        "manual",
         "api",
         "rejected",
         now,

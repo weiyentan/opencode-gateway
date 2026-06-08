@@ -20,6 +20,7 @@ class Approval(BaseModel):
     job_id: UUID
     requested_by: str
     requested_action: str
+    approval_type: str
     approved_by: Optional[str] = None
     status: str
     created_at: datetime
@@ -37,6 +38,7 @@ class ApprovalResponse(BaseModel):
     job_id: UUID
     requested_by: str
     requested_action: str
+    approval_type: str
     approved_by: Optional[str] = None
     status: str
     created_at: datetime
