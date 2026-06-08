@@ -105,11 +105,19 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
-│   │   └── health.py             # GET /health endpoint
+│   │   ├── approval.py           # POST /jobs/{id}/approve, /reject, /events
+│   │   ├── health.py             # GET /health endpoint
+│   │   ├── jobs.py               # Job API endpoints (planned: #4)
+│   │   └── workspaces.py         # GET /workspaces, /workspaces/{id}, POST pin/cleanup
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
-│   │   └── factory.py            # create_app() FastAPI factory
+│   │   ├── factory.py            # create_app() FastAPI factory
+│   │   └── models/
+│   │       ├── __init__.py       # Exports Approval, Job, Workspace models
+│   │       ├── approval.py       # Approval domain model
+│   │       ├── job.py            # Job domain model
+│   │       └── workspace.py      # Workspace domain model, WorkspaceStatus enum
 │   ├── db/
 │   │   ├── __init__.py
 │   │   └── session.py            # DatabasePool (asyncpg wrapper)
@@ -122,11 +130,14 @@ opencode-gateway/
 │       └── serve_client.py       # httpx-based OpenCode Serve REST API client
 ├── tests/
 │   ├── __init__.py
+│   ├── test_api_workspaces.py    # Workspace API endpoint tests (list, get, pin, cleanup)
 │   ├── test_app_factory.py       # Application factory lifecycle tests
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
-│   └── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_workspace_model.py   # Workspace domain model and WorkspaceStatus tests
+│   └── test_workspaces.py        # Workspace lifecycle integration tests
 ├── docs/
 │   ├── adr/                      # Architecture Decision Records
 │   ├── prd/                      # Product Requirements Document

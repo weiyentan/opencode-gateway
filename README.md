@@ -179,6 +179,10 @@ These endpoints are implemented and tested.
 | `POST` | `/jobs/{id}/approve` | Approve a job in `needs_approval` state, transitioning it to `pending` for further processing |
 | `POST` | `/jobs/{id}/reject` | Reject a job in `needs_approval` state, transitioning it to `rejected` |
 | `GET` | `/jobs/{id}/events` | Return approval/rejection event history for a job |
+| `GET` | `/workspaces` | List all workspaces, optionally filtered by `runner_id` and/or `cleanup_status` |
+| `GET` | `/workspaces/{id}` | Retrieve a single workspace by its ID |
+| `POST` | `/workspaces/{id}/pin` | Toggle the pinned flag on a workspace — pinned workspaces are excluded from automatic cleanup |
+| `POST` | `/workspaces/{id}/cleanup` | Trigger cleanup of a workspace via the executor plugin. Uses PostgreSQL advisory locking to serialise port deallocation. |
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). These complement the existing statuses (`pending`, `running`, `completed`, `failed`, `aborted`).
 
@@ -193,9 +197,6 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | `POST` | `/jobs/{id}/abort` | Abort a running job | #8 |
 | `GET` | `/runners` | List registered runners | #3 |
 | `GET` | `/runners/{id}` | Get runner details and health | #3 |
-| `POST` | `/runners/{id}/cleanup` | Trigger workspace cleanup | #6 |
-| `GET` | `/workspaces` | List workspaces | #6 |
-| `GET` | `/workspaces/{id}` | Get workspace details | #6 |
 | `GET` | `/observations` | Query runner/workspace observations | #3 |
 
 
@@ -212,7 +213,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #3 | Runner registration and observation ingestion | 🔄 Planned |
 | #4 | Job submission and tracking with local executor | 🔄 Planned |
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
-| #6 | Workspace lifecycle management | 🔄 Planned |
+| #6 | Workspace lifecycle management | ✅ Complete |
 | #7 | Job diff retrieval via OpenCode client | 🔄 Planned |
 | #8 | Job abort via OpenCode client | 🔄 Planned |
 | #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
@@ -252,11 +253,19 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
-│   │   └── health.py             # GET /health endpoint
+│   │   ├── approval.py           # POST /jobs/{id}/approve, /reject, /events
+│   │   ├── health.py             # GET /health endpoint
+│   │   ├── jobs.py               # Job API endpoints (planned: #4)
+│   │   └── workspaces.py         # GET /workspaces, /workspaces/{id}, POST pin/cleanup
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
-│   │   └── factory.py            # create_app() FastAPI factory
+│   │   ├── factory.py            # create_app() FastAPI factory
+│   │   └── models/
+│   │       ├── __init__.py       # Exports Approval, Job, Workspace models
+│   │       ├── approval.py       # Approval domain model
+│   │       ├── job.py            # Job domain model
+│   │       └── workspace.py      # Workspace domain model, WorkspaceStatus enum
 │   ├── db/
 │   │   ├── __init__.py
 │   │   └── session.py            # DatabasePool (asyncpg wrapper)
@@ -272,11 +281,14 @@ opencode-gateway/
 │       └── serve_client.py       # httpx-based OpenCode Serve REST API client
 ├── tests/
 │   ├── __init__.py
+│   ├── test_api_workspaces.py    # Workspace API endpoint tests (list, get, pin, cleanup)
 │   ├── test_app_factory.py       # Application factory lifecycle tests
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
-│   └── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_workspace_model.py   # Workspace domain model and WorkspaceStatus tests
+│   └── test_workspaces.py        # Workspace lifecycle integration tests
 ├── docs/
 │   ├── adr/                      # Architecture Decision Records (4 ADRs)
 │   ├── prd/                      # Product Requirements Document
@@ -293,7 +305,7 @@ opencode-gateway/
 ### Running Tests
 
 ```bash
-pytest tests/ -v                 # All tests (25+ tests across 5 files)
+pytest tests/ -v                 # All tests (8 test files)
 pytest tests/ -v -k "db"         # Database-related tests only (requires Postgres)
 ruff check .                     # Linting (E, F, I, UP rules)
 mypy app/ tests/                 # Type checking (strict mode)
