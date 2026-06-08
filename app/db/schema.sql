@@ -13,3 +13,14 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
 );
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id              UUID PRIMARY KEY,
+    job_id          UUID NOT NULL REFERENCES gateway_jobs(id),
+    requested_by    TEXT NOT NULL,
+    requested_action TEXT NOT NULL,
+    approved_by     TEXT,
+    status          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at      TIMESTAMPTZ
+);
