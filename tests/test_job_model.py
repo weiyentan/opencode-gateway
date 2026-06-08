@@ -193,13 +193,17 @@ class TestJobStatusEnum:
     """Tests for the JobStatus enum used on the Job model."""
 
     def test_job_status_enum_has_expected_values(self):
-        """JobStatus enum should define pending, running, completed, failed."""
+        """JobStatus enum should define pending, running, completed,
+        failed, needs_approval, rejected.
+        """
         from app.core.models.job import JobStatus
 
         assert JobStatus.PENDING.value == "pending"
         assert JobStatus.RUNNING.value == "running"
         assert JobStatus.COMPLETED.value == "completed"
         assert JobStatus.FAILED.value == "failed"
+        assert JobStatus.NEEDS_APPROVAL.value == "needs_approval"
+        assert JobStatus.REJECTED.value == "rejected"
 
     def test_job_rejects_invalid_status(self):
         """Job should reject a status not in the JobStatus enum."""

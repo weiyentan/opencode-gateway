@@ -17,6 +17,8 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    NEEDS_APPROVAL = "needs_approval"
+    REJECTED = "rejected"
 
 
 class Job(BaseModel):
