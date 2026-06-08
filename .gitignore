@@ -27,3 +27,4 @@ htmlcov/
 
 # Environment
 .env
+.status/

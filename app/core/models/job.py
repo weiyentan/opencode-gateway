@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel
+
+
+class JobStatus(str, Enum):
+    """Allowed status values for a Job's lifecycle state machine."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class Job(BaseModel):
@@ -17,7 +27,7 @@ class Job(BaseModel):
     """
 
     id: UUID
-    status: str
+    status: JobStatus
     repo_url: str
     task_summary: str
     runner_id: Optional[UUID] = None

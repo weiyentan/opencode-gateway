@@ -1,11 +1,14 @@
 """Tests for the ExecutorPlugin ABC and associated Pydantic models."""
 
+import os
 from collections.abc import Awaitable
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.executors import ExecutorPlugin
+from app.executors.local import LocalExecutor
 from app.executors.models import (
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
@@ -373,3 +376,63 @@ class TestModelsArePydantic:
         assert issubclass(RestartOpencodeResponse, BaseModel)
         assert issubclass(CollectStateResponse, BaseModel)
         assert issubclass(CleanupWorkspaceResponse, BaseModel)
+
+
+# ---------------------------------------------------------------------------
+# LocalExecutor tests
+# ---------------------------------------------------------------------------
+
+
+class TestLocalExecutor:
+    """Tests for the LocalExecutor concrete implementation."""
+
+    def test_can_instantiate_directly(self):
+        executor = LocalExecutor()
+        assert executor.name == "local"
+        assert isinstance(executor, ExecutorPlugin)
+
+    async def test_create_workspace_creates_directory(self):
+        executor = LocalExecutor()
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        resp = await executor.create_workspace(req)
+        assert os.path.isdir(resp.workspace_path)
+        assert UUID(str(resp.workspace_id))
+        assert resp.status == "ready"
+
+    async def test_create_and_cleanup_workspace(self):
+        executor = LocalExecutor()
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        resp = await executor.create_workspace(req)
+        path = resp.workspace_path
+        assert os.path.isdir(path)
+        # Now clean it up
+        cleanup_req = CleanupWorkspaceRequest(workspace_id=resp.workspace_id)
+        cleanup_resp = await executor.cleanup_workspace(cleanup_req)
+        assert cleanup_resp.status == "cleaned"
+        assert not os.path.exists(path)
+
+    async def test_start_opencode_returns_session(self):
+        executor = LocalExecutor()
+        req = StartOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.start_opencode(req)
+        assert resp.status == "running"
+        assert resp.port > 0
+        assert UUID(str(resp.session_id))
+
+    async def test_stop_opencode(self):
+        executor = LocalExecutor()
+        req = StopOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.stop_opencode(req)
+        assert resp.status == "stopped"
+
+    async def test_restart_opencode(self):
+        executor = LocalExecutor()
+        req = RestartOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.restart_opencode(req)
+        assert resp.status == "running"
+
+    async def test_collect_state(self):
+        executor = LocalExecutor()
+        req = CollectStateRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.collect_state(req)
+        assert resp.workspace_id == req.workspace_id
