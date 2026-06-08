@@ -478,8 +478,10 @@ class TestApproveJob:
             if "INSERT INTO approvals" in sql
         ]
         assert len(insert_calls) == 1
-        _, insert_args = insert_calls[0]
+        insert_sql, insert_args = insert_calls[0]
+        assert "approval_type" in insert_sql
         assert "approved" in insert_args
+        assert "manual" in insert_args
 
     @pytest.mark.asyncio
     async def test_approve_invalid_uuid_returns_422(self, client):
@@ -588,8 +590,10 @@ class TestRejectJob:
             if "INSERT INTO approvals" in sql
         ]
         assert len(insert_calls) == 1
-        _, insert_args = insert_calls[0]
+        insert_sql, insert_args = insert_calls[0]
+        assert "approval_type" in insert_sql
         assert "rejected" in insert_args
+        assert "manual" in insert_args
 
     @pytest.mark.asyncio
     async def test_reject_invalid_uuid_returns_422(self, client):

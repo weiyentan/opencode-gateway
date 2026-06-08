@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     job_id          UUID NOT NULL REFERENCES gateway_jobs(id),
     requested_by    TEXT NOT NULL,
     requested_action TEXT NOT NULL,
+    approval_type   TEXT NOT NULL,
     approved_by     TEXT,
     status          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
