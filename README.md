@@ -211,7 +211,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #2 | Gateway skeleton — FastAPI app factory, Postgres pool, health endpoint | ✅ Complete |
 | #3 | Runner registration and observation ingestion | 🔄 Planned |
 | #4 | Job submission and tracking with local executor | 🔄 Planned |
-| #5 | OpenCode client protocol and HTTP implementation | 🔄 Planned |
+| #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
 | #6 | Workspace lifecycle management | 🔄 Planned |
 | #7 | Job diff retrieval via OpenCode client | 🔄 Planned |
 | #8 | Job abort via OpenCode client | 🔄 Planned |
@@ -267,8 +267,9 @@ opencode-gateway/
 │   │   ├── models.py             # Pydantic request/response models
 │   │   └── ...                   # Future: awx.py, ssh.py
 │   └── opencode/
-│       ├── __init__.py           # Stub — will hold httpx client
-│       └── ...                   # Future: client.py, models.py
+│       ├── __init__.py           # Package init, exports OpenCodeServeClient and custom exceptions
+│       ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
+│       └── serve_client.py       # httpx-based OpenCode Serve REST API client
 ├── tests/
 │   ├── __init__.py
 │   ├── test_app_factory.py       # Application factory lifecycle tests
@@ -305,7 +306,7 @@ mypy app/ tests/                 # Type checking (strict mode)
 - **Async-first** — All I/O uses `async`/`await`: `asyncpg` for database, `httpx` for HTTP clients, `asyncio` for background scheduling.
 - **Pydantic at every boundary** — Settings use `pydantic-settings`, API responses use Pydantic models, and the executor plugin interface uses typed Pydantic request/response objects.
 - **Dependency injection** — FastAPI `Depends()` for database sessions (`get_session`) and settings (`get_settings`), making test overrides trivial.
-- **Stub-first development** — `opencode/` package exists as a stub with docstrings describing future contents, enabling incremental implementation. (The `executors/` package is fully implemented with plugin registry, factory, and local executor.)
+- **Stub-first development** — Packages start as stubs with docstrings describing future contents, enabling incremental implementation. The `executors/` package grew from a stub into a full plugin registry, factory, and local executor; the `opencode/` package is now fully implemented with protocol abstractions, an httpx client, and custom exceptions.
 - **ADR-driven decisions** — Every significant architectural choice is documented as an ADR before code is written.
 
 ---

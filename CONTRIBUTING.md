@@ -117,8 +117,9 @@ opencode-gateway/
 │   │   ├── __init__.py           # Stub — will hold ExecutorPlugin ABC
 │   │   └── ...                   # Future: base.py, local.py, awx.py
 │   └── opencode/
-│       ├── __init__.py           # Stub — will hold httpx client
-│       └── ...                   # Future: client.py, models.py
+│       ├── __init__.py           # Package init, exports OpenCodeServeClient and custom exceptions
+│       ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
+│       └── serve_client.py       # httpx-based OpenCode Serve REST API client
 ├── tests/
 │   ├── __init__.py
 │   ├── test_app_factory.py       # Application factory lifecycle tests
