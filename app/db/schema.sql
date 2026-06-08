@@ -25,3 +25,19 @@ CREATE TABLE IF NOT EXISTS approvals (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     decided_at      TIMESTAMPTZ
 );
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id              UUID PRIMARY KEY,
+    runner_id       UUID,
+    workspace_name  TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    repo_url        TEXT NOT NULL,
+    branch          TEXT,
+    port            INTEGER,
+    service_name    TEXT,
+    pinned          BOOLEAN NOT NULL DEFAULT FALSE,
+    cleanup_after   TIMESTAMPTZ,
+    cleanup_status  TEXT NOT NULL DEFAULT 'active',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
