@@ -436,3 +436,44 @@ class TestLocalExecutor:
         req = CollectStateRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         resp = await executor.collect_state(req)
         assert resp.workspace_id == req.workspace_id
+
+
+# ---------------------------------------------------------------------------
+# Plugin loader / factory tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_executor_default_local():
+    """When GATEWAY_EXECUTOR_TYPE is not set, get_executor returns a LocalExecutor."""
+    from app.executors.factory import get_executor
+
+    executor = get_executor()
+    from app.executors.local import LocalExecutor
+
+    assert isinstance(executor, LocalExecutor)
+
+
+def test_executor_registry_shape():
+    """EXECUTOR_REGISTRY maps 'local' to LocalExecutor."""
+    from app.executors import EXECUTOR_REGISTRY
+    from app.executors.local import LocalExecutor
+
+    assert "local" in EXECUTOR_REGISTRY
+    assert EXECUTOR_REGISTRY["local"] is LocalExecutor
+
+
+def test_get_executor_unknown_type(monkeypatch):
+    """An unknown GATEWAY_EXECUTOR_TYPE should raise a clear ValueError."""
+    monkeypatch.setenv("GATEWAY_EXECUTOR_TYPE", "nonexistent")
+
+    # Settings is cached at module level — reload the factory so it picks
+    # up the new env value.
+    import importlib
+
+    import app.executors.factory
+    importlib.reload(app.executors.factory)
+
+    from app.executors.factory import get_executor
+
+    with pytest.raises(ValueError, match="Unknown executor type"):
+        get_executor()

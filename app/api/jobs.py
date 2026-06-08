@@ -1,4 +1,4 @@
-"""Job API endpoints — create and retrieve coding jobs."""
+"""Job API endpoints — create, retrieve, and monitor coding jobs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Optional
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, HttpUrl
+from pydantic.config import ConfigDict
 
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
@@ -38,6 +39,17 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+
+
+class ApprovalEvent(BaseModel):
+    """A single approval/rejection event for a job."""
+
+    event_type: str
+    timestamp: datetime
+    actor: str
+    details: str
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 _FETCH_COLS = (
@@ -124,6 +136,114 @@ async def create_job(
     )
 
 
+@router.post("/jobs/{job_id}/approve", response_model=JobResponse)
+async def approve_job(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobResponse:
+    """Approve a job that is waiting for approval, transitioning it to running."""
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if row["status"] != "needs_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Record approval
+    approval_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO approvals "
+        "(id, job_id, requested_by, requested_action, approved_by, "
+        "status, created_at, decided_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        approval_id,
+        job_id,
+        "system",
+        "run_job",
+        "api",
+        "approved",
+        now,
+        now,
+    )
+
+    # Transition job to running
+    await conn.execute(
+        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
+        job_id,
+        now,
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+@router.post("/jobs/{job_id}/reject", response_model=JobResponse)
+async def reject_job(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobResponse:
+    """Reject a job that is waiting for approval, transitioning it to rejected."""
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if row["status"] != "needs_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Record rejection
+    approval_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO approvals "
+        "(id, job_id, requested_by, requested_action, approved_by, "
+        "status, created_at, decided_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        approval_id,
+        job_id,
+        "system",
+        "run_job",
+        "api",
+        "rejected",
+        now,
+        now,
+    )
+
+    # Transition job to rejected
+    await conn.execute(
+        "UPDATE gateway_jobs SET status = 'rejected', updated_at = $2 WHERE id = $1",
+        job_id,
+        now,
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: uuid.UUID,
@@ -142,3 +262,40 @@ async def get_job(
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
     )
+
+
+@router.get("/jobs/{job_id}/events", response_model=list[ApprovalEvent])
+async def get_job_events(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> list[ApprovalEvent]:
+    """Return approval/rejection events for a job.
+
+    Queries the approvals table and maps each record to an event dict
+    with event_type, timestamp, actor, and details.  Returns an empty
+    list when the job has no events, or 404 if the job does not exist.
+    """
+    # Verify the job exists first
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Query the approvals table for this job
+    records = await conn.fetch(
+        "SELECT status, approved_by, requested_by, requested_action, created_at "
+        "FROM approvals WHERE job_id = $1 ORDER BY created_at ASC",
+        job_id,
+    )
+
+    events: list[ApprovalEvent] = []
+    for rec in records:
+        events.append(
+            ApprovalEvent(
+                event_type=rec["status"],
+                timestamp=rec["created_at"],
+                actor=rec["approved_by"] if rec["approved_by"] else rec["requested_by"],
+                details=rec["requested_action"],
+            )
+        )
+
+    return events

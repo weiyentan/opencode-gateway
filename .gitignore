@@ -28,3 +28,4 @@ htmlcov/
 # Environment
 .env
 .status/
+.worktrees/
