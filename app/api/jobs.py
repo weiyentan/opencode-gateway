@@ -124,6 +124,114 @@ async def create_job(
     )
 
 
+@router.post("/jobs/{job_id}/approve", response_model=JobResponse)
+async def approve_job(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobResponse:
+    """Approve a job that is waiting for approval, transitioning it to running."""
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if row["status"] != "needs_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Record approval
+    approval_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO approvals "
+        "(id, job_id, requested_by, requested_action, approved_by, "
+        "status, created_at, decided_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        approval_id,
+        job_id,
+        "system",
+        "run_job",
+        "api",
+        "approved",
+        now,
+        now,
+    )
+
+    # Transition job to running
+    await conn.execute(
+        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
+        job_id,
+        now,
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+@router.post("/jobs/{job_id}/reject", response_model=JobResponse)
+async def reject_job(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobResponse:
+    """Reject a job that is waiting for approval, transitioning it to rejected."""
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if row["status"] != "needs_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Record rejection
+    approval_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO approvals "
+        "(id, job_id, requested_by, requested_action, approved_by, "
+        "status, created_at, decided_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        approval_id,
+        job_id,
+        "system",
+        "run_job",
+        "api",
+        "rejected",
+        now,
+        now,
+    )
+
+    # Transition job to rejected
+    await conn.execute(
+        "UPDATE gateway_jobs SET status = 'rejected', updated_at = $2 WHERE id = $1",
+        job_id,
+        now,
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: uuid.UUID,
