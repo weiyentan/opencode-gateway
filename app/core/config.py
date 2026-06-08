@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Executor plugin
+    executor_type: str = "local"
+
     # Database
     database_host: str = "localhost"
     database_port: int = 5432
