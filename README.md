@@ -176,6 +176,11 @@ These endpoints are implemented and tested.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Application health check. Returns `status`, `version`, and `database` connectivity (`"connected"` or `"disconnected"`). Graceful — always returns 200 even if the database is down. |
+| `POST` | `/jobs/{id}/approve` | Approve a job in `needs_approval` state, transitioning it to `pending` for further processing |
+| `POST` | `/jobs/{id}/reject` | Reject a job in `needs_approval` state, transitioning it to `rejected` |
+| `GET` | `/jobs/{id}/events` | Return approval/rejection event history for a job |
+
+> **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). These complement the existing statuses (`pending`, `running`, `completed`, `failed`, `aborted`).
 
 ### Planned Endpoints
 
@@ -192,8 +197,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | `GET` | `/workspaces` | List workspaces | #6 |
 | `GET` | `/workspaces/{id}` | Get workspace details | #6 |
 | `GET` | `/observations` | Query runner/workspace observations | #3 |
-| `POST` | `/approvals/{id}/approve` | Approve a pending risky operation | #11 |
-| `POST` | `/approvals/{id}/deny` | Deny a pending risky operation | #11 |
+
 
 ---
 
@@ -213,7 +217,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #8 | Job abort via OpenCode client | 🔄 Planned |
 | #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
 | #10 | AWX executor plugin | 🔄 Planned |
-| #11 | Approval gates for risky operations | 🔄 Planned |
+| #11 | Approval gates for risky operations | 🔄 In Progress |
 | #12 | Background cleanup scheduler | 🔄 Planned |
 | #13 | Paperclip integration adapter | 🔄 Planned |
 | #14 | Gateway container image and docker-compose setup | 🔄 Planned |
