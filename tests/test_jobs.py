@@ -378,3 +378,223 @@ class TestJobDispatch:
         data = response.json()
         assert data["status"] == "completed"
         assert data["completed_at"] is not None
+
+
+class TestApproveJob:
+    """Tests for POST /jobs/{id}/approve."""
+
+    @pytest.mark.asyncio
+    async def test_approve_needs_approval_job_returns_200_and_transitions_to_running(
+        self, mock_conn
+    ):
+        """Approve transitions needs_approval → running."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Approve me",
+            status="needs_approval",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/approve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "running"
+        assert data["id"] == str(job_id)
+
+    @pytest.mark.asyncio
+    async def test_approve_unknown_job_returns_404(self, client, mock_conn):
+        """Approve on non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{uuid.uuid4()}/approve")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_approve_wrong_state_returns_409(self, client, mock_conn):
+        """Approve on job not in needs_approval state returns 409."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Already running",
+            status="running",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/approve")
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_approve_writes_approval_record(self, mock_conn):
+        """Approve inserts a record into the approvals table with status='approved'."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Approve me",
+            status="needs_approval",
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/approve")
+
+        assert response.status_code == 200
+
+        # Verify an INSERT into approvals happened with approved status
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO approvals" in sql
+        ]
+        assert len(insert_calls) == 1
+        _, insert_args = insert_calls[0]
+        assert "approved" in insert_args
+
+    @pytest.mark.asyncio
+    async def test_approve_invalid_uuid_returns_422(self, client):
+        """Approve with malformed UUID returns 422."""
+        async with client as c:
+            response = await c.post("/jobs/not-a-uuid/approve")
+
+        assert response.status_code == 422
+
+
+class TestRejectJob:
+    """Tests for POST /jobs/{id}/reject."""
+
+    @pytest.mark.asyncio
+    async def test_reject_needs_approval_job_returns_200_and_transitions_to_rejected(
+        self, mock_conn
+    ):
+        """Reject transitions needs_approval → rejected."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Reject me",
+            status="needs_approval",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'rejected'" in sql:
+                row["status"] = "rejected"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/reject")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "rejected"
+        assert data["id"] == str(job_id)
+
+    @pytest.mark.asyncio
+    async def test_reject_unknown_job_returns_404(self, client, mock_conn):
+        """Reject on non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{uuid.uuid4()}/reject")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_reject_wrong_state_returns_409(self, client, mock_conn):
+        """Reject on job not in needs_approval state returns 409."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Pending job",
+            status="pending",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/reject")
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_reject_writes_rejection_record(self, mock_conn):
+        """Reject inserts a record into the approvals table with status='rejected'."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Reject me",
+            status="needs_approval",
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'rejected'" in sql:
+                row["status"] = "rejected"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/reject")
+
+        assert response.status_code == 200
+
+        # Verify an INSERT into approvals happened with rejected status
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO approvals" in sql
+        ]
+        assert len(insert_calls) == 1
+        _, insert_args = insert_calls[0]
+        assert "rejected" in insert_args
+
+    @pytest.mark.asyncio
+    async def test_reject_invalid_uuid_returns_422(self, client):
+        """Reject with malformed UUID returns 422."""
+        async with client as c:
+            response = await c.post("/jobs/not-a-uuid/reject")
+
+        assert response.status_code == 422
