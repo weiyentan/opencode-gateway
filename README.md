@@ -179,6 +179,10 @@ These endpoints are implemented and tested.
 | `POST` | `/jobs/{id}/approve` | Approve a job in `needs_approval` state, transitioning it to `pending` for further processing |
 | `POST` | `/jobs/{id}/reject` | Reject a job in `needs_approval` state, transitioning it to `rejected` |
 | `GET` | `/jobs/{id}/events` | Return approval/rejection event history for a job |
+| `GET` | `/workspaces` | List all workspaces, optionally filtered by `runner_id` and/or `status` (cleanup_status). Sorted by `created_at` descending. |
+| `GET` | `/workspaces/{id}` | Retrieve a single workspace by its ID. |
+| `POST` | `/workspaces/{id}/pin` | Toggle the pinned flag on a workspace. Pinned workspaces are excluded from automatic cleanup policies. |
+| `POST` | `/workspaces/{id}/cleanup` | Trigger cleanup of a workspace via the executor plugin. Transitions to `cleaning` status, uses a per-workspace PG advisory lock to serialise concurrent cleanup requests. |
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). These complement the existing statuses (`pending`, `running`, `completed`, `failed`, `aborted`).
 
@@ -193,9 +197,6 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | `POST` | `/jobs/{id}/abort` | Abort a running job | #8 |
 | `GET` | `/runners` | List registered runners | #3 |
 | `GET` | `/runners/{id}` | Get runner details and health | #3 |
-| `POST` | `/runners/{id}/cleanup` | Trigger workspace cleanup | #6 |
-| `GET` | `/workspaces` | List workspaces | #6 |
-| `GET` | `/workspaces/{id}` | Get workspace details | #6 |
 | `GET` | `/observations` | Query runner/workspace observations | #3 |
 
 
@@ -212,7 +213,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #3 | Runner registration and observation ingestion | 🔄 Planned |
 | #4 | Job submission and tracking with local executor | 🔄 Planned |
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
-| #6 | Workspace lifecycle management | 🔄 Planned |
+| #6 | Workspace lifecycle management | ✅ Complete |
 | #7 | Job diff retrieval via OpenCode client | 🔄 Planned |
 | #8 | Job abort via OpenCode client | 🔄 Planned |
 | #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
@@ -252,7 +253,8 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
-│   │   └── health.py             # GET /health endpoint
+│   │   ├── health.py             # GET /health endpoint
+│   │   └── workspaces.py        # Workspace endpoints (list, get, pin, cleanup)
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
@@ -276,7 +278,17 @@ opencode-gateway/
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
-│   └── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_executor_loader.py   # Executor registry and factory resolution
+│   ├── test_executors.py         # Executor plugin interface and models
+│   ├── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_job_model.py         # Job Pydantic models
+│   ├── test_jobs.py              # Job API endpoints
+│   ├── test_local_executor.py    # LocalExecutor implementation
+│   ├── test_schema.py            # Database schema migration tests
+│   ├── test_serve_client.py      # OpenCode Serve httpx client
+│   ├── test_workspace_lifecycle.py # Workspace pin/cleanup lifecycle
+│   ├── test_workspace_model.py   # Workspace Pydantic models
+│   └── test_workspaces.py        # Workspace list/get API endpoints
 ├── docs/
 │   ├── adr/                      # Architecture Decision Records (4 ADRs)
 │   ├── prd/                      # Product Requirements Document
@@ -293,7 +305,7 @@ opencode-gateway/
 ### Running Tests
 
 ```bash
-pytest tests/ -v                 # All tests (25+ tests across 5 files)
+pytest tests/ -v                 # All tests (230+ tests across 15 files)
 pytest tests/ -v -k "db"         # Database-related tests only (requires Postgres)
 ruff check .                     # Linting (E, F, I, UP rules)
 mypy app/ tests/                 # Type checking (strict mode)
@@ -317,7 +329,7 @@ mypy app/ tests/                 # Type checking (strict mode)
 |-----|-------|---------|
 | [0001](docs/adr/0001-separate-observation-tables.md) | Separate Observation Tables | Observation data is stored in domain-specific tables (`runner_observations`, `workspace_observations`, `opencode_instance_observations`) with composite indexes optimized for time-range queries, rather than a single polymorphic table. |
 | [0002](docs/adr/0002-executor-plugin-interface.md) | Executor Plugin Interface | Defines a six-method async abstract interface with typed Pydantic models for executor plugins. Concrete implementations: AWX (production), local shell (development), with SSH and Kubernetes as future options. |
-| [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | PostgreSQL is the single source of truth for port allocation (range 4100–4199). The Gateway selects an available port atomically via the database, not through the executor or Runner VM. |
+| [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | PostgreSQL is the single source of truth for port allocation (range 10000–10999). The Gateway selects an available port atomically via the database, not through the executor or Runner VM. |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | The Gateway must never store or transmit SSH keys or Runner VM credentials. The executor plugin (AWX) owns all infrastructure secrets. The Gateway authenticates to AWX via an API token only. |
 
 ---
