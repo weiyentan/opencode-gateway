@@ -183,6 +183,7 @@ class TestJobModelFields:
             "created_at",
             "updated_at",
             "completed_at",
+            "diff",
         }
 
         actual_fields = set(Job.model_fields.keys())

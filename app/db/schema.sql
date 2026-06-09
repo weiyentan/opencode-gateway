@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
     executor_job_id TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at    TIMESTAMPTZ
+    completed_at    TIMESTAMPTZ,
+    diff            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS approvals (

@@ -41,3 +41,4 @@ class Job(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+    diff: Optional[str] = None
