@@ -9,6 +9,7 @@ from typing import Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
@@ -301,3 +302,44 @@ async def get_job_events(
         )
 
     return events
+
+
+@router.get("/jobs/{job_id}/diff")
+async def get_job_diff(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JSONResponse:
+    """Return the stored diff for a completed job.
+
+    Returns the diff payload on success (200), a conflict response when the
+    job is still running (409), or 404 when the job does not exist or has no
+    diff available.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, status, diff FROM gateway_jobs WHERE id = $1",
+        job_id,
+    )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if row["status"] == "running":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "job_id": str(job_id),
+                "diff": None,
+                "status": "running",
+            },
+        )
+
+    if row["diff"] is None:
+        raise HTTPException(status_code=404, detail="Diff not available")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "job_id": str(row["id"]),
+            "diff": row["diff"],
+        },
+    )

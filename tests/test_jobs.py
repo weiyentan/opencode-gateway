@@ -715,6 +715,135 @@ class TestJobEvents:
         assert event["details"] == "run_job"
 
 
+class TestJobDiff:
+    """Tests for GET /jobs/{id}/diff."""
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_completed_job_returns_200_with_diff(self, mock_conn):
+        """GET /jobs/{id}/diff for a completed job with a diff returns 200 and the diff."""
+        job_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        row_data = {
+            "id": job_id,
+            "repo_url": "https://github.com/org/repo",
+            "task_summary": "Add feature",
+            "status": "completed",
+            "executor_type": "local",
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": now,
+            "diff": "--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new",
+        }
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row_data))
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["job_id"] == str(job_id)
+        assert data["diff"] == row_data["diff"]
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_unknown_job_returns_404(self, client, mock_conn):
+        """GET /jobs/{id}/diff for a non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{uuid.uuid4()}/diff")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_running_job_returns_409(self, mock_conn):
+        """GET /jobs/{id}/diff for a running job returns 409 with status info."""
+        job_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        row_data = {
+            "id": job_id,
+            "repo_url": "https://github.com/org/repo",
+            "task_summary": "Running job",
+            "status": "running",
+            "executor_type": "local",
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "diff": None,
+        }
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row_data))
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 409
+        data = response.json()
+        assert data["job_id"] == str(job_id)
+        assert data["diff"] is None
+        assert data["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_completed_job_without_diff_returns_404(self, mock_conn):
+        """GET /jobs/{id}/diff for a completed job with no diff returns 404."""
+        job_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        row_data = {
+            "id": job_id,
+            "repo_url": "https://github.com/org/repo",
+            "task_summary": "No diff job",
+            "status": "completed",
+            "executor_type": "local",
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": now,
+            "diff": None,
+        }
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row_data))
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_invalid_uuid_returns_422(self, client):
+        """GET /jobs/{id}/diff with a malformed UUID should return 422."""
+        async with client as c:
+            response = await c.get("/jobs/not-a-uuid/diff")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_get_diff_for_pending_job_returns_404(self, mock_conn):
+        """GET /jobs/{id}/diff for a pending job (no diff) returns 404."""
+        job_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        row_data = {
+            "id": job_id,
+            "repo_url": "https://github.com/org/repo",
+            "task_summary": "Pending job",
+            "status": "pending",
+            "executor_type": "local",
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "diff": None,
+        }
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row_data))
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 404
+
+
 class TestDoubleApprove:
     """Tests for concurrent double-approve scenario."""
 
