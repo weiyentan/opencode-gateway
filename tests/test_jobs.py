@@ -32,6 +32,7 @@ def _make_job_row(job_id, repo_url, task_summary, status="pending", *, completed
         "task_summary": task_summary,
         "status": status,
         "executor_type": "local",
+        "diff": None,
         "created_at": now,
         "updated_at": now,
         "completed_at": completed_at,

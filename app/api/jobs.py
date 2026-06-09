@@ -39,6 +39,7 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+    diff: Optional[str] = None
 
 
 class ApprovalEvent(BaseModel):
@@ -53,7 +54,7 @@ class ApprovalEvent(BaseModel):
 
 
 _FETCH_COLS = (
-    "id, repo_url, task_summary, status, created_at, updated_at, completed_at"
+    "id, repo_url, task_summary, status, created_at, updated_at, completed_at, diff"
 )
 
 
@@ -108,12 +109,14 @@ async def create_job(
 
         # 4. Mark completed
         now = datetime.now(timezone.utc)
+        diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, completed_at = $3 "
-            "WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
+            "completed_at = $3, diff = $4 WHERE id = $1",
             job_id,
             now,
             now,
+            diff_summary,
         )
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
@@ -133,6 +136,7 @@ async def create_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        diff=row["diff"],
     )
 
 
@@ -188,6 +192,7 @@ async def approve_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        diff=row["diff"],
     )
 
 
@@ -243,6 +248,7 @@ async def reject_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        diff=row["diff"],
     )
 
 
@@ -263,6 +269,7 @@ async def get_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        diff=row["diff"],
     )
 
 
