@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Each `opencode serve` instance running as a systemd service on the Runner VM needs a unique port. The port range is 4100-4199, allowing up to 100 concurrent instances.
+Each `opencode serve` instance running as a systemd service on the Runner VM needs a unique port. The port range is 10000-10999, allowing up to 1000 concurrent instances.
 
 The allocation source of truth could live in:
 1. **Postgres** — the Gateway tracks used ports in the `workspaces` table
@@ -23,7 +23,7 @@ Use Postgres as the sole source of truth for port allocation. The AWX playbook a
 - Centralised state avoids file-locking races across concurrent playbook runs
 - Port state is visible via the Gateway API for debugging and observability
 - Simplified playbook logic — no port-scanning or file-locking on the VM side
-- The port range (100 ports) is small enough that a simple `SELECT port FROM workspaces WHERE port IS NOT NULL` to find the next free port is trivially fast
+- The port range (1000 ports) is small enough that a simple `SELECT port FROM workspaces WHERE port IS NOT NULL` to find the next free port is trivially fast
 
 ## Consequences
 

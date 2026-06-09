@@ -8,7 +8,7 @@ OpenCode is powerful as a coding agent, but moving from an interactive session t
 
 OpenCode Gateway is a portable execution control plane that provides a stable orchestration API around OpenCode. It stores job and runner state in Postgres, calls the OpenCode Serve API for coding sessions, and delegates infrastructure actions — create workspace, start/stop opencode, collect state, clean up — to executor plugins. The Gateway never reaches into the runner VM directly; every infrastructure operation goes through the executor plugin interface.
 
-For the MVP, the default executor plugin is AWX, which runs Ansible playbooks against a persistent Runner VM. The Runner VM hosts workspace directories under a controlled `/opencode` filesystem, and each workspace runs its own `opencode serve` instance managed by systemd via a templated unit (`opencode@workspace.service`). The Gateway allocates ports from a Postgres-managed range (4100-4199), and AWX playbooks query the Gateway for the port rather than self-allocating.
+For the MVP, the default executor plugin is AWX, which runs Ansible playbooks against a persistent Runner VM. The Runner VM hosts workspace directories under a controlled `/opencode` filesystem, and each workspace runs its own `opencode serve` instance managed by systemd via a templated unit (`opencode@workspace.service`). The Gateway allocates ports from a Postgres-managed range (10000-10999), and AWX playbooks query the Gateway for the port rather than self-allocating.
 
 External callers — whether Paperclip, GitLab CI, GitHub Actions, AWX job templates, or EDA rulebooks — interact with the Gateway API to submit jobs, check status, retrieve diffs, and approve or abort work. The Gateway handles the rest: runner selection, health checks, workspace lifecycle, OpenCode session management, and result collection.
 
@@ -58,7 +58,7 @@ The OpenCode Serve client is an httpx-based wrapper that communicates with the O
 
 The database has seven tables: `gateway_jobs`, `runners`, `workspaces`, `runner_observations`, `workspace_observations`, `opencode_instance_observations`, and `approvals`. Observations are stored in separate tables per domain entity (per ADR 0001), with a bigserial PK and a composite index on runner/workspace and observed_at. This allows efficient time-range queries for dashboards and alerting.
 
-Port allocation is managed in Postgres from a fixed range (4100-4199, per ADR 0003). When a workspace is created, the Gateway atomically selects the next available port. The AWX playbook asks the Gateway "what port?" rather than self-allocating, avoiding collisions without requiring a distributed lock service.
+Port allocation is managed in Postgres from a fixed range (10000-10999, per ADR 0003). When a workspace is created, the Gateway atomically selects the next available port. The AWX playbook asks the Gateway "what port?" rather than self-allocating, avoiding collisions without requiring a distributed lock service.
 
 The security model follows ADR 0004: the Gateway never holds infrastructure secrets. AWX owns the SSH keys to the Runner VM. The Gateway authenticates to AWX via an API token configured at deployment time. Communication between the Gateway and OpenCode Serve is internal-network-only; OpenCode Serve is never exposed publicly. All requests, executor actions, and approval decisions are logged for audit.
 
