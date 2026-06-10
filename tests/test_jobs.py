@@ -949,7 +949,15 @@ class TestJobEvents:
         ]
 
         mock_conn.fetchrow = AsyncMock(return_value=_mock_row(job_row))
-        mock_conn.fetch = AsyncMock(return_value=approval_records)
+
+        async def _fetch_events(sql, *args):
+            if "approvals" in sql:
+                return approval_records
+            elif "job_events" in sql:
+                return []
+            return []
+
+        mock_conn.fetch = AsyncMock(side_effect=_fetch_events)
 
         client = _create_client(mock_conn)
 
@@ -963,6 +971,7 @@ class TestJobEvents:
         assert data[0]["event_type"] == "approved"
         assert data[0]["actor"] == "api"
         assert data[0]["details"] == "run_job"
+        assert data[0]["previous_status"] is None
         assert "timestamp" in data[0]
 
     @pytest.mark.asyncio
@@ -1017,7 +1026,15 @@ class TestJobEvents:
         ]
 
         mock_conn.fetchrow = AsyncMock(return_value=_mock_row(job_row))
-        mock_conn.fetch = AsyncMock(return_value=approval_records)
+
+        async def _fetch_events(sql, *args):
+            if "approvals" in sql:
+                return approval_records
+            elif "job_events" in sql:
+                return []
+            return []
+
+        mock_conn.fetch = AsyncMock(side_effect=_fetch_events)
 
         client = _create_client(mock_conn)
 
@@ -1035,6 +1052,8 @@ class TestJobEvents:
         assert event["event_type"] == "rejected"
         assert event["actor"] == "api"
         assert event["details"] == "run_job"
+        assert "previous_status" in event
+        assert event["previous_status"] is None
 
 
 class TestJobDiff:
@@ -1475,3 +1494,310 @@ class TestJobDiffFetch:
         assert data["status"] == "completed"
         assert data["diff"] == expected_diff
         assert data["opencode_session_id"] == "sess-123"
+
+
+class TestAbortEvents:
+    """Tests for abort event recording and retrieval via GET /jobs/{id}/events."""
+
+    @pytest.mark.asyncio
+    async def test_abort_records_event_in_job_events_table(self, mock_conn):
+        """Aborting a job inserts a record into job_events with correct fields."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Abort event test",
+            status="pending", opencode_session_id=None,
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+
+        # Verify an INSERT into job_events happened
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        insert_sql, insert_args = insert_calls[0]
+        assert "job_events" in insert_sql
+        assert "aborted" in insert_args
+        assert "api" in insert_args
+        assert "Job aborted" in insert_args
+        # previous_status should be "pending"
+        assert "pending" in insert_args
+
+    @pytest.mark.asyncio
+    async def test_abort_event_includes_previous_status(self, mock_conn):
+        """Abort event records the status the job had before the abort."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Previous status check",
+            status="running", opencode_session_id="sess-123",
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        from app.opencode.protocol import SessionAbortResponse
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id="sess-123", aborted=True, message="OK",
+            )
+        )
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+
+        # Verify previous_status is "running"
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _, insert_args = insert_calls[0]
+        # Find the position of previous_status value (it's the 6th positional arg)
+        # Args order: id, job_id, event_type, actor, details, previous_status, created_at
+        assert insert_args[5] == "running"
+
+    @pytest.mark.asyncio
+    async def test_events_endpoint_returns_abort_events(self, mock_conn):
+        """GET /jobs/{id}/events returns abort events from job_events table."""
+        job_id = uuid.uuid4()
+        job_row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Events with abort",
+            status="aborted",
+        )
+        now = datetime.now(timezone.utc)
+
+        # Mock: job exists, no approval records, one abort event
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(job_row))
+
+        abort_event = _mock_row({
+            "event_type": "aborted",
+            "actor": "api",
+            "details": "Job aborted",
+            "created_at": now,
+            "previous_status": "running",
+        })
+
+        async def _fetch(sql, *args):
+            if "approvals" in sql:
+                return []  # no approval events
+            elif "job_events" in sql:
+                return [abort_event]
+            return []
+
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/events")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        event = data[0]
+        assert event["event_type"] == "aborted"
+        assert event["actor"] == "api"
+        assert event["details"] == "Job aborted"
+        assert event["previous_status"] == "running"
+        assert "timestamp" in event
+
+    @pytest.mark.asyncio
+    async def test_events_returns_abort_and_approval_events_together(self, mock_conn):
+        """GET /jobs/{id}/events returns both abort and approval events sorted by time."""
+        job_id = uuid.uuid4()
+        job_row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Mixed events",
+            status="aborted",
+        )
+        t1 = datetime(2024, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t2 = datetime(2024, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        t3 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(job_row))
+
+        approval_rec = _mock_row({
+            "status": "approved",
+            "approved_by": "api",
+            "requested_by": "system",
+            "requested_action": "run_job",
+            "created_at": t1,
+        })
+
+        abort_rec1 = _mock_row({
+            "event_type": "aborted",
+            "actor": "api",
+            "details": "Job aborted",
+            "created_at": t2,
+            "previous_status": "running",
+        })
+
+        abort_rec2 = _mock_row({
+            "event_type": "aborted",
+            "actor": "system",
+            "details": "Retry abort",
+            "created_at": t3,
+            "previous_status": "aborting",
+        })
+
+        async def _fetch(sql, *args):
+            if "approvals" in sql:
+                return [approval_rec]
+            elif "job_events" in sql:
+                return [abort_rec1, abort_rec2]
+            return []
+
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/events")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 3
+
+        # Should be sorted by timestamp ascending
+        assert data[0]["event_type"] == "approved"
+        assert data[0]["previous_status"] is None
+
+        assert data[1]["event_type"] == "aborted"
+        assert data[1]["previous_status"] == "running"
+        assert data[1]["actor"] == "api"
+
+        assert data[2]["event_type"] == "aborted"
+        assert data[2]["previous_status"] == "aborting"
+        assert data[2]["actor"] == "system"
+
+    @pytest.mark.asyncio
+    async def test_events_for_unreachable_abort_does_not_record_event(self, mock_conn):
+        """When OpenCode is unreachable during abort, no event is recorded.
+
+        Job stays in aborting state, 503 is returned, no event persisted.
+        """
+        job_id = uuid.uuid4()
+        session_id = "sess-unreachable-events"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Unreachable no event",
+            status="running", opencode_session_id=session_id,
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            side_effect=RuntimeError("Connection refused")
+        )
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 503
+        assert row["status"] == "aborting"
+
+        # No INSERT into job_events should have happened
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_abort_event_recorded_for_no_session_job(self, mock_conn):
+        """Abort events are recorded even when there's no session (pending → aborted)."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "No session abort event",
+            status="pending", opencode_session_id=None,
+        )
+
+        execute_args_list: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_args_list.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert row["status"] == "aborted"
+
+        insert_calls = [
+            (sql, args) for sql, args in execute_args_list
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _, insert_args = insert_calls[0]
+        assert insert_args[2] == "aborted"      # event_type
+        assert insert_args[3] == "api"           # actor
+        assert insert_args[4] == "Job aborted"   # details
+        assert insert_args[5] == "pending"       # previous_status

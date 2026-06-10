@@ -45,13 +45,14 @@ class JobResponse(BaseModel):
     diff: Optional[str] = None
 
 
-class ApprovalEvent(BaseModel):
+class JobEvent(BaseModel):
     """A single approval/rejection event for a job."""
 
     event_type: str
     timestamp: datetime
     actor: str
     details: str
+    previous_status: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -332,6 +333,7 @@ async def abort_job(
 
     now = datetime.now(timezone.utc)
     session_id = row.get("opencode_session_id")
+    previous_status = row["status"]  # capture before transition
 
     # Transition to aborting unless already in that state (retry)
     if row["status"] != "aborting":
@@ -367,6 +369,21 @@ async def abort_job(
             job_id,
             now,
         )
+
+    # Record abort event
+    event_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        job_id,
+        "aborted",
+        "api",
+        "Job aborted",
+        previous_status,
+        now,
+    )
 
     # Return updated job
     row = await _fetch_job(conn, job_id)
@@ -404,11 +421,11 @@ async def get_job(
     )
 
 
-@router.get("/jobs/{job_id}/events", response_model=list[ApprovalEvent])
+@router.get("/jobs/{job_id}/events", response_model=list[JobEvent])
 async def get_job_events(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-) -> list[ApprovalEvent]:
+) -> list[JobEvent]:
     """Return approval/rejection events for a job.
 
     Queries the approvals table and maps each record to an event dict
@@ -421,22 +438,43 @@ async def get_job_events(
         raise HTTPException(status_code=404, detail="Job not found")
 
     # Query the approvals table for this job
-    records = await conn.fetch(
+    approval_records = await conn.fetch(
         "SELECT status, approved_by, requested_by, requested_action, created_at "
         "FROM approvals WHERE job_id = $1 ORDER BY created_at ASC",
         job_id,
     )
 
-    events: list[ApprovalEvent] = []
-    for rec in records:
+    # Query the job_events table for this job
+    event_records = await conn.fetch(
+        "SELECT event_type, actor, details, created_at, previous_status "
+        "FROM job_events WHERE job_id = $1 ORDER BY created_at ASC",
+        job_id,
+    )
+
+    events: list[JobEvent] = []
+    for rec in approval_records:
         events.append(
-            ApprovalEvent(
+            JobEvent(
                 event_type=rec["status"],
                 timestamp=rec["created_at"],
                 actor=rec["approved_by"] if rec["approved_by"] else rec["requested_by"],
                 details=rec["requested_action"],
+                previous_status=None,
             )
         )
+    for rec in event_records:
+        events.append(
+            JobEvent(
+                event_type=rec["event_type"],
+                timestamp=rec["created_at"],
+                actor=rec["actor"],
+                details=rec["details"],
+                previous_status=rec["previous_status"],
+            )
+        )
+
+    # Sort combined events by timestamp ascending
+    events.sort(key=lambda e: e.timestamp)
 
     return events
 

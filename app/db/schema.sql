@@ -44,3 +44,13 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS job_events (
+    id              UUID PRIMARY KEY,
+    job_id          UUID NOT NULL REFERENCES gateway_jobs(id),
+    event_type      TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    details         TEXT,
+    previous_status TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
