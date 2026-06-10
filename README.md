@@ -178,14 +178,15 @@ These endpoints are implemented and tested.
 | `GET` | `/health` | Application health check. Returns `status`, `version`, and `database` connectivity (`"connected"` or `"disconnected"`). Graceful — always returns 200 even if the database is down. |
 | `POST` | `/jobs/{id}/approve` | Approve a job in `needs_approval` state, transitioning it to `pending` for further processing |
 | `POST` | `/jobs/{id}/reject` | Reject a job in `needs_approval` state, transitioning it to `rejected` |
-| `GET` | `/jobs/{id}/events` | Return approval/rejection event history for a job |
+| `GET` | `/jobs/{id}/events` | Return event history for a job, including approval/rejection events and abort events (with previous_status) |
 | `GET` | `/workspaces` | List all workspaces, optionally filtered by `runner_id` and/or `status` (cleanup_status). Sorted by `created_at` descending. |
 | `GET` | `/workspaces/{id}` | Retrieve a single workspace by its ID. |
 | `POST` | `/workspaces/{id}/pin` | Toggle the pinned flag on a workspace. Pinned workspaces are excluded from automatic cleanup policies. |
 | `POST` | `/workspaces/{id}/cleanup` | Trigger cleanup of a workspace via the executor plugin. Transitions to `cleaning` status, uses a per-workspace PG advisory lock to serialise concurrent cleanup requests. |
 | `GET` | `/jobs/{job_id}/diff` | Retrieve the stored diff for a completed job. Returns 200 with the diff payload, 409 if the job is still running, or 404 if the job or its diff does not exist. |
+| `POST` | `/jobs/{id}/abort` | Abort a pending or running job. Transitions through `aborting` to `aborted`, with optional OpenCode session abort and executor cleanup. Returns 503 if the OpenCode session is unreachable (job stays in `aborting`). |
 
-> **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). These complement the existing statuses (`pending`, `running`, `completed`, `failed`, `aborted`).
+> **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). The abort feature introduces two additional statuses — `aborting` (abort in progress, OpenCode session being terminated) and `aborted` (final state after abort). These complement the existing statuses (`pending`, `running`, `completed`, `failed`).
 
 ### Planned Endpoints
 
@@ -195,7 +196,6 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 |--------|------|-------------|-------|
 | `POST` | `/jobs` | Submit a coding job | #4 |
 | `GET` | `/jobs/{id}` | Get job status, result, and diff | #4, #7 |
-| `POST` | `/jobs/{id}/abort` | Abort a running job | #8 |
 | `GET` | `/runners` | List registered runners | #3 |
 | `GET` | `/runners/{id}` | Get runner details and health | #3 |
 | `GET` | `/observations` | Query runner/workspace observations | #3 |
@@ -216,7 +216,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
 | #6 | Workspace lifecycle management | ✅ Complete |
 | #7 | Job diff retrieval via OpenCode client | ✅ Complete |
-| #8 | Job abort via OpenCode client | 🔄 Planned |
+| #8 | Job abort via OpenCode client | ✅ Complete |
 | #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
 | #10 | AWX executor plugin | 🔄 Planned |
 | #11 | Approval gates for risky operations | 🔄 In Progress |

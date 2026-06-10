@@ -56,7 +56,7 @@ The executor plugin interface defines six async methods: `create_workspace`, `st
 
 The OpenCode Serve client is an httpx-based wrapper that communicates with the OpenCode Serve REST API over the internal network. It exposes methods for health checks, session CRUD, task submission, diff retrieval, and abort. The client is designed so that the Gateway interacts with OpenCode through a protocol interface, making it testable with a mock server.
 
-The database has seven tables: `gateway_jobs`, `runners`, `workspaces`, `runner_observations`, `workspace_observations`, `opencode_instance_observations`, and `approvals`. Observations are stored in separate tables per domain entity (per ADR 0001), with a bigserial PK and a composite index on runner/workspace and observed_at. This allows efficient time-range queries for dashboards and alerting.
+The database has eight tables: `gateway_jobs`, `runners`, `workspaces`, `runner_observations`, `workspace_observations`, `opencode_instance_observations`, `approvals`, and `job_events`. Observations are stored in separate tables per domain entity (per ADR 0001), with a bigserial PK and a composite index on runner/workspace and observed_at. This allows efficient time-range queries for dashboards and alerting.
 
 Port allocation is managed in Postgres from a fixed range (10000-10999, per ADR 0003). When a workspace is created, the Gateway atomically selects the next available port. The AWX playbook asks the Gateway "what port?" rather than self-allocating, avoiding collisions without requiring a distributed lock service.
 
