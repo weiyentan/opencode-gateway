@@ -40,6 +40,7 @@ class TestJobModelConstruction:
         assert job.opencode_session_id is None
         assert job.executor_job_id is None
         assert job.completed_at is None
+        assert job.diff is None
         assert job.created_at == now
         assert job.updated_at == now
 
@@ -65,6 +66,7 @@ class TestJobModelConstruction:
             created_at=now,
             updated_at=now,
             completed_at=now,
+            diff="+ added unit tests for core module",
         )
 
         assert job.runner_id == runner_id
@@ -73,6 +75,7 @@ class TestJobModelConstruction:
         assert job.opencode_session_id == "sess-xyz789"
         assert job.executor_job_id == "awx-job-42"
         assert job.completed_at == now
+        assert job.diff == "+ added unit tests for core module"
 
 
 class TestJobModelValidation:
@@ -183,6 +186,7 @@ class TestJobModelFields:
             "created_at",
             "updated_at",
             "completed_at",
+            "diff",
         }
 
         actual_fields = set(Job.model_fields.keys())

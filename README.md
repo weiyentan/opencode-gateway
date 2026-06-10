@@ -183,6 +183,7 @@ These endpoints are implemented and tested.
 | `GET` | `/workspaces/{id}` | Retrieve a single workspace by its ID. |
 | `POST` | `/workspaces/{id}/pin` | Toggle the pinned flag on a workspace. Pinned workspaces are excluded from automatic cleanup policies. |
 | `POST` | `/workspaces/{id}/cleanup` | Trigger cleanup of a workspace via the executor plugin. Transitions to `cleaning` status, uses a per-workspace PG advisory lock to serialise concurrent cleanup requests. |
+| `GET` | `/jobs/{job_id}/diff` | Retrieve the stored diff for a completed job. Returns 200 with the diff payload, 409 if the job is still running, or 404 if the job or its diff does not exist. |
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). These complement the existing statuses (`pending`, `running`, `completed`, `failed`, `aborted`).
 
@@ -214,7 +215,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #4 | Job submission and tracking with local executor | 🔄 Planned |
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
 | #6 | Workspace lifecycle management | ✅ Complete |
-| #7 | Job diff retrieval via OpenCode client | 🔄 Planned |
+| #7 | Job diff retrieval via OpenCode client | ✅ Complete |
 | #8 | Job abort via OpenCode client | 🔄 Planned |
 | #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
 | #10 | AWX executor plugin | 🔄 Planned |
