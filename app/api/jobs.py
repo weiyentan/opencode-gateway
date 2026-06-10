@@ -301,6 +301,45 @@ async def reject_job(
     )
 
 
+
+@router.post("/jobs/{job_id}/abort", response_model=JobResponse)
+async def abort_job(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobResponse:
+    """Abort a job that is pending or running, transitioning it to aborted."""
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if row["status"] not in ("pending", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is in '{row['status']}' state, expected 'pending' or 'running'",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Transition job to aborted
+    await conn.execute(
+        "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
+        job_id,
+        now,
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
+    )
+
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: uuid.UUID,
