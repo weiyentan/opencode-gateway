@@ -16,7 +16,12 @@ from pydantic.config import ConfigDict
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
-from app.executors.models import CreateWorkspaceRequest, StartOpencodeRequest
+from app.executors.models import (
+    CleanupWorkspaceRequest,
+    CreateWorkspaceRequest,
+    StartOpencodeRequest,
+    StopOpencodeRequest,
+)
 from app.opencode.protocol import OpenCodeClientProtocol
 
 logger = logging.getLogger(__name__)
@@ -59,7 +64,7 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff"
+    "opencode_session_id, diff, workspace_name"
 )
 
 
@@ -128,6 +133,13 @@ async def create_job(
             "UPDATE gateway_jobs SET opencode_session_id = $2 WHERE id = $1",
             job_id,
             session_id,
+        )
+
+        # Store the workspace ID so it is available for abort cleanup
+        await conn.execute(
+            "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
+            job_id,
+            str(ws_response.workspace_id),
         )
 
         # 4. Mark completed
@@ -307,6 +319,7 @@ async def reject_job(
 async def abort_job(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
+    executor: ExecutorPlugin = Depends(get_executor),
     opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
 ) -> JobResponse:
     """Abort a job by cancelling its OpenCode session and marking it aborted.
@@ -369,6 +382,37 @@ async def abort_job(
             job_id,
             now,
         )
+
+    # Executor cleanup --- best effort, do not block the abort response
+    workspace_name = row.get("workspace_name")
+    if workspace_name:
+        try:
+            workspace_id = uuid.UUID(workspace_name)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid workspace_name for job %s: %r", job_id, workspace_name
+            )
+        else:
+            try:
+                await executor.stop_opencode(
+                    StopOpencodeRequest(workspace_id=workspace_id)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to stop OpenCode Serve for job %s (workspace %s)",
+                    job_id,
+                    workspace_id,
+                )
+            try:
+                await executor.cleanup_workspace(
+                    CleanupWorkspaceRequest(workspace_id=workspace_id)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up workspace for job %s (workspace %s)",
+                    job_id,
+                    workspace_id,
+                )
 
     # Record abort event
     event_id = uuid.uuid4()

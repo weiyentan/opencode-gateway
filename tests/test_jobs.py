@@ -25,7 +25,7 @@ def _mock_row(data: dict):
 
 
 def _make_job_row(job_id, repo_url, task_summary, status="pending", *, completed_at=None,
-                  opencode_session_id=None, diff=None):
+                  opencode_session_id=None, diff=None, workspace_name=None):
     """Return a dict representing a gateway_jobs table row."""
     now = datetime.now(timezone.utc)
     return {
@@ -39,6 +39,7 @@ def _make_job_row(job_id, repo_url, task_summary, status="pending", *, completed
         "completed_at": completed_at,
         "opencode_session_id": opencode_session_id,
         "diff": diff,
+        "workspace_name": workspace_name,
     }
 
 
@@ -87,8 +88,9 @@ def _create_client(mock_conn, *, mock_executor=None, mock_opencode_client=None):
 
     app.dependency_overrides[get_session] = _override_get_session
 
-    if mock_executor is not None:
-        app.dependency_overrides[get_executor] = lambda: mock_executor
+    # Always inject an executor mock so endpoints that depend on it work
+    _mock_exec = mock_executor if mock_executor is not None else AsyncMock()
+    app.dependency_overrides[get_executor] = lambda: _mock_exec
 
     if mock_opencode_client is not None:
         app.dependency_overrides[get_opencode_client] = lambda: mock_opencode_client
@@ -924,6 +926,296 @@ class TestAbortJob:
         data = response.json()
         assert data["status"] == "aborted"
         assert data["id"] == str(job_id)
+
+    @pytest.mark.asyncio
+    async def test_abort_calls_executor_cleanup(self, mock_conn):
+        """Aborting a running job with a workspace calls executor.stop_opencode
+        and executor.cleanup_workspace with the correct workspace ID."""
+        from app.executors.models import CleanupWorkspaceRequest, StopOpencodeRequest
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        job_id = uuid.uuid4()
+        session_id = "sess-exec-cleanup"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "With workspace",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id,
+                aborted=True,
+                message="Aborted",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = _create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+
+        mock_exec.stop_opencode.assert_called_once()
+        stop_call_arg = mock_exec.stop_opencode.call_args[0][0]
+        assert isinstance(stop_call_arg, StopOpencodeRequest)
+        assert stop_call_arg.workspace_id == workspace_id
+
+        mock_exec.cleanup_workspace.assert_called_once()
+        cleanup_call_arg = mock_exec.cleanup_workspace.call_args[0][0]
+        assert isinstance(cleanup_call_arg, CleanupWorkspaceRequest)
+        assert cleanup_call_arg.workspace_id == workspace_id
+
+    @pytest.mark.asyncio
+    async def test_abort_executor_stop_failure_still_returns_200(self, mock_conn):
+        """When executor.stop_opencode raises, abort still returns 200
+        and the job is marked aborted."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        job_id = uuid.uuid4()
+        session_id = "sess-stop-fail"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Stop fail",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock(
+            side_effect=RuntimeError("Stop failed")
+        )
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = _create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+
+        mock_exec.cleanup_workspace.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_abort_executor_cleanup_failure_still_returns_200(self, mock_conn):
+        """When executor.cleanup_workspace raises, abort still returns 200."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        job_id = uuid.uuid4()
+        session_id = "sess-cleanup-fail"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Cleanup fail",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock(
+            side_effect=RuntimeError("Cleanup failed")
+        )
+
+        client = _create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_abort_no_workspace_skips_executor_cleanup(self, mock_conn):
+        """When the job has no workspace_name, executor cleanup is not called."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-no-workspace"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "No workspace",
+            status="running", opencode_session_id=session_id,
+            workspace_name=None,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = _create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+
+        mock_exec.stop_opencode.assert_not_called()
+        mock_exec.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_abort_idempotent_after_cleanup_failure(self, mock_conn):
+        """First abort succeeds (executor cleanup fails silently), second abort
+        returns 409 because the job is already aborted."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+        job_id = uuid.uuid4()
+        session_id = "sess-idempotent"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Idempotent cleanup fail",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            return _mock_row(row)
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock(
+            side_effect=RuntimeError("Infrastructure unavailable")
+        )
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = _create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response1 = await c.post(f"/jobs/{job_id}/abort")
+            assert response1.status_code == 200
+            assert response1.json()["status"] == "aborted"
+
+            response2 = await c.post(f"/jobs/{job_id}/abort")
+            assert response2.status_code == 409
+            data2 = response2.json()
+            assert "detail" in data2
+            assert "aborted" in data2["detail"]
+
+            assert mock_exec.stop_opencode.call_count == 1
 
 
 class TestJobEvents:
