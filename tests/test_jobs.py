@@ -34,7 +34,6 @@ def _make_job_row(job_id, repo_url, task_summary, status="pending", *, completed
         "task_summary": task_summary,
         "status": status,
         "executor_type": "local",
-        "diff": None,
         "created_at": now,
         "updated_at": now,
         "completed_at": completed_at,
@@ -614,19 +613,18 @@ class TestRejectJob:
         assert response.status_code == 422
 
 
-
 class TestAbortJob:
     """Tests for POST /jobs/{id}/abort."""
 
     @pytest.mark.asyncio
-    async def test_abort_pending_job_returns_200_and_transitions_to_aborted(
+    async def test_abort_without_session_transitions_directly_to_aborted(
         self, mock_conn
     ):
-        """Abort transitions pending → aborted."""
+        """Aborting a pending job without a session transitions directly to aborted."""
         job_id = uuid.uuid4()
         row = _make_job_row(
-            job_id, "https://github.com/org/repo", "Abort pending",
-            status="pending",
+            job_id, "https://github.com/org/repo", "Pending no session",
+            status="pending", opencode_session_id=None,
         )
 
         async def _fetchrow(sql, *args):
@@ -652,14 +650,17 @@ class TestAbortJob:
         assert data["id"] == str(job_id)
 
     @pytest.mark.asyncio
-    async def test_abort_running_job_returns_200_and_transitions_to_aborted(
+    async def test_abort_with_session_succeeds_and_transitions_to_aborted(
         self, mock_conn
     ):
-        """Abort transitions running → aborted."""
+        """Aborting a running job with a session goes aborting→aborted on success."""
+        from app.opencode.protocol import SessionAbortResponse
+
         job_id = uuid.uuid4()
+        session_id = "sess-abc-123"
         row = _make_job_row(
-            job_id, "https://github.com/org/repo", "Abort running",
-            status="running",
+            job_id, "https://github.com/org/repo", "Running with session",
+            status="running", opencode_session_id=session_id,
         )
 
         async def _fetchrow(sql, *args):
@@ -668,13 +669,24 @@ class TestAbortJob:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
                 row["status"] = "aborted"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        client = _create_client(mock_conn)
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id,
+                aborted=True,
+                message="Session aborted successfully",
+            )
+        )
+
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
 
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
@@ -683,6 +695,56 @@ class TestAbortJob:
         data = response.json()
         assert data["status"] == "aborted"
         assert data["id"] == str(job_id)
+
+        # Verify OpenCode client was called with the correct session ID
+        mock_opencode.abort_session.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_abort_with_session_opencode_unreachable_stays_aborting(
+        self, mock_conn
+    ):
+        """When OpenCode Serve is unreachable, job stays aborting and returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-unreachable"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Running unreachable",
+            status="running", opencode_session_id=session_id,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            side_effect=RuntimeError("Connection refused")
+        )
+
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert "detail" in data
+        assert "unreachable" in data["detail"].lower()
+
+        # Job should remain in aborting state
+        assert row["status"] == "aborting"
+
+        # Verify OpenCode client was called
+        mock_opencode.abort_session.assert_called_once_with(session_id)
 
     @pytest.mark.asyncio
     async def test_abort_unknown_job_returns_404(self, client, mock_conn):
@@ -695,49 +757,34 @@ class TestAbortJob:
         assert response.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_abort_completed_job_returns_409(self, client, mock_conn):
-        """Abort on completed job returns 409."""
+    @pytest.mark.parametrize("terminal_status", [
+        "completed",
+        "failed",
+        "rejected",
+        "aborted",
+        "needs_approval",
+    ])
+    async def test_abort_terminal_state_returns_409(
+        self, terminal_status, mock_conn
+    ):
+        """Abort on a job in a terminal/non-abortable state returns 409."""
         job_id = uuid.uuid4()
         row = _make_job_row(
-            job_id, "https://github.com/org/repo", "Completed job",
-            status="completed",
+            job_id, "https://github.com/org/repo", f"{terminal_status} job",
+            status=terminal_status,
         )
         mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        # No opencode client needed — the endpoint should reject before calling it
+        client = _create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 409
-
-    @pytest.mark.asyncio
-    async def test_abort_failed_job_returns_409(self, client, mock_conn):
-        """Abort on failed job returns 409."""
-        job_id = uuid.uuid4()
-        row = _make_job_row(
-            job_id, "https://github.com/org/repo", "Failed job",
-            status="failed",
-        )
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
-
-        async with client as c:
-            response = await c.post(f"/jobs/{job_id}/abort")
-
-        assert response.status_code == 409
-
-    @pytest.mark.asyncio
-    async def test_abort_needs_approval_job_returns_409(self, client, mock_conn):
-        """Abort on needs_approval job returns 409."""
-        job_id = uuid.uuid4()
-        row = _make_job_row(
-            job_id, "https://github.com/org/repo", "Needs approval",
-            status="needs_approval",
-        )
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
-
-        async with client as c:
-            response = await c.post(f"/jobs/{job_id}/abort")
-
-        assert response.status_code == 409
+        data = response.json()
+        assert "detail" in data
+        assert terminal_status in data["detail"]
 
     @pytest.mark.asyncio
     async def test_abort_invalid_uuid_returns_422(self, client):
@@ -749,24 +796,38 @@ class TestAbortJob:
 
     @pytest.mark.asyncio
     async def test_double_abort_first_succeeds_second_returns_409(self, mock_conn):
-        """First abort succeeds, second abort returns 409 (already aborted)."""
+        """First abort succeeds, second abort on aborted job returns 409."""
+        from app.opencode.protocol import SessionAbortResponse
+
         job_id = uuid.uuid4()
+        session_id = "sess-double"
         row = _make_job_row(
             job_id, "https://github.com/org/repo", "Double abort",
-            status="running",
+            status="running", opencode_session_id=session_id,
         )
 
         async def _fetchrow(sql, *args):
             return _mock_row(row)
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
                 row["status"] = "aborted"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        client = _create_client(mock_conn)
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id,
+                aborted=True,
+                message="Aborted",
+            )
+        )
+
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
 
         async with client as c:
             # First abort - should succeed, transitioning to aborted
@@ -780,6 +841,90 @@ class TestAbortJob:
             assert response2.status_code == 409
             data2 = response2.json()
             assert "detail" in data2
+            assert "aborted" in data2["detail"]
+
+    @pytest.mark.asyncio
+    async def test_abort_retry_from_aborting_succeeds(self, mock_conn):
+        """Retrying abort from aborting state (after first OpenCode failure) succeeds."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-retry"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Retry abort",
+            status="aborting", opencode_session_id=session_id,
+        )
+
+        async def _fetchrow(sql, *args):
+            return _mock_row(row)
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id,
+                aborted=True,
+                message="Aborted on retry",
+            )
+        )
+
+        client = _create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+
+        # Verify OpenCode client was called (retry)
+        mock_opencode.abort_session.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_abort_running_job_without_opencode_client_skips_session_call(
+        self, mock_conn
+    ):
+        """When no OpenCode client is available, the job is marked aborted directly."""
+        job_id = uuid.uuid4()
+        session_id = "sess-no-client"
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "No client available",
+            status="running", opencode_session_id=session_id,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # No opencode client injected — default get_opencode_client returns None
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+        assert data["id"] == str(job_id)
+
 
 class TestJobEvents:
     """Tests for GET /jobs/{id}/events."""

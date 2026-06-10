@@ -306,25 +306,67 @@ async def reject_job(
 async def abort_job(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
+    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
 ) -> JobResponse:
-    """Abort a job that is pending or running, transitioning it to aborted."""
+    """Abort a job by cancelling its OpenCode session and marking it aborted.
+
+    If the job has an active OpenCode session the endpoint transitions the job
+    to ``aborting``, calls :meth:`OpenCodeClientProtocol.abort_session`, and on
+    success marks the job ``aborted``.  When the session is unreachable the job
+    stays in ``aborting`` and the caller receives a 503.
+
+    Jobs without a session (e.g. still *pending*) are immediately marked
+    ``aborted``.
+    """
     row = await _fetch_job(conn, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if row["status"] not in ("pending", "running"):
+    if row["status"] not in ("pending", "running", "aborting"):
         raise HTTPException(
             status_code=409,
-            detail=f"Job is in '{row['status']}' state, expected 'pending' or 'running'",
+            detail=(
+                f"Job is in '{row['status']}' state, "
+                f"expected 'pending', 'running', or 'aborting'"
+            ),
         )
 
     now = datetime.now(timezone.utc)
+    session_id = row.get("opencode_session_id")
 
-    # Transition job to aborted
-    await conn.execute(
-        "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
-        job_id,
-        now,
-    )
+    # Transition to aborting unless already in that state (retry)
+    if row["status"] != "aborting":
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'aborting', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
+
+    # If the job has an active session, cancel it via the OpenCode client
+    if session_id and opencode_client is not None:
+        try:
+            await opencode_client.abort_session(session_id)
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
+                job_id,
+                datetime.now(timezone.utc),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to abort OpenCode session %s for job %s",
+                session_id,
+                job_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="OpenCode Serve unreachable; job remains in aborting state",
+            )
+    else:
+        # No session to cancel — mark aborted immediately
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
 
     # Return updated job
     row = await _fetch_job(conn, job_id)
