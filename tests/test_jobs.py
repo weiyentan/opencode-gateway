@@ -614,6 +614,173 @@ class TestRejectJob:
         assert response.status_code == 422
 
 
+
+class TestAbortJob:
+    """Tests for POST /jobs/{id}/abort."""
+
+    @pytest.mark.asyncio
+    async def test_abort_pending_job_returns_200_and_transitions_to_aborted(
+        self, mock_conn
+    ):
+        """Abort transitions pending → aborted."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Abort pending",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+        assert data["id"] == str(job_id)
+
+    @pytest.mark.asyncio
+    async def test_abort_running_job_returns_200_and_transitions_to_aborted(
+        self, mock_conn
+    ):
+        """Abort transitions running → aborted."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Abort running",
+            status="running",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return _mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "aborted"
+        assert data["id"] == str(job_id)
+
+    @pytest.mark.asyncio
+    async def test_abort_unknown_job_returns_404(self, client, mock_conn):
+        """Abort on non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{uuid.uuid4()}/abort")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_abort_completed_job_returns_409(self, client, mock_conn):
+        """Abort on completed job returns 409."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Completed job",
+            status="completed",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_abort_failed_job_returns_409(self, client, mock_conn):
+        """Abort on failed job returns 409."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Failed job",
+            status="failed",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_abort_needs_approval_job_returns_409(self, client, mock_conn):
+        """Abort on needs_approval job returns 409."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Needs approval",
+            status="needs_approval",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_abort_invalid_uuid_returns_422(self, client):
+        """Abort with malformed UUID returns 422."""
+        async with client as c:
+            response = await c.post("/jobs/not-a-uuid/abort")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_double_abort_first_succeeds_second_returns_409(self, mock_conn):
+        """First abort succeeds, second abort returns 409 (already aborted)."""
+        job_id = uuid.uuid4()
+        row = _make_job_row(
+            job_id, "https://github.com/org/repo", "Double abort",
+            status="running",
+        )
+
+        async def _fetchrow(sql, *args):
+            return _mock_row(row)
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = _create_client(mock_conn)
+
+        async with client as c:
+            # First abort - should succeed, transitioning to aborted
+            response1 = await c.post(f"/jobs/{job_id}/abort")
+            assert response1.status_code == 200
+            data1 = response1.json()
+            assert data1["status"] == "aborted"
+
+            # Second abort - job is now aborted, should get 409
+            response2 = await c.post(f"/jobs/{job_id}/abort")
+            assert response2.status_code == 409
+            data2 = response2.json()
+            assert "detail" in data2
+
 class TestJobEvents:
     """Tests for GET /jobs/{id}/events."""
 
