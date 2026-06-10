@@ -9,6 +9,7 @@ from typing import Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
@@ -16,6 +17,7 @@ from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
 from app.executors.models import CreateWorkspaceRequest, StartOpencodeRequest
+from app.opencode.protocol import OpenCodeClientProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,8 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+    opencode_session_id: Optional[str] = None
+    diff: Optional[str] = None
 
 
 class ApprovalEvent(BaseModel):
@@ -53,7 +57,8 @@ class ApprovalEvent(BaseModel):
 
 
 _FETCH_COLS = (
-    "id, repo_url, task_summary, status, created_at, updated_at, completed_at"
+    "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
+    "opencode_session_id, diff"
 )
 
 
@@ -65,11 +70,21 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
     )
 
 
+async def get_opencode_client() -> Optional[OpenCodeClientProtocol]:
+    """Dependency that returns the OpenCode client for diff fetching.
+
+    Returns None by default; tests override this via
+    ``app.dependency_overrides`` to inject a mock.
+    """
+    return None
+
+
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
+    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
 ) -> JobResponse:
     """Create a new job, dispatch via executor, and return the final state."""
     job_id = uuid.uuid4()
@@ -99,22 +114,56 @@ async def create_job(
                 job_id=job_id,
             )
         )
-        await executor.start_opencode(
+        start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=ws_response.workspace_id,
                 workspace_path=ws_response.workspace_path,
             )
         )
+        session_id = str(start_response.session_id)
+
+        # Store the session ID so it is available for diff retrieval
+        await conn.execute(
+            "UPDATE gateway_jobs SET opencode_session_id = $2 WHERE id = $1",
+            job_id,
+            session_id,
+        )
 
         # 4. Mark completed
         now = datetime.now(timezone.utc)
+        diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, completed_at = $3 "
-            "WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
+            "completed_at = $3, diff = $4 WHERE id = $1",
             job_id,
             now,
             now,
+            diff_summary,
         )
+
+        # 5. Fetch and persist the diff (non-blocking — failure does not fail the job)
+        if opencode_client is not None:
+            try:
+                diff_response = await opencode_client.get_session_diff(session_id)
+                if diff_response and diff_response.diff:
+                    await conn.execute(
+                        "UPDATE gateway_jobs SET diff = $2 WHERE id = $1",
+                        job_id,
+                        diff_response.diff,
+                    )
+                    logger.info(
+                        "Diff fetched and persisted for job %s (session %s)",
+                        job_id,
+                        session_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to fetch diff for job %s (session %s)",
+                    job_id,
+                    session_id,
+                    exc_info=True,
+                )
+
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
         await conn.execute(
@@ -123,7 +172,7 @@ async def create_job(
             datetime.now(timezone.utc),
         )
 
-    # 5. Return final state
+    # 6. Return final state
     row = await _fetch_job(conn, job_id)
     return JobResponse(
         id=row["id"],
@@ -133,6 +182,8 @@ async def create_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
     )
 
 
@@ -188,6 +239,8 @@ async def approve_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
     )
 
 
@@ -243,6 +296,8 @@ async def reject_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
     )
 
 
@@ -263,6 +318,8 @@ async def get_job(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
     )
 
 
@@ -301,3 +358,44 @@ async def get_job_events(
         )
 
     return events
+
+
+@router.get("/jobs/{job_id}/diff")
+async def get_job_diff(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JSONResponse:
+    """Return the stored diff for a completed job.
+
+    Returns the diff payload on success (200), a conflict response when the
+    job is still running (409), or 404 when the job does not exist or has no
+    diff available.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, status, diff FROM gateway_jobs WHERE id = $1",
+        job_id,
+    )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if row["status"] == "running":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "job_id": str(job_id),
+                "diff": None,
+                "status": "running",
+            },
+        )
+
+    if row["diff"] is None:
+        raise HTTPException(status_code=404, detail="Diff not available")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "job_id": str(row["id"]),
+            "diff": row["diff"],
+        },
+    )

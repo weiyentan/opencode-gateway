@@ -38,6 +38,7 @@ class TestSchemaSqlFile:
             "created_at",
             "updated_at",
             "completed_at",
+            "diff",
         ]
         for col in required_columns:
             assert col in sql, f"Column '{col}' missing from schema.sql"
