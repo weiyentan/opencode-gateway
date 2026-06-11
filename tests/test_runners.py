@@ -264,6 +264,274 @@ class TestListRunners:
         assert len(data) == 2
 
 
+class TestGetRunnerDetail:
+    """Tests for GET /runners/{runner_id}."""
+
+    # ------------------------------------------------------------------
+    # Helper to set up mock responses for the detail endpoint
+    # ------------------------------------------------------------------
+
+    def _setup_detail_mocks(
+        self,
+        mock_conn,
+        runner_id,
+        *,
+        hostname="runner-detail.example.com",
+        status="online",
+        executor_type="awx",
+        labels=None,
+        workspace_obs=None,
+        opencode_obs=None,
+        latest_obs_present=False,
+    ):
+        """Configure mock_conn for the detail endpoint's four DB queries.
+
+        Returns the runner row so callers can inspect returned data.
+        """
+        now = datetime.now(timezone.utc)
+        runner_row_data = {
+            "id": runner_id,
+            "runner_id": str(runner_id),
+            "hostname": hostname,
+            "status": status,
+            "executor_type": executor_type,
+            "labels": labels,
+            "created_at": now,
+            "updated_at": now,
+        }
+        runner_row = _mock_row(runner_row_data)
+        runner_row.get.side_effect = runner_row_data.get
+
+        # Call 1: fetchrow for runner (returns the runner row)
+        # Call 2: fetchrow for latest observation (returns None or a row)
+        if latest_obs_present:
+            obs_row_data = {
+                "disk_used_percent": 55.0,
+                "memory_used_percent": 70.0,
+                "load_1m": 1.5,
+                "observed_at": now,
+            }
+            obs_row = _mock_row(obs_row_data)
+            mock_conn.fetchrow = AsyncMock(side_effect=[runner_row, obs_row])
+        else:
+            mock_conn.fetchrow = AsyncMock(side_effect=[runner_row, None])
+
+        # fetch for workspace observations and opencode instance observations
+        ws_mock_rows = []
+        if workspace_obs:
+            for wo in workspace_obs:
+                ws_mock_rows.append(_mock_row(wo))
+
+        oi_mock_rows = []
+        if opencode_obs:
+            for oo in opencode_obs:
+                oi_mock_rows.append(_mock_row(oo))
+
+        mock_conn.fetch = AsyncMock(side_effect=[ws_mock_rows, oi_mock_rows])
+
+        return runner_row_data
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_returns_200(self, client, mock_conn):
+        """GET /runners/{id} returns 200 for an existing runner."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(mock_conn, r_id)
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_returns_404_for_unknown_id(
+        self, client, mock_conn
+    ):
+        """GET /runners/{id} returns 404 for a non-existent runner."""
+        r_id = uuid.uuid4()
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 404
+        detail = response.json()["detail"]
+        assert str(r_id) in detail
+        assert "not found" in detail
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_has_all_base_fields(self, client, mock_conn):
+        """The response includes all RunnerResponse fields."""
+        r_id = uuid.uuid4()
+        labels = {"env": "staging", "region": "eu-west-1"}
+        self._setup_detail_mocks(
+            mock_conn,
+            r_id,
+            hostname="runner-staging.example.com",
+            status="online",
+            executor_type="awx",
+            labels=labels,
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == str(r_id)
+        assert data["runner_id"] == str(r_id)
+        assert data["hostname"] == "runner-staging.example.com"
+        assert data["status"] == "online"
+        assert data["executor_type"] == "awx"
+        assert data["labels"] == labels
+        assert "created_at" in data
+        assert "updated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_observation_arrays_are_empty_by_default(
+        self, client, mock_conn
+    ):
+        """workspace_observations and opencode_instance_observations default to []."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(mock_conn, r_id)
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["workspace_observations"] == []
+        assert data["opencode_instance_observations"] == []
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_includes_workspace_observations(
+        self, client, mock_conn
+    ):
+        """The response includes workspace_observations when present."""
+        r_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        workspace_obs = [
+            {
+                "workspace_name": "ws-alpha",
+                "status": "active",
+                "opencode_status": "running",
+                "observed_at": now,
+            },
+            {
+                "workspace_name": "ws-beta",
+                "status": "idle",
+                "opencode_status": "stopped",
+                "observed_at": now,
+            },
+        ]
+        self._setup_detail_mocks(mock_conn, r_id, workspace_obs=workspace_obs)
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["workspace_observations"]) == 2
+        assert data["workspace_observations"][0]["workspace_name"] == "ws-alpha"
+        assert data["workspace_observations"][0]["status"] == "active"
+        assert data["workspace_observations"][0]["opencode_status"] == "running"
+        assert data["workspace_observations"][1]["workspace_name"] == "ws-beta"
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_includes_opencode_instance_observations(
+        self, client, mock_conn
+    ):
+        """The response includes opencode_instance_observations when present."""
+        r_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        opencode_obs = [
+            {
+                "instance_name": "oc-main",
+                "version": "0.1.0",
+                "status": "running",
+                "observed_at": now,
+            },
+        ]
+        self._setup_detail_mocks(
+            mock_conn, r_id, opencode_obs=opencode_obs
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["opencode_instance_observations"]) == 1
+        obs = data["opencode_instance_observations"][0]
+        assert obs["instance_name"] == "oc-main"
+        assert obs["version"] == "0.1.0"
+        assert obs["status"] == "running"
+        assert "observed_at" in obs
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_response_has_both_observation_arrays(
+        self, client, mock_conn
+    ):
+        """Both observation arrays are present in the response."""
+        r_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        workspace_obs = [
+            {
+                "workspace_name": "ws-one",
+                "status": "active",
+                "opencode_status": "running",
+                "observed_at": now,
+            },
+        ]
+        opencode_obs = [
+            {
+                "instance_name": "oc-one",
+                "version": "0.2.0",
+                "status": "running",
+                "observed_at": now,
+            },
+        ]
+        self._setup_detail_mocks(
+            mock_conn,
+            r_id,
+            workspace_obs=workspace_obs,
+            opencode_obs=opencode_obs,
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["workspace_observations"]) == 1
+        assert len(data["opencode_instance_observations"]) == 1
+        assert "observed_at" in data["workspace_observations"][0]
+        assert "observed_at" in data["opencode_instance_observations"][0]
+
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_includes_latest_observation(
+        self, client, mock_conn
+    ):
+        """latest_observation is populated when runner_observations exist."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(mock_conn, r_id, latest_obs_present=True)
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        obs = data["latest_observation"]
+        assert obs is not None
+        assert obs["disk_used_percent"] == 55.0
+        assert obs["memory_used_percent"] == 70.0
+        assert obs["load_1m"] == 1.5
+        assert "observed_at" in obs
+
+
 class TestRunnersAPIErrors:
     """Tests for error handling in runner endpoints."""
 
