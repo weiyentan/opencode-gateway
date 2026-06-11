@@ -247,8 +247,9 @@ class TestWorkspaceStatusEnum:
 
     def test_workspace_status_is_string_enum(self):
         """WorkspaceStatus should be a string enum."""
-        from app.core.models.workspace import WorkspaceStatus
         from enum import Enum
+
+        from app.core.models.workspace import WorkspaceStatus
 
         assert issubclass(WorkspaceStatus, str)
         assert issubclass(WorkspaceStatus, Enum)

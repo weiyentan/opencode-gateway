@@ -1,5 +1,6 @@
 """Gateway settings loaded from environment variables with sensible defaults."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +31,22 @@ class Settings(BaseSettings):
     database_min_connections: int = 2
     database_max_connections: int = 10
     database_connection_timeout: int = 30
+
+    # Pre-flight policy thresholds — used by ObservationBasedPolicy to
+    # decide whether a runner VM is healthy enough to accept a new job.
+    # Values are expressed as percentages (0–100) or seconds.
+    disk_threshold_percent: float = Field(
+        default=80.0,
+        description="Maximum disk-usage percentage allowed on a runner VM (0–100).",
+    )
+    memory_threshold_percent: float = Field(
+        default=85.0,
+        description="Maximum memory-usage percentage allowed on a runner VM (0–100).",
+    )
+    staleness_seconds: int = Field(
+        default=600,
+        description="Maximum age (in seconds) of the last telemetry sample from a runner.",
+    )
 
     # Cleanup retention — duration after which a workspace is eligible for
     # automatic deletion, keyed by job outcome.
