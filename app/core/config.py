@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     database_max_connections: int = 10
     database_connection_timeout: int = 30
 
+    # Cleanup retention — duration after which a workspace is eligible for
+    # automatic deletion, keyed by job outcome.
+    cleanup_success_retention_hours: int = 72       # 3 days
+    cleanup_failure_retention_hours: int = 168       # 7 days
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

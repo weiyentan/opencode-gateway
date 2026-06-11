@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
+from app.core.config import get_settings
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -85,6 +86,37 @@ async def get_opencode_client() -> Optional[OpenCodeClientProtocol]:
     return None
 
 
+async def _set_workspace_cleanup_after(
+    conn: asyncpg.Connection,
+    workspace_id: uuid.UUID,
+    retention_hours: int,
+) -> None:
+    """Set cleanup_after on a workspace based on its created_at + retention.
+
+    The workspace row must already exist in the database (created by the
+    executor or workspace lifecycle).  When the row does not exist the
+    UPDATE is a silent no-op.
+    """
+    await conn.execute(
+        "UPDATE workspaces SET cleanup_after = created_at + $2::interval, "
+        "updated_at = $3 WHERE id = $1",
+        workspace_id,
+        timedelta(hours=retention_hours),
+        datetime.now(timezone.utc),
+    )
+
+
+def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
+    """Parse the *workspace_name* column (stored as a string UUID) back to a UUID."""
+    if not workspace_name:
+        return None
+    try:
+        return uuid.UUID(workspace_name)
+    except (ValueError, TypeError):
+        logger.warning("Invalid workspace_name: %r", workspace_name)
+        return None
+
+
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
@@ -94,6 +126,7 @@ async def create_job(
 ) -> JobResponse:
     """Create a new job, dispatch via executor, and return the final state."""
     job_id = uuid.uuid4()
+    settings = get_settings()
 
     # 1. Insert the job record in pending state
     await conn.execute(
@@ -113,16 +146,27 @@ async def create_job(
     )
 
     try:
-        # 3. Create workspace and start OpenCode Serve
+        # 3. Create workspace and store its ID (before potentially-failing start)
         ws_response = await executor.create_workspace(
             CreateWorkspaceRequest(
                 repo_url=str(body.repo_url),
                 job_id=job_id,
             )
         )
+        new_workspace_id = ws_response.workspace_id
+
+        # Store the workspace ID immediately so it is available even if
+        # start_opencode fails and the job is marked "failed".
+        await conn.execute(
+            "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
+            job_id,
+            str(new_workspace_id),
+        )
+
+        # 4. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
-                workspace_id=ws_response.workspace_id,
+                workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
             )
         )
@@ -135,14 +179,7 @@ async def create_job(
             session_id,
         )
 
-        # Store the workspace ID so it is available for abort cleanup
-        await conn.execute(
-            "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
-            job_id,
-            str(ws_response.workspace_id),
-        )
-
-        # 4. Mark completed
+        # 5. Mark completed
         now = datetime.now(timezone.utc)
         diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
@@ -154,7 +191,13 @@ async def create_job(
             diff_summary,
         )
 
-        # 5. Fetch and persist the diff (non-blocking — failure does not fail the job)
+        # 6. Set workspace cleanup_after for successful completion
+        if new_workspace_id is not None:
+            await _set_workspace_cleanup_after(
+                conn, new_workspace_id, settings.cleanup_success_retention_hours
+            )
+
+        # 7. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
             try:
                 diff_response = await opencode_client.get_session_diff(session_id)
@@ -185,7 +228,16 @@ async def create_job(
             datetime.now(timezone.utc),
         )
 
-    # 6. Return final state
+        # Set workspace cleanup_after for failure
+        row = await _fetch_job(conn, job_id)
+        if row is not None:
+            ws_id = _resolve_workspace_id(row.get("workspace_name"))
+            if ws_id is not None:
+                await _set_workspace_cleanup_after(
+                    conn, ws_id, settings.cleanup_failure_retention_hours
+                )
+
+    # 7. Return final state
     row = await _fetch_job(conn, job_id)
     return JobResponse(
         id=row["id"],
@@ -356,6 +408,8 @@ async def abort_job(
             now,
         )
 
+    aborted = False
+
     # If the job has an active session, cancel it via the OpenCode client
     if session_id and opencode_client is not None:
         try:
@@ -365,6 +419,7 @@ async def abort_job(
                 job_id,
                 datetime.now(timezone.utc),
             )
+            aborted = True
         except Exception:
             logger.exception(
                 "Failed to abort OpenCode session %s for job %s",
@@ -382,12 +437,22 @@ async def abort_job(
             job_id,
             now,
         )
+        aborted = True
+
+    # When the job reached aborted state, set workspace cleanup_after
+    if aborted:
+        settings = get_settings()
+        ws_id = _resolve_workspace_id(row.get("workspace_name"))
+        if ws_id is not None:
+            await _set_workspace_cleanup_after(
+                conn, ws_id, settings.cleanup_failure_retention_hours
+            )
 
     # Executor cleanup --- best effort, do not block the abort response
     workspace_name = row.get("workspace_name")
     if workspace_name:
         try:
-            workspace_id = uuid.UUID(workspace_name)
+            parsed_id = uuid.UUID(workspace_name)
         except (ValueError, TypeError):
             logger.warning(
                 "Invalid workspace_name for job %s: %r", job_id, workspace_name
@@ -395,23 +460,23 @@ async def abort_job(
         else:
             try:
                 await executor.stop_opencode(
-                    StopOpencodeRequest(workspace_id=workspace_id)
+                    StopOpencodeRequest(workspace_id=parsed_id)
                 )
             except Exception:
                 logger.exception(
                     "Failed to stop OpenCode Serve for job %s (workspace %s)",
                     job_id,
-                    workspace_id,
+                    parsed_id,
                 )
             try:
                 await executor.cleanup_workspace(
-                    CleanupWorkspaceRequest(workspace_id=workspace_id)
+                    CleanupWorkspaceRequest(workspace_id=parsed_id)
                 )
             except Exception:
                 logger.exception(
                     "Failed to clean up workspace for job %s (workspace %s)",
                     job_id,
-                    workspace_id,
+                    parsed_id,
                 )
 
     # Record abort event
