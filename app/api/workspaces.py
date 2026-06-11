@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.core.config import get_settings
 from app.core.models.workspace import WorkspacePydantic, WorkspaceStatus
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
@@ -215,7 +216,9 @@ async def pin_workspace(
 ) -> WorkspacePydantic:
     """Toggle the pinned flag on a workspace.
 
-    Pinned workspaces are excluded from automatic cleanup policies.
+    Pinned workspaces are excluded from automatic cleanup policies
+    (``cleanup_after`` is set to NULL).  Unpinning resets the
+    ``cleanup_after`` timestamp using the configured retention period.
     Calling this endpoint flips the current pin state.
     """
     row = await _fetch_workspace(conn, workspace_id)
@@ -224,10 +227,23 @@ async def pin_workspace(
 
     new_pinned = not row["pinned"]
     now = datetime.now(timezone.utc)
+    settings = get_settings()
+
+    if new_pinned:
+        # Pinned → exclude from automatic cleanup
+        cleanup_after = None
+    else:
+        # Unpinned → reset cleanup_after using default success retention
+        # from the workspace creation time
+        cleanup_after = row["created_at"] + timedelta(
+            hours=settings.cleanup_success_retention_hours
+        )
 
     await conn.execute(
-        "UPDATE workspaces SET pinned = $1, updated_at = $2 WHERE id = $3",
+        "UPDATE workspaces SET pinned = $1, cleanup_after = $2, updated_at = $3 "
+        "WHERE id = $4",
         new_pinned,
+        cleanup_after,
         now,
         workspace_id,
     )
