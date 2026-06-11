@@ -32,6 +32,23 @@ _Avoid_: Gateway, execution control plane
 A directory on the Runner VM containing a cloned repository and related artifacts. Created per-job, cleaned up according to policy.
 _Avoid_: Project directory, working directory, sandbox
 
+**Observation**:
+A time-series telemetry snapshot ingested via `POST /observations`. Runner VMs periodically push resource metrics (disk, memory, load) and per-workspace/per-instance status to the Gateway. Stored in domain-specific tables (`runner_observations`, `workspace_observations`, `opencode_instance_observations`) per ADR 0001.
+_Avoid_: Log, event, heartbeat (in the telemetry sense)
+
+**Policy Engine**:
+A pluggable pre-flight check system that inspects runner observations before a job is accepted. The default implementation (`ObservationBasedPolicy`) checks disk pressure, memory pressure, and telemetry staleness. Runners that exceed configured thresholds are rejected with HTTP 503 (`PolicyViolation`). The runner's database status is updated to reflect the pressure condition.
+_Avoid_: Guard, validator, admission control
+
+**Runner Statuses** — The Gateway tracks runner health via these statuses:
+
+| Status | Meaning |
+|--------|---------|
+| `HEALTHY` | Runner is accepting jobs |
+| `BLOCKED_DISK_PRESSURE` | Disk usage exceeds `disk_threshold_percent` |
+| `BLOCKED_MEMORY_PRESSURE` | Memory usage exceeds `memory_threshold_percent` |
+| `UNKNOWN` | No recent observations or telemetry is stale |
+
 ## Relationships
 
 - A **Job** targets one **Workspace** on one **Runner VM**

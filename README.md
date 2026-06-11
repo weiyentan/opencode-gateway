@@ -68,7 +68,7 @@ For example dialogues and deeper discussion, see [CONTEXT.md](CONTEXT.md).
 |----------|--------|-------|
 | **Runtime** | Python 3.12+ | Required for new typing features and asyncio improvements |
 | **Framework** | FastAPI | Async-first, Pydantic-native, OpenAPI auto-generation |
-| **Database** | PostgreSQL 15+ via `asyncpg` | Direct connection pool (no ORM yet; SQLAlchemy/Alembic under consideration) |
+| **Database** | PostgreSQL 15+ via `asyncpg` | Direct connection pool (asyncpg) plus SQLAlchemy ORM models for observability tables and Alembic for schema migrations |
 | **Validation** | Pydantic v2 + `pydantic-settings` | All boundary models and configuration use Pydantic |
 | **HTTP Client** | `httpx` | Async client for the OpenCode Serve API |
 | **Linting** | `ruff` | Replaces flake8, isort, pyupgrade. Selects: E, F, I, UP |
@@ -130,6 +130,9 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_CLEANUP_BATCH_SIZE` | `10` | Maximum number of expired workspaces cleaned per scheduler tick |
 | `GATEWAY_CLEANUP_SUCCESS_RETENTION_HOURS` | `72` | Retention period in hours for successfully completed workspaces before they are eligible for cleanup |
 | `GATEWAY_CLEANUP_FAILURE_RETENTION_HOURS` | `168` | Retention period in hours for failed workspaces before they are eligible for cleanup |
+| `GATEWAY_DISK_THRESHOLD_PERCENT` | `80.0` | Maximum disk-usage percentage allowed on a runner VM before the policy engine rejects new jobs (0–100) |
+| `GATEWAY_MEMORY_THRESHOLD_PERCENT` | `85.0` | Maximum memory-usage percentage allowed on a runner VM before the policy engine rejects new jobs (0–100) |
+| `GATEWAY_STALENESS_SECONDS` | `600` | Maximum age in seconds of the last telemetry sample; runners with older data are treated as UNKNOWN |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
 
@@ -260,6 +263,10 @@ These endpoints are implemented and tested.
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). The abort feature introduces two additional statuses — `aborting` (abort in progress, OpenCode session being terminated) and `aborted` (final state after abort). These complement the existing statuses (`pending`, `running`, `completed`, `failed`).
 
+| `POST` | `/observations` | Ingest a runner heartbeat observation — upserts the runner record, stores runner-level resource metrics (disk, memory, load), workspace snapshots, and OpenCode Serve instance status. Returns 201 on success. |
+| `GET` | `/runners` | List all registered Runner VMs with their latest observation summary (disk, memory, load, observed_at). Ordered by creation date descending. |
+| `GET` | `/runners/{id}` | Retrieve a single runner by UUID with full observation history (last 50 workspace observations + last 50 OpenCode instance observations) and derived policy status (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN). Returns 404 if not found. |
+
 ### Planned Endpoints
 
 These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not yet implemented. Status: **planned**.
@@ -268,9 +275,6 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 |--------|------|-------------|-------|
 | `POST` | `/jobs` | Submit a coding job | #4 |
 | `GET` | `/jobs/{id}` | Get job status, result, and diff | #4, #7 |
-| `GET` | `/runners` | List registered runners | #3 |
-| `GET` | `/runners/{id}` | Get runner details and health | #3 |
-| `GET` | `/observations` | Query runner/workspace observations | #3 |
 
 
 ---
@@ -283,18 +287,19 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 |-------|-------|--------|
 | #1 | Product Requirements Document | ✅ Complete |
 | #2 | Gateway skeleton — FastAPI app factory, Postgres pool, health endpoint | ✅ Complete |
-| #3 | Runner registration and observation ingestion | 🔄 Planned |
+| #3 | Runner registration and observation ingestion | ✅ Complete |
 | #4 | Job submission and tracking with local executor | 🔄 Planned |
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
 | #6 | Workspace lifecycle management | ✅ Complete |
 | #7 | Job diff retrieval via OpenCode client | ✅ Complete |
 | #8 | Job abort via OpenCode client | ✅ Complete |
-| #9 | Pre-flight policy: disk pressure guardrails | 🔄 Planned |
+| #9 | Pre-flight policy: disk pressure guardrails | ✅ Complete |
 | #10 | AWX executor plugin | 🔄 Planned |
 | #11 | Approval gates for risky operations | 🔄 In Progress |
 | #12 | Background cleanup scheduler | ✅ Complete |
 | #13 | Paperclip integration adapter | 🔄 Planned |
 | #14 | Gateway container image and docker-compose setup | ✅ Complete |
+
 
 ### Dependency DAG
 
@@ -334,13 +339,21 @@ opencode-gateway/
 │   │   └── factory.py            # create_app() FastAPI factory
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── session.py            # DatabasePool (asyncpg wrapper)
+│   │   ├── session.py            # DatabasePool (asyncpg wrapper)
+│   │   └── models/               # SQLAlchemy ORM models
+│   │       ├── __init__.py
+│   │       ├── base.py           # DeclarativeBase with naming convention
+│   │       └── runner.py         # Runner, RunnerObservation, WorkspaceObservation, OpenCodeInstanceObservation
 │   ├── executors/
 │   │   ├── __init__.py           # ExecutorPlugin ABC, EXECUTOR_REGISTRY, model exports
 │   │   ├── factory.py            # get_executor() — config-driven registry lookup
 │   │   ├── local.py              # LocalExecutor (default, shell-based)
 │   │   ├── models.py             # Pydantic request/response models
 │   │   └── ...                   # Future: awx.py, ssh.py
+│   ├── policy/
+│   │   ├── __init__.py           # Exports ObservationBasedPolicy, PolicyViolation, PreflightPolicy
+│   │   ├── base.py               # PreflightPolicy protocol + PolicyViolation exception
+│   │   └── observation.py        # ObservationBasedPolicy — disk/memory/staleness guardrails
 │   └── opencode/
 │       ├── __init__.py           # Package init, exports OpenCodeServeClient and custom exceptions
 │       ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
@@ -373,6 +386,12 @@ opencode-gateway/
 ├── .env.example                  # Environment variable template
 ├── .gitignore
 ├── .opencode-workflow.yaml
+├── alembic.ini                   # Alembic configuration
+├── alembic/                      # Alembic migrations
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       └── 0001_add_runners_and_observations.py
 ├── CONTEXT.md                    # Domain language glossary
 ├── pyproject.toml                # Project metadata, pytest, ruff, mypy config
 ├── requirements.txt              # Runtime and dev dependencies
@@ -382,7 +401,7 @@ opencode-gateway/
 ### Running Tests
 
 ```bash
-pytest tests/ -v                 # All tests (230+ tests across 15 files)
+pytest tests/ -v                 # All tests (700+ tests across 21 files)
 pytest tests/ -v -k "db"         # Database-related tests only (requires Postgres)
 ruff check .                     # Linting (E, F, I, UP rules)
 mypy app/ tests/                 # Type checking (strict mode)
