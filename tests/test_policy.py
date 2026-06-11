@@ -13,6 +13,7 @@ from app.policy.base import PolicyViolation, PreflightPolicy
 from app.policy.observation import (
     RUNNER_STATUS_BLOCKED_DISK,
     RUNNER_STATUS_BLOCKED_MEMORY,
+    RUNNER_STATUS_UNKNOWN,
     ObservationBasedPolicy,
 )
 
@@ -226,7 +227,7 @@ class TestPolicyViolation:
             runner_id="runner-z",
         )
         assert isinstance(exc.detail, dict)
-        assert len(exc.detail) == 4
+        assert len(exc.detail) == 5  # resource, current_value, threshold, runner_id, message
 
 
 class TestCheckDiskPressure:
@@ -501,8 +502,8 @@ class TestCheckEdgeCases:
         assert exc_info.value.detail["resource"] == "memory"
 
     @pytest.mark.asyncio
-    async def test_stale_observations_still_checked(self) -> None:
-        """Stale observations do not block — values are still checked."""
+    async def test_stale_observations_block_with_staleness_violation(self) -> None:
+        """Stale observations now raise a staleness PolicyViolation (block)."""
         policy = ObservationBasedPolicy()
         old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
         conn = _make_mock_conn(
@@ -514,7 +515,169 @@ class TestCheckEdgeCases:
         with pytest.raises(PolicyViolation) as exc_info:
             await policy.check("runner-1", conn=conn)
 
-        assert exc_info.value.detail["resource"] == "disk"
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "staleness"
+        assert detail["runner_id"] == "runner-1"
+        assert "last_seen_at" in detail
+
+
+class TestCheckStaleness:
+    """Tests for staleness detection in ObservationBasedPolicy.check()."""
+
+    @pytest.mark.asyncio
+    async def test_staleness_exceeded_raises_policy_violation(self) -> None:
+        """When the latest observation is older than staleness_seconds,
+        a PolicyViolation is raised with resource='staleness'."""
+        policy = ObservationBasedPolicy()
+        # 15 minutes ago → older than default 600s threshold
+        old_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        old_time = datetime.fromtimestamp(
+            old_time.timestamp() - 900,  # 15 min = 900s
+            tz=timezone.utc,
+        )
+        conn = _make_mock_conn(
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+            observed_at=old_time,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "staleness"
+        assert detail["runner_id"] == "runner-1"
+        assert detail["last_seen_at"] == old_time.isoformat()
+        assert detail["current_value"] >= 899  # at least ~900s old
+
+    @pytest.mark.asyncio
+    async def test_staleness_updates_runner_status_to_unknown(self) -> None:
+        """When staleness is detected, runner status is set to UNKNOWN."""
+        policy = ObservationBasedPolicy()
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        conn = _make_mock_conn_tracked(
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+            observed_at=old_time,
+        )
+
+        try:
+            await policy.check("runner-1", conn=conn)
+        except PolicyViolation:
+            pass
+
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(status_updates) == 1, (
+            f"Expected 1 status update, got {len(status_updates)}. "
+            f"All execute calls: {execute_calls}"
+        )
+        _sql, args = status_updates[0]
+        assert args[0] == RUNNER_STATUS_UNKNOWN, (
+            f"Expected status={RUNNER_STATUS_UNKNOWN}, got {args[0]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_staleness_error_message_contents(self) -> None:
+        """The PolicyViolation detail includes descriptive message and last_seen_at."""
+        policy = ObservationBasedPolicy()
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        conn = _make_mock_conn(
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+            observed_at=old_time,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        detail = exc_info.value.detail
+        assert "Runner runner-1 observation is stale" in detail["message"]
+        assert "2020-01-01T00:00:00" in detail["message"]
+        assert "Current staleness threshold is 600s" in detail["message"]
+        assert detail["last_seen_at"] == "2020-01-01T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_no_observations_warns_but_does_not_block(self) -> None:
+        """When there are no observations, return None (warn but don't block)."""
+        runner_uuid = uuid.uuid4()
+        conn = AsyncMock()
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners" in sql:
+                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            if "FROM runner_observations" in sql:
+                return None  # no observations
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        conn.execute = AsyncMock(return_value=None)
+
+        policy = ObservationBasedPolicy()
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_healthy_runner_returns_none_and_logs_accept(self) -> None:
+        """A runner with recent healthy metrics returns None and logs policy_accept."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=40.0, memory_used_percent=55.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_staleness_threshold_is_configurable(self) -> None:
+        """The staleness threshold can be set via Settings."""
+        settings = Settings(staleness_seconds=60)
+        policy = ObservationBasedPolicy(settings)
+        # 2 minutes ago → older than 60s threshold but not 600s
+        old_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        old_time = datetime.fromtimestamp(
+            old_time.timestamp() - 120,
+            tz=timezone.utc,
+        )
+        conn = _make_mock_conn(
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+            observed_at=old_time,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        detail = exc_info.value.detail
+        assert detail["threshold"] == 60
+        assert detail["resource"] == "staleness"
+
+    @pytest.mark.asyncio
+    async def test_recent_observation_does_not_trigger_staleness(self) -> None:
+        """A very recent observation does not trigger staleness."""
+        policy = ObservationBasedPolicy()
+        recent = datetime.now(timezone.utc)
+        conn = _make_mock_conn(
+            disk_used_percent=40.0,
+            memory_used_percent=55.0,
+            observed_at=recent,
+        )
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
 
 
 class TestConfigIntegration:

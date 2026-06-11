@@ -10,6 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.db.session import get_session
+from app.policy.observation import (
+    RUNNER_STATUS_BLOCKED_DISK,
+    RUNNER_STATUS_BLOCKED_MEMORY,
+    RUNNER_STATUS_UNKNOWN,
+)
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -67,6 +72,8 @@ class RunnerDetailResponse(RunnerResponse):
 
     workspace_observations: list[WorkspaceObservationItem] = []
     opencode_instance_observations: list[OpenCodeInstanceObservationItem] = []
+    policy_status: str = "HEALTHY"
+    policy_reason: str = "Runner is healthy"
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +183,17 @@ def _row_to_opencode_instance_obs_item(
     )
 
 
+def _derive_policy_status(runner_status: str) -> tuple[str, str]:
+    """Derive the policy_status and policy_reason from the runner's DB status."""
+    if runner_status == RUNNER_STATUS_BLOCKED_DISK:
+        return ("BLOCKED_DISK_PRESSURE", "Runner has disk pressure")
+    if runner_status == RUNNER_STATUS_BLOCKED_MEMORY:
+        return ("BLOCKED_MEMORY_PRESSURE", "Runner has memory pressure")
+    if runner_status == RUNNER_STATUS_UNKNOWN:
+        return ("UNKNOWN", "Runner observations are stale")
+    return ("HEALTHY", "Runner is healthy")
+
+
 # ---------------------------------------------------------------------------
 # GET /runners
 # ---------------------------------------------------------------------------
@@ -257,6 +275,8 @@ async def get_runner_detail(
             observed_at=obs_row["observed_at"],
         )
 
+    policy_status, policy_reason = _derive_policy_status(base.status)
+
     return RunnerDetailResponse(
         id=base.id,
         runner_id=base.runner_id,
@@ -269,4 +289,6 @@ async def get_runner_detail(
         latest_observation=latest_observation,
         workspace_observations=workspace_observations,
         opencode_instance_observations=opencode_instance_observations,
+        policy_status=policy_status,
+        policy_reason=policy_reason,
     )

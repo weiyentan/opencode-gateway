@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 from uuid import UUID
 
 import asyncpg
@@ -24,6 +23,7 @@ logger = logging.getLogger(__name__)
 RUNNER_STATUS_HEALTHY = "HEALTHY"
 RUNNER_STATUS_BLOCKED_DISK = "BLOCKED_DISK_PRESSURE"
 RUNNER_STATUS_BLOCKED_MEMORY = "BLOCKED_MEMORY_PRESSURE"
+RUNNER_STATUS_UNKNOWN = "UNKNOWN"
 
 
 class ObservationBasedPolicy:
@@ -59,7 +59,7 @@ class ObservationBasedPolicy:
     async def check(
         self,
         runner_id: str,
-        conn: Optional[asyncpg.Connection] = None,
+        conn: asyncpg.Connection | None = None,
     ) -> None:
         """Inspect *runner_id* against the configured thresholds.
 
@@ -122,32 +122,45 @@ class ObservationBasedPolicy:
 
         if obs_row is None:
             logger.warning(
-                "ObservationBasedPolicy.check(%r) — no observations available",
+                "policy_no_data runner_id=%s reason=no_observations",
                 runner_id,
             )
             return None
 
-        disk_used: Optional[float] = obs_row["disk_used_percent"]
-        memory_used: Optional[float] = obs_row["memory_used_percent"]
+        disk_used: float | None = obs_row["disk_used_percent"]
+        memory_used: float | None = obs_row["memory_used_percent"]
         observed_at: datetime = obs_row["observed_at"]
 
-        # Check staleness (optional guard — log but don't block yet)
+        # --- Staleness check ---
         now = datetime.now(timezone.utc)
         age_seconds = (now - observed_at).total_seconds()
         if age_seconds > self.staleness_seconds:
             logger.warning(
-                "ObservationBasedPolicy.check(%r) — observations are stale "
-                "(age=%.0fs, threshold=%ds)",
+                "policy_reject runner_id=%s reason=staleness resource=staleness "
+                "current_value=%.0f threshold=%d",
                 runner_id,
                 age_seconds,
                 self.staleness_seconds,
             )
-            # Staleness alone does not block; we still check the values we have.
+            await self._set_runner_status(conn, runner_uuid, RUNNER_STATUS_UNKNOWN)
+            raise PolicyViolation(
+                resource="staleness",
+                current_value=age_seconds,
+                threshold=self.staleness_seconds,
+                runner_id=runner_id,
+                last_seen_at=observed_at.isoformat(),
+                message=(
+                    f"Runner {runner_id} observation is stale. "
+                    f"Last seen at {observed_at.isoformat()}. "
+                    f"Current staleness threshold is {self.staleness_seconds}s."
+                ),
+            )
 
         # --- Disk pressure check ---
         if disk_used is not None and disk_used > self.disk_threshold_percent:
             logger.warning(
-                "ObservationBasedPolicy.check(%r) — disk pressure: %.1f%% > %.0f%%",
+                "policy_reject runner_id=%s reason=disk_pressure resource=disk "
+                "current_value=%.1f threshold=%.0f",
                 runner_id,
                 disk_used,
                 self.disk_threshold_percent,
@@ -163,7 +176,8 @@ class ObservationBasedPolicy:
         # --- Memory pressure check ---
         if memory_used is not None and memory_used > self.memory_threshold_percent:
             logger.warning(
-                "ObservationBasedPolicy.check(%r) — memory pressure: %.1f%% > %.0f%%",
+                "policy_reject runner_id=%s reason=memory_pressure resource=memory "
+                "current_value=%.1f threshold=%.0f",
                 runner_id,
                 memory_used,
                 self.memory_threshold_percent,
@@ -176,11 +190,9 @@ class ObservationBasedPolicy:
                 runner_id=runner_id,
             )
 
-        logger.debug(
-            "ObservationBasedPolicy.check(%r) — healthy (disk=%.1f%%, mem=%.1f%%)",
+        logger.info(
+            "policy_accept runner_id=%s reason=healthy",
             runner_id,
-            disk_used or 0,
-            memory_used or 0,
         )
         return None
 

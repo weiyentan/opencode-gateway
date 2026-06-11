@@ -20,14 +20,24 @@ class PolicyViolation(HTTPException):
         current_value: float,
         threshold: float,
         runner_id: str,
+        last_seen_at: str | None = None,
+        message: str | None = None,
     ) -> None:
         detail: dict[str, Any] = {
             "resource": resource,
             "current_value": current_value,
             "threshold": threshold,
             "runner_id": runner_id,
+            "message": message or _default_message(resource, threshold),
         }
+        if last_seen_at is not None:
+            detail["last_seen_at"] = last_seen_at
         super().__init__(status_code=503, detail=detail)
+
+
+def _default_message(resource: str, threshold: float) -> str:
+    """Return a human-readable message for a PolicyViolation."""
+    return f"Runner exceeds {resource} threshold of {threshold:.0f}%"
 
 
 @runtime_checkable
