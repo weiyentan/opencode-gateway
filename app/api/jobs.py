@@ -24,7 +24,7 @@ from app.executors.models import (
     StopOpencodeRequest,
 )
 from app.opencode.protocol import OpenCodeClientProtocol
-from app.policy import ObservationBasedPolicy
+from app.policy import ObservationBasedPolicy, PolicyViolation
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,46 @@ def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
+async def _resolve_runner_id_for_workspace(
+    conn: asyncpg.Connection,
+    workspace_id: uuid.UUID,
+) -> Optional[str]:
+    """Resolve a workspace ID to its runner's text identifier.
+
+    Looks up the workspace's ``runner_id`` (UUID FK) in the workspaces
+    table, then resolves it to the ``runners.runner_id`` text field.
+    Returns ``None`` when the workspace or runner is not found.
+    """
+    # Get the runner UUID from the workspace row.
+    ws_row = await conn.fetchrow(
+        "SELECT runner_id FROM workspaces WHERE id = $1",
+        workspace_id,
+    )
+    if ws_row is None or ws_row.get("runner_id") is None:
+        logger.debug(
+            "No runner_id for workspace %s — skipping policy check",
+            workspace_id,
+        )
+        return None
+
+    runner_uuid = ws_row["runner_id"]
+
+    # Resolve to the text runner_id.
+    runner_row = await conn.fetchrow(
+        "SELECT runner_id FROM runners WHERE id = $1",
+        runner_uuid,
+    )
+    if runner_row is None:
+        logger.warning(
+            "Runner UUID %s referenced by workspace %s not found",
+            runner_uuid,
+            workspace_id,
+        )
+        return None
+
+    return runner_row["runner_id"]
+
+
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
@@ -164,9 +204,12 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 3b. Run pre-flight policy check (skeleton — always returns None)
-        policy = ObservationBasedPolicy(settings)
-        await policy.check(str(new_workspace_id))
+        # 3b. Run pre-flight policy check — resolves workspace → runner and
+        # inspects runner observations for disk/memory pressure.
+        runner_text_id = await _resolve_runner_id_for_workspace(conn, new_workspace_id)
+        if runner_text_id is not None:
+            policy = ObservationBasedPolicy(settings)
+            await policy.check(runner_text_id, conn=conn)
 
         # 4. Start OpenCode Serve
         start_response = await executor.start_opencode(
@@ -224,6 +267,25 @@ async def create_job(
                     session_id,
                     exc_info=True,
                 )
+
+    except PolicyViolation:
+        # Policy rejected the job before dispatch — mark as failed and re-raise
+        # the 503 so FastAPI can return it to the caller.
+        logger.warning(
+            "Policy check rejected job %s: %s",
+            job_id,
+            "disk/memory pressure",
+        )
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            job_id,
+            datetime.now(timezone.utc),
+        )
+        if new_workspace_id is not None:
+            await _set_workspace_cleanup_after(
+                conn, new_workspace_id, settings.cleanup_failure_retention_hours
+            )
+        raise
 
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
