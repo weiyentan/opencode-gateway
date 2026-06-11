@@ -2,11 +2,88 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from app.core.config import Settings
-from app.policy.base import PreflightPolicy
-from app.policy.observation import ObservationBasedPolicy
+from app.policy.base import PolicyViolation, PreflightPolicy
+from app.policy.observation import (
+    RUNNER_STATUS_BLOCKED_DISK,
+    RUNNER_STATUS_BLOCKED_MEMORY,
+    ObservationBasedPolicy,
+)
+
+
+def _mock_row(data: dict):
+    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
+    row = MagicMock()
+    row.__getitem__.side_effect = data.__getitem__
+    row.get = data.get
+    return row
+
+
+def _make_mock_conn(
+    *,
+    runner_id="runner-1",
+    runner_uuid=None,
+    disk_used_percent=None,
+    memory_used_percent=None,
+    observed_at=None,
+) -> AsyncMock:
+    """Build a mock asyncpg connection with configurable observation data.
+
+    Parameters
+    ----------
+    runner_id:
+        The text runner_id to return from the runners lookup.
+    runner_uuid:
+        The runner's UUID.  Auto-generated when None.
+    disk_used_percent:
+        The disk_used_percent value to return from runner_observations.
+        When None, the observation row is not returned (simulates
+        "no observations").
+    memory_used_percent:
+        The memory_used_percent value to return from runner_observations.
+    observed_at:
+        The observed_at timestamp.  Defaults to now (UTC).
+    """
+    conn = AsyncMock()
+
+    if runner_uuid is None:
+        runner_uuid = uuid.uuid4()
+
+    # Runner lookup: SELECT id, status FROM runners WHERE runner_id = $1
+    async def _fetchrow_runner(sql, *args):
+        if "FROM runners" in sql:
+            return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+        return None
+
+    if disk_used_percent is not None or memory_used_percent is not None:
+        # Observation lookup: SELECT ... FROM runner_observations ...
+        obs_at = observed_at if observed_at is not None else datetime.now(timezone.utc)
+
+        async def _fetchrow_obs(sql, *args):
+            if "FROM runners" in sql:
+                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            if "FROM runner_observations" in sql:
+                return _mock_row(
+                    {
+                        "disk_used_percent": disk_used_percent,
+                        "memory_used_percent": memory_used_percent,
+                        "observed_at": obs_at,
+                    }
+                )
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow_obs)
+    else:
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow_runner)
+
+    conn.execute = AsyncMock(return_value=None)
+    return conn
 
 
 class TestPreflightPolicyProtocol:
@@ -87,19 +164,17 @@ class TestObservationBasedPolicy:
         assert policy.memory_threshold_percent == 60.0
         assert policy.staleness_seconds == 120
 
-    def test_check_returns_none(self) -> None:
-        """check() must return None — skeleton implementation, no enforcement."""
+    def test_check_returns_none_without_conn(self) -> None:
+        """check() returns None when no DB connection is provided (safe skip)."""
         policy = ObservationBasedPolicy()
-        # We need to run the async method; use asyncio.run_simple or
-        # run the async test directly.
         import asyncio
 
         result = asyncio.run(policy.check("runner-1"))
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_check_returns_none_async(self) -> None:
-        """check() must return None when awaited directly (async test)."""
+    async def test_check_returns_none_without_conn_async(self) -> None:
+        """check() returns None when no DB connection is provided (async)."""
         policy = ObservationBasedPolicy()
         result = await policy.check("runner-1")
         assert result is None
@@ -108,6 +183,338 @@ class TestObservationBasedPolicy:
         """ObservationBasedPolicy should satisfy the PreflightPolicy protocol."""
         policy = ObservationBasedPolicy()
         assert isinstance(policy, PreflightPolicy)
+
+
+# ---------------------------------------------------------------------------
+# Enforcement tests — disk and memory thresholds
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyViolation:
+    """Tests for the PolicyViolation exception."""
+
+    def test_status_code_is_503(self) -> None:
+        """PolicyViolation must have status_code 503."""
+        exc = PolicyViolation(
+            resource="disk",
+            current_value=90.0,
+            threshold=80.0,
+            runner_id="runner-1",
+        )
+        assert exc.status_code == 503
+
+    def test_detail_has_required_fields(self) -> None:
+        """The detail dict must contain resource, current_value, threshold, runner_id."""
+        exc = PolicyViolation(
+            resource="memory",
+            current_value=92.5,
+            threshold=85.0,
+            runner_id="runner-alpha",
+        )
+        detail = exc.detail
+        assert detail["resource"] == "memory"
+        assert detail["current_value"] == 92.5
+        assert detail["threshold"] == 85.0
+        assert detail["runner_id"] == "runner-alpha"
+
+    def test_detail_type_is_dict(self) -> None:
+        """The detail must be a dict for JSON serialisation."""
+        exc = PolicyViolation(
+            resource="disk",
+            current_value=99.0,
+            threshold=95.0,
+            runner_id="runner-z",
+        )
+        assert isinstance(exc.detail, dict)
+        assert len(exc.detail) == 4
+
+
+class TestCheckDiskPressure:
+    """Tests for disk pressure detection in ObservationBasedPolicy.check()."""
+
+    @pytest.mark.asyncio
+    async def test_disk_threshold_exceeded_raises_policy_violation(self) -> None:
+        """When disk_used_percent > threshold, PolicyViolation is raised."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=90.0, memory_used_percent=50.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "disk"
+        assert detail["current_value"] == 90.0
+        assert detail["threshold"] == 80.0
+        assert detail["runner_id"] == "runner-1"
+
+    @pytest.mark.asyncio
+    async def test_disk_threshold_exceeded_updates_runner_status(self) -> None:
+        """When disk pressure is detected, runner status is set to BLOCKED_DISK_PRESSURE."""
+        policy = ObservationBasedPolicy()
+        runner_uuid = uuid.uuid4()
+
+        # Track execute calls via a side-effect list (captures both SQL and args).
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        conn = _make_mock_conn_tracked(
+            runner_uuid=runner_uuid,
+            disk_used_percent=95.0,
+            memory_used_percent=50.0,
+        )
+
+        try:
+            await policy.check("runner-1", conn=conn)
+        except PolicyViolation:
+            pass
+
+        # Verify the runner status update was invoked with the correct status
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(status_updates) == 1, (
+            f"Expected 1 status update, got {len(status_updates)}. "
+            f"All execute calls: {execute_calls}"
+        )
+        _sql, args = status_updates[0]
+        assert args[0] == RUNNER_STATUS_BLOCKED_DISK, (
+            f"Expected status={RUNNER_STATUS_BLOCKED_DISK}, got {args[0]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disk_below_threshold_does_not_raise(self) -> None:
+        """When disk_used_percent is below threshold, no exception is raised."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=70.0, memory_used_percent=50.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_disk_at_threshold_does_not_raise(self) -> None:
+        """When disk_used_percent equals the threshold, no exception (strict > check)."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=80.0, memory_used_percent=50.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_disk_exceeded_with_custom_threshold(self) -> None:
+        """Custom thresholds from Settings are respected."""
+        settings = Settings(disk_threshold_percent=75.0)
+        policy = ObservationBasedPolicy(settings)
+        conn = _make_mock_conn(disk_used_percent=80.0, memory_used_percent=50.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["threshold"] == 75.0
+        assert exc_info.value.detail["resource"] == "disk"
+
+    @pytest.mark.asyncio
+    async def test_disk_none_does_not_raise(self) -> None:
+        """When disk_used_percent is NULL, no disk pressure is flagged."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=None, memory_used_percent=50.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+
+class TestCheckMemoryPressure:
+    """Tests for memory pressure detection in ObservationBasedPolicy.check()."""
+
+    @pytest.mark.asyncio
+    async def test_memory_threshold_exceeded_raises_policy_violation(self) -> None:
+        """When memory_used_percent > threshold, PolicyViolation is raised."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=90.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "memory"
+        assert detail["current_value"] == 90.0
+        assert detail["threshold"] == 85.0
+        assert detail["runner_id"] == "runner-1"
+
+    @pytest.mark.asyncio
+    async def test_memory_threshold_exceeded_updates_runner_status(self) -> None:
+        """When memory pressure is detected, runner status is set to BLOCKED_MEMORY_PRESSURE."""
+        policy = ObservationBasedPolicy()
+
+        # Track execute calls via side-effect list (captures both SQL and args).
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        conn = _make_mock_conn_tracked(
+            disk_used_percent=50.0,
+            memory_used_percent=95.0,
+        )
+
+        try:
+            await policy.check("runner-1", conn=conn)
+        except PolicyViolation:
+            pass
+
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(status_updates) == 1
+        _sql, args = status_updates[0]
+        assert args[0] == RUNNER_STATUS_BLOCKED_MEMORY, (
+            f"Expected status={RUNNER_STATUS_BLOCKED_MEMORY}, got {args[0]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_memory_below_threshold_does_not_raise(self) -> None:
+        """When memory_used_percent is below threshold, no exception is raised."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=75.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_memory_at_threshold_does_not_raise(self) -> None:
+        """When memory_used_percent equals the threshold, no exception (strict > check)."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=85.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_memory_exceeded_with_custom_threshold(self) -> None:
+        """Custom memory thresholds from Settings are respected."""
+        settings = Settings(memory_threshold_percent=60.0)
+        policy = ObservationBasedPolicy(settings)
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=70.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["threshold"] == 60.0
+        assert exc_info.value.detail["resource"] == "memory"
+
+    @pytest.mark.asyncio
+    async def test_memory_none_does_not_raise(self) -> None:
+        """When memory_used_percent is NULL, no memory pressure is flagged."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=None)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+
+class TestCheckEdgeCases:
+    """Edge case tests for ObservationBasedPolicy.check()."""
+
+    @pytest.mark.asyncio
+    async def test_no_conn_returns_none(self) -> None:
+        """When conn is None, check returns None (skip enforcement)."""
+        policy = ObservationBasedPolicy()
+        result = await policy.check("runner-1", conn=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_runner_not_found_returns_none(self) -> None:
+        """When the runner_id is not in the runners table, return None."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=None)  # runner not found
+        conn.execute = AsyncMock(return_value=None)
+
+        policy = ObservationBasedPolicy()
+        result = await policy.check("unknown-runner", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_observations_returns_none(self) -> None:
+        """When the runner has no observations, return None."""
+        runner_uuid = uuid.uuid4()
+        conn = AsyncMock()
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners" in sql:
+                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            if "FROM runner_observations" in sql:
+                return None  # no observations
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        conn.execute = AsyncMock(return_value=None)
+
+        policy = ObservationBasedPolicy()
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_healthy_runner_returns_none(self) -> None:
+        """A runner with healthy metrics returns None."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=40.0, memory_used_percent=55.0)
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_disk_checked_before_memory(self) -> None:
+        """Disk pressure is checked first — disk > memory when both exceed."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=95.0, memory_used_percent=95.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        # Disk is checked first, so disk violation should be raised
+        assert exc_info.value.detail["resource"] == "disk"
+
+    @pytest.mark.asyncio
+    async def test_only_memory_exceeded_raises_memory_violation(self) -> None:
+        """When only memory exceeds threshold, memory violation is raised."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=90.0)
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "memory"
+
+    @pytest.mark.asyncio
+    async def test_stale_observations_still_checked(self) -> None:
+        """Stale observations do not block — values are still checked."""
+        policy = ObservationBasedPolicy()
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        conn = _make_mock_conn(
+            disk_used_percent=90.0,
+            memory_used_percent=50.0,
+            observed_at=old_time,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "disk"
 
 
 class TestConfigIntegration:

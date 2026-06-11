@@ -8,7 +8,7 @@ Gateway to any specific implementation.
 
 from __future__ import annotations
 
-from app.policy.base import PreflightPolicy
+from app.policy.base import PolicyViolation, PreflightPolicy
 from app.policy.observation import ObservationBasedPolicy
 
-__all__ = ["ObservationBasedPolicy", "PreflightPolicy"]
+__all__ = ["ObservationBasedPolicy", "PolicyViolation", "PreflightPolicy"]

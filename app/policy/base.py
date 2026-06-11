@@ -2,7 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+from fastapi import HTTPException
+
+
+class PolicyViolation(HTTPException):
+    """Raised by a pre-flight policy when a runner exceeds a resource threshold.
+
+    This is an HTTP exception with status code 503 so the Gateway can
+    propagate it directly to callers.
+    """
+
+    def __init__(
+        self,
+        resource: str,
+        current_value: float,
+        threshold: float,
+        runner_id: str,
+    ) -> None:
+        detail: dict[str, Any] = {
+            "resource": resource,
+            "current_value": current_value,
+            "threshold": threshold,
+            "runner_id": runner_id,
+        }
+        super().__init__(status_code=503, detail=detail)
 
 
 @runtime_checkable
@@ -14,8 +39,8 @@ class PreflightPolicy(Protocol):
     when the runner is healthy enough to accept work.
 
     Implementations that detect an unhealthy runner should raise an
-    exception (e.g. :class:`PreflightRejection`) — see
-    :mod:`app.policy.observation` for the skeleton implementation.
+    exception (e.g. :class:`PolicyViolation`) — see
+    :mod:`app.policy.observation` for the observation-based implementation.
     """
 
     async def check(self, runner_id: str) -> None:  # pragma: no cover

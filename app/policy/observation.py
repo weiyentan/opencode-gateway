@@ -1,21 +1,29 @@
-"""Observation-based pre-flight policy — skeleton with configurable thresholds.
+"""Observation-based pre-flight policy — disk and memory pressure guardrails.
 
 This module provides :class:`ObservationBasedPolicy`, the default
-pre-flight policy for the Gateway.  In future iterations it will
-inspect runner telemetry (disk, memory, staleness) and reject jobs
-when a runner exceeds its configured thresholds.
-
-Currently the policy is a **skeleton only** — :meth:`check` always
-returns ``None``.  No enforcement logic is implemented yet.
+pre-flight policy for the Gateway.  It inspects runner telemetry
+(disk and memory usage) and rejects jobs when a runner exceeds its
+configured thresholds.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
+from typing import Optional
+from uuid import UUID
+
+import asyncpg
 
 from app.core.config import Settings
+from app.policy.base import PolicyViolation
 
 logger = logging.getLogger(__name__)
+
+# Runner status constants
+RUNNER_STATUS_HEALTHY = "HEALTHY"
+RUNNER_STATUS_BLOCKED_DISK = "BLOCKED_DISK_PRESSURE"
+RUNNER_STATUS_BLOCKED_MEMORY = "BLOCKED_MEMORY_PRESSURE"
 
 
 class ObservationBasedPolicy:
@@ -27,8 +35,11 @@ class ObservationBasedPolicy:
     * ``memory_threshold_percent`` — max memory usage percentage (default 85 %)
     * ``staleness_seconds`` — max age of last telemetry (default 600 s)
 
-    **Skeleton notice:** :meth:`check` currently returns ``None`` in
-    every case.  Enforcement logic will be added in a follow-up issue.
+    When :meth:`check` is called with a database connection, it queries
+    the latest ``runner_observations`` for the given *runner_id* and
+    raises :class:`PolicyViolation` (HTTP 503) if any threshold is
+    breached.  The runner's status is also updated in the database to
+    reflect the pressure condition.
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -45,29 +56,149 @@ class ObservationBasedPolicy:
         self.memory_threshold_percent: float = cfg.memory_threshold_percent
         self.staleness_seconds: int = cfg.staleness_seconds
 
-    async def check(self, runner_id: str) -> None:  # pragma: no cover
+    async def check(
+        self,
+        runner_id: str,
+        conn: Optional[asyncpg.Connection] = None,
+    ) -> None:
         """Inspect *runner_id* against the configured thresholds.
 
-        **Skeleton implementation** — always returns ``None``.
-        No telemetry lookup or threshold comparison is performed yet.
+        Queries the ``runners`` and ``runner_observations`` tables via
+        *conn*.  When *conn* is ``None`` or no observations exist for
+        the runner, a warning is logged and ``None`` is returned (the
+        runner is not blocked).
 
         Parameters
         ----------
         runner_id:
-            The identifier of the runner VM to inspect.
+            The text identifier of the runner VM to inspect (the
+            ``runners.runner_id`` column value).
+        conn:
+            An ``asyncpg`` database connection.  When ``None`` the
+            check is skipped.
 
         Returns
         -------
         None
-            The runner is accepted unconditionally in this skeleton
-            version.
+            The runner is healthy — all resource metrics are within
+            their configured thresholds.
+
+        Raises
+        ------
+        PolicyViolation
+            A disk or memory threshold has been breached (HTTP 503).
         """
-        logger.debug(
-            "ObservationBasedPolicy.check(%r) — skeleton pass (disk≤%.0f%%, "
-            "mem≤%.0f%%, stale≤%ds)",
+        if conn is None:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — no DB connection, "
+                "skipping enforcement",
+                runner_id,
+            )
+            return None
+
+        # Resolve the text runner_id to the internal runner UUID.
+        runner_row = await conn.fetchrow(
+            "SELECT id, status FROM runners WHERE runner_id = $1",
             runner_id,
-            self.disk_threshold_percent,
-            self.memory_threshold_percent,
-            self.staleness_seconds,
+        )
+        if runner_row is None:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — runner not found in DB",
+                runner_id,
+            )
+            return None
+
+        runner_uuid: UUID = runner_row["id"]
+
+        # Fetch the latest runner observation.
+        obs_row = await conn.fetchrow(
+            "SELECT disk_used_percent, memory_used_percent, observed_at "
+            "FROM runner_observations "
+            "WHERE runner_id = $1 "
+            "ORDER BY observed_at DESC "
+            "LIMIT 1",
+            runner_uuid,
+        )
+
+        if obs_row is None:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — no observations available",
+                runner_id,
+            )
+            return None
+
+        disk_used: Optional[float] = obs_row["disk_used_percent"]
+        memory_used: Optional[float] = obs_row["memory_used_percent"]
+        observed_at: datetime = obs_row["observed_at"]
+
+        # Check staleness (optional guard — log but don't block yet)
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - observed_at).total_seconds()
+        if age_seconds > self.staleness_seconds:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — observations are stale "
+                "(age=%.0fs, threshold=%ds)",
+                runner_id,
+                age_seconds,
+                self.staleness_seconds,
+            )
+            # Staleness alone does not block; we still check the values we have.
+
+        # --- Disk pressure check ---
+        if disk_used is not None and disk_used > self.disk_threshold_percent:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — disk pressure: %.1f%% > %.0f%%",
+                runner_id,
+                disk_used,
+                self.disk_threshold_percent,
+            )
+            await self._set_runner_status(conn, runner_uuid, RUNNER_STATUS_BLOCKED_DISK)
+            raise PolicyViolation(
+                resource="disk",
+                current_value=disk_used,
+                threshold=self.disk_threshold_percent,
+                runner_id=runner_id,
+            )
+
+        # --- Memory pressure check ---
+        if memory_used is not None and memory_used > self.memory_threshold_percent:
+            logger.warning(
+                "ObservationBasedPolicy.check(%r) — memory pressure: %.1f%% > %.0f%%",
+                runner_id,
+                memory_used,
+                self.memory_threshold_percent,
+            )
+            await self._set_runner_status(conn, runner_uuid, RUNNER_STATUS_BLOCKED_MEMORY)
+            raise PolicyViolation(
+                resource="memory",
+                current_value=memory_used,
+                threshold=self.memory_threshold_percent,
+                runner_id=runner_id,
+            )
+
+        logger.debug(
+            "ObservationBasedPolicy.check(%r) — healthy (disk=%.1f%%, mem=%.1f%%)",
+            runner_id,
+            disk_used or 0,
+            memory_used or 0,
         )
         return None
+
+    @staticmethod
+    async def _set_runner_status(
+        conn: asyncpg.Connection,
+        runner_uuid: UUID,
+        status: str,
+    ) -> None:
+        """Update the runner's status in the database."""
+        await conn.execute(
+            "UPDATE runners SET status = $1, updated_at = $2 WHERE id = $3",
+            status,
+            datetime.now(timezone.utc),
+            runner_uuid,
+        )
+        logger.info(
+            "Runner %s status updated to %s",
+            runner_uuid,
+            status,
+        )
