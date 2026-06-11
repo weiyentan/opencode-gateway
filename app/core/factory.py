@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.core.config import get_settings
 from app.db.schema import ensure_schema
 from app.db.session import DatabasePool
+from app.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ def create_app(
     The application also initialises a Postgres connection pool on
     startup and closes it on shutdown.  If Postgres is unreachable the
     app logs a warning and continues without a pool.
+
+    A background cleanup scheduler is started during the boot sequence
+    and stopped gracefully on shutdown.
     """
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
@@ -65,7 +69,15 @@ def create_app(
             )
             app.state.pool = None  # type: ignore[attr-defined]
 
+        # --- Cleanup scheduler ---
+        scheduler = Scheduler()
+        app.state.scheduler = scheduler  # type: ignore[attr-defined]
+        await scheduler.start(ctx={"pool": app.state.pool})  # type: ignore[attr-defined]
+
         yield
+
+        # --- Cleanup scheduler shutdown ---
+        await scheduler.stop(ctx={"pool": app.state.pool})  # type: ignore[attr-defined]
 
         # --- Postgres pool shutdown ---
         db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]
