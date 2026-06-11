@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.core.config import get_settings
 from app.db.schema import ensure_schema
 from app.db.session import DatabasePool
+from app.scheduler import CleanupScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ def create_app(
     The application also initialises a Postgres connection pool on
     startup and closes it on shutdown.  If Postgres is unreachable the
     app logs a warning and continues without a pool.
+
+    A background cleanup scheduler is started during the boot sequence
+    and stopped gracefully on shutdown.
     """
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
@@ -65,7 +69,31 @@ def create_app(
             )
             app.state.pool = None  # type: ignore[attr-defined]
 
+        # --- Executor plugin ---
+        executor = _create_executor(settings)
+
+        # --- Cleanup scheduler ---
+        scheduler = CleanupScheduler(
+            interval_seconds=settings.cleanup_interval_seconds,
+            batch_size=settings.cleanup_batch_size,
+        )
+        app.state.scheduler = scheduler  # type: ignore[attr-defined]
+        await scheduler.start(
+            ctx={
+                "pool": app.state.pool,  # type: ignore[attr-defined]
+                "executor": executor,
+            }
+        )
+
         yield
+
+        # --- Cleanup scheduler shutdown ---
+        await scheduler.stop(
+            ctx={
+                "pool": app.state.pool,  # type: ignore[attr-defined]
+                "executor": executor,
+            }
+        )
 
         # --- Postgres pool shutdown ---
         db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]
@@ -91,3 +119,22 @@ def create_app(
     app.include_router(workspaces_router)
 
     return app
+
+
+def _create_executor(settings: Any) -> Any:
+    """Instantiate the configured executor plugin.
+
+    Returns ``None`` if the executor type is not found in the registry
+    so the scheduler can skip cleanup ticks gracefully instead of
+    crashing the Gateway process.
+    """
+    from app.executors import EXECUTOR_REGISTRY
+
+    executor_cls = EXECUTOR_REGISTRY.get(settings.executor_type)
+    if executor_cls is None:
+        logger.warning(
+            "Unknown executor type %r — cleanup scheduler will skip ticks",
+            settings.executor_type,
+        )
+        return None
+    return executor_cls()
