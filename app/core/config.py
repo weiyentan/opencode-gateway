@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     cleanup_success_retention_hours: int = 72       # 3 days
     cleanup_failure_retention_hours: int = 168       # 7 days
 
+    # Cleanup scheduler — controls the background cleanup loop.
+    cleanup_interval_seconds: int = 900    # 15 minutes
+    cleanup_batch_size: int = 10           # workspaces per tick
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
