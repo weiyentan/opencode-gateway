@@ -530,6 +530,85 @@ class TestGetRunnerDetail:
         assert obs["memory_used_percent"] == 70.0
         assert obs["load_1m"] == 1.5
         assert "observed_at" in obs
+    @pytest.mark.asyncio
+    async def test_get_runner_detail_includes_policy_status(self, client, mock_conn):
+        """The response includes policy_status and policy_reason fields."""
+        r_id = uuid.uuid4()
+        runner_data = self._setup_detail_mocks(
+            mock_conn, r_id, status="online"
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "policy_status" in data
+        assert "policy_reason" in data
+
+    @pytest.mark.asyncio
+    async def test_policy_status_healthy(self, client, mock_conn):
+        """policy_status is HEALTHY for runners with no pressure status."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(
+            mock_conn, r_id, status="online"
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["policy_status"] == "HEALTHY"
+        assert data["policy_reason"] == "Runner is healthy"
+
+    @pytest.mark.asyncio
+    async def test_policy_status_unknown(self, client, mock_conn):
+        """policy_status is UNKNOWN when runner status is UNKNOWN."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(
+            mock_conn, r_id, status="UNKNOWN"
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["policy_status"] == "UNKNOWN"
+        assert data["policy_reason"] == "Runner observations are stale"
+
+    @pytest.mark.asyncio
+    async def test_policy_status_blocked_disk(self, client, mock_conn):
+        """policy_status is BLOCKED_DISK_PRESSURE when runner status matches."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(
+            mock_conn, r_id, status="BLOCKED_DISK_PRESSURE"
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["policy_status"] == "BLOCKED_DISK_PRESSURE"
+        assert data["policy_reason"] == "Runner has disk pressure"
+
+    @pytest.mark.asyncio
+    async def test_policy_status_blocked_memory(self, client, mock_conn):
+        """policy_status is BLOCKED_MEMORY_PRESSURE when runner status matches."""
+        r_id = uuid.uuid4()
+        self._setup_detail_mocks(
+            mock_conn, r_id, status="BLOCKED_MEMORY_PRESSURE"
+        )
+
+        async with client as c:
+            response = await c.get(f"/runners/{r_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["policy_status"] == "BLOCKED_MEMORY_PRESSURE"
+        assert data["policy_reason"] == "Runner has memory pressure"
 
 
 class TestRunnersAPIErrors:
