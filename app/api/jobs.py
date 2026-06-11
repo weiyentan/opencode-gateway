@@ -24,6 +24,7 @@ from app.executors.models import (
     StopOpencodeRequest,
 )
 from app.opencode.protocol import OpenCodeClientProtocol
+from app.policy import ObservationBasedPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,10 @@ async def create_job(
             job_id,
             str(new_workspace_id),
         )
+
+        # 3b. Run pre-flight policy check (skeleton — always returns None)
+        policy = ObservationBasedPolicy(settings)
+        await policy.check(str(new_workspace_id))
 
         # 4. Start OpenCode Serve
         start_response = await executor.start_opencode(
