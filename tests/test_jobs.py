@@ -218,7 +218,9 @@ class TestJobDispatch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -267,7 +269,9 @@ class TestJobDispatch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -313,7 +317,9 @@ class TestJobDispatch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -358,7 +364,9 @@ class TestJobDispatch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -1531,7 +1539,9 @@ class TestJobDiffFetch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         execute_calls: list[tuple] = []
@@ -1608,7 +1618,9 @@ class TestJobDiffFetch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -1669,7 +1681,9 @@ class TestJobDiffFetch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
@@ -1727,7 +1741,9 @@ class TestJobDiffFetch:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
-                return _mock_row(row_data)
+                if "gateway_jobs" in sql:
+                    return _mock_row(row_data)
+                return None
             return None
 
         async def _execute(sql, *args):
