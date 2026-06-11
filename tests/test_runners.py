@@ -263,6 +263,10 @@ class TestListRunners:
         data = response.json()
         assert len(data) == 2
 
+        # Verify descending order by created_at
+        created_ats = [r["created_at"] for r in data]
+        assert created_ats == sorted(created_ats, reverse=True)
+
 
 class TestGetRunnerDetail:
     """Tests for GET /runners/{runner_id}."""

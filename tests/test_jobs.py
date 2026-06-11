@@ -397,6 +397,66 @@ class TestJobDispatch:
         assert data["status"] == "completed"
         assert data["completed_at"] is not None
 
+    @pytest.mark.asyncio
+    async def test_create_job_returns_503_when_policy_rejects_runner(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs returns 503 when ObservationBasedPolicy.check raises PolicyViolation."""
+        from unittest.mock import patch
+
+        from app.policy import ObservationBasedPolicy, PolicyViolation
+
+        job_id = uuid.uuid4()
+        workspace_uuid = uuid.uuid4()
+        runner_uuid = uuid.uuid4()
+
+        # Build mock rows for _resolve_runner_id_for_workspace queries
+        ws_row = _mock_row({"runner_id": runner_uuid})
+        runner_row = _mock_row({"runner_id": "test-runner-99"})
+
+        async def _execute(sql, *args):
+            pass
+
+        async def _fetchrow(sql, *args):
+            if "workspaces" in sql and "runner_id" in sql:
+                return ws_row
+            if "FROM runners WHERE id" in sql:
+                return runner_row
+            return None
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = _create_client(mock_conn, mock_executor=mock_executor)
+
+        with patch.object(
+            ObservationBasedPolicy, "check", new_callable=AsyncMock
+        ) as mock_check:
+            mock_check.side_effect = PolicyViolation(
+                resource="disk",
+                current_value=95.0,
+                threshold=80.0,
+                runner_id="test-runner-99",
+            )
+
+            async with client as c:
+                response = await c.post(
+                    "/jobs",
+                    json={
+                        "repo_url": "https://github.com/org/repo",
+                        "task_summary": "Fix a bug",
+                    },
+                )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["detail"]["resource"] == "disk"
+        assert data["detail"]["current_value"] == 95.0
+        assert data["detail"]["threshold"] == 80.0
+        assert data["detail"]["runner_id"] == "test-runner-99"
+        assert "disk" in data["detail"]["message"]
+        assert "80%" in data["detail"]["message"]
+
 
 class TestApproveJob:
     """Tests for POST /jobs/{id}/approve."""

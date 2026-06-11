@@ -29,7 +29,7 @@ def upgrade() -> None:
         sa.Column("hostname", sa.Text(), nullable=False),
         sa.Column("executor_type", sa.Text(), nullable=False),
         sa.Column("labels", postgresql.JSONB(), nullable=True),
-        sa.Column("status", sa.Text(), nullable=False, server_default="unknown"),
+        sa.Column("status", sa.Text(), nullable=False, server_default="UNKNOWN"),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),

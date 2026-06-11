@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
@@ -16,7 +17,7 @@ from app.policy.observation import (
     RUNNER_STATUS_UNKNOWN,
 )
 
-logger = __import__("logging").getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["runners"])
 

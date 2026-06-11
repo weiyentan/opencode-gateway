@@ -34,7 +34,7 @@ class Runner(Base):
     hostname: Mapped[str] = mapped_column(Text, nullable=False)
     executor_type: Mapped[str] = mapped_column(Text, nullable=False)
     labels: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="UNKNOWN")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
