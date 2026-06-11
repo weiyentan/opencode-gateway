@@ -167,7 +167,75 @@ Expected response:
 
 If the database is unreachable, the response still returns HTTP 200 but reports `"database": "disconnected"`.
 
-> **Docker support** is planned (Issue #14) but not yet available. For now, run Postgres locally or use `docker run` to spin up a temporary PostgreSQL container.
+> **Docker support** is available — see [Running with Docker](#running-with-docker) below for container-based setup.
+
+---
+
+## Running with Docker
+
+The Gateway can be run entirely in containers using Docker Compose — no local Python or PostgreSQL installation required.
+
+### Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) (Engine 20.10+)
+- [Docker Compose](https://docs.docker.com/compose/) (v2+)
+
+### Quick start
+
+```bash
+# Clone and enter the repository
+git clone <repo-url>
+cd opencode-gateway
+
+# Optionally create a .env file (defaults shown in .env.example work out of the box)
+cp .env.example .env
+
+# Build the image and start both services
+docker compose up -d
+
+# Verify the Gateway is running
+curl -f http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{"status":"ok","version":"0.1.0-dev","database":"connected"}
+```
+
+### Services
+
+| Service     | Container               | Port | Description                                       |
+|-------------|-------------------------|------|---------------------------------------------------|
+| **gateway** | `opencode-gateway`      | 8000 | FastAPI application (built from this `Dockerfile`) |
+| **postgres**| `opencode-gateway-db`   | 5432 | PostgreSQL 15 (Alpine) with persistent volume     |
+
+### Configuration
+
+All Gateway configuration uses the `GATEWAY_` prefix and can be set via:
+
+1. A `.env` file in the project root (loaded by both `docker compose` and `pydantic-settings`).
+2. Directly in the `environment` block of `docker-compose.yaml`.
+
+The PostgreSQL container is configured with the `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` variables — all documented in `.env.example` with secure defaults for local development.
+
+> **Production note:** Change `POSTGRES_PASSWORD` before deploying. The bundled `.env.example` uses `opencode` as the password — suitable only for local development.
+
+### Useful commands
+
+```bash
+# View logs
+docker compose logs -f gateway
+
+# Rebuild after code changes
+docker compose up -d --build
+
+# Stop everything
+docker compose down
+
+# Stop and remove the database volume (destroys all data)
+docker compose down -v
+```
 
 ---
 
@@ -226,7 +294,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #11 | Approval gates for risky operations | 🔄 In Progress |
 | #12 | Background cleanup scheduler | ✅ Complete |
 | #13 | Paperclip integration adapter | 🔄 Planned |
-| #14 | Gateway container image and docker-compose setup | 🔄 Planned |
+| #14 | Gateway container image and docker-compose setup | ✅ Complete |
 
 ### Dependency DAG
 

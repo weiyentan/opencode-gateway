@@ -1,0 +1,53 @@
+services:
+  gateway:
+    build: .
+    container_name: opencode-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8000"
+      GATEWAY_DATABASE_HOST: postgres
+      GATEWAY_DATABASE_PORT: "5432"
+      GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
+      GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
+      GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      GATEWAY_EXECUTOR_TYPE: ${GATEWAY_EXECUTOR_TYPE:-local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: opencode-gateway-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-opencode_gateway}
+      POSTGRES_USER: ${POSTGRES_USER:-opencode}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - gateway-net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-opencode} -d ${POSTGRES_DB:-opencode_gateway}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+    driver: local
+
+networks:
+  gateway-net:
+    driver: bridge

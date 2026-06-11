@@ -20,7 +20,7 @@ Methodology: issue-analyst (6-factor scoring: files touched, new concepts, patte
 | #11 | Approval gates for risky operations | 90–150 min | High | Approvals table. needs_approval job status. Approve/reject endpoints. Audit logging. |
 | #12 | Background cleanup scheduler | 90–150 min | Medium | Async scheduler via FastAPI lifespan. Configurable interval. Cleanup policy (72h success / 7d failure). |
 | #13 | Paperclip integration adapter | 90–150 min | Medium | Callback webhook on job completion. Retry policy. Structured result envelope. Documentation. |
-| #14 | Gateway container image and docker-compose setup | 45–75 min | High | Multi-stage Dockerfile, docker-compose.yaml with Postgres, .dockerignore, .env.example, README update. |
+| #14 | Gateway container image and docker-compose setup | ✅ Done | — | Multi-stage Dockerfile, docker-compose.yaml with Postgres, .dockerignore, .env.example, README update. |
 
 ## Dependency DAG
 

@@ -1,0 +1,51 @@
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments (broader catch)
+*venv*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.mypy_cache/
+
+# Environment
+.env
+.env.*
+
+# Git
+.git/
+.gitignore
+
+# Project scratch and status
+.status/
+.scratch/
+
+# Database files
+*.db
+
+# Documentation (not needed at runtime)
+docs/
+CONTEXT.md
+CONTRIBUTING.md
+LICENSE
+
+# CI and tooling
+.opencode-workflow.yaml
