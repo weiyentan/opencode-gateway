@@ -112,10 +112,12 @@ def create_app(
 
     from app.api.health import router as health_router
     from app.api.jobs import router as jobs_router
+    from app.api.observations import router as observations_router
     from app.api.workspaces import router as workspaces_router
 
     app.include_router(health_router)
     app.include_router(jobs_router)
+    app.include_router(observations_router)
     app.include_router(workspaces_router)
 
     return app
