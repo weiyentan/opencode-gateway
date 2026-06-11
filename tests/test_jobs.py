@@ -5,9 +5,8 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from fastapi import Request
+from httpx import ASGITransport, AsyncClient
 
 from app.core.factory import create_app
 from app.db.session import get_session

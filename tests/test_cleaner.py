@@ -23,7 +23,6 @@ import pytest
 
 from app.scheduler.cleaner import CleanupScheduler, _uuid_to_lock_key
 
-
 # ---------------------------------------------------------------------------
 # Helpers — build consistent mocks for asyncpg Pool
 # ---------------------------------------------------------------------------

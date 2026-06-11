@@ -291,8 +291,9 @@ class TestJobStatusEnum:
 
     def test_job_status_is_string_enum(self):
         """JobStatus should be a string enum."""
-        from app.core.models.job import JobStatus
         from enum import Enum
+
+        from app.core.models.job import JobStatus
 
         assert issubclass(JobStatus, str)
         assert issubclass(JobStatus, Enum)
