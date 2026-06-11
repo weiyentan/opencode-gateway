@@ -8,14 +8,12 @@ from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from fastapi import Request
+from httpx import ASGITransport, AsyncClient
 
 from app.core.factory import create_app
 from app.db.session import get_session
 from app.executors.factory import get_executor
-
 
 # ---------------------------------------------------------------------------
 # Helpers
