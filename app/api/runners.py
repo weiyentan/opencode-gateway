@@ -1,4 +1,4 @@
-"""Runner API endpoints — list runners with latest observations."""
+"""Runner API endpoints — list runners and retrieve runner details."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 
 import asyncpg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.db.session import get_session
@@ -31,7 +31,7 @@ class RunnerObservationSummary(BaseModel):
 
 
 class RunnerResponse(BaseModel):
-    """Response model for a single runner returned by the API."""
+    """Response model for a single runner returned by the list endpoint."""
 
     id: uuid.UUID
     runner_id: str
@@ -42,6 +42,31 @@ class RunnerResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     latest_observation: RunnerObservationSummary | None = None
+
+
+class WorkspaceObservationItem(BaseModel):
+    """A single workspace observation entry."""
+
+    workspace_name: str
+    status: str | None = None
+    opencode_status: str | None = None
+    observed_at: datetime
+
+
+class OpenCodeInstanceObservationItem(BaseModel):
+    """A single OpenCode Serve instance observation entry."""
+
+    instance_name: str
+    version: str | None = None
+    status: str | None = None
+    observed_at: datetime
+
+
+class RunnerDetailResponse(RunnerResponse):
+    """Response model for a single runner with observation history."""
+
+    workspace_observations: list[WorkspaceObservationItem] = []
+    opencode_instance_observations: list[OpenCodeInstanceObservationItem] = []
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +126,57 @@ def _row_to_runner_response(row: asyncpg.Record) -> RunnerResponse:
 
 
 # ---------------------------------------------------------------------------
+# Query helpers — detail endpoint
+# ---------------------------------------------------------------------------
+
+_WORKSPACE_OBS_COLS = (
+    "wo.workspace_name, wo.status, wo.opencode_status, wo.observed_at"
+)
+
+_OPENCODE_INSTANCE_OBS_COLS = (
+    "oi.instance_name, oi.version, oi.status, oi.observed_at"
+)
+
+_WORKSPACE_OBS_QUERY = (
+    f"SELECT {_WORKSPACE_OBS_COLS} "
+    "FROM workspace_observations wo "
+    "WHERE wo.runner_id = $1 "
+    "ORDER BY wo.observed_at DESC "
+    "LIMIT 50"
+)
+
+_OPENCODE_INSTANCE_OBS_QUERY = (
+    f"SELECT {_OPENCODE_INSTANCE_OBS_COLS} "
+    "FROM opencode_instance_observations oi "
+    "WHERE oi.runner_id = $1 "
+    "ORDER BY oi.observed_at DESC "
+    "LIMIT 50"
+)
+
+
+def _row_to_workspace_obs_item(row: asyncpg.Record) -> WorkspaceObservationItem:
+    """Convert an asyncpg Record to a WorkspaceObservationItem."""
+    return WorkspaceObservationItem(
+        workspace_name=row["workspace_name"],
+        status=row.get("status"),
+        opencode_status=row.get("opencode_status"),
+        observed_at=row["observed_at"],
+    )
+
+
+def _row_to_opencode_instance_obs_item(
+    row: asyncpg.Record,
+) -> OpenCodeInstanceObservationItem:
+    """Convert an asyncpg Record to an OpenCodeInstanceObservationItem."""
+    return OpenCodeInstanceObservationItem(
+        instance_name=row["instance_name"],
+        version=row.get("version"),
+        status=row.get("status"),
+        observed_at=row["observed_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # GET /runners
 # ---------------------------------------------------------------------------
 
@@ -118,3 +194,79 @@ async def list_runners(
     """
     rows = await conn.fetch(_RUNNER_LIST_QUERY)
     return [_row_to_runner_response(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# GET /runners/{runner_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/runners/{runner_id}", response_model=RunnerDetailResponse)
+async def get_runner_detail(
+    runner_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> RunnerDetailResponse:
+    """Retrieve a single runner with its observation history.
+
+    Returns the runner's details along with the last 50 workspace
+    observations and last 50 OpenCode Serve instance observations,
+    each ordered by ``observed_at`` descending.
+
+    Returns 404 if the runner ID does not exist.
+    """
+    # Fetch the runner row
+    row = await conn.fetchrow(
+        f"SELECT {_RUNNER_COLS} FROM runners r WHERE r.id = $1",
+        runner_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Runner {runner_id} not found",
+        )
+
+    # Build the base RunnerResponse
+    base = _row_to_runner_response(row)
+
+    # Fetch workspace observations
+    ws_rows = await conn.fetch(_WORKSPACE_OBS_QUERY, runner_id)
+    workspace_observations = [_row_to_workspace_obs_item(r) for r in ws_rows]
+
+    # Fetch OpenCode instance observations
+    oi_rows = await conn.fetch(_OPENCODE_INSTANCE_OBS_QUERY, runner_id)
+    opencode_instance_observations = [
+        _row_to_opencode_instance_obs_item(r) for r in oi_rows
+    ]
+
+    # Fetch the latest observation summary separately (the list query
+    # uses a lateral join; for the detail endpoint we re-query)
+    obs_row = await conn.fetchrow(
+        "SELECT disk_used_percent, memory_used_percent, load_1m, observed_at "
+        "FROM runner_observations "
+        "WHERE runner_id = $1 "
+        "ORDER BY observed_at DESC "
+        "LIMIT 1",
+        runner_id,
+    )
+    latest_observation: RunnerObservationSummary | None = None
+    if obs_row is not None:
+        latest_observation = RunnerObservationSummary(
+            disk_used_percent=obs_row.get("disk_used_percent"),
+            memory_used_percent=obs_row.get("memory_used_percent"),
+            load_1m=obs_row.get("load_1m"),
+            observed_at=obs_row["observed_at"],
+        )
+
+    return RunnerDetailResponse(
+        id=base.id,
+        runner_id=base.runner_id,
+        hostname=base.hostname,
+        status=base.status,
+        executor_type=base.executor_type,
+        labels=base.labels,
+        created_at=base.created_at,
+        updated_at=base.updated_at,
+        latest_observation=latest_observation,
+        workspace_observations=workspace_observations,
+        opencode_instance_observations=opencode_instance_observations,
+    )
