@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from app.core.config import Settings
-from app.executors import EXECUTOR_REGISTRY
-from app.executors import ExecutorPlugin
+from app.executors import EXECUTOR_REGISTRY, ExecutorPlugin
 
 
 def get_executor() -> ExecutorPlugin:
