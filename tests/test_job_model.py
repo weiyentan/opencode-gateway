@@ -197,11 +197,31 @@ class TestJobStatusEnum:
     """Tests for the JobStatus enum used on the Job model."""
 
     def test_job_status_enum_has_expected_values(self):
-        """JobStatus enum should define pending, running, completed,
-        failed, needs_approval, rejected.
-        """
+        """JobStatus enum should define all 8 status values including aborting and aborted."""
         from app.core.models.job import JobStatus
 
+        assert JobStatus.PENDING.value == "pending"
+        assert JobStatus.RUNNING.value == "running"
+        assert JobStatus.COMPLETED.value == "completed"
+        assert JobStatus.FAILED.value == "failed"
+        assert JobStatus.NEEDS_APPROVAL.value == "needs_approval"
+        assert JobStatus.REJECTED.value == "rejected"
+        assert JobStatus.ABORTING.value == "aborting"
+        assert JobStatus.ABORTED.value == "aborted"
+
+    def test_original_six_values_are_unchanged(self):
+        """The original 6 enum values must be unchanged."""
+        from app.core.models.job import JobStatus
+
+        original_values = {
+            JobStatus.PENDING,
+            JobStatus.RUNNING,
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.NEEDS_APPROVAL,
+            JobStatus.REJECTED,
+        }
+        assert len(original_values) == 6
         assert JobStatus.PENDING.value == "pending"
         assert JobStatus.RUNNING.value == "running"
         assert JobStatus.COMPLETED.value == "completed"
@@ -242,6 +262,33 @@ class TestJobStatusEnum:
             )
             assert job.status == status
 
+    def test_job_accepts_aborting_and_aborted_strings(self):
+        """Job should accept 'aborting' and 'aborted' as valid status strings."""
+        from app.core.models.job import Job
+
+        now = datetime.now(timezone.utc)
+        job = Job(
+            id=uuid4(),
+            status="aborting",
+            repo_url="https://github.com/example/repo.git",
+            task_summary="Test aborting",
+            executor_type="awx",
+            created_at=now,
+            updated_at=now,
+        )
+        assert job.status.value == "aborting"
+
+        job2 = Job(
+            id=uuid4(),
+            status="aborted",
+            repo_url="https://github.com/example/repo.git",
+            task_summary="Test aborted",
+            executor_type="awx",
+            created_at=now,
+            updated_at=now,
+        )
+        assert job2.status.value == "aborted"
+
     def test_job_status_is_string_enum(self):
         """JobStatus should be a string enum."""
         from app.core.models.job import JobStatus
@@ -249,6 +296,113 @@ class TestJobStatusEnum:
 
         assert issubclass(JobStatus, str)
         assert issubclass(JobStatus, Enum)
+
+    def test_job_status_enum_has_eight_members(self):
+        """JobStatus should have exactly 8 members."""
+        from app.core.models.job import JobStatus
+
+        assert len(JobStatus) == 8
+
+
+class TestJobStatusTransition:
+    """Tests for the JobStatus.validate_transition method."""
+
+    def test_pending_to_aborting_is_valid(self):
+        """pending → aborting is allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.ABORTING) is True
+
+    def test_running_to_aborting_is_valid(self):
+        """running → aborting is allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.RUNNING, JobStatus.ABORTING) is True
+
+    def test_aborting_to_aborted_is_valid(self):
+        """aborting → aborted is allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.ABORTING, JobStatus.ABORTED) is True
+
+    def test_pending_to_aborted_is_invalid(self):
+        """pending → aborted is not allowed (must go through aborting)."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.ABORTED) is False
+
+    def test_running_to_aborted_is_invalid(self):
+        """running → aborted is not allowed (must go through aborting)."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.RUNNING, JobStatus.ABORTED) is False
+
+    def test_completed_to_aborting_is_invalid(self):
+        """completed → aborting is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.COMPLETED, JobStatus.ABORTING) is False
+
+    def test_failed_to_aborting_is_invalid(self):
+        """failed → aborting is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.FAILED, JobStatus.ABORTING) is False
+
+    def test_aborted_to_running_is_invalid(self):
+        """aborted → running is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.ABORTED, JobStatus.RUNNING) is False
+
+    def test_aborting_to_pending_is_invalid(self):
+        """aborting → pending is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.ABORTING, JobStatus.PENDING) is False
+
+    def test_aborted_to_completed_is_invalid(self):
+        """aborted → completed is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.ABORTED, JobStatus.COMPLETED) is False
+
+    def test_needs_approval_to_aborting_is_invalid(self):
+        """needs_approval → aborting is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.NEEDS_APPROVAL, JobStatus.ABORTING) is False
+
+    def test_rejected_to_aborting_is_invalid(self):
+        """rejected → aborting is not allowed."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.REJECTED, JobStatus.ABORTING) is False
+
+    def test_same_status_self_transition_is_invalid(self):
+        """Same-status transitions should be rejected."""
+        from app.core.models.job import JobStatus
+
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.PENDING) is False
+        assert JobStatus.validate_transition(JobStatus.RUNNING, JobStatus.RUNNING) is False
+        assert JobStatus.validate_transition(JobStatus.ABORTING, JobStatus.ABORTING) is False
+        assert JobStatus.validate_transition(JobStatus.ABORTED, JobStatus.ABORTED) is False
+
+    def test_invalid_status_string_rejected_by_pydantic(self):
+        """Invalid status strings are still rejected by Pydantic."""
+        from app.core.models.job import Job
+
+        now = datetime.now(timezone.utc)
+        with pytest.raises(ValidationError):
+            Job(
+                id=uuid4(),
+                status="invalid_status",
+                repo_url="https://github.com/example/repo.git",
+                task_summary="Test",
+                executor_type="awx",
+                created_at=now,
+                updated_at=now,
+            )
 
 
 class TestJobModelSerialization:

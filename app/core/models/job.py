@@ -19,6 +19,27 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     NEEDS_APPROVAL = "needs_approval"
     REJECTED = "rejected"
+    ABORTING = "aborting"
+    ABORTED = "aborted"
+
+    @staticmethod
+    def validate_transition(current: JobStatus, target: JobStatus) -> bool:
+        """Validate whether a transition from *current* to *target* is allowed.
+
+        Allowed transitions:
+            pending → aborting
+            running → aborting
+            aborting → aborted
+
+        All other transitions return ``False``.
+        """
+        if current == JobStatus.PENDING and target == JobStatus.ABORTING:
+            return True
+        if current == JobStatus.RUNNING and target == JobStatus.ABORTING:
+            return True
+        if current == JobStatus.ABORTING and target == JobStatus.ABORTED:
+            return True
+        return False
 
 
 class Job(BaseModel):
