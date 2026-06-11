@@ -102,8 +102,12 @@ class TestPreflightPolicyProtocol:
     def test_conforming_object_satisfies_protocol(self) -> None:
         """An object with a matching async check() method should pass isinstance."""
 
+        import asyncpg
+
         class ConformingPolicy:
-            async def check(self, runner_id: str) -> None:
+            async def check(
+                self, runner_id: str, conn: asyncpg.Connection | None = None
+            ) -> None:
                 return None
 
         obj = ConformingPolicy()
@@ -184,6 +188,26 @@ class TestObservationBasedPolicy:
         """ObservationBasedPolicy should satisfy the PreflightPolicy protocol."""
         policy = ObservationBasedPolicy()
         assert isinstance(policy, PreflightPolicy)
+
+    def test_concrete_check_signature_matches_protocol(self) -> None:
+        """ObservationBasedPolicy.check() accepts all PreflightPolicy.check()
+        parameters, including the optional ``conn``."""
+        import inspect
+
+        import asyncpg
+
+        # Verify ObservationBasedPolicy.check has the conn parameter
+        sig = inspect.signature(ObservationBasedPolicy.check)
+        params = sig.parameters
+        assert "runner_id" in params
+        assert "conn" in params
+        assert params["conn"].default is None
+        assert params["conn"].annotation in (
+            "asyncpg.Connection | None",
+            "asyncpg.connection.Connection | None",
+        ) or (
+            hasattr(params["conn"].annotation, "__origin__")
+        )
 
 
 # ---------------------------------------------------------------------------

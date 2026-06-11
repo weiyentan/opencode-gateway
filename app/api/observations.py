@@ -99,7 +99,6 @@ async def ingest_observations(
     5. Creates ``OpenCodeInstanceObservation`` rows for each instance entry.
     """
     now = _utcnow()
-    runner_uuid = uuid.uuid4()
 
     # ------------------------------------------------------------------
     # 1. Upsert runner (INSERT … ON CONFLICT)
@@ -108,7 +107,7 @@ async def ingest_observations(
         """
         INSERT INTO runners (id, runner_id, hostname, executor_type, labels, status,
                              created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 'HEALTHY', $6, $6)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, 'HEALTHY', $5, $5)
         ON CONFLICT (runner_id)
         DO UPDATE SET
             hostname       = EXCLUDED.hostname,
@@ -118,7 +117,6 @@ async def ingest_observations(
             updated_at     = EXCLUDED.updated_at
         RETURNING id
         """,
-        runner_uuid,
         body.runner_id,
         body.hostname,
         body.executor_type,

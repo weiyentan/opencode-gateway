@@ -457,6 +457,9 @@ class TestJobDispatch:
         assert "disk" in data["detail"]["message"]
         assert "80%" in data["detail"]["message"]
 
+        # Verify executor cleanup was triggered on the created workspace
+        mock_executor.cleanup_workspace.assert_awaited_once()
+
 
 class TestApproveJob:
     """Tests for POST /jobs/{id}/approve."""

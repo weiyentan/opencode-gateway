@@ -285,6 +285,17 @@ async def create_job(
             await _set_workspace_cleanup_after(
                 conn, new_workspace_id, settings.cleanup_failure_retention_hours
             )
+            try:
+                await executor.cleanup_workspace(
+                    CleanupWorkspaceRequest(workspace_id=new_workspace_id)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up workspace for policy-rejected job %s "
+                    "(workspace %s)",
+                    job_id,
+                    new_workspace_id,
+                )
         raise
 
     except Exception:

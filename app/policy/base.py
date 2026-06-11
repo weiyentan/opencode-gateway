@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+import asyncpg
 from fastapi import HTTPException
 
 
@@ -53,7 +54,9 @@ class PreflightPolicy(Protocol):
     :mod:`app.policy.observation` for the observation-based implementation.
     """
 
-    async def check(self, runner_id: str) -> None:  # pragma: no cover
+    async def check(
+        self, runner_id: str, conn: asyncpg.Connection | None = None
+    ) -> None:  # pragma: no cover
         """Inspect *runner_id* and return ``None`` if the runner is healthy.
 
         Parameters
@@ -62,6 +65,9 @@ class PreflightPolicy(Protocol):
             The identifier of the runner (VM) that will host the job's
             workspace.  The concrete implementation determines what
             operations are performed against this identifier.
+        conn:
+            An optional asyncpg database connection.  Concrete
+            implementations may use this to query runner state.
 
         Returns
         -------

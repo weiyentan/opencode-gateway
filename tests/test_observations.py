@@ -158,9 +158,9 @@ class TestIngestObservations:
 
         # Verify runner_id, hostname, executor_type were passed as args
         args = insert_args_captured[0]
-        assert args[1] == "runner-alpha-1"  # runner_id param ($2)
-        assert args[2] == "alpha-1.example.com"  # hostname ($3)
-        assert args[3] == "awx"  # executor_type ($4)
+        assert args[0] == "runner-alpha-1"  # runner_id param ($1)
+        assert args[1] == "alpha-1.example.com"  # hostname ($2)
+        assert args[2] == "awx"  # executor_type ($3)
 
     @pytest.mark.asyncio
     async def test_upsert_updates_existing_runner(self, client, mock_conn):
