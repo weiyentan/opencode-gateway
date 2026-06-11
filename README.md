@@ -126,6 +126,10 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_EXECUTOR_TYPE` | `local` | Executor plugin type (`local`, `awx`, etc.) — looked up in `EXECUTOR_REGISTRY` |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
+| `GATEWAY_CLEANUP_INTERVAL_SECONDS` | `900` | Background cleanup scheduler tick interval in seconds (default: 15 minutes) |
+| `GATEWAY_CLEANUP_BATCH_SIZE` | `10` | Maximum number of expired workspaces cleaned per scheduler tick |
+| `GATEWAY_CLEANUP_SUCCESS_RETENTION_HOURS` | `72` | Retention period in hours for successfully completed workspaces before they are eligible for cleanup |
+| `GATEWAY_CLEANUP_FAILURE_RETENTION_HOURS` | `168` | Retention period in hours for failed workspaces before they are eligible for cleanup |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
 
