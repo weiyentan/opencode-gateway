@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     cleanup_interval_seconds: int = 900    # 15 minutes
     cleanup_batch_size: int = 10           # workspaces per tick
 
+    # AWX executor plugin — connection and authentication settings.
+    awx_base_url: str = ""
+    awx_token: str = ""
+    awx_create_workspace_template_id: int = 0
+    awx_opencode_lifecycle_template_id: int = 0
+    awx_workspace_teardown_template_id: int = 0
+    awx_poll_interval_seconds: int = 5
+    awx_timeout_seconds: int = 300
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
