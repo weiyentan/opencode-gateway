@@ -11,7 +11,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.config import get_settings
-from app.core.models.workspace import WorkspacePydantic, WorkspaceStatus
+from app.core.models.workspace import Workspace, WorkspaceStatus
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -33,9 +33,9 @@ _WORKSPACE_COLS = (
 )
 
 
-def _row_to_workspace(row: asyncpg.Record) -> WorkspacePydantic:
-    """Convert an asyncpg Record to a WorkspacePydantic (GET endpoints)."""
-    return WorkspacePydantic(
+def _row_to_workspace(row: asyncpg.Record) -> Workspace:
+    """Convert an asyncpg Record to a Workspace (GET endpoints)."""
+    return Workspace(
         id=row["id"],
         runner_id=row.get("runner_id"),
         workspace_name=row["workspace_name"],
@@ -65,9 +65,9 @@ _CLEANUP_LOCK_CLASS = 47002
 # ---------------------------------------------------------------------------
 
 
-def _build_response(row: asyncpg.Record) -> WorkspacePydantic:
-    """Convert an asyncpg workspace row to a WorkspacePydantic (POST endpoints)."""
-    return WorkspacePydantic(
+def _build_response(row: asyncpg.Record) -> Workspace:
+    """Convert an asyncpg workspace row to a Workspace (POST endpoints)."""
+    return Workspace(
         id=row["id"],
         runner_id=row["runner_id"],
         workspace_name=row["workspace_name"],
@@ -89,12 +89,12 @@ def _build_response(row: asyncpg.Record) -> WorkspacePydantic:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/workspaces", response_model=list[WorkspacePydantic])
+@router.get("/workspaces", response_model=list[Workspace])
 async def list_workspaces(
     runner_id: Optional[uuid.UUID] = None,
     status: Optional[str] = None,
     conn: asyncpg.Connection = Depends(get_session),
-) -> list[WorkspacePydantic]:
+) -> list[Workspace]:
     """List all workspaces, optionally filtered by runner_id and/or status.
 
     - ``runner_id``: filter by the Runner VM that hosts the workspace.
@@ -124,11 +124,11 @@ async def list_workspaces(
     return [_row_to_workspace(row) for row in rows]
 
 
-@router.get("/workspaces/{workspace_id}", response_model=WorkspacePydantic)
+@router.get("/workspaces/{workspace_id}", response_model=Workspace)
 async def get_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Retrieve a single workspace by its ID."""
     row = await conn.fetchrow(
         f"SELECT {_WORKSPACE_COLS} FROM workspaces WHERE id = $1",
@@ -209,11 +209,11 @@ async def _release_cleanup_lock(conn: asyncpg.Connection, workspace_id: uuid.UUI
 # ---------------------------------------------------------------------------
 
 
-@router.post("/workspaces/{workspace_id}/pin", response_model=WorkspacePydantic)
+@router.post("/workspaces/{workspace_id}/pin", response_model=Workspace)
 async def pin_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Toggle the pinned flag on a workspace.
 
     Pinned workspaces are excluded from automatic cleanup policies
@@ -252,12 +252,12 @@ async def pin_workspace(
     return _build_response(row)
 
 
-@router.post("/workspaces/{workspace_id}/cleanup", response_model=WorkspacePydantic)
+@router.post("/workspaces/{workspace_id}/cleanup", response_model=Workspace)
 async def cleanup_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Trigger cleanup of a workspace via the executor plugin.
 
     Transitions the workspace to ``'cleaning'`` status, acquires a

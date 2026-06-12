@@ -27,19 +27,5 @@ class Approval(BaseModel):
     decided_at: Optional[datetime] = None
 
 
-class ApprovalResponse(BaseModel):
-    """Response-oriented model for returning approval data.
-
-    Mirrors Approval but is intended for API response serialisation
-    where the caller may receive partial or summary views.
-    """
-
-    id: UUID
-    job_id: UUID
-    requested_by: str
-    requested_action: str
-    approval_type: str
-    approved_by: Optional[str] = None
-    status: str
-    created_at: datetime
-    decided_at: Optional[datetime] = None
+# ApprovalResponse kept as a backward-compatible alias; use Approval directly.
+ApprovalResponse = Approval
