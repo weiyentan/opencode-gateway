@@ -1,6 +1,7 @@
 """Tests for the AWX API client.
 
-Covers construction, launch_job_template, error handling, and logging.
+Covers construction, launch_job_template, get_job, wait_for_job,
+cancel_job, error handling, and logging.
 Uses mocked httpx.AsyncClient to avoid real network calls, following
 the same pattern as test_serve_client.py.
 """
@@ -8,12 +9,12 @@ the same pattern as test_serve_client.py.
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from app.executors.awx.client import AWXApiClient, AWXJobSummary
+from app.executors.awx.client import AWXApiClient, AWXJobResult, AWXJobSummary
 from app.executors.awx.exceptions import (
     AWXClientError,
     AWXConnectionError,
@@ -310,3 +311,381 @@ class TestLogging:
             await client.launch_job_template(template_id=1)
 
         assert any("failed" in msg.lower() for msg in caplog.messages)
+
+
+# ── get_job() ────────────────────────────────────────────────────────
+
+
+class TestGetJob:
+    """``GET /api/v2/jobs/{id}/``."""
+
+    @pytest.mark.asyncio
+    async def test_returns_job_summary(self, client):
+        """Should return AWXJobSummary with job details."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 42,
+                "status": "running",
+                "started": "2024-01-01T00:00:00Z",
+                "finished": None,
+            },
+        )
+
+        result = await client.get_job(42)
+
+        assert isinstance(result, AWXJobSummary)
+        assert result.job_id == 42
+        assert result.status == "running"
+        assert result.started == "2024-01-01T00:00:00Z"
+        assert result.finished is None
+        client._client.request.assert_awaited_once_with(
+            "GET",
+            "https://awx.example.com/api/v2/jobs/42/",
+        )
+
+    @pytest.mark.asyncio
+    async def test_defaults_status_to_unknown(self, client):
+        """Should default status to 'unknown' when AWX omits it."""
+        client._client.request.return_value = _mock_response(
+            {"id": 99},
+        )
+
+        result = await client.get_job(99)
+        assert result.status == "unknown"
+        assert result.started is None
+        assert result.finished is None
+
+    @pytest.mark.asyncio
+    async def test_raises_http_error_on_404(self, client):
+        """A 404 from AWX should raise AWXHTTPError."""
+        client._client.request.return_value = _mock_response(
+            {"detail": "Not found"}, status_code=404,
+        )
+
+        with pytest.raises(AWXHTTPError) as exc_info:
+            await client.get_job(99999)
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_populates_timestamps(self, client):
+        """Should populate started and finished when AWX provides them."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 7,
+                "status": "successful",
+                "started": "2024-06-01T10:00:00Z",
+                "finished": "2024-06-01T10:05:30Z",
+            },
+        )
+
+        result = await client.get_job(7)
+        assert result.started == "2024-06-01T10:00:00Z"
+        assert result.finished == "2024-06-01T10:05:30Z"
+
+
+# ── wait_for_job() ───────────────────────────────────────────────────
+
+
+class TestWaitForJob:
+    """Poll loop ``wait_for_job()``."""
+
+    @pytest.mark.asyncio
+    async def test_returns_immediately_when_already_successful(self, client):
+        """Should return AWXJobResult on first poll if already successful."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 1,
+                "status": "successful",
+                "started": "2024-01-01T00:00:00Z",
+                "finished": "2024-01-01T00:05:00Z",
+                "elapsed": 300.0,
+                "artifacts": {"key": "value"},
+            },
+        )
+
+        result = await client.wait_for_job(1)
+
+        assert isinstance(result, AWXJobResult)
+        assert result.job_id == 1
+        assert result.status == "successful"
+        assert result.elapsed_seconds == 300.0
+        assert result.artifacts == {"key": "value"}
+
+    @pytest.mark.asyncio
+    async def test_raises_job_error_when_failed(self, client):
+        """Should raise AWXJobError when job status is 'failed'."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 2,
+                "status": "failed",
+                "started": "2024-01-01T00:00:00Z",
+                "finished": "2024-01-01T00:01:00Z",
+            },
+        )
+
+        with pytest.raises(AWXJobError) as exc_info:
+            await client.wait_for_job(2)
+        assert exc_info.value.job_id == 2
+        assert "failed" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_raises_job_error_when_canceled(self, client):
+        """Should raise AWXJobError when job status is 'canceled'."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 3,
+                "status": "canceled",
+            },
+        )
+
+        with pytest.raises(AWXJobError) as exc_info:
+            await client.wait_for_job(3)
+        assert exc_info.value.job_id == 3
+        assert "canceled" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_raises_job_error_when_error(self, client):
+        """Should raise AWXJobError when job status is 'error'."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 4,
+                "status": "error",
+            },
+        )
+
+        with pytest.raises(AWXJobError) as exc_info:
+            await client.wait_for_job(4)
+        assert exc_info.value.job_id == 4
+
+    @pytest.mark.asyncio
+    async def test_polls_until_successful(self, client):
+        """Should poll multiple times until status becomes 'successful'."""
+        # get_job calls: pending → running → successful
+        # Then wait_for_job makes an extra request for artifacts
+        call_responses = [
+            _mock_response({"id": 10, "status": "pending"}),
+            _mock_response({"id": 10, "status": "running"}),
+            _mock_response(
+                {
+                    "id": 10,
+                    "status": "successful",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:05:00Z",
+                },
+            ),
+            # Extra request for artifacts (success case)
+            _mock_response(
+                {
+                    "id": 10,
+                    "status": "successful",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:05:00Z",
+                    "artifacts": {"output": "done"},
+                },
+            ),
+        ]
+        client._client.request.side_effect = call_responses
+
+        with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
+            result = await client.wait_for_job(10)
+
+        assert result.job_id == 10
+        assert result.status == "successful"
+        assert result.artifacts == {"output": "done"}
+
+    @pytest.mark.asyncio
+    async def test_polls_until_failed(self, client):
+        """Should poll multiple times and raise AWXJobError on failure."""
+        call_responses = [
+            _mock_response({"id": 11, "status": "pending"}),
+            _mock_response({"id": 11, "status": "running"}),
+            _mock_response(
+                {
+                    "id": 11,
+                    "status": "failed",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:02:00Z",
+                },
+            ),
+        ]
+        client._client.request.side_effect = call_responses
+
+        with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(AWXJobError) as exc_info:
+                await client.wait_for_job(11)
+        assert exc_info.value.job_id == 11
+
+    @pytest.mark.asyncio
+    async def test_times_out_without_auto_cancel(self, client):
+        """Should raise AWXTimeoutError without auto-cancelling the job."""
+        client._client.request.return_value = _mock_response(
+            {"id": 12, "status": "running"},
+        )
+
+        with patch(
+            "app.executors.awx.client.time.monotonic",
+            side_effect=[0, 0, 99999],  # Start, after first poll → expired
+        ):
+            with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(AWXTimeoutError) as exc_info:
+                    await client.wait_for_job(12, max_seconds=30)
+        assert "12" in str(exc_info.value)
+        assert "30" in str(exc_info.value)
+        # Verify cancel endpoint was never called
+        for call in client._client.request.call_args_list:
+            url = call.args[1]  # Second positional arg is the URL
+            assert "/cancel/" not in url
+
+    @pytest.mark.asyncio
+    async def test_uses_configured_timeout_when_max_seconds_is_none(self, client):
+        """Should default to self._timeout when max_seconds is None."""
+        client._client.request.return_value = _mock_response(
+            {"id": 13, "status": "running"},
+        )
+
+        with patch(
+            "app.executors.awx.client.time.monotonic",
+            side_effect=[0, 0, 99999],
+        ):
+            with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(AWXTimeoutError) as exc_info:
+                    await client.wait_for_job(13)
+        # The fixture has timeout_seconds=30 (see client fixture)
+        assert "30" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_connection_error_mid_poll_propagates(self, client):
+        """Connection errors during polling should propagate to caller."""
+        call_responses = [
+            _mock_response({"id": 14, "status": "pending"}),
+            httpx.ConnectError("Connection lost"),
+        ]
+        # First: successful mock response, then: side_effect for the error
+        client._client.request.side_effect = [
+            call_responses[0],
+            call_responses[1],
+        ]
+
+        with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(AWXConnectionError):
+                await client.wait_for_job(14)
+
+    @pytest.mark.asyncio
+    async def test_empty_artifacts_handled(self, client):
+        """Empty or missing artifacts should default to empty dict."""
+        client._client.request.side_effect = [
+            _mock_response(
+                {
+                    "id": 15,
+                    "status": "successful",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:05:00Z",
+                },
+            ),
+            _mock_response(
+                {
+                    "id": 15,
+                    "status": "successful",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:05:00Z",
+                    # No artifacts field at all
+                },
+            ),
+        ]
+
+        result = await client.wait_for_job(15)
+        assert result.artifacts == {}
+
+    @pytest.mark.asyncio
+    async def test_elapsed_seconds_none_when_timestamps_missing(self, client):
+        """elapsed_seconds should be None if started/finished are missing."""
+        client._client.request.side_effect = [
+            _mock_response(
+                {
+                    "id": 16,
+                    "status": "successful",
+                    # No started/finished fields
+                },
+            ),
+            _mock_response(
+                {
+                    "id": 16,
+                    "status": "successful",
+                    "artifacts": {},
+                },
+            ),
+        ]
+
+        result = await client.wait_for_job(16)
+        assert result.elapsed_seconds is None
+
+
+# ── cancel_job() ──────────────────────────────────────────────────────
+
+
+class TestCancelJob:
+    """``POST /api/v2/jobs/{id}/cancel/``."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_job_and_returns_result(self, client):
+        """Should POST to cancel endpoint and return AWXJobResult."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 42,
+                "status": "canceled",
+                "started": "2024-01-01T00:00:00Z",
+                "finished": "2024-01-01T00:03:00Z",
+                "elapsed": 180.0,
+                "artifacts": {},
+            },
+        )
+
+        result = await client.cancel_job(42)
+
+        assert isinstance(result, AWXJobResult)
+        assert result.job_id == 42
+        assert result.status == "canceled"
+        assert result.elapsed_seconds == 180.0
+        assert result.artifacts == {}
+        client._client.request.assert_awaited_once_with(
+            "POST",
+            "https://awx.example.com/api/v2/jobs/42/cancel/",
+        )
+
+    @pytest.mark.asyncio
+    async def test_raises_http_error_on_failure(self, client):
+        """Should raise AWXHTTPError if cancel request fails."""
+        client._client.request.return_value = _mock_response(
+            {"detail": "Cannot cancel finished job"}, status_code=400,
+        )
+
+        with pytest.raises(AWXHTTPError) as exc_info:
+            await client.cancel_job(99)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_defaults_missing_fields(self, client):
+        """Should default missing fields gracefully."""
+        client._client.request.return_value = _mock_response(
+            {"id": 7, "status": "canceled"},
+        )
+
+        result = await client.cancel_job(7)
+        assert result.job_id == 7
+        assert result.status == "canceled"
+        assert result.elapsed_seconds is None
+        assert result.artifacts == {}
+
+    @pytest.mark.asyncio
+    async def test_elapsed_seconds_none_when_no_timestamps(self, client):
+        """elapsed_seconds should be None if started/finished are missing."""
+        client._client.request.return_value = _mock_response(
+            {
+                "id": 5,
+                "status": "canceled",
+                "artifacts": {},
+            },
+        )
+
+        result = await client.cancel_job(5)
+        assert result.elapsed_seconds is None

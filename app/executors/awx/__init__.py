@@ -6,7 +6,7 @@ executor factory and other modules can import from a single package.
 
 from __future__ import annotations
 
-from app.executors.awx.client import AWXApiClient, AWXJobSummary
+from app.executors.awx.client import AWXApiClient, AWXJobResult, AWXJobSummary
 from app.executors.awx.exceptions import (
     AWXClientError,
     AWXConnectionError,
@@ -21,6 +21,7 @@ __all__ = [
     "AWXConnectionError",
     "AWXHTTPError",
     "AWXJobError",
+    "AWXJobResult",
     "AWXJobSummary",
     "AWXTimeoutError",
 ]
