@@ -56,13 +56,37 @@ class OpenCodeClientProtocol(ABC):
     Defines the interface that any OpenCode Serve client implementation
     must satisfy.  Concrete implementations handle the actual HTTP
     transport (httpx, requests, etc.) and error handling.
+
+    .. rubric:: Current active surface
+
+    The Gateway currently calls two protocol methods at runtime:
+
+    * :meth:`get_session_diff` — retrieve the diff produced by a session
+    * :meth:`abort_session`     — abort a running session
+
+    .. rubric:: Intentional future surface
+
+    The following methods exist to allow a future Gateway or monitoring
+    layer to manage OpenCode Serve sessions directly.  They are
+    implemented by :class:`OpenCodeServeClient` but are not yet invoked
+    at runtime by the Gateway:
+
+    * :meth:`health`          — check server health
+    * :meth:`list_sessions`   — list all sessions
+    * :meth:`get_session`     — get a specific session by ID
+    * :meth:`create_session`  — create a new coding session
+    * :meth:`delete_session`  — delete a session
     """
+
+    # -- Intentional future surface ---------------------------------------
 
     @abstractmethod
     async def health(self) -> SessionInfo:
         """Check the health of the OpenCode Serve instance.
 
-        Calls ``GET /global/health``.
+        **Future surface.**  Calls ``GET /global/health``.  Not yet
+        invoked by the Gateway at runtime; available for monitoring
+        or health-check callers.
 
         Returns:
             SessionInfo with server health and status details.
@@ -73,7 +97,8 @@ class OpenCodeClientProtocol(ABC):
     async def list_sessions(self) -> SessionListResponse:
         """List all sessions managed by the OpenCode Serve instance.
 
-        Calls ``GET /session``.
+        **Future surface.**  Calls ``GET /session``.  Not yet invoked
+        by the Gateway at runtime.
 
         Returns:
             SessionListResponse containing all sessions and a total count.
@@ -84,7 +109,8 @@ class OpenCodeClientProtocol(ABC):
     async def get_session(self, session_id: str) -> SessionInfo:
         """Get detailed information for a specific session.
 
-        Calls ``GET /session/{session_id}``.
+        **Future surface.**  Calls ``GET /session/{session_id}``.  Not
+        yet invoked by the Gateway at runtime.
 
         Args:
             session_id: The unique identifier of the session to retrieve.
@@ -103,7 +129,9 @@ class OpenCodeClientProtocol(ABC):
     ) -> SessionInfo:
         """Create a new coding session on the OpenCode Serve instance.
 
-        Calls ``POST /session``.
+        **Future surface.**  Calls ``POST /session``.  Not yet invoked
+        by the Gateway at runtime; the Gateway currently manages
+        sessions through the executor plugin instead.
 
         Args:
             workspace_path: Path to the workspace directory on the Runner VM.
@@ -119,7 +147,8 @@ class OpenCodeClientProtocol(ABC):
     async def delete_session(self, session_id: str) -> SessionAbortResponse:
         """Delete a session from the OpenCode Serve instance.
 
-        Calls ``DELETE /session/{session_id}``.
+        **Future surface.**  Calls ``DELETE /session/{session_id}``.
+        Not yet invoked by the Gateway at runtime.
 
         Args:
             session_id: The unique identifier of the session to delete.
@@ -128,6 +157,8 @@ class OpenCodeClientProtocol(ABC):
             SessionAbortResponse confirming deletion.
         """
         ...
+
+    # -- Active surface ---------------------------------------------------
 
     @abstractmethod
     async def get_session_diff(self, session_id: str) -> SessionDiffResponse:

@@ -28,12 +28,34 @@ from app.executors.models import (
 class ExecutorPlugin(ABC):
     """Abstract base class for executor plugins.
 
-    Per ADR 0002, every executor must implement these six async lifecycle
-    methods.  Each method accepts and returns typed Pydantic models so
+    Per ADR 0002, the executor exposes a six-method async lifecycle
+    interface.  Each method accepts and returns typed Pydantic models so
     the Gateway never needs to know backend-specific details.
+
+    .. rubric:: Current active surface
+
+    The Gateway currently calls four of the six lifecycle methods at
+    runtime:
+
+    * :meth:`create_workspace` — provision a workspace directory
+    * :meth:`start_opencode`  — start the OpenCode Serve process
+    * :meth:`stop_opencode`   — stop the OpenCode Serve process
+    * :meth:`cleanup_workspace` — tear down a workspace directory
+
+    .. rubric:: Intentional future surface
+
+    The following two methods are part of the designed six-method
+    lifecycle (ADR 0002) but are not yet invoked by the Gateway at
+    runtime.  They exist so that concrete executors can provide them
+    uniformly when the Gateway grows call sites that need them:
+
+    * :meth:`restart_opencode` — restart the OpenCode Serve process
+    * :meth:`collect_state`    — collect workspace / service state
     """
 
     name: str
+
+    # -- Active surface ---------------------------------------------------
 
     @abstractmethod
     async def create_workspace(
@@ -57,24 +79,36 @@ class ExecutorPlugin(ABC):
         ...
 
     @abstractmethod
+    async def cleanup_workspace(
+        self, request: CleanupWorkspaceRequest
+    ) -> CleanupWorkspaceResponse:
+        """Tear down a workspace directory."""
+        ...
+
+    # -- Intentional future surface ---------------------------------------
+
+    @abstractmethod
     async def restart_opencode(
         self, request: RestartOpencodeRequest
     ) -> RestartOpencodeResponse:
-        """Restart the OpenCode Serve process for a workspace."""
+        """Restart the OpenCode Serve process for a workspace.
+
+        **Future surface.**  Not yet called by the Gateway at runtime;
+        included so every executor provides a uniform implementation
+        when a call site is added.
+        """
         ...
 
     @abstractmethod
     async def collect_state(
         self, request: CollectStateRequest
     ) -> CollectStateResponse:
-        """Collect the current state of a workspace and its service."""
-        ...
+        """Collect the current state of a workspace and its service.
 
-    @abstractmethod
-    async def cleanup_workspace(
-        self, request: CleanupWorkspaceRequest
-    ) -> CleanupWorkspaceResponse:
-        """Tear down a workspace directory."""
+        **Future surface.**  Not yet called by the Gateway at runtime;
+        included so every executor provides a uniform implementation
+        when a call site is added.
+        """
         ...
 
 
