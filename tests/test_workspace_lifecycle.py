@@ -577,8 +577,9 @@ class TestPortAllocation:
     async def test_allocate_port_uses_port_lock_key(
         self, mock_conn: AsyncMock
     ) -> None:
-        """The lock key must match _PORT_LOCK_KEY (47001)."""
-        from app.api.workspaces import _PORT_LOCK_KEY, allocate_port
+        """The lock key must match PORT_LOCK_KEY (47001)."""
+        from app.api.workspaces import allocate_port
+        from app.db.lock import PORT_LOCK_KEY
 
         execute_calls: list[tuple] = []
 
@@ -596,7 +597,7 @@ class TestPortAllocation:
         await allocate_port(mock_conn)
 
         lock_call = next((s, a) for s, a in execute_calls if "pg_advisory_lock" in s)
-        assert lock_call[1][0] == _PORT_LOCK_KEY
+        assert lock_call[1][0] == PORT_LOCK_KEY
 
 
 # ---------------------------------------------------------------------------
