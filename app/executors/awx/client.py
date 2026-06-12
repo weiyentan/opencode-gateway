@@ -39,6 +39,21 @@ class AWXJobSummary(BaseModel):
     status: str
 
 
+class AWXJobResult(BaseModel):
+    """Result of a completed AWX job.
+
+    Attributes:
+        job_id: The AWX job ID.
+        status: The final job status (``"successful"``, ``"failed"``, etc.).
+        artifacts: Dictionary of artifacts produced by the job (e.g.
+            ``set_stats`` data from Ansible).
+    """
+
+    job_id: int
+    status: str
+    artifacts: dict[str, Any] = {}
+
+
 # ── Client implementation ────────────────────────────────────────────────
 
 
@@ -190,3 +205,91 @@ class AWXApiClient:
 
         status = data.get("status", "unknown")
         return AWXJobSummary(job_id=job_id, status=status)
+
+    async def get_job(self, job_id: int) -> AWXJobResult:
+        """Retrieve the current state of a running or completed AWX job.
+
+        Calls ``GET /api/v2/jobs/{job_id}/``.
+
+        Args:
+            job_id: The AWX job ID to query.
+
+        Returns:
+            AWXJobResult with ``job_id``, ``status``, and ``artifacts``.
+
+        Raises:
+            AWXJobError: If the response is missing the job ID.
+        """
+        response = await self._request(
+            "GET",
+            f"/api/v2/jobs/{job_id}/",
+        )
+
+        data = response.json()
+
+        job_id_result = data.get("id")
+        if job_id_result is None:
+            raise AWXJobError(
+                f"AWX job detail response missing job ID for job {job_id}",
+                job_id=job_id,
+            )
+
+        return AWXJobResult(
+            job_id=job_id_result,
+            status=data.get("status", "unknown"),
+            artifacts=data.get("artifacts", {}),
+        )
+
+    async def wait_for_job(
+        self, job_id: int, timeout_seconds: int | None = None
+    ) -> AWXJobResult:
+        """Poll an AWX job until it reaches a terminal status.
+
+        Terminal statuses are ``"successful"``, ``"failed"``, ``"error"``,
+        and ``"canceled"``. Polls at ``self._poll_interval`` seconds.
+
+        Args:
+            job_id: The AWX job ID to wait for.
+            timeout_seconds: Maximum seconds to wait. Defaults to
+                ``self._timeout`` if not provided.
+
+        Returns:
+            AWXJobResult for the completed job.
+
+        Raises:
+            AWXTimeoutError: If the job does not complete within the
+                configured timeout.
+            AWXJobError: If the job reaches a ``"failed"`` or ``"error"``
+                terminal status.
+        """
+        import asyncio
+
+        if timeout_seconds is None:
+            timeout_seconds = self._timeout
+
+        terminal_statuses = frozenset(
+            {"successful", "failed", "error", "canceled"}
+        )
+
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+
+        while True:
+            result = await self.get_job(job_id)
+
+            if result.status in terminal_statuses:
+                if result.status in ("failed", "error"):
+                    raise AWXJobError(
+                        f"AWX job {job_id} ended with status "
+                        f"{result.status!r}",
+                        job_id=job_id,
+                    )
+                return result
+
+            if asyncio.get_event_loop().time() >= deadline:
+                raise AWXTimeoutError(
+                    f"AWX job {job_id} did not complete within "
+                    f"{timeout_seconds} seconds (last status: "
+                    f"{result.status!r})"
+                )
+
+            await asyncio.sleep(self._poll_interval)
