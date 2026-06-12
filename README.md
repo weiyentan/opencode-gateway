@@ -136,6 +136,40 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
 
+### AWX Executor Configuration
+
+When `GATEWAY_EXECUTOR_TYPE` is set to `awx`, the Gateway uses [AWX](https://github.com/ansible/awx) (Ansible Automation Platform) as the executor plugin to manage workspace lifecycle on Runner VMs. The following environment variables configure the AWX connection:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_AWX_BASE_URL` | *(empty)* | Base URL of the AWX instance (e.g. `https://awx.example.com`) |
+| `GATEWAY_AWX_TOKEN` | *(empty)* | AWX API Bearer token for authentication |
+| `GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID` | `0` | AWX job template ID for workspace creation (maps to `gateway-create-workspace` in AWX) |
+| `GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID` | `0` | AWX job template ID for OpenCode start/stop/restart (maps to `gateway-opencode-lifecycle`) |
+| `GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID` | `0` | AWX job template ID for workspace teardown and state collection (maps to `gateway-workspace-teardown`) |
+| `GATEWAY_AWX_POLL_INTERVAL_SECONDS` | `5` | Seconds between poll retries when waiting for AWX job completion |
+| `GATEWAY_AWX_TIMEOUT_SECONDS` | `300` | Maximum seconds to wait for an AWX job to complete |
+
+To switch from the default `local` executor to the AWX executor, set the following in your `.env` file:
+
+```bash
+# Switch executor type to AWX
+GATEWAY_EXECUTOR_TYPE=awx
+
+# AWX connection and authentication
+GATEWAY_AWX_BASE_URL=https://awx.example.com
+GATEWAY_AWX_TOKEN=your-awx-api-token
+
+# Job template IDs (replace with your actual AWX template IDs)
+GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID=10
+GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID=20
+GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID=30
+```
+
+All three template IDs are required and must be non-zero. If any template ID is missing or zero, the Gateway raises a `ValueError` at startup.
+
+> **Template contract:** The exact AWX job template structure (expected `extra_vars`, artifact outputs, and playbook contracts) is defined in the [GitLab issue #82](https://gitlab.com/opencode/gateway/-/issues/82) under the "AWX Template Contract" section. Refer to that issue when creating or updating the corresponding AWX job templates.
+
 ### Run
 
 **Development** (with auto-reload):
