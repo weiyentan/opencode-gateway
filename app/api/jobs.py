@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
 from app.core.config import get_settings
+from app.core.lifecycle import can_transition
+from app.core.models.job import JobStatus
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -179,7 +181,12 @@ async def create_job(
         executor.name,
     )
 
-    # 2. Transition to running and dispatch to executor
+    # 2. Validate and perform pending → running transition
+    if not can_transition(JobStatus.PENDING, JobStatus.RUNNING):
+        logger.error(
+            "Lifecycle rejected transition pending→running for job %s", job_id
+        )
+        raise HTTPException(status_code=500, detail="Internal state machine error")
     await conn.execute(
         "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
         job_id,
@@ -345,6 +352,13 @@ async def approve_job(
             detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
         )
 
+    # Validate the transition against the centralised rule set (defence-in-depth)
+    if not can_transition(JobStatus.NEEDS_APPROVAL, JobStatus.RUNNING):
+        logger.error(
+            "Lifecycle rejected transition needs_approval→running for job %s", job_id
+        )
+        raise HTTPException(status_code=500, detail="Internal state machine error")
+
     now = datetime.now(timezone.utc)
 
     # Record approval
@@ -401,6 +415,13 @@ async def reject_job(
             status_code=409,
             detail=f"Job is in '{row['status']}' state, expected 'needs_approval'",
         )
+
+    # Validate the transition against the centralised rule set (defence-in-depth)
+    if not can_transition(JobStatus.NEEDS_APPROVAL, JobStatus.REJECTED):
+        logger.error(
+            "Lifecycle rejected transition needs_approval→rejected for job %s", job_id
+        )
+        raise HTTPException(status_code=500, detail="Internal state machine error")
 
     now = datetime.now(timezone.utc)
 
@@ -465,12 +486,18 @@ async def abort_job(
     row = await _fetch_job(conn, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if row["status"] not in ("pending", "running", "aborting"):
+
+    current_status = JobStatus(row["status"])
+
+    # Allow retry from aborting; otherwise validate via centralised transition table
+    if current_status != JobStatus.ABORTING and not can_transition(
+        current_status, JobStatus.ABORTING
+    ):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Job is in '{row['status']}' state, "
-                f"expected 'pending', 'running', or 'aborting'"
+                f"Job is in '{row['status']}' state; "
+                f"cannot transition to aborting"
             ),
         )
 
@@ -479,7 +506,7 @@ async def abort_job(
     previous_status = row["status"]  # capture before transition
 
     # Transition to aborting unless already in that state (retry)
-    if row["status"] != "aborting":
+    if current_status != JobStatus.ABORTING:
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'aborting', updated_at = $2 WHERE id = $1",
             job_id,

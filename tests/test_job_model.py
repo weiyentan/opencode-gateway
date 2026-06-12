@@ -406,6 +406,161 @@ class TestJobStatusTransition:
             )
 
 
+class TestLifecycleCanTransition:
+    """Tests for the centralised can_transition function in app.core.lifecycle."""
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _can_transition(current: str, target: str) -> bool:
+        """Thin wrapper so tests can use plain strings."""
+        from app.core.lifecycle import can_transition
+        from app.core.models.job import JobStatus
+
+        return can_transition(JobStatus(current), JobStatus(target))
+
+    # -- valid transitions ------------------------------------------------
+
+    def test_pending_to_running_is_valid(self):
+        assert self._can_transition("pending", "running") is True
+
+    def test_pending_to_needs_approval_is_valid(self):
+        assert self._can_transition("pending", "needs_approval") is True
+
+    def test_pending_to_aborting_is_valid(self):
+        assert self._can_transition("pending", "aborting") is True
+
+    def test_running_to_completed_is_valid(self):
+        assert self._can_transition("running", "completed") is True
+
+    def test_running_to_failed_is_valid(self):
+        assert self._can_transition("running", "failed") is True
+
+    def test_running_to_aborting_is_valid(self):
+        assert self._can_transition("running", "aborting") is True
+
+    def test_needs_approval_to_running_is_valid(self):
+        assert self._can_transition("needs_approval", "running") is True
+
+    def test_needs_approval_to_rejected_is_valid(self):
+        assert self._can_transition("needs_approval", "rejected") is True
+
+    def test_aborting_to_aborted_is_valid(self):
+        assert self._can_transition("aborting", "aborted") is True
+
+    # -- self-transitions are always rejected -----------------------------
+
+    def test_self_transition_pending_is_invalid(self):
+        assert self._can_transition("pending", "pending") is False
+
+    def test_self_transition_running_is_invalid(self):
+        assert self._can_transition("running", "running") is False
+
+    def test_self_transition_completed_is_invalid(self):
+        assert self._can_transition("completed", "completed") is False
+
+    def test_self_transition_failed_is_invalid(self):
+        assert self._can_transition("failed", "failed") is False
+
+    def test_self_transition_aborted_is_invalid(self):
+        assert self._can_transition("aborted", "aborted") is False
+
+    # -- terminal states (completed / failed / rejected / aborted) --------
+
+    def test_completed_to_any_is_invalid(self):
+        for target in ("pending", "running", "needs_approval", "failed",
+                       "rejected", "aborting", "aborted", "completed"):
+            assert self._can_transition("completed", target) is False
+
+    def test_failed_to_any_is_invalid(self):
+        for target in ("pending", "running", "needs_approval", "completed",
+                       "rejected", "aborting", "aborted", "failed"):
+            assert self._can_transition("failed", target) is False
+
+    def test_rejected_to_any_is_invalid(self):
+        for target in ("pending", "running", "needs_approval", "completed",
+                       "failed", "aborting", "aborted", "rejected"):
+            assert self._can_transition("rejected", target) is False
+
+    def test_aborted_to_any_is_invalid(self):
+        for target in ("pending", "running", "needs_approval", "completed",
+                       "failed", "aborting", "rejected", "aborted"):
+            assert self._can_transition("aborted", target) is False
+
+    # -- backward edges that are NOT allowed ------------------------------
+
+    def test_running_to_pending_is_invalid(self):
+        assert self._can_transition("running", "pending") is False
+
+    def test_completed_to_running_is_invalid(self):
+        assert self._can_transition("completed", "running") is False
+
+    def test_failed_to_running_is_invalid(self):
+        assert self._can_transition("failed", "running") is False
+
+    def test_aborting_to_running_is_invalid(self):
+        assert self._can_transition("aborting", "running") is False
+
+    def test_aborted_to_aborting_is_invalid(self):
+        assert self._can_transition("aborted", "aborting") is False
+
+    # -- direct aborted (skip aborting) -----------------------------------
+
+    def test_pending_to_aborted_is_invalid(self):
+        assert self._can_transition("pending", "aborted") is False
+
+    def test_running_to_aborted_is_invalid(self):
+        assert self._can_transition("running", "aborted") is False
+
+    # -- approve / reject from non-needs_approval -------------------------
+
+    def test_running_to_needs_approval_is_invalid(self):
+        assert self._can_transition("running", "needs_approval") is False
+
+    def test_pending_to_rejected_is_invalid(self):
+        assert self._can_transition("pending", "rejected") is False
+
+    # -- the transition table has exactly 9 entries -----------------------
+
+    def test_valid_transitions_count_is_nine(self):
+        from app.core.lifecycle import VALID_TRANSITIONS
+
+        assert len(VALID_TRANSITIONS) == 9
+
+    # -- every transition in the table references known enum members ------
+
+    def test_all_transitions_use_valid_enum_members(self):
+        from app.core.lifecycle import VALID_TRANSITIONS
+        from app.core.models.job import JobStatus
+
+        all_members = set(JobStatus)
+        for src, dst in VALID_TRANSITIONS:
+            assert src in all_members
+            assert dst in all_members
+
+
+class TestJobStatusValidateTransitionBackwardCompat:
+    """Verify that JobStatus.validate_transition still works as before."""
+
+    def test_delegates_to_lifecycle_can_transition(self):
+        """validate_transition delegates to the centralised lifecycle module."""
+        from app.core.models.job import JobStatus
+
+        # These should still be valid (matching the old behaviour)
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.ABORTING) is True
+        assert JobStatus.validate_transition(JobStatus.RUNNING, JobStatus.ABORTING) is True
+        assert JobStatus.validate_transition(JobStatus.ABORTING, JobStatus.ABORTED) is True
+
+        # These should still be invalid (matching the old behaviour)
+        assert JobStatus.validate_transition(JobStatus.COMPLETED, JobStatus.ABORTING) is False
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.ABORTED) is False
+        assert JobStatus.validate_transition(JobStatus.ABORTED, JobStatus.RUNNING) is False
+
+        # New transitions available via the expanded table
+        assert JobStatus.validate_transition(JobStatus.PENDING, JobStatus.RUNNING) is True
+        assert JobStatus.validate_transition(JobStatus.RUNNING, JobStatus.COMPLETED) is True
+
+
 class TestJobModelSerialization:
     """Tests that Job can be serialized and deserialized."""
 
