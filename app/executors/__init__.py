@@ -80,11 +80,13 @@ class ExecutorPlugin(ABC):
 
 # --- Executor plugin registry ------------------------------------------------
 # Imported after ExecutorPlugin is defined to avoid circular imports
-# (LocalExecutor imports ExecutorPlugin from this module).
+# (LocalExecutor and AWXExecutorPlugin import ExecutorPlugin from this module).
 
+from app.executors.awx.plugin import AWXExecutorPlugin  # noqa: E402
 from app.executors.local import LocalExecutor  # noqa: E402
 
 EXECUTOR_REGISTRY: dict[str, type[ExecutorPlugin]] = {
+    "awx": AWXExecutorPlugin,
     "local": LocalExecutor,
 }
 
