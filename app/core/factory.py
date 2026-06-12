@@ -79,21 +79,14 @@ def create_app(
         )
         app.state.scheduler = scheduler  # type: ignore[attr-defined]
         await scheduler.start(
-            ctx={
-                "pool": app.state.pool,  # type: ignore[attr-defined]
-                "executor": executor,
-            }
+            pool=app.state.pool,  # type: ignore[attr-defined]
+            executor=executor,
         )
 
         yield
 
         # --- Cleanup scheduler shutdown ---
-        await scheduler.stop(
-            ctx={
-                "pool": app.state.pool,  # type: ignore[attr-defined]
-                "executor": executor,
-            }
-        )
+        await scheduler.stop()
 
         # --- Postgres pool shutdown ---
         db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]

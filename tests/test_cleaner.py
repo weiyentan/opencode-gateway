@@ -169,23 +169,23 @@ class TestCleanupSchedulerLifecycle:
         """Calling start() should create a running asyncio Task."""
         scheduler = CleanupScheduler(interval_seconds=0.05)
         executor = _mock_executor()
-        await scheduler.start(ctx={"pool": None, "executor": executor})
+        await scheduler.start(pool=None, executor=executor)
 
         assert scheduler._task is not None
         assert not scheduler._task.done()
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_stop_cancels_task_and_awaits_it(self):
         """stop() should cancel the internal task and wait for it to finish."""
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         task = scheduler._task
         assert task is not None
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert task.cancelled() or task.done()
         assert scheduler._task is None
@@ -194,15 +194,15 @@ class TestCleanupSchedulerLifecycle:
     async def test_stop_idempotent(self):
         """Calling stop() on an unstarted scheduler should not error."""
         scheduler = CleanupScheduler()
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_start_logs_info_message(self, caplog):
         """start() must emit an INFO-level log about scheduler startup."""
-        caplog.set_level(logging.INFO, logger="app.scheduler.engine")
+        caplog.set_level(logging.INFO, logger="app.scheduler.cleaner")
 
         scheduler = CleanupScheduler()
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         info_logs = [
             r.getMessage()
@@ -212,7 +212,7 @@ class TestCleanupSchedulerLifecycle:
         ]
         assert len(info_logs) == 1
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -229,26 +229,26 @@ class TestIntervalTiming:
         call_count = 0
 
         class CountingCleanup(CleanupScheduler):
-            async def _tick(self, ctx):
+            async def _tick(self):
                 nonlocal call_count
                 call_count += 1
                 await asyncio.sleep(0)
 
         scheduler = CountingCleanup(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         await asyncio.sleep(0.20)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert call_count >= 2, f"Expected >= 2 ticks, got {call_count}"
 
     @pytest.mark.asyncio
     async def test_custom_interval_used(self, caplog):
         """The interval_seconds passed to the constructor should appear in the log."""
-        caplog.set_level(logging.INFO, logger="app.scheduler.engine")
+        caplog.set_level(logging.INFO, logger="app.scheduler.cleaner")
 
         scheduler = CleanupScheduler(interval_seconds=42.0)
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         info_logs = [
             r.getMessage()
@@ -259,7 +259,7 @@ class TestIntervalTiming:
         assert len(info_logs) == 1
         assert "42.0" in info_logs[0]
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +302,9 @@ class TestExpiredWorkspaceQuery:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         processing_logs = [
             r.getMessage()
@@ -333,9 +333,9 @@ class TestAdvisoryLockAcquisition:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         executor.cleanup_workspace.assert_called()
         call_args = executor.cleanup_workspace.call_args[0][0]
@@ -354,9 +354,9 @@ class TestAdvisoryLockAcquisition:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Executor should NOT be called because lock was unavailable
         executor.cleanup_workspace.assert_not_called()
@@ -380,9 +380,9 @@ class TestAdvisoryLockAcquisition:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         unlock_calls = [
             (sql, args)
@@ -416,9 +416,9 @@ class TestBatchProcessing:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(batch_size=batch_size, interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Each tick processes all rows returned by the mock.
         # With a 0.05s interval and 0.12s sleep, at least 1 tick fires.
@@ -454,9 +454,9 @@ class TestExecutorIntegration:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         executor.cleanup_workspace.assert_called()
         request = executor.cleanup_workspace.call_args[0][0]
@@ -473,9 +473,9 @@ class TestExecutorIntegration:
         executor = _mock_executor(cleanup_status="cleaned")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Should have an UPDATE setting cleanup_status
         update_calls = [
@@ -499,9 +499,9 @@ class TestExecutorIntegration:
         executor = _mock_executor(cleanup_status="error")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         warning_logs = [
             r.getMessage()
@@ -541,9 +541,9 @@ class TestErrorRecovery:
         executor = _mock_executor(raises=RuntimeError("simulated cleanup failure"))
 
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.20)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Both workspaces should have been attempted across multiple ticks
         assert executor.cleanup_workspace.call_count >= 2
@@ -570,7 +570,7 @@ class TestContextCancellation:
     async def test_cancel_stops_loop(self):
         """Cancelling the task should cause the loop to exit."""
         scheduler = CleanupScheduler(interval_seconds=60.0)  # long interval
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         assert scheduler._task is not None
         assert not scheduler._task.done()
@@ -586,11 +586,11 @@ class TestContextCancellation:
     async def test_stop_during_long_sleep_exits_cleanly(self):
         """Calling stop() while the scheduler is sleeping should cancel and exit."""
         scheduler = CleanupScheduler(interval_seconds=60.0)
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
 
         # Give it a moment to enter the sleep
         await asyncio.sleep(0.05)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert scheduler._task is None or scheduler._task.done()
 
@@ -609,9 +609,9 @@ class TestMissingDependencies:
         caplog.set_level(logging.DEBUG, logger="app.scheduler.cleaner")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": None, "executor": _mock_executor()})
+        await scheduler.start(pool=None, executor=_mock_executor())
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         debug_logs = [
             r.getMessage()
@@ -627,9 +627,9 @@ class TestMissingDependencies:
 
         pool, _conn = _mock_pool()
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": None})
+        await scheduler.start(pool=pool, executor=None)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         debug_logs = [
             r.getMessage()
@@ -687,9 +687,9 @@ class TestStatusResponseHandling:
         executor = _mock_executor(cleanup_status="")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls

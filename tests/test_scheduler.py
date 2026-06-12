@@ -1,4 +1,8 @@
-"""Tests for the cleanup scheduler lifecycle skeleton."""
+"""Tests for the cleanup scheduler lifecycle.
+
+These tests cover the scheduler loop behaviour (start/stop, error recovery,
+periodic ticks) using CleanupScheduler with explicit typed dependencies.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import logging
 
 import pytest
 
-from app.scheduler import Scheduler
+from app.scheduler.cleaner import CleanupScheduler
 
 
 class TestSchedulerLifecycle:
@@ -16,24 +20,24 @@ class TestSchedulerLifecycle:
     @pytest.mark.asyncio
     async def test_start_creates_background_task(self):
         """Calling start() should create a running asyncio Task."""
-        scheduler = Scheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={})
+        scheduler = CleanupScheduler(interval_seconds=0.05)
+        await scheduler.start()
 
         assert scheduler._task is not None
         assert not scheduler._task.done()
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_stop_cancels_task_and_awaits_it(self):
         """stop() should cancel the internal task and wait for it to finish."""
-        scheduler = Scheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={})
+        scheduler = CleanupScheduler(interval_seconds=0.05)
+        await scheduler.start()
 
         task = scheduler._task
         assert task is not None
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert task.cancelled() or task.done()
         assert scheduler._task is None
@@ -41,32 +45,32 @@ class TestSchedulerLifecycle:
     @pytest.mark.asyncio
     async def test_stop_idempotent(self):
         """Calling stop() on an unstarted scheduler should not error."""
-        scheduler = Scheduler()
-        await scheduler.stop(ctx={})  # no-op, should not raise
+        scheduler = CleanupScheduler()
+        await scheduler.stop()  # no-op, should not raise
 
     @pytest.mark.asyncio
     async def test_stop_awaits_task_completion(self):
         """stop() awaits the internal task before returning, clearing _task."""
-        scheduler = Scheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={})
+        scheduler = CleanupScheduler(interval_seconds=0.05)
+        await scheduler.start()
         task = scheduler._task
 
         # stop() must clear _task after the background loop exits
         assert task is not None
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
         assert task.done()
         assert scheduler._task is None
 
     @pytest.mark.asyncio
     async def test_errors_inside_tick_are_logged_not_raised(self, caplog):
         """An exception in _tick must not crash the scheduler or propagate."""
-        scheduler = Scheduler(interval_seconds=0.05)
+        scheduler = CleanupScheduler(interval_seconds=0.05)
 
-        async def broken_tick(ctx):
+        async def broken_tick():
             raise RuntimeError("simulated tick failure")
 
         scheduler._tick = broken_tick  # type: ignore[method-assign]
-        await scheduler.start(ctx={})
+        await scheduler.start()
 
         # Let a few ticks run so the error path is exercised
         await asyncio.sleep(0.25)
@@ -74,7 +78,7 @@ class TestSchedulerLifecycle:
         # The scheduler should still be running
         assert not scheduler._task.done()
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # The error should have been logged
         error_logs = [
@@ -91,10 +95,10 @@ class TestSchedulerLifecycle:
     @pytest.mark.asyncio
     async def test_start_logs_info_message(self, caplog):
         """start() must emit an INFO-level log about scheduler startup."""
-        caplog.set_level(logging.INFO, logger="app.scheduler.engine")
+        caplog.set_level(logging.INFO, logger="app.scheduler.cleaner")
 
-        scheduler = Scheduler()
-        await scheduler.start(ctx={})
+        scheduler = CleanupScheduler()
+        await scheduler.start()
 
         info_logs = [
             r.getMessage()
@@ -104,16 +108,16 @@ class TestSchedulerLifecycle:
         ]
         assert len(info_logs) == 1
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_stop_logs_stopped_message(self, caplog):
         """stop() should log that the scheduler was stopped."""
-        caplog.set_level(logging.INFO, logger="app.scheduler.engine")
+        caplog.set_level(logging.INFO, logger="app.scheduler.cleaner")
 
-        scheduler = Scheduler()
-        await scheduler.start(ctx={})
-        await scheduler.stop(ctx={})
+        scheduler = CleanupScheduler()
+        await scheduler.start()
+        await scheduler.stop()
 
         stop_logs = [
             r.getMessage()
@@ -132,39 +136,31 @@ class TestSchedulerTick:
         """_tick() should be invoked multiple times as intervals elapse."""
         call_count = 0
 
-        class CountingScheduler(Scheduler):
-            async def _tick(self, ctx):
+        class CountingScheduler(CleanupScheduler):
+            async def _tick(self):
                 nonlocal call_count
                 call_count += 1
                 await asyncio.sleep(0)
 
         scheduler = CountingScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={})
+        await scheduler.start()
 
         # Let enough time pass for several ticks
         await asyncio.sleep(0.20)
 
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
         assert call_count >= 2, f"Expected >= 2 ticks, got {call_count}"
 
     @pytest.mark.asyncio
-    async def test_tick_receives_context(self):
-        """The ctx dict passed to start() should be forwarded to _tick()."""
-        received_ctx = None
+    async def test_start_sets_dependencies_on_instance(self):
+        """Dependencies passed to start() are stored and available to _tick()."""
+        scheduler = CleanupScheduler(interval_seconds=0.05)
+        await scheduler.start(pool="fake-pool", executor="fake-executor")
 
-        class RecordingScheduler(Scheduler):
-            async def _tick(self, ctx):
-                nonlocal received_ctx
-                received_ctx = ctx
-                await asyncio.sleep(0)
+        assert scheduler._pool == "fake-pool"
+        assert scheduler._executor == "fake-executor"
 
-        scheduler = RecordingScheduler(interval_seconds=0.05)
-        test_ctx = {"pool": "fake-pool", "executor": "fake-executor"}
-        await scheduler.start(ctx=test_ctx)
-        await asyncio.sleep(0.10)
-        await scheduler.stop(ctx={})
-
-        assert received_ctx is test_ctx
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_errors_in_tick_do_not_stop_loop(self):
@@ -172,8 +168,8 @@ class TestSchedulerTick:
         tick_count = 0
         error_raised = False
 
-        class IntermittentErrorScheduler(Scheduler):
-            async def _tick(self, ctx):
+        class IntermittentErrorScheduler(CleanupScheduler):
+            async def _tick(self):
                 nonlocal tick_count, error_raised
                 tick_count += 1
                 if not error_raised:
@@ -182,9 +178,9 @@ class TestSchedulerTick:
                 await asyncio.sleep(0)
 
         scheduler = IntermittentErrorScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={})
+        await scheduler.start()
         await asyncio.sleep(0.20)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert tick_count >= 2, f"Expected >= 2 ticks even after error, got {tick_count}"
 
@@ -194,13 +190,13 @@ class TestSchedulerFactoryIntegration:
 
     @pytest.mark.asyncio
     async def test_scheduler_attached_to_app_state(self):
-        """After startup, app.state.scheduler must be a Scheduler instance."""
+        """After startup, app.state.scheduler must be a CleanupScheduler instance."""
         from app.core.factory import create_app
 
         app = create_app()
         async with app.router.lifespan_context(app):
             scheduler = getattr(app.state, "scheduler", None)
-            assert isinstance(scheduler, Scheduler)
+            assert isinstance(scheduler, CleanupScheduler)
 
     @pytest.mark.asyncio
     async def test_scheduler_cleaned_up_after_lifespan(self):

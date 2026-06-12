@@ -102,9 +102,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.15)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Executor must have been called with the correct workspace_id
         executor.cleanup_workspace.assert_called()
@@ -128,9 +128,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.15)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         assert executor.cleanup_workspace.call_count >= 3
 
@@ -153,9 +153,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=batch_size)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # Exactly batch_size should have been processed (per tick)
         assert executor.cleanup_workspace.call_count >= batch_size
@@ -170,9 +170,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # No workspaces → no cleanup calls
         executor.cleanup_workspace.assert_not_called()
@@ -187,9 +187,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         executor.cleanup_workspace.assert_not_called()
 
@@ -203,9 +203,9 @@ class TestSchedulerEndToEndCleanup:
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=10)
 
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         executor.cleanup_workspace.assert_not_called()
 
@@ -229,8 +229,8 @@ class TestFullTickFlow:
         )
         executor = _mock_executor()
 
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
 
         # At minimum the processing log exists
         assert any("processing" in r.getMessage().lower() for r in caplog.records)
@@ -251,8 +251,8 @@ class TestFullTickFlow:
         )
         executor = _mock_executor()
 
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
 
         unlock_calls = [
             (sql, args) for sql, args in conn.execute_calls
@@ -269,8 +269,8 @@ class TestFullTickFlow:
         )
         executor = _mock_executor()
 
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
 
         # Collect all operations in order
         ops = []
@@ -349,11 +349,11 @@ class TestMultiTickAccumulation:
         executor = _mock_executor()
 
         scheduler = CleanupScheduler(interval_seconds=0.05, batch_size=batch_size)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
 
         # Let multiple ticks run
         await asyncio.sleep(0.25)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
 
         # The mock returns the same rows each tick, so every tick processes
         # up to batch_size again. Total calls should be >= total.

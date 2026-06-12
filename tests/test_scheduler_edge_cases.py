@@ -138,23 +138,22 @@ class TestDatabaseConnectionFailure:
             fetch_rows=[_make_expired_row(ws_id)],
             acquire_raises=ConnectionError("database unavailable"),
         )
-        await scheduler.start(ctx={"pool": pool2, "executor": executor})
+        await scheduler.start(pool=pool2, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
         assert scheduler._task is None or scheduler._task.done()
 
     @pytest.mark.asyncio
     async def test_tick_handles_db_failure_gracefully(self, caplog):
-        caplog.set_level(logging.ERROR, logger="app.scheduler.engine")
+        caplog.set_level(logging.ERROR, logger="app.scheduler.cleaner")
         tick_count = 0
         class DBFailingScheduler(CleanupScheduler):
-            async def _tick(self, ctx):
+            async def _tick(self):
                 nonlocal tick_count
                 tick_count += 1
-                pool = ctx.get("pool")
-                if pool is not None:
+                if self._pool is not None:
                     try:
-                        await self._query_expired(pool)
+                        await self._query_expired(self._pool)
                     except ConnectionError:
                         logger = logging.getLogger("app.scheduler.cleaner")
                         logger.error("DB failure during query — will retry")
@@ -164,9 +163,9 @@ class TestDatabaseConnectionFailure:
         )
         executor = _mock_executor()
         scheduler = DBFailingScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.15)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
         assert tick_count >= 2
 
 
@@ -189,9 +188,9 @@ class TestAllWorkspacesPinned:
         pool, _conn = _mock_pool(fetch_rows=[])
         executor = _mock_executor()
         scheduler = CleanupScheduler(interval_seconds=0.05)
-        await scheduler.start(ctx={"pool": pool, "executor": executor})
+        await scheduler.start(pool=pool, executor=executor)
         await asyncio.sleep(0.12)
-        await scheduler.stop(ctx={})
+        await scheduler.stop()
         executor.cleanup_workspace.assert_not_called()
         processing_logs = [
             r.getMessage() for r in caplog.records
@@ -277,8 +276,8 @@ class TestPartialBatchHandling:
         rows = [_make_expired_row(w) for w in ws_ids]
         pool, _conn = _mock_pool(fetch_rows=rows, lock_acquired=True)
         executor = _mock_executor()
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
         assert executor.cleanup_workspace.call_count == 2
 
     @pytest.mark.asyncio
@@ -288,8 +287,8 @@ class TestPartialBatchHandling:
         rows = [_make_expired_row(w) for w in ws_ids]
         pool, _conn = _mock_pool(fetch_rows=rows, lock_acquired=True)
         executor = _mock_executor()
-        scheduler = CleanupScheduler(batch_size=batch_size)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=batch_size)
+        await scheduler._tick()
         assert executor.cleanup_workspace.call_count == batch_size
 
 
@@ -314,8 +313,8 @@ class TestBatchSizeEdgeCases:
             fetch_rows=[_make_expired_row(ws_id)], lock_acquired=True,
         )
         executor = _mock_executor()
-        scheduler = CleanupScheduler(batch_size=1000)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=1000)
+        await scheduler._tick()
         assert executor.cleanup_workspace.call_count == 1
 
 
@@ -340,8 +339,8 @@ class TestMixedCleanupResults:
             CleanupWorkspaceResponse(status="cleaned"),
             RuntimeError("cleanup exploded"),
         ]
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
         assert executor.cleanup_workspace.call_count == 2
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls
@@ -364,8 +363,8 @@ class TestMixedCleanupResults:
             CleanupWorkspaceResponse(status="error"),
             CleanupWorkspaceResponse(status="cleaned"),
         ]
-        scheduler = CleanupScheduler(batch_size=10)
-        await scheduler._tick({"pool": pool, "executor": executor})
+        scheduler = CleanupScheduler(pool=pool, executor=executor, batch_size=10)
+        await scheduler._tick()
         assert executor.cleanup_workspace.call_count == 2
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls

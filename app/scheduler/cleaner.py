@@ -1,7 +1,9 @@
-"""Cleanup scheduler — queries expired workspaces and invokes the executor.
+"""Cleanup scheduler — background workspace cleanup with PostgreSQL advisory locks.
 
-Implements the background workspace cleanup loop with PostgreSQL advisory
-locks, configurable batching, and executor integration.
+Contains the complete scheduler loop (previously split across engine.py and
+cleaner.py).  The one-adapter ``Scheduler`` base class has been inlined here
+because it had exactly one implementation — there was no benefit in carrying a
+separate abstraction that was never used for anything else.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from typing import Any
 import asyncpg
 
 from app.executors import CleanupWorkspaceRequest, ExecutorPlugin
-from app.scheduler.engine import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,13 @@ def _uuid_to_lock_key(workspace_id: Any) -> int:
     return uid.int & 0x7FFFFFFFFFFFFFFF
 
 
-class CleanupScheduler(Scheduler):
+class CleanupScheduler:
     """Background scheduler that periodically cleans up expired workspaces.
+
+    Accepts explicit typed dependencies (``pool`` and ``executor``) rather
+    than a loosely-typed context dictionary.  The scheduler is wired into
+    the Gateway application lifespan: it starts on boot, performs a soft-stop
+    on graceful shutdown, and errors inside a tick never crash the process.
 
     Each tick:
       1. Queries the database for eligible workspaces (past their
@@ -53,37 +59,86 @@ class CleanupScheduler(Scheduler):
 
     def __init__(
         self,
+        pool: asyncpg.Pool | None = None,
+        executor: ExecutorPlugin | None = None,
         interval_seconds: float | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
-        super().__init__(
-            interval_seconds=interval_seconds or DEFAULT_INTERVAL_SECONDS,
-        )
-        self._batch_size = batch_size
+        # --- Dependencies (may also be supplied via start()) ---
+        self._pool: asyncpg.Pool | None = pool
+        self._executor: ExecutorPlugin | None = executor
+
+        # --- Scheduler loop state ---
+        self._task: asyncio.Task[None] | None = None
+        self._stopped: asyncio.Event = asyncio.Event()
+        self._interval: float = interval_seconds or DEFAULT_INTERVAL_SECONDS
+        self._batch_size: int = batch_size
+
+    # ------------------------------------------------------------------
+    # Public lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(
+        self,
+        pool: asyncpg.Pool | None = None,
+        executor: ExecutorPlugin | None = None,
+    ) -> None:
+        """Begin the background loop.
+
+        Optionally override *pool* and *executor* — useful when
+        dependencies are not available at construction time (e.g. the
+        database pool is created inside the lifespan handler).
+        """
+        if pool is not None:
+            self._pool = pool
+        if executor is not None:
+            self._executor = executor
+
+        logger.info("Cleanup scheduler started (interval=%.1fs)", self._interval)
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        """Soft-stop the scheduler.
+
+        Cancels the background task and waits for any in-flight work
+        to complete before returning.  Errors during the cancellation
+        window are logged and swallowed so the Gateway can shut down
+        cleanly.
+        """
+        if self._task is None:
+            return
+
+        self._stopped.set()
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Scheduler raised an error during shutdown")
+        finally:
+            self._task = None
+            logger.info("Cleanup scheduler stopped")
 
     # ------------------------------------------------------------------
     # Tick implementation — the real work happens here
     # ------------------------------------------------------------------
 
-    async def _tick(self, ctx: dict[str, Any]) -> None:
+    async def _tick(self) -> None:
         """Single cleanup iteration.
 
-        Requires ``pool`` (asyncpg.Pool) and ``executor``
-        (ExecutorPlugin) in the context dictionary.  Silently skips
-        when either is missing so the scheduler does not crash when
-        Postgres is unavailable during boot.
+        Uses ``self._pool`` and ``self._executor``.  Silently skips when
+        either is ``None`` so the scheduler does not crash when Postgres
+        is unavailable during boot.
         """
-        pool: asyncpg.Pool | None = ctx.get("pool")
-        executor: ExecutorPlugin | None = ctx.get("executor")
-
-        if pool is None:
+        if self._pool is None:
             logger.debug("CleanupScheduler._tick: no database pool available — skipping")
             return
-        if executor is None:
+        if self._executor is None:
             logger.debug("CleanupScheduler._tick: no executor available — skipping")
             return
 
-        rows = await self._query_expired(pool)
+        rows = await self._query_expired(self._pool)
         if not rows:
             return
 
@@ -91,13 +146,36 @@ class CleanupScheduler(Scheduler):
 
         for row in rows:
             try:
-                await self._process_one(pool, executor, row)
+                await self._process_one(self._pool, self._executor, row)
             except asyncio.CancelledError:  # pragma: no cover
                 raise
             except Exception:
                 logger.exception(
                     "Unhandled error during cleanup of workspace %s", row.get("id")
                 )
+
+    # ------------------------------------------------------------------
+    # Background loop
+    # ------------------------------------------------------------------
+
+    async def _run(self) -> None:
+        """Main scheduler loop — ticks at the configured interval.
+
+        Each tick is wrapped in a try/except so that errors are logged
+        but never propagate to crash the Gateway process.
+        """
+        while not self._stopped.is_set():
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Scheduler loop encountered an error")
+
+            try:
+                await asyncio.sleep(self._interval)
+            except asyncio.CancelledError:
+                break
 
     # ------------------------------------------------------------------
     # Internal helpers
