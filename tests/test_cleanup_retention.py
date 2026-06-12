@@ -49,7 +49,7 @@ def _patch_settings(**overrides: int):
     async def _get():
         return base
 
-    return patch("app.api.jobs.get_settings", _get)
+    return patch("app.core.job_orchestrator.get_settings", _get)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ class TestSuccessfulJobCleanupAfter:
             return s
 
         # Patch get_settings for this test
-        with patch("app.api.jobs.get_settings", _override_settings):
+        with patch("app.core.job_orchestrator.get_settings", _override_settings):
             client = create_client(mock_conn, mock_executor=mock_executor)
             async with client as c:
                 response = await c.post(
@@ -397,7 +397,7 @@ class TestFailedJobCleanupAfter:
             s.cleanup_failure_retention_hours = 336  # 14 days
             return s
 
-        with patch("app.api.jobs.get_settings", _override_settings):
+        with patch("app.core.job_orchestrator.get_settings", _override_settings):
             client = create_client(mock_conn, mock_executor=mock_start_fail_executor)
             async with client as c:
                 response = await c.post(
