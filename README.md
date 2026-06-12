@@ -21,7 +21,7 @@ The Gateway is built as four layered concerns, each in its own package:
 |-------|----------|----------------|
 | **API Layer** | `app/api/` | REST endpoints for jobs, runners, workspaces, observations, and approvals. API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), policy module for pre-flight checks (disk pressure, runner health, concurrent job limits), and a background scheduler for periodic cleanup and observation polling. |
-| **Executor Plugin Interface** | `app/executors/` | Abstract async base class defining six methods (`create_workspace`, `start_opencode`, `stop_opencode`, `restart_opencode`, `collect_state`, `cleanup_workspace`), typed Pydantic models, and a registry (`EXECUTOR_REGISTRY`) mapping executor type names to implementation classes. The factory (`factory.py`) resolves the active executor from the `GATEWAY_EXECUTOR_TYPE` config via the registry. MVPs: **local executor** (default, shipping), **AWX** (planned). Design documented in [ADR 0002](docs/adr/0002-executor-plugin-interface.md). |
+| **Executor Plugin Interface** | `app/executors/` | Abstract async base class defining six methods (`create_workspace`, `start_opencode`, `stop_opencode`, `restart_opencode`, `collect_state`, `cleanup_workspace`), typed Pydantic models, and a registry (`EXECUTOR_REGISTRY`) mapping executor type names to implementation classes. The factory (`factory.py`) resolves the active executor from the `GATEWAY_EXECUTOR_TYPE` config via the registry. MVPs: **local executor** (default, shipping), **AWX executor** (shipping). Design documented in [ADR 0002](docs/adr/0002-executor-plugin-interface.md). |
 | **OpenCode Serve Client** | `app/opencode/` | `httpx`-based wrapper for the OpenCode Serve REST API: health checks, session CRUD, task submission, diff retrieval, and abort. |
 
 ### Interaction Flow
@@ -135,6 +135,40 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_STALENESS_SECONDS` | `600` | Maximum age in seconds of the last telemetry sample; runners with older data are treated as UNKNOWN |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
+
+### AWX Executor Configuration
+
+When `GATEWAY_EXECUTOR_TYPE` is set to `awx`, the Gateway uses [AWX](https://github.com/ansible/awx) (Ansible Automation Platform) as the executor plugin to manage workspace lifecycle on Runner VMs. The following environment variables configure the AWX connection:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_AWX_BASE_URL` | *(empty)* | Base URL of the AWX instance (e.g. `https://awx.example.com`) |
+| `GATEWAY_AWX_TOKEN` | *(empty)* | AWX API Bearer token for authentication |
+| `GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID` | `0` | AWX job template ID for workspace creation (maps to `gateway-create-workspace` in AWX) |
+| `GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID` | `0` | AWX job template ID for OpenCode start/stop/restart (maps to `gateway-opencode-lifecycle`) |
+| `GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID` | `0` | AWX job template ID for workspace teardown and state collection (maps to `gateway-workspace-teardown`) |
+| `GATEWAY_AWX_POLL_INTERVAL_SECONDS` | `5` | Seconds between poll retries when waiting for AWX job completion |
+| `GATEWAY_AWX_TIMEOUT_SECONDS` | `300` | Maximum seconds to wait for an AWX job to complete |
+
+To switch from the default `local` executor to the AWX executor, set the following in your `.env` file:
+
+```bash
+# Switch executor type to AWX
+GATEWAY_EXECUTOR_TYPE=awx
+
+# AWX connection and authentication
+GATEWAY_AWX_BASE_URL=https://awx.example.com
+GATEWAY_AWX_TOKEN=your-awx-api-token
+
+# Job template IDs (replace with your actual AWX template IDs)
+GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID=10
+GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID=20
+GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID=30
+```
+
+All three template IDs are required and must be non-zero. If any template ID is missing or zero, the Gateway raises a `ValueError` at startup.
+
+> **Template contract:** The exact AWX job template structure (expected `extra_vars`, artifact outputs, and playbook contracts) is defined in the [GitLab issue #82](https://gitlab.com/opencode/gateway/-/issues/82) under the "AWX Template Contract" section. Refer to that issue when creating or updating the corresponding AWX job templates.
 
 ### Run
 
@@ -294,7 +328,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #7 | Job diff retrieval via OpenCode client | ✅ Complete |
 | #8 | Job abort via OpenCode client | ✅ Complete |
 | #9 | Pre-flight policy: disk pressure guardrails | ✅ Complete |
-| #10 | AWX executor plugin | 🔄 Planned |
+| #10 | AWX executor plugin | ✅ Complete |
 | #11 | Approval gates for risky operations | 🔄 In Progress |
 | #12 | Background cleanup scheduler | ✅ Complete |
 | #13 | Paperclip integration adapter | 🔄 Planned |
@@ -349,7 +383,11 @@ opencode-gateway/
 │   │   ├── factory.py            # get_executor() — config-driven registry lookup
 │   │   ├── local.py              # LocalExecutor (default, shell-based)
 │   │   ├── models.py             # Pydantic request/response models
-│   │   └── ...                   # Future: awx.py, ssh.py
+│   │   └── awx/
+│   │       ├── __init__.py       # AWX executor package exports
+│   │       ├── client.py         # AWXApiClient — httpx REST API client
+│   │       ├── exceptions.py     # AWX exception hierarchy
+│   │       └── plugin.py         # AWXExecutorPlugin — lifecycle implementation
 │   ├── policy/
 │   │   ├── __init__.py           # Exports ObservationBasedPolicy, PolicyViolation, PreflightPolicy
 │   │   ├── base.py               # PreflightPolicy protocol + PolicyViolation exception
@@ -365,11 +403,14 @@ opencode-gateway/
 ├── tests/
 │   ├── __init__.py
 │   ├── test_app_factory.py       # Application factory lifecycle tests
+│   ├── test_awx_client.py        # AWXApiClient unit tests
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
 │   ├── test_executor_loader.py   # Executor registry and factory resolution
 │   ├── test_executors.py         # Executor plugin interface and models
+│   ├── test_executors_awx.py     # AWXExecutorPlugin unit tests
+│   ├── test_executors_awx_mocktransport.py # AWXExecutorPlugin mock transport tests
 │   ├── test_health.py            # Health endpoint: connected, disconnected, broken
 │   ├── test_job_model.py         # Job Pydantic models
 │   ├── test_jobs.py              # Job API endpoints
@@ -378,7 +419,12 @@ opencode-gateway/
 │   ├── test_serve_client.py      # OpenCode Serve httpx client
 │   ├── test_workspace_lifecycle.py # Workspace pin/cleanup lifecycle
 │   ├── test_workspace_model.py   # Workspace Pydantic models
-│   └── test_workspaces.py        # Workspace list/get API endpoints
+│   ├── test_workspaces.py        # Workspace list/get API endpoints
+│   ├── test_clients/
+│   │   ├── __init__.py
+│   │   ├── test_awx_client_mocktransport.py # AWXApiClient mock transport tests
+│   │   └── test_serve_client_comprehensive.py # OpenCode Serve client comprehensive tests
+│   └── ...                       # Future: integration, e2e tests
 ├── docs/
 │   ├── adr/                      # Architecture Decision Records (4 ADRs)
 │   ├── prd/                      # Product Requirements Document
@@ -401,7 +447,7 @@ opencode-gateway/
 ### Running Tests
 
 ```bash
-pytest tests/ -v                 # All tests (700+ tests across 21 files)
+pytest tests/ -v                 # All tests (650+ tests across 28 files)
 pytest tests/ -v -k "db"         # Database-related tests only (requires Postgres)
 ruff check .                     # Linting (E, F, I, UP rules)
 mypy app/ tests/                 # Type checking (strict mode)
