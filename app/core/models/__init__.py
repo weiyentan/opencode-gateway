@@ -4,10 +4,10 @@ from app.core.models.workspace import Workspace, WorkspacePydantic, WorkspaceSta
 
 __all__ = [
     "Approval",
-    "ApprovalResponse",
+    "ApprovalResponse",  # backward-compatible alias for Approval
     "Job",
     "JobStatus",
     "Workspace",
-    "WorkspacePydantic",
+    "WorkspacePydantic",  # backward-compatible alias for Workspace
     "WorkspaceStatus",
 ]

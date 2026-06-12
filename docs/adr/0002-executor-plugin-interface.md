@@ -34,12 +34,44 @@ Exclude `provision_runner` from the base interface — runner provisioning is an
 - Typed Pydantic models provide validation and documentation at the boundary
 - Leaving `provision_runner` out keeps the per-job interface focused and avoids mixing bootstrap concerns with operational ones
 
+## Refinement (issue #70)
+
+The six-method interface was inspected to identify which methods are
+actually called at runtime by the Gateway.  Four methods are actively
+invoked:
+
+* ``create_workspace``
+* ``start_opencode``
+* ``stop_opencode``
+* ``cleanup_workspace``
+
+The remaining two — ``restart_opencode`` and ``collect_state`` — are
+retained as **intentional future surface**:
+
+* ``restart_opencode`` is a natural extension of the lifecycle (the
+  operator may want to bounce the service without a full teardown).
+* ``collect_state`` supports a future monitoring / telemetry loop that
+  would poll workspace health without joining it to a create/cleanup
+  cycle.
+
+Both are annotated as future surface in the source and remain required
+by the ABC so every executor provides a uniform implementation when
+Gateway call sites are added.
+
+Similarly, the ``OpenCodeClientProtocol`` has seven methods but only
+two — ``get_session_diff`` and ``abort_session`` — are called at
+runtime.  The remaining five (``health``, ``list_sessions``,
+``get_session``, ``create_session``, ``delete_session``) are
+documented as future surface.
+
 ## Consequences
 
 Positive:
 - The Gateway never calls infrastructure-specific APIs directly
 - Adding a new executor type only requires implementing the interface
 - Pydantic models serve as living documentation
+- Unused methods are documented as future surface, reducing cognitive
+  load for readers who only need to understand the active subset
 
 Negative:
 - Some executor-specific capabilities may not fit the generic interface

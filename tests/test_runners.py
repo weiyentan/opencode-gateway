@@ -5,21 +5,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
 
-from app.core.factory import create_app
-from app.db.session import get_session
+from tests.conftest import mock_row
 
-
-def _mock_row(data: dict):
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    from unittest.mock import MagicMock
-
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    row.get.side_effect = data.get
-    return row
+# mock_conn and client fixtures are auto-discovered from conftest.py
 
 
 def _make_runner_row(
@@ -76,33 +65,6 @@ def _make_runner_row_with_observation(
     return row
 
 
-@pytest.fixture
-def mock_conn():
-    """Return a mock asyncpg connection."""
-    return AsyncMock()
-
-
-def _create_client(mock_conn):
-    """Build app with overridden get_session dependency, return httpx AsyncClient."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
-
-
-@pytest.fixture
-def client(mock_conn):
-    """Build app with overridden get_session dependency, return httpx AsyncClient."""
-    return _create_client(mock_conn)
-
-
 class TestListRunners:
     """Tests for GET /runners."""
 
@@ -126,7 +88,7 @@ class TestListRunners:
         row2 = _make_runner_row(r2_id, hostname="runner-beta")
 
         mock_conn.fetch = AsyncMock(
-            return_value=[_mock_row(row1), _mock_row(row2)]
+            return_value=[mock_row(row1), mock_row(row2)]
         )
 
         async with client as c:
@@ -151,7 +113,7 @@ class TestListRunners:
             labels=labels,
         )
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/runners")
@@ -180,7 +142,7 @@ class TestListRunners:
             load_1m=2.1,
         )
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/runners")
@@ -202,7 +164,7 @@ class TestListRunners:
         r_id = uuid.uuid4()
         row = _make_runner_row(r_id)
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/runners")
@@ -224,7 +186,7 @@ class TestListRunners:
             load_1m=0.8,
         )
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/runners")
@@ -253,7 +215,7 @@ class TestListRunners:
 
         # Return in wrong order to verify server sorts
         mock_conn.fetch = AsyncMock(
-            return_value=[_mock_row(row2), _mock_row(row1)]
+            return_value=[mock_row(row2), mock_row(row1)]
         )
 
         async with client as c:
@@ -303,7 +265,7 @@ class TestGetRunnerDetail:
             "created_at": now,
             "updated_at": now,
         }
-        runner_row = _mock_row(runner_row_data)
+        runner_row = mock_row(runner_row_data)
         runner_row.get.side_effect = runner_row_data.get
 
         # Call 1: fetchrow for runner (returns the runner row)
@@ -315,23 +277,23 @@ class TestGetRunnerDetail:
                 "load_1m": 1.5,
                 "observed_at": now,
             }
-            obs_row = _mock_row(obs_row_data)
+            obs_row = mock_row(obs_row_data)
             mock_conn.fetchrow = AsyncMock(side_effect=[runner_row, obs_row])
         else:
             mock_conn.fetchrow = AsyncMock(side_effect=[runner_row, None])
 
         # fetch for workspace observations and opencode instance observations
-        ws_mock_rows = []
+        wsmock_rows = []
         if workspace_obs:
             for wo in workspace_obs:
-                ws_mock_rows.append(_mock_row(wo))
+                wsmock_rows.append(mock_row(wo))
 
-        oi_mock_rows = []
+        oimock_rows = []
         if opencode_obs:
             for oo in opencode_obs:
-                oi_mock_rows.append(_mock_row(oo))
+                oimock_rows.append(mock_row(oo))
 
-        mock_conn.fetch = AsyncMock(side_effect=[ws_mock_rows, oi_mock_rows])
+        mock_conn.fetch = AsyncMock(side_effect=[wsmock_rows, oimock_rows])
 
         return runner_row_data
 

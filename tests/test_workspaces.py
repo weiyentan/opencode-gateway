@@ -5,81 +5,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
 
-from app.core.factory import create_app
-from app.db.session import get_session
+from tests.conftest import make_workspace_row, mock_row
 
-
-def _mock_row(data: dict):
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    from unittest.mock import MagicMock
-
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    row.get.side_effect = data.get
-    return row
-
-
-def _make_workspace_row(
-    workspace_id,
-    *,
-    runner_id=None,
-    workspace_name="ws-test",
-    path="/data/workspaces/ws-test",
-    repo_url="https://github.com/example/repo.git",
-    branch=None,
-    port=None,
-    service_name=None,
-    pinned=False,
-    cleanup_after=None,
-    cleanup_status="active",
-):
-    """Return a dict representing a workspaces table row."""
-    now = datetime.now(timezone.utc)
-    return {
-        "id": workspace_id,
-        "runner_id": runner_id,
-        "workspace_name": workspace_name,
-        "path": path,
-        "repo_url": repo_url,
-        "branch": branch,
-        "port": port,
-        "service_name": service_name,
-        "pinned": pinned,
-        "cleanup_after": cleanup_after,
-        "cleanup_status": cleanup_status,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-
-@pytest.fixture
-def mock_conn():
-    """Return a mock asyncpg connection."""
-    return AsyncMock()
-
-
-def _create_client(mock_conn):
-    """Build app with overridden get_session dependency, return httpx AsyncClient."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
-
-
-@pytest.fixture
-def client(mock_conn):
-    """Build app with overridden get_session dependency, return httpx AsyncClient."""
-    return _create_client(mock_conn)
+# mock_conn and client fixtures are auto-discovered from conftest.py
 
 
 class TestListWorkspaces:
@@ -101,11 +30,11 @@ class TestListWorkspaces:
         """GET /workspaces returns all workspaces from the DB."""
         ws1_id = uuid.uuid4()
         ws2_id = uuid.uuid4()
-        row1 = _make_workspace_row(ws1_id, workspace_name="ws-one")
-        row2 = _make_workspace_row(ws2_id, workspace_name="ws-two")
+        row1 = make_workspace_row(ws1_id, workspace_name="ws-one")
+        row2 = make_workspace_row(ws2_id, workspace_name="ws-two")
 
         mock_conn.fetch = AsyncMock(
-            return_value=[_mock_row(row1), _mock_row(row2)]
+            return_value=[mock_row(row1), mock_row(row2)]
         )
 
         async with client as c:
@@ -121,7 +50,7 @@ class TestListWorkspaces:
     async def test_list_workspaces_response_has_all_expected_fields(self, client, mock_conn):
         """GET /workspaces returns objects with all WorkspacePydantic fields."""
         ws_id = uuid.uuid4()
-        row = _make_workspace_row(
+        row = make_workspace_row(
             ws_id,
             runner_id=uuid.uuid4(),
             workspace_name="ws-full",
@@ -134,7 +63,7 @@ class TestListWorkspaces:
             cleanup_status="active",
         )
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/workspaces")
@@ -162,14 +91,14 @@ class TestListWorkspaces:
 
         ws1_id = uuid.uuid4()
         ws2_id = uuid.uuid4()
-        row1 = _make_workspace_row(ws1_id, workspace_name="ws-old")
-        row2 = _make_workspace_row(ws2_id, workspace_name="ws-new")
+        row1 = make_workspace_row(ws1_id, workspace_name="ws-old")
+        row2 = make_workspace_row(ws2_id, workspace_name="ws-new")
         row1["created_at"] = earlier
         row2["created_at"] = later
 
         # Return in wrong order to verify server sorts
         mock_conn.fetch = AsyncMock(
-            return_value=[_mock_row(row1), _mock_row(row2)]
+            return_value=[mock_row(row1), mock_row(row2)]
         )
 
         async with client as c:
@@ -188,9 +117,9 @@ class TestListWorkspacesFiltering:
         """GET /workspaces?runner_id=... filters by runner_id."""
         target_runner = uuid.uuid4()
         ws_id = uuid.uuid4()
-        row = _make_workspace_row(ws_id, runner_id=target_runner)
+        row = make_workspace_row(ws_id, runner_id=target_runner)
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get(f"/workspaces?runner_id={target_runner}")
@@ -211,9 +140,9 @@ class TestListWorkspacesFiltering:
     async def test_filter_by_status(self, client, mock_conn):
         """GET /workspaces?status=... filters by cleanup_status."""
         ws_id = uuid.uuid4()
-        row = _make_workspace_row(ws_id, cleanup_status="pinned")
+        row = make_workspace_row(ws_id, cleanup_status="pinned")
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get("/workspaces?status=pinned")
@@ -235,11 +164,11 @@ class TestListWorkspacesFiltering:
         """GET /workspaces?runner_id=...&status=... applies both filters."""
         target_runner = uuid.uuid4()
         ws_id = uuid.uuid4()
-        row = _make_workspace_row(
+        row = make_workspace_row(
             ws_id, runner_id=target_runner, cleanup_status="cleaning"
         )
 
-        mock_conn.fetch = AsyncMock(return_value=[_mock_row(row)])
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
 
         async with client as c:
             response = await c.get(
@@ -288,12 +217,12 @@ class TestGetWorkspace:
     async def test_get_existing_workspace_returns_200(self, client, mock_conn):
         """GET /workspaces/{id} for an existing workspace returns 200 with full record."""
         ws_id = uuid.uuid4()
-        row = _make_workspace_row(
+        row = make_workspace_row(
             ws_id,
             workspace_name="ws-single",
             repo_url="https://github.com/example/single.git",
         )
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
 
         async with client as c:
             response = await c.get(f"/workspaces/{ws_id}")
@@ -328,7 +257,7 @@ class TestGetWorkspace:
         """GET /workspaces/{id} returns all WorkspacePydantic fields."""
         ws_id = uuid.uuid4()
         runner_id = uuid.uuid4()
-        row = _make_workspace_row(
+        row = make_workspace_row(
             ws_id,
             runner_id=runner_id,
             workspace_name="ws-all-fields",
@@ -340,7 +269,7 @@ class TestGetWorkspace:
             pinned=True,
             cleanup_status="active",
         )
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
 
         async with client as c:
             response = await c.get(f"/workspaces/{ws_id}")

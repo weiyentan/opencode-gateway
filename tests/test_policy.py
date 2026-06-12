@@ -16,14 +16,7 @@ from app.policy.observation import (
     RUNNER_STATUS_UNKNOWN,
     ObservationBasedPolicy,
 )
-
-
-def _mock_row(data: dict):
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    row.get = data.get
-    return row
+from tests.conftest import mock_row
 
 
 def _make_mock_conn(
@@ -59,7 +52,7 @@ def _make_mock_conn(
     # Runner lookup: SELECT id, status FROM runners WHERE runner_id = $1
     async def _fetchrow_runner(sql, *args):
         if "FROM runners" in sql:
-            return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            return mock_row({"id": runner_uuid, "status": "HEALTHY"})
         return None
 
     if disk_used_percent is not None or memory_used_percent is not None:
@@ -68,9 +61,9 @@ def _make_mock_conn(
 
         async def _fetchrow_obs(sql, *args):
             if "FROM runners" in sql:
-                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+                return mock_row({"id": runner_uuid, "status": "HEALTHY"})
             if "FROM runner_observations" in sql:
-                return _mock_row(
+                return mock_row(
                     {
                         "disk_used_percent": disk_used_percent,
                         "memory_used_percent": memory_used_percent,
@@ -481,7 +474,7 @@ class TestCheckEdgeCases:
 
         async def _fetchrow(sql, *args):
             if "FROM runners" in sql:
-                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+                return mock_row({"id": runner_uuid, "status": "HEALTHY"})
             if "FROM runner_observations" in sql:
                 return None  # no observations
             return None
@@ -644,7 +637,7 @@ class TestCheckStaleness:
 
         async def _fetchrow(sql, *args):
             if "FROM runners" in sql:
-                return _mock_row({"id": runner_uuid, "status": "HEALTHY"})
+                return mock_row({"id": runner_uuid, "status": "HEALTHY"})
             if "FROM runner_observations" in sql:
                 return None  # no observations
             return None

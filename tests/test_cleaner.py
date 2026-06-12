@@ -21,7 +21,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.scheduler.cleaner import CleanupScheduler, _uuid_to_lock_key
+from app.db.lock import uuid_to_lock_key
+from app.scheduler.cleaner import CleanupScheduler
 
 # ---------------------------------------------------------------------------
 # Helpers — build consistent mocks for asyncpg Pool
@@ -133,7 +134,7 @@ class TestUuidToLockKey:
     def test_converts_uuid_to_positive_bigint(self):
         """A UUID object must be converted to a positive integer."""
         ws_id = uuid.UUID("550e8400-e29b-41d4-a716-446655440000")
-        key = _uuid_to_lock_key(ws_id)
+        key = uuid_to_lock_key(ws_id)
         assert isinstance(key, int)
         assert 0 <= key <= 0x7FFFFFFFFFFFFFFF
 
@@ -141,19 +142,19 @@ class TestUuidToLockKey:
         """A string UUID should work the same as a UUID object."""
         uid_str = "550e8400-e29b-41d4-a716-446655440000"
         uid_obj = uuid.UUID(uid_str)
-        assert _uuid_to_lock_key(uid_str) == _uuid_to_lock_key(uid_obj)
+        assert uuid_to_lock_key(uid_str) == uuid_to_lock_key(uid_obj)
 
     def test_different_uuids_produce_different_keys(self):
         """Two different UUIDs should NOT produce the same key."""
         a = uuid.uuid4()
         b = uuid.uuid4()
         # Statistically impossible to collide with 63-bit space
-        assert a != b
+        assert uuid_to_lock_key(a) != uuid_to_lock_key(b)
 
     def test_same_uuid_produces_same_key(self):
         """The same UUID always produces the same key."""
         ws_id = uuid.uuid4()
-        assert _uuid_to_lock_key(ws_id) == _uuid_to_lock_key(ws_id)
+        assert uuid_to_lock_key(ws_id) == uuid_to_lock_key(ws_id)
 
 
 # ---------------------------------------------------------------------------

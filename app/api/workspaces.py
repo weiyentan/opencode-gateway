@@ -11,7 +11,8 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.config import get_settings
-from app.core.models.workspace import WorkspacePydantic, WorkspaceStatus
+from app.core.models.workspace import Workspace, WorkspaceStatus
+from app.db.lock import PORT_LOCK_KEY, release_cleanup_lock, try_acquire_cleanup_lock
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -33,9 +34,9 @@ _WORKSPACE_COLS = (
 )
 
 
-def _row_to_workspace(row: asyncpg.Record) -> WorkspacePydantic:
-    """Convert an asyncpg Record to a WorkspacePydantic (GET endpoints)."""
-    return WorkspacePydantic(
+def _row_to_workspace(row: asyncpg.Record) -> Workspace:
+    """Convert an asyncpg Record to a Workspace (GET endpoints)."""
+    return Workspace(
         id=row["id"],
         runner_id=row.get("runner_id"),
         workspace_name=row["workspace_name"],
@@ -53,21 +54,13 @@ def _row_to_workspace(row: asyncpg.Record) -> WorkspacePydantic:
 
 
 # ---------------------------------------------------------------------------
-# PG advisory lock key constants
-# ---------------------------------------------------------------------------
-
-_PORT_LOCK_KEY = 47001
-_CLEANUP_LOCK_CLASS = 47002
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_response(row: asyncpg.Record) -> WorkspacePydantic:
-    """Convert an asyncpg workspace row to a WorkspacePydantic (POST endpoints)."""
-    return WorkspacePydantic(
+def _build_response(row: asyncpg.Record) -> Workspace:
+    """Convert an asyncpg workspace row to a Workspace (POST endpoints)."""
+    return Workspace(
         id=row["id"],
         runner_id=row["runner_id"],
         workspace_name=row["workspace_name"],
@@ -89,12 +82,12 @@ def _build_response(row: asyncpg.Record) -> WorkspacePydantic:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/workspaces", response_model=list[WorkspacePydantic])
+@router.get("/workspaces", response_model=list[Workspace])
 async def list_workspaces(
     runner_id: Optional[uuid.UUID] = None,
     status: Optional[str] = None,
     conn: asyncpg.Connection = Depends(get_session),
-) -> list[WorkspacePydantic]:
+) -> list[Workspace]:
     """List all workspaces, optionally filtered by runner_id and/or status.
 
     - ``runner_id``: filter by the Runner VM that hosts the workspace.
@@ -124,11 +117,11 @@ async def list_workspaces(
     return [_row_to_workspace(row) for row in rows]
 
 
-@router.get("/workspaces/{workspace_id}", response_model=WorkspacePydantic)
+@router.get("/workspaces/{workspace_id}", response_model=Workspace)
 async def get_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Retrieve a single workspace by its ID."""
     row = await conn.fetchrow(
         f"SELECT {_WORKSPACE_COLS} FROM workspaces WHERE id = $1",
@@ -157,7 +150,7 @@ async def _fetch_workspace(
 async def allocate_port(conn: asyncpg.Connection) -> int:
     """Allocate a free port using a PG advisory lock to avoid race conditions.
 
-    Acquires an exclusive advisory lock (key ``_PORT_LOCK_KEY``), scans the
+    Acquires an exclusive advisory lock (key ``PORT_LOCK_KEY``), scans the
     ``workspaces`` table for the highest port in the dynamic range
     (10000–10999), and returns the next available number.
 
@@ -165,7 +158,7 @@ async def allocate_port(conn: asyncpg.Connection) -> int:
     requests can receive the same port.  It is released automatically when
     the connection is returned to the pool.
     """
-    await conn.execute("SELECT pg_advisory_lock($1)", _PORT_LOCK_KEY)
+    await conn.execute("SELECT pg_advisory_lock($1)", PORT_LOCK_KEY)
     try:
         row = await conn.fetchrow(
             "SELECT COALESCE(MAX(port), 0) AS max_port FROM workspaces "
@@ -176,32 +169,7 @@ async def allocate_port(conn: asyncpg.Connection) -> int:
         max_port: int = row["max_port"] if row else 0  # type: ignore[index]
         return max_port + 1 if max_port > 0 else 10000
     finally:
-        await conn.execute("SELECT pg_advisory_unlock($1)", _PORT_LOCK_KEY)
-
-
-async def _acquire_cleanup_lock(conn: asyncpg.Connection, workspace_id: uuid.UUID) -> bool:
-    """Try to acquire a per-workspace cleanup advisory lock.
-
-    Uses ``pg_try_advisory_lock`` so the caller can distinguish between
-    "lock already held" and other failures.  Returns ``True`` when the
-    lock is acquired, ``False`` when another process holds it.
-    """
-    key = (_CLEANUP_LOCK_CLASS << 32) | (workspace_id.int & 0xFFFFFFFF)
-    locked: bool = await conn.fetchval(  # type: ignore[assignment]
-        "SELECT pg_try_advisory_lock($1, $2)",
-        _CLEANUP_LOCK_CLASS,
-        workspace_id.int & 0xFFFFFFFF,
-    )
-    return locked
-
-
-async def _release_cleanup_lock(conn: asyncpg.Connection, workspace_id: uuid.UUID) -> None:
-    """Release the per-workspace cleanup advisory lock."""
-    await conn.execute(
-        "SELECT pg_advisory_unlock($1, $2)",
-        _CLEANUP_LOCK_CLASS,
-        workspace_id.int & 0xFFFFFFFF,
-    )
+        await conn.execute("SELECT pg_advisory_unlock($1)", PORT_LOCK_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +177,11 @@ async def _release_cleanup_lock(conn: asyncpg.Connection, workspace_id: uuid.UUI
 # ---------------------------------------------------------------------------
 
 
-@router.post("/workspaces/{workspace_id}/pin", response_model=WorkspacePydantic)
+@router.post("/workspaces/{workspace_id}/pin", response_model=Workspace)
 async def pin_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Toggle the pinned flag on a workspace.
 
     Pinned workspaces are excluded from automatic cleanup policies
@@ -252,12 +220,12 @@ async def pin_workspace(
     return _build_response(row)
 
 
-@router.post("/workspaces/{workspace_id}/cleanup", response_model=WorkspacePydantic)
+@router.post("/workspaces/{workspace_id}/cleanup", response_model=Workspace)
 async def cleanup_workspace(
     workspace_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
-) -> WorkspacePydantic:
+) -> Workspace:
     """Trigger cleanup of a workspace via the executor plugin.
 
     Transitions the workspace to ``'cleaning'`` status, acquires a
@@ -275,7 +243,7 @@ async def cleanup_workspace(
         )
 
     # Serialise concurrent cleanup attempts
-    if not await _acquire_cleanup_lock(conn, workspace_id):
+    if not await try_acquire_cleanup_lock(conn, workspace_id):
         raise HTTPException(
             status_code=409,
             detail="Workspace cleanup is already in progress (lock held by another process)",
@@ -309,4 +277,4 @@ async def cleanup_workspace(
             detail="Cleanup failed",
         )
     finally:
-        await _release_cleanup_lock(conn, workspace_id)
+        await release_cleanup_lock(conn, workspace_id)

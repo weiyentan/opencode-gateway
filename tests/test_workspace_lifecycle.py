@@ -4,98 +4,29 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
+from tests.conftest import create_client, make_workspace_row, mock_row
 
-from app.core.factory import create_app
-from app.db.session import get_session
-from app.executors.factory import get_executor
+from app.core.factory import create_app  # used by TestWorkspaceRoutesRegistered
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _mock_row(data: dict) -> MagicMock:
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    return row
-
-
-def _make_workspace_row(
-    workspace_id: uuid.UUID,
-    workspace_name: str = "ws-test",
-    path: str = "/data/workspaces/ws-test",
-    repo_url: str = "https://github.com/example/repo.git",
-    *,
-    pinned: bool = False,
-    cleanup_status: str = "active",
-    port: Optional[int] = None,
-    runner_id: Optional[uuid.UUID] = None,
-    branch: Optional[str] = None,
-    service_name: Optional[str] = None,
-    cleanup_after: Optional[datetime] = None,
-) -> dict:
-    """Return a dict representing a workspaces table row."""
-    now = datetime.now(timezone.utc)
-    return {
-        "id": workspace_id,
-        "runner_id": runner_id,
-        "workspace_name": workspace_name,
-        "path": path,
-        "repo_url": repo_url,
-        "branch": branch,
-        "port": port,
-        "service_name": service_name,
-        "pinned": pinned,
-        "cleanup_after": cleanup_after,
-        "cleanup_status": cleanup_status,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-
-def _create_client(
-    mock_conn: AsyncMock,
-    *,
-    mock_executor: Optional[AsyncMock] = None,
-) -> AsyncClient:
-    """Build app with overridden dependencies, return httpx AsyncClient."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-
-    if mock_executor is not None:
-        app.dependency_overrides[get_executor] = lambda: mock_executor
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+# mock_conn and client fixtures are auto-discovered from conftest.py
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures (local overrides)
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_conn() -> AsyncMock:
-    """Return a mock asyncpg connection."""
-    return AsyncMock()
 
 
 @pytest.fixture
 def mock_executor() -> AsyncMock:
-    """Return a mock ExecutorPlugin for cleanup operations."""
+    """Return a mock ExecutorPlugin for cleanup operations.
+
+    Deliberately different from conftest:mock_executor — this one only
+    provides cleanup_workspace, not the full job lifecycle mock.
+    """
     from app.executors.models import CleanupWorkspaceResponse
 
     executor = AsyncMock()
@@ -105,10 +36,7 @@ def mock_executor() -> AsyncMock:
     return executor
 
 
-@pytest.fixture
-def client(mock_conn: AsyncMock) -> AsyncClient:
-    """Build app with overridden get_session dependency."""
-    return _create_client(mock_conn)
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +51,13 @@ class TestPinWorkspace:
     async def test_pin_flips_false_to_true(self, mock_conn: AsyncMock) -> None:
         """Pinning an unpinned workspace should set pinned=True."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, pinned=False)
+        row_data = make_workspace_row(ws_id, pinned=False)
 
         calls = []
 
         async def _fetchrow(sql: str, *args):
             calls.append(("fetchrow", sql, args))
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             calls.append(("execute", sql, args))
@@ -138,7 +66,7 @@ class TestPinWorkspace:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -152,10 +80,10 @@ class TestPinWorkspace:
     async def test_pin_flips_true_to_false(self, mock_conn: AsyncMock) -> None:
         """Pinning an already-pinned workspace should set pinned=False."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, pinned=True)
+        row_data = make_workspace_row(ws_id, pinned=True)
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             if "UPDATE workspaces SET pinned" in sql:
@@ -163,7 +91,7 @@ class TestPinWorkspace:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -187,11 +115,11 @@ class TestPinWorkspace:
         """The updated_at field should be refreshed after pin toggle."""
         ws_id = uuid.uuid4()
         old_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
-        row_data = _make_workspace_row(ws_id, pinned=False)
+        row_data = make_workspace_row(ws_id, pinned=False)
         row_data["updated_at"] = old_time
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             if "UPDATE workspaces SET pinned" in sql:
@@ -200,7 +128,7 @@ class TestPinWorkspace:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -226,7 +154,7 @@ class TestPinWorkspace:
     async def test_pin_returns_all_workspace_fields(self, mock_conn: AsyncMock) -> None:
         """The response should include all workspace fields."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(
+        row_data = make_workspace_row(
             ws_id,
             workspace_name="ws-complete",
             path="/data/workspaces/ws-complete",
@@ -239,7 +167,7 @@ class TestPinWorkspace:
         )
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             if "UPDATE workspaces SET pinned" in sql:
@@ -247,7 +175,7 @@ class TestPinWorkspace:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -280,13 +208,13 @@ class TestCleanupWorkspace:
     ) -> None:
         """Cleanup on an active workspace transitions to cleaning and calls executor."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         # Track advisory lock calls
         lock_acquired = False
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             nonlocal lock_acquired
@@ -305,7 +233,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -333,10 +261,10 @@ class TestCleanupWorkspace:
     ) -> None:
         """Cleanup on a workspace already in 'cleaning' status returns 409."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="cleaning")
+        row_data = make_workspace_row(ws_id, cleanup_status="cleaning")
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row(row_data))
-        client = _create_client(mock_conn)
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row_data))
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -351,10 +279,10 @@ class TestCleanupWorkspace:
     ) -> None:
         """When advisory lock cannot be acquired, cleanup returns 409."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -363,7 +291,7 @@ class TestCleanupWorkspace:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -378,7 +306,7 @@ class TestCleanupWorkspace:
     ) -> None:
         """When the executor raises, cleanup status reverts to active and returns 500."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         failing_executor = AsyncMock()
         failing_executor.cleanup_workspace = AsyncMock(
@@ -386,7 +314,7 @@ class TestCleanupWorkspace:
         )
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -406,7 +334,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=failing_executor)
+        client = create_client(mock_conn, mock_executor=failing_executor)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -429,10 +357,10 @@ class TestCleanupWorkspace:
     ) -> None:
         """The executor.cleanup_workspace call should receive the correct workspace_id."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -448,7 +376,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -463,12 +391,12 @@ class TestCleanupWorkspace:
     ) -> None:
         """The advisory lock must be released after successful cleanup."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -483,7 +411,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -500,7 +428,7 @@ class TestCleanupWorkspace:
     ) -> None:
         """The advisory lock must still be released after a cleanup failure."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         failing_executor = AsyncMock()
         failing_executor.cleanup_workspace = AsyncMock(
@@ -510,7 +438,7 @@ class TestCleanupWorkspace:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -525,7 +453,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=failing_executor)
+        client = create_client(mock_conn, mock_executor=failing_executor)
 
         async with client as c:
             await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -542,10 +470,10 @@ class TestCleanupWorkspace:
     ) -> None:
         """The workspace should be in 'cleaning' status while cleanup is in progress."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(ws_id, cleanup_status="active")
+        row_data = make_workspace_row(ws_id, cleanup_status="active")
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _fetchval(sql: str, *args):
             if "pg_try_advisory_lock" in sql:
@@ -561,7 +489,7 @@ class TestCleanupWorkspace:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.fetchval = AsyncMock(side_effect=_fetchval)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
@@ -587,7 +515,7 @@ class TestPortAllocation:
 
         async def _fetchrow(sql: str, *args):
             if "SELECT COALESCE(MAX(port)" in sql:
-                return _mock_row({"max_port": 0})
+                return mock_row({"max_port": 0})
             return None
 
         async def _execute(sql: str, *args):
@@ -606,7 +534,7 @@ class TestPortAllocation:
 
         async def _fetchrow(sql: str, *args):
             if "SELECT COALESCE(MAX(port)" in sql:
-                return _mock_row({"max_port": 10042})
+                return mock_row({"max_port": 10042})
             return None
 
         async def _execute(sql: str, *args):
@@ -629,7 +557,7 @@ class TestPortAllocation:
 
         async def _fetchrow(sql: str, *args):
             if "SELECT COALESCE(MAX(port)" in sql:
-                return _mock_row({"max_port": 0})
+                return mock_row({"max_port": 0})
             return None
 
         async def _execute(sql: str, *args):
@@ -649,14 +577,15 @@ class TestPortAllocation:
     async def test_allocate_port_uses_port_lock_key(
         self, mock_conn: AsyncMock
     ) -> None:
-        """The lock key must match _PORT_LOCK_KEY (47001)."""
-        from app.api.workspaces import _PORT_LOCK_KEY, allocate_port
+        """The lock key must match PORT_LOCK_KEY (47001)."""
+        from app.api.workspaces import allocate_port
+        from app.db.lock import PORT_LOCK_KEY
 
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
             if "SELECT COALESCE(MAX(port)" in sql:
-                return _mock_row({"max_port": 0})
+                return mock_row({"max_port": 0})
             return None
 
         async def _execute(sql: str, *args):
@@ -668,7 +597,7 @@ class TestPortAllocation:
         await allocate_port(mock_conn)
 
         lock_call = next((s, a) for s, a in execute_calls if "pg_advisory_lock" in s)
-        assert lock_call[1][0] == _PORT_LOCK_KEY
+        assert lock_call[1][0] == PORT_LOCK_KEY
 
 
 # ---------------------------------------------------------------------------

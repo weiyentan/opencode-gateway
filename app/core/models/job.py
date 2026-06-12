@@ -26,20 +26,14 @@ class JobStatus(str, Enum):
     def validate_transition(current: JobStatus, target: JobStatus) -> bool:
         """Validate whether a transition from *current* to *target* is allowed.
 
-        Allowed transitions:
-            pending → aborting
-            running → aborting
-            aborting → aborted
-
-        All other transitions return ``False``.
+        Delegates to the centralised transition table in
+        :mod:`app.core.lifecycle`.
         """
-        if current == JobStatus.PENDING and target == JobStatus.ABORTING:
-            return True
-        if current == JobStatus.RUNNING and target == JobStatus.ABORTING:
-            return True
-        if current == JobStatus.ABORTING and target == JobStatus.ABORTED:
-            return True
-        return False
+        # Lazy import avoids a module-level circular dependency between
+        #   job.py → lifecycle.py → job.py
+        from app.core.lifecycle import can_transition  # noqa: PLC0415
+
+        return can_transition(current, target)
 
 
 class Job(BaseModel):
