@@ -72,3 +72,28 @@ _Avoid_: Guard, validator, admission control
 ## Flagged ambiguities
 
 - (none yet)
+
+### AWX Executor Plugin
+
+**AWX Job Templates** — Three AWX job templates that map to the ExecutorPlugin lifecycle interface:
+
+| Template | extra_vars | Lifecycle methods |
+|---|---|---|
+| `gateway-create-workspace` | `repo_url`, `branch`, `job_id` | `create_workspace` |
+| `gateway-opencode-lifecycle` | `action: start\|stop\|restart`, `workspace_path` | `start_opencode`, `stop_opencode`, `restart_opencode` |
+| `gateway-workspace-teardown` | `action: collect\|cleanup`, `workspace_path` | `collect_state`, `cleanup_workspace` |
+
+**AWX API Client** — Thin httpx-based client that calls the AWX REST API with a Bearer token. Uses the same pattern as `OpenCodeServeClient`.
+
+**Gateway AWX Configuration** — All env vars use the `GATEWAY_AWX_*` prefix:
+- `GATEWAY_AWX_BASE_URL` — AWX instance URL
+- `GATEWAY_AWX_TOKEN` — AWX API Bearer token
+- `GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID` — Template ID for workspace creation
+- `GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID` — Template ID for opencode lifecycle
+- `GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID` — Template ID for teardown/collect
+- `GATEWAY_AWX_POLL_INTERVAL_SECONDS` — Seconds between poll retries (default 5)
+- `GATEWAY_AWX_TIMEOUT_SECONDS` — Max seconds to wait for a job (default 300)
+
+**AWXApiClient** — Thin httpx-based client that calls the AWX REST API with a Bearer token. Uses the same pattern as `OpenCodeServeClient` with custom exception classes `AWXConnectionError`, `AWXTimeoutError`, `AWXHTTPError`, and `AWXJobError`.
+
+**AWXExecutorPlugin** — Concrete `ExecutorPlugin` implementation that maps the 6 lifecycle methods to AWX job template launches. Receives an `AWXApiClient` instance and template IDs via dependency injection from the executor factory. Does not read env vars directly.
