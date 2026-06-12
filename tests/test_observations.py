@@ -4,48 +4,10 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
 
-from app.core.factory import create_app
-from app.db.session import get_session
+from tests.conftest import mock_row
 
-
-def _mock_row(data: dict):
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    from unittest.mock import MagicMock
-
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    row.get = data.get
-    return row
-
-
-@pytest.fixture
-def mock_conn():
-    """Return a mock asyncpg connection."""
-    return AsyncMock()
-
-
-def _create_client(mock_conn):
-    """Build app with overridden get_session dependency, return httpx AsyncClient."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
-
-
-@pytest.fixture
-def client(mock_conn):
-    """Build app with overridden get_session, return httpx AsyncClient."""
-    return _create_client(mock_conn)
+# mock_conn and client fixtures are auto-discovered from conftest.py
 
 
 class TestIngestObservations:
@@ -85,7 +47,7 @@ class TestIngestObservations:
     async def test_minimal_payload_returns_201(self, client, mock_conn):
         """POST /observations with only required fields returns 201."""
         runner_uuid = uuid.uuid4()
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
         mock_conn.execute = AsyncMock(return_value=None)
 
         async with client as c:
@@ -100,7 +62,7 @@ class TestIngestObservations:
     async def test_full_payload_returns_201(self, client, mock_conn):
         """POST /observations with all optional fields returns 201."""
         runner_uuid = uuid.uuid4()
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
         mock_conn.execute = AsyncMock(return_value=None)
 
         async with client as c:
@@ -115,7 +77,7 @@ class TestIngestObservations:
     async def test_response_structure(self, client, mock_conn):
         """Response contains only status and runner_id fields."""
         runner_uuid = uuid.uuid4()
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
         mock_conn.execute = AsyncMock(return_value=None)
 
         async with client as c:
@@ -139,7 +101,7 @@ class TestIngestObservations:
         async def _fetchrow(sql, *args):
             insert_sql_captured.append(sql)
             insert_args_captured.append(args)
-            return _mock_row({"id": runner_uuid})
+            return mock_row({"id": runner_uuid})
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(return_value=None)
@@ -168,7 +130,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
 
         async def _fetchrow(sql, *args):
-            return _mock_row({"id": runner_uuid})
+            return mock_row({"id": runner_uuid})
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(return_value=None)
@@ -188,7 +150,7 @@ class TestIngestObservations:
             # Reset the call for a clean slate
             mock_conn.fetchrow.reset_mock()
             mock_conn.fetchrow = AsyncMock(
-                side_effect=lambda sql, *args: _mock_row({"id": runner_uuid})
+                side_effect=lambda sql, *args: mock_row({"id": runner_uuid})
             )
 
             # Second call — upserts (updates) existing runner with new hostname
@@ -215,7 +177,7 @@ class TestIngestObservations:
 
         async def _fetchrow(sql, *args):
             insert_args_captured.append(args)
-            return _mock_row({"id": runner_uuid})
+            return mock_row({"id": runner_uuid})
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(return_value=None)
@@ -239,7 +201,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
         execute_calls: list[tuple[str, tuple]] = []
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))
@@ -272,7 +234,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
         execute_calls: list[tuple[str, tuple]] = []
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))
@@ -310,7 +272,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
         execute_calls: list[tuple[str, tuple]] = []
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))
@@ -334,7 +296,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
         execute_calls: list[tuple[str, tuple]] = []
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))
@@ -372,7 +334,7 @@ class TestIngestObservations:
         runner_uuid = uuid.uuid4()
         execute_calls: list[tuple[str, tuple]] = []
 
-        mock_conn.fetchrow = AsyncMock(return_value=_mock_row({"id": runner_uuid}))
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"id": runner_uuid}))
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))

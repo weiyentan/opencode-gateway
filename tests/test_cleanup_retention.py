@@ -12,114 +12,26 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
 
-from app.core.factory import create_app
-from app.db.session import get_session
-from app.executors.factory import get_executor
+from tests.conftest import (
+    create_client,
+    make_job_row,
+    make_workspace_row,
+    mock_row,
+)
+
+# mock_conn and mock_executor fixtures are auto-discovered from conftest.py
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-def _mock_row(data: dict) -> MagicMock:
-    """Return a MagicMock that behaves like an asyncpg Record for dict-like access."""
-    row = MagicMock()
-    row.__getitem__.side_effect = data.__getitem__
-    row.get = data.get
-    return row
-
-
-def _make_workspace_row(
-    workspace_id: uuid.UUID,
-    workspace_name: str = "ws-test",
-    path: str = "/data/workspaces/ws-test",
-    repo_url: str = "https://github.com/example/repo.git",
-    *,
-    pinned: bool = False,
-    cleanup_status: str = "active",
-    cleanup_after: Optional[datetime] = None,
-    created_at: Optional[datetime] = None,
-) -> dict:
-    """Return a dict representing a workspaces table row."""
-    now = created_at or datetime.now(timezone.utc)
-    return {
-        "id": workspace_id,
-        "runner_id": None,
-        "workspace_name": workspace_name,
-        "path": path,
-        "repo_url": repo_url,
-        "branch": None,
-        "port": None,
-        "service_name": None,
-        "pinned": pinned,
-        "cleanup_after": cleanup_after,
-        "cleanup_status": cleanup_status,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-
-def _make_job_row(
-    job_id: uuid.UUID,
-    repo_url: str,
-    task_summary: str,
-    status: str = "pending",
-    *,
-    completed_at: Optional[datetime] = None,
-    opencode_session_id: Optional[str] = None,
-    diff: Optional[str] = None,
-    workspace_name: Optional[str] = None,
-) -> dict:
-    """Return a dict representing a gateway_jobs table row."""
-    now = datetime.now(timezone.utc)
-    return {
-        "id": job_id,
-        "repo_url": repo_url,
-        "task_summary": task_summary,
-        "status": status,
-        "executor_type": "local",
-        "created_at": now,
-        "updated_at": now,
-        "completed_at": completed_at,
-        "opencode_session_id": opencode_session_id,
-        "diff": diff,
-        "workspace_name": workspace_name,
-    }
-
-
-def _create_client(
-    mock_conn: AsyncMock,
-    *,
-    mock_executor: Optional[AsyncMock] = None,
-    mock_opencode_client: Optional[AsyncMock] = None,
-) -> AsyncClient:
-    """Build app with overridden dependencies, return httpx AsyncClient."""
-    from app.api.jobs import get_opencode_client
-
-    app = create_app()
-    mock_pool = AsyncMock()
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-
-    _mock_exec = mock_executor if mock_executor is not None else AsyncMock()
-    app.dependency_overrides[get_executor] = lambda: _mock_exec
-
-    if mock_opencode_client is not None:
-        app.dependency_overrides[get_opencode_client] = lambda: mock_opencode_client
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+# (mock_row, make_job_row, make_workspace_row, create_client are imported from tests.conftest)
 
 
 # ---------------------------------------------------------------------------
@@ -141,39 +53,8 @@ def _patch_settings(**overrides: int):
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures (mock_conn and mock_executor come from conftest.py)
 # ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_conn() -> AsyncMock:
-    """Return a mock asyncpg connection."""
-    return AsyncMock()
-
-
-@pytest.fixture
-def mock_executor() -> AsyncMock:
-    """Return a mock ExecutorPlugin for job lifecycle."""
-    from app.executors.models import (
-        CreateWorkspaceResponse,
-        StartOpencodeResponse,
-    )
-
-    executor = AsyncMock()
-    executor.create_workspace = AsyncMock(
-        return_value=CreateWorkspaceResponse(
-            workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
-            workspace_path="/tmp/opencode/ws",
-            status="ready",
-        )
-    )
-    executor.start_opencode = AsyncMock(
-        return_value=StartOpencodeResponse(
-            session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
-            status="running",
-            port=8080,
-        )
-    )
-    return executor
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +108,14 @@ class TestSuccessfulJobCleanupAfter:
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Fix a bug", status="pending"
         )
 
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -249,7 +130,7 @@ class TestSuccessfulJobCleanupAfter:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        client = _create_client(mock_conn, mock_executor=mock_executor)
+        client = create_client(mock_conn, mock_executor=mock_executor)
 
         async with client as c:
             response = await c.post(
@@ -282,14 +163,14 @@ class TestSuccessfulJobCleanupAfter:
         """When config is overridden, successful job uses the configured value."""
         job_id = uuid.uuid4()
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Fix a bug", status="pending"
         )
 
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -312,7 +193,7 @@ class TestSuccessfulJobCleanupAfter:
 
         # Patch get_settings for this test
         with patch("app.api.jobs.get_settings", _override_settings):
-            client = _create_client(mock_conn, mock_executor=mock_executor)
+            client = create_client(mock_conn, mock_executor=mock_executor)
             async with client as c:
                 response = await c.post(
                     "/jobs",
@@ -348,14 +229,14 @@ class TestFailedJobCleanupAfter:
         """POST /jobs (failure) → workspace cleanup_after = created_at + 168h."""
         job_id = uuid.uuid4()
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Fix a bug", status="pending",
         )
 
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -375,7 +256,7 @@ class TestFailedJobCleanupAfter:
             side_effect=RuntimeError("Workspace creation failed")
         )
 
-        client = _create_client(mock_conn, mock_executor=failing_executor)
+        client = create_client(mock_conn, mock_executor=failing_executor)
 
         async with client as c:
             response = await c.post(
@@ -405,7 +286,7 @@ class TestFailedJobCleanupAfter:
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Fix a bug", status="pending",
         )
 
@@ -426,7 +307,7 @@ class TestFailedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -442,7 +323,7 @@ class TestFailedJobCleanupAfter:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        client = _create_client(mock_conn, mock_executor=mock_start_fail_executor)
+        client = create_client(mock_conn, mock_executor=mock_start_fail_executor)
 
         async with client as c:
             response = await c.post(
@@ -474,7 +355,7 @@ class TestFailedJobCleanupAfter:
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Fix a bug", status="pending",
         )
 
@@ -494,7 +375,7 @@ class TestFailedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -517,7 +398,7 @@ class TestFailedJobCleanupAfter:
             return s
 
         with patch("app.api.jobs.get_settings", _override_settings):
-            client = _create_client(mock_conn, mock_executor=mock_start_fail_executor)
+            client = create_client(mock_conn, mock_executor=mock_start_fail_executor)
             async with client as c:
                 response = await c.post(
                     "/jobs",
@@ -554,7 +435,7 @@ class TestPinnedWorkspaceCleanupAfter:
         """Pinning a workspace sets cleanup_after = NULL."""
         ws_id = uuid.uuid4()
         created = datetime.now(timezone.utc)
-        row_data = _make_workspace_row(
+        row_data = make_workspace_row(
             ws_id,
             pinned=False,
             cleanup_after=created + timedelta(hours=72),
@@ -564,7 +445,7 @@ class TestPinnedWorkspaceCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -575,7 +456,7 @@ class TestPinnedWorkspaceCleanupAfter:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -600,7 +481,7 @@ class TestPinnedWorkspaceCleanupAfter:
         """Unpinning a workspace resets cleanup_after using success retention."""
         ws_id = uuid.uuid4()
         created = datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
-        row_data = _make_workspace_row(
+        row_data = make_workspace_row(
             ws_id,
             pinned=True,
             cleanup_after=None,
@@ -610,7 +491,7 @@ class TestPinnedWorkspaceCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -620,7 +501,7 @@ class TestPinnedWorkspaceCleanupAfter:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -644,14 +525,14 @@ class TestPinnedWorkspaceCleanupAfter:
     ) -> None:
         """Pinning an already-pinned workspace keeps cleanup_after as NULL."""
         ws_id = uuid.uuid4()
-        row_data = _make_workspace_row(
+        row_data = make_workspace_row(
             ws_id,
             pinned=True,
             cleanup_after=None,
         )
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(row_data)
+            return mock_row(row_data)
 
         async def _execute(sql: str, *args):
             if "UPDATE workspaces SET pinned" in sql:
@@ -662,7 +543,7 @@ class TestPinnedWorkspaceCleanupAfter:
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/workspaces/{ws_id}/pin")
@@ -690,7 +571,7 @@ class TestAbortedJobCleanupAfter:
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Abort me",
             status="running",
             opencode_session_id="sess-123",
@@ -700,7 +581,7 @@ class TestAbortedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -724,7 +605,7 @@ class TestAbortedJobCleanupAfter:
         mock_exec.stop_opencode = AsyncMock()
         mock_exec.cleanup_workspace = AsyncMock()
 
-        client = _create_client(
+        client = create_client(
             mock_conn,
             mock_executor=mock_exec,
             mock_opencode_client=mock_opencode,
@@ -753,7 +634,7 @@ class TestAbortedJobCleanupAfter:
         """Aborting a job with no workspace_name does not emit a workspace UPDATE."""
         job_id = uuid.uuid4()
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Abort no ws",
             status="pending",
             opencode_session_id=None,
@@ -763,7 +644,7 @@ class TestAbortedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -773,7 +654,7 @@ class TestAbortedJobCleanupAfter:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
@@ -795,7 +676,7 @@ class TestAbortedJobCleanupAfter:
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 
-        job_row_data = _make_job_row(
+        job_row_data = make_job_row(
             job_id, "https://github.com/org/repo", "Abort no client",
             status="running",
             opencode_session_id="sess-noclient",
@@ -805,7 +686,7 @@ class TestAbortedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
-            return _mock_row(job_row_data)
+            return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
@@ -818,7 +699,7 @@ class TestAbortedJobCleanupAfter:
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
         # No opencode client → default get_opencode_client returns None → direct abort
-        client = _create_client(mock_conn)
+        client = create_client(mock_conn)
 
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
