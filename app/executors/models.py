@@ -33,11 +33,17 @@ class WorkspaceState(str, Enum):
 
 
 class CreateWorkspaceRequest(BaseModel):
-    """Request to provision a workspace directory for a new job."""
+    """Request to provision a workspace directory for a new job.
+
+    *runner_id* is an optional hint that allows the Gateway to pre-select
+    which runner (VM) should host the workspace.  When provided, the
+    executor should create the workspace on the specified runner.
+    """
 
     repo_url: str
     branch: Optional[str] = None
     job_id: Optional[UUID] = None
+    runner_id: Optional[str] = None
 
 
 class CreateWorkspaceResponse(BaseModel):

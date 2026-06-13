@@ -120,44 +120,25 @@ def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
-async def _resolve_runner_id_for_workspace(
-    conn: asyncpg.Connection,
-    workspace_id: uuid.UUID,
-) -> Optional[str]:
-    """Resolve a workspace ID to its runner's text identifier.
+async def _resolve_target_runner(conn: asyncpg.Connection) -> Optional[str]:
+    """Select a target runner for a new job — any HEALTHY runner.
 
-    Looks up the workspace's ``runner_id`` (UUID FK) in the workspaces
-    table, then resolves it to the ``runners.runner_id`` text field.
-    Returns ``None`` when the workspace or runner is not found.
+    Queries the ``runners`` table for a runner whose status is
+    ``HEALTHY``.  Returns the text ``runner_id`` column value, or
+    ``None`` when no HEALTHY runner is available.
+
+    The caller is expected to run the pre-flight policy check against
+    the returned runner *before* provisioning a workspace on it.
     """
-    # Get the runner UUID from the workspace row.
-    ws_row = await conn.fetchrow(
-        "SELECT runner_id FROM workspaces WHERE id = $1",
-        workspace_id,
+    row = await conn.fetchrow(
+        "SELECT runner_id FROM runners WHERE status = 'HEALTHY' LIMIT 1"
     )
-    if ws_row is None or ws_row.get("runner_id") is None:
-        logger.debug(
-            "No runner_id for workspace %s — skipping policy check",
-            workspace_id,
-        )
+    if row is None:
+        logger.warning("No HEALTHY runner available — policy check skipped")
         return None
-
-    runner_uuid = ws_row["runner_id"]
-
-    # Resolve to the text runner_id.
-    runner_row = await conn.fetchrow(
-        "SELECT runner_id FROM runners WHERE id = $1",
-        runner_uuid,
-    )
-    if runner_row is None:
-        logger.warning(
-            "Runner UUID %s referenced by workspace %s not found",
-            runner_uuid,
-            workspace_id,
-        )
-        return None
-
-    return runner_row["runner_id"]
+    # Use .get() so the lookup is resilient against mock rows that do not
+    # carry a 'runner_id' key (common in tests that reuse generic mocks).
+    return row.get("runner_id")
 
 
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -194,11 +175,19 @@ async def create_job(
     )
 
     try:
-        # 3. Create workspace and store its ID (before potentially-failing start)
+        # 3. Resolve a target runner and run pre-flight policy check.
+        #    This MUST run before any infrastructure action — see ADR 0002.
+        runner_text_id = await _resolve_target_runner(conn)
+        if runner_text_id is not None:
+            policy = ObservationBasedPolicy(settings)
+            await policy.check(runner_text_id, conn=conn)
+
+        # 4. Create workspace on the selected runner (only after policy passes)
         ws_response = await executor.create_workspace(
             CreateWorkspaceRequest(
                 repo_url=str(body.repo_url),
                 job_id=job_id,
+                runner_id=runner_text_id,
             )
         )
         new_workspace_id = ws_response.workspace_id
@@ -211,14 +200,7 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 3b. Run pre-flight policy check — resolves workspace → runner and
-        # inspects runner observations for disk/memory pressure.
-        runner_text_id = await _resolve_runner_id_for_workspace(conn, new_workspace_id)
-        if runner_text_id is not None:
-            policy = ObservationBasedPolicy(settings)
-            await policy.check(runner_text_id, conn=conn)
-
-        # 4. Start OpenCode Serve
+        # 5. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
@@ -234,7 +216,7 @@ async def create_job(
             session_id,
         )
 
-        # 5. Mark completed
+        # 6. Mark completed
         now = datetime.now(timezone.utc)
         diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
@@ -246,13 +228,13 @@ async def create_job(
             diff_summary,
         )
 
-        # 6. Set workspace cleanup_after for successful completion
+        # 7. Set workspace cleanup_after for successful completion
         if new_workspace_id is not None:
             await _set_workspace_cleanup_after(
                 conn, new_workspace_id, settings.cleanup_success_retention_hours
             )
 
-        # 7. Fetch and persist the diff (non-blocking — failure does not fail the job)
+        # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
             try:
                 diff_response = await opencode_client.get_session_diff(session_id)
@@ -276,33 +258,17 @@ async def create_job(
                 )
 
     except PolicyViolation:
-        # Policy rejected the job before dispatch — mark as failed and re-raise
-        # the 503 so FastAPI can return it to the caller.
+        # Policy rejected the job BEFORE any infrastructure action was taken.
+        # Mark as failed and re-raise the 503 — no workspace to clean up.
         logger.warning(
-            "Policy check rejected job %s: %s",
+            "Policy check rejected job %s before workspace creation",
             job_id,
-            "disk/memory pressure",
         )
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),
         )
-        if new_workspace_id is not None:
-            await _set_workspace_cleanup_after(
-                conn, new_workspace_id, settings.cleanup_failure_retention_hours
-            )
-            try:
-                await executor.cleanup_workspace(
-                    CleanupWorkspaceRequest(workspace_id=new_workspace_id)
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to clean up workspace for policy-rejected job %s "
-                    "(workspace %s)",
-                    job_id,
-                    new_workspace_id,
-                )
         raise
 
     except Exception:
@@ -322,7 +288,7 @@ async def create_job(
                     conn, ws_id, settings.cleanup_failure_retention_hours
                 )
 
-    # 7. Return final state
+    # 9. Return final state
     row = await _fetch_job(conn, job_id)
     return JobResponse(
         id=row["id"],

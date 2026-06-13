@@ -308,28 +308,23 @@ class TestJobDispatch:
     async def test_create_job_returns_503_when_policy_rejects_runner(
         self, mock_conn, mock_executor
     ):
-        """POST /jobs returns 503 when ObservationBasedPolicy.check raises PolicyViolation."""
+        """POST /jobs returns 503 when ObservationBasedPolicy.check raises PolicyViolation.
+
+        The policy check runs before workspace creation, so no
+        executor.create_workspace() or cleanup_workspace() call is made.
+        """
         from unittest.mock import patch
 
         from app.policy import ObservationBasedPolicy, PolicyViolation
 
-        job_id = uuid.uuid4()
-        workspace_uuid = uuid.uuid4()
-        runner_uuid = uuid.uuid4()
-
-        # Build mock rows for _resolve_runner_id_for_workspace queries
-        ws_row = mock_row({"runner_id": runner_uuid})
-        runner_row = mock_row({"runner_id": "test-runner-99"})
+        # Mock _resolve_target_runner: return a HEALTHY runner
+        async def _fetchrow(sql, *args):
+            if "FROM runners WHERE status = 'HEALTHY'" in sql:
+                return mock_row({"runner_id": "test-runner-99"})
+            return None
 
         async def _execute(sql, *args):
             pass
-
-        async def _fetchrow(sql, *args):
-            if "workspaces" in sql and "runner_id" in sql:
-                return ws_row
-            if "FROM runners WHERE id" in sql:
-                return runner_row
-            return None
 
         mock_conn.execute = AsyncMock(side_effect=_execute)
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -364,8 +359,9 @@ class TestJobDispatch:
         assert "disk" in data["detail"]["message"]
         assert "80%" in data["detail"]["message"]
 
-        # Verify executor cleanup was triggered on the created workspace
-        mock_executor.cleanup_workspace.assert_awaited_once()
+        # Policy check runs before workspace creation — no executor calls
+        mock_executor.create_workspace.assert_not_called()
+        mock_executor.cleanup_workspace.assert_not_called()
 
 
 class TestApproveJob:
