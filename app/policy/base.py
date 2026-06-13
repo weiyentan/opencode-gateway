@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import asyncpg
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyViolation(HTTPException):
@@ -76,3 +80,57 @@ class PreflightPolicy(Protocol):
             creation.
         """
         ...
+
+
+# ── Alert infrastructure ────────────────────────────────────────────────
+
+
+@dataclass
+class Alert:
+    """A structured alert emitted when a policy threshold is breached.
+
+    Carries all contextual information needed by downstream alert
+    handlers (logging, webhooks, Slack, email, etc.).  The ``level``
+    defaults to ``"WARNING"`` but can be overridden for higher-severity
+    conditions.
+    """
+
+    runner_id: str
+    metric: str
+    current_value: float
+    threshold: float
+    level: str = "WARNING"
+
+
+@runtime_checkable
+class AlertHandler(Protocol):
+    """Protocol for pluggable alert handlers.
+
+    Alert handlers receive structured :class:`Alert` instances and can
+    route them to any destination: logs, webhooks, Slack, email, etc.
+    The protocol requires only an async ``__call__``, making it
+    compatible with simple callables, classes, and dependency-injected
+    services.
+    """
+
+    async def __call__(self, alert: Alert) -> None: ...
+
+
+class LoggingAlertHandler:
+    """Default alert handler — logs alerts at WARNING level.
+
+    Produces structured log entries (``policy_alert`` key=value format)
+    that can be ingested by log aggregation systems.  This handler is
+    always enabled unless explicitly replaced.
+    """
+
+    async def __call__(self, alert: Alert) -> None:
+        logger.warning(
+            "policy_alert runner_id=%s metric=%s current_value=%.1f "
+            "threshold=%.0f level=%s",
+            alert.runner_id,
+            alert.metric,
+            alert.current_value,
+            alert.threshold,
+            alert.level,
+        )

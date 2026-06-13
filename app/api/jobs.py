@@ -732,3 +732,81 @@ async def get_job_diff(
             "diff": row["diff"],
         },
     )
+
+
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+) -> JSONResponse:
+    """Return the full log output for a job by proxying to its OpenCode session.
+
+    Retrieves the session log from the OpenCode Serve API.  Returns 404
+    when the job does not exist, 409 when the job has no associated session,
+    and 424 when the session exists but has not started yet (status is
+    still pending/created/queued).
+    """
+    # 1. Look up the job
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # 2. Check for an associated session
+    session_id: Optional[str] = row.get("opencode_session_id")
+    if not session_id:
+        raise HTTPException(
+            status_code=409,
+            detail="No session associated with this job",
+        )
+
+    # 3. Require an OpenCode client to fetch logs
+    if opencode_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve client not available",
+        )
+
+    # 4. Get session info to check status
+    try:
+        session_info = await opencode_client.get_session(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to get session info for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve unreachable",
+        )
+
+    # 5. Check whether the session has started (424 when still pending)
+    if session_info.status in ("pending", "created", "queued"):
+        raise HTTPException(
+            status_code=424,
+            detail=f"Session has not started yet (status: {session_info.status})",
+        )
+
+    # 6. Fetch the session log
+    try:
+        log_response = await opencode_client.get_session_log(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to get session log for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to retrieve session logs",
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "job_id": str(job_id),
+            "session_id": session_id,
+            "log": log_response.log,
+        },
+    )

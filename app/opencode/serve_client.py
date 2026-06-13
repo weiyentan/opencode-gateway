@@ -17,6 +17,7 @@ from app.opencode.protocol import (
     SessionDiffResponse,
     SessionInfo,
     SessionListResponse,
+    SessionLogResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,18 @@ class OpenCodeServeClient(OpenCodeClientProtocol):
         """
         response = await self._request("DELETE", f"/session/{session_id}")
         return SessionAbortResponse(**response.json())
+
+    async def get_session_log(self, session_id: str) -> SessionLogResponse:
+        """Retrieve the full log output of a session.
+
+        Args:
+            session_id: The unique identifier of the session.
+
+        Returns:
+            SessionLogResponse containing the session's full log output.
+        """
+        response = await self._request("GET", f"/session/{session_id}/log")
+        return SessionLogResponse(**response.json())
 
     async def get_session_diff(self, session_id: str) -> SessionDiffResponse:
         """Retrieve the diff produced by a session.
