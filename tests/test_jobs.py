@@ -2564,3 +2564,379 @@ class TestRunnerSelection:
         assert response.status_code == 201
         data = response.json()
         assert data["status"] == "completed"
+class TestJobLogs:
+    """Tests for GET /jobs/{id}/logs (log retrieval via OpenCode Serve proxy)."""
+
+    @pytest.mark.asyncio
+    async def test_get_logs_returns_full_log_output(self, mock_conn):
+        """GET /jobs/{id}/logs returns 200 with full log content from the session."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-logs-1"
+        log_content = (
+            "INFO: Starting session...\n"
+            "INFO: Cloning repository...\n"
+            "INFO: Running analysis...\n"
+            "INFO: Session complete.\n"
+        )
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Run logging task",
+            status="completed",
+            opencode_session_id=session_id,
+            completed_at=now,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="completed",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["job_id"] == str(job_id)
+        assert data["session_id"] == session_id
+        assert data["log"] == log_content
+
+        # Verify the OpenCode client was called correctly
+        mock_opencode.get_session.assert_called_once_with(session_id)
+        mock_opencode.get_session_log.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_unknown_job_returns_404(self, client, mock_conn):
+        """GET /jobs/{id}/logs for a non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{uuid.uuid4()}/logs")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_logs_no_session_returns_409(self, mock_conn):
+        """GET /jobs/{id}/logs for a job with no session returns 409."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No session yet",
+            status="pending",
+            opencode_session_id=None,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 409
+        assert "detail" in response.json()
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_not_started_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'pending' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-pending"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Pending session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="pending",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+        assert "detail" in response.json()
+        assert "pending" in response.json()["detail"]
+
+        # get_session was called but get_session_log was not
+        mock_opencode.get_session.assert_called_once_with(session_id)
+        assert not mock_opencode.get_session_log.called
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_created_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'created' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-created"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Created session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="created",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_queued_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'queued' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-queued"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Queued session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="queued",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+
+    @pytest.mark.asyncio
+    async def test_get_logs_no_opencode_client_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs without an OpenCode client returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-no-client"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No client",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        # No opencode client injected
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503
+        assert "detail" in response.json()
+
+    @pytest.mark.asyncio
+    async def test_get_logs_opencode_unreachable_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs when OpenCode Serve is unreachable returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-down"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Serve down",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            side_effect=RuntimeError("Connection refused")
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_logs_invalid_uuid_returns_422(self, client):
+        """GET /jobs/{id}/logs with a malformed UUID returns 422."""
+        async with client as c:
+            response = await c.get("/jobs/not-a-uuid/logs")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_running_session_returns_logs(self, mock_conn):
+        """GET /jobs/{id}/logs for a running session returns 200 with logs."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-running"
+        log_content = "Running analysis step 1/10...\n"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Running task",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="running",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["log"] == log_content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_failed_session_returns_logs(self, mock_conn):
+        """GET /jobs/{id}/logs for a failed session returns 200 with logs."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-failed"
+        log_content = "ERROR: Task failed at step 3\n"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Failed task",
+            status="failed",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="failed",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["log"] == log_content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_log_fetch_failure_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs when get_session_log raises returns 503."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-log-fail"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Log fetch failure",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="running",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            side_effect=RuntimeError("Log service unavailable")
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503
