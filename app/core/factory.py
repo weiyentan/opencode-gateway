@@ -103,6 +103,25 @@ def create_app(
         lifespan=lifespan,
     )
 
+    # ── Middleware (applied in registration order — last added runs first) ──
+    from app.core.auth import ApiKeyMiddleware
+    from app.core.envelope import ResponseEnvelopeMiddleware
+
+    app.add_middleware(ApiKeyMiddleware)
+    app.add_middleware(ResponseEnvelopeMiddleware)
+
+    # ── Exception handlers ──────────────────────────────────────────────
+    from starlette.exceptions import HTTPException
+    from fastapi.exceptions import RequestValidationError
+
+    from app.core.envelope import (
+        http_exception_handler,
+        validation_exception_handler,
+    )
+
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+
     from app.api.health import router as health_router
     from app.api.jobs import router as jobs_router
     from app.api.observations import router as observations_router

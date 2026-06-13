@@ -54,7 +54,7 @@ class TestIngestObservations:
             response = await c.post("/observations", json=self.MINIMAL_PAYLOAD)
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "ok"
         assert data["runner_id"] == "runner-alpha-1"
 
@@ -69,7 +69,7 @@ class TestIngestObservations:
             response = await c.post("/observations", json=self.FULL_PAYLOAD)
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "ok"
         assert data["runner_id"] == "runner-beta-2"
 
@@ -84,7 +84,7 @@ class TestIngestObservations:
             response = await c.post("/observations", json=self.MINIMAL_PAYLOAD)
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert set(data.keys()) == {"status", "runner_id"}
 
     # ------------------------------------------------------------------

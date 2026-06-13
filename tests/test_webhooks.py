@@ -102,7 +102,7 @@ class TestCreateWebhook:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert "id" in data
         assert data["url"] == "https://example.com/callback"
         assert data["events"] == ["job.completed", "job.failed"]
@@ -127,7 +127,7 @@ class TestCreateWebhook:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["events"] == ["job.completed"]
 
     @pytest.mark.asyncio
@@ -187,7 +187,7 @@ class TestListWebhooks:
             response = await c.get("/webhooks")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert isinstance(data, list)
         assert len(data) == 0
 
@@ -215,7 +215,7 @@ class TestListWebhooks:
             response = await c.get("/webhooks")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 1
         assert data[0]["id"] == str(webhook_id)
         assert data[0]["url"] == "https://example.com/callback"
@@ -546,7 +546,7 @@ class TestWebhookIntegration:
                 )
 
             assert response.status_code == 201
-            data = response.json()
+            data = response.json()["data"]
             assert data["status"] == "completed"
 
             # dispatch_webhooks should have been called
@@ -626,7 +626,7 @@ class TestWebhookIntegration:
                 )
 
             assert response.status_code == 201
-            data = response.json()
+            data = response.json()["data"]
             assert data["status"] == "failed"
 
             # dispatch_webhooks should have been called for failure

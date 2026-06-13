@@ -281,7 +281,7 @@ class TestFailedJobCleanupAfter:
             )
 
         assert response.status_code == 201
-        assert response.json()["status"] == "failed"
+        assert response.json()["data"]["status"] == "failed"
 
         # The job has no workspace_name because the executor failed before creating it,
         # so no workspace update should be emitted
@@ -354,7 +354,7 @@ class TestFailedJobCleanupAfter:
             )
 
         assert response.status_code == 201
-        assert response.json()["status"] == "failed"
+        assert response.json()["data"]["status"] == "failed"
 
         ws_updates = [
             (sql, args) for sql, args in execute_calls
@@ -434,7 +434,7 @@ class TestFailedJobCleanupAfter:
                 )
 
         assert response.status_code == 201
-        assert response.json()["status"] == "failed"
+        assert response.json()["data"]["status"] == "failed"
 
         ws_updates = [
             (sql, args) for sql, args in execute_calls
@@ -487,7 +487,7 @@ class TestPinnedWorkspaceCleanupAfter:
             response = await c.post(f"/workspaces/{ws_id}/pin")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["pinned"] is True
         assert data["cleanup_after"] is None
 
@@ -532,7 +532,7 @@ class TestPinnedWorkspaceCleanupAfter:
             response = await c.post(f"/workspaces/{ws_id}/pin")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["pinned"] is False
         assert data["cleanup_after"] is not None
 
@@ -575,7 +575,7 @@ class TestPinnedWorkspaceCleanupAfter:
 
         assert response.status_code == 200
         # The pin toggled: was True, now False → cleanup_after gets set
-        data = response.json()
+        data = response.json()["data"]
         assert data["pinned"] is False
         assert data["cleanup_after"] is not None
 
@@ -640,7 +640,7 @@ class TestAbortedJobCleanupAfter:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "aborted"
+        assert response.json()["data"]["status"] == "aborted"
 
         # Verify cleanup_after UPDATE was called
         ws_updates = [
@@ -685,7 +685,7 @@ class TestAbortedJobCleanupAfter:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "aborted"
+        assert response.json()["data"]["status"] == "aborted"
 
         ws_updates = [
             (sql, args) for sql, args in execute_calls
@@ -730,7 +730,7 @@ class TestAbortedJobCleanupAfter:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "aborted"
+        assert response.json()["data"]["status"] == "aborted"
 
         ws_updates = [
             (sql, args) for sql, args in execute_calls
