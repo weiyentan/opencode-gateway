@@ -54,3 +54,11 @@ CREATE TABLE IF NOT EXISTS job_events (
     previous_status TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id              UUID PRIMARY KEY,
+    url             TEXT NOT NULL,
+    events          TEXT[] NOT NULL DEFAULT '{}',
+    secret          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
