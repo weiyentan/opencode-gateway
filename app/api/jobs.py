@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
+from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
-from app.db.session import get_session
+from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
 from app.executors.models import (
@@ -31,6 +32,11 @@ from app.policy import ObservationBasedPolicy, PolicyViolation
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["jobs"])
+
+
+async def _get_pool(request: Request) -> DatabasePool:
+    """FastAPI dependency that returns the database pool for background tasks."""
+    return request.app.state.pool  # type: ignore[return-value]
 
 
 class JobCreateRequest(BaseModel):
@@ -49,9 +55,9 @@ class JobResponse(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
-    completed_at: Optional[datetime] = None
-    opencode_session_id: Optional[str] = None
-    diff: Optional[str] = None
+    completed_at: datetime | None = None
+    opencode_session_id: str | None = None
+    diff: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -61,7 +67,7 @@ class JobEvent(BaseModel):
     timestamp: datetime
     actor: str
     details: str
-    previous_status: Optional[str] = None
+    previous_status: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -80,7 +86,7 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
     )
 
 
-async def get_opencode_client() -> Optional[OpenCodeClientProtocol]:
+async def get_opencode_client() -> OpenCodeClientProtocol | None:
     """Dependency that returns the OpenCode client for diff fetching.
 
     Returns None by default; tests override this via
@@ -105,11 +111,11 @@ async def _set_workspace_cleanup_after(
         "updated_at = $3 WHERE id = $1",
         workspace_id,
         timedelta(hours=retention_hours),
-        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),  # noqa: UP017
     )
 
 
-def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
+def _resolve_workspace_id(workspace_name: str | None) -> uuid.UUID | None:
     """Parse the *workspace_name* column (stored as a string UUID) back to a UUID."""
     if not workspace_name:
         return None
@@ -123,7 +129,7 @@ def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
 async def _resolve_runner_id_for_workspace(
     conn: asyncpg.Connection,
     workspace_id: uuid.UUID,
-) -> Optional[str]:
+) -> str | None:
     """Resolve a workspace ID to its runner's text identifier.
 
     Looks up the workspace's ``runner_id`` (UUID FK) in the workspaces
@@ -164,8 +170,9 @@ async def _resolve_runner_id_for_workspace(
 async def create_job(
     body: JobCreateRequest,
     conn: asyncpg.Connection = Depends(get_session),
+    pool: DatabasePool = Depends(_get_pool),
     executor: ExecutorPlugin = Depends(get_executor),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JobResponse:
     """Create a new job, dispatch via executor, and return the final state."""
     job_id = uuid.uuid4()
@@ -190,7 +197,7 @@ async def create_job(
     await conn.execute(
         "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
         job_id,
-        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),  # noqa: UP017
     )
 
     try:
@@ -235,7 +242,7 @@ async def create_job(
         )
 
         # 5. Mark completed
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)  # noqa: UP017
         diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
@@ -244,6 +251,24 @@ async def create_job(
             now,
             now,
             diff_summary,
+        )
+
+        # Fire webhooks asynchronously — non-blocking
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.completed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.completed",
+                    "status": "completed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": now.isoformat(),
+                    "diff": diff_summary,
+                },
+            )
         )
 
         # 6. Set workspace cleanup_after for successful completion
@@ -286,8 +311,27 @@ async def create_job(
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),  # noqa: UP017
         )
+
+        # Fire webhooks asynchronously for policy-rejected jobs
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                    "error": "Policy rejected: disk/memory pressure",
+                },
+            )
+        )
+
         if new_workspace_id is not None:
             await _set_workspace_cleanup_after(
                 conn, new_workspace_id, settings.cleanup_failure_retention_hours
@@ -310,7 +354,24 @@ async def create_job(
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
+
+        # Fire webhooks asynchronously for failed jobs
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                },
+            )
         )
 
         # Set workspace cleanup_after for failure
@@ -359,7 +420,7 @@ async def approve_job(
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
 
     # Record approval
     approval_id = uuid.uuid4()
@@ -423,7 +484,7 @@ async def reject_job(
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
 
     # Record rejection
     approval_id = uuid.uuid4()
@@ -471,7 +532,7 @@ async def abort_job(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JobResponse:
     """Abort a job by cancelling its OpenCode session and marking it aborted.
 
@@ -501,7 +562,7 @@ async def abort_job(
             ),
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     session_id = row.get("opencode_session_id")
     previous_status = row["status"]  # capture before transition
 
@@ -522,7 +583,7 @@ async def abort_job(
             await conn.execute(
                 "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
                 job_id,
-                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),  # noqa: UP017
             )
             aborted = True
         except Exception:
