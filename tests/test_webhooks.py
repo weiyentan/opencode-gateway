@@ -508,6 +508,12 @@ class TestWebhookIntegration:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
+                if "LEFT JOIN workspaces" in sql:
+                    return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+                if "FROM runners WHERE id" in sql:
+                    return mock_row({"runner_id": "test-runner"})
+                if "FROM runner_observations" in sql:
+                    return None
                 if "gateway_jobs" in sql:
                     return mock_row(row_data)
                 return None
@@ -576,6 +582,12 @@ class TestWebhookIntegration:
 
         async def _fetchrow(sql, *args):
             if "SELECT" in sql.upper():
+                if "LEFT JOIN workspaces" in sql:
+                    return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+                if "FROM runners WHERE id" in sql:
+                    return mock_row({"runner_id": "test-runner"})
+                if "from runner_observations" in sql:
+                    return None
                 if "gateway_jobs" in sql:
                     return mock_row(row_data)
                 return None

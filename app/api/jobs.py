@@ -1,10 +1,10 @@
 """Job API endpoints — create, retrieve, and monitor coding jobs."""
 
-from __future__ import annotations
-
 import asyncio
+import json
 import logging
 import uuid
+from typing import Optional
 from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
@@ -46,6 +46,8 @@ class JobCreateRequest(BaseModel):
     or request a runner that matches a set of label constraints
     (``labels``).  When neither is provided the Gateway auto-selects the
     best available runner via :func:`select_runner`.
+
+    ``env_vars`` are environment variables to pass to the OpenCode session.
     """
 
     repo_url: HttpUrl = Field(description="URL of the repository to work on")
@@ -61,6 +63,7 @@ class JobCreateRequest(BaseModel):
         "must exist as a key in the runner's labels JSONB column. "
         "Ignored when ``runner_id`` is provided.",
     )
+    env_vars: dict[str, str] = {}
 
 
 class JobResponse(BaseModel):
@@ -286,13 +289,14 @@ async def create_job(
     # 1. Insert the job record in pending state
     await conn.execute(
         "INSERT INTO gateway_jobs "
-        "(id, repo_url, task_summary, status, executor_type, runner_id) "
-        "VALUES ($1, $2, $3, 'pending', $4, $5)",
+        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
         resolved_runner_id,
+        json.dumps(body.env_vars) if body.env_vars else "{}",
     )
 
     # 2. Validate and perform pending → running transition
@@ -306,6 +310,8 @@ async def create_job(
         job_id,
         datetime.now(timezone.utc),  # noqa: UP017
     )
+
+    new_workspace_id = None
 
     try:
         # Resolve the selected runner's text ID for pre-flight policy check.
@@ -327,6 +333,7 @@ async def create_job(
                 repo_url=str(body.repo_url),
                 job_id=job_id,
                 runner_id=runner_text_id,
+                env_vars=body.env_vars,
             )
         )
         new_workspace_id = ws_response.workspace_id
@@ -344,6 +351,7 @@ async def create_job(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
+                env_vars=body.env_vars,
             )
         )
         session_id = str(start_response.session_id)

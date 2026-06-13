@@ -53,6 +53,7 @@ class TestCreateJob:
                 json={
                     "repo_url": "https://github.com/org/repo",
                     "task_summary": "Fix a bug",
+                    "env_vars": {},
                 },
             )
 
@@ -90,6 +91,39 @@ class TestCreateJob:
                 },
             )
         assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_env_vars(self, client, mock_conn):
+        """POST /jobs with env_vars should store and pass them through."""
+        import json
+
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Task with env vars",
+            env_vars={"MY_VAR": "my_value", "LOG_LEVEL": "debug"},
+        )
+        mock_conn.execute = AsyncMock(return_value=None)
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Task with env vars",
+                    "env_vars": {"MY_VAR": "my_value", "LOG_LEVEL": "debug"},
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["repo_url"] == "https://github.com/org/repo"
+        assert data["task_summary"] == "Task with env vars"
+
+        # Verify env_vars was passed in the INSERT statement (7th positional arg)
+        insert_call = mock_conn.execute.call_args_list[0]
+        assert "INSERT INTO gateway_jobs" in str(insert_call)
+        assert insert_call.args[6] == json.dumps({"MY_VAR": "my_value", "LOG_LEVEL": "debug"})
 
 
 class TestGetJob:

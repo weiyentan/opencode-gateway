@@ -38,12 +38,15 @@ class CreateWorkspaceRequest(BaseModel):
     *runner_id* is an optional hint that allows the Gateway to pre-select
     which runner (VM) should host the workspace.  When provided, the
     executor should create the workspace on the specified runner.
+
+    *env_vars* are environment variables to pass to the OpenCode session.
     """
 
     repo_url: str
     branch: Optional[str] = None
     job_id: Optional[UUID] = None
     runner_id: Optional[str] = None
+    env_vars: dict[str, str] = {}
 
 
 class CreateWorkspaceResponse(BaseModel):
@@ -60,10 +63,14 @@ class CreateWorkspaceResponse(BaseModel):
 
 
 class StartOpencodeRequest(BaseModel):
-    """Request to start the OpenCode Serve process for a workspace."""
+    """Request to start the OpenCode Serve process for a workspace.
+
+    *env_vars* are environment variables to pass to the OpenCode session.
+    """
 
     workspace_id: UUID
     workspace_path: Optional[str] = None
+    env_vars: dict[str, str] = {}
 
 
 class StartOpencodeResponse(BaseModel):
