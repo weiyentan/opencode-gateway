@@ -1,19 +1,23 @@
-"""Runner API endpoints — list runners and retrieve runner details."""
+"""Runner API endpoints — list runners, retrieve runner details, and manage runner status."""
 
 from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status as http_status
+from pydantic import BaseModel, Field
 
 from app.db.session import get_session
 from app.policy.observation import (
     RUNNER_STATUS_BLOCKED_DISK,
     RUNNER_STATUS_BLOCKED_MEMORY,
+    RUNNER_STATUS_HEALTHY,
+    RUNNER_STATUS_MAINTENANCE,
+    RUNNER_STATUS_OFFLINE,
+    RUNNER_STATUS_ONLINE,
     RUNNER_STATUS_UNKNOWN,
 )
 
@@ -192,7 +196,105 @@ def _derive_policy_status(runner_status: str) -> tuple[str, str]:
         return ("BLOCKED_MEMORY_PRESSURE", "Runner has memory pressure")
     if runner_status == RUNNER_STATUS_UNKNOWN:
         return ("UNKNOWN", "Runner observations are stale")
+    if runner_status == RUNNER_STATUS_OFFLINE:
+        return ("OFFLINE", "Runner is manually set offline")
+    if runner_status == RUNNER_STATUS_MAINTENANCE:
+        return ("MAINTENANCE", "Runner is in maintenance mode")
+    if runner_status == RUNNER_STATUS_ONLINE:
+        return ("ONLINE", "Runner is manually set online")
     return ("HEALTHY", "Runner is healthy")
+
+
+# ---------------------------------------------------------------------------
+# Status transition validation
+# ---------------------------------------------------------------------------
+
+# Valid status transitions for POST /runners/{runner_id}/status.
+# The *keys* are the target statuses; the *values* are the set of
+# allowed source statuses.
+_VALID_TRANSITIONS: dict[str, frozenset[str]] = {
+    RUNNER_STATUS_OFFLINE: frozenset({
+        RUNNER_STATUS_HEALTHY,
+        RUNNER_STATUS_BLOCKED_DISK,
+        RUNNER_STATUS_BLOCKED_MEMORY,
+        RUNNER_STATUS_UNKNOWN,
+        RUNNER_STATUS_ONLINE,
+        RUNNER_STATUS_MAINTENANCE,
+    }),
+    RUNNER_STATUS_MAINTENANCE: frozenset({
+        RUNNER_STATUS_HEALTHY,
+        RUNNER_STATUS_BLOCKED_DISK,
+        RUNNER_STATUS_BLOCKED_MEMORY,
+        RUNNER_STATUS_UNKNOWN,
+        RUNNER_STATUS_ONLINE,
+        RUNNER_STATUS_OFFLINE,
+    }),
+    RUNNER_STATUS_ONLINE: frozenset({
+        RUNNER_STATUS_OFFLINE,
+        RUNNER_STATUS_MAINTENANCE,
+    }),
+}
+
+_VALID_TARGET_STATUSES: frozenset[str] = frozenset(_VALID_TRANSITIONS.keys())
+
+
+def _validate_status_transition(
+    current_status: str,
+    target_status: str,
+    runner_id: uuid.UUID,
+) -> None:
+    """Validate that *target_status* is a valid transition from *current_status*.
+
+    Raises :class:`HTTPException` (422) when the transition is not allowed.
+    """
+    if target_status not in _VALID_TARGET_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid target status '{target_status}'. "
+                f"Allowed values: {', '.join(sorted(_VALID_TARGET_STATUSES))}"
+            ),
+        )
+
+    allowed_sources = _VALID_TRANSITIONS[target_status]
+    if current_status not in allowed_sources:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Cannot transition from '{current_status}' to '{target_status}'. "
+                f"Allowed source statuses for '{target_status}': "
+                f"{', '.join(sorted(allowed_sources))}"
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request / response models for POST /runners/{runner_id}/status
+# ---------------------------------------------------------------------------
+
+
+class RunnerStatusUpdateRequest(BaseModel):
+    """Request body for POST /runners/{runner_id}/status."""
+
+    status: str = Field(
+        description="Target runner status. One of: offline, online, maintenance.",
+    )
+    reason: str = Field(
+        default="",
+        description="Human-readable reason for the status change.",
+    )
+
+
+class RunnerStatusUpdateResponse(BaseModel):
+    """Response body for POST /runners/{runner_id}/status."""
+
+    id: uuid.UUID
+    runner_id: str
+    hostname: str
+    previous_status: str
+    current_status: str
+    reason: str
+    updated_at: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -292,4 +394,91 @@ async def get_runner_detail(
         opencode_instance_observations=opencode_instance_observations,
         policy_status=policy_status,
         policy_reason=policy_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /runners/{runner_id}/status
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/runners/{runner_id}/status",
+    response_model=RunnerStatusUpdateResponse,
+    status_code=http_status.HTTP_200_OK,
+)
+async def set_runner_status(
+    runner_id: uuid.UUID,
+    body: RunnerStatusUpdateRequest,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> RunnerStatusUpdateResponse:
+    """Manually set a runner's status.
+
+    Allows operators to set a runner to ``offline``, ``online``, or
+    ``maintenance``.  The transition is validated against the allowed
+    state machine, the runner record is updated, and the change is
+    logged in the ``job_events`` table.
+
+    Returns 404 if the runner ID does not exist, and 422 if the
+    requested transition is not allowed.
+    """
+    # Fetch the current runner row
+    row = await conn.fetchrow(
+        "SELECT id, runner_id, hostname, status FROM runners WHERE id = $1",
+        runner_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Runner {runner_id} not found",
+        )
+
+    previous_status: str = row["status"]
+    target_status: str = body.status
+
+    # Validate the transition
+    _validate_status_transition(previous_status, target_status, runner_id)
+
+    # Update the runner status
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        "UPDATE runners SET status = $1, updated_at = $2 WHERE id = $3",
+        target_status,
+        now,
+        runner_id,
+    )
+
+    # Log the status change in job_events (using zero-UUID as sentinel
+    # job_id since runner status changes are not tied to a specific job)
+    event_id = uuid.uuid4()
+    sentinel_job_id = uuid.UUID(int=0)
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        sentinel_job_id,
+        f"runner_status_{target_status}",
+        "api",
+        body.reason or f"Runner status changed to {target_status}",
+        previous_status,
+        now,
+    )
+
+    logger.info(
+        "Runner %s status changed: %s → %s (reason: %s)",
+        runner_id,
+        previous_status,
+        target_status,
+        body.reason,
+    )
+
+    return RunnerStatusUpdateResponse(
+        id=row["id"],
+        runner_id=row["runner_id"],
+        hostname=row["hostname"],
+        previous_status=previous_status,
+        current_status=target_status,
+        reason=body.reason,
+        updated_at=now,
     )

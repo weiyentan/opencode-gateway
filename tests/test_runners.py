@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.conftest import mock_row
+from tests.conftest import create_client, mock_row
 
 # mock_conn and client fixtures are auto-discovered from conftest.py
 
@@ -517,7 +517,7 @@ class TestGetRunnerDetail:
         """policy_status is HEALTHY for runners with no pressure status."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="online"
+            mock_conn, r_id, status="HEALTHY"
         )
 
         async with client as c:
@@ -591,3 +591,268 @@ class TestRunnersAPIErrors:
             response = await c.get("/runners")
 
         assert response.status_code == 500
+
+
+class TestPostRunnerStatus:
+    """Tests for POST /runners/{runner_id}/status."""
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _setup_mocks(
+        mock_conn,
+        *,
+        runner_id_val=None,
+        runner_id_str=None,
+        hostname="runner-offline.example.com",
+        current_status="HEALTHY",
+    ):
+        """Configure mock_conn.fetchrow to return a runner row, and track execute calls."""
+        if runner_id_val is None:
+            runner_id_val = uuid.uuid4()
+        if runner_id_str is None:
+            runner_id_str = str(runner_id_val)
+
+        db_row = {
+            "id": runner_id_val,
+            "runner_id": runner_id_str,
+            "hostname": hostname,
+            "status": current_status,
+        }
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners" in sql:
+                return mock_row(db_row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        return runner_id_val, execute_calls
+
+    # ------------------------------------------------------------------
+    # valid transitions
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("current_status, target_status", [
+        ("HEALTHY", "offline"),
+        ("HEALTHY", "maintenance"),
+        ("BLOCKED_DISK_PRESSURE", "offline"),
+        ("BLOCKED_DISK_PRESSURE", "maintenance"),
+        ("BLOCKED_MEMORY_PRESSURE", "offline"),
+        ("BLOCKED_MEMORY_PRESSURE", "maintenance"),
+        ("UNKNOWN", "offline"),
+        ("UNKNOWN", "maintenance"),
+        ("online", "offline"),
+        ("online", "maintenance"),
+        ("offline", "online"),
+        ("offline", "maintenance"),
+        ("maintenance", "online"),
+        ("maintenance", "offline"),
+    ])
+    async def test_valid_transition_returns_200(
+        self, current_status, target_status, mock_conn
+    ):
+        """POST /runners/{id}/status with a valid transition returns 200."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_status=current_status
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": target_status, "reason": "Testing transition"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["previous_status"] == current_status
+        assert data["current_status"] == target_status
+        assert data["reason"] == "Testing transition"
+        assert "updated_at" in data
+
+        # Verify runner status UPDATE was issued
+        update_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(update_calls) == 1
+        _sql, args = update_calls[0]
+        assert args[0] == target_status
+
+    # ------------------------------------------------------------------
+    # job_events logging
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_status_change_logs_to_job_events(self, mock_conn):
+        """POST /runners/{id}/status inserts a record into job_events."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_status="HEALTHY"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": "offline", "reason": "Maintenance window"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify job_events INSERT
+        insert_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _sql, args = insert_calls[0]
+        # args: (event_id, sentinel_job_id, event_type, actor, details, previous_status, created_at)
+        assert args[2] == "runner_status_offline"
+        assert args[3] == "api"
+        assert args[4] == "Maintenance window"
+        assert args[5] == "HEALTHY"
+
+    @pytest.mark.asyncio
+    async def test_status_change_logs_default_reason_when_empty(self, mock_conn):
+        """When reason is empty, the job_events details uses a default message."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_status="UNKNOWN"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": "maintenance"},
+            )
+
+        assert response.status_code == 200
+
+        insert_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _sql, args = insert_calls[0]
+        assert args[2] == "runner_status_maintenance"
+        assert args[4] == "Runner status changed to maintenance"
+        assert args[5] == "UNKNOWN"
+
+    # ------------------------------------------------------------------
+    # invalid transitions
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("current_status, target_status", [
+        ("HEALTHY", "online"),       # cannot go directly from system status to online
+        ("BLOCKED_DISK_PRESSURE", "online"),
+        ("BLOCKED_MEMORY_PRESSURE", "online"),
+        ("UNKNOWN", "online"),
+        ("online", "HEALTHY"),       # invalid target
+        ("online", "BLOCKED_DISK_PRESSURE"),
+        ("offline", "HEALTHY"),       # invalid target
+        ("offline", "BLOCKED_MEMORY_PRESSURE"),
+    ])
+    async def test_invalid_transition_returns_422(
+        self, current_status, target_status, mock_conn
+    ):
+        """POST /runners/{id}/status with an invalid transition returns 422."""
+        r_id, _ = self._setup_mocks(
+            mock_conn, current_status=current_status
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": target_status, "reason": "Invalid attempt"},
+            )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bogus_status", [
+        "HEALTHY",
+        "UNKNOWN",
+        "running",
+        "paused",
+        "",
+    ])
+    async def test_unknown_target_status_returns_422(
+        self, bogus_status, mock_conn
+    ):
+        """POST /runners/{id}/status with a non-manual target returns 422."""
+        r_id, _ = self._setup_mocks(mock_conn, current_status="HEALTHY")
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": bogus_status, "reason": "Bad status"},
+            )
+
+        assert response.status_code == 422
+
+    # ------------------------------------------------------------------
+    # not found
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_set_status_on_unknown_runner_returns_404(self, mock_conn):
+        """POST /runners/{id}/status on a non-existent runner returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock()
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{uuid.uuid4()}/status",
+                json={"status": "offline", "reason": "Test"},
+            )
+
+        assert response.status_code == 404
+
+    # ------------------------------------------------------------------
+    # response structure
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_response_includes_previous_and_current_status(self, mock_conn):
+        """The response body includes previous_status, current_status, and reason."""
+        r_id, _ = self._setup_mocks(
+            mock_conn, current_status="BLOCKED_DISK_PRESSURE"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/status",
+                json={"status": "maintenance", "reason": "Disk replacement"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["previous_status"] == "BLOCKED_DISK_PRESSURE"
+        assert data["current_status"] == "maintenance"
+        assert data["reason"] == "Disk replacement"
+        assert data["hostname"] == "runner-offline.example.com"
+        assert "id" in data
+        assert "runner_id" in data
+        assert "updated_at" in data

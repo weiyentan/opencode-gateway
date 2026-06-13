@@ -19,11 +19,24 @@ from app.policy.base import PolicyViolation
 
 logger = logging.getLogger(__name__)
 
-# Runner status constants
+# Runner status constants — observation-derived (system) statuses
 RUNNER_STATUS_HEALTHY = "HEALTHY"
 RUNNER_STATUS_BLOCKED_DISK = "BLOCKED_DISK_PRESSURE"
 RUNNER_STATUS_BLOCKED_MEMORY = "BLOCKED_MEMORY_PRESSURE"
 RUNNER_STATUS_UNKNOWN = "UNKNOWN"
+
+# Runner status constants — manually-set (operator) statuses
+RUNNER_STATUS_OFFLINE = "offline"
+RUNNER_STATUS_ONLINE = "online"
+RUNNER_STATUS_MAINTENANCE = "maintenance"
+
+# Set of statuses that are under operator control and should not be
+# overwritten by the observation-based policy engine.
+_MANUAL_STATUSES: frozenset[str] = frozenset({
+    RUNNER_STATUS_OFFLINE,
+    RUNNER_STATUS_ONLINE,
+    RUNNER_STATUS_MAINTENANCE,
+})
 
 
 class ObservationBasedPolicy:
@@ -109,6 +122,37 @@ class ObservationBasedPolicy:
             return None
 
         runner_uuid: UUID = runner_row["id"]
+        runner_status: str = runner_row["status"]
+
+        # ------------------------------------------------------------------
+        # Manual status guard — operator-controlled statuses take priority
+        # over observation-derived thresholds.
+        # ------------------------------------------------------------------
+        if runner_status in _MANUAL_STATUSES:
+            if runner_status in (RUNNER_STATUS_OFFLINE, RUNNER_STATUS_MAINTENANCE):
+                logger.warning(
+                    "policy_reject runner_id=%s reason=manual_status status=%s",
+                    runner_id,
+                    runner_status,
+                )
+                raise PolicyViolation(
+                    resource="manual_status",
+                    current_value=1.0,
+                    threshold=0.0,
+                    runner_id=runner_id,
+                    message=(
+                        f"Runner {runner_id} is {runner_status}. "
+                        f"No jobs can be dispatched to this runner."
+                    ),
+                )
+            # runner_status == "online" — manually cleared for dispatch;
+            # allow the job but do NOT update the status based on
+            # observation data (the operator has overridden it).
+            logger.info(
+                "policy_accept runner_id=%s reason=manual_online",
+                runner_id,
+            )
+            return None
 
         # Fetch the latest runner observation.
         obs_row = await conn.fetchrow(
