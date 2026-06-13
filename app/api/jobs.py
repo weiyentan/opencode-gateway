@@ -299,14 +299,15 @@ async def create_job(
     # 1. Insert the job record in pending state
     await conn.execute(
         "INSERT INTO gateway_jobs "
-        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars) "
-        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)",
+        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars, workflow_run_id) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb, $7)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
         resolved_runner_id,
         json.dumps(body.env_vars) if body.env_vars else "{}",
+        body.workflow_run_id,
     )
 
     # 2. Validate and perform pending → running transition
