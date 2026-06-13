@@ -367,6 +367,107 @@ class TestJobDispatch:
         # Verify executor cleanup was triggered on the created workspace
         mock_executor.cleanup_workspace.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_create_job_returns_503_when_runner_is_offline(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs returns 503 when the runner status is 'offline'."""
+        workspace_uuid = uuid.uuid4()
+        runner_uuid = uuid.uuid4()
+        runner_text_id = "test-runner-offline"
+
+        # Build mock rows for _resolve_runner_id_for_workspace queries
+        # and for the policy's internal runner lookup.
+        ws_row = mock_row({"runner_id": runner_uuid})
+        runner_by_id_row = mock_row({"runner_id": runner_text_id})
+        runner_by_text_row = mock_row(
+            {"id": runner_uuid, "status": "offline"}
+        )
+
+        async def _execute(sql, *args):
+            pass
+
+        async def _fetchrow(sql, *args):
+            if "workspaces" in sql and "runner_id" in sql:
+                return ws_row
+            if "FROM runners WHERE id" in sql:
+                return runner_by_id_row
+            if "FROM runners WHERE runner_id" in sql:
+                return runner_by_text_row
+            return None
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fix a bug",
+                },
+            )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["detail"]["resource"] == "manual_status"
+        assert data["detail"]["runner_id"] == runner_text_id
+        assert "offline" in data["detail"]["message"]
+
+        # Verify executor cleanup was triggered
+        mock_executor.cleanup_workspace.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_create_job_returns_503_when_runner_is_maintenance(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs returns 503 when the runner status is 'maintenance'."""
+        workspace_uuid = uuid.uuid4()
+        runner_uuid = uuid.uuid4()
+        runner_text_id = "test-runner-maint"
+
+        ws_row = mock_row({"runner_id": runner_uuid})
+        runner_by_id_row = mock_row({"runner_id": runner_text_id})
+        runner_by_text_row = mock_row(
+            {"id": runner_uuid, "status": "maintenance"}
+        )
+
+        async def _execute(sql, *args):
+            pass
+
+        async def _fetchrow(sql, *args):
+            if "workspaces" in sql and "runner_id" in sql:
+                return ws_row
+            if "FROM runners WHERE id" in sql:
+                return runner_by_id_row
+            if "FROM runners WHERE runner_id" in sql:
+                return runner_by_text_row
+            return None
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fix a bug",
+                },
+            )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["detail"]["resource"] == "manual_status"
+        assert data["detail"]["runner_id"] == runner_text_id
+        assert "maintenance" in data["detail"]["message"]
+
+        mock_executor.cleanup_workspace.assert_awaited_once()
+
 
 class TestApproveJob:
     """Tests for POST /jobs/{id}/approve."""

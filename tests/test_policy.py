@@ -23,6 +23,7 @@ def _make_mock_conn(
     *,
     runner_id="runner-1",
     runner_uuid=None,
+    runner_status="HEALTHY",
     disk_used_percent=None,
     memory_used_percent=None,
     observed_at=None,
@@ -35,6 +36,8 @@ def _make_mock_conn(
         The text runner_id to return from the runners lookup.
     runner_uuid:
         The runner's UUID.  Auto-generated when None.
+    runner_status:
+        The runner's DB status (e.g. "HEALTHY", "offline", "maintenance").
     disk_used_percent:
         The disk_used_percent value to return from runner_observations.
         When None, the observation row is not returned (simulates
@@ -52,7 +55,7 @@ def _make_mock_conn(
     # Runner lookup: SELECT id, status FROM runners WHERE runner_id = $1
     async def _fetchrow_runner(sql, *args):
         if "FROM runners" in sql:
-            return mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            return mock_row({"id": runner_uuid, "status": runner_status})
         return None
 
     if disk_used_percent is not None or memory_used_percent is not None:
@@ -61,7 +64,7 @@ def _make_mock_conn(
 
         async def _fetchrow_obs(sql, *args):
             if "FROM runners" in sql:
-                return mock_row({"id": runner_uuid, "status": "HEALTHY"})
+                return mock_row({"id": runner_uuid, "status": runner_status})
             if "FROM runner_observations" in sql:
                 return mock_row(
                     {
@@ -695,6 +698,132 @@ class TestCheckStaleness:
 
         result = await policy.check("runner-1", conn=conn)
         assert result is None
+
+
+class TestManualStatusPolicy:
+    """Tests for manual (operator-set) status handling in ObservationBasedPolicy."""
+
+    @pytest.mark.asyncio
+    async def test_offline_runner_rejects_with_policy_violation(self) -> None:
+        """When runner status is 'offline', check() raises PolicyViolation."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="offline",
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "manual_status"
+        assert detail["runner_id"] == "runner-1"
+        assert "offline" in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_maintenance_runner_rejects_with_policy_violation(self) -> None:
+        """When runner status is 'maintenance', check() raises PolicyViolation."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="maintenance",
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "manual_status"
+        assert detail["runner_id"] == "runner-1"
+        assert "maintenance" in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_online_runner_allows_dispatch_without_updating_status(
+        self,
+    ) -> None:
+        """When runner status is 'online', check() returns None and does NOT
+        update the runner status even if observation thresholds are exceeded."""
+        policy = ObservationBasedPolicy()
+        runner_uuid = uuid.uuid4()
+
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        conn = _make_mock_conn_tracked(
+            runner_uuid=runner_uuid,
+            runner_status="online",
+            disk_used_percent=95.0,  # exceeds threshold but should be ignored
+            memory_used_percent=95.0,  # exceeds threshold but should be ignored
+        )
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+        # Verify NO status update was issued (online status is preserved)
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(status_updates) == 0, (
+            f"Expected 0 status updates for online runner, got {len(status_updates)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_runner_blocks_even_with_healthy_metrics(self) -> None:
+        """An offline runner is blocked even when disk/memory are healthy."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="offline",
+            disk_used_percent=10.0,
+            memory_used_percent=20.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+
+    @pytest.mark.asyncio
+    async def test_maintenance_runner_blocks_even_with_healthy_metrics(self) -> None:
+        """A maintenance runner is blocked even when disk/memory are healthy."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="maintenance",
+            disk_used_percent=10.0,
+            memory_used_percent=20.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+
+    @pytest.mark.asyncio
+    async def test_healthy_runner_still_checked_normally(self) -> None:
+        """A runner with a system status (HEALTHY) still goes through normal observation checks."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="HEALTHY",
+            disk_used_percent=90.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        # Should be a disk violation, not a manual_status one
+        assert exc_info.value.detail["resource"] == "disk"
 
 
 class TestConfigIntegration:
