@@ -34,10 +34,27 @@ router = APIRouter(tags=["jobs"])
 
 
 class JobCreateRequest(BaseModel):
-    """Request body for POST /jobs."""
+    """Request body for POST /jobs.
+
+    Callers may optionally pin the job to a specific runner (``runner_id``)
+    or request a runner that matches a set of label constraints
+    (``labels``).  When neither is provided the Gateway auto-selects the
+    best available runner via :func:`select_runner`.
+    """
 
     repo_url: HttpUrl = Field(description="URL of the repository to work on")
     task_summary: str = Field(min_length=1, description="Summary of the task to perform")
+    runner_id: Optional[uuid.UUID] = Field(
+        default=None,
+        description="UUID of the runner to pin this job to.  When set, the "
+        "runner must exist and be HEALTHY.",
+    )
+    labels: Optional[list[str]] = Field(
+        default=None,
+        description="Labels used to filter eligible runners.  Each label "
+        "must exist as a key in the runner's labels JSONB column. "
+        "Ignored when ``runner_id`` is provided.",
+    )
 
 
 class JobResponse(BaseModel):
@@ -141,6 +158,127 @@ async def _resolve_target_runner(conn: asyncpg.Connection) -> Optional[str]:
     return row.get("runner_id")
 
 
+async def select_runner(
+    conn: asyncpg.Connection,
+    runner_id: Optional[uuid.UUID] = None,
+    labels: Optional[list[str]] = None,
+) -> uuid.UUID:
+    """Select an appropriate runner for a new job.
+
+    **Runner Selection Algorithm**
+
+    This function implements three selection modes in priority order:
+
+    **1. Explicit Pinning (``runner_id`` provided)**
+    When the caller specifies a ``runner_id``:
+
+    1. Look up the runner by its UUID primary key in the ``runners`` table.
+    2. If the runner does not exist → raise ``HTTPException(400)``.
+    3. If the runner's ``status`` is not ``HEALTHY`` → raise
+       ``HTTPException(400)``.
+    4. Otherwise, return the runner's UUID.
+
+    **2. Label-Based Selection (``labels`` provided, ``runner_id`` absent)**
+    When the caller provides ``labels`` but no ``runner_id``:
+
+    1. Query all runners where:
+       - ``status = 'HEALTHY'``, AND
+       - the ``labels`` JSONB column contains every requested label as a
+         key (checked via PostgreSQL ``?&`` operator).
+    2. Among the candidates, count each runner's active workspaces
+       (``workspaces`` rows where ``cleanup_status = 'active'``).
+    3. Select the runner with the **fewest** active workspaces (load
+       balancing).
+    4. Break ties by picking the runner with the lowest UUID
+       (deterministic tie-break).
+    5. If no runner matches → raise ``HTTPException(400)``.
+
+    **3. Automatic Selection (neither ``runner_id`` nor ``labels``)**
+    When the caller provides no constraints:
+
+    1. Query all runners with ``status = 'HEALTHY'``.
+    2. Count each runner's active workspaces.
+    3. Select the runner with the **fewest** active workspaces.
+    4. Break ties by lowest UUID.
+    5. If no healthy runner exists → raise ``HTTPException(400)``.
+
+    **What counts as an active workspace?**
+    Workspaces where ``cleanup_status = 'active'`` count as active load
+    on a runner.  Workspaces that have been cleaned (``cleanup_status =
+    'cleaned'``) or are otherwise non-active are excluded from the
+    tally.
+
+    Parameters
+    ----------
+    conn:
+        An active asyncpg database connection.
+    runner_id:
+        Explicit runner UUID to pin to.  When set, *labels* is ignored.
+    labels:
+        List of label keys that a runner's ``labels`` JSONB column must
+        contain.  Only used when *runner_id* is ``None``.
+
+    Returns
+    -------
+    uuid.UUID
+        The UUID of the selected runner.
+
+    Raises
+    ------
+    HTTPException(400)
+        If the requested runner is not found, is unhealthy, or no
+        matching healthy runner is available.
+    """
+    if runner_id is not None:
+        # --- Mode 1: Explicit pinning ---
+        row = await conn.fetchrow(
+            "SELECT id, status FROM runners WHERE id = $1",
+            runner_id,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner not found: {runner_id}",
+            )
+        if row["status"] != "HEALTHY":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner is not healthy (status={row['status']}): {runner_id}",
+            )
+        return runner_id
+
+    # Build the base query for modes 2 and 3
+    query = (
+        "SELECT r.id, COUNT(w.id) AS active_workspaces "
+        "FROM runners r "
+        "LEFT JOIN workspaces w ON w.runner_id = r.id "
+        "   AND w.cleanup_status = 'active' "
+        "WHERE r.status = 'HEALTHY'"
+    )
+    query_args: list[list[str]] = []
+
+    if labels:
+        # --- Mode 2: Label-based selection ---
+        # PostgreSQL ?& operator checks that all keys exist in the JSONB object.
+        query += " AND r.labels IS NOT NULL AND r.labels ?& $1"
+        query_args.append(labels)
+
+    query += " GROUP BY r.id ORDER BY active_workspaces ASC, r.id ASC LIMIT 1"
+
+    row = await conn.fetchrow(query, *query_args)
+    if row is None:
+        if labels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No healthy runner found matching labels: {labels}",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="No healthy runners available",
+        )
+    return row["id"]  # type: ignore[no-any-return]
+
+
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
@@ -152,14 +290,23 @@ async def create_job(
     job_id = uuid.uuid4()
     settings = get_settings()
 
+    # 0. Select (or validate) the target runner
+    resolved_runner_id = await select_runner(
+        conn,
+        runner_id=body.runner_id,
+        labels=body.labels,
+    )
+
     # 1. Insert the job record in pending state
     await conn.execute(
-        "INSERT INTO gateway_jobs (id, repo_url, task_summary, status, executor_type) "
-        "VALUES ($1, $2, $3, 'pending', $4)",
+        "INSERT INTO gateway_jobs "
+        "(id, repo_url, task_summary, status, executor_type, runner_id) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
+        resolved_runner_id,
     )
 
     # 2. Validate and perform pending → running transition
