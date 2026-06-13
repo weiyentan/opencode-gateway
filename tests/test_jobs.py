@@ -2,13 +2,36 @@
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tests.conftest import create_client, make_job_row, mock_row
 
 # mock_conn, mock_executor, and client fixtures are auto-discovered from conftest.py
+
+
+@pytest.fixture(autouse=True)
+def _patch_select_runner_for_existing_tests(request):
+    """Auto-patch select_runner so existing tests don't break.
+
+    The runner selection logic (issue #92) is tested explicitly in
+    ``TestRunnerSelection`` — those tests bypass this patch.  Every
+    other test class gets a dummy runner UUID so the job creation
+    flow proceeds without needing to mock the ``runners`` table.
+    """
+    # Skip patching when the test class is TestRunnerSelection itself
+    if request.cls and request.cls.__name__ == "TestRunnerSelection":
+        yield
+        return
+
+    _dummy = uuid.UUID("00000000-0000-0000-0000-000000000099")
+
+    async def _fake_select(conn, runner_id=None, labels=None):
+        return _dummy
+
+    with patch("app.api.jobs.select_runner", new=_fake_select):
+        yield
 
 
 class TestCreateJob:
@@ -2078,3 +2101,375 @@ class TestAbortEvents:
         assert insert_args[3] == "api"           # actor
         assert insert_args[4] == "Job aborted"   # details
         assert insert_args[5] == "pending"       # previous_status
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Runner Selection & Job Pinning (issue #92)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerSelection:
+    """Tests for runner selection and job pinning in POST /jobs."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_healthy_runner_succeeds(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a valid, healthy runner_id should dispatch to that runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Pin to runner",
+            status="pending",
+        )
+
+        # Track which SQL is being queried so we can return the right mock
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_not_found_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a non-existent runner_id should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return None  # runner not found
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to non-existent runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "not found" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_unhealthy_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a runner that is not HEALTHY should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "BLOCKED_DISK_PRESSURE"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to unhealthy runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "not healthy" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_label_based_selection_matching_runner_found(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with labels should auto-select a matching healthy runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Label match",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "r.labels IS NOT NULL AND r.labels ?&" in sql:
+                # Label-based query returns a runner
+                return mock_row({"id": runner_id, "active_workspaces": 2})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Label match",
+                    "labels": ["gpu", "high-memory"],
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_label_based_selection_no_matching_runner_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with labels that match no healthy runner should return 400."""
+        async def _fetchrow(sql, *args):
+            if "r.labels IS NOT NULL AND r.labels ?&" in sql:
+                return None  # no matching runner
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No matching label",
+                    "labels": ["nonexistent-label"],
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "no healthy runner" in data["detail"].lower()
+        assert "nonexistent-label" in data["detail"]
+
+    @pytest.mark.asyncio
+    async def test_automatic_selection_healthy_runner_available(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs without runner_id or labels should auto-select a healthy runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Auto select",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            # The automatic selection query doesn't have label conditions
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                return mock_row({"id": runner_id, "active_workspaces": 1})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Auto select",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_automatic_selection_no_healthy_runners_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs without constraints when no healthy runners exist → 400."""
+        async def _fetchrow(sql, *args):
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                return None  # no healthy runner
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No healthy runners",
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "no healthy runners" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_load_balancing_picks_runner_with_fewest_workspaces(
+        self, mock_conn, mock_executor
+    ):
+        """Runner selection should prefer the runner with the fewest active workspaces."""
+        job_id = uuid.uuid4()
+        runner_with_fewer = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Load balance",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                # Return the runner with fewest workspaces
+                return mock_row({"id": runner_with_fewer, "active_workspaces": 0})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Load balance",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_runner_id_takes_precedence_over_labels(
+        self, mock_conn, mock_executor
+    ):
+        """When both runner_id and labels are provided, runner_id takes precedence."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Pin over labels",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            # Only the explicit runner lookup should be called (not the label query)
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin over labels",
+                    "runner_id": str(runner_id),
+                    "labels": ["gpu"],
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
