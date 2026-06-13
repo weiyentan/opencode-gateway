@@ -53,6 +53,9 @@ class Job(BaseModel):
     opencode_session_id: Optional[str] = None
     executor_type: str
     executor_job_id: Optional[str] = None
+    branch_name: Optional[str] = None
+    mr_url: Optional[str] = None
+    workflow_run_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
