@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
     opencode_session_id TEXT,
     executor_type   TEXT NOT NULL,
     executor_job_id TEXT,
+    env_vars        JSONB DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ,
@@ -52,5 +53,13 @@ CREATE TABLE IF NOT EXISTS job_events (
     actor           TEXT NOT NULL,
     details         TEXT,
     previous_status TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id              UUID PRIMARY KEY,
+    url             TEXT NOT NULL,
+    events          TEXT[] NOT NULL DEFAULT '{}',
+    secret          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

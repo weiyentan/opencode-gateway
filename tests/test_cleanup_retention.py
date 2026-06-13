@@ -115,6 +115,12 @@ class TestSuccessfulJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
+            if "FROM runners" in sql and "LEFT JOIN" in sql:
+                return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            if "FROM runner_observations" in sql:
+                return None
             return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
@@ -170,6 +176,12 @@ class TestSuccessfulJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
+            if "FROM runners" in sql and "LEFT JOIN" in sql:
+                return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            if "FROM runner_observations" in sql:
+                return None
             return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
@@ -191,7 +203,6 @@ class TestSuccessfulJobCleanupAfter:
             s.cleanup_success_retention_hours = 48
             return s
 
-        # Patch get_settings for this test
         with patch("app.api.jobs.get_settings", _override_settings):
             client = create_client(mock_conn, mock_executor=mock_executor)
             async with client as c:
@@ -236,6 +247,8 @@ class TestFailedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
             return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
@@ -307,6 +320,12 @@ class TestFailedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
+            if "FROM runners" in sql and "LEFT JOIN" in sql:
+                return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            if "FROM runner_observations" in sql:
+                return None
             return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):
@@ -375,6 +394,12 @@ class TestFailedJobCleanupAfter:
         execute_calls: list[tuple] = []
 
         async def _fetchrow(sql: str, *args):
+            if "FROM runners" in sql and "LEFT JOIN" in sql:
+                return mock_row({"id": uuid.UUID(int=0), "active_workspaces": 0})
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            if "FROM runner_observations" in sql:
+                return None
             return mock_row(job_row_data)
 
         async def _execute(sql: str, *args):

@@ -18,7 +18,6 @@ from app.core.factory import create_app
 from app.db.session import get_session
 from app.executors.factory import get_executor
 
-
 # ══════════════════════════════════════════════════════════════════════════
 #  Core helpers
 # ══════════════════════════════════════════════════════════════════════════
@@ -42,15 +41,17 @@ def make_job_row(
     opencode_session_id: str | None = None,
     diff: str | None = None,
     workspace_name: str | None = None,
+    env_vars: dict[str, str] | None = None,
 ) -> dict:
     """Return a dict representing a gateway_jobs table row."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     return {
         "id": job_id,
         "repo_url": repo_url,
         "task_summary": task_summary,
         "status": status,
         "executor_type": "local",
+        "env_vars": env_vars or {},
         "created_at": now,
         "updated_at": now,
         "completed_at": completed_at,
@@ -76,7 +77,7 @@ def make_workspace_row(
     created_at: datetime | None = None,
 ) -> dict:
     """Return a dict representing a workspaces table row."""
-    now = created_at or datetime.now(timezone.utc)
+    now = created_at or datetime.now(timezone.utc)  # noqa: UP017
     return {
         "id": workspace_id,
         "runner_id": runner_id,
@@ -101,16 +102,21 @@ def create_client(
     mock_opencode_client: AsyncMock | None = None,
 ) -> AsyncClient:
     """Build app with overridden dependencies, return httpx AsyncClient."""
-    from app.api.jobs import get_opencode_client
+    from app.api.jobs import _get_pool, get_opencode_client
 
     app = create_app()
     mock_pool = AsyncMock()
+    # Set pool.pool to None so background webhook dispatch exits early in tests.
+    # The webhook dispatch is tested separately in test_webhooks.py with its own
+    # mock setup.
+    mock_pool.pool = None
     app.state.pool = mock_pool
 
     async def _override_get_session(request: Request):
         yield mock_conn
 
     app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[_get_pool] = lambda: mock_pool
 
     # Always inject an executor mock so endpoints that depend on it work
     _mock_exec = mock_executor if mock_executor is not None else AsyncMock()

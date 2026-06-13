@@ -7,6 +7,7 @@ is configured.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 import uuid as _uuid
@@ -62,7 +63,21 @@ class LocalExecutor(ExecutorPlugin):
         self, request: StartOpencodeRequest
     ) -> StartOpencodeResponse:
         session_id = _uuid.uuid4()
-        logger.info("start_opencode: workspace=%s -> session=%s", request.workspace_id, session_id)
+        if request.env_vars:
+            logger.info(
+                "start_opencode: workspace=%s -> session=%s env_vars=%s",
+                request.workspace_id,
+                session_id,
+                request.env_vars,
+            )
+        else:
+            logger.info(
+                "start_opencode: workspace=%s -> session=%s",
+                request.workspace_id,
+                session_id,
+            )
+        # Store env_vars for test verification
+        self._last_env_vars: dict[str, str] = dict(request.env_vars)
         return StartOpencodeResponse(
             session_id=session_id,
             status="running",

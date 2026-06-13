@@ -2,13 +2,36 @@
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tests.conftest import create_client, make_job_row, mock_row
 
 # mock_conn, mock_executor, and client fixtures are auto-discovered from conftest.py
+
+
+@pytest.fixture(autouse=True)
+def _patch_select_runner_for_existing_tests(request):
+    """Auto-patch select_runner so existing tests don't break.
+
+    The runner selection logic (issue #92) is tested explicitly in
+    ``TestRunnerSelection`` — those tests bypass this patch.  Every
+    other test class gets a dummy runner UUID so the job creation
+    flow proceeds without needing to mock the ``runners`` table.
+    """
+    # Skip patching when the test class is TestRunnerSelection itself
+    if request.cls and request.cls.__name__ == "TestRunnerSelection":
+        yield
+        return
+
+    _dummy = uuid.UUID("00000000-0000-0000-0000-000000000099")
+
+    async def _fake_select(conn, runner_id=None, labels=None):
+        return _dummy
+
+    with patch("app.api.jobs.select_runner", new=_fake_select):
+        yield
 
 
 class TestCreateJob:
@@ -30,6 +53,7 @@ class TestCreateJob:
                 json={
                     "repo_url": "https://github.com/org/repo",
                     "task_summary": "Fix a bug",
+                    "env_vars": {},
                 },
             )
 
@@ -67,6 +91,39 @@ class TestCreateJob:
                 },
             )
         assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_env_vars(self, client, mock_conn):
+        """POST /jobs with env_vars should store and pass them through."""
+        import json
+
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Task with env vars",
+            env_vars={"MY_VAR": "my_value", "LOG_LEVEL": "debug"},
+        )
+        mock_conn.execute = AsyncMock(return_value=None)
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Task with env vars",
+                    "env_vars": {"MY_VAR": "my_value", "LOG_LEVEL": "debug"},
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["repo_url"] == "https://github.com/org/repo"
+        assert data["task_summary"] == "Task with env vars"
+
+        # Verify env_vars was passed in the INSERT statement (7th positional arg)
+        insert_call = mock_conn.execute.call_args_list[0]
+        assert "INSERT INTO gateway_jobs" in str(insert_call)
+        assert insert_call.args[6] == json.dumps({"MY_VAR": "my_value", "LOG_LEVEL": "debug"})
 
 
 class TestGetJob:
@@ -308,28 +365,24 @@ class TestJobDispatch:
     async def test_create_job_returns_503_when_policy_rejects_runner(
         self, mock_conn, mock_executor
     ):
-        """POST /jobs returns 503 when ObservationBasedPolicy.check raises PolicyViolation."""
+        """POST /jobs returns 503 when ObservationBasedPolicy.check raises PolicyViolation.
+
+        The policy check runs before workspace creation, so no
+        executor.create_workspace() or cleanup_workspace() call is made.
+        """
         from unittest.mock import patch
 
         from app.policy import ObservationBasedPolicy, PolicyViolation
 
-        job_id = uuid.uuid4()
-        workspace_uuid = uuid.uuid4()
-        runner_uuid = uuid.uuid4()
-
-        # Build mock rows for _resolve_runner_id_for_workspace queries
-        ws_row = mock_row({"runner_id": runner_uuid})
-        runner_row = mock_row({"runner_id": "test-runner-99"})
+        # Mock the runner resolution query: return the text runner_id
+        # for the dummy UUID returned by the patched select_runner.
+        async def _fetchrow(sql, *args):
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner-99"})
+            return None
 
         async def _execute(sql, *args):
             pass
-
-        async def _fetchrow(sql, *args):
-            if "workspaces" in sql and "runner_id" in sql:
-                return ws_row
-            if "FROM runners WHERE id" in sql:
-                return runner_row
-            return None
 
         mock_conn.execute = AsyncMock(side_effect=_execute)
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -364,8 +417,103 @@ class TestJobDispatch:
         assert "disk" in data["detail"]["message"]
         assert "80%" in data["detail"]["message"]
 
-        # Verify executor cleanup was triggered on the created workspace
-        mock_executor.cleanup_workspace.assert_awaited_once()
+        # Policy check runs before workspace creation — no executor calls
+        mock_executor.create_workspace.assert_not_called()
+        mock_executor.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_job_returns_503_when_runner_is_offline(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs returns 503 when the runner status is 'offline'."""
+        runner_uuid = uuid.uuid4()
+        runner_text_id = "test-runner-offline"
+
+        runner_by_id_row = mock_row({"runner_id": runner_text_id})
+        runner_by_text_row = mock_row(
+            {"id": runner_uuid, "status": "offline"}
+        )
+
+        async def _execute(sql, *args):
+            pass
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners WHERE id" in sql:
+                return runner_by_id_row
+            if "FROM runners WHERE runner_id" in sql:
+                return runner_by_text_row
+            return None
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fix a bug",
+                },
+            )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["detail"]["resource"] == "manual_status"
+        assert data["detail"]["runner_id"] == runner_text_id
+        assert "offline" in data["detail"]["message"]
+
+        # Policy check happens before workspace creation — no workspace was
+        # created, so no cleanup should occur.
+        mock_executor.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_job_returns_503_when_runner_is_maintenance(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs returns 503 when the runner status is 'maintenance'."""
+        runner_uuid = uuid.uuid4()
+        runner_text_id = "test-runner-maint"
+
+        runner_by_id_row = mock_row({"runner_id": runner_text_id})
+        runner_by_text_row = mock_row(
+            {"id": runner_uuid, "status": "maintenance"}
+        )
+
+        async def _execute(sql, *args):
+            pass
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners WHERE id" in sql:
+                return runner_by_id_row
+            if "FROM runners WHERE runner_id" in sql:
+                return runner_by_text_row
+            return None
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fix a bug",
+                },
+            )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["detail"]["resource"] == "manual_status"
+        assert data["detail"]["runner_id"] == runner_text_id
+        assert "maintenance" in data["detail"]["message"]
+
+        # Policy check happens before workspace creation — no workspace was
+        # created, so no cleanup should occur.
+        mock_executor.cleanup_workspace.assert_not_called()
 
 
 class TestApproveJob:
@@ -2078,3 +2226,751 @@ class TestAbortEvents:
         assert insert_args[3] == "api"           # actor
         assert insert_args[4] == "Job aborted"   # details
         assert insert_args[5] == "pending"       # previous_status
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Runner Selection & Job Pinning (issue #92)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestRunnerSelection:
+    """Tests for runner selection and job pinning in POST /jobs."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_healthy_runner_succeeds(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a valid, healthy runner_id should dispatch to that runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Pin to runner",
+            status="pending",
+        )
+
+        # Track which SQL is being queried so we can return the right mock
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_not_found_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a non-existent runner_id should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return None  # runner not found
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to non-existent runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "not found" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_unhealthy_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a runner that is not HEALTHY should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "BLOCKED_DISK_PRESSURE"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to unhealthy runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "not healthy" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_label_based_selection_matching_runner_found(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with labels should auto-select a matching healthy runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Label match",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "r.labels IS NOT NULL AND r.labels ?&" in sql:
+                # Label-based query returns a runner
+                return mock_row({"id": runner_id, "active_workspaces": 2})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Label match",
+                    "labels": ["gpu", "high-memory"],
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_label_based_selection_no_matching_runner_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with labels that match no healthy runner should return 400."""
+        async def _fetchrow(sql, *args):
+            if "r.labels IS NOT NULL AND r.labels ?&" in sql:
+                return None  # no matching runner
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No matching label",
+                    "labels": ["nonexistent-label"],
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "no healthy runner" in data["detail"].lower()
+        assert "nonexistent-label" in data["detail"]
+
+    @pytest.mark.asyncio
+    async def test_automatic_selection_healthy_runner_available(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs without runner_id or labels should auto-select a healthy runner."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Auto select",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            # The automatic selection query doesn't have label conditions
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                return mock_row({"id": runner_id, "active_workspaces": 1})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Auto select",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_automatic_selection_no_healthy_runners_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs without constraints when no healthy runners exist → 400."""
+        async def _fetchrow(sql, *args):
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                return None  # no healthy runner
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No healthy runners",
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert "no healthy runners" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_load_balancing_picks_runner_with_fewest_workspaces(
+        self, mock_conn, mock_executor
+    ):
+        """Runner selection should prefer the runner with the fewest active workspaces."""
+        job_id = uuid.uuid4()
+        runner_with_fewer = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Load balance",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if (
+                "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql
+                and "r.labels" not in sql
+            ):
+                # Return the runner with fewest workspaces
+                return mock_row({"id": runner_with_fewer, "active_workspaces": 0})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Load balance",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_runner_id_takes_precedence_over_labels(
+        self, mock_conn, mock_executor
+    ):
+        """When both runner_id and labels are provided, runner_id takes precedence."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Pin over labels",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            # Only the explicit runner lookup should be called (not the label query)
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                row_data["completed_at"] = datetime.now(timezone.utc)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin over labels",
+                    "runner_id": str(runner_id),
+                    "labels": ["gpu"],
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "completed"
+class TestJobLogs:
+    """Tests for GET /jobs/{id}/logs (log retrieval via OpenCode Serve proxy)."""
+
+    @pytest.mark.asyncio
+    async def test_get_logs_returns_full_log_output(self, mock_conn):
+        """GET /jobs/{id}/logs returns 200 with full log content from the session."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-logs-1"
+        log_content = (
+            "INFO: Starting session...\n"
+            "INFO: Cloning repository...\n"
+            "INFO: Running analysis...\n"
+            "INFO: Session complete.\n"
+        )
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Run logging task",
+            status="completed",
+            opencode_session_id=session_id,
+            completed_at=now,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="completed",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["job_id"] == str(job_id)
+        assert data["session_id"] == session_id
+        assert data["log"] == log_content
+
+        # Verify the OpenCode client was called correctly
+        mock_opencode.get_session.assert_called_once_with(session_id)
+        mock_opencode.get_session_log.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_unknown_job_returns_404(self, client, mock_conn):
+        """GET /jobs/{id}/logs for a non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{uuid.uuid4()}/logs")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_logs_no_session_returns_409(self, mock_conn):
+        """GET /jobs/{id}/logs for a job with no session returns 409."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No session yet",
+            status="pending",
+            opencode_session_id=None,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 409
+        assert "detail" in response.json()
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_not_started_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'pending' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-pending"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Pending session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="pending",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+        assert "detail" in response.json()
+        assert "pending" in response.json()["detail"]
+
+        # get_session was called but get_session_log was not
+        mock_opencode.get_session.assert_called_once_with(session_id)
+        assert not mock_opencode.get_session_log.called
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_created_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'created' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-created"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Created session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="created",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+
+    @pytest.mark.asyncio
+    async def test_get_logs_session_queued_returns_424(self, mock_conn):
+        """GET /jobs/{id}/logs when session status is 'queued' returns 424."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-queued"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Queued session",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="queued",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 424
+
+    @pytest.mark.asyncio
+    async def test_get_logs_no_opencode_client_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs without an OpenCode client returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-no-client"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No client",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        # No opencode client injected
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503
+        assert "detail" in response.json()
+
+    @pytest.mark.asyncio
+    async def test_get_logs_opencode_unreachable_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs when OpenCode Serve is unreachable returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-down"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Serve down",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            side_effect=RuntimeError("Connection refused")
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_logs_invalid_uuid_returns_422(self, client):
+        """GET /jobs/{id}/logs with a malformed UUID returns 422."""
+        async with client as c:
+            response = await c.get("/jobs/not-a-uuid/logs")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_running_session_returns_logs(self, mock_conn):
+        """GET /jobs/{id}/logs for a running session returns 200 with logs."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-running"
+        log_content = "Running analysis step 1/10...\n"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Running task",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="running",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["log"] == log_content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_for_failed_session_returns_logs(self, mock_conn):
+        """GET /jobs/{id}/logs for a failed session returns 200 with logs."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-failed"
+        log_content = "ERROR: Task failed at step 3\n"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Failed task",
+            status="failed",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="failed",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["log"] == log_content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_log_fetch_failure_returns_503(self, mock_conn):
+        """GET /jobs/{id}/logs when get_session_log raises returns 503."""
+        from app.opencode.protocol import SessionInfo
+
+        job_id = uuid.uuid4()
+        session_id = "sess-log-fail"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Log fetch failure",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="running",
+                workspace_path="/tmp/opencode/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            side_effect=RuntimeError("Log service unavailable")
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 503

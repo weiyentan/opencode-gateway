@@ -166,6 +166,7 @@ class TestCreateWorkspaceModels:
         assert req.repo_url == "https://example.com/repo.git"
         assert req.branch is None
         assert req.job_id is None
+        assert req.env_vars == {}
 
     def test_request_all_fields(self):
         """All fields should be accepted."""
@@ -173,9 +174,11 @@ class TestCreateWorkspaceModels:
             repo_url="https://example.com/repo.git",
             branch="feature/x",
             job_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            env_vars={"MY_VAR": "my_value"},
         )
         assert req.branch == "feature/x"
         assert str(req.job_id) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert req.env_vars == {"MY_VAR": "my_value"}
 
     def test_request_missing_repo_url_raises(self):
         """repo_url is required — missing it should raise ValidationError."""
@@ -219,6 +222,15 @@ class TestStartOpencodeModels:
         )
         assert str(req.workspace_id) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         assert req.workspace_path == "/tmp/ws"
+        assert req.env_vars == {}
+
+    def test_request_with_env_vars(self):
+        """env_vars should be accepted and stored."""
+        req = StartOpencodeRequest(
+            workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            env_vars={"FOO": "bar", "BAZ": "qux"},
+        )
+        assert req.env_vars == {"FOO": "bar", "BAZ": "qux"}
 
     def test_request_minimal(self):
         """workspace_path defaults to None."""
@@ -417,6 +429,17 @@ class TestLocalExecutor:
         assert resp.status == "running"
         assert resp.port > 0
         assert UUID(str(resp.session_id))
+
+    async def test_start_opencode_with_env_vars(self):
+        """env_vars should be stored on the executor for test verification."""
+        executor = LocalExecutor()
+        req = StartOpencodeRequest(
+            workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            env_vars={"MY_SECRET": "s3cret", "LOG_LEVEL": "debug"},
+        )
+        resp = await executor.start_opencode(req)
+        assert resp.status == "running"
+        assert executor._last_env_vars == {"MY_SECRET": "s3cret", "LOG_LEVEL": "debug"}
 
     async def test_stop_opencode(self):
         executor = LocalExecutor()

@@ -15,15 +15,33 @@ from uuid import UUID
 import asyncpg
 
 from app.core.config import Settings
-from app.policy.base import PolicyViolation
+from app.policy.base import (
+    Alert,
+    AlertHandler,
+    LoggingAlertHandler,
+    PolicyViolation,
+)
 
 logger = logging.getLogger(__name__)
 
-# Runner status constants
+# Runner status constants — observation-derived (system) statuses
 RUNNER_STATUS_HEALTHY = "HEALTHY"
 RUNNER_STATUS_BLOCKED_DISK = "BLOCKED_DISK_PRESSURE"
 RUNNER_STATUS_BLOCKED_MEMORY = "BLOCKED_MEMORY_PRESSURE"
 RUNNER_STATUS_UNKNOWN = "UNKNOWN"
+
+# Runner status constants — manually-set (operator) statuses
+RUNNER_STATUS_OFFLINE = "offline"
+RUNNER_STATUS_ONLINE = "online"
+RUNNER_STATUS_MAINTENANCE = "maintenance"
+
+# Set of statuses that are under operator control and should not be
+# overwritten by the observation-based policy engine.
+_MANUAL_STATUSES: frozenset[str] = frozenset({
+    RUNNER_STATUS_OFFLINE,
+    RUNNER_STATUS_ONLINE,
+    RUNNER_STATUS_MAINTENANCE,
+})
 
 
 class ObservationBasedPolicy:
@@ -42,7 +60,11 @@ class ObservationBasedPolicy:
     reflect the pressure condition.
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        alert_handlers: list[AlertHandler] | None = None,
+    ) -> None:
         """Initialise the policy with threshold values from *settings*.
 
         Parameters
@@ -50,11 +72,18 @@ class ObservationBasedPolicy:
         settings:
             A :class:`Settings` instance.  When ``None`` a default
             :class:`Settings` object is created.
+        alert_handlers:
+            A list of :class:`AlertHandler` callables.  When ``None``
+            the default :class:`LoggingAlertHandler` is used, ensuring
+            alerts are always logged at WARNING level.
         """
         cfg = settings if settings is not None else Settings()
         self.disk_threshold_percent: float = cfg.disk_threshold_percent
         self.memory_threshold_percent: float = cfg.memory_threshold_percent
         self.staleness_seconds: int = cfg.staleness_seconds
+        self._alert_handlers: list[AlertHandler] = (
+            alert_handlers if alert_handlers is not None else [LoggingAlertHandler()]
+        )
 
     async def check(
         self,
@@ -109,6 +138,37 @@ class ObservationBasedPolicy:
             return None
 
         runner_uuid: UUID = runner_row["id"]
+        runner_status: str = runner_row["status"]
+
+        # ------------------------------------------------------------------
+        # Manual status guard — operator-controlled statuses take priority
+        # over observation-derived thresholds.
+        # ------------------------------------------------------------------
+        if runner_status in _MANUAL_STATUSES:
+            if runner_status in (RUNNER_STATUS_OFFLINE, RUNNER_STATUS_MAINTENANCE):
+                logger.warning(
+                    "policy_reject runner_id=%s reason=manual_status status=%s",
+                    runner_id,
+                    runner_status,
+                )
+                raise PolicyViolation(
+                    resource="manual_status",
+                    current_value=1.0,
+                    threshold=0.0,
+                    runner_id=runner_id,
+                    message=(
+                        f"Runner {runner_id} is {runner_status}. "
+                        f"No jobs can be dispatched to this runner."
+                    ),
+                )
+            # runner_status == "online" — manually cleared for dispatch;
+            # allow the job but do NOT update the status based on
+            # observation data (the operator has overridden it).
+            logger.info(
+                "policy_accept runner_id=%s reason=manual_online",
+                runner_id,
+            )
+            return None
 
         # Fetch the latest runner observation.
         obs_row = await conn.fetchrow(
@@ -135,6 +195,9 @@ class ObservationBasedPolicy:
         now = datetime.now(timezone.utc)
         age_seconds = (now - observed_at).total_seconds()
         if age_seconds > self.staleness_seconds:
+            await self._emit_alert(
+                runner_id, "staleness", float(age_seconds), float(self.staleness_seconds)
+            )
             logger.warning(
                 "policy_reject runner_id=%s reason=staleness resource=staleness "
                 "current_value=%.0f threshold=%d",
@@ -158,6 +221,7 @@ class ObservationBasedPolicy:
 
         # --- Disk pressure check ---
         if disk_used is not None and disk_used > self.disk_threshold_percent:
+            await self._emit_alert(runner_id, "disk", disk_used, self.disk_threshold_percent)
             logger.warning(
                 "policy_reject runner_id=%s reason=disk_pressure resource=disk "
                 "current_value=%.1f threshold=%.0f",
@@ -175,6 +239,7 @@ class ObservationBasedPolicy:
 
         # --- Memory pressure check ---
         if memory_used is not None and memory_used > self.memory_threshold_percent:
+            await self._emit_alert(runner_id, "memory", memory_used, self.memory_threshold_percent)
             logger.warning(
                 "policy_reject runner_id=%s reason=memory_pressure resource=memory "
                 "current_value=%.1f threshold=%.0f",
@@ -214,3 +279,33 @@ class ObservationBasedPolicy:
             runner_uuid,
             status,
         )
+
+    async def _emit_alert(
+        self,
+        runner_id: str,
+        metric: str,
+        current_value: float,
+        threshold: float,
+    ) -> None:
+        """Emit a structured alert to all registered alert handlers.
+
+        Each handler in :attr:`_alert_handlers` is called sequentially.
+        Failures in a single handler are logged and do not prevent
+        subsequent handlers from executing.
+        """
+        alert = Alert(
+            runner_id=runner_id,
+            metric=metric,
+            current_value=current_value,
+            threshold=threshold,
+        )
+        for handler in self._alert_handlers:
+            try:
+                await handler(alert)
+            except Exception:
+                logger.exception(
+                    "Alert handler %s failed for runner=%s metric=%s",
+                    handler,
+                    runner_id,
+                    metric,
+                )

@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.core.config import Settings
-from app.policy.base import PolicyViolation, PreflightPolicy
+from app.policy.base import (
+    Alert,
+    AlertHandler,
+    LoggingAlertHandler,
+    PolicyViolation,
+    PreflightPolicy,
+)
 from app.policy.observation import (
     RUNNER_STATUS_BLOCKED_DISK,
     RUNNER_STATUS_BLOCKED_MEMORY,
@@ -23,6 +29,7 @@ def _make_mock_conn(
     *,
     runner_id="runner-1",
     runner_uuid=None,
+    runner_status="HEALTHY",
     disk_used_percent=None,
     memory_used_percent=None,
     observed_at=None,
@@ -35,6 +42,8 @@ def _make_mock_conn(
         The text runner_id to return from the runners lookup.
     runner_uuid:
         The runner's UUID.  Auto-generated when None.
+    runner_status:
+        The runner's DB status (e.g. "HEALTHY", "offline", "maintenance").
     disk_used_percent:
         The disk_used_percent value to return from runner_observations.
         When None, the observation row is not returned (simulates
@@ -52,7 +61,7 @@ def _make_mock_conn(
     # Runner lookup: SELECT id, status FROM runners WHERE runner_id = $1
     async def _fetchrow_runner(sql, *args):
         if "FROM runners" in sql:
-            return mock_row({"id": runner_uuid, "status": "HEALTHY"})
+            return mock_row({"id": runner_uuid, "status": runner_status})
         return None
 
     if disk_used_percent is not None or memory_used_percent is not None:
@@ -61,7 +70,7 @@ def _make_mock_conn(
 
         async def _fetchrow_obs(sql, *args):
             if "FROM runners" in sql:
-                return mock_row({"id": runner_uuid, "status": "HEALTHY"})
+                return mock_row({"id": runner_uuid, "status": runner_status})
             if "FROM runner_observations" in sql:
                 return mock_row(
                     {
@@ -697,6 +706,132 @@ class TestCheckStaleness:
         assert result is None
 
 
+class TestManualStatusPolicy:
+    """Tests for manual (operator-set) status handling in ObservationBasedPolicy."""
+
+    @pytest.mark.asyncio
+    async def test_offline_runner_rejects_with_policy_violation(self) -> None:
+        """When runner status is 'offline', check() raises PolicyViolation."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="offline",
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "manual_status"
+        assert detail["runner_id"] == "runner-1"
+        assert "offline" in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_maintenance_runner_rejects_with_policy_violation(self) -> None:
+        """When runner status is 'maintenance', check() raises PolicyViolation."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="maintenance",
+            disk_used_percent=50.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.status_code == 503
+        detail = exc_info.value.detail
+        assert detail["resource"] == "manual_status"
+        assert detail["runner_id"] == "runner-1"
+        assert "maintenance" in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_online_runner_allows_dispatch_without_updating_status(
+        self,
+    ) -> None:
+        """When runner status is 'online', check() returns None and does NOT
+        update the runner status even if observation thresholds are exceeded."""
+        policy = ObservationBasedPolicy()
+        runner_uuid = uuid.uuid4()
+
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        conn = _make_mock_conn_tracked(
+            runner_uuid=runner_uuid,
+            runner_status="online",
+            disk_used_percent=95.0,  # exceeds threshold but should be ignored
+            memory_used_percent=95.0,  # exceeds threshold but should be ignored
+        )
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None
+
+        # Verify NO status update was issued (online status is preserved)
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET status" in sql
+        ]
+        assert len(status_updates) == 0, (
+            f"Expected 0 status updates for online runner, got {len(status_updates)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_runner_blocks_even_with_healthy_metrics(self) -> None:
+        """An offline runner is blocked even when disk/memory are healthy."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="offline",
+            disk_used_percent=10.0,
+            memory_used_percent=20.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+
+    @pytest.mark.asyncio
+    async def test_maintenance_runner_blocks_even_with_healthy_metrics(self) -> None:
+        """A maintenance runner is blocked even when disk/memory are healthy."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="maintenance",
+            disk_used_percent=10.0,
+            memory_used_percent=20.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+
+    @pytest.mark.asyncio
+    async def test_healthy_runner_still_checked_normally(self) -> None:
+        """A runner with a system status (HEALTHY) still goes through normal observation checks."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="HEALTHY",
+            disk_used_percent=90.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        # Should be a disk violation, not a manual_status one
+        assert exc_info.value.detail["resource"] == "disk"
+
+
 class TestConfigIntegration:
     """Verify that Settings fields are correctly declared."""
 
@@ -724,3 +859,254 @@ class TestConfigIntegration:
             assert field_info.description, (
                 f"Field '{attr}' is missing a Field() description"
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Alert model tests
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestAlert:
+    """Tests for the Alert dataclass and alert infrastructure."""
+
+    def test_alert_has_required_fields(self) -> None:
+        """Alert must carry runner_id, metric, current_value, threshold, level."""
+        alert = Alert(
+            runner_id="runner-1",
+            metric="disk",
+            current_value=95.0,
+            threshold=80.0,
+        )
+        assert alert.runner_id == "runner-1"
+        assert alert.metric == "disk"
+        assert alert.current_value == 95.0
+        assert alert.threshold == 80.0
+        assert alert.level == "WARNING"
+
+    def test_alert_default_level_is_warning(self) -> None:
+        """Level defaults to WARNING when not explicitly set."""
+        alert = Alert(
+            runner_id="runner-x",
+            metric="memory",
+            current_value=90.0,
+            threshold=85.0,
+        )
+        assert alert.level == "WARNING"
+
+    def test_alert_custom_level(self) -> None:
+        """Level can be overridden for higher-severity conditions."""
+        alert = Alert(
+            runner_id="runner-critical",
+            metric="disk",
+            current_value=99.0,
+            threshold=80.0,
+            level="CRITICAL",
+        )
+        assert alert.level == "CRITICAL"
+
+    def test_alert_is_dataclass(self) -> None:
+        """Alert should be a dataclass for easy construction and comparison."""
+        a1 = Alert(runner_id="r1", metric="disk", current_value=90.0, threshold=80.0)
+        a2 = Alert(runner_id="r1", metric="disk", current_value=90.0, threshold=80.0)
+        assert a1 == a2
+
+    def test_logging_alert_handler_is_callable(self) -> None:
+        """LoggingAlertHandler should be an async callable."""
+        handler = LoggingAlertHandler()
+        assert callable(handler)
+
+    @pytest.mark.asyncio
+    async def test_logging_alert_handler_logs_at_warning(self, caplog) -> None:
+        """LoggingAlertHandler should emit a WARNING-level structured log."""
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        handler = LoggingAlertHandler()
+        alert = Alert(
+            runner_id="runner-abc",
+            metric="disk",
+            current_value=88.0,
+            threshold=80.0,
+        )
+        await handler(alert)
+
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.levelname == "WARNING"
+        assert "policy_alert" in record.message
+        assert "runner_id=runner-abc" in record.message
+        assert "metric=disk" in record.message
+        assert "current_value=88.0" in record.message
+        assert "threshold=80" in record.message
+        assert "level=WARNING" in record.message
+
+    def test_alert_handler_protocol_is_type(self) -> None:
+        """AlertHandler should be a Protocol (type)."""
+        assert isinstance(AlertHandler, type)
+
+    def test_conforming_async_callable_satisfies_alert_handler(self) -> None:
+        """An async callable matching the signature should satisfy AlertHandler."""
+
+        class CustomHandler:
+            async def __call__(self, alert: Alert) -> None:
+                pass
+
+        handler = CustomHandler()
+        assert isinstance(handler, AlertHandler)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Alert emission integration tests
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestAlertEmission:
+    """Tests for structured alert emission from ObservationBasedPolicy.check()."""
+
+    @pytest.mark.asyncio
+    async def test_disk_pressure_emits_alert_with_correct_fields(self) -> None:
+        """When disk exceeds threshold, an alert is emitted with correct fields."""
+        captured_alerts: list[Alert] = []
+
+        async def _capture(alert: Alert) -> None:
+            captured_alerts.append(alert)
+
+        policy = ObservationBasedPolicy(alert_handlers=[_capture])
+        conn = _make_mock_conn(disk_used_percent=90.0, memory_used_percent=50.0)
+
+        try:
+            await policy.check("runner-disk-alert", conn=conn)
+        except PolicyViolation:
+            pass
+
+        assert len(captured_alerts) == 1
+        alert = captured_alerts[0]
+        assert alert.runner_id == "runner-disk-alert"
+        assert alert.metric == "disk"
+        assert alert.current_value == 90.0
+        assert alert.threshold == 80.0
+        assert alert.level == "WARNING"
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_emits_alert_with_correct_fields(self) -> None:
+        """When memory exceeds threshold, an alert is emitted with correct fields."""
+        captured_alerts: list[Alert] = []
+
+        async def _capture(alert: Alert) -> None:
+            captured_alerts.append(alert)
+
+        policy = ObservationBasedPolicy(alert_handlers=[_capture])
+        conn = _make_mock_conn(disk_used_percent=50.0, memory_used_percent=92.0)
+
+        try:
+            await policy.check("runner-mem-alert", conn=conn)
+        except PolicyViolation:
+            pass
+
+        assert len(captured_alerts) == 1
+        alert = captured_alerts[0]
+        assert alert.runner_id == "runner-mem-alert"
+        assert alert.metric == "memory"
+        assert alert.current_value == 92.0
+        assert alert.threshold == 85.0
+        assert alert.level == "WARNING"
+
+    @pytest.mark.asyncio
+    async def test_healthy_runner_emits_no_alert(self) -> None:
+        """When runner is healthy, no alert is emitted."""
+        captured_alerts: list[Alert] = []
+
+        async def _capture(alert: Alert) -> None:
+            captured_alerts.append(alert)
+
+        policy = ObservationBasedPolicy(alert_handlers=[_capture])
+        conn = _make_mock_conn(disk_used_percent=40.0, memory_used_percent=55.0)
+
+        result = await policy.check("runner-healthy", conn=conn)
+        assert result is None
+        assert len(captured_alerts) == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_alert_handlers_all_called(self) -> None:
+        """When multiple alert handlers are registered, all are called."""
+        captured_by: list[str] = []
+
+        async def _handler_a(alert: Alert) -> None:
+            captured_by.append("a")
+
+        async def _handler_b(alert: Alert) -> None:
+            captured_by.append("b")
+
+        policy = ObservationBasedPolicy(alert_handlers=[_handler_a, _handler_b])
+        conn = _make_mock_conn(disk_used_percent=95.0, memory_used_percent=50.0)
+
+        try:
+            await policy.check("runner-multi", conn=conn)
+        except PolicyViolation:
+            pass
+
+        assert "a" in captured_by
+        assert "b" in captured_by
+        assert len(captured_by) == 2
+
+    @pytest.mark.asyncio
+    async def test_alert_handler_failure_does_not_block_others(self) -> None:
+        """If one alert handler raises, subsequent handlers still execute."""
+        captured_by: list[str] = []
+
+        async def _failing_handler(alert: Alert) -> None:
+            raise RuntimeError("Simulated handler failure")
+
+        async def _good_handler(alert: Alert) -> None:
+            captured_by.append("good")
+
+        policy = ObservationBasedPolicy(alert_handlers=[_failing_handler, _good_handler])
+        conn = _make_mock_conn(disk_used_percent=95.0, memory_used_percent=50.0)
+
+        try:
+            await policy.check("runner-failover", conn=conn)
+        except PolicyViolation:
+            pass
+
+        assert "good" in captured_by
+
+    @pytest.mark.asyncio
+    async def test_default_alert_handler_is_logging_handler(self) -> None:
+        """When no alert_handlers specified, LoggingAlertHandler is used by default."""
+        policy = ObservationBasedPolicy()
+        assert len(policy._alert_handlers) == 1
+        assert isinstance(policy._alert_handlers[0], LoggingAlertHandler)
+
+    @pytest.mark.asyncio
+    async def test_disk_pressure_with_custom_threshold_emits_correct_threshold(
+        self,
+    ) -> None:
+        """Alert threshold matches the custom Settings threshold."""
+        captured_alerts: list[Alert] = []
+
+        async def _capture(alert: Alert) -> None:
+            captured_alerts.append(alert)
+
+        settings = Settings(disk_threshold_percent=75.0)
+        policy = ObservationBasedPolicy(settings=settings, alert_handlers=[_capture])
+        conn = _make_mock_conn(disk_used_percent=80.0, memory_used_percent=50.0)
+
+        try:
+            await policy.check("runner-custom", conn=conn)
+        except PolicyViolation:
+            pass
+
+        assert len(captured_alerts) == 1
+        assert captured_alerts[0].threshold == 75.0
+        assert captured_alerts[0].current_value == 80.0
+
+    @pytest.mark.asyncio
+    async def test_alert_handler_receives_alert_arg_type_annotation(self) -> None:
+        """AlertHandler protocol check verifies the annotation is Alert."""
+
+        class TypedHandler:
+            async def __call__(self, alert: Alert) -> None:
+                pass
+
+        handler = TypedHandler()
+        assert isinstance(handler, AlertHandler)

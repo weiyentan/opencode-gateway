@@ -1,22 +1,23 @@
 """Job API endpoints — create, retrieve, and monitor coding jobs."""
 
-from __future__ import annotations
-
+import asyncio
+import json
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
 from typing import Optional
+from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic.config import ConfigDict
 
+from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
-from app.db.session import get_session
+from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
 from app.executors.models import (
@@ -33,11 +34,36 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["jobs"])
 
 
+async def _get_pool(request: Request) -> DatabasePool:
+    """FastAPI dependency that returns the database pool for background tasks."""
+    return request.app.state.pool  # type: ignore[return-value]
+
+
 class JobCreateRequest(BaseModel):
-    """Request body for POST /jobs."""
+    """Request body for POST /jobs.
+
+    Callers may optionally pin the job to a specific runner (``runner_id``)
+    or request a runner that matches a set of label constraints
+    (``labels``).  When neither is provided the Gateway auto-selects the
+    best available runner via :func:`select_runner`.
+
+    ``env_vars`` are environment variables to pass to the OpenCode session.
+    """
 
     repo_url: HttpUrl = Field(description="URL of the repository to work on")
     task_summary: str = Field(min_length=1, description="Summary of the task to perform")
+    runner_id: Optional[uuid.UUID] = Field(
+        default=None,
+        description="UUID of the runner to pin this job to.  When set, the "
+        "runner must exist and be HEALTHY.",
+    )
+    labels: Optional[list[str]] = Field(
+        default=None,
+        description="Labels used to filter eligible runners.  Each label "
+        "must exist as a key in the runner's labels JSONB column. "
+        "Ignored when ``runner_id`` is provided.",
+    )
+    env_vars: dict[str, str] = {}
 
 
 class JobResponse(BaseModel):
@@ -49,9 +75,9 @@ class JobResponse(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
-    completed_at: Optional[datetime] = None
-    opencode_session_id: Optional[str] = None
-    diff: Optional[str] = None
+    completed_at: datetime | None = None
+    opencode_session_id: str | None = None
+    diff: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -61,7 +87,7 @@ class JobEvent(BaseModel):
     timestamp: datetime
     actor: str
     details: str
-    previous_status: Optional[str] = None
+    previous_status: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -80,7 +106,7 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
     )
 
 
-async def get_opencode_client() -> Optional[OpenCodeClientProtocol]:
+async def get_opencode_client() -> OpenCodeClientProtocol | None:
     """Dependency that returns the OpenCode client for diff fetching.
 
     Returns None by default; tests override this via
@@ -105,11 +131,11 @@ async def _set_workspace_cleanup_after(
         "updated_at = $3 WHERE id = $1",
         workspace_id,
         timedelta(hours=retention_hours),
-        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),  # noqa: UP017
     )
 
 
-def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
+def _resolve_workspace_id(workspace_name: str | None) -> uuid.UUID | None:
     """Parse the *workspace_name* column (stored as a string UUID) back to a UUID."""
     if not workspace_name:
         return None
@@ -120,65 +146,157 @@ def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
-async def _resolve_runner_id_for_workspace(
+async def select_runner(
     conn: asyncpg.Connection,
-    workspace_id: uuid.UUID,
-) -> Optional[str]:
-    """Resolve a workspace ID to its runner's text identifier.
+    runner_id: uuid.UUID | None = None,
+    labels: list[str] | None = None,
+) -> uuid.UUID:
+    """Select an appropriate runner for a new job.
 
-    Looks up the workspace's ``runner_id`` (UUID FK) in the workspaces
-    table, then resolves it to the ``runners.runner_id`` text field.
-    Returns ``None`` when the workspace or runner is not found.
+    **Runner Selection Algorithm**
+
+    This function implements three selection modes in priority order:
+
+    **1. Explicit Pinning (``runner_id`` provided)**
+    When the caller specifies a ``runner_id``:
+
+    1. Look up the runner by its UUID primary key in the ``runners`` table.
+    2. If the runner does not exist → raise ``HTTPException(400)``.
+    3. If the runner's ``status`` is not ``HEALTHY`` → raise
+       ``HTTPException(400)``.
+    4. Otherwise, return the runner's UUID.
+
+    **2. Label-Based Selection (``labels`` provided, ``runner_id`` absent)**
+    When the caller provides ``labels`` but no ``runner_id``:
+
+    1. Query all runners where:
+       - ``status = 'HEALTHY'``, AND
+       - the ``labels`` JSONB column contains every requested label as a
+         key (checked via PostgreSQL ``?&`` operator).
+    2. Among the candidates, count each runner's active workspaces
+       (``workspaces`` rows where ``cleanup_status = 'active'``).
+    3. Select the runner with the **fewest** active workspaces (load
+       balancing).
+    4. Break ties by picking the runner with the lowest UUID
+       (deterministic tie-break).
+    5. If no runner matches → raise ``HTTPException(400)``.
+
+    **3. Automatic Selection (neither ``runner_id`` nor ``labels``)**
+    When the caller provides no constraints:
+
+    1. Query all runners with ``status = 'HEALTHY'``.
+    2. Count each runner's active workspaces.
+    3. Select the runner with the **fewest** active workspaces.
+    4. Break ties by lowest UUID.
+    5. If no healthy runner exists → raise ``HTTPException(400)``.
+
+    **What counts as an active workspace?**
+    Workspaces where ``cleanup_status = 'active'`` count as active load
+    on a runner.  Workspaces that have been cleaned (``cleanup_status =
+    'cleaned'``) or are otherwise non-active are excluded from the
+    tally.
+
+    Parameters
+    ----------
+    conn:
+        An active asyncpg database connection.
+    runner_id:
+        Explicit runner UUID to pin to.  When set, *labels* is ignored.
+    labels:
+        List of label keys that a runner's ``labels`` JSONB column must
+        contain.  Only used when *runner_id* is ``None``.
+
+    Returns
+    -------
+    uuid.UUID
+        The UUID of the selected runner.
+
+    Raises
+    ------
+    HTTPException(400)
+        If the requested runner is not found, is unhealthy, or no
+        matching healthy runner is available.
     """
-    # Get the runner UUID from the workspace row.
-    ws_row = await conn.fetchrow(
-        "SELECT runner_id FROM workspaces WHERE id = $1",
-        workspace_id,
-    )
-    if ws_row is None or ws_row.get("runner_id") is None:
-        logger.debug(
-            "No runner_id for workspace %s — skipping policy check",
-            workspace_id,
+    if runner_id is not None:
+        # --- Mode 1: Explicit pinning ---
+        row = await conn.fetchrow(
+            "SELECT id, status FROM runners WHERE id = $1",
+            runner_id,
         )
-        return None
+        if row is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner not found: {runner_id}",
+            )
+        if row["status"] != "HEALTHY":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner is not healthy (status={row['status']}): {runner_id}",
+            )
+        return runner_id
 
-    runner_uuid = ws_row["runner_id"]
-
-    # Resolve to the text runner_id.
-    runner_row = await conn.fetchrow(
-        "SELECT runner_id FROM runners WHERE id = $1",
-        runner_uuid,
+    # Build the base query for modes 2 and 3
+    query = (
+        "SELECT r.id, COUNT(w.id) AS active_workspaces "
+        "FROM runners r "
+        "LEFT JOIN workspaces w ON w.runner_id = r.id "
+        "   AND w.cleanup_status = 'active' "
+        "WHERE r.status = 'HEALTHY'"
     )
-    if runner_row is None:
-        logger.warning(
-            "Runner UUID %s referenced by workspace %s not found",
-            runner_uuid,
-            workspace_id,
-        )
-        return None
+    query_args: list[list[str]] = []
 
-    return runner_row["runner_id"]
+    if labels:
+        # --- Mode 2: Label-based selection ---
+        # PostgreSQL ?& operator checks that all keys exist in the JSONB object.
+        query += " AND r.labels IS NOT NULL AND r.labels ?& $1"
+        query_args.append(labels)
+
+    query += " GROUP BY r.id ORDER BY active_workspaces ASC, r.id ASC LIMIT 1"
+
+    row = await conn.fetchrow(query, *query_args)
+    if row is None:
+        if labels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No healthy runner found matching labels: {labels}",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="No healthy runners available",
+        )
+    return row["id"]  # type: ignore[no-any-return]
 
 
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
     conn: asyncpg.Connection = Depends(get_session),
+    pool: DatabasePool = Depends(_get_pool),
     executor: ExecutorPlugin = Depends(get_executor),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JobResponse:
     """Create a new job, dispatch via executor, and return the final state."""
     job_id = uuid.uuid4()
     settings = get_settings()
 
+    # 0. Select (or validate) the target runner
+    resolved_runner_id = await select_runner(
+        conn,
+        runner_id=body.runner_id,
+        labels=body.labels,
+    )
+
     # 1. Insert the job record in pending state
     await conn.execute(
-        "INSERT INTO gateway_jobs (id, repo_url, task_summary, status, executor_type) "
-        "VALUES ($1, $2, $3, 'pending', $4)",
+        "INSERT INTO gateway_jobs "
+        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
+        resolved_runner_id,
+        json.dumps(body.env_vars) if body.env_vars else "{}",
     )
 
     # 2. Validate and perform pending → running transition
@@ -190,15 +308,32 @@ async def create_job(
     await conn.execute(
         "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
         job_id,
-        datetime.now(timezone.utc),
+        datetime.now(timezone.utc),  # noqa: UP017
     )
 
+    new_workspace_id = None
+
     try:
-        # 3. Create workspace and store its ID (before potentially-failing start)
+        # Resolve the selected runner's text ID for pre-flight policy check.
+        # This ensures the policy inspects the same runner that select_runner()
+        # chose for the job.
+        runner_row = await conn.fetchrow(
+            "SELECT runner_id FROM runners WHERE id = $1",
+            resolved_runner_id,
+        )
+        runner_text_id = runner_row["runner_id"] if runner_row else None
+
+        if runner_text_id is not None:
+            policy = ObservationBasedPolicy(settings)
+            await policy.check(runner_text_id, conn=conn)
+
+        # 4. Create workspace on the selected runner (only after policy passes)
         ws_response = await executor.create_workspace(
             CreateWorkspaceRequest(
                 repo_url=str(body.repo_url),
                 job_id=job_id,
+                runner_id=runner_text_id,
+                env_vars=body.env_vars,
             )
         )
         new_workspace_id = ws_response.workspace_id
@@ -211,18 +346,12 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 3b. Run pre-flight policy check — resolves workspace → runner and
-        # inspects runner observations for disk/memory pressure.
-        runner_text_id = await _resolve_runner_id_for_workspace(conn, new_workspace_id)
-        if runner_text_id is not None:
-            policy = ObservationBasedPolicy(settings)
-            await policy.check(runner_text_id, conn=conn)
-
-        # 4. Start OpenCode Serve
+        # 5. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
+                env_vars=body.env_vars,
             )
         )
         session_id = str(start_response.session_id)
@@ -235,7 +364,7 @@ async def create_job(
         )
 
         # 5. Mark completed
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)  # noqa: UP017
         diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
@@ -246,13 +375,31 @@ async def create_job(
             diff_summary,
         )
 
+        # Fire webhooks asynchronously — non-blocking
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.completed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.completed",
+                    "status": "completed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": now.isoformat(),
+                    "diff": diff_summary,
+                },
+            )
+        )
+
         # 6. Set workspace cleanup_after for successful completion
         if new_workspace_id is not None:
             await _set_workspace_cleanup_after(
                 conn, new_workspace_id, settings.cleanup_success_retention_hours
             )
 
-        # 7. Fetch and persist the diff (non-blocking — failure does not fail the job)
+        # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
             try:
                 diff_response = await opencode_client.get_session_diff(session_id)
@@ -276,18 +423,35 @@ async def create_job(
                 )
 
     except PolicyViolation:
-        # Policy rejected the job before dispatch — mark as failed and re-raise
-        # the 503 so FastAPI can return it to the caller.
+        # Policy rejected the job BEFORE any infrastructure action was taken.
+        # Mark as failed and re-raise the 503 — no workspace to clean up.
         logger.warning(
-            "Policy check rejected job %s: %s",
+            "Policy check rejected job %s before workspace creation",
             job_id,
-            "disk/memory pressure",
         )
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),  # noqa: UP017
         )
+        # Fire webhooks asynchronously for policy-rejected jobs
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                    "error": "Policy rejected: disk/memory pressure",
+                },
+            )
+        )
+
         if new_workspace_id is not None:
             await _set_workspace_cleanup_after(
                 conn, new_workspace_id, settings.cleanup_failure_retention_hours
@@ -310,7 +474,24 @@ async def create_job(
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
+
+        # Fire webhooks asynchronously for failed jobs
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                },
+            )
         )
 
         # Set workspace cleanup_after for failure
@@ -322,7 +503,7 @@ async def create_job(
                     conn, ws_id, settings.cleanup_failure_retention_hours
                 )
 
-    # 7. Return final state
+    # 9. Return final state
     row = await _fetch_job(conn, job_id)
     return JobResponse(
         id=row["id"],
@@ -359,7 +540,7 @@ async def approve_job(
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
 
     # Record approval
     approval_id = uuid.uuid4()
@@ -423,7 +604,7 @@ async def reject_job(
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
 
     # Record rejection
     approval_id = uuid.uuid4()
@@ -471,7 +652,7 @@ async def abort_job(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JobResponse:
     """Abort a job by cancelling its OpenCode session and marking it aborted.
 
@@ -501,7 +682,7 @@ async def abort_job(
             ),
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)  # noqa: UP017
     session_id = row.get("opencode_session_id")
     previous_status = row["status"]  # capture before transition
 
@@ -522,7 +703,7 @@ async def abort_job(
             await conn.execute(
                 "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
                 job_id,
-                datetime.now(timezone.utc),
+                datetime.now(timezone.utc),  # noqa: UP017
             )
             aborted = True
         except Exception:
@@ -730,5 +911,83 @@ async def get_job_diff(
         content={
             "job_id": str(row["id"]),
             "diff": row["diff"],
+        },
+    )
+
+
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: uuid.UUID,
+    conn: asyncpg.Connection = Depends(get_session),
+    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+) -> JSONResponse:
+    """Return the full log output for a job by proxying to its OpenCode session.
+
+    Retrieves the session log from the OpenCode Serve API.  Returns 404
+    when the job does not exist, 409 when the job has no associated session,
+    and 424 when the session exists but has not started yet (status is
+    still pending/created/queued).
+    """
+    # 1. Look up the job
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # 2. Check for an associated session
+    session_id: Optional[str] = row.get("opencode_session_id")
+    if not session_id:
+        raise HTTPException(
+            status_code=409,
+            detail="No session associated with this job",
+        )
+
+    # 3. Require an OpenCode client to fetch logs
+    if opencode_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve client not available",
+        )
+
+    # 4. Get session info to check status
+    try:
+        session_info = await opencode_client.get_session(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to get session info for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve unreachable",
+        )
+
+    # 5. Check whether the session has started (424 when still pending)
+    if session_info.status in ("pending", "created", "queued"):
+        raise HTTPException(
+            status_code=424,
+            detail=f"Session has not started yet (status: {session_info.status})",
+        )
+
+    # 6. Fetch the session log
+    try:
+        log_response = await opencode_client.get_session_log(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to get session log for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to retrieve session logs",
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "job_id": str(job_id),
+            "session_id": session_id,
+            "log": log_response.log,
         },
     )

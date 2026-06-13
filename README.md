@@ -26,7 +26,7 @@ The Gateway is built as four layered concerns, each in its own package:
 
 ### Interaction Flow
 
-> **Submit job** → Gateway creates a job record in PostgreSQL → checks runner health via policy module → delegates workspace creation to the executor plugin → executor starts OpenCode Serve on an allocated port → Gateway sends the coding task via the OpenCode client → OpenCode produces a diff → Gateway records the result → caller polls or retrieves the diff.
+> **Submit job** → Gateway selects a runner (by explicit pinning, label match, or automatic load-balancing) → validates runner health via the policy module → creates a job record in PostgreSQL → delegates workspace creation to the executor plugin → executor starts OpenCode Serve on an allocated port → Gateway sends the coding task via the OpenCode client → OpenCode produces a diff → Gateway records the result → caller polls or retrieves the diff.
 
 Two critical security boundaries:
 
@@ -297,18 +297,18 @@ These endpoints are implemented and tested.
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). The abort feature introduces two additional statuses — `aborting` (abort in progress, OpenCode session being terminated) and `aborted` (final state after abort). These complement the existing statuses (`pending`, `running`, `completed`, `failed`).
 
+| `POST` | `/jobs` | Submit a coding job. Accepts optional `runner_id` (pin to a specific runner) and `labels` (filter runners by label key). Auto-selects a healthy runner via load-balancing when neither is provided. Returns the final job state (201) or a policy violation (503). |
+| `GET` | `/jobs/{id}` | Retrieve a job's status, result, and diff by its ID. |
 | `POST` | `/observations` | Ingest a runner heartbeat observation — upserts the runner record, stores runner-level resource metrics (disk, memory, load), workspace snapshots, and OpenCode Serve instance status. Returns 201 on success. |
 | `GET` | `/runners` | List all registered Runner VMs with their latest observation summary (disk, memory, load, observed_at). Ordered by creation date descending. |
-| `GET` | `/runners/{id}` | Retrieve a single runner by UUID with full observation history (last 50 workspace observations + last 50 OpenCode instance observations) and derived policy status (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN). Returns 404 if not found. |
+| `GET` | `/runners/{id}` | Retrieve a single runner by UUID with full observation history (last 50 workspace observations + last 50 OpenCode instance observations) and derived policy status (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN, OFFLINE, MAINTENANCE, ONLINE). Returns 404 if not found. |
+| `POST` | `/runners/{id}/status` | Manually set a runner's status to `offline`, `online`, or `maintenance`. Validates the state machine transition, logs the change to `job_events`. Returns 404 if runner not found, 422 for invalid transitions. |
 
 ### Planned Endpoints
 
 These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not yet implemented. Status: **planned**.
 
-| Method | Path | Description | Issue |
-|--------|------|-------------|-------|
-| `POST` | `/jobs` | Submit a coding job | #4 |
-| `GET` | `/jobs/{id}` | Get job status, result, and diff | #4, #7 |
+*(None — all MVP endpoints are now implemented.)*
 
 
 ---
@@ -322,7 +322,7 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #1 | Product Requirements Document | ✅ Complete |
 | #2 | Gateway skeleton — FastAPI app factory, Postgres pool, health endpoint | ✅ Complete |
 | #3 | Runner registration and observation ingestion | ✅ Complete |
-| #4 | Job submission and tracking with local executor | 🔄 Planned |
+| #4 | Job submission and tracking with local executor | ✅ Complete |
 | #5 | OpenCode client protocol and HTTP implementation | ✅ Complete |
 | #6 | Workspace lifecycle management | ✅ Complete |
 | #7 | Job diff retrieval via OpenCode client | ✅ Complete |
@@ -333,23 +333,30 @@ These endpoints are defined in the [PRD](docs/prd/opencode-gateway.md) but not y
 | #12 | Background cleanup scheduler | ✅ Complete |
 | #13 | Paperclip integration adapter | 🔄 Planned |
 | #14 | Gateway container image and docker-compose setup | ✅ Complete |
+| #88 | Policy check reordering (policy before workspace creation) | ✅ Complete |
+| #92 | Runner selection & job pinning (explicit, label-based, auto load-balancing) | ✅ Complete |
+| #96 | Runner status management (manual offline/online/maintenance transitions) | ✅ Complete |
+| #97 | Test infrastructure (integration tests, seed script, compose override) | ✅ Complete |
 
 
 ### Dependency DAG
 
 ```
-#2 (foundation) → #3 (observations) → #9 (policy)
-                → #4 (jobs + executors) → #6 (workspaces) → #12 (cleanup scheduler)
+#2 (foundation) → #3 (observations) → #9 (policy) → #88 (policy reorder)
+                → #4 (jobs + executors) → #92 (runner selection)
+                                        → #6 (workspaces) → #12 (cleanup scheduler)
                                         → #10 (AWX executor)
                                         → #11 (approvals)
                 → #5 (OpenCode client) → #7 (diff), #8 (abort)
                 → #14 (Docker)
+                → #96 (runner status)
+                → #97 (test infrastructure)
                                         → #13 (Paperclip adapter)
 ```
 
 **Critical path**: #2 → #4 → #6 → #12 (or #2 → #4 → #10 if AWX is available early).
 
-Total estimated effort: **7.5–12 hours** wall-clock across 14 issues. See the [full effort estimate](docs/issues/2026-06-04-effort-estimate.md) for per-issue breakdowns and risk analysis.
+Total estimated effort: **7.5–12 hours** wall-clock across 18 issues. See the [full effort estimate](docs/issues/2026-06-04-effort-estimate.md) for per-issue breakdowns and risk analysis.
 
 ---
 

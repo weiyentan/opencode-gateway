@@ -50,6 +50,13 @@ class SessionAbortResponse(BaseModel):
     message: str | None = None
 
 
+class SessionLogResponse(BaseModel):
+    """Response containing the full log output of a session."""
+
+    session_id: str
+    log: str
+
+
 class OpenCodeClientProtocol(ABC):
     """Abstract protocol for communicating with an OpenCode Serve instance.
 
@@ -59,10 +66,12 @@ class OpenCodeClientProtocol(ABC):
 
     .. rubric:: Current active surface
 
-    The Gateway currently calls two protocol methods at runtime:
+    The Gateway currently calls four protocol methods at runtime:
 
     * :meth:`get_session_diff` — retrieve the diff produced by a session
-    * :meth:`abort_session`     — abort a running session
+    * :meth:`get_session`      — get a specific session by ID (used for status checks)
+    * :meth:`get_session_log`  — retrieve the full log output of a session
+    * :meth:`abort_session`    — abort a running session
 
     .. rubric:: Intentional future surface
 
@@ -73,7 +82,6 @@ class OpenCodeClientProtocol(ABC):
 
     * :meth:`health`          — check server health
     * :meth:`list_sessions`   — list all sessions
-    * :meth:`get_session`     — get a specific session by ID
     * :meth:`create_session`  — create a new coding session
     * :meth:`delete_session`  — delete a session
     """
@@ -171,6 +179,20 @@ class OpenCodeClientProtocol(ABC):
 
         Returns:
             SessionDiffResponse containing the diff and list of changed files.
+        """
+        ...
+
+    @abstractmethod
+    async def get_session_log(self, session_id: str) -> SessionLogResponse:
+        """Retrieve the full log output of a session.
+
+        Calls ``GET /session/{session_id}/log``.
+
+        Args:
+            session_id: The unique identifier of the session.
+
+        Returns:
+            SessionLogResponse containing the session's full log output.
         """
         ...
 
