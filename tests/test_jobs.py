@@ -340,9 +340,10 @@ class TestJobDispatch:
 
         from app.policy import ObservationBasedPolicy, PolicyViolation
 
-        # Mock _resolve_target_runner: return a HEALTHY runner
+        # Mock the runner resolution query: return the text runner_id
+        # for the dummy UUID returned by the patched select_runner.
         async def _fetchrow(sql, *args):
-            if "FROM runners WHERE status = 'HEALTHY'" in sql:
+            if "FROM runners WHERE id" in sql:
                 return mock_row({"runner_id": "test-runner-99"})
             return None
 
@@ -391,13 +392,9 @@ class TestJobDispatch:
         self, mock_conn, mock_executor
     ):
         """POST /jobs returns 503 when the runner status is 'offline'."""
-        workspace_uuid = uuid.uuid4()
         runner_uuid = uuid.uuid4()
         runner_text_id = "test-runner-offline"
 
-        # Build mock rows for _resolve_runner_id_for_workspace queries
-        # and for the policy's internal runner lookup.
-        ws_row = mock_row({"runner_id": runner_uuid})
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
             {"id": runner_uuid, "status": "offline"}
@@ -407,8 +404,6 @@ class TestJobDispatch:
             pass
 
         async def _fetchrow(sql, *args):
-            if "workspaces" in sql and "runner_id" in sql:
-                return ws_row
             if "FROM runners WHERE id" in sql:
                 return runner_by_id_row
             if "FROM runners WHERE runner_id" in sql:
@@ -435,19 +430,18 @@ class TestJobDispatch:
         assert data["detail"]["runner_id"] == runner_text_id
         assert "offline" in data["detail"]["message"]
 
-        # Verify executor cleanup was triggered
-        mock_executor.cleanup_workspace.assert_awaited_once()
+        # Policy check happens before workspace creation — no workspace was
+        # created, so no cleanup should occur.
+        mock_executor.cleanup_workspace.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_job_returns_503_when_runner_is_maintenance(
         self, mock_conn, mock_executor
     ):
         """POST /jobs returns 503 when the runner status is 'maintenance'."""
-        workspace_uuid = uuid.uuid4()
         runner_uuid = uuid.uuid4()
         runner_text_id = "test-runner-maint"
 
-        ws_row = mock_row({"runner_id": runner_uuid})
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
             {"id": runner_uuid, "status": "maintenance"}
@@ -457,8 +451,6 @@ class TestJobDispatch:
             pass
 
         async def _fetchrow(sql, *args):
-            if "workspaces" in sql and "runner_id" in sql:
-                return ws_row
             if "FROM runners WHERE id" in sql:
                 return runner_by_id_row
             if "FROM runners WHERE runner_id" in sql:
@@ -485,7 +477,9 @@ class TestJobDispatch:
         assert data["detail"]["runner_id"] == runner_text_id
         assert "maintenance" in data["detail"]["message"]
 
-        mock_executor.cleanup_workspace.assert_awaited_once()
+        # Policy check happens before workspace creation — no workspace was
+        # created, so no cleanup should occur.
+        mock_executor.cleanup_workspace.assert_not_called()
 
 
 class TestApproveJob:

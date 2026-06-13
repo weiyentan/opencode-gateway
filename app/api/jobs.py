@@ -137,27 +137,6 @@ def _resolve_workspace_id(workspace_name: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
-async def _resolve_target_runner(conn: asyncpg.Connection) -> Optional[str]:
-    """Select a target runner for a new job — any HEALTHY runner.
-
-    Queries the ``runners`` table for a runner whose status is
-    ``HEALTHY``.  Returns the text ``runner_id`` column value, or
-    ``None`` when no HEALTHY runner is available.
-
-    The caller is expected to run the pre-flight policy check against
-    the returned runner *before* provisioning a workspace on it.
-    """
-    row = await conn.fetchrow(
-        "SELECT runner_id FROM runners WHERE status = 'HEALTHY' LIMIT 1"
-    )
-    if row is None:
-        logger.warning("No HEALTHY runner available — policy check skipped")
-        return None
-    # Use .get() so the lookup is resilient against mock rows that do not
-    # carry a 'runner_id' key (common in tests that reuse generic mocks).
-    return row.get("runner_id")
-
-
 async def select_runner(
     conn: asyncpg.Connection,
     runner_id: Optional[uuid.UUID] = None,
@@ -322,9 +301,15 @@ async def create_job(
     )
 
     try:
-        # 3. Resolve a target runner and run pre-flight policy check.
-        #    This MUST run before any infrastructure action — see ADR 0002.
-        runner_text_id = await _resolve_target_runner(conn)
+        # Resolve the selected runner's text ID for pre-flight policy check.
+        # This ensures the policy inspects the same runner that select_runner()
+        # chose for the job.
+        runner_row = await conn.fetchrow(
+            "SELECT runner_id FROM runners WHERE id = $1",
+            resolved_runner_id,
+        )
+        runner_text_id = runner_row["runner_id"] if runner_row else None
+
         if runner_text_id is not None:
             policy = ObservationBasedPolicy(settings)
             await policy.check(runner_text_id, conn=conn)
