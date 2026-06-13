@@ -37,7 +37,7 @@ A time-series telemetry snapshot ingested via `POST /observations`. Runner VMs p
 _Avoid_: Log, event, heartbeat (in the telemetry sense)
 
 **Policy Engine**:
-A pluggable pre-flight check system that inspects runner observations before a job is accepted. The default implementation (`ObservationBasedPolicy`) checks disk pressure, memory pressure, and telemetry staleness. Runners that exceed configured thresholds are rejected with HTTP 503 (`PolicyViolation`). The runner's database status is updated to reflect the pressure condition.
+A pluggable pre-flight check system that inspects runner observations before a job is accepted. The default implementation (`ObservationBasedPolicy`) checks disk pressure, memory pressure, and telemetry staleness. Runners that exceed configured thresholds are rejected with HTTP 503 (`PolicyViolation`). The runner's database status is updated to reflect the pressure condition. Runners with operator-set statuses (`offline`, `maintenance`) are rejected immediately regardless of observation data; runners set to `online` bypass observation-based checks entirely.
 _Avoid_: Guard, validator, admission control
 
 **Runner Statuses** — The Gateway tracks runner health via these statuses:
@@ -48,6 +48,9 @@ _Avoid_: Guard, validator, admission control
 | `BLOCKED_DISK_PRESSURE` | Disk usage exceeds `disk_threshold_percent` |
 | `BLOCKED_MEMORY_PRESSURE` | Memory usage exceeds `memory_threshold_percent` |
 | `UNKNOWN` | No recent observations or telemetry is stale |
+| `offline` | Operator-set — runner is offline and rejects all jobs immediately |
+| `online` | Operator-set — runner is cleared for dispatch; observation thresholds are skipped |
+| `maintenance` | Operator-set — runner is under maintenance and rejects all jobs immediately |
 
 ## Relationships
 

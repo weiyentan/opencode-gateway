@@ -81,11 +81,32 @@ Expected response: `{"status": "ok", "version": "0.1.0-dev", "database": "connec
 ## Running Tests
 
 ```bash
-pytest tests/ -v                 # Run all tests
+pytest tests/ -v                 # Run all tests (unit + integration)
 pytest tests/ -v -k "db"         # Run only database-related tests (requires Postgres)
+pytest tests/integration/ -v -m integration  # Integration tests only (requires Postgres)
 ```
 
-Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). The database tests require a running PostgreSQL instance with the correct credentials.
+Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). Unit tests mock the database layer; integration tests (marked with `@pytest.mark.integration`) require a running PostgreSQL instance.
+
+### Integration test database
+
+A dedicated Docker Compose file starts a Postgres container on port 5433 for integration tests:
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+pytest tests/integration/ -v -m integration
+docker compose -f docker-compose.test.yml down -v
+```
+
+### Database seeding
+
+The `scripts/seed.py` tool populates the database with sample data for manual testing:
+
+```bash
+python scripts/seed.py --runners 3 --workspaces 5 --jobs 10 --observations 20
+```
+
+See `python scripts/seed.py --help` for all options. The script is idempotent and safe to run multiple times.
 
 ---
 
@@ -113,32 +134,85 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
-│   │   └── health.py             # GET /health endpoint
+│   │   ├── health.py             # GET /health endpoint
+│   │   ├── jobs.py               # Job CRUD, dispatch, approval, abort
+│   │   ├── runners.py            # Runner list, detail, status management
+│   │   └── workspaces.py         # Workspace endpoints (list, get, pin, cleanup)
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
-│   │   └── factory.py            # create_app() FastAPI factory
+│   │   ├── factory.py            # create_app() FastAPI factory
+│   │   └── lifecycle.py          # State machine transition rules
 │   ├── db/
 │   │   ├── __init__.py
-│   │   └── session.py            # DatabasePool (asyncpg wrapper)
+│   │   ├── schema.py             # Schema migration utility
+│   │   ├── session.py            # DatabasePool (asyncpg wrapper)
+│   │   └── models/               # SQLAlchemy ORM models
+│   │       ├── __init__.py
+│   │       ├── base.py           # DeclarativeBase with naming convention
+│   │       └── runner.py         # Runner, RunnerObservation, WorkspaceObservation, etc.
 │   ├── executors/
-│   │   ├── __init__.py           # Stub — will hold ExecutorPlugin ABC
-│   │   └── ...                   # Future: base.py, local.py, awx.py
-│   └── opencode/
-│       ├── __init__.py           # Package init, exports OpenCodeServeClient and custom exceptions
-│       ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
-│       └── serve_client.py       # httpx-based OpenCode Serve REST API client
+│   │   ├── __init__.py           # ExecutorPlugin ABC, EXECUTOR_REGISTRY, model exports
+│   │   ├── factory.py            # get_executor() — config-driven registry lookup
+│   │   ├── local.py              # LocalExecutor (default, shell-based)
+│   │   ├── models.py             # Pydantic request/response models
+│   │   └── awx/
+│   │       ├── __init__.py       # AWX executor package exports
+│   │       ├── client.py         # AWXApiClient — httpx REST API client
+│   │       ├── exceptions.py     # AWX exception hierarchy
+│   │       └── plugin.py         # AWXExecutorPlugin — lifecycle implementation
+│   ├── policy/
+│   │   ├── __init__.py           # Exports ObservationBasedPolicy, PolicyViolation
+│   │   ├── base.py               # PreflightPolicy protocol + PolicyViolation exception
+│   │   └── observation.py        # ObservationBasedPolicy — disk/memory/staleness guardrails
+│   ├── opencode/
+│   │   ├── __init__.py           # Package init, exports OpenCodeServeClient
+│   │   ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
+│   │   └── serve_client.py       # httpx-based OpenCode Serve REST API client
+│   └── scheduler/
+│       ├── __init__.py           # Scheduler package
+│       ├── cleaner.py            # CleanupScheduler — background workspace cleanup
+│       └── engine.py             # Scheduler engine base class
 ├── tests/
 │   ├── __init__.py
+│   ├── conftest.py               # Shared fixtures (mock_conn, client, async test helpers)
+│   ├── integration/              # Integration tests requiring Postgres
+│   │   ├── __init__.py
+│   │   ├── conftest.py           # DB fixtures, helper factories
+│   │   ├── test_job_crud.py      # Job CRUD integration tests
+│   │   ├── test_runner.py        # Runner + observation integration tests
+│   │   └── test_schema.py        # Schema migration smoke tests
 │   ├── test_app_factory.py       # Application factory lifecycle tests
+│   ├── test_awx_client.py        # AWXApiClient unit tests
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
-│   └── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_executor_loader.py   # Executor registry and factory resolution
+│   ├── test_executors.py         # Executor plugin interface and models
+│   ├── test_executors_awx.py     # AWXExecutorPlugin unit tests
+│   ├── test_health.py            # Health endpoint: connected, disconnected, broken
+│   ├── test_job_model.py         # Job Pydantic models
+│   ├── test_jobs.py              # Job API endpoints
+│   ├── test_local_executor.py    # LocalExecutor implementation
+│   ├── test_policy.py            # Policy engine unit tests
+│   ├── test_runners.py           # Runner API endpoints
+│   ├── test_schema.py            # Database schema tests
+│   ├── test_serve_client.py      # OpenCode Serve httpx client
+│   ├── test_workspace_lifecycle.py # Workspace pin/cleanup lifecycle
+│   ├── test_workspace_model.py   # Workspace Pydantic models
+│   ├── test_workspaces.py        # Workspace list/get API endpoints
+│   └── test_clients/             # Client test suites with mock transport
+│       ├── __init__.py
+│       ├── test_awx_client_mocktransport.py
+│       └── test_serve_client_comprehensive.py
+├── scripts/
+│   ├── seed.py                   # Database seeding script (runners, jobs, observations)
+│   └── worktree-manager.sh       # Git worktree management helper
 ├── docs/
-│   ├── adr/                      # Architecture Decision Records
+│   ├── adr/                      # Architecture Decision Records (4 ADRs)
 │   ├── prd/                      # Product Requirements Document
 │   └── issues/                   # Planning and effort estimates
+├── docker-compose.test.yml       # Standalone Postgres for integration tests
 ├── pyproject.toml                # Project metadata, pytest, ruff, mypy config
 ├── requirements.txt              # Runtime and dev dependencies
 └── README.md
