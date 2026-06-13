@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
     executor_type   TEXT NOT NULL,
     executor_job_id TEXT,
     env_vars        JSONB DEFAULT '{}'::jsonb,
+    branch_name     TEXT,
+    mr_url          TEXT,
+    workflow_run_id TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ,
@@ -17,6 +20,9 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
 );
 
 ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS diff TEXT;
+ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS branch_name TEXT;
+ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS mr_url TEXT;
+ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS workflow_run_id TEXT;
 
 CREATE TABLE IF NOT EXISTS approvals (
     id              UUID PRIMARY KEY,
