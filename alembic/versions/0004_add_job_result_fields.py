@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import sqlalchemy as sa
-
 from alembic import op
 
 # revision identifiers, used by Alembic.
@@ -20,17 +18,17 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "gateway_jobs",
-        sa.Column("branch_name", sa.Text, nullable=True),
+    op.execute(
+        "ALTER TABLE gateway_jobs "
+        "ADD COLUMN IF NOT EXISTS branch_name TEXT"
     )
-    op.add_column(
-        "gateway_jobs",
-        sa.Column("mr_url", sa.Text, nullable=True),
+    op.execute(
+        "ALTER TABLE gateway_jobs "
+        "ADD COLUMN IF NOT EXISTS mr_url TEXT"
     )
-    op.add_column(
-        "gateway_jobs",
-        sa.Column("workflow_run_id", sa.Text, nullable=True),
+    op.execute(
+        "ALTER TABLE gateway_jobs "
+        "ADD COLUMN IF NOT EXISTS workflow_run_id TEXT"
     )
 
 

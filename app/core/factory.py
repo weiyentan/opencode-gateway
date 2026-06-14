@@ -111,16 +111,20 @@ def create_app(
     app.add_middleware(ResponseEnvelopeMiddleware)
 
     # ── Exception handlers ──────────────────────────────────────────────
-    from starlette.exceptions import HTTPException
     from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException
 
     from app.core.envelope import (
         http_exception_handler,
         validation_exception_handler,
     )
 
-    app.add_exception_handler(HTTPException, http_exception_handler)
+    # RequestValidationError must be registered BEFORE HTTPException
+    # because the former is a subclass of the latter.  Starlette
+    # resolves handlers in insertion order via isinstance(), so the
+    # more-specific handler must come first.
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(HTTPException, http_exception_handler)
 
     from app.api.health import router as health_router
     from app.api.jobs import router as jobs_router
