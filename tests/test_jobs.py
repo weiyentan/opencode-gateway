@@ -2974,3 +2974,504 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 503
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Job Listing (GET /jobs) & Enriched Responses (issue #91)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestListJobs:
+    """Tests for GET /jobs listing endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_returns_paginated_results(self, mock_conn):
+        """GET /jobs returns a paginated list of job summaries ordered by created_at DESC."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Job 1",
+            status="completed",
+            branch_name="feature-branch",
+            mr_url="https://github.com/org/repo/pull/1",
+            workflow_run_id="wr-123",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "items" in data
+        assert "total" in data
+        assert "limit" in data
+        assert "offset" in data
+        assert data["total"] == 1
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+        assert len(data["items"]) == 1
+        assert data["items"][0]["id"] == str(job_id)
+        assert data["items"][0]["status"] == "completed"
+
+        # Verify SQL order is correct
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "ORDER BY created_at DESC" in call_sql
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_with_limit_and_offset(self, mock_conn):
+        """GET /jobs respects limit and offset query parameters."""
+        job_id_1 = uuid.uuid4()
+        job_id_2 = uuid.uuid4()
+        row1 = make_job_row(job_id_1, "https://github.com/org/repo", "Job 1")
+        row2 = make_job_row(job_id_2, "https://github.com/org/repo", "Job 2")
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 10}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row1), mock_row(row2)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs?limit=2&offset=5")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["limit"] == 2
+        assert data["offset"] == 5
+        assert len(data["items"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filters_by_status(self, mock_conn):
+        """GET /jobs with status filter returns only matching jobs."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Failed job",
+            status="failed",
+        )
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs?status=failed")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert len(data["items"]) == 1
+        assert data["items"][0]["status"] == "failed"
+
+        # Verify the SQL query included the status filter
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "WHERE" in call_sql
+        assert "status" in call_sql
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filters_by_workflow_run_id(self, mock_conn):
+        """GET /jobs with workflow_run_id filter returns only matching jobs."""
+        workflow_id = "wr-789"
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Workflow job",
+            status="completed", workflow_run_id=workflow_id,
+        )
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs?workflow_run_id={workflow_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert data["items"][0]["workflow_run_id"] == workflow_id
+
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "WHERE" in call_sql
+        assert "workflow_run_id" in call_sql
+        assert mock_conn.fetch.call_args[0][1:] == (workflow_id, 50, 0)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filters_by_runner_id(self, mock_conn):
+        """GET /jobs with runner_id filter returns only matching jobs."""
+        runner_id = uuid.uuid4()
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Runner job",
+            status="completed",
+        )
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs?runner_id={runner_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+
+        # Verify the SQL query included the runner_id filter
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "WHERE" in call_sql
+        assert "runner_id" in call_sql
+        assert mock_conn.fetch.call_args[0][1:] == (runner_id, 50, 0)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_filters_by_combined_fields(self, mock_conn):
+        """GET /jobs supports combining status, runner_id, and workflow_run_id filters."""
+        runner_id = uuid.uuid4()
+        workflow_id = "wr-789"
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Combined filter job",
+            status="completed", workflow_run_id=workflow_id,
+        )
+        row["runner_id"] = runner_id
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(
+                f"/jobs?status=completed&runner_id={runner_id}&workflow_run_id={workflow_id}"
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert len(data["items"]) == 1
+        assert data["items"][0]["workflow_run_id"] == workflow_id
+
+        count_sql = mock_conn.fetchrow.call_args[0][0]
+        assert "status = $1" in count_sql
+        assert "runner_id = $2" in count_sql
+        assert "workflow_run_id = $3" in count_sql
+        assert mock_conn.fetchrow.call_args[0][1:] == ("completed", runner_id, workflow_id)
+
+        call_sql = mock_conn.fetch.call_args[0][0]
+        assert "status = $1" in call_sql
+        assert "runner_id = $2" in call_sql
+        assert "workflow_run_id = $3" in call_sql
+        assert "LIMIT $4 OFFSET $5" in call_sql
+        assert mock_conn.fetch.call_args[0][1:] == (
+            "completed",
+            runner_id,
+            workflow_id,
+            50,
+            0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_empty_result(self, mock_conn):
+        """GET /jobs returns empty list when no jobs match."""
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 0}))
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"] == []
+        assert data["total"] == 0
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_invalid_limit_returns_422(self, client):
+        """GET /jobs with a non-integer limit returns 422."""
+        async with client as c:
+            response = await c.get("/jobs?limit=invalid")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_invalid_status_returns_422(self, client):
+        """GET /jobs with an invalid status returns 422."""
+        async with client as c:
+            response = await c.get("/jobs?status=not-a-real-status")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_empty_workflow_run_id_is_treated_as_absent(self, mock_conn):
+        """GET /jobs with an empty workflow_run_id does not apply the filter."""
+        job_id = uuid.uuid4()
+        row = make_job_row(job_id, "https://github.com/org/repo", "Job 1")
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs?workflow_run_id=")
+
+        assert response.status_code == 200
+        assert mock_conn.fetchrow.call_args[0][1:] == ()
+        assert mock_conn.fetch.call_args[0][1:] == (50, 0)
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_non_positive_limit_returns_422(self, client):
+        """GET /jobs with limit < 1 returns 422."""
+        async with client as c:
+            response = await c.get("/jobs?limit=0")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_list_jobs_negative_offset_returns_422(self, client):
+        """GET /jobs with offset < 0 returns 422."""
+        async with client as c:
+            response = await c.get("/jobs?offset=-1")
+
+        assert response.status_code == 422
+
+
+class TestEnrichedJobResponse:
+    """Tests for enriched JobResponse fields (branch_name, mr_url, workflow_run_id)."""
+
+    @pytest.mark.asyncio
+    async def test_job_response_includes_branch_name(self, mock_conn):
+        """GET /jobs/{id} returns branch_name in the response."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Branch test",
+            status="completed",
+            branch_name="feature/my-branch",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "branch_name" in data
+        assert data["branch_name"] == "feature/my-branch"
+
+    @pytest.mark.asyncio
+    async def test_job_response_includes_mr_url(self, mock_conn):
+        """GET /jobs/{id} returns mr_url in the response."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "MR test",
+            status="completed",
+            mr_url="https://github.com/org/repo/pull/42",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "mr_url" in data
+        assert data["mr_url"] == "https://github.com/org/repo/pull/42"
+
+    @pytest.mark.asyncio
+    async def test_job_response_includes_workflow_run_id(self, mock_conn):
+        """GET /jobs/{id} returns workflow_run_id in the response."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Workflow test",
+            status="completed",
+            workflow_run_id="wr-456",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "workflow_run_id" in data
+        assert data["workflow_run_id"] == "wr-456"
+
+    @pytest.mark.asyncio
+    async def test_job_response_new_fields_are_null_by_default(self, mock_conn):
+        """Enriched fields are None when not set in the database."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Default null fields",
+            status="pending",
+        )
+        # Ensure the new fields are not set in the row
+        assert row["branch_name"] is None
+        assert row["mr_url"] is None
+        assert row["workflow_run_id"] is None
+
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["branch_name"] is None
+        assert data["mr_url"] is None
+        assert data["workflow_run_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_enriched_fields_in_list_response(self, mock_conn):
+        """GET /jobs includes enriched fields in each item."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Enriched list",
+            status="completed",
+            branch_name="main",
+            mr_url="https://github.com/org/repo/pull/99",
+            workflow_run_id="wr-999",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row({"count": 1}))
+        mock_conn.fetch = AsyncMock(return_value=[mock_row(row)])
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get("/jobs")
+
+        assert response.status_code == 200
+        data = response.json()
+        item = data["items"][0]
+        assert item["branch_name"] == "main"
+        assert item["mr_url"] == "https://github.com/org/repo/pull/99"
+        assert item["workflow_run_id"] == "wr-999"
+
+
+class TestJobCreateWithWorkflowRunId:
+    """Tests for JobCreateRequest with optional workflow_run_id."""
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_workflow_run_id(self, mock_conn):
+        """POST /jobs accepts workflow_run_id and returns it in the response."""
+        job_id = uuid.uuid4()
+        workflow_run_id = "wr-001"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Workflow job",
+            status="pending", workflow_run_id=workflow_run_id,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "gateway_jobs" in sql:
+                return mock_row(row)
+            # For the policy runner lookup, return None so policy is skipped
+            return None
+
+        async def _execute(sql, *args):
+            pass
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Workflow job",
+                    "workflow_run_id": workflow_run_id,
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["workflow_run_id"] == workflow_run_id
+
+        insert_call = mock_conn.execute.call_args_list[0]
+        assert "workflow_run_id" in insert_call.args[0]
+        assert insert_call.args[7] == workflow_run_id
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_empty_workflow_run_id_stores_none(self, mock_conn):
+        """POST /jobs treats an empty workflow_run_id as absent."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Workflow job", status="pending"
+        )
+
+        async def _fetchrow(sql, *args):
+            if "gateway_jobs" in sql:
+                return mock_row(row)
+            return None
+
+        mock_conn.execute = AsyncMock(return_value=None)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Workflow job",
+                    "workflow_run_id": "",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["workflow_run_id"] is None
+
+        insert_call = mock_conn.execute.call_args_list[0]
+        assert insert_call.args[7] is None
+
+    @pytest.mark.asyncio
+    async def test_create_job_without_workflow_run_id(self, mock_conn):
+        """POST /jobs without workflow_run_id defaults to None."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "No workflow",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "gateway_jobs" in sql:
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            pass
+
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No workflow",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["workflow_run_id"] is None

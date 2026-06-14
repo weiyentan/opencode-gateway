@@ -1,5 +1,7 @@
 """Job API endpoints — create, retrieve, and monitor coding jobs."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -8,9 +10,9 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from pydantic.config import ConfigDict
 
 from app.api.webhooks import dispatch_webhooks
@@ -52,7 +54,7 @@ class JobCreateRequest(BaseModel):
 
     repo_url: HttpUrl = Field(description="URL of the repository to work on")
     task_summary: str = Field(min_length=1, description="Summary of the task to perform")
-    runner_id: Optional[uuid.UUID] = Field(
+    runner_id: uuid.UUID | None = Field(
         default=None,
         description="UUID of the runner to pin this job to.  When set, the "
         "runner must exist and be HEALTHY.",
@@ -64,10 +66,28 @@ class JobCreateRequest(BaseModel):
         "Ignored when ``runner_id`` is provided.",
     )
     env_vars: dict[str, str] = {}
+    workflow_run_id: str | None = Field(
+        default=None,
+        description="Correlation ID that allows Paperclip to correlate this job "
+        "to a workflow run.",
+    )
+
+    @field_validator("workflow_run_id", mode="before")
+    @classmethod
+    def _normalize_workflow_run_id(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
 
 
 class JobResponse(BaseModel):
-    """Response body for job endpoints."""
+    """Response body for job endpoints.
+
+    ``branch_name`` and ``mr_url`` are write-once fields set externally
+    (e.g. by Paperclip or AWX job templates) when the coding session
+    completes.  They remain ``None`` until populated via a webhook or
+    update endpoint.
+    """
 
     id: uuid.UUID
     repo_url: str
@@ -78,6 +98,9 @@ class JobResponse(BaseModel):
     completed_at: datetime | None = None
     opencode_session_id: str | None = None
     diff: str | None = None
+    branch_name: str | None = None
+    mr_url: str | None = None
+    workflow_run_id: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -94,7 +117,7 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name"
+    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
 )
 
 
@@ -289,14 +312,15 @@ async def create_job(
     # 1. Insert the job record in pending state
     await conn.execute(
         "INSERT INTO gateway_jobs "
-        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars) "
-        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)",
+        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars, workflow_run_id) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb, $7)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
         resolved_runner_id,
         json.dumps(body.env_vars) if body.env_vars else "{}",
+        body.workflow_run_id,
     )
 
     # 2. Validate and perform pending → running transition
@@ -515,6 +539,9 @@ async def create_job(
         completed_at=row["completed_at"],
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
     )
 
 
@@ -579,6 +606,9 @@ async def approve_job(
         completed_at=row["completed_at"],
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
     )
 
 
@@ -643,8 +673,10 @@ async def reject_job(
         completed_at=row["completed_at"],
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
     )
-
 
 
 @router.post("/jobs/{job_id}/abort", response_model=JobResponse)
@@ -792,7 +824,11 @@ async def abort_job(
         completed_at=row["completed_at"],
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
     )
+
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
@@ -813,6 +849,105 @@ async def get_job(
         completed_at=row["completed_at"],
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
+    )
+
+
+class JobListResponse(BaseModel):
+    """Response body for the GET /jobs listing endpoint."""
+
+    items: list[JobResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+@router.get("/jobs", response_model=JobListResponse)
+async def list_jobs(
+    status: JobStatus | None = None,
+    runner_id: uuid.UUID | None = None,
+    workflow_run_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> JobListResponse:
+    """Return a paginated list of job summaries ordered by created_at DESC.
+
+    Supports optional query filters: ``status``, ``runner_id``,
+    ``workflow_run_id``, ``limit``, and ``offset``.
+
+    Returns a ``JobListResponse`` containing the matching ``items``,
+    the ``total`` count (ignoring pagination), and the requested
+    ``limit`` / ``offset`` for cursor tracking.
+    """
+    if workflow_run_id is not None and workflow_run_id.strip() == "":
+        workflow_run_id = None
+
+    # Build WHERE clauses dynamically
+    where_clauses: list[str] = []
+    params: list = []
+    param_index = 1
+
+    if status is not None:
+        where_clauses.append(f"status = ${param_index}")
+        params.append(status.value)
+        param_index += 1
+
+    if runner_id is not None:
+        where_clauses.append(f"runner_id = ${param_index}")
+        params.append(runner_id)
+        param_index += 1
+
+    if workflow_run_id is not None:
+        where_clauses.append(f"workflow_run_id = ${param_index}")
+        params.append(workflow_run_id)
+        param_index += 1
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    # Count total matching rows (ignoring pagination)
+    count_sql = f"SELECT COUNT(*) FROM gateway_jobs {where_sql}"
+    total_row = await conn.fetchrow(count_sql, *params)
+    total = total_row["count"] if total_row else 0  # type: ignore[index]
+
+    # Fetch paginated results
+    query = (
+        f"SELECT {_FETCH_COLS} FROM gateway_jobs "
+        f"{where_sql} ORDER BY created_at DESC "
+        f"LIMIT ${param_index} OFFSET ${param_index + 1}"
+    )
+    params.append(limit)
+    params.append(offset)
+
+    rows = await conn.fetch(query, *params)
+
+    items = [
+        JobResponse(
+            id=row["id"],
+            repo_url=row["repo_url"],
+            task_summary=row["task_summary"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+            opencode_session_id=row.get("opencode_session_id"),
+            diff=row.get("diff"),
+            branch_name=row.get("branch_name"),
+            mr_url=row.get("mr_url"),
+            workflow_run_id=row.get("workflow_run_id"),
+        )
+        for row in rows
+    ]
+
+    return JobListResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

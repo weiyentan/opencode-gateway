@@ -42,6 +42,9 @@ def make_job_row(
     diff: str | None = None,
     workspace_name: str | None = None,
     env_vars: dict[str, str] | None = None,
+    branch_name: str | None = None,
+    mr_url: str | None = None,
+    workflow_run_id: str | None = None,
 ) -> dict:
     """Return a dict representing a gateway_jobs table row."""
     now = datetime.now(timezone.utc)  # noqa: UP017
@@ -58,6 +61,9 @@ def make_job_row(
         "opencode_session_id": opencode_session_id,
         "diff": diff,
         "workspace_name": workspace_name,
+        "branch_name": branch_name,
+        "mr_url": mr_url,
+        "workflow_run_id": workflow_run_id,
     }
 
 
