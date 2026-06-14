@@ -6,13 +6,12 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Optional
 from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from pydantic.config import ConfigDict
 
 from app.api.webhooks import dispatch_webhooks
@@ -54,27 +53,40 @@ class JobCreateRequest(BaseModel):
 
     repo_url: HttpUrl = Field(description="URL of the repository to work on")
     task_summary: str = Field(min_length=1, description="Summary of the task to perform")
-    runner_id: Optional[uuid.UUID] = Field(
+    runner_id: uuid.UUID | None = Field(
         default=None,
         description="UUID of the runner to pin this job to.  When set, the "
         "runner must exist and be HEALTHY.",
     )
-    labels: Optional[list[str]] = Field(
+    labels: list[str] | None = Field(
         default=None,
         description="Labels used to filter eligible runners.  Each label "
         "must exist as a key in the runner's labels JSONB column. "
         "Ignored when ``runner_id`` is provided.",
     )
     env_vars: dict[str, str] = {}
-    workflow_run_id: Optional[str] = Field(
+    workflow_run_id: str | None = Field(
         default=None,
         description="Correlation ID that allows Paperclip to correlate this job "
         "to a workflow run.",
     )
 
+    @field_validator("workflow_run_id", mode="before")
+    @classmethod
+    def _normalize_workflow_run_id(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
 
 class JobResponse(BaseModel):
-    """Response body for job endpoints."""
+    """Response body for job endpoints.
+
+    ``branch_name`` and ``mr_url`` are write-once fields set externally
+    (e.g. by Paperclip or AWX job templates) when the coding session
+    completes.  They remain ``None`` until populated via a webhook or
+    update endpoint.
+    """
 
     id: uuid.UUID
     repo_url: str
@@ -299,14 +311,15 @@ async def create_job(
     # 1. Insert the job record in pending state
     await conn.execute(
         "INSERT INTO gateway_jobs "
-        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars) "
-        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)",
+        "(id, repo_url, task_summary, status, executor_type, runner_id, env_vars, workflow_run_id) "
+        "VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb, $7)",
         job_id,
         str(body.repo_url),
         body.task_summary,
         executor.name,
         resolved_runner_id,
         json.dumps(body.env_vars) if body.env_vars else "{}",
+        body.workflow_run_id,
     )
 
     # 2. Validate and perform pending → running transition
@@ -852,11 +865,11 @@ class JobListResponse(BaseModel):
 
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
-    status: Optional[str] = None,
-    runner_id: Optional[uuid.UUID] = None,
-    workflow_run_id: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
+    status: JobStatus | None = None,
+    runner_id: uuid.UUID | None = None,
+    workflow_run_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobListResponse:
     """Return a paginated list of job summaries ordered by created_at DESC.
@@ -868,6 +881,9 @@ async def list_jobs(
     the ``total`` count (ignoring pagination), and the requested
     ``limit`` / ``offset`` for cursor tracking.
     """
+    if workflow_run_id is not None and workflow_run_id.strip() == "":
+        workflow_run_id = None
+
     # Build WHERE clauses dynamically
     where_clauses: list[str] = []
     params: list = []
@@ -875,7 +891,7 @@ async def list_jobs(
 
     if status is not None:
         where_clauses.append(f"status = ${param_index}")
-        params.append(status)
+        params.append(status.value)
         param_index += 1
 
     if runner_id is not None:
@@ -1037,7 +1053,7 @@ async def get_job_diff(
 async def get_job_logs(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JSONResponse:
     """Return the full log output for a job by proxying to its OpenCode session.
 
@@ -1052,7 +1068,7 @@ async def get_job_logs(
         raise HTTPException(status_code=404, detail="Job not found")
 
     # 2. Check for an associated session
-    session_id: Optional[str] = row.get("opencode_session_id")
+    session_id: str | None = row.get("opencode_session_id")
     if not session_id:
         raise HTTPException(
             status_code=409,
