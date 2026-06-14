@@ -69,10 +69,14 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
         if "application/json" not in content_type:
             return response
 
-        # Consume the response body stream
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk
+        # Read the response body (Starlette >=0.49 uses .body; older
+        # versions used .body_iterator — we support both via getattr).
+        if hasattr(response, "body_iterator"):
+            body = b""
+            async for chunk in response.body_iterator:  # type: ignore[union-attr]
+                body += chunk
+        else:
+            body = response.body  # type: ignore[assignment]
 
         # Only wrap JSON bodies
         try:
@@ -85,8 +89,15 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
                 media_type=response.media_type,
             )
 
-        # Already wrapped — don't double-wrap
-        if isinstance(data, dict) and data.get("status") in ("ok", "error"):
+        # Already wrapped — don't double-wrap.
+        # We require BOTH a 'status' field AND either 'data' or 'error'
+        # to be present; this prevents false positives on domain models
+        # that happen to have a 'status' field (e.g. HealthResponse).
+        if (
+            isinstance(data, dict)
+            and data.get("status") in ("ok", "error")
+            and ("data" in data or "error" in data)
+        ):
             return Response(
                 content=json.dumps(data),
                 status_code=response.status_code,
@@ -95,11 +106,16 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
             )
 
         # Wrap the original body as data
-        wrapped: dict[str, Any] = (
-            {"status": "ok", "data": data}
-            if 200 <= response.status_code < 300
-            else {"status": "error", "error": {"code": _status_to_code(response.status_code), "message": str(data)}}
-        )
+        if 200 <= response.status_code < 300:
+            wrapped: dict[str, Any] = {"status": "ok", "data": data}
+        else:
+            wrapped = {
+                "status": "error",
+                "error": {
+                    "code": _status_to_code(response.status_code),
+                    "message": str(data),
+                },
+            }
 
         return Response(
             content=json.dumps(wrapped),

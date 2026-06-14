@@ -16,10 +16,41 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.core.factory import create_app
-from tests.conftest import create_client, make_job_row, mock_row
+from tests.conftest import create_client
 
 # Re-use the test API key from conftest
 _TEST_API_KEY = "test-api-key"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _setup_app_state(app):
+    """Set up minimal app.state and dependency overrides for testing.
+
+    Without this, FastAPI dependency resolution crashes with
+    ``AttributeError: 'State' object has no attribute 'pool'`` because
+    the ASGI transport does not run the lifespan handler that normally
+    initialises ``app.state.pool``.
+    """
+    from unittest.mock import AsyncMock
+
+    from app.api.jobs import _get_pool
+    from app.db.session import get_session
+    from app.executors.factory import get_executor
+
+    mock_pool = AsyncMock()
+    mock_pool.pool = None  # No real pool needed
+    app.state.pool = mock_pool
+
+    mock_conn = AsyncMock()
+
+    async def _override_get_session(request):
+        yield mock_conn
+
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[_get_pool] = lambda: mock_pool
+    app.dependency_overrides[get_executor] = lambda: AsyncMock()
 
 
 # ── Auth fixtures ────────────────────────────────────────────────────────
@@ -29,6 +60,7 @@ _TEST_API_KEY = "test-api-key"
 def client_no_auth():
     """Client with no Authorization header — should get 401."""
     app = create_app()
+    _setup_app_state(app)
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     return AsyncClient(transport=transport, base_url="http://test")
 
@@ -37,6 +69,7 @@ def client_no_auth():
 def client_bad_auth():
     """Client with an invalid API key — should get 401."""
     app = create_app()
+    _setup_app_state(app)
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     return AsyncClient(
         transport=transport,
@@ -49,6 +82,7 @@ def client_bad_auth():
 def client_valid_auth():
     """Client with the valid test API key — should pass auth."""
     app = create_app()
+    _setup_app_state(app)
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     return AsyncClient(
         transport=transport,
