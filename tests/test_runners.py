@@ -77,7 +77,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        assert response.json() == []
+        assert response.json()["data"] == []
 
     @pytest.mark.asyncio
     async def test_list_runners_returns_all_runners(self, client, mock_conn):
@@ -95,7 +95,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 2
         hostnames = {r["hostname"] for r in data}
         assert hostnames == {"runner-alpha", "runner-beta"}
@@ -119,7 +119,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        data = response.json()[0]
+        data = response.json()["data"][0]
         assert data["id"] == str(r_id)
         assert data["runner_id"] == str(r_id)
         assert data["hostname"] == "runner-full.example.com"
@@ -148,7 +148,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        data = response.json()[0]
+        data = response.json()["data"][0]
         obs = data["latest_observation"]
         assert obs is not None
         assert obs["disk_used_percent"] == 55.0
@@ -170,7 +170,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        data = response.json()[0]
+        data = response.json()["data"][0]
         assert data["latest_observation"] is None
 
     @pytest.mark.asyncio
@@ -192,7 +192,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        obs = response.json()[0]["latest_observation"]
+        obs = response.json()["data"][0]["latest_observation"]
         assert set(obs.keys()) == {
             "disk_used_percent",
             "memory_used_percent",
@@ -222,7 +222,7 @@ class TestListRunners:
             response = await c.get("/runners")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 2
 
         # Verify descending order by created_at
@@ -324,9 +324,11 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 404
-        detail = response.json()["detail"]
-        assert str(r_id) in detail
-        assert "not found" in detail
+        error_data = response.json()
+        assert error_data["status"] == "error"
+        assert error_data["error"]["code"] == "NOT_FOUND"
+        assert str(r_id) in error_data["error"]["message"]
+        assert "not found" in error_data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_get_runner_detail_has_all_base_fields(self, client, mock_conn):
@@ -346,7 +348,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["id"] == str(r_id)
         assert data["runner_id"] == str(r_id)
         assert data["hostname"] == "runner-staging.example.com"
@@ -368,7 +370,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["workspace_observations"] == []
         assert data["opencode_instance_observations"] == []
 
@@ -399,7 +401,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data["workspace_observations"]) == 2
         assert data["workspace_observations"][0]["workspace_name"] == "ws-alpha"
         assert data["workspace_observations"][0]["status"] == "active"
@@ -429,7 +431,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data["opencode_instance_observations"]) == 1
         obs = data["opencode_instance_observations"][0]
         assert obs["instance_name"] == "oc-main"
@@ -471,7 +473,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data["workspace_observations"]) == 1
         assert len(data["opencode_instance_observations"]) == 1
         assert "observed_at" in data["workspace_observations"][0]
@@ -489,7 +491,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         obs = data["latest_observation"]
         assert obs is not None
         assert obs["disk_used_percent"] == 55.0
@@ -508,7 +510,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert "policy_status" in data
         assert "policy_reason" in data
 
@@ -524,7 +526,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["policy_status"] == "HEALTHY"
         assert data["policy_reason"] == "Runner is healthy"
 
@@ -540,7 +542,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["policy_status"] == "UNKNOWN"
         assert data["policy_reason"] == "Runner observations are stale"
 
@@ -556,7 +558,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["policy_status"] == "BLOCKED_DISK_PRESSURE"
         assert data["policy_reason"] == "Runner has disk pressure"
 
@@ -572,7 +574,7 @@ class TestGetRunnerDetail:
             response = await c.get(f"/runners/{r_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["policy_status"] == "BLOCKED_MEMORY_PRESSURE"
         assert data["policy_reason"] == "Runner has memory pressure"
 
@@ -675,7 +677,7 @@ class TestPostRunnerStatus:
             )
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["previous_status"] == current_status
         assert data["current_status"] == target_status
         assert data["reason"] == "Testing transition"
@@ -848,7 +850,7 @@ class TestPostRunnerStatus:
             )
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["previous_status"] == "BLOCKED_DISK_PRESSURE"
         assert data["current_status"] == "maintenance"
         assert data["reason"] == "Disk replacement"

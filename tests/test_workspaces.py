@@ -23,7 +23,7 @@ class TestListWorkspaces:
             response = await c.get("/workspaces")
 
         assert response.status_code == 200
-        assert response.json() == []
+        assert response.json()["data"] == []
 
     @pytest.mark.asyncio
     async def test_list_workspaces_returns_all_workspaces(self, client, mock_conn):
@@ -41,7 +41,7 @@ class TestListWorkspaces:
             response = await c.get("/workspaces")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 2
         names = {w["workspace_name"] for w in data}
         assert names == {"ws-one", "ws-two"}
@@ -69,7 +69,7 @@ class TestListWorkspaces:
             response = await c.get("/workspaces")
 
         assert response.status_code == 200
-        data = response.json()[0]
+        data = response.json()["data"][0]
         assert data["id"] == str(ws_id)
         assert data["runner_id"] is not None
         assert data["workspace_name"] == "ws-full"
@@ -105,7 +105,7 @@ class TestListWorkspaces:
             response = await c.get("/workspaces")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 2
 
 
@@ -125,7 +125,7 @@ class TestListWorkspacesFiltering:
             response = await c.get(f"/workspaces?runner_id={target_runner}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 1
         assert data[0]["id"] == str(ws_id)
 
@@ -148,7 +148,7 @@ class TestListWorkspacesFiltering:
             response = await c.get("/workspaces?status=pinned")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 1
         assert data[0]["cleanup_status"] == "pinned"
 
@@ -176,7 +176,7 @@ class TestListWorkspacesFiltering:
             )
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 1
         assert data[0]["cleanup_status"] == "cleaning"
 
@@ -196,7 +196,7 @@ class TestListWorkspacesFiltering:
             response = await c.get(f"/workspaces?runner_id={uuid.uuid4()}")
 
         assert response.status_code == 200
-        assert response.json() == []
+        assert response.json()["data"] == []
 
     @pytest.mark.asyncio
     async def test_filter_by_status_returns_empty_when_no_match(self, client, mock_conn):
@@ -207,7 +207,7 @@ class TestListWorkspacesFiltering:
             response = await c.get("/workspaces?status=invalid_status")
 
         assert response.status_code == 200
-        assert response.json() == []
+        assert response.json()["data"] == []
 
 
 class TestGetWorkspace:
@@ -228,7 +228,7 @@ class TestGetWorkspace:
             response = await c.get(f"/workspaces/{ws_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["id"] == str(ws_id)
         assert data["workspace_name"] == "ws-single"
         assert data["repo_url"] == "https://github.com/example/single.git"
@@ -242,7 +242,10 @@ class TestGetWorkspace:
             response = await c.get(f"/workspaces/{uuid.uuid4()}")
 
         assert response.status_code == 404
-        assert response.json()["detail"] == "Workspace not found"
+        error_data = response.json()
+        assert error_data["status"] == "error"
+        assert error_data["error"]["code"] == "NOT_FOUND"
+        assert error_data["error"]["message"] == "Workspace not found"
 
     @pytest.mark.asyncio
     async def test_get_invalid_uuid_returns_422(self, client):
@@ -275,7 +278,7 @@ class TestGetWorkspace:
             response = await c.get(f"/workspaces/{ws_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["id"] == str(ws_id)
         assert data["runner_id"] == str(runner_id)
         assert data["workspace_name"] == "ws-all-fields"

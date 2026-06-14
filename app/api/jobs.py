@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Optional
 from datetime import datetime, timedelta, timezone  # noqa: UP017
 
 import asyncpg
@@ -59,7 +58,7 @@ class JobCreateRequest(BaseModel):
         description="UUID of the runner to pin this job to.  When set, the "
         "runner must exist and be HEALTHY.",
     )
-    labels: Optional[list[str]] = Field(
+    labels: list[str] | None = Field(
         default=None,
         description="Labels used to filter eligible runners.  Each label "
         "must exist as a key in the runner's labels JSONB column. "
@@ -1054,7 +1053,7 @@ async def get_job_diff(
 async def get_job_logs(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
-    opencode_client: Optional[OpenCodeClientProtocol] = Depends(get_opencode_client),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JSONResponse:
     """Return the full log output for a job by proxying to its OpenCode session.
 
@@ -1069,7 +1068,7 @@ async def get_job_logs(
         raise HTTPException(status_code=404, detail="Job not found")
 
     # 2. Check for an associated session
-    session_id: Optional[str] = row.get("opencode_session_id")
+    session_id: str | None = row.get("opencode_session_id")
     if not session_id:
         raise HTTPException(
             status_code=409,

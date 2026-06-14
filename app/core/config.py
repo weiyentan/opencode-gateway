@@ -15,6 +15,9 @@ class Settings(BaseSettings):
         extra="forbid",
     )
 
+    # API authentication
+    api_key: str = ""
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000

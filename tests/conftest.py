@@ -6,6 +6,7 @@ that were previously copy-pasted across individual test files.
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +18,15 @@ from httpx import ASGITransport, AsyncClient
 from app.core.factory import create_app
 from app.db.session import get_session
 from app.executors.factory import get_executor
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Test API key — set before any module imports create_app() so that the
+#  auth middleware passes for all existing tests.  Individual auth tests
+#  override this by creating clients without the header.
+# ══════════════════════════════════════════════════════════════════════════
+
+_TEST_API_KEY = "test-api-key"
+os.environ.setdefault("GATEWAY_API_KEY", _TEST_API_KEY)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Core helpers
@@ -106,8 +116,15 @@ def create_client(
     *,
     mock_executor: AsyncMock | None = None,
     mock_opencode_client: AsyncMock | None = None,
+    api_key: str | None = _TEST_API_KEY,
 ) -> AsyncClient:
-    """Build app with overridden dependencies, return httpx AsyncClient."""
+    """Build app with overridden dependencies, return httpx AsyncClient.
+
+    By default adds an ``Authorization: Bearer <api_key>`` header so
+    existing tests pass through the API-key middleware.  Pass
+    ``api_key=None`` to create an unauthenticated client (for auth
+    failure tests).
+    """
     from app.api.jobs import _get_pool, get_opencode_client
 
     app = create_app()
@@ -131,8 +148,12 @@ def create_client(
     if mock_opencode_client is not None:
         app.dependency_overrides[get_opencode_client] = lambda: mock_opencode_client
 
+    headers: dict[str, str] = {}
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(transport=transport, base_url="http://test", headers=headers)
 
 
 # ══════════════════════════════════════════════════════════════════════════

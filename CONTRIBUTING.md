@@ -74,7 +74,7 @@ Verify it's running:
 curl http://localhost:8000/health
 ```
 
-Expected response: `{"status": "ok", "version": "0.1.0-dev", "database": "connected"}` (or `"disconnected"` if Postgres is unreachable — the Gateway degrades gracefully).
+Expected response: `{"status": "ok", "data": {"status": "ok", "version": "0.1.0-dev", "database": "connected"}}` (or `"data": {"status": "ok", "version": "0.1.0-dev", "database": "disconnected"}` if Postgres is unreachable — the Gateway degrades gracefully).
 
 ---
 

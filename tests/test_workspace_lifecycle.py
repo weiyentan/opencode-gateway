@@ -72,7 +72,7 @@ class TestPinWorkspace:
             response = await c.post(f"/workspaces/{ws_id}/pin")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["pinned"] is True
         assert data["id"] == str(ws_id)
 
@@ -97,7 +97,7 @@ class TestPinWorkspace:
             response = await c.post(f"/workspaces/{ws_id}/pin")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["pinned"] is False
 
     @pytest.mark.asyncio
@@ -135,7 +135,7 @@ class TestPinWorkspace:
 
         assert response.status_code == 200
         # Verify updated_at in response is newer than old_time
-        updated_str = response.json()["updated_at"]
+        updated_str = response.json()["data"]["updated_at"]
         # Python 3.9 fromisoformat doesn't accept 'Z', replace with +00:00
         if updated_str.endswith("Z"):
             updated_str = updated_str[:-1] + "+00:00"
@@ -181,7 +181,7 @@ class TestPinWorkspace:
             response = await c.post(f"/workspaces/{ws_id}/pin")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["id"] == str(ws_id)
         assert data["workspace_name"] == "ws-complete"
         assert data["path"] == "/data/workspaces/ws-complete"
@@ -239,7 +239,7 @@ class TestCleanupWorkspace:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["cleanup_status"] == "cleaning"
         mock_executor.cleanup_workspace.assert_called_once()
 
@@ -271,7 +271,9 @@ class TestCleanupWorkspace:
 
         assert response.status_code == 409
         data = response.json()
-        assert "already being cleaned" in data["detail"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "CONFLICT"
+        assert "already being cleaned" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_cleanup_lock_contention_returns_409(
@@ -298,7 +300,9 @@ class TestCleanupWorkspace:
 
         assert response.status_code == 409
         data = response.json()
-        assert "lock held by another process" in data["detail"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "CONFLICT"
+        assert "lock held by another process" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_cleanup_executor_failure_reverts_and_returns_500(
@@ -495,7 +499,7 @@ class TestCleanupWorkspace:
             response = await c.post(f"/workspaces/{ws_id}/cleanup")
 
         assert response.status_code == 200
-        assert response.json()["cleanup_status"] == "cleaning"
+        assert response.json()["data"]["cleanup_status"] == "cleaning"
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,11 @@ def client_no_db():
     app = create_app()
     app.state.pool = None
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer test-api-key"},
+    )
 
 
 @pytest.fixture
@@ -26,7 +30,11 @@ def client_healthy_db():
     app = create_app()
     app.state.pool = mock_pool
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer test-api-key"},
+    )
 
 
 @pytest.fixture
@@ -37,7 +45,11 @@ def client_broken_db():
     app = create_app()
     app.state.pool = mock_pool
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer test-api-key"},
+    )
 
 
 class TestHealthEndpointBasic:
@@ -50,7 +62,9 @@ class TestHealthEndpointBasic:
             response = await client.get("/health")
 
         assert response.status_code == 200
-        data = response.json()
+        payload = response.json()
+        assert payload["status"] == "ok"
+        data = payload["data"]
         assert "status" in data
         assert "version" in data
         assert "database" in data
@@ -62,9 +76,10 @@ class TestHealthEndpointBasic:
         async with client_no_db as client:
             response = await client.get("/health")
 
-        data = response.json()
-        assert isinstance(data["version"], str)
-        assert len(data["version"]) > 0
+        payload = response.json()
+        version = payload["data"]["version"]
+        assert isinstance(version, str)
+        assert len(version) > 0
 
 
 class TestHealthDatabaseConnected:
@@ -76,8 +91,8 @@ class TestHealthDatabaseConnected:
         async with client_healthy_db as client:
             response = await client.get("/health")
 
-        data = response.json()
-        assert data["database"] == "connected"
+        payload = response.json()
+        assert payload["data"]["database"] == "connected"
 
 
 class TestHealthDatabaseDisconnected:
@@ -89,8 +104,8 @@ class TestHealthDatabaseDisconnected:
         async with client_no_db as client:
             response = await client.get("/health")
 
-        data = response.json()
-        assert data["database"] == "disconnected"
+        payload = response.json()
+        assert payload["data"]["database"] == "disconnected"
 
     @pytest.mark.asyncio
     async def test_database_disconnected_when_acquire_raises(self, client_broken_db):
@@ -100,5 +115,5 @@ class TestHealthDatabaseDisconnected:
 
         # Must still return 200, never 500
         assert response.status_code == 200
-        data = response.json()
-        assert data["database"] == "disconnected"
+        payload = response.json()
+        assert payload["data"]["database"] == "disconnected"

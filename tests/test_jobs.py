@@ -58,7 +58,9 @@ class TestCreateJob:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        payload = response.json()
+        assert payload["status"] == "ok"
+        data = payload["data"]
         assert data["repo_url"] == "https://github.com/org/repo"
         assert data["task_summary"] == "Fix a bug"
         assert data["status"] == "pending"
@@ -116,7 +118,7 @@ class TestCreateJob:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["repo_url"] == "https://github.com/org/repo"
         assert data["task_summary"] == "Task with env vars"
 
@@ -142,7 +144,7 @@ class TestGetJob:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["id"] == str(job_id)
         assert data["repo_url"] == "https://github.com/org/repo"
         assert data["task_summary"] == "Add feature"
@@ -211,7 +213,7 @@ class TestJobDispatch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
         assert data["completed_at"] is not None
 
@@ -264,7 +266,7 @@ class TestJobDispatch:
             )
 
         assert response.status_code == 201
-        assert response.json()["status"] == "completed"
+        assert response.json()["data"]["status"] == "completed"
 
         # Verify status transition updates happened
         update_statements = [s for s in execute_calls if "UPDATE gateway_jobs" in s]
@@ -313,7 +315,7 @@ class TestJobDispatch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "failed"
         assert data["completed_at"] is None
 
@@ -357,7 +359,7 @@ class TestJobDispatch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
         assert data["completed_at"] is not None
 
@@ -410,12 +412,10 @@ class TestJobDispatch:
 
         assert response.status_code == 503
         data = response.json()
-        assert data["detail"]["resource"] == "disk"
-        assert data["detail"]["current_value"] == 95.0
-        assert data["detail"]["threshold"] == 80.0
-        assert data["detail"]["runner_id"] == "test-runner-99"
-        assert "disk" in data["detail"]["message"]
-        assert "80%" in data["detail"]["message"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "disk" in data["error"]["message"]
+        assert "80%" in data["error"]["message"]
 
         # Policy check runs before workspace creation — no executor calls
         mock_executor.create_workspace.assert_not_called()
@@ -460,9 +460,9 @@ class TestJobDispatch:
 
         assert response.status_code == 503
         data = response.json()
-        assert data["detail"]["resource"] == "manual_status"
-        assert data["detail"]["runner_id"] == runner_text_id
-        assert "offline" in data["detail"]["message"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "offline" in data["error"]["message"]
 
         # Policy check happens before workspace creation — no workspace was
         # created, so no cleanup should occur.
@@ -507,9 +507,9 @@ class TestJobDispatch:
 
         assert response.status_code == 503
         data = response.json()
-        assert data["detail"]["resource"] == "manual_status"
-        assert data["detail"]["runner_id"] == runner_text_id
-        assert "maintenance" in data["detail"]["message"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "maintenance" in data["error"]["message"]
 
         # Policy check happens before workspace creation — no workspace was
         # created, so no cleanup should occur.
@@ -548,7 +548,7 @@ class TestApproveJob:
             response = await c.post(f"/jobs/{job_id}/approve")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "running"
         assert data["id"] == str(job_id)
 
@@ -660,7 +660,7 @@ class TestRejectJob:
             response = await c.post(f"/jobs/{job_id}/reject")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "rejected"
         assert data["id"] == str(job_id)
 
@@ -772,7 +772,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
         assert data["id"] == str(job_id)
 
@@ -819,7 +819,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
         assert data["id"] == str(job_id)
 
@@ -864,8 +864,9 @@ class TestAbortJob:
 
         assert response.status_code == 503
         data = response.json()
-        assert "detail" in data
-        assert "unreachable" in data["detail"].lower()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "unreachable" in data["error"]["message"].lower()
 
         # Job should remain in aborting state
         assert row["status"] == "aborting"
@@ -910,8 +911,9 @@ class TestAbortJob:
 
         assert response.status_code == 409
         data = response.json()
-        assert "detail" in data
-        assert terminal_status in data["detail"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "CONFLICT"
+        assert terminal_status in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_abort_invalid_uuid_returns_422(self, client):
@@ -960,15 +962,16 @@ class TestAbortJob:
             # First abort - should succeed, transitioning to aborted
             response1 = await c.post(f"/jobs/{job_id}/abort")
             assert response1.status_code == 200
-            data1 = response1.json()
+            data1 = response1.json()["data"]
             assert data1["status"] == "aborted"
 
             # Second abort - job is now aborted, should get 409
             response2 = await c.post(f"/jobs/{job_id}/abort")
             assert response2.status_code == 409
             data2 = response2.json()
-            assert "detail" in data2
-            assert "aborted" in data2["detail"]
+            assert data2["status"] == "error"
+            assert data2["error"]["code"] == "CONFLICT"
+            assert "aborted" in data2["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_abort_retry_from_aborting_succeeds(self, mock_conn):
@@ -1009,7 +1012,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
 
         # Verify OpenCode client was called (retry)
@@ -1048,7 +1051,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
         assert data["id"] == str(job_id)
 
@@ -1105,7 +1108,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
 
         mock_exec.stop_opencode.assert_called_once()
@@ -1170,7 +1173,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
 
         mock_exec.cleanup_workspace.assert_called_once()
@@ -1226,7 +1229,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
 
     @pytest.mark.asyncio
@@ -1277,7 +1280,7 @@ class TestAbortJob:
             response = await c.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "aborted"
 
         mock_exec.stop_opencode.assert_not_called()
@@ -1332,13 +1335,14 @@ class TestAbortJob:
         async with client as c:
             response1 = await c.post(f"/jobs/{job_id}/abort")
             assert response1.status_code == 200
-            assert response1.json()["status"] == "aborted"
+            assert response1.json()["data"]["status"] == "aborted"
 
             response2 = await c.post(f"/jobs/{job_id}/abort")
             assert response2.status_code == 409
             data2 = response2.json()
-            assert "detail" in data2
-            assert "aborted" in data2["detail"]
+            assert data2["status"] == "error"
+            assert data2["error"]["code"] == "CONFLICT"
+            assert "aborted" in data2["error"]["message"]
 
             assert mock_exec.stop_opencode.call_count == 1
 
@@ -1382,7 +1386,7 @@ class TestJobEvents:
             response = await c.get(f"/jobs/{job_id}/events")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert isinstance(data, list)
         assert len(data) == 1
         assert data[0]["event_type"] == "approved"
@@ -1409,7 +1413,7 @@ class TestJobEvents:
             response = await c.get(f"/jobs/{job_id}/events")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert isinstance(data, list)
         assert len(data) == 0
 
@@ -1459,7 +1463,7 @@ class TestJobEvents:
             response = await c.get(f"/jobs/{job_id}/events")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert len(data) == 1
         event = data[0]
         assert "event_type" in event
@@ -1500,7 +1504,7 @@ class TestJobDiff:
             response = await c.get(f"/jobs/{job_id}/diff")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["job_id"] == str(job_id)
         assert data["diff"] == row_data["diff"]
 
@@ -1539,9 +1543,9 @@ class TestJobDiff:
 
         assert response.status_code == 409
         data = response.json()
-        assert data["job_id"] == str(job_id)
-        assert data["diff"] is None
-        assert data["status"] == "running"
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "CONFLICT"
+        assert "running" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_get_diff_for_completed_job_without_diff_returns_404(self, mock_conn):
@@ -1630,14 +1634,15 @@ class TestDoubleApprove:
             # First approve - should succeed, transitioning to running
             response1 = await c.post(f"/jobs/{job_id}/approve")
             assert response1.status_code == 200
-            data1 = response1.json()
+            data1 = response1.json()["data"]
             assert data1["status"] == "running"
 
             # Second approve - job is now running, should get 409
             response2 = await c.post(f"/jobs/{job_id}/approve")
             assert response2.status_code == 409
             data2 = response2.json()
-            assert "detail" in data2
+            assert data2["status"] == "error"
+            assert data2["error"]["code"] == "CONFLICT"
 
 
 class TestJobDiffFetch:
@@ -1706,7 +1711,7 @@ class TestJobDiffFetch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
         assert data["diff"] == expected_diff
 
@@ -1777,7 +1782,7 @@ class TestJobDiffFetch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         # Job MUST complete even though diff fetch failed
         assert data["status"] == "completed"
         assert data["diff"] is None
@@ -1843,7 +1848,7 @@ class TestJobDiffFetch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert "diff" in data
         assert data["diff"] == expected_diff
         assert data["status"] == "completed"
@@ -1892,7 +1897,7 @@ class TestJobDiffFetch:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
         # diff should be null when no client is available
         assert data["diff"] is None
@@ -1915,7 +1920,7 @@ class TestJobDiffFetch:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
         assert data["diff"] == expected_diff
         assert data["opencode_session_id"] == "sess-123"
@@ -2056,7 +2061,7 @@ class TestAbortEvents:
             response = await c.get(f"/jobs/{job_id}/events")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert isinstance(data, list)
         assert len(data) == 1
         event = data[0]
@@ -2119,7 +2124,7 @@ class TestAbortEvents:
             response = await c.get(f"/jobs/{job_id}/events")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert isinstance(data, list)
         assert len(data) == 3
 
@@ -2280,7 +2285,7 @@ class TestRunnerSelection:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
 
     @pytest.mark.asyncio
@@ -2312,7 +2317,9 @@ class TestRunnerSelection:
 
         assert response.status_code == 400
         data = response.json()
-        assert "not found" in data["detail"].lower()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "not found" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_explicit_runner_pin_unhealthy_returns_400(
@@ -2343,7 +2350,9 @@ class TestRunnerSelection:
 
         assert response.status_code == 400
         data = response.json()
-        assert "not healthy" in data["detail"].lower()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "not healthy" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_label_based_selection_matching_runner_found(
@@ -2389,7 +2398,7 @@ class TestRunnerSelection:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
 
     @pytest.mark.asyncio
@@ -2419,8 +2428,10 @@ class TestRunnerSelection:
 
         assert response.status_code == 400
         data = response.json()
-        assert "no healthy runner" in data["detail"].lower()
-        assert "nonexistent-label" in data["detail"]
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "no healthy runner" in data["error"]["message"].lower()
+        assert "nonexistent-label" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_automatic_selection_healthy_runner_available(
@@ -2468,7 +2479,7 @@ class TestRunnerSelection:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
 
     @pytest.mark.asyncio
@@ -2500,7 +2511,9 @@ class TestRunnerSelection:
 
         assert response.status_code == 400
         data = response.json()
-        assert "no healthy runners" in data["detail"].lower()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "no healthy runners" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_load_balancing_picks_runner_with_fewest_workspaces(
@@ -2548,7 +2561,7 @@ class TestRunnerSelection:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
 
     @pytest.mark.asyncio
@@ -2596,7 +2609,7 @@ class TestRunnerSelection:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["status"] == "completed"
 class TestJobLogs:
     """Tests for GET /jobs/{id}/logs (log retrieval via OpenCode Serve proxy)."""
@@ -2647,7 +2660,7 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["job_id"] == str(job_id)
         assert data["session_id"] == session_id
         assert data["log"] == log_content
@@ -2685,7 +2698,10 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 409
-        assert "detail" in response.json()
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "CONFLICT"
+        assert "No session" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_get_logs_session_not_started_returns_424(self, mock_conn):
@@ -2720,8 +2736,10 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 424
-        assert "detail" in response.json()
-        assert "pending" in response.json()["detail"]
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "FAILED_DEPENDENCY"
+        assert "pending" in data["error"]["message"]
 
         # get_session was called but get_session_log was not
         mock_opencode.get_session.assert_called_once_with(session_id)
@@ -2816,7 +2834,10 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 503
-        assert "detail" in response.json()
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "OpenCode Serve client" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_get_logs_opencode_unreachable_returns_503(self, mock_conn):
@@ -2892,7 +2913,7 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["log"] == log_content
 
     @pytest.mark.asyncio
@@ -2935,7 +2956,7 @@ class TestJobLogs:
             response = await c.get(f"/jobs/{job_id}/logs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["log"] == log_content
 
     @pytest.mark.asyncio
@@ -3004,7 +3025,7 @@ class TestListJobs:
             response = await c.get("/jobs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert "items" in data
         assert "total" in data
         assert "limit" in data
@@ -3037,7 +3058,7 @@ class TestListJobs:
             response = await c.get("/jobs?limit=2&offset=5")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["limit"] == 2
         assert data["offset"] == 5
         assert len(data["items"]) == 2
@@ -3060,7 +3081,7 @@ class TestListJobs:
             response = await c.get("/jobs?status=failed")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["total"] == 1
         assert len(data["items"]) == 1
         assert data["items"][0]["status"] == "failed"
@@ -3089,7 +3110,7 @@ class TestListJobs:
             response = await c.get(f"/jobs?workflow_run_id={workflow_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["total"] == 1
         assert data["items"][0]["workflow_run_id"] == workflow_id
 
@@ -3117,7 +3138,7 @@ class TestListJobs:
             response = await c.get(f"/jobs?runner_id={runner_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["total"] == 1
 
         # Verify the SQL query included the runner_id filter
@@ -3149,7 +3170,7 @@ class TestListJobs:
             )
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["total"] == 1
         assert len(data["items"]) == 1
         assert data["items"][0]["workflow_run_id"] == workflow_id
@@ -3185,7 +3206,7 @@ class TestListJobs:
             response = await c.get("/jobs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["items"] == []
         assert data["total"] == 0
         assert data["limit"] == 50
@@ -3262,7 +3283,7 @@ class TestEnrichedJobResponse:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert "branch_name" in data
         assert data["branch_name"] == "feature/my-branch"
 
@@ -3283,7 +3304,7 @@ class TestEnrichedJobResponse:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert "mr_url" in data
         assert data["mr_url"] == "https://github.com/org/repo/pull/42"
 
@@ -3304,7 +3325,7 @@ class TestEnrichedJobResponse:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert "workflow_run_id" in data
         assert data["workflow_run_id"] == "wr-456"
 
@@ -3329,7 +3350,7 @@ class TestEnrichedJobResponse:
             response = await c.get(f"/jobs/{job_id}")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         assert data["branch_name"] is None
         assert data["mr_url"] is None
         assert data["workflow_run_id"] is None
@@ -3354,7 +3375,7 @@ class TestEnrichedJobResponse:
             response = await c.get("/jobs")
 
         assert response.status_code == 200
-        data = response.json()
+        data = response.json()["data"]
         item = data["items"][0]
         assert item["branch_name"] == "main"
         assert item["mr_url"] == "https://github.com/org/repo/pull/99"
@@ -3399,7 +3420,7 @@ class TestJobCreateWithWorkflowRunId:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["workflow_run_id"] == workflow_run_id
 
         insert_call = mock_conn.execute.call_args_list[0]
@@ -3435,7 +3456,7 @@ class TestJobCreateWithWorkflowRunId:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["workflow_run_id"] is None
 
         insert_call = mock_conn.execute.call_args_list[0]
@@ -3473,5 +3494,5 @@ class TestJobCreateWithWorkflowRunId:
             )
 
         assert response.status_code == 201
-        data = response.json()
+        data = response.json()["data"]
         assert data["workflow_run_id"] is None
