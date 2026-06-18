@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: weiyentan/opencode-gateway
+  IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME }}
 
 jobs:
 
