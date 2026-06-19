@@ -146,17 +146,19 @@ def create_app(
 def _create_executor(settings: Any) -> Any:
     """Instantiate the configured executor plugin.
 
+    Delegates to :func:`app.executors.factory.create_executor_from_settings`
+    so all executor types follow the same construction path.  The AWX
+    executor receives a fully-configured ``AWXApiClient`` and validated
+    template IDs rather than being instantiated with no arguments.
+
     Returns ``None`` if the executor type is not found in the registry
     so the scheduler can skip cleanup ticks gracefully instead of
     crashing the Gateway process.
-    """
-    from app.executors import EXECUTOR_REGISTRY
 
-    executor_cls = EXECUTOR_REGISTRY.get(settings.executor_type)
-    if executor_cls is None:
-        logger.warning(
-            "Unknown executor type %r — cleanup scheduler will skip ticks",
-            settings.executor_type,
-        )
-        return None
-    return executor_cls()
+    Raises:
+        ValueError: If the executor type is ``"awx"`` and required
+            AWX settings are missing (fail-fast at startup).
+    """
+    from app.executors.factory import create_executor_from_settings
+
+    return create_executor_from_settings(settings)

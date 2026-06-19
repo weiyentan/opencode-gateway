@@ -507,6 +507,8 @@ class TestAWXExecutorFactory:
 
     def test_awx_missing_template_ids_raises(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_EXECUTOR_TYPE", "awx")
+        monkeypatch.setenv("GATEWAY_AWX_BASE_URL", "https://awx.example.com")
+        monkeypatch.setenv("GATEWAY_AWX_TOKEN", "test-token")
         # Do NOT set template IDs — they default to 0 which triggers error.
 
         import app.executors.factory
@@ -518,6 +520,8 @@ class TestAWXExecutorFactory:
 
     def test_awx_missing_single_template_id_raises(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_EXECUTOR_TYPE", "awx")
+        monkeypatch.setenv("GATEWAY_AWX_BASE_URL", "https://awx.example.com")
+        monkeypatch.setenv("GATEWAY_AWX_TOKEN", "test-token")
         monkeypatch.setenv("GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID", "10")
         monkeypatch.setenv("GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID", "20")
         # workspace_teardown_template_id is missing → defaults to 0
