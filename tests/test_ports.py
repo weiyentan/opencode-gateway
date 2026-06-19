@@ -594,6 +594,12 @@ class TestAllocateAndAssignPort:
 
         conn.fetch = AsyncMock(side_effect=_fetch)
         conn.execute = AsyncMock(side_effect=_execute)
+        # Mock conn.transaction() as an async context manager
+        from unittest.mock import MagicMock
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
 
         port = await allocate_and_assign_port(conn, ws_id)
 
@@ -625,13 +631,21 @@ class TestAllocateAndAssignPort:
 
         conn.fetch = AsyncMock(side_effect=_fetch)
         conn.execute = AsyncMock(side_effect=_execute)
+        from unittest.mock import MagicMock
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
 
         await allocate_and_assign_port(conn, ws_id)
 
         lock_calls = [(s, a) for s, a in execute_calls if "pg_advisory_lock" in s]
         unlock_calls = [(s, a) for s, a in execute_calls if "pg_advisory_unlock" in s]
-        assert len(lock_calls) == 1
-        assert len(unlock_calls) == 1
+        # allocate_and_assign_port acquires the lock, then allocate_port acquires
+        # it again (PG advisory locks are reentrant per session), so we expect 2
+        # lock and 2 unlock calls total.
+        assert len(lock_calls) == 2
+        assert len(unlock_calls) == 2
 
     @pytest.mark.asyncio
     async def test_concurrent_allocate_and_assign_are_unique(self):
@@ -652,6 +666,14 @@ class TestAllocateAndAssignPort:
             conn = AsyncMock()
             conn.fetch = AsyncMock(side_effect=_fetch)
             conn.execute = AsyncMock(side_effect=_execute)
+            # Mock conn.transaction() as an async context manager.
+            # Use MagicMock (not AsyncMock) because conn.transaction() is a
+            # synchronous call that returns a transaction object.
+            from unittest.mock import MagicMock
+            mock_tx = AsyncMock()
+            mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+            mock_tx.__aexit__ = AsyncMock(return_value=None)
+            conn.transaction = MagicMock(return_value=mock_tx)
 
             port = await allocate_and_assign_port(conn, ws_id)
 

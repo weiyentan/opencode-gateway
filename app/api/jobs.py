@@ -18,7 +18,7 @@ from app.api.webhooks import build_job_completed_payload, dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
-from app.core.ports import PortExhaustedError, allocate_port
+from app.core.ports import PortExhaustedError, allocate_and_assign_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.awx.exceptions import AWXArtifactError
@@ -488,9 +488,12 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 4a. Allocate a port and persist it against the workspace (ADR 0003).
+        # 4a. Allocate a port and persist it atomically against the workspace (ADR 0003).
+        # allocate_and_assign_port acquires an advisory lock, selects a free port,
+        # and updates the workspace row in a single transaction, eliminating the
+        # race window that existed with the old two-step allocate + UPDATE pattern.
         try:
-            allocated_port = await allocate_port(conn)
+            allocated_port = await allocate_and_assign_port(conn, new_workspace_id)
         except PortExhaustedError:
             logger.error(
                 "Port exhaustion — no free ports in range 10000–10999 "
@@ -502,13 +505,6 @@ async def create_job(
                 status_code=503,
                 detail="No available ports — all 1000 ports in range 10000–10999 are in use",
             )
-
-        await conn.execute(
-            "UPDATE workspaces SET port = $2, updated_at = $3 WHERE id = $1",
-            new_workspace_id,
-            allocated_port,
-            datetime.now(timezone.utc),  # noqa: UP017
-        )
         logger.info(
             "Allocated port %d for job %s (workspace %s)",
             allocated_port,
