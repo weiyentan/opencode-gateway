@@ -6,13 +6,9 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
-from app.api.jobs import _get_pool
 from app.api.webhooks import _compute_signature
-from app.core.factory import create_app
-from app.db.session import get_session
 from tests.conftest import create_client, mock_row
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -68,19 +64,7 @@ class TestSignature:
 
 def _make_webhook_client(mock_conn: AsyncMock) -> AsyncClient:
     """Build a test client with webhook and pool dependencies overridden."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    mock_pool.pool = None
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-    app.dependency_overrides[_get_pool] = lambda: mock_pool
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return create_client(mock_conn)
 
 
 class TestCreateWebhook:
@@ -524,11 +508,12 @@ class TestWebhookIntegration:
             if "INSERT INTO gateway_jobs" in sql and args and isinstance(args[0], uuid.UUID):
                 captured_job_id = args[0]
                 row_data["id"] = args[0]  # Update the row to match
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = "2026-06-14T00:00:00Z"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -547,17 +532,17 @@ class TestWebhookIntegration:
 
             assert response.status_code == 201
             data = response.json()["data"]
-            assert data["status"] == "completed"
+            assert data["status"] == "running"
 
-            # dispatch_webhooks should have been called
+            # dispatch_webhooks should have been called with job.running event
             mock_dispatch.assert_called()
             call_args = mock_dispatch.call_args[0]
             # call_args: (pool, job_id, event_type, payload)
-            assert call_args[2] == "job.completed"
+            assert call_args[2] == "job.running"
             # The job_id in the payload should match the one assigned by create_job
             assert call_args[3]["job_id"] == str(captured_job_id)
-            assert call_args[3]["event_type"] == "job.completed"
-            assert call_args[3]["status"] == "completed"
+            assert call_args[3]["event_type"] == "job.running"
+            assert call_args[3]["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_job_failure_triggers_webhook_dispatch(self):
@@ -598,8 +583,8 @@ class TestWebhookIntegration:
             if "INSERT INTO gateway_jobs" in sql and args and isinstance(args[0], uuid.UUID):
                 captured_job_id = args[0]
                 row_data["id"] = args[0]
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                row_data["status"] = "running"
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 

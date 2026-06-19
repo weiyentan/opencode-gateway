@@ -6,8 +6,7 @@ Covers normal flow, error paths, and template-ID validation.
 from __future__ import annotations
 
 import importlib
-import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -15,6 +14,7 @@ import pytest
 from app.executors import EXECUTOR_REGISTRY, ExecutorPlugin
 from app.executors.awx.client import AWXApiClient, AWXJobResult, AWXJobSummary
 from app.executors.awx.exceptions import (
+    AWXArtifactError,
     AWXClientError,
     AWXConnectionError,
     AWXJobError,
@@ -198,18 +198,21 @@ class TestAWXExecutorPluginCreateWorkspace:
             },
         )
 
-    async def test_creates_workspace_with_missing_artifacts_returns_defaults(self):
-        """When AWX returns no artifacts, sensible defaults are used."""
+    async def test_creates_workspace_with_missing_artifacts_raises(self):
+        """When AWX returns no artifacts, an AWXArtifactError is raised
+        instead of falling back to placeholder values."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, status="successful", artifacts={})
         plugin = _make_plugin(client)
 
         req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
-        resp = await plugin.create_workspace(req)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
 
-        assert resp.status == "successful"
-        assert resp.workspace_path == ""
-        assert resp.workspace_id == UUID(int=0)
+        err = exc_info.value
+        assert err.template_name == "gateway-create-workspace"
+        assert "workspace_id" in err.missing_fields
+        assert "workspace_path" in err.missing_fields
 
 
 # ── start / stop / restart ──────────────────────────────────────────────
@@ -266,17 +269,49 @@ class TestAWXExecutorPluginLifecycle:
             },
         )
 
-    async def test_start_opencode_missing_artifacts_returns_defaults(self):
+    async def test_start_opencode_missing_artifacts_raises(self):
+        """When AWX returns no artifacts for start, an AWXArtifactError is raised
+        instead of falling back to zero UUID and zero port."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, artifacts={})
         plugin = _make_plugin(client)
 
         ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+
+        err = exc_info.value
+        assert "gateway-opencode-lifecycle" in err.template_name
+        assert "session_id" in err.missing_fields
+        assert "port" in err.missing_fields
+
+    async def test_start_opencode_passes_port_in_extra_vars(self):
+        """When port is provided in the request, it is passed as an extra_var."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={"session_id": "00000000-1111-2222-3333-444444444444",
+                       "port": 10042},
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            port=10042,
+        )
         resp = await plugin.start_opencode(req)
 
-        assert resp.port == 0
-        assert resp.session_id == UUID(int=0)
+        assert resp.port == 10042
+        client.launch_job_template.assert_awaited_once_with(
+            _LIFECYCLE_TEMPLATE,
+            extra_vars={
+                "action": "start",
+                "workspace_path": f"{_BASE_PATH}/{ws_id}",
+                "port": 10042,
+            },
+        )
 
     async def test_stop_opencode(self):
         client = AsyncMock(spec=AWXApiClient)
@@ -360,18 +395,21 @@ class TestAWXExecutorPluginTeardown:
 
         assert resp.status == WorkspaceState.ERROR
 
-    async def test_collect_state_falls_back_to_job_status(self):
-        """When artifacts lack a 'status' key, use the AWX job status."""
+    async def test_collect_state_missing_status_raises(self):
+        """When artifacts lack a 'status' key, an AWXArtifactError is raised
+        instead of falling back to the AWX job status."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, status="successful", artifacts={})
         plugin = _make_plugin(client)
 
         ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         req = CollectStateRequest(workspace_id=ws_id)
-        resp = await plugin.collect_state(req)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.collect_state(req)
 
-        # "successful" is not a WorkspaceState, so it defaults to ERROR.
-        assert resp.status == WorkspaceState.ERROR
+        err = exc_info.value
+        assert "gateway-workspace-teardown" in err.template_name
+        assert "status" in err.missing_fields
 
     async def test_cleanup_workspace(self):
         client = AsyncMock(spec=AWXApiClient)
@@ -466,6 +504,303 @@ class TestAWXExecutorPluginErrorHandling:
             await plugin.cleanup_workspace(req)
 
 
+# ── Artifact validation: create_workspace ────────────────────────────────
+
+
+class TestAWXArtifactValidationCreateWorkspace:
+    """Validate that create_workspace fails hard on malformed artifacts."""
+
+    async def test_missing_both_fields_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts={})
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert err.template_name == "gateway-create-workspace"
+        assert "workspace_id" in err.missing_fields
+        assert "workspace_path" in err.missing_fields
+
+    async def test_none_artifacts_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts=None)
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert "workspace_id" in err.missing_fields
+
+    async def test_invalid_uuid_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "workspace_id": "not-a-valid-uuid",
+                "workspace_path": "/some/path",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert "workspace_id" in err.invalid_fields
+
+    async def test_empty_workspace_path_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "workspace_path": "",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert "workspace_path" in err.invalid_fields
+
+    async def test_missing_workspace_path_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert "workspace_path" in err.missing_fields
+
+    async def test_missing_workspace_id_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={"workspace_path": "/some/path"},
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.create_workspace(req)
+        err = exc_info.value
+        assert "workspace_id" in err.missing_fields
+
+
+# ── Artifact validation: start_opencode ──────────────────────────────────
+
+
+class TestAWXArtifactValidationStartOpencode:
+    """Validate that start_opencode fails hard on malformed artifacts."""
+
+    async def test_missing_both_fields_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts={})
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "gateway-opencode-lifecycle" in err.template_name
+        assert "session_id" in err.missing_fields
+        assert "port" in err.missing_fields
+
+    async def test_invalid_session_id_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={"session_id": "bad-uuid", "port": 8080},
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "session_id" in err.invalid_fields
+
+    async def test_port_zero_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "port": 0,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "port" in err.invalid_fields
+
+    async def test_negative_port_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "port": -1,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "port" in err.invalid_fields
+
+    async def test_port_as_string_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "port": "not-a-number",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "port" in err.invalid_fields
+
+    async def test_missing_session_id_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={"port": 8080},
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.start_opencode(req)
+        err = exc_info.value
+        assert "session_id" in err.missing_fields
+
+
+# ── Artifact validation: collect_state ───────────────────────────────────
+
+
+class TestAWXArtifactValidationCollectState:
+    """Validate that collect_state fails hard on malformed artifacts."""
+
+    async def test_missing_status_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts={})
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CollectStateRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.collect_state(req)
+        err = exc_info.value
+        assert "gateway-workspace-teardown" in err.template_name
+        assert "status" in err.missing_fields
+
+    async def test_empty_status_raises(self):
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts={"status": ""})
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CollectStateRequest(workspace_id=ws_id)
+        with pytest.raises(AWXArtifactError) as exc_info:
+            await plugin.collect_state(req)
+        err = exc_info.value
+        assert "status" in err.invalid_fields
+
+    async def test_valid_with_optional_fields(self):
+        """Artifacts with status plus optional fields should validate."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "status": "running",
+                "process_status": "active",
+                "port": 9090,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CollectStateRequest(workspace_id=ws_id)
+        resp = await plugin.collect_state(req)
+
+        assert resp.status == WorkspaceState.RUNNING
+        assert resp.process_status == "active"
+        assert resp.port == 9090
+
+    async def test_unrecognised_status_still_maps_to_error(self):
+        """An unrecognised workspace state string still maps to ERROR
+        (not a validation failure — the status field format is valid)."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, artifacts={"status": "bogus"})
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CollectStateRequest(workspace_id=ws_id)
+        resp = await plugin.collect_state(req)
+
+        assert resp.status == WorkspaceState.ERROR
+
+
+# ── AWXArtifactError attributes ──────────────────────────────────────────
+
+
+class TestAWXArtifactErrorAttributes:
+    """Verify that AWXArtifactError carries descriptive failure metadata."""
+
+    def test_basic_error_attributes(self):
+        err = AWXArtifactError(
+            "artifacts missing required fields",
+            template_name="gateway-create-workspace",
+            missing_fields=["workspace_id", "workspace_path"],
+            invalid_fields=["port"],
+        )
+
+        assert str(err) == "artifacts missing required fields"
+        assert err.template_name == "gateway-create-workspace"
+        assert err.missing_fields == ["workspace_id", "workspace_path"]
+        assert err.invalid_fields == ["port"]
+
+    def test_error_with_default_empty_lists(self):
+        err = AWXArtifactError("something went wrong")
+        assert err.template_name is None
+        assert err.missing_fields == []
+        assert err.invalid_fields == []
+
+    def test_is_subclass_of_awx_client_error(self):
+        err = AWXArtifactError("test")
+        assert isinstance(err, AWXClientError)
+        assert isinstance(err, Exception)
+
+
 # ── Registry ────────────────────────────────────────────────────────────
 
 
@@ -507,6 +842,8 @@ class TestAWXExecutorFactory:
 
     def test_awx_missing_template_ids_raises(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_EXECUTOR_TYPE", "awx")
+        monkeypatch.setenv("GATEWAY_AWX_BASE_URL", "https://awx.example.com")
+        monkeypatch.setenv("GATEWAY_AWX_TOKEN", "test-token")
         # Do NOT set template IDs — they default to 0 which triggers error.
 
         import app.executors.factory
@@ -518,6 +855,8 @@ class TestAWXExecutorFactory:
 
     def test_awx_missing_single_template_id_raises(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_EXECUTOR_TYPE", "awx")
+        monkeypatch.setenv("GATEWAY_AWX_BASE_URL", "https://awx.example.com")
+        monkeypatch.setenv("GATEWAY_AWX_TOKEN", "test-token")
         monkeypatch.setenv("GATEWAY_AWX_CREATE_WORKSPACE_TEMPLATE_ID", "10")
         monkeypatch.setenv("GATEWAY_AWX_OPENCODE_LIFECYCLE_TEMPLATE_ID", "20")
         # workspace_teardown_template_id is missing → defaults to 0

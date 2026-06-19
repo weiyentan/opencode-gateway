@@ -11,10 +11,29 @@ from pydantic import BaseModel
 
 
 class JobStatus(str, Enum):
-    """Allowed status values for a Job's lifecycle state machine."""
+    """Allowed status values for a Job's lifecycle state machine.
+
+    Lifecycle path::
+
+        pending
+        ├── provisioning_workspace
+        │   └── starting_opencode
+        │       └── running
+        │           └── awaiting_review
+        │               ├── completed
+        │               └── failed
+        ├── needs_approval
+        │   ├── running
+        │   └── rejected
+        └── aborting
+            └── aborted
+    """
 
     PENDING = "pending"
+    PROVISIONING_WORKSPACE = "provisioning_workspace"
+    STARTING_OPENCODE = "starting_opencode"
     RUNNING = "running"
+    AWAITING_REVIEW = "awaiting_review"
     COMPLETED = "completed"
     FAILED = "failed"
     NEEDS_APPROVAL = "needs_approval"
@@ -54,8 +73,10 @@ class Job(BaseModel):
     executor_type: str
     executor_job_id: Optional[str] = None
     branch_name: Optional[str] = None
+    commit_sha: Optional[str] = None
     mr_url: Optional[str] = None
     workflow_run_id: Optional[str] = None
+    failure_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None

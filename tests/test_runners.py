@@ -16,6 +16,8 @@ def _make_runner_row(
     *,
     hostname="runner-01.example.com",
     status="online",
+    admin_status=None,
+    health_status=None,
     executor_type="awx",
     labels=None,
 ):
@@ -26,6 +28,8 @@ def _make_runner_row(
         "runner_id": str(runner_id_val),
         "hostname": hostname,
         "status": status,
+        "admin_status": admin_status,
+        "health_status": health_status,
         "executor_type": executor_type,
         "labels": labels,
         "created_at": now,
@@ -244,6 +248,8 @@ class TestGetRunnerDetail:
         *,
         hostname="runner-detail.example.com",
         status="online",
+        admin_status=None,
+        health_status=None,
         executor_type="awx",
         labels=None,
         workspace_obs=None,
@@ -260,6 +266,8 @@ class TestGetRunnerDetail:
             "runner_id": str(runner_id),
             "hostname": hostname,
             "status": status,
+            "admin_status": admin_status,
+            "health_status": health_status,
             "executor_type": executor_type,
             "labels": labels,
             "created_at": now,
@@ -519,7 +527,7 @@ class TestGetRunnerDetail:
         """policy_status is HEALTHY for runners with no pressure status."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="HEALTHY"
+            mock_conn, r_id, status="HEALTHY", health_status="HEALTHY"
         )
 
         async with client as c:
@@ -532,10 +540,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_unknown(self, client, mock_conn):
-        """policy_status is UNKNOWN when runner status is UNKNOWN."""
+        """policy_status is UNKNOWN when health_status is UNKNOWN."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="UNKNOWN"
+            mock_conn, r_id, status="UNKNOWN", health_status="UNKNOWN"
         )
 
         async with client as c:
@@ -548,10 +556,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_blocked_disk(self, client, mock_conn):
-        """policy_status is BLOCKED_DISK_PRESSURE when runner status matches."""
+        """policy_status is BLOCKED_DISK_PRESSURE when health_status matches."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="BLOCKED_DISK_PRESSURE"
+            mock_conn, r_id, status="BLOCKED_DISK_PRESSURE", health_status="BLOCKED_DISK_PRESSURE"
         )
 
         async with client as c:
@@ -564,10 +572,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_blocked_memory(self, client, mock_conn):
-        """policy_status is BLOCKED_MEMORY_PRESSURE when runner status matches."""
+        """policy_status is BLOCKED_MEMORY_PRESSURE when health_status matches."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="BLOCKED_MEMORY_PRESSURE"
+            mock_conn, r_id, status="BLOCKED_MEMORY_PRESSURE", health_status="BLOCKED_MEMORY_PRESSURE"
         )
 
         async with client as c:
@@ -610,8 +618,19 @@ class TestPostRunnerStatus:
         runner_id_str=None,
         hostname="runner-offline.example.com",
         current_status="HEALTHY",
+        current_admin_status=None,
     ):
-        """Configure mock_conn.fetchrow to return a runner row, and track execute calls."""
+        """Configure mock_conn.fetchrow to return a runner row, and track execute calls.
+
+        Parameters
+        ----------
+        current_status:
+            The value for the legacy ``status`` column.
+        current_admin_status:
+            The value for the ``admin_status`` column. When None, the mock
+            returns None (simulating a runner that has never had its admin
+            status set by an operator).
+        """
         if runner_id_val is None:
             runner_id_val = uuid.uuid4()
         if runner_id_str is None:
@@ -621,6 +640,7 @@ class TestPostRunnerStatus:
             "id": runner_id_val,
             "runner_id": runner_id_str,
             "hostname": hostname,
+            "admin_status": current_admin_status,
             "status": current_status,
         }
 
@@ -683,22 +703,22 @@ class TestPostRunnerStatus:
         assert data["reason"] == "Testing transition"
         assert "updated_at" in data
 
-        # Verify runner status UPDATE was issued
+        # Verify runner admin_status UPDATE was issued
         update_calls = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET admin_status" in sql
         ]
         assert len(update_calls) == 1
         _sql, args = update_calls[0]
         assert args[0] == target_status
 
     # ------------------------------------------------------------------
-    # job_events logging
+    # runner_events logging
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_status_change_logs_to_job_events(self, mock_conn):
-        """POST /runners/{id}/status inserts a record into job_events."""
+    async def test_status_change_logs_to_runner_events(self, mock_conn):
+        """POST /runners/{id}/status inserts a record into runner_events."""
         r_id, execute_calls = self._setup_mocks(
             mock_conn, current_status="HEALTHY"
         )
@@ -713,22 +733,23 @@ class TestPostRunnerStatus:
 
         assert response.status_code == 200
 
-        # Verify job_events INSERT
+        # Verify runner_events INSERT
         insert_calls = [
             (sql, args) for sql, args in execute_calls
-            if "INSERT INTO job_events" in sql
+            if "INSERT INTO runner_events" in sql
         ]
         assert len(insert_calls) == 1
         _sql, args = insert_calls[0]
-        # args: (event_id, sentinel_job_id, event_type, actor, details, previous_status, created_at)
+        # args: (event_id, runner_id, event_type, old_status, new_status, reason, created_at)
+        assert args[1] == r_id  # runner_id
         assert args[2] == "runner_status_offline"
-        assert args[3] == "api"
-        assert args[4] == "Maintenance window"
-        assert args[5] == "HEALTHY"
+        assert args[3] == "HEALTHY"
+        assert args[4] == "offline"
+        assert args[5] == "Maintenance window"
 
     @pytest.mark.asyncio
     async def test_status_change_logs_default_reason_when_empty(self, mock_conn):
-        """When reason is empty, the job_events details uses a default message."""
+        """When reason is empty, the runner_events reason uses a default message."""
         r_id, execute_calls = self._setup_mocks(
             mock_conn, current_status="UNKNOWN"
         )
@@ -745,13 +766,14 @@ class TestPostRunnerStatus:
 
         insert_calls = [
             (sql, args) for sql, args in execute_calls
-            if "INSERT INTO job_events" in sql
+            if "INSERT INTO runner_events" in sql
         ]
         assert len(insert_calls) == 1
         _sql, args = insert_calls[0]
         assert args[2] == "runner_status_maintenance"
-        assert args[4] == "Runner status changed to maintenance"
-        assert args[5] == "UNKNOWN"
+        assert args[3] == "UNKNOWN"
+        assert args[4] == "maintenance"
+        assert args[5] == "Runner status changed to maintenance"
 
     # ------------------------------------------------------------------
     # invalid transitions

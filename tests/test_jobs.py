@@ -173,8 +173,8 @@ class TestJobDispatch:
     """Tests for the executor dispatch wiring in POST /jobs."""
 
     @pytest.mark.asyncio
-    async def test_post_job_dispatches_to_executor_and_completes(self, mock_conn, mock_executor):
-        """POST /jobs should dispatch to executor and return completed status with completed_at."""
+    async def test_post_job_dispatches_to_executor_and_runs(self, mock_conn, mock_executor):
+        """POST /jobs should dispatch to executor and return running status (not completed)."""
         job_id = uuid.uuid4()
 
         # Track status changes across the flow
@@ -190,11 +190,12 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
@@ -214,16 +215,17 @@ class TestJobDispatch:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
-        assert data["completed_at"] is not None
+        assert data["status"] == "running"
+        # completed_at should NOT be set — job is only running, not completed
+        assert data["completed_at"] is None
 
         # Verify executor was called
         mock_executor.create_workspace.assert_called_once()
         mock_executor.start_opencode.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_post_job_transitions_pending_to_running_to_completed(self, mock_conn, mock_executor):
-        """Status should transition pending → running → completed in the DB."""
+    async def test_post_job_transitions_granular_states(self, mock_conn, mock_executor):
+        """Status should transition through granular provisioning states."""
         job_id = uuid.uuid4()
 
         # Capture update calls to verify status transitions
@@ -243,11 +245,12 @@ class TestJobDispatch:
         async def _execute(sql, *args):
             execute_calls.append(sql)
             # Update row_data.status based on UPDATE statements
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
@@ -266,11 +269,11 @@ class TestJobDispatch:
             )
 
         assert response.status_code == 201
-        assert response.json()["data"]["status"] == "completed"
+        assert response.json()["data"]["status"] == "running"
 
-        # Verify status transition updates happened
+        # Verify granular state transitions happened
         update_statements = [s for s in execute_calls if "UPDATE gateway_jobs" in s]
-        assert len(update_statements) >= 2  # pending→running, running→completed
+        assert len(update_statements) >= 3  # pending→prov, prov→start, start→running
 
     @pytest.mark.asyncio
     async def test_executor_failure_transitions_job_to_failed(self, mock_conn):
@@ -289,8 +292,10 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                row_data["status"] = "running"
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
@@ -320,8 +325,8 @@ class TestJobDispatch:
         assert data["completed_at"] is None
 
     @pytest.mark.asyncio
-    async def test_completed_job_has_completed_at_set(self, mock_conn, mock_executor):
-        """A completed job should have completed_at populated."""
+    async def test_running_job_has_no_completed_at(self, mock_conn, mock_executor):
+        """A running job (just dispatched) should NOT have completed_at set."""
         job_id = uuid.uuid4()
 
         row_data = make_job_row(
@@ -336,11 +341,12 @@ class TestJobDispatch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
 
@@ -360,8 +366,8 @@ class TestJobDispatch:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
-        assert data["completed_at"] is not None
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
 
     @pytest.mark.asyncio
     async def test_create_job_returns_503_when_policy_rejects_runner(
@@ -431,7 +437,7 @@ class TestJobDispatch:
 
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
-            {"id": runner_uuid, "status": "offline"}
+            {"id": runner_uuid, "admin_status": "offline", "health_status": None, "status": "offline"}
         )
 
         async def _execute(sql, *args):
@@ -478,7 +484,7 @@ class TestJobDispatch:
 
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
-            {"id": runner_uuid, "status": "maintenance"}
+            {"id": runner_uuid, "admin_status": "maintenance", "health_status": None, "status": "maintenance"}
         )
 
         async def _execute(sql, *args):
@@ -1649,8 +1655,9 @@ class TestJobDiffFetch:
     """Tests for diff fetching on job completion (issue #45)."""
 
     @pytest.mark.asyncio
-    async def test_completed_job_fetches_and_persists_diff(self, mock_conn, mock_executor):
-        """Diff should be fetched from OpenCode Serve and persisted to the DB."""
+    async def test_running_job_fetches_and_persists_diff(self, mock_conn, mock_executor):
+        """Diff should be fetched from OpenCode Serve and persisted even though
+        the job stays in 'running' status."""
         from app.opencode.protocol import SessionDiffResponse
 
         job_id = uuid.uuid4()
@@ -1671,11 +1678,12 @@ class TestJobDiffFetch:
 
         async def _execute(sql, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET diff" in sql:
                 # Capture the diff value stored
                 row_data["diff"] = args[1] if len(args) > 1 else None
@@ -1712,7 +1720,7 @@ class TestJobDiffFetch:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
         assert data["diff"] == expected_diff
 
         # Verify get_session_diff was called with the session ID
@@ -1732,7 +1740,7 @@ class TestJobDiffFetch:
 
     @pytest.mark.asyncio
     async def test_diff_fetch_failure_does_not_fail_job(self, mock_conn, mock_executor):
-        """When diff fetch raises, the job should still complete (not fail)."""
+        """When diff fetch raises, the job should still reach running (not fail)."""
         job_id = uuid.uuid4()
 
         row_data = make_job_row(
@@ -1747,11 +1755,12 @@ class TestJobDiffFetch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 row_data["status"] = "failed"
             elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
@@ -1783,16 +1792,16 @@ class TestJobDiffFetch:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        # Job MUST complete even though diff fetch failed
-        assert data["status"] == "completed"
+        # Job MUST reach running even though diff fetch failed
+        assert data["status"] == "running"
         assert data["diff"] is None
 
         # Verify diff fetch was attempted
         mock_opencode.get_session_diff.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_completed_job_response_includes_diff(self, mock_conn, mock_executor):
-        """A completed job response should include the diff field."""
+    async def test_running_job_response_includes_diff(self, mock_conn, mock_executor):
+        """A running job response should include the diff field when fetched."""
         from app.opencode.protocol import SessionDiffResponse
 
         job_id = uuid.uuid4()
@@ -1810,11 +1819,12 @@ class TestJobDiffFetch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET diff" in sql:
                 row_data["diff"] = args[1] if len(args) > 1 else None
             elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
@@ -1851,11 +1861,11 @@ class TestJobDiffFetch:
         data = response.json()["data"]
         assert "diff" in data
         assert data["diff"] == expected_diff
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_diff_fetch_not_attempted_when_client_is_none(self, mock_conn, mock_executor):
-        """When no OpenCode client is injected (default None), job completes with null diff."""
+        """When no OpenCode client is injected, job reaches running with null diff."""
         job_id = uuid.uuid4()
 
         row_data = make_job_row(
@@ -1870,11 +1880,12 @@ class TestJobDiffFetch:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
             elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
                 row_data["opencode_session_id"] = args[1] if len(args) > 1 else None
 
@@ -1898,7 +1909,7 @@ class TestJobDiffFetch:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
         # diff should be null when no client is available
         assert data["diff"] is None
 
@@ -1924,6 +1935,246 @@ class TestJobDiffFetch:
         assert data["status"] == "completed"
         assert data["diff"] == expected_diff
         assert data["opencode_session_id"] == "sess-123"
+
+
+class TestCompleteJob:
+    """Tests for POST /jobs/{id}/complete — transition to terminal / review states."""
+
+    @pytest.mark.asyncio
+    async def test_complete_running_to_awaiting_review(self, mock_conn):
+        """Transition running → awaiting_review stores metadata."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "To review",
+            status="running", opencode_session_id="sess-001",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET" in sql and "SET status" in sql:
+                row["status"] = args[1]  # $2 = target status
+                # Parse metadata fields from the SQL:
+                # "SET status = $2, updated_at = $3, branch_name = $4, ..."
+                # The positions in args correspond to $N placeholders.
+                field_map = {
+                    "branch_name": None,
+                    "commit_sha": None,
+                    "mr_url": None,
+                    "diff": None,
+                    "failure_reason": None,
+                    "completed_at": None,
+                }
+                for field in field_map:
+                    if field in sql:
+                        # Find the position of this field's $N
+                        import re
+                        m = re.search(
+                            rf"{field} = \$(\d+)", sql
+                        )
+                        if m:
+                            pos = int(m.group(1))
+                            if pos <= len(args):
+                                row[field] = args[pos - 1]
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={
+                    "target_status": "awaiting_review",
+                    "branch_name": "feature/my-fix",
+                    "commit_sha": "abc123def456",
+                    "mr_url": "https://github.com/org/repo/pull/42",
+                    "diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "awaiting_review"
+        assert data["branch_name"] == "feature/my-fix"
+        assert data["commit_sha"] == "abc123def456"
+        assert data["mr_url"] == "https://github.com/org/repo/pull/42"
+        assert data["diff"] == "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"
+        assert data["completed_at"] is None  # not terminal
+
+    @pytest.mark.asyncio
+    async def test_complete_awaiting_review_to_completed(self, mock_conn):
+        """Transition awaiting_review → completed sets completed_at."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Approve me",
+            status="awaiting_review",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET" in sql and "SET status" in sql:
+                row["status"] = args[1]
+                if "completed_at" in sql:
+                    import re
+                    m = re.search(r"completed_at = \$(\d+)", sql)
+                    if m:
+                        pos = int(m.group(1))
+                        if pos <= len(args):
+                            row["completed_at"] = args[pos - 1]
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={
+                    "target_status": "completed",
+                    "summary": "All tests pass, review approved",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+        assert data["completed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_complete_awaiting_review_to_failed(self, mock_conn):
+        """Transition awaiting_review → failed sets completed_at and failure_reason."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Rejected",
+            status="awaiting_review",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET" in sql and "SET status" in sql:
+                row["status"] = args[1]
+                import re
+                if "completed_at" in sql:
+                    m = re.search(r"completed_at = \$(\d+)", sql)
+                    if m:
+                        pos = int(m.group(1))
+                        if pos <= len(args):
+                            row["completed_at"] = args[pos - 1]
+                if "failure_reason" in sql:
+                    m = re.search(r"failure_reason = \$(\d+)", sql)
+                    if m:
+                        pos = int(m.group(1))
+                        if pos <= len(args):
+                            row["failure_reason"] = args[pos - 1]
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={
+                    "target_status": "failed",
+                    "failure_reason": "Tests did not pass; review rejected",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert data["completed_at"] is not None
+        assert data["failure_reason"] == "Tests did not pass; review rejected"
+
+    @pytest.mark.asyncio
+    async def test_complete_unknown_job_returns_404(self, mock_conn):
+        """Complete on non-existent job returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{uuid.uuid4()}/complete",
+                json={"target_status": "awaiting_review"},
+            )
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_complete_invalid_target_status_returns_400(self, mock_conn):
+        """Complete with an invalid target_status returns 400."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Bad target",
+            status="running",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "pending"},
+            )
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_complete_invalid_transition_returns_409(self, mock_conn):
+        """Complete from a state that cannot transition to the target returns 409."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Already done",
+            status="completed",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "awaiting_review"},
+            )
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_complete_from_pending_returns_409(self, mock_conn):
+        """Complete from pending state (not running/awaiting_review) returns 409."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Still pending",
+            status="pending",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "completed"},
+            )
+
+        assert response.status_code == 409
 
 
 class TestAbortEvents:
@@ -2263,11 +2514,12 @@ class TestRunnerSelection:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -2286,7 +2538,7 @@ class TestRunnerSelection:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_explicit_runner_pin_not_found_returns_400(
@@ -2376,11 +2628,12 @@ class TestRunnerSelection:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -2399,7 +2652,7 @@ class TestRunnerSelection:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_label_based_selection_no_matching_runner_returns_400(
@@ -2458,11 +2711,12 @@ class TestRunnerSelection:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -2480,7 +2734,7 @@ class TestRunnerSelection:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_automatic_selection_no_healthy_runners_returns_400(
@@ -2540,11 +2794,12 @@ class TestRunnerSelection:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -2562,7 +2817,7 @@ class TestRunnerSelection:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_runner_id_takes_precedence_over_labels(
@@ -2586,11 +2841,12 @@ class TestRunnerSelection:
             return None
 
         async def _execute(sql, *args):
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                row_data["status"] = "completed"
-                row_data["completed_at"] = datetime.now(timezone.utc)
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -2610,7 +2866,7 @@ class TestRunnerSelection:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 class TestJobLogs:
     """Tests for GET /jobs/{id}/logs (log retrieval via OpenCode Serve proxy)."""
 
@@ -3339,8 +3595,10 @@ class TestEnrichedJobResponse:
         )
         # Ensure the new fields are not set in the row
         assert row["branch_name"] is None
+        assert row["commit_sha"] is None
         assert row["mr_url"] is None
         assert row["workflow_run_id"] is None
+        assert row["failure_reason"] is None
 
         mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
 
@@ -3352,8 +3610,10 @@ class TestEnrichedJobResponse:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["branch_name"] is None
+        assert data["commit_sha"] is None
         assert data["mr_url"] is None
         assert data["workflow_run_id"] is None
+        assert data["failure_reason"] is None
 
     @pytest.mark.asyncio
     async def test_enriched_fields_in_list_response(self, mock_conn):

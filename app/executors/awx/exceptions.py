@@ -45,3 +45,34 @@ class AWXJobError(AWXClientError):
     def __init__(self, message: str, job_id: int) -> None:
         self.job_id = job_id
         super().__init__(message)
+
+
+class AWXArtifactError(AWXClientError):
+    """Raised when AWX job artifacts are missing, malformed, or invalid.
+
+    Indicates that the AWX job completed successfully but returned
+    artifacts that do not match the expected schema for the job template.
+    This is a hard failure — the executor must not fall back to
+    placeholder values (e.g. zero UUID).
+
+    Attributes:
+        template_name: The name of the AWX job template that produced
+            the invalid artifacts (e.g. ``"gateway-create-workspace"``).
+        missing_fields: List of required field names that were absent
+            from the artifacts.
+        invalid_fields: List of field names whose values failed
+            validation (e.g. invalid UUID format).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        template_name: str | None = None,
+        missing_fields: list[str] | None = None,
+        invalid_fields: list[str] | None = None,
+    ) -> None:
+        self.template_name = template_name
+        self.missing_fields = missing_fields or []
+        self.invalid_fields = invalid_fields or []
+        super().__init__(message)

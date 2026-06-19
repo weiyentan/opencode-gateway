@@ -478,25 +478,30 @@ class TestExecutorIntegration:
         await asyncio.sleep(0.12)
         await scheduler.stop()
 
-        # Should have an UPDATE setting cleanup_status
+        # Should have UPDATE calls setting cleanup_status to cleaning then cleaned.
+        # The second update (cleaned) passes (now_done, ws_id).
         update_calls = [
             (sql, args)
             for sql, args in conn.execute_calls
-            if "UPDATE workspaces" in sql
+            if "UPDATE workspaces" in sql and "cleaned" in sql
         ]
         assert len(update_calls) >= 1, (
-            f"Expected UPDATE workspaces call, got: {conn.execute_calls}"
+            f"Expected UPDATE workspaces SET ... cleaned call, got: {conn.execute_calls}"
         )
         _sql, args = update_calls[0]
-        assert args[0] == ws_id
+        # args: (now_done, ws_id) — ws_id is at index 1
+        assert args[1] == ws_id
 
     @pytest.mark.asyncio
-    async def test_does_not_update_status_on_unexpected_response(self, caplog):
-        """If executor returns status != 'cleaned', status is NOT updated."""
+    async def test_unexpected_response_transitions_to_cleanup_failed(self, caplog):
+        """If executor returns status != 'cleaned', workspace transitions to cleanup_failed."""
         caplog.set_level(logging.WARNING, logger="app.scheduler.cleaner")
 
         ws_id = uuid.uuid4()
-        pool, conn = _mock_pool(fetch_rows=[_make_expired_row(ws_id)])
+        pool, conn = _mock_pool(
+            fetch_rows=[_make_expired_row(ws_id)],
+            lock_acquired=True,
+        )
         executor = _mock_executor(cleanup_status="error")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
@@ -511,12 +516,15 @@ class TestExecutorIntegration:
         ]
         assert len(warning_logs) >= 1
 
-        # And no UPDATE was issued
+        # A cleanup_failed UPDATE should have been issued
         update_calls = [
-            (sql, args) for sql, args in conn.execute_calls
-            if "UPDATE workspaces" in sql
+            (sql, args)
+            for sql, args in conn.execute_calls
+            if "UPDATE workspaces" in sql and "cleanup_failed" in sql
         ]
-        assert len(update_calls) == 0
+        assert len(update_calls) >= 1, (
+            f"Expected cleanup_failed UPDATE, got: {conn.execute_calls}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -681,10 +689,13 @@ class TestStatusResponseHandling:
     """Edge cases around executor status responses."""
 
     @pytest.mark.asyncio
-    async def test_empty_status_does_not_update_db(self):
-        """If the response status is empty/blank, no UPDATE should occur."""
+    async def test_empty_status_transitions_to_cleanup_failed(self):
+        """If the response status is empty/blank, workspace transitions to cleanup_failed."""
         ws_id = uuid.uuid4()
-        pool, conn = _mock_pool(fetch_rows=[_make_expired_row(ws_id)])
+        pool, conn = _mock_pool(
+            fetch_rows=[_make_expired_row(ws_id)],
+            lock_acquired=True,
+        )
         executor = _mock_executor(cleanup_status="")
 
         scheduler = CleanupScheduler(interval_seconds=0.05)
@@ -694,6 +705,8 @@ class TestStatusResponseHandling:
 
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls
-            if "UPDATE workspaces" in sql
+            if "UPDATE workspaces" in sql and "cleanup_failed" in sql
         ]
-        assert len(update_calls) == 0
+        assert len(update_calls) >= 1, (
+            f"Expected cleanup_failed UPDATE, got: {conn.execute_calls}"
+        )

@@ -1,6 +1,10 @@
 """Gateway settings loaded from environment variables with sensible defaults."""
 
-from pydantic import Field
+from __future__ import annotations
+
+import warnings
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,8 +19,49 @@ class Settings(BaseSettings):
         extra="forbid",
     )
 
+    # Deployment environment: "production" | "development"
+    # Controls whether an API key is required (production) or optional (development).
+    # Maps to env var GATEWAY_ENV.
+    env: str = "production"
+
     # API authentication
+    # Requests must include an ``Authorization: Bearer <api-key>`` header.
+    # Required in production mode unless GATEWAY_ALLOW_INSECURE_AUTH is set.
     api_key: str = ""
+
+    # Explicit insecure-auth opt-in.  When ``true``, the Gateway starts
+    # without an API key even in production mode and logs a loud warning.
+    # Prefer GATEWAY_ENV=development for local work.
+    allow_insecure_auth: bool = False
+
+    @model_validator(mode="after")
+    def _validate_auth_requirements(self) -> Settings:
+        """Fail fast when an API key is required but not configured.
+
+        Production mode requires an API key unless the operator has
+        explicitly opted into insecure auth via
+        ``GATEWAY_ALLOW_INSECURE_AUTH=true``.
+        """
+        if (
+            self.env != "development"
+            and not self.allow_insecure_auth
+            and not self.api_key
+        ):
+            raise ValueError(
+                "GATEWAY_API_KEY must be set in production mode. "
+                "Set GATEWAY_ENV=development for local development, "
+                "or GATEWAY_ALLOW_INSECURE_AUTH=true to explicitly "
+                "opt-in to insecure mode."
+            )
+        if self.allow_insecure_auth:
+            warnings.warn(
+                "INSECURE AUTH: GATEWAY_ALLOW_INSECURE_AUTH is enabled. "
+                "The Gateway is running without API key authentication. "
+                "This is NOT safe for production deployments.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
 
     # Server
     host: str = "0.0.0.0"
