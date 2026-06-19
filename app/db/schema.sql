@@ -76,10 +76,11 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS webhooks (
-    id              UUID PRIMARY KEY,
-    url             TEXT NOT NULL,
-    events          TEXT[] NOT NULL DEFAULT '{}',
-    secret          TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- webhooks table — now managed by Alembic migration 0002_add_webhooks.py
+-- CREATE TABLE IF NOT EXISTS webhooks (
+--     id              UUID PRIMARY KEY,
+--     url             TEXT NOT NULL,
+--     events          TEXT[] NOT NULL DEFAULT '{}',
+--     secret          TEXT NOT NULL,
+--     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- );
