@@ -102,6 +102,8 @@ class JobResponse(BaseModel):
     branch_name: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
+    commit_sha: str | None = None
+    failure_reason: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -118,7 +120,8 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
+    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id, "
+    "commit_sha, failure_reason"
 )
 
 
@@ -484,9 +487,11 @@ async def create_job(
             job_id,
         )
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),  # noqa: UP017
+            "Policy rejected: disk/memory pressure",
         )
         # Fire webhooks asynchronously for policy-rejected jobs
         asyncio.create_task(
@@ -537,9 +542,11 @@ async def create_job(
 
         logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),  # noqa: UP017
+            error_detail,
         )
 
         # Record the artifact failure as a job event
@@ -587,9 +594,11 @@ async def create_job(
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),  # noqa: UP017
+            f"Executor dispatch failed: {body.task_summary}",
         )
 
         # Record the failure as a job event
@@ -649,6 +658,8 @@ async def create_job(
         branch_name=row.get("branch_name"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        commit_sha=row.get("commit_sha"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -716,6 +727,8 @@ async def approve_job(
         branch_name=row.get("branch_name"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        commit_sha=row.get("commit_sha"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -783,6 +796,8 @@ async def reject_job(
         branch_name=row.get("branch_name"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        commit_sha=row.get("commit_sha"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -934,6 +949,8 @@ async def abort_job(
         branch_name=row.get("branch_name"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        commit_sha=row.get("commit_sha"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -959,6 +976,8 @@ async def get_job(
         branch_name=row.get("branch_name"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        commit_sha=row.get("commit_sha"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -1046,6 +1065,8 @@ async def list_jobs(
             branch_name=row.get("branch_name"),
             mr_url=row.get("mr_url"),
             workflow_run_id=row.get("workflow_run_id"),
+            commit_sha=row.get("commit_sha"),
+            failure_reason=row.get("failure_reason"),
         )
         for row in rows
     ]
