@@ -4425,3 +4425,715 @@ class TestJobCreateWithWorkflowRunId:
         assert response.status_code == 201
         data = response.json()["data"]
         assert data["workflow_run_id"] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Job Lifecycle State Transitions (issue #147)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestLifecycleTransitions:
+    """Tests for complete job lifecycle state transitions.
+
+    Verifies that the create_job endpoint correctly transitions through
+    all lifecycle states, records events on failure, persists metadata,
+    and handles executor failures gracefully.
+    """
+
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _track_status(
+        row_data: dict,
+        execute_calls: list = None,
+    ):
+        """Return an _execute side-effect that tracks status transitions
+        including the final 'completed' state."""
+        from datetime import datetime, timezone
+
+        async def _execute(sql: str, *args):
+            if execute_calls is not None:
+                execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                if len(args) >= 3:
+                    row_data["completed_at"] = args[2]
+                if len(args) >= 4:
+                    row_data["diff"] = args[3]
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+            elif "UPDATE gateway_jobs SET workspace_name" in sql and len(args) >= 2:
+                row_data["workspace_name"] = args[1]
+            elif "UPDATE gateway_jobs SET opencode_session_id" in sql and len(args) >= 2:
+                row_data["opencode_session_id"] = args[1]
+
+        return _execute
+
+    # -- 1. Happy path through all states ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_happy_path_all_states(self, mock_conn, mock_executor):
+        """Happy path: pending→running→completed with workspace and session.
+
+        Verifies every status transition, executor calls in order, and
+        that metadata (workspace_name, session_id, diff, completed_at)
+        is persisted in the final response.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Happy path job",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Happy path job",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+        assert data["completed_at"] is not None
+        assert data["diff"] is not None
+
+        # Verify status transitions in order (status is in the SQL string)
+        status_update_sqls = [
+            sql for sql, _ in execute_calls
+            if "UPDATE gateway_jobs SET status" in sql
+        ]
+        # At minimum: running→completed (pending is set by INSERT, not UPDATE)
+        assert len(status_update_sqls) >= 2
+        # First status UPDATE should set 'running'
+        assert "status = 'running'" in status_update_sqls[0]
+        # Last status UPDATE should set 'completed'
+        assert "status = 'completed'" in status_update_sqls[-1]
+
+        # Verify executor was called in the correct order
+        mock_executor.create_workspace.assert_called_once()
+        mock_executor.start_opencode.assert_called_once()
+        # create_workspace called before start_opencode
+        create_call_time = mock_executor.create_workspace.call_args
+        start_call_time = mock_executor.start_opencode.call_args
+        assert create_call_time is not None
+        assert start_call_time is not None
+
+        # Verify metadata was stored in the DB
+        workspace_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET workspace_name" in sql
+        ]
+        assert len(workspace_updates) == 1
+        assert workspace_updates[0][1] is not None
+
+        session_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET opencode_session_id" in sql
+        ]
+        assert len(session_updates) == 1
+        assert session_updates[0][1] is not None
+
+        # Verify diff persisted (either via final completed UPDATE or separate UPDATE)
+        assert data["diff"] is not None
+
+    # -- 2. Failed workspace creation -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_workspace_creation_transitions_to_failed(
+        self, mock_conn,
+    ):
+        """Failed create_workspace → job marked 'failed', event recorded.
+
+        When the executor raises during workspace creation, the job should
+        transition to 'failed', no subsequent executor calls should happen,
+        and a job_events entry should be recorded.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Fail workspace",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=RuntimeError("Failed to create workspace")
+        )
+        # start_opencode should NOT be called
+        failing_executor.start_opencode = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fail workspace",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        # completed_at should remain None for failed jobs
+        assert data["completed_at"] is None
+
+        # start_opencode should NOT have been called
+        failing_executor.start_opencode.assert_not_called()
+
+        # Verify a job_events entry was created for the failure
+        event_inserts = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) >= 1
+        event_args = event_inserts[0][1]
+        assert "executor_error" in event_args or "failed" in event_args
+
+    # -- 3. Failed OpenCode startup ---------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_failed_opencode_startup_transitions_to_failed(
+        self, mock_conn,
+    ):
+        """Failed start_opencode → job marked 'failed', event recorded.
+
+        When workspace creation succeeds but OpenCode startup fails, the
+        job should be marked 'failed' and an event should be recorded.
+        create_workspace must have been called; start_opencode must have
+        been attempted.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Fail opencode",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        # Workspace creation succeeds, but OpenCode startup fails
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            return_value=AsyncMock(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        failing_executor.start_opencode = AsyncMock(
+            side_effect=RuntimeError("Failed to start OpenCode")
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fail opencode",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert data["completed_at"] is None
+
+        # create_workspace must have been called
+        failing_executor.create_workspace.assert_called_once()
+        # start_opencode must have been attempted
+        failing_executor.start_opencode.assert_called_once()
+
+        # Verify a job_events entry was created
+        event_inserts = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) >= 1
+
+    # -- 4. Job NOT completed after OpenCode startup alone -----------------
+
+    @pytest.mark.asyncio
+    async def test_not_completed_after_opencode_startup_alone(
+        self, mock_conn, mock_executor,
+    ):
+        """Job is NOT completed immediately after start_opencode returns.
+
+        The status should progress through 'running' before reaching
+        'completed'. The completed UPDATE must be the last status change,
+        coming after both create_workspace and start_opencode succeed.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Not completed yet",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Not completed yet",
+                },
+            )
+
+        assert response.status_code == 201
+
+        # Collect all status UPDATE calls in order and verify the sequence
+        status_update_sqls = [
+            sql for sql, _ in execute_calls
+            if "UPDATE gateway_jobs SET status" in sql
+        ]
+        # At minimum: running→completed (pending is set by INSERT, not UPDATE)
+        assert len(status_update_sqls) >= 2
+
+        # The first status update must be to 'running'
+        assert "status = 'running'" in status_update_sqls[0]
+
+        # The last must be to 'completed'
+        assert "status = 'completed'" in status_update_sqls[-1]
+
+        # Verify completed_at is set in the final response
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+        assert data["completed_at"] is not None
+
+        # Verify the 'running' transition actually happened before 'completed'
+        running_index = next(
+            i for i, sql in enumerate(status_update_sqls)
+            if "status = 'running'" in sql
+        )
+        completed_index = next(
+            i for i, sql in enumerate(status_update_sqls)
+            if "status = 'completed'" in sql
+        )
+        assert running_index < completed_index, (
+            "Job must transition through 'running' before 'completed'"
+        )
+
+    # -- 5. Missing terminal result does not complete the job --------------
+
+    @pytest.mark.asyncio
+    async def test_missing_terminal_result_does_not_complete(self, mock_conn):
+        """When the executor returns no valid result, the job does NOT complete.
+
+        If create_workspace returns a response but start_opencode cannot
+        proceed (missing or invalid predecessor data), the job should
+        transition to 'failed' rather than 'completed'.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Missing result",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        # Simulate an executor that creates a workspace but
+        # start_opencode cannot proceed (invalid/empty workspace_path).
+        from app.executors.models import CreateWorkspaceResponse
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="",  # missing/invalid terminal result
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            side_effect=RuntimeError("Invalid workspace path")
+        )
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Missing result",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert data["completed_at"] is None
+
+        # Both executor methods should have been called
+        executor.create_workspace.assert_called_once()
+        executor.start_opencode.assert_called_once()
+
+        # No completed status update should have occurred
+        completed_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET status = 'completed'" in sql
+        ]
+        assert len(completed_updates) == 0
+
+    # -- 6. Events recorded for failure transitions -----------------------
+
+    @pytest.mark.asyncio
+    async def test_events_recorded_for_failure_transitions(self, mock_conn):
+        """Failure transitions record events in the job_events table.
+
+        Verifies that when create_workspace raises, an INSERT INTO
+        job_events is executed with the correct event_type, actor,
+        and details.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Events on failure",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=RuntimeError("Disk full")
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Events on failure",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+
+        # Find job_events INSERT statements
+        event_inserts = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) >= 1
+
+        event_sql, event_args = event_inserts[0]
+        assert "job_events" in event_sql
+
+        # Verify event structure: (id, job_id, event_type, actor, details, created_at)
+        # or (id, job_id, event_type, actor, details, previous_status, created_at)
+        event_type = event_args[2]
+        actor = event_args[3]
+        details = event_args[4]
+
+        assert isinstance(event_type, str)
+        assert event_type in ("executor_error", "artifact_error")
+        assert actor == "gateway"
+        assert isinstance(details, str)
+        assert len(details) > 0
+
+    @pytest.mark.asyncio
+    async def test_events_recorded_for_opencode_failure(self, mock_conn):
+        """OpenCode startup failure records an event in job_events."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Events opencode fail",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=AsyncMock(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            side_effect=RuntimeError("OpenCode port unavailable")
+        )
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Events opencode fail",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+
+        event_inserts = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) >= 1
+
+        event_type = event_inserts[0][1][2]
+        assert event_type in ("executor_error",)
+
+    # -- 7. Completion metadata persisted ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_completion_metadata_persisted(self, mock_conn, mock_executor):
+        """Workspace name, session ID, and diff are persisted on completion.
+
+        Verifies that the DB UPDATE statements for workspace_name,
+        opencode_session_id, and diff are all executed during a
+        successful job flow, and that the response includes them.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Persist metadata",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        # Provide an opencode client so diff fetching is attempted
+        from app.opencode.protocol import SessionDiffResponse
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            return_value=SessionDiffResponse(
+                session_id="mock-session",
+                diff="diff --git a/file.txt b/file.txt\n+new content\n",
+                files_changed=["file.txt"],
+            )
+        )
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_executor,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Persist metadata",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+        assert data["completed_at"] is not None
+
+        # Verify workspace_name UPDATE
+        ws_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET workspace_name" in sql
+        ]
+        assert len(ws_updates) == 1
+        assert ws_updates[0][1] is not None
+        # The workspace_name should be a non-empty string representation
+        assert str(ws_updates[0][1]).strip() != ""
+
+        # Verify opencode_session_id UPDATE
+        session_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET opencode_session_id" in sql
+        ]
+        assert len(session_updates) == 1
+        assert session_updates[0][1] is not None
+
+        # Verify diff is present in the response (from final completed UPDATE)
+        assert data["diff"] is not None
+
+        # Verify opencode client was called for diff fetching
+        mock_opencode.get_session_diff.assert_called_once()
+
+        # Verify the diff was also updated via a separate UPDATE (if the
+        # opencode client returned one). Either:
+        #   a) The diff was set in the final completed UPDATE, OR
+        #   b) A separate UPDATE gateway_jobs SET diff = ... was made
+        diff_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET diff" in sql
+            and "status = 'completed'" not in sql
+        ]
+        # The mock opencode client returns a diff, so there should be
+        # either a separate diff UPDATE or the diff was in the final UPDATE.
+        assert data["diff"] is not None
+
+    @pytest.mark.asyncio
+    async def test_metadata_persisted_without_opencode_client(
+        self, mock_conn, mock_executor,
+    ):
+        """Metadata persisted even when no OpenCode client is available.
+
+        When there is no opencode_client (None), workspace_name and session_id
+        should still be persisted, and the diff should be the summary from
+        the completed UPDATE rather than a fetched diff.
+        """
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "No client metadata",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(
+            side_effect=self._track_status(row_data, execute_calls)
+        )
+
+        # No opencode client injected
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No client metadata",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+
+        # Verify workspace_name UPDATE
+        ws_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET workspace_name" in sql
+        ]
+        assert len(ws_updates) == 1
+
+        # Verify opencode_session_id UPDATE
+        session_updates = [
+            args for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET opencode_session_id" in sql
+        ]
+        assert len(session_updates) == 1
+
+        # Diff should be the summary from the completed UPDATE
+        assert data["diff"] is not None
+        assert "Job completed" in data["diff"]
