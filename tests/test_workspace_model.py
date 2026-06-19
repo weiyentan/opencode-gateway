@@ -193,6 +193,10 @@ class TestWorkspaceModelFields:
             "pinned",
             "cleanup_after",
             "cleanup_status",
+            "cleanup_started_at",
+            "cleanup_completed_at",
+            "cleanup_failed_at",
+            "cleanup_failure_reason",
             "created_at",
             "updated_at",
         }
@@ -205,11 +209,13 @@ class TestWorkspaceStatusEnum:
     """Tests for the WorkspaceStatus enum used on the Workspace model."""
 
     def test_workspace_status_enum_has_expected_values(self):
-        """WorkspaceStatus enum should define active, cleaning, pinned."""
+        """WorkspaceStatus enum should define active, cleaning, cleaned, cleanup_failed, pinned."""
         from app.core.models.workspace import WorkspaceStatus
 
         assert WorkspaceStatus.ACTIVE.value == "active"
         assert WorkspaceStatus.CLEANING.value == "cleaning"
+        assert WorkspaceStatus.CLEANED.value == "cleaned"
+        assert WorkspaceStatus.CLEANUP_FAILED.value == "cleanup_failed"
         assert WorkspaceStatus.PINNED.value == "pinned"
 
     def test_workspace_rejects_invalid_status(self):
