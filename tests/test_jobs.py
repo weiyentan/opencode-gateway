@@ -34,6 +34,39 @@ def _patch_select_runner_for_existing_tests(request):
         yield
 
 
+@pytest.fixture
+def mock_executor():
+    """Override conftest mock_executor with port=10000 to match
+    allocate_and_assign_port's default return value.
+
+    The conftest fixture returns port=8080, but
+    ``allocate_and_assign_port`` returns 10000 when no rows are in the
+    mock database.  Without this override, every test would trigger a
+    port mismatch after the issue #162 validation is added.
+    """
+    from app.executors.models import (
+        CreateWorkspaceResponse,
+        StartOpencodeResponse,
+    )
+
+    executor = AsyncMock()
+    executor.create_workspace = AsyncMock(
+        return_value=CreateWorkspaceResponse(
+            workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            workspace_path="/tmp/opencode/ws",
+            status="ready",
+        )
+    )
+    executor.start_opencode = AsyncMock(
+        return_value=StartOpencodeResponse(
+            session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+            status="running",
+            port=10000,
+        )
+    )
+    return executor
+
+
 class TestCreateJob:
     """Tests for POST /jobs."""
 
@@ -520,6 +553,336 @@ class TestJobDispatch:
         # Policy check happens before workspace creation — no workspace was
         # created, so no cleanup should occur.
         mock_executor.cleanup_workspace.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  AWX Port Mismatch Validation (issue #162)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestPortMismatch:
+    """Tests for AWX returned port vs Gateway allocated port validation.
+
+    When start_opencode() returns a port different from the port that
+    allocate_and_assign_port() allocated, the job should fail, emit a
+    ``port_mismatch`` event, and call cleanup_workspace.
+    """
+
+    @pytest.mark.asyncio
+    async def test_port_mismatch_fails_job(self, mock_conn):
+        """When AWX returns a port different from allocated, the job transitions
+        to ``failed`` with a descriptive failure_reason."""
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Port mismatch test",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        import re
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+                # Extract failure_reason if present
+                m = re.search(r"failure_reason = \$(\d+)", sql)
+                if m:
+                    pos = int(m.group(1))
+                    if pos <= len(args):
+                        row_data["failure_reason"] = args[pos - 1]
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # Create an executor that returns a DIFFERENT port (9999) than
+        # the one allocate_and_assign_port returns (10000).
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=9999,
+            )
+        )
+        executor.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Port mismatch test",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert data["failure_reason"] is not None
+        assert "Port mismatch" in data["failure_reason"]
+
+    @pytest.mark.asyncio
+    async def test_port_mismatch_records_event(self, mock_conn):
+        """Port mismatch records a ``port_mismatch`` event in job_events."""
+        import re
+
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Port mismatch event",
+            status="pending",
+        )
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+                m = re.search(r"failure_reason = \$(\d+)", sql)
+                if m:
+                    pos = int(m.group(1))
+                    if pos <= len(args):
+                        row_data["failure_reason"] = args[pos - 1]
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=9999,
+            )
+        )
+        executor.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Port mismatch event",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+
+        # Find port_mismatch events in job_events inserts
+        event_inserts = [
+            args for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+            and len(args) > 2
+            and args[2] == "port_mismatch"
+        ]
+        assert len(event_inserts) == 1, (
+            f"Expected exactly 1 port_mismatch event, got {len(event_inserts)}"
+        )
+        event_args = event_inserts[0]
+        assert event_args[3] == "gateway"  # actor
+        assert "9999" in event_args[4]     # details should mention returned port
+        assert "10000" in event_args[4]    # details should mention allocated port
+
+    @pytest.mark.asyncio
+    async def test_port_mismatch_calls_cleanup(self, mock_conn):
+        """Port mismatch calls cleanup_workspace, not stop_opencode."""
+        import re
+
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Port mismatch cleanup",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+                m = re.search(r"failure_reason = \$(\d+)", sql)
+                if m:
+                    pos = int(m.group(1))
+                    if pos <= len(args):
+                        row_data["failure_reason"] = args[pos - 1]
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=9999,
+            )
+        )
+        executor.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Port mismatch cleanup",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+
+        # cleanup_workspace should be called; stop_opencode should NOT
+        executor.cleanup_workspace.assert_called_once()
+        executor.stop_opencode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_port_mismatch_does_not_reach_running(self, mock_conn):
+        """When ports mismatch, the lifecycle does NOT continue to 'running'."""
+        import re
+
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Port no running",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+                m = re.search(r"failure_reason = \$(\d+)", sql)
+                if m:
+                    pos = int(m.group(1))
+                    if pos <= len(args):
+                        row_data["failure_reason"] = args[pos - 1]
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=9999,
+            )
+        )
+        executor.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Port no running",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert data["status"] != "running"
 
 
 class TestApproveJob:

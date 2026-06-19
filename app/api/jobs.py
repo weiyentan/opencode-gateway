@@ -32,6 +32,26 @@ from app.executors.models import (
 from app.opencode.protocol import OpenCodeClientProtocol
 from app.policy import ObservationBasedPolicy, PolicyViolation
 
+
+class PortMismatchError(Exception):
+    """Raised when the AWX-executor returns a port that does not match the
+    Gateway-allocated port.
+
+    Attributes:
+        allocated_port: The port the Gateway assigned via
+            :func:`allocate_and_assign_port`.
+        returned_port: The port the AWX playbook reported back in
+            :class:`StartOpencodeResponse`.
+    """
+
+    def __init__(self, allocated_port: int, returned_port: int) -> None:
+        self.allocated_port = allocated_port
+        self.returned_port = returned_port
+        super().__init__(
+            f"Port mismatch: allocated {allocated_port}, "
+            f"AWX returned {returned_port}"
+        )
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["jobs"])
@@ -549,6 +569,15 @@ async def create_job(
             session_id,
         )
 
+        # 6a. Validate that the AWX-returned port matches the allocated port.
+        # If the playbook overrides the port, health checks and cleanup would
+        # target the wrong session.  Fail the job immediately on mismatch.
+        if start_response.port != allocated_port:
+            raise PortMismatchError(
+                allocated_port=allocated_port,
+                returned_port=start_response.port,
+            )
+
         # 7. Transition: starting_opencode → running
         if not can_transition(JobStatus.STARTING_OPENCODE, JobStatus.RUNNING):
             logger.error(
@@ -711,6 +740,82 @@ async def create_job(
                 await _set_workspace_cleanup_after(
                     conn, ws_id, settings.cleanup_failure_retention_hours
                 )
+
+    except PortMismatchError as exc:
+        # Port mismatch — the AWX playbook returned a port different from
+        # the one the Gateway allocated.  Fail the job, record the mismatch
+        # event, and clean up the workspace.
+        error_detail = (
+            f"Port mismatch: allocated port {exc.allocated_port}, "
+            f"AWX returned port {exc.returned_port}"
+        )
+        logger.error("Port mismatch for job %s: %s", job_id, error_detail)
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
+            job_id,
+            now,
+            error_detail,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            error_detail,
+        )
+
+        # Record the port_mismatch event (separate from the status transition)
+        event_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO job_events "
+            "(id, job_id, event_type, actor, details, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event_id,
+            job_id,
+            "port_mismatch",
+            "gateway",
+            error_detail,
+            now,
+        )
+
+        # Fire webhooks asynchronously
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                    "error": error_detail,
+                },
+            )
+        )
+
+        # Set workspace cleanup_after for failure
+        row = await _fetch_job(conn, job_id)
+        if row is not None:
+            ws_id = _resolve_workspace_id(row.get("workspace_name"))
+            if ws_id is not None:
+                await _set_workspace_cleanup_after(
+                    conn, ws_id, settings.cleanup_failure_retention_hours
+                )
+
+        # Clean up the workspace (best-effort)
+        try:
+            await executor.cleanup_workspace(
+                CleanupWorkspaceRequest(workspace_id=new_workspace_id)
+            )
+        except Exception:
+            logger.exception(
+                "Failed to clean up workspace for port-mismatch job %s "
+                "(workspace %s)",
+                job_id,
+                new_workspace_id,
+            )
 
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)

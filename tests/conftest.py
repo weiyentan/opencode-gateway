@@ -238,7 +238,7 @@ def mock_executor() -> AsyncMock:
         return_value=StartOpencodeResponse(
             session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
             status="running",
-            port=8080,
+            port=10000,
         )
     )
     return executor

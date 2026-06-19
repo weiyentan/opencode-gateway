@@ -899,3 +899,107 @@ class TestEventTrailCompleteness:
         # For this scenario there should be no events (diff failure is graceful)
         assert isinstance(events, list)
         # If any events existed, they would be sorted by timestamp
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tests: Issue #162 — AWX returned port vs Gateway allocated port
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPortMismatch:
+    """Acceptance Criterion: When the AWX playbook returns a port different
+    from the one the Gateway allocated, the job must fail, emit a
+    ``port_mismatch`` event, and clean up the workspace.
+
+    Verifies:
+    - Job status is 'failed' with a descriptive failure_reason
+    - A ``port_mismatch`` job event is recorded with expected vs actual port
+    - A ``failed`` transition event is also recorded
+    - cleanup_workspace is called
+    - The lifecycle does NOT continue (no transition to 'running')
+    """
+
+    @pytest.mark.asyncio
+    async def test_port_mismatch_fails_job_with_event_trail(
+        self,
+        app_client: AsyncClient,
+        fake_executor: FakeExecutorPlugin,
+        db_conn,
+        runner_id: uuid.UUID,
+    ):
+        """AWX returns port 9999 but Gateway allocated 10000 → job fails with
+        port_mismatch event and cleanup_workspace call."""
+        # Override the start_opencode response to return a DIFFERENT port
+        fake_executor.start_opencode_response = (
+            fake_executor.start_opencode_response.__class__(
+                session_id=fake_executor.start_opencode_response.session_id,
+                status=fake_executor.start_opencode_response.status,
+                port=9999,  # Mismatched — gateway allocates 10000
+            )
+        )
+
+        payload = {
+            "repo_url": "https://github.com/example/port-mismatch.git",
+            "task_summary": "Port mismatch integration test",
+            "runner_id": str(runner_id),
+        }
+
+        async with app_client as client:
+            response = await client.post("/jobs", json=payload)
+
+        # ── Job reached failed state ──────────────────────────────────
+        assert response.status_code == 201, (
+            f"Expected 201, got {response.status_code}: {response.text}"
+        )
+        data = response.json()["data"]
+        assert data["status"] == "failed", (
+            f"Expected 'failed', got '{data['status']}'"
+        )
+        assert data["failure_reason"] is not None
+        assert "Port mismatch" in data["failure_reason"]
+        assert "10000" in data["failure_reason"]
+        assert "9999" in data["failure_reason"]
+
+        job_id = uuid.UUID(data["id"])
+
+        # ── Database confirms failed ──────────────────────────────────
+        row = await db_conn.fetchrow(
+            "SELECT status, failure_reason FROM gateway_jobs WHERE id = $1",
+            job_id,
+        )
+        assert row["status"] == "failed"
+        assert row["failure_reason"] is not None
+        assert "Port mismatch" in row["failure_reason"]
+
+        # ── Event trail: should have a port_mismatch event ────────────
+        events = await _fetch_events(db_conn, job_id)
+        port_mismatch_events = [
+            e for e in events
+            if e["event_type"] == "port_mismatch"
+        ]
+        assert len(port_mismatch_events) == 1, (
+            f"Expected exactly 1 port_mismatch event, "
+            f"got {len(port_mismatch_events)}: "
+            f"{[e['event_type'] for e in events]}"
+        )
+        pm_event = port_mismatch_events[0]
+        assert pm_event["actor"] == "gateway"
+        assert pm_event["details"] is not None
+        assert "10000" in pm_event["details"]
+        assert "9999" in pm_event["details"]
+
+        # ── Event trail: should also have a failed transition event ───
+        failed_events = [
+            e for e in events
+            if e["event_type"] == "failed"
+        ]
+        assert len(failed_events) >= 1
+
+        # ── Lifecycle call trace ──────────────────────────────────────
+        # create_workspace and start_opencode were called
+        assert len(fake_executor.calls["create_workspace"]) == 1
+        assert len(fake_executor.calls["start_opencode"]) == 1
+        # cleanup_workspace was called (best-effort cleanup)
+        assert len(fake_executor.calls["cleanup_workspace"]) == 1
+        # stop_opencode was NOT called — lifecycle stopped at port check
+        assert len(fake_executor.calls["stop_opencode"]) == 0
