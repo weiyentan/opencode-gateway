@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from pydantic.config import ConfigDict
 
-from app.api.webhooks import build_job_completed_payload, dispatch_webhooks
+from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
@@ -571,39 +571,6 @@ async def create_job(
             "Job is now running",
         )
         current_status = "running"
-
-        # 8. Mark completed
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        diff_summary = f"Job completed: {body.task_summary}"
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
-            "completed_at = $3, diff = $4 WHERE id = $1",
-            job_id,
-            now,
-            now,
-            diff_summary,
-        )
-        await _record_job_event(
-            conn, job_id, "running", "completed",
-            diff_summary,
-        )
-
-        # Fetch the updated job row for the structured webhook payload
-        completed_job_row = await _fetch_job(conn, job_id)
-
-        # Fire webhooks asynchronously — non-blocking
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
-                job_id,
-                "job.completed",
-                build_job_completed_payload(
-                    completed_job_row,
-                    task_summary=body.task_summary,
-                ),
-            )
-        )
-        current_status = "completed"
 
         # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
