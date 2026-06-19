@@ -1929,6 +1929,153 @@ class TestJobDiffFetch:
         assert data["diff"] is None
 
     @pytest.mark.asyncio
+    async def test_diff_fetch_stores_metadata_in_database(self, mock_conn, mock_executor):
+        """When diff is fetched, the diff content is persisted to the database."""
+        from app.opencode.protocol import SessionDiffResponse
+
+        job_id = uuid.uuid4()
+        expected_diff = "diff --git a/README.md b/README.md\n+new content\n"
+        execute_calls: list[tuple] = []
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Metadata store",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET diff" in sql:
+                row_data["diff"] = args[1] if len(args) > 1 else None
+            elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
+                row_data["opencode_session_id"] = args[1] if len(args) > 1 else None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            return_value=SessionDiffResponse(
+                session_id="sess-meta-123",
+                diff=expected_diff,
+                files_changed=["README.md"],
+            )
+        )
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_executor,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Metadata store",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["diff"] == expected_diff
+        assert data["status"] == "running"
+
+        # Verify the diff UPDATE was executed on the database
+        diff_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE gateway_jobs SET diff" in sql
+        ]
+        assert len(diff_updates) == 1
+        _, update_args = diff_updates[0]
+        assert expected_diff in update_args
+
+    @pytest.mark.asyncio
+    async def test_diff_fetch_failure_logged_gracefully(
+        self, mock_conn, mock_executor, caplog,
+    ):
+        """When diff fetch raises, a warning is logged and job status remains running."""
+        import logging
+
+        from app.api import jobs as jobs_module
+
+        job_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Graceful failure",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+            elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
+                row_data["opencode_session_id"] = args[1] if len(args) > 1 else None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            side_effect=RuntimeError("OpenCode Serve internal error")
+        )
+
+        # Enable logging capture on the jobs module
+        jobs_module.logger.setLevel(logging.WARNING)
+        caplog.set_level(logging.WARNING, logger=jobs_module.logger.name)
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_executor,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Graceful failure",
+                },
+            )
+
+        # Job status MUST remain running — diff fetch failure must NOT
+        # cause a transition to failed.
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "running"
+        assert data["diff"] is None
+
+        # Verify a warning was logged about the failed diff fetch
+        # (the log message references the dynamically-generated job ID and
+        # the session ID from the fixture — we check for the key phrase)
+        assert any("Failed to fetch diff" in msg for msg in caplog.messages)
+        # The log should mention the session that had the error
+        assert any("session" in msg.lower() for msg in caplog.messages)
+
+    @pytest.mark.asyncio
     async def test_get_job_returns_diff_for_completed_job(self, mock_conn):
         """GET /jobs/{id} should return the diff for a completed job that has one."""
         job_id = uuid.uuid4()
@@ -1950,6 +2097,268 @@ class TestJobDiffFetch:
         assert data["status"] == "completed"
         assert data["diff"] == expected_diff
         assert data["opencode_session_id"] == "sess-123"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  OpenCode client wiring (issue #149)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestOpencodeClientWiring:
+    """Tests for the OpenCode client dependency injection wiring.
+
+    Verifies that ``get_opencode_client()`` follows the expected DI
+    pattern: returns ``None`` by default, but a configured client
+    (mock or real) can be injected and is used by the endpoints.
+    """
+
+    @pytest.mark.asyncio
+    async def test_injected_client_receives_diff_fetch_call(self, mock_conn, mock_executor):
+        """A mock OpenCode client injected via DI receives get_session_diff calls."""
+        from app.opencode.protocol import SessionDiffResponse
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "DI wiring",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
+                # The initial diff_summary is set here
+                if len(args) >= 4:
+                    row_data["diff"] = args[3]
+            elif "UPDATE gateway_jobs SET diff" in sql:
+                row_data["diff"] = args[1] if len(args) > 1 else None
+            elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
+                row_data["opencode_session_id"] = args[1] if len(args) > 1 else None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            return_value=SessionDiffResponse(
+                session_id="sess-wired",
+                diff="wired diff content",
+                files_changed=["file.py"],
+            )
+        )
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_executor,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "DI wiring",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["diff"] == "wired diff content"
+
+        # The injected client must have been called with a session ID
+        mock_opencode.get_session_diff.assert_called_once()
+        call_args = mock_opencode.get_session_diff.call_args[0]
+        assert len(call_args) == 1
+        assert isinstance(call_args[0], str)
+        assert len(call_args[0]) > 0
+
+    @pytest.mark.asyncio
+    async def test_injected_client_used_for_abort(self, mock_conn):
+        """A mock OpenCode client injected via DI receives abort_session calls."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-abort-wiring"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Abort wiring",
+            status="running", opencode_session_id=session_id,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id,
+                aborted=True,
+                message="Aborted via wiring",
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "aborted"
+
+        # Verify the injected client received the abort call
+        mock_opencode.abort_session.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_injected_client_used_for_logs(self, mock_conn):
+        """A mock OpenCode client injected via DI receives get_session and
+        get_session_log calls."""
+        from app.opencode.protocol import SessionInfo, SessionLogResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-logs-wiring"
+        log_content = "Log from injected client\n"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Logs wiring",
+            status="completed", opencode_session_id=session_id,
+            completed_at=now,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session = AsyncMock(
+            return_value=SessionInfo(
+                id=session_id,
+                status="completed",
+                workspace_path="/tmp/ws",
+                created_at=now,
+            )
+        )
+        mock_opencode.get_session_log = AsyncMock(
+            return_value=SessionLogResponse(
+                session_id=session_id,
+                log=log_content,
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/logs")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["log"] == log_content
+
+        mock_opencode.get_session.assert_called_once_with(session_id)
+        mock_opencode.get_session_log.assert_called_once_with(session_id)
+
+    @pytest.mark.asyncio
+    async def test_default_get_opencode_client_no_injection_skips_diff(self, mock_conn, mock_executor):
+        """With no injected client (default None), diff fetch is skipped entirely."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "No client",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET opencode_session_id" in sql:
+                row_data["opencode_session_id"] = args[1] if len(args) > 1 else None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # No opencode client — use default which returns None
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No client",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "running"
+        assert data["diff"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_job_returns_structured_result_with_diff(self, mock_conn):
+        """GET /jobs/{id} returns structured result metadata including the diff."""
+        job_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Structured result",
+            status="completed",
+            completed_at=now,
+            opencode_session_id="sess-struct",
+            diff="structured diff content",
+            branch_name="feature/structured",
+            mr_url="https://github.com/org/repo/pull/99",
+            workflow_run_id="wr-structured",
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+
+        # Verify structured result metadata
+        assert data["id"] == str(job_id)
+        assert data["repo_url"] == "https://github.com/org/repo"
+        assert data["task_summary"] == "Structured result"
+        assert data["status"] == "completed"
+        assert data["completed_at"] is not None
+        assert data["opencode_session_id"] == "sess-struct"
+        assert data["diff"] == "structured diff content"
+        assert data["branch_name"] == "feature/structured"
+        assert data["mr_url"] == "https://github.com/org/repo/pull/99"
+        assert data["workflow_run_id"] == "wr-structured"
+
+        # Timestamps should be present
+        assert "created_at" in data
+        assert "updated_at" in data
 
 
 class TestCompleteJob:
