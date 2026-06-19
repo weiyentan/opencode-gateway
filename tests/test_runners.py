@@ -880,3 +880,272 @@ class TestPostRunnerStatus:
         assert "id" in data
         assert "runner_id" in data
         assert "updated_at" in data
+
+
+class TestPostRunnerAdminStatus:
+    """Tests for POST /runners/{runner_id}/admin-status."""
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _setup_mocks(
+        mock_conn,
+        *,
+        runner_id_val=None,
+        runner_id_str=None,
+        hostname="runner-admin.example.com",
+        current_admin_status=None,
+    ):
+        """Configure mock_conn.fetchrow to return a runner row, and track execute calls.
+
+        Parameters
+        ----------
+        current_admin_status:
+            The value for the ``admin_status`` column. When None, the mock
+            returns None (simulating a runner that has never had its admin
+            status set by an operator).
+        """
+        if runner_id_val is None:
+            runner_id_val = uuid.uuid4()
+        if runner_id_str is None:
+            runner_id_str = str(runner_id_val)
+
+        db_row = {
+            "id": runner_id_val,
+            "runner_id": runner_id_str,
+            "hostname": hostname,
+            "admin_status": current_admin_status,
+        }
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners" in sql:
+                return mock_row(db_row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        return runner_id_val, execute_calls
+
+    # ------------------------------------------------------------------
+    # valid transitions
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_admin_status", [
+        "online",
+        "offline",
+        "maintenance",
+    ])
+    async def test_valid_admin_status_returns_200(
+        self, target_admin_status, mock_conn
+    ):
+        """POST /runners/{id}/admin-status with a valid value returns 200."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_admin_status=None
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": target_admin_status},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["previous_admin_status"] is None
+        assert data["current_admin_status"] == target_admin_status
+        assert "updated_at" in data
+
+        # Verify only admin_status UPDATE was issued (no status or health_status)
+        update_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET" in sql
+        ]
+        assert len(update_calls) == 1
+        _sql, args = update_calls[0]
+        # UPDATE runners SET admin_status = $1, updated_at = $2 WHERE id = $3
+        assert args[0] == target_admin_status
+        # Confirm status/health_status are NOT in the SET clause
+        assert "health_status" not in _sql
+        assert "status = $" not in _sql.replace("admin_status", "")
+
+    @pytest.mark.asyncio
+    async def test_admin_status_does_not_affect_health_status(self, mock_conn):
+        """POST /runners/{id}/admin-status does not touch health_status."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_admin_status="maintenance"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": "online"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["previous_admin_status"] == "maintenance"
+        assert data["current_admin_status"] == "online"
+
+        # Verify the UPDATE statement only touches admin_status
+        update_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET" in sql
+        ]
+        assert len(update_calls) == 1
+        _sql = update_calls[0][0]
+        assert "admin_status" in _sql
+        assert "health_status" not in _sql
+        assert "status" not in _sql.replace("admin_status", "")
+
+    # ------------------------------------------------------------------
+    # runner_events logging
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_admin_status_change_logs_to_runner_events(self, mock_conn):
+        """POST /runners/{id}/admin-status inserts a record into runner_events."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_admin_status=None
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": "offline"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify runner_events INSERT
+        insert_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO runner_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _sql, args = insert_calls[0]
+        # args: (event_id, runner_id, event_type, old_status, new_status, reason, created_at)
+        assert args[1] == r_id  # runner_id
+        assert args[2] == "admin_status_offline"
+        assert args[3] is None  # old_status was None (no prior admin status)
+        assert args[4] == "offline"
+        assert args[5] == "Admin status changed to offline"
+
+    @pytest.mark.asyncio
+    async def test_admin_status_change_logs_with_previous_admin_status(self, mock_conn):
+        """runner_events records the previous admin_status when one existed."""
+        r_id, execute_calls = self._setup_mocks(
+            mock_conn, current_admin_status="online"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": "maintenance"},
+            )
+
+        assert response.status_code == 200
+
+        insert_calls = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO runner_events" in sql
+        ]
+        assert len(insert_calls) == 1
+        _sql, args = insert_calls[0]
+        assert args[2] == "admin_status_maintenance"
+        assert args[3] == "online"  # old_status
+        assert args[4] == "maintenance"
+        assert args[5] == "Admin status changed to maintenance"
+
+    # ------------------------------------------------------------------
+    # invalid values
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bogus_status", [
+        "HEALTHY",
+        "UNKNOWN",
+        "running",
+        "paused",
+        "",
+        "BLOCKED_DISK_PRESSURE",
+    ])
+    async def test_invalid_admin_status_returns_422(
+        self, bogus_status, mock_conn
+    ):
+        """POST /runners/{id}/admin-status with an invalid value returns 422."""
+        r_id, _ = self._setup_mocks(mock_conn, current_admin_status=None)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": bogus_status},
+            )
+
+        assert response.status_code == 422
+
+    # ------------------------------------------------------------------
+    # not found
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_set_admin_status_on_unknown_runner_returns_404(self, mock_conn):
+        """POST /runners/{id}/admin-status on non-existent runner returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock()
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{uuid.uuid4()}/admin-status",
+                json={"admin_status": "offline"},
+            )
+
+        assert response.status_code == 404
+
+    # ------------------------------------------------------------------
+    # response structure
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_admin_status_response_includes_previous_and_current(self, mock_conn):
+        """The response body includes previous_admin_status, current_admin_status."""
+        r_id, _ = self._setup_mocks(
+            mock_conn, current_admin_status="online"
+        )
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                f"/runners/{r_id}/admin-status",
+                json={"admin_status": "offline"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["previous_admin_status"] == "online"
+        assert data["current_admin_status"] == "offline"
+        assert data["hostname"] == "runner-admin.example.com"
+        assert "id" in data
+        assert "runner_id" in data
+        assert "updated_at" in data

@@ -311,6 +311,39 @@ class RunnerStatusUpdateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Request / response models for POST /runners/{runner_id}/admin-status
+# ---------------------------------------------------------------------------
+
+
+_VALID_ADMIN_STATUSES: frozenset[str] = frozenset({
+    RUNNER_STATUS_OFFLINE,
+    RUNNER_STATUS_ONLINE,
+    RUNNER_STATUS_MAINTENANCE,
+})
+
+
+class AdminStatusUpdateRequest(BaseModel):
+    """Request body for POST /runners/{runner_id}/admin-status."""
+
+    admin_status: str = Field(
+        description=(
+            "Target admin status. One of: online, offline, maintenance."
+        ),
+    )
+
+
+class AdminStatusUpdateResponse(BaseModel):
+    """Response body for POST /runners/{runner_id}/admin-status."""
+
+    id: uuid.UUID
+    runner_id: str
+    hostname: str
+    previous_admin_status: str | None = None
+    current_admin_status: str
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
 # GET /runners
 # ---------------------------------------------------------------------------
 
@@ -495,5 +528,97 @@ async def set_runner_status(
         previous_status=previous_status,
         current_status=target_status,
         reason=body.reason,
+        updated_at=now,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /runners/{runner_id}/admin-status
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/runners/{runner_id}/admin-status",
+    response_model=AdminStatusUpdateResponse,
+    status_code=http_status.HTTP_200_OK,
+)
+async def set_runner_admin_status(
+    runner_id: uuid.UUID,
+    body: AdminStatusUpdateRequest,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AdminStatusUpdateResponse:
+    """Set a runner's admin_status without affecting health_status or status.
+
+    Allows operators to set a runner to ``online``, ``offline``, or
+    ``maintenance``.  Unlike the ``POST /runners/{runner_id}/status``
+    endpoint this does not affect the observation-derived ``health_status``
+    or the legacy ``status`` column — only the ``admin_status`` column is
+    updated.
+
+    Returns 404 if the runner ID does not exist, and 422 if the
+    requested ``admin_status`` value is not one of the allowed values.
+    """
+    # Fetch the current runner row
+    row = await conn.fetchrow(
+        "SELECT id, runner_id, hostname, admin_status FROM runners WHERE id = $1",
+        runner_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Runner {runner_id} not found",
+        )
+
+    target_admin_status: str = body.admin_status
+
+    # Validate that the requested value is a recognised admin status
+    if target_admin_status not in _VALID_ADMIN_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid admin_status '{target_admin_status}'. "
+                f"Allowed values: {', '.join(sorted(_VALID_ADMIN_STATUSES))}"
+            ),
+        )
+
+    previous_admin_status: str | None = row.get("admin_status")
+
+    # Update ONLY admin_status — health_status and status are untouched
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        "UPDATE runners SET admin_status = $1, updated_at = $2 WHERE id = $3",
+        target_admin_status,
+        now,
+        runner_id,
+    )
+
+    # Log the admin status change in runner_events
+    event_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO runner_events "
+        "(id, runner_id, event_type, old_status, new_status, reason, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        runner_id,
+        f"admin_status_{target_admin_status}",
+        previous_admin_status,
+        target_admin_status,
+        f"Admin status changed to {target_admin_status}",
+        now,
+    )
+
+    logger.info(
+        "Runner %s admin_status changed: %s → %s",
+        runner_id,
+        previous_admin_status,
+        target_admin_status,
+    )
+
+    return AdminStatusUpdateResponse(
+        id=row["id"],
+        runner_id=row["runner_id"],
+        hostname=row["hostname"],
+        previous_admin_status=previous_admin_status,
+        current_admin_status=target_admin_status,
         updated_at=now,
     )
