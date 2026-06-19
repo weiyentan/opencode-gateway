@@ -18,6 +18,7 @@ from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
+from app.core.ports import PortExhaustedError, allocate_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -82,10 +83,10 @@ class JobCreateRequest(BaseModel):
 class JobResponse(BaseModel):
     """Response body for job endpoints.
 
-    Completion metadata (``branch_name``, ``commit_sha``, ``mr_url``,
-    ``failure_reason``) is populated when the job transitions to
-    ``completed`` or ``failed`` via a webhook or the
-    ``POST /jobs/{id}/complete`` endpoint.
+    ``branch_name`` and ``mr_url`` are write-once fields set externally
+    (e.g. by Paperclip or AWX job templates) when the coding session
+    completes.  They remain ``None`` until populated via a webhook or
+    update endpoint.
     """
 
     id: uuid.UUID
@@ -98,10 +99,8 @@ class JobResponse(BaseModel):
     opencode_session_id: str | None = None
     diff: str | None = None
     branch_name: str | None = None
-    commit_sha: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
-    failure_reason: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -118,8 +117,7 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name, branch_name, commit_sha, mr_url, "
-    "workflow_run_id, failure_reason"
+    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
 )
 
 
@@ -325,16 +323,14 @@ async def create_job(
         body.workflow_run_id,
     )
 
-    # 2. Transition pending → provisioning_workspace
-    if not can_transition(JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE):
+    # 2. Validate and perform pending → running transition
+    if not can_transition(JobStatus.PENDING, JobStatus.RUNNING):
         logger.error(
-            "Lifecycle rejected transition pending→provisioning_workspace for job %s",
-            job_id,
+            "Lifecycle rejected transition pending→running for job %s", job_id
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
     await conn.execute(
-        "UPDATE gateway_jobs SET status = 'provisioning_workspace', updated_at = $2 "
-        "WHERE id = $1",
+        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
         job_id,
         datetime.now(timezone.utc),  # noqa: UP017
     )
@@ -374,30 +370,40 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 5. Transition provisioning_workspace → starting_opencode
-        if not can_transition(
-            JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE
-        ):
+        # 4a. Allocate a port and persist it against the workspace (ADR 0003).
+        try:
+            allocated_port = await allocate_port(conn)
+        except PortExhaustedError:
             logger.error(
-                "Lifecycle rejected transition "
-                "provisioning_workspace→starting_opencode for job %s",
+                "Port exhaustion — no free ports in range 10000–10999 "
+                "for job %s (workspace %s)",
                 job_id,
+                new_workspace_id,
             )
             raise HTTPException(
-                status_code=500, detail="Internal state machine error"
+                status_code=503,
+                detail="No available ports — all 1000 ports in range 10000–10999 are in use",
             )
+
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'starting_opencode', updated_at = $2 "
-            "WHERE id = $1",
-            job_id,
+            "UPDATE workspaces SET port = $2, updated_at = $3 WHERE id = $1",
+            new_workspace_id,
+            allocated_port,
             datetime.now(timezone.utc),  # noqa: UP017
         )
+        logger.info(
+            "Allocated port %d for job %s (workspace %s)",
+            allocated_port,
+            job_id,
+            new_workspace_id,
+        )
 
-        # 6. Start OpenCode Serve
+        # 5. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
+                port=allocated_port,
                 env_vars=body.env_vars,
             )
         )
@@ -410,44 +416,43 @@ async def create_job(
             session_id,
         )
 
-        # 7. Transition starting_opencode → running
-        #    "running" now means "OpenCode Serve started successfully"
-        #    — the job is NOT yet completed.
-        if not can_transition(
-            JobStatus.STARTING_OPENCODE, JobStatus.RUNNING
-        ):
-            logger.error(
-                "Lifecycle rejected transition starting_opencode→running for job %s",
-                job_id,
-            )
-            raise HTTPException(
-                status_code=500, detail="Internal state machine error"
-            )
+        # 5. Mark completed
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'running', updated_at = $2 "
-            "WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
+            "completed_at = $3, diff = $4 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+            now,
+            diff_summary,
         )
 
-        # Fire webhooks asynchronously — non-blocking (job is now running)
+        # Fire webhooks asynchronously — non-blocking
         asyncio.create_task(
             dispatch_webhooks(
                 pool,
                 job_id,
-                "job.running",
+                "job.completed",
                 {
                     "job_id": str(job_id),
-                    "event_type": "job.running",
-                    "status": "running",
+                    "event_type": "job.completed",
+                    "status": "completed",
                     "repo_url": str(body.repo_url),
                     "task_summary": body.task_summary,
-                    "opencode_session_id": session_id,
+                    "completed_at": now.isoformat(),
+                    "diff": diff_summary,
                 },
             )
         )
 
-        # 8. Fetch and persist the diff (best-effort — failure does not fail the job)
+        # 6. Set workspace cleanup_after for successful completion
+        if new_workspace_id is not None:
+            await _set_workspace_cleanup_after(
+                conn, new_workspace_id, settings.cleanup_success_retention_hours
+            )
+
+        # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
             try:
                 diff_response = await opencode_client.get_session_diff(session_id)
@@ -564,168 +569,8 @@ async def create_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
-    )
-
-
-class JobCompleteRequest(BaseModel):
-    """Request body for POST /jobs/{id}/complete.
-
-    Supplies completion metadata and an optional target status
-    (``awaiting_review``, ``completed``, or ``failed``).  The endpoint
-    validates the transition against the centralised lifecycle rules
-    before applying the update.
-    """
-
-    target_status: str = Field(
-        default="awaiting_review",
-        description="Target status — must be awaiting_review, completed, or failed",
-    )
-    branch_name: str | None = None
-    commit_sha: str | None = None
-    mr_url: str | None = None
-    diff: str | None = None
-    failure_reason: str | None = None
-    summary: str | None = None
-
-
-@router.post("/jobs/{job_id}/complete", response_model=JobResponse)
-async def complete_job(
-    job_id: uuid.UUID,
-    body: JobCompleteRequest,
-    conn: asyncpg.Connection = Depends(get_session),
-    pool: DatabasePool = Depends(_get_pool),
-) -> JobResponse:
-    """Mark a job as completed, failed, or awaiting review.
-
-    Transitions the job from *running* (or *awaiting_review*) to the
-    requested *target_status*, stores completion metadata, and fires a
-    corresponding webhook event.
-
-    Accepted targets:
-      - ``awaiting_review`` — work is finished and needs human review
-      - ``completed``       — review approved, job is done
-      - ``failed``          — review found issues or the job errored
-    """
-    valid_targets = {
-        JobStatus.AWAITING_REVIEW,
-        JobStatus.COMPLETED,
-        JobStatus.FAILED,
-    }
-    target = JobStatus(body.target_status)
-    if target not in valid_targets:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Invalid target_status: {body.target_status!r}. "
-                f"Must be one of: awaiting_review, completed, failed"
-            ),
-        )
-
-    row = await _fetch_job(conn, job_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    current_status = JobStatus(row["status"])
-
-    if not can_transition(current_status, target):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cannot transition from '{current_status.value}' "
-                f"to '{target.value}'"
-            ),
-        )
-
-    now = datetime.now(timezone.utc)  # noqa: UP017
-
-    # Build SET clause with only the provided metadata fields
-    set_parts = ["status = $2", "updated_at = $3"]
-    params: list[object] = [job_id, target.value, now]
-    param_idx = 4
-
-    # Set completed_at when reaching a terminal state
-    if target in (JobStatus.COMPLETED, JobStatus.FAILED):
-        set_parts.append(f"completed_at = ${param_idx}")
-        params.append(now)
-        param_idx += 1
-
-    # Completion metadata — store whatever the caller provides
-    metadata_fields = {
-        "branch_name": body.branch_name,
-        "commit_sha": body.commit_sha,
-        "mr_url": body.mr_url,
-        "diff": body.diff,
-        "failure_reason": body.failure_reason,
-    }
-    for field, value in metadata_fields.items():
-        if value is not None:
-            set_parts.append(f"{field} = ${param_idx}")
-            params.append(value)
-            param_idx += 1
-
-    set_clause = ", ".join(set_parts)
-    await conn.execute(
-        f"UPDATE gateway_jobs SET {set_clause} WHERE id = $1",
-        *params,
-    )
-
-    # Determine webhook event type
-    event_type = f"job.{target.value}"
-
-    # Fire webhooks asynchronously
-    asyncio.create_task(
-        dispatch_webhooks(
-            pool,
-            job_id,
-            event_type,
-            {
-                "job_id": str(job_id),
-                "event_type": event_type,
-                "status": target.value,
-                "completed_at": now.isoformat()
-                if target in (JobStatus.COMPLETED, JobStatus.FAILED)
-                else None,
-                "branch_name": body.branch_name,
-                "commit_sha": body.commit_sha,
-                "mr_url": body.mr_url,
-                "failure_reason": body.failure_reason,
-            },
-        )
-    )
-
-    # Set workspace cleanup retention for terminal states
-    if target in (JobStatus.COMPLETED, JobStatus.FAILED):
-        settings = get_settings()
-        retention = (
-            settings.cleanup_success_retention_hours
-            if target == JobStatus.COMPLETED
-            else settings.cleanup_failure_retention_hours
-        )
-        ws_id = _resolve_workspace_id(row.get("workspace_name"))
-        if ws_id is not None:
-            await _set_workspace_cleanup_after(conn, ws_id, retention)
-
-    # Return updated job
-    row = await _fetch_job(conn, job_id)
-    return JobResponse(
-        id=row["id"],
-        repo_url=row["repo_url"],
-        task_summary=row["task_summary"],
-        status=row["status"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        completed_at=row["completed_at"],
-        opencode_session_id=row.get("opencode_session_id"),
-        diff=row.get("diff"),
-        branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
-        mr_url=row.get("mr_url"),
-        workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -791,10 +636,8 @@ async def approve_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -860,10 +703,8 @@ async def reject_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -1013,10 +854,8 @@ async def abort_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -1040,10 +879,8 @@ async def get_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
-        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
-        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -1129,10 +966,8 @@ async def list_jobs(
             opencode_session_id=row.get("opencode_session_id"),
             diff=row.get("diff"),
             branch_name=row.get("branch_name"),
-            commit_sha=row.get("commit_sha"),
             mr_url=row.get("mr_url"),
             workflow_run_id=row.get("workflow_run_id"),
-            failure_reason=row.get("failure_reason"),
         )
         for row in rows
     ]
@@ -1222,13 +1057,13 @@ async def get_job_diff(
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if row["status"] in ("running", "provisioning_workspace", "starting_opencode"):
+    if row["status"] == "running":
         return JSONResponse(
             status_code=409,
             content={
                 "job_id": str(job_id),
                 "diff": None,
-                "status": row["status"],
+                "status": "running",
             },
         )
 
