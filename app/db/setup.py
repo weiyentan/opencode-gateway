@@ -37,6 +37,8 @@ _REQUIRED_TABLES = [
     "runner_observations",
     "workspace_observations",
     "opencode_instance_observations",
+    "webhooks",
+    "runner_events",
 ]
 
 # Resolved once when the module is loaded.
