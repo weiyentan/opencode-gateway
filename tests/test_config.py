@@ -208,3 +208,51 @@ def test_insecure_auth_opt_in_without_key(monkeypatch):
 
     assert settings.allow_insecure_auth is True
     assert settings.api_key == ""
+
+
+# ── Issue #142: OpenCode base URL setting ──────────────────────────────
+
+
+def test_opencode_base_url_default(monkeypatch):
+    """opencode_base_url defaults to http://localhost:8080."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.opencode_base_url == "http://localhost:8080"
+
+
+def test_opencode_base_url_override(monkeypatch):
+    """GATEWAY_OPENCODE_BASE_URL can be overridden via environment variable."""
+    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "http://opencode-serve:8080")
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.opencode_base_url == "http://opencode-serve:8080"
+
+
+def test_opencode_base_url_empty_disables_client(monkeypatch):
+    """When GATEWAY_OPENCODE_BASE_URL is empty, get_opencode_client returns None."""
+    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "")
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.api.jobs import get_opencode_client
+
+    import asyncio
+
+    result = asyncio.run(get_opencode_client())
+    assert result is None
+
+
+def test_opencode_base_url_creates_client(monkeypatch):
+    """When GATEWAY_OPENCODE_BASE_URL is set, get_opencode_client returns a client."""
+    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "http://opencode-serve:8080")
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.api.jobs import get_opencode_client
+    from app.opencode.serve_client import OpenCodeServeClient
+
+    import asyncio
+
+    result = asyncio.run(get_opencode_client())
+    assert isinstance(result, OpenCodeServeClient)
+    assert result._base_url == "http://opencode-serve:8080"
