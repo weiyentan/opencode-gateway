@@ -138,6 +138,7 @@ The following tables are created by the migration chain and validated at startup
 | `job_events` | 0000 | Audit trail — event type, actor, previous status for state transitions |
 | `approvals` | 0000 | Approval gates — requested action, approver, decision timestamp |
 | `runners` | 0001 | Runner VM registry — hostname, executor type, labels, status |
+| `runner_events` | 0006 | Runner status-change audit trail — event type, old/new status, reason |
 | `runner_observations` | 0001 | Time-series runner metrics — disk, memory, load averages |
 | `workspace_observations` | 0001 | Per-workspace snapshots — status, opencode status |
 | `opencode_instance_observations` | 0001 | Per-instance snapshots — version, status |
@@ -169,9 +170,6 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GATEWAY_ENV` | `production` | Deployment environment: `production` or `development`. See [Authentication](#authentication) below. |
-| `GATEWAY_API_KEY` | *(empty)* | API key for Bearer token authentication. **Required in production.** See [Authentication](#authentication). |
-| `GATEWAY_ALLOW_INSECURE_AUTH` | `false` | Explicit opt-in to run without an API key in production. Logs a loud warning. Prefer `GATEWAY_ENV=development` for local work. |
 | `GATEWAY_HOST` | `0.0.0.0` | Server bind address |
 | `GATEWAY_PORT` | `8000` | Server port |
 | `GATEWAY_DATABASE_HOST` | `localhost` | PostgreSQL host |
@@ -192,44 +190,6 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_STALENESS_SECONDS` | `600` | Maximum age in seconds of the last telemetry sample; runners with older data are treated as UNKNOWN |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
-
-### Authentication
-
-The Gateway enforces Bearer-token authentication in production by default. Every request must include an `Authorization: Bearer <api-key>` header matching the configured `GATEWAY_API_KEY`.
-
-Three modes are supported:
-
-| Mode | `GATEWAY_ENV` | `GATEWAY_API_KEY` | `GATEWAY_ALLOW_INSECURE_AUTH` | Behaviour |
-|------|---------------|-------------------|-------------------------------|-----------|
-| **Production** (default) | `production` | *required* | `false` (default) | API key is required. The Gateway refuses to start without one. |
-| **Development** | `development` | *optional* | `false` (default) | API key is optional. Requests pass through without authentication — convenient for local work. |
-| **Insecure opt-in** | any | *optional* | `true` | API key is optional. The Gateway logs a loud warning at startup. Prefer `GATEWAY_ENV=development` for local work. |
-
-**Local development:**
-
-```bash
-# Run without an API key
-GATEWAY_ENV=development python -m app
-
-# Or run with a key for consistency with production
-GATEWAY_ENV=production GATEWAY_API_KEY=dev-key-123 python -m app
-```
-
-**Production deployment:**
-
-```bash
-# Required — the Gateway refuses to start without this
-export GATEWAY_API_KEY="$(openssl rand -hex 32)"
-python -m app
-```
-
-**Making authenticated requests:**
-
-```bash
-curl -H "Authorization: Bearer ${GATEWAY_API_KEY}" http://localhost:8000/health
-```
-
-> **Security note:** API key comparison uses constant-time comparison (`hmac.compare_digest`) to prevent timing side-channel attacks.
 
 ### AWX Executor Configuration
 
@@ -264,23 +224,6 @@ GATEWAY_AWX_WORKSPACE_TEARDOWN_TEMPLATE_ID=30
 All three template IDs are required and must be non-zero. If any template ID is missing or zero, the Gateway raises a `ValueError` at startup.
 
 > **Template contract:** The exact AWX job template structure (expected `extra_vars`, artifact outputs, and playbook contracts) is defined in the [GitLab issue #82](https://gitlab.com/opencode/gateway/-/issues/82) under the "AWX Template Contract" section. Refer to that issue when creating or updating the corresponding AWX job templates.
-
-### Passing Secrets to OpenCode Sessions
-
-When submitting a job, callers may pass environment variables via the ``env_vars`` field on the job request body.  These variables are forwarded to the OpenCode Serve process on the Runner VM and are available to the coding session.
-
-Because ``env_vars`` frequently contains credentials (API tokens, database passwords, signing keys), the Gateway applies **automatic redaction** before writing environment variable values to logs or job events:
-
-* **Key-name detection** — Any key whose name contains ``token``, ``password``, ``secret``, ``key``, ``credential``, or ``auth`` (case-insensitive, underscore-insensitive) has its value replaced with ``***`` in log output.
-* **Belt-and-suspenders** — In addition to explicit redaction in executor code paths, the root logger is configured with a :class:`~app.core.logging.RedactingFormatter` that strips secret-like values from the rendered log message as a secondary safeguard.
-
-**What this means for callers:**
-
-* Secret values are **never** written to Gateway logs, executor debug output, or job event records.
-* The redaction covers nested ``env_vars`` dictionaries passed through the executor plugin interface.
-* Non-secret variables (``REPO_URL``, ``BRANCH``, ``LOG_LEVEL``, etc.) are logged normally.
-
-> **Security note:** The Gateway does not inspect or validate the *content* of secret values — it only prevents them from appearing in logs.  Callers remain responsible for transmitting secrets securely (HTTPS), rotating credentials regularly, and following the principle of least privilege.  Infrastructure secrets (SSH keys, Runner VM credentials) are never held by the Gateway — see [ADR 0004](docs/adr/0004-gateway-no-infra-secrets.md).
 
 ### Run
 
@@ -414,7 +357,7 @@ These endpoints are implemented and tested.
 | `POST` | `/observations` | Ingest a runner heartbeat observation — upserts the runner record, stores runner-level resource metrics (disk, memory, load), workspace snapshots, and OpenCode Serve instance status. Returns 201 on success. |
 | `GET` | `/runners` | List all registered Runner VMs with their latest observation summary (disk, memory, load, observed_at). Ordered by creation date descending. |
 | `GET` | `/runners/{id}` | Retrieve a single runner by UUID with full observation history (last 50 workspace observations + last 50 OpenCode instance observations) and derived policy status (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN, OFFLINE, MAINTENANCE, ONLINE). Returns 404 if not found. |
-| `POST` | `/runners/{id}/status` | Manually set a runner's status to `offline`, `online`, or `maintenance`. Validates the state machine transition, logs the change to `job_events`. Returns 404 if runner not found, 422 for invalid transitions. |
+| `POST` | `/runners/{id}/status` | Manually set a runner's status to `offline`, `online`, or `maintenance`. Validates the state machine transition, logs the change to `runner_events`. Returns 404 if runner not found, 422 for invalid transitions. |
 
 ### Planned Endpoints
 

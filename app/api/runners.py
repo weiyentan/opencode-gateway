@@ -434,7 +434,7 @@ async def set_runner_status(
     Allows operators to set a runner to ``offline``, ``online``, or
     ``maintenance``.  The transition is validated against the allowed
     state machine, the runner record is updated, and the change is
-    logged in the ``job_events`` table.
+    logged in the ``runner_events`` table.
 
     Returns 404 if the runner ID does not exist, and 422 if the
     requested transition is not allowed.
@@ -465,20 +465,18 @@ async def set_runner_status(
         runner_id,
     )
 
-    # Log the status change in job_events (using zero-UUID as sentinel
-    # job_id since runner status changes are not tied to a specific job)
+    # Log the status change in runner_events
     event_id = uuid.uuid4()
-    sentinel_job_id = uuid.UUID(int=0)
     await conn.execute(
-        "INSERT INTO job_events "
-        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "INSERT INTO runner_events "
+        "(id, runner_id, event_type, old_status, new_status, reason, created_at) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7)",
         event_id,
-        sentinel_job_id,
+        runner_id,
         f"runner_status_{target_status}",
-        "api",
-        body.reason or f"Runner status changed to {target_status}",
         previous_status,
+        target_status,
+        body.reason or f"Runner status changed to {target_status}",
         now,
     )
 

@@ -69,8 +69,8 @@ class TestCheckRequiredTables:
         mock_conn.fetch = AsyncMock(return_value=[
             {"table_name": t} for t in [
                 "gateway_jobs", "workspaces", "job_events", "approvals",
-                "runners", "runner_observations", "workspace_observations",
-                "opencode_instance_observations",
+                "runners", "runner_events", "runner_observations",
+                "workspace_observations", "opencode_instance_observations",
             ]
         ])
 

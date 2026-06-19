@@ -29,6 +29,7 @@ class TestSchemaMigration:
             "workspaces",
             "job_events",
             "runners",
+            "runner_events",
             "runner_observations",
             "workspace_observations",
             "opencode_instance_observations",
