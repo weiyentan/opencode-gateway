@@ -1038,6 +1038,7 @@ async def reject_job(
 async def complete_job(
     job_id: uuid.UUID,
     body: JobCompleteRequest,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
     pool: DatabasePool = Depends(_get_pool),
 ) -> JobResponse:
