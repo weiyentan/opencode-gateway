@@ -693,12 +693,12 @@ class TestPostRunnerStatus:
         assert args[0] == target_status
 
     # ------------------------------------------------------------------
-    # job_events logging
+    # runner_events logging
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_status_change_logs_to_job_events(self, mock_conn):
-        """POST /runners/{id}/status inserts a record into job_events."""
+    async def test_status_change_logs_to_runner_events(self, mock_conn):
+        """POST /runners/{id}/status inserts a record into runner_events."""
         r_id, execute_calls = self._setup_mocks(
             mock_conn, current_status="HEALTHY"
         )
@@ -713,22 +713,23 @@ class TestPostRunnerStatus:
 
         assert response.status_code == 200
 
-        # Verify job_events INSERT
+        # Verify runner_events INSERT
         insert_calls = [
             (sql, args) for sql, args in execute_calls
-            if "INSERT INTO job_events" in sql
+            if "INSERT INTO runner_events" in sql
         ]
         assert len(insert_calls) == 1
         _sql, args = insert_calls[0]
-        # args: (event_id, sentinel_job_id, event_type, actor, details, previous_status, created_at)
+        # args: (event_id, runner_id, event_type, old_status, new_status, reason, created_at)
+        assert args[1] == r_id  # runner_id
         assert args[2] == "runner_status_offline"
-        assert args[3] == "api"
-        assert args[4] == "Maintenance window"
-        assert args[5] == "HEALTHY"
+        assert args[3] == "HEALTHY"
+        assert args[4] == "offline"
+        assert args[5] == "Maintenance window"
 
     @pytest.mark.asyncio
     async def test_status_change_logs_default_reason_when_empty(self, mock_conn):
-        """When reason is empty, the job_events details uses a default message."""
+        """When reason is empty, the runner_events reason uses a default message."""
         r_id, execute_calls = self._setup_mocks(
             mock_conn, current_status="UNKNOWN"
         )
@@ -745,13 +746,14 @@ class TestPostRunnerStatus:
 
         insert_calls = [
             (sql, args) for sql, args in execute_calls
-            if "INSERT INTO job_events" in sql
+            if "INSERT INTO runner_events" in sql
         ]
         assert len(insert_calls) == 1
         _sql, args = insert_calls[0]
         assert args[2] == "runner_status_maintenance"
-        assert args[4] == "Runner status changed to maintenance"
-        assert args[5] == "UNKNOWN"
+        assert args[3] == "UNKNOWN"
+        assert args[4] == "maintenance"
+        assert args[5] == "Runner status changed to maintenance"
 
     # ------------------------------------------------------------------
     # invalid transitions

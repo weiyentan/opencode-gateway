@@ -60,6 +60,7 @@ _TRUNCATE_ORDER = [
     "opencode_instance_observations",
     "workspace_observations",
     "runner_observations",
+    "runner_events",
     "job_events",
     "approvals",
     "gateway_jobs",
