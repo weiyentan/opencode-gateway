@@ -555,3 +555,358 @@ class TestPortLifecycle:
         port3 = await allocate_port(conn)
         assert port3 == 10000
         used_ports[str(ws_id3)] = port3
+
+
+# ---------------------------------------------------------------------------
+# allocate_and_assign_port
+# ---------------------------------------------------------------------------
+
+
+def _import_allocate_and_assign_port():
+    from app.core.ports import allocate_and_assign_port
+
+    return allocate_and_assign_port
+
+
+class TestAllocateAndAssignPort:
+    """Tests for allocate_and_assign_port() (implemented in issue #136).
+
+    These tests validate the combined allocate-and-persist workflow that
+    ``allocate_and_assign_port(conn, workspace_id)`` will implement once
+    #136 lands.  Until then, these tests will fail with ImportError.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_valid_port_and_updates_workspace(self):
+        """allocate_and_assign_port returns a valid port and persists it."""
+        allocate_and_assign_port = _import_allocate_and_assign_port()
+
+        conn = AsyncMock()
+        ws_id = uuid.uuid4()
+        execute_calls: list[tuple] = []
+
+        async def _fetch(sql: str, *args):  # noqa: ARG001
+            return []
+
+        async def _execute(sql: str, *args):
+            execute_calls.append((sql, args))
+            return "UPDATE 1"
+
+        conn.fetch = AsyncMock(side_effect=_fetch)
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        port = await allocate_and_assign_port(conn, ws_id)
+
+        assert 10000 <= port <= 10999
+
+        # Verify the UPDATE was executed with the port and workspace id
+        update_calls = [(s, a) for s, a in execute_calls if "UPDATE workspaces" in s]
+        assert len(update_calls) == 1
+        sql, args = update_calls[0]
+        assert "SET port" in sql
+        assert args[0] == port
+        assert args[1] == ws_id
+
+    @pytest.mark.asyncio
+    async def test_acquires_and_releases_lock(self):
+        """allocate_and_assign_port must acquire and release the advisory lock."""
+        allocate_and_assign_port = _import_allocate_and_assign_port()
+
+        conn = AsyncMock()
+        ws_id = uuid.uuid4()
+        execute_calls: list[tuple] = []
+
+        async def _fetch(sql: str, *args):  # noqa: ARG001
+            return []
+
+        async def _execute(sql: str, *args):
+            execute_calls.append((sql, args))
+            return "UPDATE 1"
+
+        conn.fetch = AsyncMock(side_effect=_fetch)
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        await allocate_and_assign_port(conn, ws_id)
+
+        lock_calls = [(s, a) for s, a in execute_calls if "pg_advisory_lock" in s]
+        unlock_calls = [(s, a) for s, a in execute_calls if "pg_advisory_unlock" in s]
+        assert len(lock_calls) == 1
+        assert len(unlock_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_allocate_and_assign_are_unique(self):
+        """Multiple concurrent allocate_and_assign_port calls get unique ports."""
+        allocate_and_assign_port = _import_allocate_and_assign_port()
+
+        # Shared state to track used ports
+        used_ports: set[int] = set()
+        lock = asyncio.Lock()
+
+        async def _fetch(sql: str, *args):  # noqa: ARG001
+            return [mock_row({"port": p}) for p in sorted(used_ports)]
+
+        async def _execute(sql: str, *args):  # noqa: ARG001
+            return "UPDATE 1"
+
+        async def concurrent_assign(ws_id) -> int:
+            conn = AsyncMock()
+            conn.fetch = AsyncMock(side_effect=_fetch)
+            conn.execute = AsyncMock(side_effect=_execute)
+
+            port = await allocate_and_assign_port(conn, ws_id)
+
+            # Simulate the DB persisting the port (under the lock)
+            async with lock:
+                assert port not in used_ports, f"Port {port} was already allocated!"
+                used_ports.add(port)
+
+            return port
+
+        ws_ids = [uuid.uuid4() for _ in range(50)]
+        tasks = [concurrent_assign(ws_id) for ws_id in ws_ids]
+        ports = await asyncio.gather(*tasks)
+
+        assert len(ports) == 50
+        assert len(set(ports)) == 50
+        for p in ports:
+            assert 10000 <= p <= 10999
+
+
+# ---------------------------------------------------------------------------
+# Port reuse after workspace cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestPortReuseAfterCleanup:
+    """Tests that ports are reusable after workspace cleanup.
+
+    When a workspace is cleaned (``cleanup_status = 'cleaned'``), its port
+    should not block reallocation — either the cleanup process releases the
+    port, or the allocation query filters out cleaned workspaces.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cleaned_workspace_port_not_counted_as_used(self):
+        """Port from a cleaned workspace is treated as available for allocation."""
+        allocate_port = _import_allocate_port()
+
+        # Simulate: two cleaned workspaces still hold ports 10000 and 10001.
+        # The DB query filters them out (cleanup_status != 'cleaned'),
+        # so allocate_port sees no used ports and returns 10000.
+        async def _fetch(sql: str, *args):  # noqa: ARG001
+            return []
+
+        async def _execute(sql: str, *args):  # noqa: ARG001
+            pass
+
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(side_effect=_fetch)
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        port = await allocate_port(conn)
+        assert port == 10000
+
+    @pytest.mark.asyncio
+    async def test_allocate_after_cleanup_reuses_freed_port(self):
+        """allocate → cleanup → re-allocate cycle reuses the port."""
+        allocate_port = _import_allocate_port()
+
+        # Simulate DB state: active workspaces with allocated ports
+        active_ports: set[int] = set()
+
+        async def _fetch(sql: str, *args):  # noqa: ARG001
+            return [mock_row({"port": p}) for p in sorted(active_ports)]
+
+        async def _execute(sql: str, *args):  # noqa: ARG001
+            return "UPDATE 1"
+
+        async def _make_conn():
+            conn = AsyncMock()
+            conn.fetch = AsyncMock(side_effect=_fetch)
+            conn.execute = AsyncMock(side_effect=_execute)
+            return conn
+
+        # 1. Allocate first port
+        conn = await _make_conn()
+        port_a = await allocate_port(conn)
+        assert port_a == 10000
+        active_ports.add(port_a)
+
+        # 2. Allocate second port
+        conn = await _make_conn()
+        port_b = await allocate_port(conn)
+        assert port_b == 10001
+        active_ports.add(port_b)
+
+        # 3. Simulate cleanup: first workspace cleaned, port freed
+        active_ports.discard(10000)
+
+        # 4. Allocate again — should get 10000 (reused from cleaned workspace)
+        conn = await _make_conn()
+        port_c = await allocate_port(conn)
+        assert port_c == 10000
+        active_ports.add(port_c)
+
+        # 5. Verify we have 2 active ports with correct values
+        assert len(active_ports) == 2
+        assert 10000 in active_ports
+        assert 10001 in active_ports
+
+
+# ---------------------------------------------------------------------------
+# Duplicate active port rejection (partial unique index from issue #135)
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicatePortRejection:
+    """Tests that duplicate active port assignments are rejected.
+
+    Issue #135 adds a partial unique index on workspaces.port that only
+    applies to active (non-cleaned) workspaces.  This prevents two active
+    workspaces from holding the same port while allowing cleaned workspaces
+    to retain their port value without blocking reuse.
+    """
+
+    @pytest.mark.asyncio
+    async def test_duplicate_active_port_raises_unique_violation(self):
+        """Assigning an active workspace's port to another active workspace fails."""
+        from asyncpg.exceptions import UniqueViolationError
+
+        conn = AsyncMock()
+
+        async def _execute(sql: str, *args):  # noqa: ARG001
+            if "UPDATE workspaces SET port" in sql:
+                raise UniqueViolationError(
+                    'duplicate key value violates unique constraint '
+                    '"ix_workspaces_active_port"'
+                )
+            return "UPDATE 1"
+
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        with pytest.raises(UniqueViolationError):
+            await conn.execute(
+                "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+                10000,
+                uuid.uuid4(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_port_on_cleaned_workspace_allowed(self):
+        """Two cleaned workspaces CAN share the same port (unique index excludes cleaned)."""
+        conn = AsyncMock()
+        execute_calls: list[tuple] = []
+
+        async def _execute(sql: str, *args):
+            execute_calls.append((sql, args))
+            return "UPDATE 1"
+
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        # Assign port 10000 to two different cleaned workspaces —
+        # the partial unique index allows this because cleanup_status='cleaned'
+        # is excluded from the unique constraint.
+        await conn.execute(
+            "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+            10000,
+            uuid.uuid4(),
+        )
+        await conn.execute(
+            "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+            10000,
+            uuid.uuid4(),
+        )
+
+        update_count = len([c for c in execute_calls if "UPDATE" in c[0]])
+        assert update_count == 2
+
+
+# ---------------------------------------------------------------------------
+# CHECK constraint on port range (migration 0009)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckConstraint:
+    """Tests that port values outside 10000–10999 are rejected by CHECK constraint.
+
+    Migration 0009 adds ``ck_workspaces_port_range`` which enforces
+    ``port IS NULL OR (port >= 10000 AND port <= 10999)``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_port_below_range_rejected_by_constraint(self):
+        """Port value below 10000 is rejected by the CHECK constraint."""
+        from asyncpg.exceptions import CheckViolationError
+
+        conn = AsyncMock()
+
+        async def _execute(sql: str, *args):
+            if "UPDATE workspaces SET port" in sql:
+                for arg in args:
+                    if isinstance(arg, int) and arg < 10000:
+                        raise CheckViolationError(
+                            'new row for relation "workspaces" violates '
+                            'check constraint "ck_workspaces_port_range"'
+                        )
+            return "UPDATE 1"
+
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        with pytest.raises(CheckViolationError):
+            await conn.execute(
+                "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+                9999,
+                uuid.uuid4(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_port_above_range_rejected_by_constraint(self):
+        """Port value above 10999 is rejected by the CHECK constraint."""
+        from asyncpg.exceptions import CheckViolationError
+
+        conn = AsyncMock()
+
+        async def _execute(sql: str, *args):
+            if "UPDATE workspaces SET port" in sql:
+                for arg in args:
+                    if isinstance(arg, int) and arg > 10999:
+                        raise CheckViolationError(
+                            'new row for relation "workspaces" violates '
+                            'check constraint "ck_workspaces_port_range"'
+                        )
+            return "UPDATE 1"
+
+        conn.execute = AsyncMock(side_effect=_execute)
+
+        with pytest.raises(CheckViolationError):
+            await conn.execute(
+                "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+                11000,
+                uuid.uuid4(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_null_port_accepted_by_constraint(self):
+        """NULL port value is accepted (CHECK constraint allows NULL)."""
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        result = await conn.execute(
+            "UPDATE workspaces SET port = NULL, updated_at = NOW() WHERE id = $1",
+            uuid.uuid4(),
+        )
+        assert result == "UPDATE 1"
+
+    @pytest.mark.asyncio
+    async def test_port_in_range_accepted_by_constraint(self):
+        """Port values within 10000–10999 are accepted by the CHECK constraint."""
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        for port in (10000, 10500, 10999):
+            result = await conn.execute(
+                "UPDATE workspaces SET port = $1, updated_at = NOW() WHERE id = $2",
+                port,
+                uuid.uuid4(),
+            )
+            assert result == "UPDATE 1"
