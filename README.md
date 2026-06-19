@@ -211,6 +211,23 @@ All three template IDs are required and must be non-zero. If any template ID is 
 
 > **Template contract:** The exact AWX job template structure (expected `extra_vars`, artifact outputs, and playbook contracts) is defined in the [GitLab issue #82](https://gitlab.com/opencode/gateway/-/issues/82) under the "AWX Template Contract" section. Refer to that issue when creating or updating the corresponding AWX job templates.
 
+### Passing Secrets to OpenCode Sessions
+
+When submitting a job, callers may pass environment variables via the ``env_vars`` field on the job request body.  These variables are forwarded to the OpenCode Serve process on the Runner VM and are available to the coding session.
+
+Because ``env_vars`` frequently contains credentials (API tokens, database passwords, signing keys), the Gateway applies **automatic redaction** before writing environment variable values to logs or job events:
+
+* **Key-name detection** — Any key whose name contains ``token``, ``password``, ``secret``, ``key``, ``credential``, or ``auth`` (case-insensitive, underscore-insensitive) has its value replaced with ``***`` in log output.
+* **Belt-and-suspenders** — In addition to explicit redaction in executor code paths, the root logger is configured with a :class:`~app.core.logging.RedactingFormatter` that strips secret-like values from the rendered log message as a secondary safeguard.
+
+**What this means for callers:**
+
+* Secret values are **never** written to Gateway logs, executor debug output, or job event records.
+* The redaction covers nested ``env_vars`` dictionaries passed through the executor plugin interface.
+* Non-secret variables (``REPO_URL``, ``BRANCH``, ``LOG_LEVEL``, etc.) are logged normally.
+
+> **Security note:** The Gateway does not inspect or validate the *content* of secret values — it only prevents them from appearing in logs.  Callers remain responsible for transmitting secrets securely (HTTPS), rotating credentials regularly, and following the principle of least privilege.  Infrastructure secrets (SSH keys, Runner VM credentials) are never held by the Gateway — see [ADR 0004](docs/adr/0004-gateway-no-infra-secrets.md).
+
 ### Run
 
 **Development** (with auto-reload):

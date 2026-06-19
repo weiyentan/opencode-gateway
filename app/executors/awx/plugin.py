@@ -10,6 +10,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from app.core.secrets import redact_dict
 from app.executors import ExecutorPlugin
 from app.executors.awx.client import AWXApiClient, AWXJobResult
 from app.executors.awx.exceptions import AWXClientError
@@ -128,7 +129,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
         logger.debug(
             "Launching AWX template %d with extra_vars=%s",
             template_id,
-            extra_vars,
+            redact_dict(extra_vars),
         )
         summary = await self._client.launch_job_template(
             template_id,
