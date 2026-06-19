@@ -106,14 +106,15 @@ async def ingest_observations(
     runner_row = await conn.fetchrow(
         """
         INSERT INTO runners (id, runner_id, hostname, executor_type, labels, status,
-                             created_at, updated_at)
-        VALUES (gen_random_uuid(), $1, $2, $3, $4, 'HEALTHY', $5, $5)
+                             health_status, created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, 'HEALTHY', 'HEALTHY', $5, $5)
         ON CONFLICT (runner_id)
         DO UPDATE SET
             hostname       = EXCLUDED.hostname,
             executor_type  = EXCLUDED.executor_type,
             labels         = EXCLUDED.labels,
             status         = 'HEALTHY',
+            health_status  = 'HEALTHY',
             updated_at     = EXCLUDED.updated_at
         RETURNING id
         """,

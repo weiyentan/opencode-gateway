@@ -13,6 +13,7 @@ import tempfile
 import uuid as _uuid
 from uuid import UUID
 
+from app.core.secrets import redact_dict
 from app.executors import ExecutorPlugin
 from app.executors.models import (
     CleanupWorkspaceRequest,
@@ -68,7 +69,7 @@ class LocalExecutor(ExecutorPlugin):
                 "start_opencode: workspace=%s -> session=%s env_vars=%s",
                 request.workspace_id,
                 session_id,
-                request.env_vars,
+                redact_dict(request.env_vars),
             )
         else:
             logger.info(

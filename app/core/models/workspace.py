@@ -11,10 +11,19 @@ from pydantic import BaseModel
 
 
 class WorkspaceStatus(str, Enum):
-    """Allowed status values for a Workspace's cleanup lifecycle."""
+    """Allowed status values for a Workspace's cleanup lifecycle.
+
+    State machine for workspace cleanup:
+
+        active ──► cleaning ──► cleaned
+                       │
+                       └──────► cleanup_failed
+    """
 
     ACTIVE = "active"
     CLEANING = "cleaning"
+    CLEANED = "cleaned"
+    CLEANUP_FAILED = "cleanup_failed"
     PINNED = "pinned"
 
 
@@ -36,6 +45,10 @@ class Workspace(BaseModel):
     pinned: bool = False
     cleanup_after: Optional[datetime] = None
     cleanup_status: WorkspaceStatus = WorkspaceStatus.ACTIVE
+    cleanup_started_at: Optional[datetime] = None
+    cleanup_completed_at: Optional[datetime] = None
+    cleanup_failed_at: Optional[datetime] = None
+    cleanup_failure_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

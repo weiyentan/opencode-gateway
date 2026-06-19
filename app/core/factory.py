@@ -29,6 +29,8 @@ async def _invoke_hook(hook: Callable[[], Any]) -> None:
 def create_app(
     on_startup: list[Callable[[], Any]] | None = None,
     on_shutdown: list[Callable[[], Any]] | None = None,
+    *,
+    configure_logging: bool = True,
 ) -> FastAPI:
     """Build the FastAPI Gateway application.
 
@@ -42,7 +44,20 @@ def create_app(
 
     A background cleanup scheduler is started during the boot sequence
     and stopped gracefully on shutdown.
+
+    Args:
+        on_startup: Optional list of callbacks to run on startup.
+        on_shutdown: Optional list of callbacks to run on shutdown.
+        configure_logging: If ``True`` (the default), install the
+            :class:`~app.core.logging.RedactingFormatter` on the root
+            logger so that secret-like values are redacted from all
+            log output.  Set to ``False`` in tests that need to
+            inspect raw log messages.
     """
+    if configure_logging:
+        from app.core.logging import configure_root_logger
+        configure_root_logger()
+
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
 
@@ -58,16 +73,20 @@ def create_app(
         try:
             await pool.connect()
             app.state.pool = pool  # type: ignore[attr-defined]
-
-            # Ensure the database schema is current (idempotent)
-            if pool.pool is not None:
-                await ensure_schema(pool.pool)
         except Exception:
             logger.warning(
                 "Postgres unavailable — starting without database pool",
                 exc_info=True,
             )
             app.state.pool = None  # type: ignore[attr-defined]
+
+        # --- Schema migration (Alembic) ---
+        # Only run if the pool connected successfully.  Schema migration
+        # failures are NOT treated as graceful degradation — they are a
+        # hard startup error because missing tables would cause runtime
+        # failures in API endpoints.
+        if app.state.pool is not None and app.state.pool.pool is not None:  # type: ignore[attr-defined]
+            await ensure_schema(app.state.pool.pool)  # type: ignore[attr-defined]
 
         # --- Executor plugin ---
         executor = _create_executor(settings)
@@ -146,17 +165,19 @@ def create_app(
 def _create_executor(settings: Any) -> Any:
     """Instantiate the configured executor plugin.
 
+    Delegates to :func:`app.executors.factory.create_executor_from_settings`
+    so all executor types follow the same construction path.  The AWX
+    executor receives a fully-configured ``AWXApiClient`` and validated
+    template IDs rather than being instantiated with no arguments.
+
     Returns ``None`` if the executor type is not found in the registry
     so the scheduler can skip cleanup ticks gracefully instead of
     crashing the Gateway process.
-    """
-    from app.executors import EXECUTOR_REGISTRY
 
-    executor_cls = EXECUTOR_REGISTRY.get(settings.executor_type)
-    if executor_cls is None:
-        logger.warning(
-            "Unknown executor type %r — cleanup scheduler will skip ticks",
-            settings.executor_type,
-        )
-        return None
-    return executor_cls()
+    Raises:
+        ValueError: If the executor type is ``"awx"`` and required
+            AWX settings are missing (fail-fast at startup).
+    """
+    from app.executors.factory import create_executor_from_settings
+
+    return create_executor_from_settings(settings)

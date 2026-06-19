@@ -53,8 +53,10 @@ def make_job_row(
     workspace_name: str | None = None,
     env_vars: dict[str, str] | None = None,
     branch_name: str | None = None,
+    commit_sha: str | None = None,
     mr_url: str | None = None,
     workflow_run_id: str | None = None,
+    failure_reason: str | None = None,
 ) -> dict:
     """Return a dict representing a gateway_jobs table row."""
     now = datetime.now(timezone.utc)  # noqa: UP017
@@ -72,8 +74,10 @@ def make_job_row(
         "diff": diff,
         "workspace_name": workspace_name,
         "branch_name": branch_name,
+        "commit_sha": commit_sha,
         "mr_url": mr_url,
         "workflow_run_id": workflow_run_id,
+        "failure_reason": failure_reason,
     }
 
 
@@ -90,6 +94,10 @@ def make_workspace_row(
     pinned: bool = False,
     cleanup_after: datetime | None = None,
     cleanup_status: str = "active",
+    cleanup_started_at: datetime | None = None,
+    cleanup_completed_at: datetime | None = None,
+    cleanup_failed_at: datetime | None = None,
+    cleanup_failure_reason: str | None = None,
     created_at: datetime | None = None,
 ) -> dict:
     """Return a dict representing a workspaces table row."""
@@ -106,6 +114,10 @@ def make_workspace_row(
         "pinned": pinned,
         "cleanup_after": cleanup_after,
         "cleanup_status": cleanup_status,
+        "cleanup_started_at": cleanup_started_at,
+        "cleanup_completed_at": cleanup_completed_at,
+        "cleanup_failed_at": cleanup_failed_at,
+        "cleanup_failure_reason": cleanup_failure_reason,
         "created_at": now,
         "updated_at": now,
     }
@@ -127,7 +139,7 @@ def create_client(
     """
     from app.api.jobs import _get_pool, get_opencode_client
 
-    app = create_app()
+    app = create_app(configure_logging=False)
     mock_pool = AsyncMock()
     # Set pool.pool to None so background webhook dispatch exits early in tests.
     # The webhook dispatch is tested separately in test_webhooks.py with its own
@@ -159,6 +171,21 @@ def create_client(
 # ══════════════════════════════════════════════════════════════════════════
 #  Fixtures
 # ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture(autouse=True)
+def _skip_migrations_in_unit_tests() -> None:
+    """Replace ensure_schema with a no-op in unit tests (no real database).
+
+    Unit tests use mock database connections — Alembic cannot run real
+    migrations against them.  Individual test files that need to verify
+    ensure_schema behaviour (e.g. test_schema.py) apply their own
+    targeted patches inside the test function body.
+    """
+    from unittest.mock import patch
+
+    with patch("app.core.factory.ensure_schema", AsyncMock()):
+        yield
 
 
 @pytest.fixture

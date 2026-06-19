@@ -184,8 +184,10 @@ class TestJobModelFields:
             "executor_type",
             "executor_job_id",
             "branch_name",
+            "commit_sha",
             "mr_url",
             "workflow_run_id",
+            "failure_reason",
             "created_at",
             "updated_at",
             "completed_at",
@@ -200,11 +202,14 @@ class TestJobStatusEnum:
     """Tests for the JobStatus enum used on the Job model."""
 
     def test_job_status_enum_has_expected_values(self):
-        """JobStatus enum should define all 8 status values including aborting and aborted."""
+        """JobStatus enum should define all 11 status values."""
         from app.core.models.job import JobStatus
 
         assert JobStatus.PENDING.value == "pending"
+        assert JobStatus.PROVISIONING_WORKSPACE.value == "provisioning_workspace"
+        assert JobStatus.STARTING_OPENCODE.value == "starting_opencode"
         assert JobStatus.RUNNING.value == "running"
+        assert JobStatus.AWAITING_REVIEW.value == "awaiting_review"
         assert JobStatus.COMPLETED.value == "completed"
         assert JobStatus.FAILED.value == "failed"
         assert JobStatus.NEEDS_APPROVAL.value == "needs_approval"
@@ -301,11 +306,11 @@ class TestJobStatusEnum:
         assert issubclass(JobStatus, str)
         assert issubclass(JobStatus, Enum)
 
-    def test_job_status_enum_has_eight_members(self):
-        """JobStatus should have exactly 8 members."""
+    def test_job_status_enum_has_eleven_members(self):
+        """JobStatus should have exactly 11 members."""
         from app.core.models.job import JobStatus
 
-        assert len(JobStatus) == 8
+        assert len(JobStatus) == 11
 
 
 class TestJobStatusTransition:
@@ -523,12 +528,12 @@ class TestLifecycleCanTransition:
     def test_pending_to_rejected_is_invalid(self):
         assert self._can_transition("pending", "rejected") is False
 
-    # -- the transition table has exactly 9 entries -----------------------
+    # -- the transition table has 20 entries ------------------------------
 
-    def test_valid_transitions_count_is_nine(self):
+    def test_valid_transitions_count_is_twenty(self):
         from app.core.lifecycle import VALID_TRANSITIONS
 
-        assert len(VALID_TRANSITIONS) == 9
+        assert len(VALID_TRANSITIONS) == 20
 
     # -- every transition in the table references known enum members ------
 
@@ -540,6 +545,66 @@ class TestLifecycleCanTransition:
         for src, dst in VALID_TRANSITIONS:
             assert src in all_members
             assert dst in all_members
+
+    # -- expanded lifecycle: provisioning stages --------------------------
+
+    def test_pending_to_provisioning_workspace_is_valid(self):
+        assert self._can_transition("pending", "provisioning_workspace") is True
+
+    def test_provisioning_workspace_to_starting_opencode_is_valid(self):
+        assert self._can_transition("provisioning_workspace", "starting_opencode") is True
+
+    def test_starting_opencode_to_running_is_valid(self):
+        assert self._can_transition("starting_opencode", "running") is True
+
+    # -- expanded lifecycle: review gate ----------------------------------
+
+    def test_running_to_awaiting_review_is_valid(self):
+        assert self._can_transition("running", "awaiting_review") is True
+
+    def test_awaiting_review_to_completed_is_valid(self):
+        assert self._can_transition("awaiting_review", "completed") is True
+
+    def test_awaiting_review_to_failed_is_valid(self):
+        assert self._can_transition("awaiting_review", "failed") is True
+
+    # -- failure during provisioning stages -------------------------------
+
+    def test_provisioning_workspace_to_failed_is_valid(self):
+        assert self._can_transition("provisioning_workspace", "failed") is True
+
+    def test_starting_opencode_to_failed_is_valid(self):
+        assert self._can_transition("starting_opencode", "failed") is True
+
+    # -- abort during provisioning stages ---------------------------------
+
+    def test_provisioning_workspace_to_aborting_is_valid(self):
+        assert self._can_transition("provisioning_workspace", "aborting") is True
+
+    def test_starting_opencode_to_aborting_is_valid(self):
+        assert self._can_transition("starting_opencode", "aborting") is True
+
+    def test_awaiting_review_to_aborting_is_valid(self):
+        assert self._can_transition("awaiting_review", "aborting") is True
+
+    # -- backward-compatible legacy transitions ---------------------------
+
+    def test_pending_to_running_is_still_valid(self):
+        assert self._can_transition("pending", "running") is True
+
+    def test_running_to_completed_is_still_valid(self):
+        assert self._can_transition("running", "completed") is True
+
+    # -- invalid cross-state transitions ----------------------------------
+
+    def test_provisioning_workspace_to_running_is_invalid(self):
+        assert self._can_transition("provisioning_workspace", "running") is False
+
+    def test_starting_opencode_to_completed_is_invalid(self):
+        assert self._can_transition("starting_opencode", "completed") is False
+
+    def test_awaiting_review_to_pending_is_invalid(self):
+        assert self._can_transition("awaiting_review", "pending") is False
 
 
 class TestJobStatusValidateTransitionBackwardCompat:

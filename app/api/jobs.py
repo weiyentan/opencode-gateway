@@ -18,8 +18,10 @@ from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
+from app.core.ports import PortExhaustedError, allocate_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
+from app.executors.awx.exceptions import AWXArtifactError
 from app.executors.factory import get_executor
 from app.executors.models import (
     CleanupWorkspaceRequest,
@@ -369,11 +371,40 @@ async def create_job(
             str(new_workspace_id),
         )
 
+        # 4a. Allocate a port and persist it against the workspace (ADR 0003).
+        try:
+            allocated_port = await allocate_port(conn)
+        except PortExhaustedError:
+            logger.error(
+                "Port exhaustion — no free ports in range 10000–10999 "
+                "for job %s (workspace %s)",
+                job_id,
+                new_workspace_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="No available ports — all 1000 ports in range 10000–10999 are in use",
+            )
+
+        await conn.execute(
+            "UPDATE workspaces SET port = $2, updated_at = $3 WHERE id = $1",
+            new_workspace_id,
+            allocated_port,
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
+        logger.info(
+            "Allocated port %d for job %s (workspace %s)",
+            allocated_port,
+            job_id,
+            new_workspace_id,
+        )
+
         # 5. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
+                port=allocated_port,
                 env_vars=body.env_vars,
             )
         )
@@ -492,12 +523,88 @@ async def create_job(
                 )
         raise
 
+    except AWXArtifactError as exc:
+        # Artifact validation failure — the AWX job completed but returned
+        # malformed or missing data.  Store a descriptive failure reason.
+        details_parts = [f"AWX artifact validation failed: {exc}"]
+        if exc.template_name:
+            details_parts.append(f"template={exc.template_name}")
+        if exc.missing_fields:
+            details_parts.append(f"missing_fields={exc.missing_fields}")
+        if exc.invalid_fields:
+            details_parts.append(f"invalid_fields={exc.invalid_fields}")
+        error_detail = "; ".join(details_parts)
+
+        logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            job_id,
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
+
+        # Record the artifact failure as a job event
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        event_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO job_events "
+            "(id, job_id, event_type, actor, details, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event_id,
+            job_id,
+            "artifact_error",
+            "gateway",
+            error_detail,
+            now,
+        )
+
+        # Fire webhooks asynchronously with the error detail
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                    "error": error_detail,
+                },
+            )
+        )
+
+        # Set workspace cleanup_after for failure (if a workspace was created)
+        row = await _fetch_job(conn, job_id)
+        if row is not None:
+            ws_id = _resolve_workspace_id(row.get("workspace_name"))
+            if ws_id is not None:
+                await _set_workspace_cleanup_after(
+                    conn, ws_id, settings.cleanup_failure_retention_hours
+                )
+
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
             datetime.now(timezone.utc),  # noqa: UP017
+        )
+
+        # Record the failure as a job event
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        event_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO job_events "
+            "(id, job_id, event_type, actor, details, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event_id,
+            job_id,
+            "executor_error",
+            "gateway",
+            f"Executor dispatch failed: {body.task_summary}",
+            now,
         )
 
         # Fire webhooks asynchronously for failed jobs
@@ -513,6 +620,7 @@ async def create_job(
                     "repo_url": str(body.repo_url),
                     "task_summary": body.task_summary,
                     "completed_at": None,
+                    "error": f"Executor dispatch failed: {body.task_summary}",
                 },
             )
         )

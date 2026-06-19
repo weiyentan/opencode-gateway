@@ -127,7 +127,7 @@ class ObservationBasedPolicy:
 
         # Resolve the text runner_id to the internal runner UUID.
         runner_row = await conn.fetchrow(
-            "SELECT id, status FROM runners WHERE runner_id = $1",
+            "SELECT id, admin_status, health_status, status FROM runners WHERE runner_id = $1",
             runner_id,
         )
         if runner_row is None:
@@ -138,34 +138,35 @@ class ObservationBasedPolicy:
             return None
 
         runner_uuid: UUID = runner_row["id"]
+        runner_admin_status: str | None = runner_row.get("admin_status")
+        runner_health_status: str | None = runner_row.get("health_status")
         runner_status: str = runner_row["status"]
 
         # ------------------------------------------------------------------
-        # Manual status guard — operator-controlled statuses take priority
+        # Admin status guard — operator-controlled statuses take priority
         # over observation-derived thresholds.
         # ------------------------------------------------------------------
-        if runner_status in _MANUAL_STATUSES:
-            if runner_status in (RUNNER_STATUS_OFFLINE, RUNNER_STATUS_MAINTENANCE):
-                logger.warning(
-                    "policy_reject runner_id=%s reason=manual_status status=%s",
-                    runner_id,
-                    runner_status,
-                )
-                raise PolicyViolation(
-                    resource="manual_status",
-                    current_value=1.0,
-                    threshold=0.0,
-                    runner_id=runner_id,
-                    message=(
-                        f"Runner {runner_id} is {runner_status}. "
-                        f"No jobs can be dispatched to this runner."
-                    ),
-                )
-            # runner_status == "online" — manually cleared for dispatch;
-            # allow the job but do NOT update the status based on
-            # observation data (the operator has overridden it).
+        if runner_admin_status in (RUNNER_STATUS_OFFLINE, RUNNER_STATUS_MAINTENANCE):
+            logger.warning(
+                "policy_reject runner_id=%s reason=admin_status status=%s",
+                runner_id,
+                runner_admin_status,
+            )
+            raise PolicyViolation(
+                resource="manual_status",
+                current_value=1.0,
+                threshold=0.0,
+                runner_id=runner_id,
+                message=(
+                    f"Runner {runner_id} is {runner_admin_status}. "
+                    f"No jobs can be dispatched to this runner."
+                ),
+            )
+        if runner_admin_status == RUNNER_STATUS_ONLINE:
+            # Manually cleared for dispatch; allow the job but do NOT
+            # update the status based on observation data.
             logger.info(
-                "policy_accept runner_id=%s reason=manual_online",
+                "policy_accept runner_id=%s reason=admin_online",
                 runner_id,
             )
             return None
@@ -267,15 +268,19 @@ class ObservationBasedPolicy:
         runner_uuid: UUID,
         status: str,
     ) -> None:
-        """Update the runner's status in the database."""
+        """Update the runner's health_status and legacy status in the database.
+
+        Only updates health_status (observation-derived). The admin_status
+        column is never touched by the policy engine.
+        """
         await conn.execute(
-            "UPDATE runners SET status = $1, updated_at = $2 WHERE id = $3",
+            "UPDATE runners SET health_status = $1, status = $1, updated_at = $2 WHERE id = $3",
             status,
             datetime.now(timezone.utc),
             runner_uuid,
         )
         logger.info(
-            "Runner %s status updated to %s",
+            "Runner %s health_status updated to %s",
             runner_uuid,
             status,
         )

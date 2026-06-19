@@ -35,6 +35,10 @@ class Runner(Base):
     executor_type: Mapped[str] = mapped_column(Text, nullable=False)
     labels: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="UNKNOWN")
+    # admin_status: operator-set (online, offline, maintenance), NULL initially
+    admin_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    # health_status: observation-derived (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN), NULL initially
+    health_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -51,6 +55,9 @@ class Runner(Base):
     )
     opencode_instance_observations: Mapped[list[OpenCodeInstanceObservation]] = (
         relationship(back_populates="runner", cascade="all, delete-orphan")
+    )
+    runner_events: Mapped[list[RunnerEvent]] = relationship(
+        back_populates="runner", cascade="all, delete-orphan"
     )
 
 
@@ -139,3 +146,36 @@ class OpenCodeInstanceObservation(Base):
 
     # Relationship
     runner: Mapped[Runner] = relationship(back_populates="opencode_instance_observations")
+
+
+class RunnerEvent(Base):
+    """An event recording a runner status change.
+
+    Replaces the previous pattern of writing runner status changes into
+    ``job_events`` with a fake zero-UUID job_id.  Each status transition
+    (system-driven or operator-driven) is recorded here.
+    """
+
+    __tablename__ = "runner_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    runner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runners.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    old_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    new_status: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    metadata_: Mapped[Optional[dict]] = mapped_column(
+        "metadata", JSONB, nullable=True
+    )
+
+    # Relationship
+    runner: Mapped[Runner] = relationship(back_populates="runner_events")
