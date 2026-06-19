@@ -17,19 +17,33 @@ from app.core.models.job import JobStatus
 
 VALID_TRANSITIONS: frozenset[tuple[JobStatus, JobStatus]] = frozenset(
     {
-        # Normal lifecycle
-        (JobStatus.PENDING, JobStatus.RUNNING),
-        (JobStatus.PENDING, JobStatus.NEEDS_APPROVAL),
-        (JobStatus.PENDING, JobStatus.ABORTING),
-        # Running phase
-        (JobStatus.RUNNING, JobStatus.COMPLETED),
-        (JobStatus.RUNNING, JobStatus.FAILED),
-        (JobStatus.RUNNING, JobStatus.ABORTING),
+        # Normal lifecycle — granular provisioning
+        (JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE),
+        (JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE),
+        (JobStatus.STARTING_OPENCODE, JobStatus.RUNNING),
+        # Post-execution — review gate
+        (JobStatus.RUNNING, JobStatus.AWAITING_REVIEW),
+        (JobStatus.AWAITING_REVIEW, JobStatus.COMPLETED),
+        (JobStatus.AWAITING_REVIEW, JobStatus.FAILED),
         # Approval flow
+        (JobStatus.PENDING, JobStatus.NEEDS_APPROVAL),
         (JobStatus.NEEDS_APPROVAL, JobStatus.RUNNING),
         (JobStatus.NEEDS_APPROVAL, JobStatus.REJECTED),
-        # Abort flow
+        # Failure / abort during provisioning stages
+        (JobStatus.PROVISIONING_WORKSPACE, JobStatus.FAILED),
+        (JobStatus.STARTING_OPENCODE, JobStatus.FAILED),
+        (JobStatus.PROVISIONING_WORKSPACE, JobStatus.ABORTING),
+        (JobStatus.STARTING_OPENCODE, JobStatus.ABORTING),
+        (JobStatus.RUNNING, JobStatus.FAILED),
+        (JobStatus.RUNNING, JobStatus.ABORTING),
+        # Abort from pending and review
+        (JobStatus.PENDING, JobStatus.ABORTING),
+        (JobStatus.AWAITING_REVIEW, JobStatus.ABORTING),
+        # Abort finalisation
         (JobStatus.ABORTING, JobStatus.ABORTED),
+        # Backward-compatible legacy transitions (existing data)
+        (JobStatus.PENDING, JobStatus.RUNNING),
+        (JobStatus.RUNNING, JobStatus.COMPLETED),
     },
 )
 
