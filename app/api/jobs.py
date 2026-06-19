@@ -101,8 +101,11 @@ class JobResponse(BaseModel):
     opencode_session_id: str | None = None
     diff: str | None = None
     branch_name: str | None = None
+    commit_sha: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
+    diff_url: str | None = None
+    failure_reason: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -119,7 +122,8 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
+    "opencode_session_id, diff, workspace_name, branch_name, commit_sha, mr_url, "
+    "workflow_run_id, failure_reason"
 )
 
 
@@ -317,6 +321,7 @@ async def select_runner(
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
     pool: DatabasePool = Depends(_get_pool),
     executor: ExecutorPlugin = Depends(get_executor),
@@ -658,14 +663,18 @@ async def create_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/approve", response_model=JobResponse)
 async def approve_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Approve a job that is waiting for approval, transitioning it to running."""
@@ -725,14 +734,18 @@ async def approve_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/reject", response_model=JobResponse)
 async def reject_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Reject a job that is waiting for approval, transitioning it to rejected."""
@@ -792,14 +805,18 @@ async def reject_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/abort", response_model=JobResponse)
 async def abort_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
     opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
@@ -943,14 +960,18 @@ async def abort_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Retrieve a job by its ID."""
@@ -968,8 +989,11 @@ async def get_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -984,6 +1008,7 @@ class JobListResponse(BaseModel):
 
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
+    request: Request,
     status: JobStatus | None = None,
     runner_id: uuid.UUID | None = None,
     workflow_run_id: str | None = None,
@@ -1055,8 +1080,11 @@ async def list_jobs(
             opencode_session_id=row.get("opencode_session_id"),
             diff=row.get("diff"),
             branch_name=row.get("branch_name"),
+            commit_sha=row.get("commit_sha"),
             mr_url=row.get("mr_url"),
             workflow_run_id=row.get("workflow_run_id"),
+            diff_url=str(request.url_for("get_job_diff", job_id=str(row["id"]))),
+            failure_reason=row.get("failure_reason"),
         )
         for row in rows
     ]
