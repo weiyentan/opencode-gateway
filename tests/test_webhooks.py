@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import AsyncClient
 
-from app.api.webhooks import _compute_signature
+from app.api.webhooks import _compute_signature, build_job_completed_payload
 from tests.conftest import create_client, mock_row
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -55,6 +55,130 @@ class TestSignature:
         assert sig == sig.lower()
         assert all(c in "0123456789abcdef" for c in sig)
         assert len(sig) == 64
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Structured payload construction
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestBuildJobCompletedPayload:
+    """Tests for build_job_completed_payload — structured payload builder."""
+
+    def test_returns_all_required_fields(self):
+        """Payload contains every field specified in the issue-150 schema."""
+        import uuid
+        from datetime import datetime, timezone
+
+        job_id = uuid.uuid4()
+        job_row = {
+            "id": job_id,
+            "branch_name": "feat/awesome",
+            "mr_url": "https://gitlab.com/org/repo/-/merge_requests/42",
+            "opencode_session_id": "sess-abc-123",
+            "task_summary": "Add awesome feature",
+            "workflow_run_id": "wf-run-001",
+        }
+
+        payload = build_job_completed_payload(job_row, task_summary="Add awesome feature")
+
+        assert payload["job_id"] == str(job_id)
+        assert payload["status"] == "completed"
+        assert payload["diff_url"] == f"/jobs/{job_id}/diff"
+        assert payload["branch_name"] == "feat/awesome"
+        assert payload["mr_url"] == "https://gitlab.com/org/repo/-/merge_requests/42"
+        assert payload["session_id"] == "sess-abc-123"
+        assert payload["task_summary"] == "Add awesome feature"
+        assert payload["failure_reason"] is None
+        assert payload["workflow_run_id"] == "wf-run-001"
+
+        # Verify all 9 fields from the schema are present
+        assert set(payload.keys()) == {
+            "job_id",
+            "status",
+            "diff_url",
+            "branch_name",
+            "mr_url",
+            "session_id",
+            "task_summary",
+            "failure_reason",
+            "workflow_run_id",
+        }
+
+    def test_fields_default_to_none_when_missing(self):
+        """When a field is absent from the job row, it should be None."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {"id": job_id, "task_summary": "Minimal row"}
+
+        payload = build_job_completed_payload(job_row)
+
+        assert payload["branch_name"] is None
+        assert payload["mr_url"] is None
+        assert payload["session_id"] is None
+        assert payload["workflow_run_id"] is None
+        assert payload["failure_reason"] is None
+        assert payload["task_summary"] == "Minimal row"
+
+    def test_diff_url_uses_job_id(self):
+        """diff_url is a relative path derived from the job UUID."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {"id": job_id, "task_summary": "Test"}
+
+        payload = build_job_completed_payload(job_row)
+
+        assert payload["diff_url"] == f"/jobs/{job_id}/diff"
+
+    def test_task_summary_fallback_to_row(self):
+        """When task_summary is not passed, fall back to job_row."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {"id": job_id, "task_summary": "From row"}
+
+        payload = build_job_completed_payload(job_row)
+
+        assert payload["task_summary"] == "From row"
+
+    def test_task_summary_overrides_row(self):
+        """Explicit task_summary parameter overrides job_row value."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {"id": job_id, "task_summary": "From row"}
+
+        payload = build_job_completed_payload(job_row, task_summary="Explicit")
+
+        assert payload["task_summary"] == "Explicit"
+
+    def test_session_id_is_opencode_session_id(self):
+        """session_id maps from opencode_session_id column."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {
+            "id": job_id,
+            "opencode_session_id": "sess-xyz",
+            "task_summary": "Test",
+        }
+
+        payload = build_job_completed_payload(job_row)
+
+        assert payload["session_id"] == "sess-xyz"
+
+    def test_workflow_run_id_is_optional(self):
+        """workflow_run_id can be None when absent."""
+        import uuid
+
+        job_id = uuid.uuid4()
+        job_row = {"id": job_id, "task_summary": "Test"}
+
+        payload = build_job_completed_payload(job_row)
+
+        assert payload["workflow_run_id"] is None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -470,8 +594,8 @@ class TestWebhookIntegration:
 
     @pytest.mark.asyncio
     async def test_job_completion_triggers_webhook_dispatch(self, mock_conn, mock_executor):
-        """When a job completes successfully, dispatch_webhooks is called."""
-        job_id = uuid.uuid4()  # This UUID represents what the DB row will return
+        """When a job completes successfully, dispatch_webhooks is called with structured payload."""
+        job_id = uuid.uuid4()
 
         row_data = {
             "id": job_id,
@@ -482,9 +606,12 @@ class TestWebhookIntegration:
             "created_at": "2026-06-14T00:00:00Z",
             "updated_at": "2026-06-14T00:00:00Z",
             "completed_at": None,
-            "opencode_session_id": None,
+            "opencode_session_id": "sess-abc-123",
             "diff": None,
             "workspace_name": None,
+            "branch_name": None,
+            "mr_url": None,
+            "workflow_run_id": None,
         }
 
         # Track the job_id assigned by create_job (uuid.uuid4() inside the handler)
@@ -514,6 +641,8 @@ class TestWebhookIntegration:
                 row_data["status"] = "starting_opencode"
             elif "UPDATE gateway_jobs SET status = 'running'" in sql:
                 row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
+                row_data["status"] = "completed"
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -532,17 +661,32 @@ class TestWebhookIntegration:
 
             assert response.status_code == 201
             data = response.json()["data"]
-            assert data["status"] == "running"
+            assert data["status"] == "completed"
 
-            # dispatch_webhooks should have been called with job.running event
+            # dispatch_webhooks should have been called with job.completed event
+            # and the structured payload
             mock_dispatch.assert_called()
             call_args = mock_dispatch.call_args[0]
             # call_args: (pool, job_id, event_type, payload)
-            assert call_args[2] == "job.running"
-            # The job_id in the payload should match the one assigned by create_job
-            assert call_args[3]["job_id"] == str(captured_job_id)
-            assert call_args[3]["event_type"] == "job.running"
-            assert call_args[3]["status"] == "running"
+            assert call_args[2] == "job.completed"
+
+            # Verify structured payload fields
+            payload = call_args[3]
+            assert payload["job_id"] == str(captured_job_id)
+            assert payload["status"] == "completed"
+            assert payload["diff_url"] == f"/jobs/{captured_job_id}/diff"
+            assert payload["branch_name"] is None
+            assert payload["mr_url"] is None
+            assert payload["session_id"] == "sess-abc-123"
+            assert payload["task_summary"] == "Fix a bug"
+            assert payload["failure_reason"] is None
+            assert payload["workflow_run_id"] is None
+
+            # Verify all expected keys are present
+            assert set(payload.keys()) == {
+                "job_id", "status", "diff_url", "branch_name", "mr_url",
+                "session_id", "task_summary", "failure_reason", "workflow_run_id",
+            }
 
     @pytest.mark.asyncio
     async def test_job_failure_triggers_webhook_dispatch(self):
