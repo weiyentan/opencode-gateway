@@ -64,6 +64,48 @@ async def _fetch_webhook_rows(conn: asyncpg.Connection, event_type: str):
     )
 
 
+# ── Payload builder ─────────────────────────────────────────────────────
+
+
+def build_job_completed_payload(
+    job_row: dict,
+    task_summary: str | None = None,
+) -> dict:
+    """Build a structured webhook payload for a completed job.
+
+    The payload is HMAC-signed inside :func:`dispatch_webhooks` before
+    being POSTed to each matching webhook.  Fields that are not yet
+    available (e.g. ``branch_name``) are included as ``None`` so
+    consumers always see a consistent schema.
+
+    Parameters
+    ----------
+    job_row:
+        A dict or asyncpg Record representing a row from ``gateway_jobs``
+        (typically the return value of ``_fetch_job``).
+    task_summary:
+        Optional human-readable summary.  Falls back to
+        ``job_row["task_summary"]`` when not provided.
+
+    Returns
+    -------
+    dict
+        A JSON-serialisable dict with the fields specified in the
+        issue-150 payload schema.
+    """
+    return {
+        "job_id": str(job_row["id"]),
+        "status": "completed",
+        "diff_url": f"/jobs/{job_row['id']}/diff",
+        "branch_name": job_row.get("branch_name"),
+        "mr_url": job_row.get("mr_url"),
+        "session_id": job_row.get("opencode_session_id"),
+        "task_summary": task_summary or job_row.get("task_summary", ""),
+        "failure_reason": None,
+        "workflow_run_id": job_row.get("workflow_run_id"),
+    }
+
+
 # ── Webhook dispatcher (called by jobs.py) ──────────────────────────────
 
 
