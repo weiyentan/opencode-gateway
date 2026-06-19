@@ -1285,39 +1285,53 @@ async def get_job_events(
 async def get_job_diff(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JSONResponse:
-    """Return the stored diff for a completed job.
+    """Return the diff for a completed job by fetching it from OpenCode Serve.
 
-    Returns the diff payload on success (200), a conflict response when the
-    job is still running (409), or 404 when the job does not exist or has no
-    diff available.
+    Fetches the diff from the OpenCode Serve instance via the stored
+    ``opencode_session_id``.  Returns 404 when the job or its session is
+    not found, and 503 when the OpenCode Serve instance is unreachable.
     """
     row = await conn.fetchrow(
-        "SELECT id, status, diff FROM gateway_jobs WHERE id = $1",
+        "SELECT id, status, opencode_session_id FROM gateway_jobs WHERE id = $1",
         job_id,
     )
 
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if row["status"] == "running":
-        return JSONResponse(
-            status_code=409,
-            content={
-                "job_id": str(job_id),
-                "diff": None,
-                "status": "running",
-            },
+    session_id: str | None = row.get("opencode_session_id")
+    if not session_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No session associated with this job",
         )
 
-    if row["diff"] is None:
-        raise HTTPException(status_code=404, detail="Diff not available")
+    if opencode_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve client not available",
+        )
+
+    try:
+        diff_response = await opencode_client.get_session_diff(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to fetch diff for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve unreachable",
+        )
 
     return JSONResponse(
         status_code=200,
         content={
             "job_id": str(row["id"]),
-            "diff": row["diff"],
+            "diff": diff_response.diff,
         },
     )
 
@@ -1344,7 +1358,7 @@ async def get_job_logs(
     session_id: str | None = row.get("opencode_session_id")
     if not session_id:
         raise HTTPException(
-            status_code=409,
+            status_code=404,
             detail="No session associated with this job",
         )
 

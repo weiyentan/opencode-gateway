@@ -1484,27 +1484,37 @@ class TestJobEvents:
 
 
 class TestJobDiff:
-    """Tests for GET /jobs/{id}/diff."""
+    """Tests for GET /jobs/{id}/diff (fetches diff from OpenCode Serve via session)."""
 
     @pytest.mark.asyncio
-    async def test_get_diff_for_completed_job_returns_200_with_diff(self, mock_conn):
-        """GET /jobs/{id}/diff for a completed job with a diff returns 200 and the diff."""
-        job_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        row_data = {
-            "id": job_id,
-            "repo_url": "https://github.com/org/repo",
-            "task_summary": "Add feature",
-            "status": "completed",
-            "executor_type": "local",
-            "created_at": now,
-            "updated_at": now,
-            "completed_at": now,
-            "diff": "--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new",
-        }
-        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row_data))
+    async def test_get_diff_returns_200_with_diff(self, mock_conn):
+        """GET /jobs/{id}/diff returns 200 with diff content fetched from OpenCode."""
+        from app.opencode.protocol import SessionDiffResponse
 
-        client = create_client(mock_conn)
+        job_id = uuid.uuid4()
+        session_id = "sess-diff-1"
+        expected_diff = "--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new"
+        now = datetime.now(timezone.utc)
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Completed job with diff",
+            status="completed",
+            opencode_session_id=session_id,
+            completed_at=now,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            return_value=SessionDiffResponse(
+                session_id=session_id,
+                diff=expected_diff,
+                files_changed=["file.py"],
+            )
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
 
         async with client as c:
             response = await c.get(f"/jobs/{job_id}/diff")
@@ -1512,7 +1522,9 @@ class TestJobDiff:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["job_id"] == str(job_id)
-        assert data["diff"] == row_data["diff"]
+        assert data["diff"] == expected_diff
+
+        mock_opencode.get_session_diff.assert_called_once_with(session_id)
 
     @pytest.mark.asyncio
     async def test_get_diff_for_unknown_job_returns_404(self, client, mock_conn):
@@ -1525,51 +1537,18 @@ class TestJobDiff:
         assert response.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_get_diff_for_running_job_returns_409(self, mock_conn):
-        """GET /jobs/{id}/diff for a running job returns 409 with status info."""
+    async def test_get_diff_no_session_returns_404(self, mock_conn):
+        """GET /jobs/{id}/diff with no session_id returns 404."""
         job_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        row_data = {
-            "id": job_id,
-            "repo_url": "https://github.com/org/repo",
-            "task_summary": "Running job",
-            "status": "running",
-            "executor_type": "local",
-            "created_at": now,
-            "updated_at": now,
-            "completed_at": None,
-            "diff": None,
-        }
-        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row_data))
-
-        client = create_client(mock_conn)
-
-        async with client as c:
-            response = await c.get(f"/jobs/{job_id}/diff")
-
-        assert response.status_code == 409
-        data = response.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "CONFLICT"
-        assert "running" in data["error"]["message"]
-
-    @pytest.mark.asyncio
-    async def test_get_diff_for_completed_job_without_diff_returns_404(self, mock_conn):
-        """GET /jobs/{id}/diff for a completed job with no diff returns 404."""
-        job_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        row_data = {
-            "id": job_id,
-            "repo_url": "https://github.com/org/repo",
-            "task_summary": "No diff job",
-            "status": "completed",
-            "executor_type": "local",
-            "created_at": now,
-            "updated_at": now,
-            "completed_at": now,
-            "diff": None,
-        }
-        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row_data))
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No session",
+            status="completed",
+            opencode_session_id=None,
+            completed_at=datetime.now(timezone.utc),
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
 
         client = create_client(mock_conn)
 
@@ -1577,39 +1556,75 @@ class TestJobDiff:
             response = await c.get(f"/jobs/{job_id}/diff")
 
         assert response.status_code == 404
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "NOT_FOUND"
+        assert "No session" in data["error"]["message"]
 
     @pytest.mark.asyncio
-    async def test_get_diff_for_invalid_uuid_returns_422(self, client):
+    async def test_get_diff_no_opencode_client_returns_503(self, mock_conn):
+        """GET /jobs/{id}/diff without an OpenCode client returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-no-client"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "No client",
+            status="running",
+            opencode_session_id=session_id,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        # No opencode client injected
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "OpenCode Serve client" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_get_diff_opencode_unreachable_returns_503(self, mock_conn):
+        """GET /jobs/{id}/diff when OpenCode Serve is unreachable returns 503."""
+        job_id = uuid.uuid4()
+        session_id = "sess-down"
+        row = make_job_row(
+            job_id,
+            "https://github.com/org/repo",
+            "Serve down",
+            status="completed",
+            opencode_session_id=session_id,
+            completed_at=datetime.now(timezone.utc),
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row))
+
+        mock_opencode = AsyncMock()
+        mock_opencode.get_session_diff = AsyncMock(
+            side_effect=RuntimeError("Connection refused")
+        )
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.get(f"/jobs/{job_id}/diff")
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "unreachable" in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_diff_invalid_uuid_returns_422(self, client):
         """GET /jobs/{id}/diff with a malformed UUID should return 422."""
         async with client as c:
             response = await c.get("/jobs/not-a-uuid/diff")
 
         assert response.status_code == 422
-
-    @pytest.mark.asyncio
-    async def test_get_diff_for_pending_job_returns_404(self, mock_conn):
-        """GET /jobs/{id}/diff for a pending job (no diff) returns 404."""
-        job_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        row_data = {
-            "id": job_id,
-            "repo_url": "https://github.com/org/repo",
-            "task_summary": "Pending job",
-            "status": "pending",
-            "executor_type": "local",
-            "created_at": now,
-            "updated_at": now,
-            "completed_at": None,
-            "diff": None,
-        }
-        mock_conn.fetchrow = AsyncMock(return_value=mock_row(row_data))
-
-        client = create_client(mock_conn)
-
-        async with client as c:
-            response = await c.get(f"/jobs/{job_id}/diff")
-
-        assert response.status_code == 404
 
 
 class TestDoubleApprove:
@@ -3590,8 +3605,8 @@ class TestJobLogs:
         assert response.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_get_logs_no_session_returns_409(self, mock_conn):
-        """GET /jobs/{id}/logs for a job with no session returns 409."""
+    async def test_get_logs_no_session_returns_404(self, mock_conn):
+        """GET /jobs/{id}/logs for a job with no session returns 404."""
         job_id = uuid.uuid4()
         row = make_job_row(
             job_id,
@@ -3607,10 +3622,10 @@ class TestJobLogs:
         async with client as c:
             response = await c.get(f"/jobs/{job_id}/logs")
 
-        assert response.status_code == 409
+        assert response.status_code == 404
         data = response.json()
         assert data["status"] == "error"
-        assert data["error"]["code"] == "CONFLICT"
+        assert data["error"]["code"] == "NOT_FOUND"
         assert "No session" in data["error"]["message"]
 
     @pytest.mark.asyncio
