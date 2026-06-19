@@ -6,8 +6,7 @@ Covers normal flow, error paths, and template-ID validation.
 from __future__ import annotations
 
 import importlib
-import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
