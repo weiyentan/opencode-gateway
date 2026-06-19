@@ -431,7 +431,7 @@ class TestJobDispatch:
 
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
-            {"id": runner_uuid, "status": "offline"}
+            {"id": runner_uuid, "admin_status": "offline", "health_status": None, "status": "offline"}
         )
 
         async def _execute(sql, *args):
@@ -478,7 +478,7 @@ class TestJobDispatch:
 
         runner_by_id_row = mock_row({"runner_id": runner_text_id})
         runner_by_text_row = mock_row(
-            {"id": runner_uuid, "status": "maintenance"}
+            {"id": runner_uuid, "admin_status": "maintenance", "health_status": None, "status": "maintenance"}
         )
 
         async def _execute(sql, *args):

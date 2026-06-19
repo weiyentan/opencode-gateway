@@ -16,6 +16,8 @@ def _make_runner_row(
     *,
     hostname="runner-01.example.com",
     status="online",
+    admin_status=None,
+    health_status=None,
     executor_type="awx",
     labels=None,
 ):
@@ -26,6 +28,8 @@ def _make_runner_row(
         "runner_id": str(runner_id_val),
         "hostname": hostname,
         "status": status,
+        "admin_status": admin_status,
+        "health_status": health_status,
         "executor_type": executor_type,
         "labels": labels,
         "created_at": now,
@@ -244,6 +248,8 @@ class TestGetRunnerDetail:
         *,
         hostname="runner-detail.example.com",
         status="online",
+        admin_status=None,
+        health_status=None,
         executor_type="awx",
         labels=None,
         workspace_obs=None,
@@ -260,6 +266,8 @@ class TestGetRunnerDetail:
             "runner_id": str(runner_id),
             "hostname": hostname,
             "status": status,
+            "admin_status": admin_status,
+            "health_status": health_status,
             "executor_type": executor_type,
             "labels": labels,
             "created_at": now,
@@ -519,7 +527,7 @@ class TestGetRunnerDetail:
         """policy_status is HEALTHY for runners with no pressure status."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="HEALTHY"
+            mock_conn, r_id, status="HEALTHY", health_status="HEALTHY"
         )
 
         async with client as c:
@@ -532,10 +540,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_unknown(self, client, mock_conn):
-        """policy_status is UNKNOWN when runner status is UNKNOWN."""
+        """policy_status is UNKNOWN when health_status is UNKNOWN."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="UNKNOWN"
+            mock_conn, r_id, status="UNKNOWN", health_status="UNKNOWN"
         )
 
         async with client as c:
@@ -548,10 +556,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_blocked_disk(self, client, mock_conn):
-        """policy_status is BLOCKED_DISK_PRESSURE when runner status matches."""
+        """policy_status is BLOCKED_DISK_PRESSURE when health_status matches."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="BLOCKED_DISK_PRESSURE"
+            mock_conn, r_id, status="BLOCKED_DISK_PRESSURE", health_status="BLOCKED_DISK_PRESSURE"
         )
 
         async with client as c:
@@ -564,10 +572,10 @@ class TestGetRunnerDetail:
 
     @pytest.mark.asyncio
     async def test_policy_status_blocked_memory(self, client, mock_conn):
-        """policy_status is BLOCKED_MEMORY_PRESSURE when runner status matches."""
+        """policy_status is BLOCKED_MEMORY_PRESSURE when health_status matches."""
         r_id = uuid.uuid4()
         self._setup_detail_mocks(
-            mock_conn, r_id, status="BLOCKED_MEMORY_PRESSURE"
+            mock_conn, r_id, status="BLOCKED_MEMORY_PRESSURE", health_status="BLOCKED_MEMORY_PRESSURE"
         )
 
         async with client as c:
@@ -610,8 +618,19 @@ class TestPostRunnerStatus:
         runner_id_str=None,
         hostname="runner-offline.example.com",
         current_status="HEALTHY",
+        current_admin_status=None,
     ):
-        """Configure mock_conn.fetchrow to return a runner row, and track execute calls."""
+        """Configure mock_conn.fetchrow to return a runner row, and track execute calls.
+
+        Parameters
+        ----------
+        current_status:
+            The value for the legacy ``status`` column.
+        current_admin_status:
+            The value for the ``admin_status`` column. When None, the mock
+            returns None (simulating a runner that has never had its admin
+            status set by an operator).
+        """
         if runner_id_val is None:
             runner_id_val = uuid.uuid4()
         if runner_id_str is None:
@@ -621,6 +640,7 @@ class TestPostRunnerStatus:
             "id": runner_id_val,
             "runner_id": runner_id_str,
             "hostname": hostname,
+            "admin_status": current_admin_status,
             "status": current_status,
         }
 
@@ -683,10 +703,10 @@ class TestPostRunnerStatus:
         assert data["reason"] == "Testing transition"
         assert "updated_at" in data
 
-        # Verify runner status UPDATE was issued
+        # Verify runner admin_status UPDATE was issued
         update_calls = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET admin_status" in sql
         ]
         assert len(update_calls) == 1
         _sql, args = update_calls[0]

@@ -298,11 +298,13 @@ class TestPartialBatchHandling:
 
 
 class TestBatchSizeEdgeCases:
-    def test_batch_size_one(self):
+    @pytest.mark.asyncio
+    async def test_batch_size_one(self):
         scheduler = CleanupScheduler(batch_size=1)
         assert scheduler._batch_size == 1
 
-    def test_batch_size_zero_technically_allowed(self):
+    @pytest.mark.asyncio
+    async def test_batch_size_zero_technically_allowed(self):
         scheduler = CleanupScheduler(batch_size=0)
         assert scheduler._batch_size == 0
 
