@@ -324,14 +324,14 @@ async def create_job(
         body.workflow_run_id,
     )
 
-    # 2. Validate and perform pending → running transition
-    if not can_transition(JobStatus.PENDING, JobStatus.RUNNING):
+    # 2. Validate and perform pending → provisioning_workspace transition
+    if not can_transition(JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE):
         logger.error(
-            "Lifecycle rejected transition pending→running for job %s", job_id
+            "Lifecycle rejected transition pending→provisioning_workspace for job %s", job_id
         )
         raise HTTPException(status_code=500, detail="Internal state machine error")
     await conn.execute(
-        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
+        "UPDATE gateway_jobs SET status = 'provisioning_workspace', updated_at = $2 WHERE id = $1",
         job_id,
         datetime.now(timezone.utc),  # noqa: UP017
     )
@@ -362,6 +362,18 @@ async def create_job(
             )
         )
         new_workspace_id = ws_response.workspace_id
+
+        # 4a. Transition: provisioning_workspace → starting_opencode
+        if not can_transition(JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE):
+            logger.error(
+                "Lifecycle rejected transition provisioning_workspace→starting_opencode for job %s", job_id
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'starting_opencode', updated_at = $2 WHERE id = $1",
+            job_id,
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
 
         # Store the workspace ID immediately so it is available even if
         # start_opencode fails and the job is marked "failed".
@@ -417,41 +429,17 @@ async def create_job(
             session_id,
         )
 
-        # 5. Mark completed
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        diff_summary = f"Job completed: {body.task_summary}"
+        # 5a. Transition: starting_opencode → running (NOT completed)
+        if not can_transition(JobStatus.STARTING_OPENCODE, JobStatus.RUNNING):
+            logger.error(
+                "Lifecycle rejected transition starting_opencode→running for job %s", job_id
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
-            "completed_at = $3, diff = $4 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
             job_id,
-            now,
-            now,
-            diff_summary,
+            datetime.now(timezone.utc),  # noqa: UP017
         )
-
-        # Fire webhooks asynchronously — non-blocking
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
-                job_id,
-                "job.completed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.completed",
-                    "status": "completed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": now.isoformat(),
-                    "diff": diff_summary,
-                },
-            )
-        )
-
-        # 6. Set workspace cleanup_after for successful completion
-        if new_workspace_id is not None:
-            await _set_workspace_cleanup_after(
-                conn, new_workspace_id, settings.cleanup_success_retention_hours
-            )
 
         # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
