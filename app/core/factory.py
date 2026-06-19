@@ -58,16 +58,20 @@ def create_app(
         try:
             await pool.connect()
             app.state.pool = pool  # type: ignore[attr-defined]
-
-            # Ensure the database schema is current (idempotent)
-            if pool.pool is not None:
-                await ensure_schema(pool.pool)
         except Exception:
             logger.warning(
                 "Postgres unavailable — starting without database pool",
                 exc_info=True,
             )
             app.state.pool = None  # type: ignore[attr-defined]
+
+        # --- Schema migration (Alembic) ---
+        # Only run if the pool connected successfully.  Schema migration
+        # failures are NOT treated as graceful degradation — they are a
+        # hard startup error because missing tables would cause runtime
+        # failures in API endpoints.
+        if app.state.pool is not None and app.state.pool.pool is not None:  # type: ignore[attr-defined]
+            await ensure_schema(app.state.pool.pool)  # type: ignore[attr-defined]
 
         # --- Executor plugin ---
         executor = _create_executor(settings)
