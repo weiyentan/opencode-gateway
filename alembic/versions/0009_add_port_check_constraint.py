@@ -1,7 +1,7 @@
 """Add CHECK constraint on workspaces.port for the 10000–10999 range.
 
-Revision ID: 0006
-Revises: 0005
+Revision ID: 0009
+Revises: 0008
 Create Date: 2026-06-19
 
 Per ADR 0003, port values must be in the range 10000–10999.  This
@@ -13,8 +13,8 @@ from typing import Sequence, Union
 
 from alembic import op
 
-revision: str = "0006"
-down_revision: Union[str, None] = "0005"
+revision: str = "0009"
+down_revision: Union[str, None] = "0008"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
