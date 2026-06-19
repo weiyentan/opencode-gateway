@@ -687,10 +687,10 @@ class TestOpenCodeStartupFailure:
 
 class TestDiffFetchFailure:
     """Acceptance Criterion 4: The OpenCode client fails to fetch the session
-    diff → the job remains 'completed' with the fallback summary diff.
+    diff → the job remains 'running' with the fallback summary diff.
 
     Verifies:
-    - Job status is 'completed' despite the diff fetch failure
+    - Job status is 'running' despite the diff fetch failure
     - The job_events table is empty (no error events for this non-fatal failure)
     - The job's diff column contains a value (the fallback summary)
     - All lifecycle methods completed successfully
@@ -705,7 +705,7 @@ class TestDiffFetchFailure:
         db_conn,
         runner_id: uuid.UUID,
     ):
-        """When get_session_diff raises, the job stays completed and no
+        """When get_session_diff raises, the job stays running and no
         error events are recorded."""
         fake_opencode_client.get_session_diff_failure = RuntimeError(
             "OpenCode Serve unreachable on port 10000"
@@ -720,23 +720,23 @@ class TestDiffFetchFailure:
         async with app_client as client:
             response = await client.post("/jobs", json=payload)
 
-        # ── Job stays completed ───────────────────────────────────────
+        # ── Job stays running ─────────────────────────────────────────
         assert response.status_code == 201, (
             f"Expected 201, got {response.status_code}: {response.text}"
         )
         data = response.json()["data"]
-        assert data["status"] == "completed", (
-            f"Expected 'completed', got '{data['status']}'"
+        assert data["status"] == "running", (
+            f"Expected 'running', got '{data['status']}'"
         )
 
         job_id = uuid.UUID(data["id"])
 
-        # ── Database confirms completed ───────────────────────────────
+        # ── Database confirms running ─────────────────────────────────
         row = await db_conn.fetchrow(
             "SELECT status, diff, opencode_session_id FROM gateway_jobs WHERE id = $1",
             job_id,
         )
-        assert row["status"] == "completed"
+        assert row["status"] == "running"
         # Diff should fall back to the summary (not the OpenCode detail)
         assert row["diff"] is not None, (
             "Job should have a fallback summary diff even when OpenCode diff fetch fails"

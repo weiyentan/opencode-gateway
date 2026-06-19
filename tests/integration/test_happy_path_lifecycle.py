@@ -299,16 +299,23 @@ class TestHappyPathLifecycle:
         assert body["status"] == "ok", f"Response status not ok: {body}"
         data = body["data"]
 
-        # Final status must be "completed".
-        assert data["status"] == "completed", (
-            f"Expected final status 'completed', got '{data['status']}'"
+        # Final status must be "running" (job completes asynchronously).
+        assert data["status"] == "running", (
+            f"Expected final status 'running', got '{data['status']}'"
         )
-        assert data["completed_at"] is not None, "completed_at must be set"
+        assert data["completed_at"] is None, "completed_at must be None until /complete"
         assert data["opencode_session_id"] is not None, (
             "opencode_session_id must be set"
         )
         assert data["diff"] is not None, "diff must be present"
         assert uuid.UUID(data["id"]) == job_id, "Job ID must match"
+
+        # Complete the job to reach terminal state for DB assertions.
+        complete_resp = await app_client.post(f"/jobs/{job_id}/complete", json={"target_status": "completed"})
+        assert complete_resp.status_code == 200
+        complete_data = complete_resp.json()
+        assert complete_data["data"]["status"] == "completed"
+        assert complete_data["data"]["completed_at"] is not None
 
         # -- 5. Verify final database state --------------------------------
         final_row = await db_conn.fetchrow(
@@ -464,7 +471,7 @@ class TestHappyPathLifecycle:
         response = await job_task
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
         # The diff from the fake client should include "file.py".
         assert "file.py" in data["diff"], (

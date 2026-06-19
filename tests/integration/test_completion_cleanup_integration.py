@@ -279,12 +279,12 @@ class TestNoPrematureCompletion:
         async with app_client as client:
             response = await client.post("/jobs", json=payload)
 
-        # ── Verify the final response shows completed ─────────────────
+        # ── Verify the final response shows running ─────────────────
         assert response.status_code == 201, (
             f"Expected 201, got {response.status_code}: {response.text}"
         )
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
         # ── Verify status snapshots captured during executor calls ────
         # Both create_workspace and start_opencode should have been called
@@ -332,18 +332,36 @@ class TestNoPrematureCompletion:
             "runner_id": str(runner_id),
         }
 
-        async with app_client as client:
-            response = await client.post("/jobs", json=payload)
+        response = await app_client.post("/jobs", json=payload)
 
         assert response.status_code == 201
-        job_id = uuid.UUID(response.json()["data"]["id"])
+        data = response.json()["data"]
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
+        job_id = uuid.UUID(data["id"])
 
+        # After POST /jobs, the job should be in "running" state.
         row = await db_conn.fetchrow(
             "SELECT status, created_at, completed_at, updated_at "
             "FROM gateway_jobs WHERE id = $1",
             job_id,
         )
         assert row is not None
+        assert row["status"] == "running"
+        assert row["completed_at"] is None
+
+        # Complete the job to reach terminal state for timestamp verification.
+        complete_resp = await app_client.post(
+            f"/jobs/{job_id}/complete",
+            json={"target_status": "completed"},
+        )
+        assert complete_resp.status_code == 200
+
+        row = await db_conn.fetchrow(
+            "SELECT status, created_at, completed_at, updated_at "
+            "FROM gateway_jobs WHERE id = $1",
+            job_id,
+        )
         assert row["status"] == "completed"
         assert row["completed_at"] is not None
         # completed_at must be after created_at (proving the job existed
@@ -366,7 +384,7 @@ class TestNoPrematureCompletion:
         """Executor call count and snapshots together prove the running transition.
 
         The flow is::
-            pending → running → [create_workspace] → [start_opencode] → completed
+            pending → running → [create_workspace] → [start_opencode] → completed (via /complete)
 
         By verifying that create_workspace and start_opencode were called
         AND that the DB showed 'running' during those calls, we prove
@@ -382,7 +400,7 @@ class TestNoPrematureCompletion:
             response = await client.post("/jobs", json=payload)
 
         assert response.status_code == 201
-        assert response.json()["data"]["status"] == "completed"
+        assert response.json()["data"]["status"] == "running"
 
         # Sequence proof: create_workspace must have been called before
         # start_opencode (enforced by the sync handler).
@@ -457,10 +475,22 @@ class TestCleanupAfterCompletion:
 
         assert response.status_code == 201
         job_data = response.json()["data"]
-        assert job_data["status"] == "completed"
+        assert job_data["status"] == "running"
         job_id = uuid.UUID(job_data["id"])
 
-        # 3. Get the workspace ID from the job record
+        # 3. Complete the job to reach terminal state for cleanup.
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-api-key"},
+        ) as client:
+            complete_resp = await client.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "completed"},
+            )
+        assert complete_resp.status_code == 200
+
+        # 4. Get the workspace ID from the job record
         row = await db_conn.fetchrow(
             "SELECT workspace_name FROM gateway_jobs WHERE id = $1",
             job_id,
@@ -468,7 +498,7 @@ class TestCleanupAfterCompletion:
         assert row is not None
         ws_id = uuid.UUID(row["workspace_name"])
 
-        # 4. Call the workspace cleanup endpoint
+        # 5. Call the workspace cleanup endpoint
         async with AsyncClient(
             transport=transport,
             base_url="http://test",
@@ -484,12 +514,12 @@ class TestCleanupAfterCompletion:
             f"Unexpected cleanup_status: {cleanup_data['cleanup_status']}"
         )
 
-        # 5. Verify executor.cleanup_workspace was called
+        # 6. Verify executor.cleanup_workspace was called
         assert len(tracked_executor.calls["cleanup_workspace"]) == 1
         cleanup_call = tracked_executor.calls["cleanup_workspace"][0]
         assert cleanup_call.workspace_id == ws_id
 
-        # 6. Verify the job status is STILL completed (not affected by cleanup)
+        # 7. Verify the job status is STILL completed (not affected by cleanup)
         job_row = await db_conn.fetchrow(
             "SELECT status FROM gateway_jobs WHERE id = $1",
             job_id,
@@ -544,10 +574,22 @@ class TestCleanupAfterCompletion:
 
         assert response.status_code == 201
         job_data = response.json()["data"]
-        assert job_data["status"] == "completed"
+        assert job_data["status"] == "running"
         job_id = uuid.UUID(job_data["id"])
 
-        # 2. Get the workspace ID
+        # 2. Complete the job to reach terminal state for cleanup.
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-api-key"},
+        ) as client:
+            complete_resp = await client.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "completed"},
+            )
+        assert complete_resp.status_code == 200
+
+        # 3. Get the workspace ID
         row = await db_conn.fetchrow(
             "SELECT workspace_name FROM gateway_jobs WHERE id = $1",
             job_id,
@@ -555,7 +597,7 @@ class TestCleanupAfterCompletion:
         assert row is not None
         ws_id = uuid.UUID(row["workspace_name"])
 
-        # 3. Verify the workspace exists and is active
+        # 4. Verify the workspace exists and is active
         ws_row = await db_conn.fetchrow(
             "SELECT cleanup_status FROM workspaces WHERE id = $1",
             ws_id,
@@ -563,12 +605,12 @@ class TestCleanupAfterCompletion:
         assert ws_row is not None
         assert ws_row["cleanup_status"] == "active"
 
-        # 4. Inject a cleanup failure into the executor
+        # 5. Inject a cleanup failure into the executor
         tracked_executor.cleanup_workspace_failure = RuntimeError(
             "rm -rf workspace failed: Permission denied"
         )
 
-        # 5. Call the workspace cleanup endpoint
+        # 6. Call the workspace cleanup endpoint
         async with AsyncClient(
             transport=transport,
             base_url="http://test",
@@ -584,14 +626,14 @@ class TestCleanupAfterCompletion:
         )
         cleanup_data = cleanup_response.json()["data"]
 
-        # 6. Verify the workspace shows cleanup_failed status
+        # 7. Verify the workspace shows cleanup_failed status
         assert cleanup_data["cleanup_status"] == "cleanup_failed", (
             f"Expected cleanup_failed, got {cleanup_data['cleanup_status']}"
         )
         assert cleanup_data["cleanup_failure_reason"] is not None
         assert "rm -rf workspace failed" in cleanup_data["cleanup_failure_reason"]
 
-        # 7. THE KEY ASSERTION: verify the job status is STILL completed
+        # 8. THE KEY ASSERTION: verify the job status is STILL completed
         job_row = await db_conn.fetchrow(
             "SELECT status FROM gateway_jobs WHERE id = $1",
             job_id,
@@ -601,7 +643,7 @@ class TestCleanupAfterCompletion:
             f"failure — must remain 'completed'"
         )
 
-        # 8. Verify the workspace record confirms the failure in the DB
+        # 9. Verify the workspace record confirms the failure in the DB
         ws_row_after = await db_conn.fetchrow(
             "SELECT cleanup_status, cleanup_failed_at, cleanup_failure_reason "
             "FROM workspaces WHERE id = $1",

@@ -109,6 +109,21 @@ Alembic is the **single source of truth** for the production database schema. Al
 
 The Gateway automatically runs migrations at startup — no manual steps are required in development or production. If any required table is missing after migration, startup fails with a clear error message naming the missing tables.
 
+The 10 required tables are:
+
+| Table | Purpose |
+|-------|---------|
+| `gateway_jobs` | Core job lifecycle tracking |
+| `workspaces` | Per-job workspace directories |
+| `job_events` | State transition audit trail |
+| `approvals` | Human approval records |
+| `runners` | Runner VM registry |
+| `runner_events` | Runner status change audit trail |
+| `runner_observations` | Runner telemetry snapshots |
+| `workspace_observations` | Per-workspace resource metrics |
+| `opencode_instance_observations` | Per-instance opencode serve state |
+| `webhooks` | Webhook endpoint configuration |
+
 #### Manual migration (optional)
 
 For troubleshooting or CI pipelines, you can run migrations manually:

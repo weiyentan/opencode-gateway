@@ -514,21 +514,28 @@ class TestFullLifecycle:
         async with app_client as client:
             response = await client.post("/jobs", json=payload)
 
-        # ── Verify HTTP response ─────────────────────────────────────
-        assert response.status_code == 201, (
-            f"Expected 201, got {response.status_code}: {response.text}"
-        )
-        body = response.json()
-        assert body["status"] == "ok", f"Response status not ok: {body}"
-        data = body["data"]
-        assert data["status"] == "completed"
-        assert data["repo_url"] == "https://github.com/example/test-repo.git"
-        assert data["task_summary"] == "Integration test full lifecycle"
-        assert data["completed_at"] is not None
-        assert data["opencode_session_id"] is not None
-        assert data["diff"] is not None
+            # ── Verify HTTP response ─────────────────────────────────────
+            assert response.status_code == 201, (
+                f"Expected 201, got {response.status_code}: {response.text}"
+            )
+            body = response.json()
+            assert body["status"] == "ok", f"Response status not ok: {body}"
+            data = body["data"]
+            assert data["status"] == "running"
+            assert data["repo_url"] == "https://github.com/example/test-repo.git"
+            assert data["task_summary"] == "Integration test full lifecycle"
+            assert data["completed_at"] is None
+            assert data["opencode_session_id"] is not None
+            assert data["diff"] is not None
 
-        job_id = uuid.UUID(data["id"])
+            job_id = uuid.UUID(data["id"])
+
+            # Complete the job to reach terminal state for DB assertions.
+            complete_resp = await client.post(
+                f"/jobs/{job_id}/complete",
+                json={"target_status": "completed"},
+            )
+            assert complete_resp.status_code == 200
 
         # ── Verify executor was called ───────────────────────────────
         assert len(fake_executor.calls["create_workspace"]) == 1
@@ -696,7 +703,7 @@ class TestFullLifecycle:
         db_conn,
         runner_id: uuid.UUID,
     ):
-        """When diff fetch fails, the job remains completed (failure is non-fatal)."""
+        """When diff fetch fails, the job remains running (failure is non-fatal)."""
         # Inject failure into the fake OpenCode client
         fake_opencode_client.get_session_diff_failure = RuntimeError(
             "OpenCode unreachable"
@@ -713,13 +720,13 @@ class TestFullLifecycle:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
 
         job_id = uuid.UUID(data["id"])
         row = await db_conn.fetchrow(
             "SELECT status, diff FROM gateway_jobs WHERE id = $1", job_id,
         )
-        assert row["status"] == "completed"
+        assert row["status"] == "running"
         # Diff will be the fallback summary, not the OpenCode detail
         assert row["diff"] is not None  # falls back to the summary diff
 
@@ -1174,7 +1181,7 @@ class TestRunnerHealthIntegration:
         # The job should succeed despite no observations (online bypasses policy)
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
         assert len(fake_executor.calls["create_workspace"]) == 1
 
     # ═════════════════════════════════════════════════════════════════════
@@ -1212,7 +1219,7 @@ class TestRunnerHealthIntegration:
             f"Expected 201 for eligible runner, got {response.status_code}: {response.text}"
         )
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
         assert len(fake_executor.calls["create_workspace"]) == 1
 
     @pytest.mark.asyncio

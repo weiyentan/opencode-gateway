@@ -488,18 +488,6 @@ async def create_job(
         )
         new_workspace_id = ws_response.workspace_id
 
-        # 4a. Transition: provisioning_workspace → starting_opencode
-        if not can_transition(JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE):
-            logger.error(
-                "Lifecycle rejected transition provisioning_workspace→starting_opencode for job %s", job_id
-            )
-            raise HTTPException(status_code=500, detail="Internal state machine error")
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'starting_opencode', updated_at = $2 WHERE id = $1",
-            job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
-        )
-
         # Store the workspace ID immediately so it is available even if
         # start_opencode fails and the job is marked "failed".
         await conn.execute(
@@ -508,7 +496,7 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 4a. Allocate a port and persist it atomically against the workspace (ADR 0003).
+        # 4. Allocate a port and persist it atomically against the workspace (ADR 0003).
         # allocate_and_assign_port acquires an advisory lock, selects a free port,
         # and updates the workspace row in a single transaction, eliminating the
         # race window that existed with the old two-step allocate + UPDATE pattern.
