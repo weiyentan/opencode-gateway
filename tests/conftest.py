@@ -161,6 +161,21 @@ def create_client(
 # ══════════════════════════════════════════════════════════════════════════
 
 
+@pytest.fixture(autouse=True)
+def _skip_migrations_in_unit_tests() -> None:
+    """Replace ensure_schema with a no-op in unit tests (no real database).
+
+    Unit tests use mock database connections — Alembic cannot run real
+    migrations against them.  Individual test files that need to verify
+    ensure_schema behaviour (e.g. test_schema.py) apply their own
+    targeted patches inside the test function body.
+    """
+    from unittest.mock import patch
+
+    with patch("app.core.factory.ensure_schema", AsyncMock()):
+        yield
+
+
 @pytest.fixture
 def mock_conn() -> AsyncMock:
     """Return a mock asyncpg connection."""
