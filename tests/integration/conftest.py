@@ -274,21 +274,33 @@ async def create_runner(
     *,
     hostname: str = "test-runner.example.com",
     status: str = "HEALTHY",
+    admin_status: str | None = "online",
+    health_status: str | None = "HEALTHY",
     executor_type: str = "local",
     labels: dict | None = None,
 ) -> uuid.UUID:
-    """Insert a runner and return its UUID."""
+    """Insert a runner and return its UUID.
+
+    Sets all three status columns: the legacy *status* field, the
+    operator-set *admin_status* (default ``"online"``), and the
+    observation-derived *health_status* (default ``"HEALTHY"``).
+
+    Pass ``admin_status=None`` or ``health_status=None`` to leave the
+    column NULL (useful for tests that verify NULL handling).
+    """
     rid = uuid.uuid4()
     await conn.execute(
         "INSERT INTO runners (id, runner_id, hostname, executor_type, labels, "
-        "status, created_at, updated_at) "
-        "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $7)",
+        "status, admin_status, health_status, created_at, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $9)",
         rid,
         str(rid),
         hostname,
         executor_type,
         '{"env": "test"}' if labels is None else str(labels).replace("'", '"'),
         status,
+        admin_status,
+        health_status,
         datetime.now(timezone.utc),
     )
     return rid

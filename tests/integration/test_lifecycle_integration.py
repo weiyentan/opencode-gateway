@@ -260,11 +260,13 @@ def fake_opencode_client() -> FakeOpenCodeClient:
 
 @pytest.fixture
 async def runner_id(db_conn) -> uuid.UUID:
-    """Create a HEALTHY runner in the test database and return its UUID."""
+    """Create a HEALTHY runner in the test database with explicit triple-status."""
     return await create_runner(
         db_conn,
         hostname="integration-test-runner",
         status="HEALTHY",
+        admin_status="online",
+        health_status="HEALTHY",
         executor_type="local",
     )
 
@@ -1044,11 +1046,12 @@ class TestRunnerHealthIntegration:
         from app.db.session import get_session
         from app.executors.factory import get_executor
 
-        # Create an offline runner
+        # Create an offline runner (admin_status rejects the job immediately)
         offline_runner_id = await create_runner(
             db_conn,
             hostname="offline-runner",
             status="offline",
+            admin_status="offline",
             executor_type="local",
         )
 
@@ -1103,6 +1106,7 @@ class TestRunnerHealthIntegration:
             db_conn,
             hostname="maint-runner",
             status="maintenance",
+            admin_status="maintenance",
             executor_type="local",
         )
 
@@ -1153,6 +1157,8 @@ class TestRunnerHealthIntegration:
             db_conn,
             hostname="online-runner",
             status="online",
+            admin_status="online",
+            health_status="HEALTHY",
             executor_type="local",
         )
 
@@ -1170,3 +1176,152 @@ class TestRunnerHealthIntegration:
         data = response.json()["data"]
         assert data["status"] == "completed"
         assert len(fake_executor.calls["create_workspace"]) == 1
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Triple-status scheduling model
+    # ═════════════════════════════════════════════════════════════════════
+
+    @pytest.mark.asyncio
+    async def test_eligible_runner_admin_online_health_healthy_is_accepted(
+        self,
+        app_client: AsyncClient,
+        fake_executor: FakeExecutorPlugin,
+        db_conn,
+    ):
+        """A runner with admin_status='online' and health_status='HEALTHY'
+        is eligible for job dispatch and the job is accepted."""
+        runner_id = await create_runner(
+            db_conn,
+            hostname="eligible-runner",
+            status="HEALTHY",
+            admin_status="online",
+            health_status="HEALTHY",
+            executor_type="local",
+        )
+
+        payload = {
+            "repo_url": "https://github.com/example/eligible-test.git",
+            "task_summary": "Eligible runner test",
+            "runner_id": str(runner_id),
+        }
+
+        async with app_client as client:
+            response = await client.post("/jobs", json=payload)
+
+        assert response.status_code == 201, (
+            f"Expected 201 for eligible runner, got {response.status_code}: {response.text}"
+        )
+        data = response.json()["data"]
+        assert data["status"] == "completed"
+        assert len(fake_executor.calls["create_workspace"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_rejected_runner_admin_maintenance_health_healthy(
+        self,
+        db_conn,
+        fake_executor: FakeExecutorPlugin,
+    ):
+        """A runner with admin_status='maintenance' is rejected even with
+        health_status='HEALTHY'."""
+        from app.api.jobs import get_opencode_client
+        from app.core.factory import create_app
+        from app.db.session import get_session
+        from app.executors.factory import get_executor
+
+        maint_runner_id = await create_runner(
+            db_conn,
+            hostname="maint-rejected-runner",
+            status="maintenance",
+            admin_status="maintenance",
+            health_status="HEALTHY",
+            executor_type="local",
+        )
+
+        app = create_app()
+        app.state.pool = AsyncMock()
+        app.state.pool.pool = None
+
+        async def _override_get_session(request):
+            yield db_conn
+
+        app.dependency_overrides[get_session] = _override_get_session
+        app.dependency_overrides[get_executor] = lambda: fake_executor
+        app.dependency_overrides[get_opencode_client] = lambda: None
+
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-api-key"},
+        ) as client:
+            response = await client.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/example/maint-reject.git",
+                    "task_summary": "Maintenance runner rejection test",
+                    "runner_id": str(maint_runner_id),
+                },
+            )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "error"
+        assert len(fake_executor.calls["create_workspace"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_rejected_runner_admin_online_health_unknown(
+        self,
+        db_conn,
+        fake_executor: FakeExecutorPlugin,
+    ):
+        """A runner with admin_status='online' but health_status='UNKNOWN'
+        is rejected because health_status must be 'HEALTHY'."""
+        from app.api.jobs import get_opencode_client
+        from app.core.factory import create_app
+        from app.db.session import get_session
+        from app.executors.factory import get_executor
+
+        unknown_runner_id = await create_runner(
+            db_conn,
+            hostname="unknown-health-runner",
+            status="UNKNOWN",
+            admin_status="online",
+            health_status="UNKNOWN",
+            executor_type="local",
+        )
+
+        app = create_app()
+        app.state.pool = AsyncMock()
+        app.state.pool.pool = None
+
+        async def _override_get_session(request):
+            yield db_conn
+
+        app.dependency_overrides[get_session] = _override_get_session
+        app.dependency_overrides[get_executor] = lambda: fake_executor
+        app.dependency_overrides[get_opencode_client] = lambda: None
+
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-api-key"},
+        ) as client:
+            response = await client.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/example/unknown-health.git",
+                    "task_summary": "Unknown health runner test",
+                    "runner_id": str(unknown_runner_id),
+                },
+            )
+
+        # explicit pin: health_status='UNKNOWN' != 'HEALTHY' → 400
+        assert response.status_code == 400, (
+            f"Expected 400 for runner with health_status='UNKNOWN', "
+            f"got {response.status_code}: {response.text}"
+        )
+        data = response.json()
+        assert data["status"] == "error"
+        assert "health_status" in data["error"]["message"].lower()
+        assert len(fake_executor.calls["create_workspace"]) == 0

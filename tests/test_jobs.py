@@ -3874,7 +3874,7 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "no healthy runners" in data["error"]["message"].lower()
+        assert "no runners with admin_status" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_explicit_pin_rejects_admin_status_offline(
@@ -3885,8 +3885,8 @@ class TestRunnerSelection:
         runner_id = uuid.uuid4()
 
         async def _fetchrow(sql, *args):
-            if "SELECT id, status FROM runners WHERE id" in sql:
-                return mock_row({"id": runner_id, "status": "offline"})
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "offline", "health_status": "HEALTHY"})
             return None
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -3908,7 +3908,8 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "not healthy" in data["error"]["message"].lower()
+        assert "admin_status" in data["error"]["message"].lower()
+        assert "offline" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_explicit_pin_rejects_admin_status_maintenance(
@@ -3919,8 +3920,8 @@ class TestRunnerSelection:
         runner_id = uuid.uuid4()
 
         async def _fetchrow(sql, *args):
-            if "SELECT id, status FROM runners WHERE id" in sql:
-                return mock_row({"id": runner_id, "status": "maintenance"})
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "maintenance", "health_status": "HEALTHY"})
             return None
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -3942,7 +3943,8 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "not healthy" in data["error"]["message"].lower()
+        assert "admin_status" in data["error"]["message"].lower()
+        assert "maintenance" in data["error"]["message"]
 
 
 class TestJobLogs:
