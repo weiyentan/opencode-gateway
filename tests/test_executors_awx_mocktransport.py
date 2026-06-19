@@ -19,6 +19,7 @@ import pytest
 
 from app.executors.awx.client import AWXApiClient
 from app.executors.awx.exceptions import (
+    AWXArtifactError,
     AWXClientError,
     AWXConnectionError,
     AWXHTTPError,
@@ -263,10 +264,10 @@ class TestCreateWorkspace:
         assert str(resp.workspace_id) == "11111111-2222-3333-4444-555555555555"
 
     @pytest.mark.asyncio
-    async def test_creates_workspace_with_missing_artifacts_returns_defaults(
+    async def test_creates_workspace_with_missing_artifacts_raises(
         self,
     ) -> None:
-        """When AWX returns no artifacts, sensible defaults are used."""
+        """When AWX returns no artifacts, an AWXArtifactError is raised."""
         handler = _make_awx_handler(
             launch_response={"id": 103, "status": "pending"},
             job_responses=[
@@ -287,11 +288,13 @@ class TestCreateWorkspace:
 
         req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
         with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
-            resp = await plugin.create_workspace(req)
+            with pytest.raises(AWXArtifactError) as exc_info:
+                await plugin.create_workspace(req)
 
-        assert resp.status == "successful"
-        assert resp.workspace_path == ""
-        assert resp.workspace_id == UUID(int=0)
+        err = exc_info.value
+        assert err.template_name == "gateway-create-workspace"
+        assert "workspace_id" in err.missing_fields
+        assert "workspace_path" in err.missing_fields
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -402,8 +405,8 @@ class TestLifecycle:
         assert resp.port == 8080
 
     @pytest.mark.asyncio
-    async def test_start_opencode_missing_artifacts_returns_defaults(self) -> None:
-        """When AWX returns no artifacts, port=0 and session_id=UUID(0)."""
+    async def test_start_opencode_missing_artifacts_raises(self) -> None:
+        """When AWX returns no artifacts, an AWXArtifactError is raised."""
         handler = _make_awx_handler(
             launch_response={"id": 203, "status": "pending"},
             job_responses=[
@@ -424,10 +427,13 @@ class TestLifecycle:
 
         req = StartOpencodeRequest(workspace_id=self.WS_ID)
         with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
-            resp = await plugin.start_opencode(req)
+            with pytest.raises(AWXArtifactError) as exc_info:
+                await plugin.start_opencode(req)
 
-        assert resp.port == 0
-        assert resp.session_id == UUID(int=0)
+        err = exc_info.value
+        assert "gateway-opencode-lifecycle" in err.template_name
+        assert "session_id" in err.missing_fields
+        assert "port" in err.missing_fields
 
     @pytest.mark.asyncio
     async def test_stop_opencode(self) -> None:
@@ -601,8 +607,8 @@ class TestTeardown:
         assert resp.status == WorkspaceState.ERROR
 
     @pytest.mark.asyncio
-    async def test_collect_state_falls_back_to_job_status(self) -> None:
-        """When artifacts lack a 'status' key, fall back to AWX job status."""
+    async def test_collect_state_missing_status_raises(self) -> None:
+        """When artifacts lack a 'status' key, an AWXArtifactError is raised."""
         handler = _make_awx_handler(
             launch_response={"id": 403, "status": "pending"},
             job_responses=[
@@ -623,10 +629,12 @@ class TestTeardown:
 
         req = CollectStateRequest(workspace_id=self.WS_ID)
         with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
-            resp = await plugin.collect_state(req)
+            with pytest.raises(AWXArtifactError) as exc_info:
+                await plugin.collect_state(req)
 
-        # "successful" is not a valid WorkspaceState, defaults to ERROR
-        assert resp.status == WorkspaceState.ERROR
+        err = exc_info.value
+        assert "gateway-workspace-teardown" in err.template_name
+        assert "status" in err.missing_fields
 
     @pytest.mark.asyncio
     async def test_cleanup_workspace(self) -> None:
@@ -854,7 +862,10 @@ class TestTemplateIDs:
                     "status": "successful",
                     "started": "2024-01-01T00:00:00Z",
                     "finished": "2024-01-01T00:01:00Z",
-                    "artifacts": {},
+                    "artifacts": {
+                        "workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "workspace_path": "/some/path",
+                    },
                 },
             )
 
@@ -886,7 +897,10 @@ class TestTemplateIDs:
                     "status": "successful",
                     "started": "2024-01-01T00:00:00Z",
                     "finished": "2024-01-01T00:01:00Z",
-                    "artifacts": {},
+                    "artifacts": {
+                        "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "port": 8080,
+                    },
                 },
             )
 
@@ -918,7 +932,7 @@ class TestTemplateIDs:
                     "status": "successful",
                     "started": "2024-01-01T00:00:00Z",
                     "finished": "2024-01-01T00:01:00Z",
-                    "artifacts": {},
+                    "artifacts": {"status": "running"},
                 },
             )
 
