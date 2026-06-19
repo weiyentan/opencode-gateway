@@ -2490,13 +2490,19 @@ class TestAbortEvents:
 
 
 class TestRunnerSelection:
-    """Tests for runner selection and job pinning in POST /jobs."""
+    """Tests for runner selection and job pinning in POST /jobs.
+
+    Verifies that select_runner() filters runners using admin_status='online'
+    AND health_status='HEALTHY' instead of the legacy status field.
+    Runners with admin_status='offline' or 'maintenance' are excluded,
+    as are runners with health_status != 'HEALTHY'.
+    """
 
     @pytest.mark.asyncio
     async def test_explicit_runner_pin_healthy_runner_succeeds(
         self, mock_conn, mock_executor
     ):
-        """POST /jobs with a valid, healthy runner_id should dispatch to that runner."""
+        """POST /jobs with a valid, online+healthy runner_id should dispatch to that runner."""
         job_id = uuid.uuid4()
         runner_id = uuid.uuid4()
 
@@ -2507,8 +2513,8 @@ class TestRunnerSelection:
 
         # Track which SQL is being queried so we can return the right mock
         async def _fetchrow(sql, *args):
-            if "SELECT id, status FROM runners WHERE id" in sql:
-                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "online", "health_status": "HEALTHY"})
             if "SELECT" in sql.upper() and "gateway_jobs" in sql:
                 return mock_row(row_data)
             return None
@@ -2548,7 +2554,7 @@ class TestRunnerSelection:
         runner_id = uuid.uuid4()
 
         async def _fetchrow(sql, *args):
-            if "SELECT id, status FROM runners WHERE id" in sql:
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
                 return None  # runner not found
             return None
 
@@ -2577,12 +2583,12 @@ class TestRunnerSelection:
     async def test_explicit_runner_pin_unhealthy_returns_400(
         self, mock_conn, mock_executor
     ):
-        """POST /jobs with a runner that is not HEALTHY should return 400."""
+        """POST /jobs with a runner whose health_status is not HEALTHY should return 400."""
         runner_id = uuid.uuid4()
 
         async def _fetchrow(sql, *args):
-            if "SELECT id, status FROM runners WHERE id" in sql:
-                return mock_row({"id": runner_id, "status": "BLOCKED_DISK_PRESSURE"})
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "online", "health_status": "BLOCKED_DISK_PRESSURE"})
             return None
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -2604,7 +2610,109 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "not healthy" in data["error"]["message"].lower()
+        assert "health_status" in data["error"]["message"].lower()
+        assert "BLOCKED_DISK_PRESSURE" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_admin_status_offline_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a runner whose admin_status is 'offline' should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "offline", "health_status": "HEALTHY"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to offline runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "admin_status" in data["error"]["message"].lower()
+        assert "offline" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_admin_status_maintenance_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a runner whose admin_status is 'maintenance' should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "maintenance", "health_status": "HEALTHY"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to maintenance runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "admin_status" in data["error"]["message"].lower()
+        assert "maintenance" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_runner_pin_health_status_null_returns_400(
+        self, mock_conn, mock_executor
+    ):
+        """POST /jobs with a runner whose health_status is None should return 400."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "online", "health_status": None})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to null health runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "health_status" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_label_based_selection_matching_runner_found(
@@ -2683,7 +2791,7 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "no healthy runner" in data["error"]["message"].lower()
+        assert "no runner" in data["error"]["message"].lower()
         assert "nonexistent-label" in data["error"]["message"]
 
     @pytest.mark.asyncio
@@ -2767,7 +2875,7 @@ class TestRunnerSelection:
         data = response.json()
         assert data["status"] == "error"
         assert data["error"]["code"] == "BAD_REQUEST"
-        assert "no healthy runners" in data["error"]["message"].lower()
+        assert "no runners" in data["error"]["message"].lower()
 
     @pytest.mark.asyncio
     async def test_load_balancing_picks_runner_with_fewest_workspaces(
@@ -2834,8 +2942,8 @@ class TestRunnerSelection:
 
         async def _fetchrow(sql, *args):
             # Only the explicit runner lookup should be called (not the label query)
-            if "SELECT id, status FROM runners WHERE id" in sql:
-                return mock_row({"id": runner_id, "status": "HEALTHY"})
+            if "SELECT id, admin_status, health_status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "admin_status": "online", "health_status": "HEALTHY"})
             if "SELECT" in sql.upper() and "gateway_jobs" in sql:
                 return mock_row(row_data)
             return None

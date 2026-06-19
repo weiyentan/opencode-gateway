@@ -58,7 +58,8 @@ class JobCreateRequest(BaseModel):
     runner_id: uuid.UUID | None = Field(
         default=None,
         description="UUID of the runner to pin this job to.  When set, the "
-        "runner must exist and be HEALTHY.",
+        "runner must exist, have admin_status='online', and "
+        "health_status='HEALTHY'.",
     )
     labels: list[str] | None = Field(
         default=None,
@@ -186,15 +187,18 @@ async def select_runner(
 
     1. Look up the runner by its UUID primary key in the ``runners`` table.
     2. If the runner does not exist → raise ``HTTPException(400)``.
-    3. If the runner's ``status`` is not ``HEALTHY`` → raise
+    3. If the runner's ``admin_status`` is not ``online`` → raise
        ``HTTPException(400)``.
-    4. Otherwise, return the runner's UUID.
+    4. If the runner's ``health_status`` is not ``HEALTHY`` → raise
+       ``HTTPException(400)``.
+    5. Otherwise, return the runner's UUID.
 
     **2. Label-Based Selection (``labels`` provided, ``runner_id`` absent)**
     When the caller provides ``labels`` but no ``runner_id``:
 
     1. Query all runners where:
-       - ``status = 'HEALTHY'``, AND
+       - ``admin_status = 'online'``, AND
+       - ``health_status = 'HEALTHY'``, AND
        - the ``labels`` JSONB column contains every requested label as a
          key (checked via PostgreSQL ``?&`` operator).
     2. Among the candidates, count each runner's active workspaces
@@ -208,7 +212,8 @@ async def select_runner(
     **3. Automatic Selection (neither ``runner_id`` nor ``labels``)**
     When the caller provides no constraints:
 
-    1. Query all runners with ``status = 'HEALTHY'``.
+    1. Query all runners with ``admin_status = 'online'`` AND
+       ``health_status = 'HEALTHY'``.
     2. Count each runner's active workspaces.
     3. Select the runner with the **fewest** active workspaces.
     4. Break ties by lowest UUID.
@@ -238,13 +243,14 @@ async def select_runner(
     Raises
     ------
     HTTPException(400)
-        If the requested runner is not found, is unhealthy, or no
-        matching healthy runner is available.
+        If the requested runner is not found, its ``admin_status`` is
+        not ``online``, its ``health_status`` is not ``HEALTHY``, or no
+        matching runner with the required statuses is available.
     """
     if runner_id is not None:
         # --- Mode 1: Explicit pinning ---
         row = await conn.fetchrow(
-            "SELECT id, status FROM runners WHERE id = $1",
+            "SELECT id, admin_status, health_status FROM runners WHERE id = $1",
             runner_id,
         )
         if row is None:
@@ -252,10 +258,17 @@ async def select_runner(
                 status_code=400,
                 detail=f"Runner not found: {runner_id}",
             )
-        if row["status"] != "HEALTHY":
+        admin_status = row["admin_status"]
+        if admin_status != "online":
             raise HTTPException(
                 status_code=400,
-                detail=f"Runner is not healthy (status={row['status']}): {runner_id}",
+                detail=f"Runner admin_status is '{admin_status}', expected 'online': {runner_id}",
+            )
+        health_status = row["health_status"]
+        if health_status != "HEALTHY":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner health_status is '{health_status}', expected 'HEALTHY': {runner_id}",
             )
         return runner_id
 
@@ -265,7 +278,7 @@ async def select_runner(
         "FROM runners r "
         "LEFT JOIN workspaces w ON w.runner_id = r.id "
         "   AND w.cleanup_status = 'active' "
-        "WHERE r.status = 'HEALTHY'"
+        "WHERE r.admin_status = 'online' AND r.health_status = 'HEALTHY'"
     )
     query_args: list[list[str]] = []
 
@@ -282,11 +295,12 @@ async def select_runner(
         if labels:
             raise HTTPException(
                 status_code=400,
-                detail=f"No healthy runner found matching labels: {labels}",
+                detail=f"No runner with admin_status='online' and health_status='HEALTHY' "
+                f"found matching labels: {labels}",
             )
         raise HTTPException(
             status_code=400,
-            detail="No healthy runners available",
+            detail="No runners with admin_status='online' and health_status='HEALTHY' available",
         )
     return row["id"]  # type: ignore[no-any-return]
 
