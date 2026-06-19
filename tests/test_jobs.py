@@ -2968,9 +2968,8 @@ class TestLifecycleEventRecording:
         ]
 
         # Should have events for: pending→provisioning_workspace,
-        # provisioning_workspace→starting_opencode, starting_opencode→running,
-        # and running→completed
-        assert len(event_inserts) == 4
+        # provisioning_workspace→starting_opencode, starting_opencode→running
+        assert len(event_inserts) == 3
 
         # Verify first event: pending→provisioning_workspace
         first_sql, first_args = event_inserts[0]
@@ -2988,12 +2987,6 @@ class TestLifecycleEventRecording:
         third_sql, third_args = event_inserts[2]
         assert third_args[2] == "running"
         assert third_args[5] == "starting_opencode"
-
-        # Verify fourth event: running→completed
-        fourth_sql, fourth_args = event_inserts[3]
-        assert fourth_args[2] == "completed"
-        assert fourth_args[5] == "running"
-        assert "Job completed" in fourth_args[4]
 
     @pytest.mark.asyncio
     async def test_create_job_records_events_with_correct_message(self, mock_conn, mock_executor):
@@ -3042,13 +3035,12 @@ class TestLifecycleEventRecording:
             args[4] for sql, args in execute_calls
             if "INSERT INTO job_events" in sql
         ]
-        assert len(event_inserts) == 4
+        assert len(event_inserts) == 3
 
         # Verify messages describe each stage
         assert "Provisioning workspace" in event_inserts[0]
         assert "Starting OpenCode Serve" in event_inserts[1]
         assert "Job is now running" in event_inserts[2]
-        assert "Job completed" in event_inserts[3]
 
     @pytest.mark.asyncio
     async def test_executor_failure_records_failed_event(self, mock_conn):
@@ -4847,8 +4839,8 @@ class TestLifecycleTransitions:
     """Tests for complete job lifecycle state transitions.
 
     Verifies that the create_job endpoint correctly transitions through
-    all lifecycle states, records events on failure, persists metadata,
-    and handles executor failures gracefully.
+    all lifecycle states (stopping at 'running'), records events on failure,
+    persists metadata, and handles executor failures gracefully.
     """
 
     # -- helpers -----------------------------------------------------------
@@ -4858,8 +4850,7 @@ class TestLifecycleTransitions:
         row_data: dict,
         execute_calls: list = None,
     ):
-        """Return an _execute side-effect that tracks status transitions
-        including the final 'completed' state."""
+        """Return an _execute side-effect that tracks status transitions."""
         from datetime import datetime, timezone
 
         async def _execute(sql: str, *args):
@@ -4883,6 +4874,8 @@ class TestLifecycleTransitions:
                 row_data["workspace_name"] = args[1]
             elif "UPDATE gateway_jobs SET opencode_session_id" in sql and len(args) >= 2:
                 row_data["opencode_session_id"] = args[1]
+            elif "UPDATE gateway_jobs SET diff" in sql and len(args) >= 2:
+                row_data["diff"] = args[1]
 
         return _execute
 
@@ -4890,11 +4883,12 @@ class TestLifecycleTransitions:
 
     @pytest.mark.asyncio
     async def test_happy_path_all_states(self, mock_conn, mock_executor):
-        """Happy path: pending→running→completed with workspace and session.
+        """Happy path: pending→provisioning_workspace→starting_opencode→running.
 
         Verifies every status transition, executor calls in order, and
-        that metadata (workspace_name, session_id, diff, completed_at)
-        is persisted in the final response.
+        that metadata (workspace_name, session_id) is persisted.
+        The job stops at 'running' — completion only happens via
+        POST /jobs/{id}/complete or a terminal webhook.
         """
         job_id = uuid.uuid4()
         row_data = make_job_row(
@@ -4928,21 +4922,26 @@ class TestLifecycleTransitions:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
-        assert data["completed_at"] is not None
-        assert data["diff"] is not None
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
 
         # Verify status transitions in order (status is in the SQL string)
         status_update_sqls = [
             sql for sql, _ in execute_calls
             if "UPDATE gateway_jobs SET status" in sql
         ]
-        # At minimum: running→completed (pending is set by INSERT, not UPDATE)
-        assert len(status_update_sqls) >= 2
-        # First status UPDATE should set 'running'
-        assert "status = 'running'" in status_update_sqls[0]
-        # Last status UPDATE should set 'completed'
-        assert "status = 'completed'" in status_update_sqls[-1]
+        # Should have provisioning_workspace, starting_opencode, running
+        assert len(status_update_sqls) >= 3
+        # First status UPDATE should set 'provisioning_workspace'
+        assert "status = 'provisioning_workspace'" in status_update_sqls[0]
+        # Last status UPDATE should set 'running'
+        assert "status = 'running'" in status_update_sqls[-1]
+        # There should be NO completed status update
+        completed_updates = [
+            sql for sql in status_update_sqls
+            if "status = 'completed'" in sql
+        ]
+        assert len(completed_updates) == 0
 
         # Verify executor was called in the correct order
         mock_executor.create_workspace.assert_called_once()
@@ -4967,9 +4966,6 @@ class TestLifecycleTransitions:
         ]
         assert len(session_updates) == 1
         assert session_updates[0][1] is not None
-
-        # Verify diff persisted (either via final completed UPDATE or separate UPDATE)
-        assert data["diff"] is not None
 
     # -- 2. Failed workspace creation -------------------------------------
 
@@ -5034,8 +5030,10 @@ class TestLifecycleTransitions:
             (sql, args) for sql, args in execute_calls
             if "INSERT INTO job_events" in sql
         ]
-        assert len(event_inserts) >= 1
-        event_args = event_inserts[0][1]
+        # Should have at least 2 events: provisioning_workspace + executor_error
+        assert len(event_inserts) >= 2
+        # The last event should be the error event
+        event_args = event_inserts[-1][1]
         assert "executor_error" in event_args or "failed" in event_args
 
     # -- 3. Failed OpenCode startup ---------------------------------------
@@ -5117,11 +5115,12 @@ class TestLifecycleTransitions:
     async def test_not_completed_after_opencode_startup_alone(
         self, mock_conn, mock_executor,
     ):
-        """Job is NOT completed immediately after start_opencode returns.
+        """Job is NOT completed after start_opencode returns.
 
-        The status should progress through 'running' before reaching
-        'completed'. The completed UPDATE must be the last status change,
-        coming after both create_workspace and start_opencode succeed.
+        OpenCode startup alone does NOT complete the job. The status
+        should be 'running' after successful create_workspace and
+        start_opencode, with completed_at remaining NULL. No
+        completed UPDATE should have been issued.
         """
         job_id = uuid.uuid4()
         row_data = make_job_row(
@@ -5160,32 +5159,28 @@ class TestLifecycleTransitions:
             sql for sql, _ in execute_calls
             if "UPDATE gateway_jobs SET status" in sql
         ]
-        # At minimum: running→completed (pending is set by INSERT, not UPDATE)
-        assert len(status_update_sqls) >= 2
+        # At minimum: provisioning_workspace, starting_opencode, running
+        assert len(status_update_sqls) >= 3
 
-        # The first status update must be to 'running'
-        assert "status = 'running'" in status_update_sqls[0]
+        # Verify all three transitions happened
+        assert any("status = 'provisioning_workspace'" in sql for sql in status_update_sqls)
+        assert any("status = 'starting_opencode'" in sql for sql in status_update_sqls)
+        assert any("status = 'running'" in sql for sql in status_update_sqls)
 
-        # The last must be to 'completed'
-        assert "status = 'completed'" in status_update_sqls[-1]
+        # The last status update must be to 'running' (not 'completed')
+        assert "status = 'running'" in status_update_sqls[-1]
 
-        # Verify completed_at is set in the final response
-        data = response.json()["data"]
-        assert data["status"] == "completed"
-        assert data["completed_at"] is not None
-
-        # Verify the 'running' transition actually happened before 'completed'
-        running_index = next(
-            i for i, sql in enumerate(status_update_sqls)
-            if "status = 'running'" in sql
-        )
-        completed_index = next(
-            i for i, sql in enumerate(status_update_sqls)
+        # No completed status update should have occurred
+        completed_updates = [
+            sql for sql in status_update_sqls
             if "status = 'completed'" in sql
-        )
-        assert running_index < completed_index, (
-            "Job must transition through 'running' before 'completed'"
-        )
+        ]
+        assert len(completed_updates) == 0
+
+        # Verify completed_at is NOT set in the final response
+        data = response.json()["data"]
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
 
     # -- 5. Missing terminal result does not complete the job --------------
 
@@ -5313,9 +5308,11 @@ class TestLifecycleTransitions:
             (sql, args) for sql, args in execute_calls
             if "INSERT INTO job_events" in sql
         ]
-        assert len(event_inserts) >= 1
+        # Should have at least 2 events: provisioning_workspace + the error event
+        assert len(event_inserts) >= 2
 
-        event_sql, event_args = event_inserts[0]
+        # The last event should be the error event
+        event_sql, event_args = event_inserts[-1]
         assert "job_events" in event_sql
 
         # Verify event structure: (id, job_id, event_type, actor, details, created_at)
@@ -5383,20 +5380,24 @@ class TestLifecycleTransitions:
             (sql, args) for sql, args in execute_calls
             if "INSERT INTO job_events" in sql
         ]
-        assert len(event_inserts) >= 1
+        # Should have at least 2 events: provisioning_workspace → starting_opencode
+        # transition and then the executor_error event
+        assert len(event_inserts) >= 2
 
-        event_type = event_inserts[0][1][2]
+        # The last event should be the error event
+        event_type = event_inserts[-1][1][2]
         assert event_type in ("executor_error",)
 
     # -- 7. Completion metadata persisted ---------------------------------
 
     @pytest.mark.asyncio
     async def test_completion_metadata_persisted(self, mock_conn, mock_executor):
-        """Workspace name, session ID, and diff are persisted on completion.
+        """Workspace name, session ID, and diff are persisted on job startup.
 
         Verifies that the DB UPDATE statements for workspace_name,
         opencode_session_id, and diff are all executed during a
-        successful job flow, and that the response includes them.
+        successful job flow. The job stops at 'running' — completion
+        only happens via POST /jobs/{id}/complete.
         """
         job_id = uuid.uuid4()
         row_data = make_job_row(
@@ -5446,8 +5447,8 @@ class TestLifecycleTransitions:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
-        assert data["completed_at"] is not None
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
 
         # Verify workspace_name UPDATE
         ws_updates = [
@@ -5467,24 +5468,18 @@ class TestLifecycleTransitions:
         assert len(session_updates) == 1
         assert session_updates[0][1] is not None
 
-        # Verify diff is present in the response (from final completed UPDATE)
+        # Verify diff is present in the response (fetched and persisted)
         assert data["diff"] is not None
 
         # Verify opencode client was called for diff fetching
         mock_opencode.get_session_diff.assert_called_once()
 
-        # Verify the diff was also updated via a separate UPDATE (if the
-        # opencode client returned one). Either:
-        #   a) The diff was set in the final completed UPDATE, OR
-        #   b) A separate UPDATE gateway_jobs SET diff = ... was made
+        # Verify the diff was persisted via a separate UPDATE
         diff_updates = [
             args for sql, args in execute_calls
             if "UPDATE gateway_jobs SET diff" in sql
-            and "status = 'completed'" not in sql
         ]
-        # The mock opencode client returns a diff, so there should be
-        # either a separate diff UPDATE or the diff was in the final UPDATE.
-        assert data["diff"] is not None
+        assert len(diff_updates) >= 1
 
     @pytest.mark.asyncio
     async def test_metadata_persisted_without_opencode_client(
@@ -5493,8 +5488,7 @@ class TestLifecycleTransitions:
         """Metadata persisted even when no OpenCode client is available.
 
         When there is no opencode_client (None), workspace_name and session_id
-        should still be persisted, and the diff should be the summary from
-        the completed UPDATE rather than a fetched diff.
+        should still be persisted. The job stops at 'running' after startup.
         """
         job_id = uuid.uuid4()
         row_data = make_job_row(
@@ -5529,7 +5523,8 @@ class TestLifecycleTransitions:
 
         assert response.status_code == 201
         data = response.json()["data"]
-        assert data["status"] == "completed"
+        assert data["status"] == "running"
+        assert data["completed_at"] is None
 
         # Verify workspace_name UPDATE
         ws_updates = [
@@ -5545,6 +5540,5 @@ class TestLifecycleTransitions:
         ]
         assert len(session_updates) == 1
 
-        # Diff should be the summary from the completed UPDATE
-        assert data["diff"] is not None
-        assert "Job completed" in data["diff"]
+        # Diff should be None — no completed UPDATE and no opencode client
+        assert data["diff"] is None
