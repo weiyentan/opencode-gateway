@@ -2485,6 +2485,381 @@ class TestAbortEvents:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Lifecycle Event Recording (issue #144)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestLifecycleEventRecording:
+    """Tests that job_events are recorded on every lifecycle transition."""
+
+    @pytest.mark.asyncio
+    async def test_create_job_records_pending_to_provisioning_event(self, mock_conn, mock_executor):
+        """create_job records pending→provisioning_workspace event."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Test event",
+            status="pending",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Test event recording",
+                },
+            )
+
+        assert response.status_code == 201
+
+        # Find all INSERT INTO job_events calls
+        event_inserts = [
+            (sql, args) for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+
+        # Should have events for: pending→provisioning_workspace,
+        # provisioning_workspace→starting_opencode, starting_opencode→running,
+        # and running→completed
+        assert len(event_inserts) == 4
+
+        # Verify first event: pending→provisioning_workspace
+        first_sql, first_args = event_inserts[0]
+        assert "job_events" in first_sql
+        assert first_args[2] == "provisioning_workspace"  # event_type = to_status
+        assert first_args[3] == "system"                   # actor
+        assert first_args[5] == "pending"                  # previous_status = from_status
+
+        # Verify second event: provisioning_workspace→starting_opencode
+        second_sql, second_args = event_inserts[1]
+        assert second_args[2] == "starting_opencode"
+        assert second_args[5] == "provisioning_workspace"
+
+        # Verify third event: starting_opencode→running
+        third_sql, third_args = event_inserts[2]
+        assert third_args[2] == "running"
+        assert third_args[5] == "starting_opencode"
+
+        # Verify fourth event: running→completed
+        fourth_sql, fourth_args = event_inserts[3]
+        assert fourth_args[2] == "completed"
+        assert fourth_args[5] == "running"
+        assert "Job completed" in fourth_args[4]
+
+    @pytest.mark.asyncio
+    async def test_create_job_records_events_with_correct_message(self, mock_conn, mock_executor):
+        """Each event has a human-readable message in the details field."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Test messages",
+            status="pending",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Test messages",
+                },
+            )
+
+        assert response.status_code == 201
+
+        event_inserts = [
+            args[4] for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) == 4
+
+        # Verify messages describe each stage
+        assert "Provisioning workspace" in event_inserts[0]
+        assert "Starting OpenCode Serve" in event_inserts[1]
+        assert "Job is now running" in event_inserts[2]
+        assert "Job completed" in event_inserts[3]
+
+    @pytest.mark.asyncio
+    async def test_executor_failure_records_failed_event(self, mock_conn):
+        """When executor.create_workspace fails, a failed transition event is recorded."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Fail event",
+            status="pending",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=RuntimeError("Workspace creation failed")
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Fail event",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+
+        # Find all INSERT INTO job_events calls
+        event_inserts = [
+            args for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+
+        # Should have at least 2 events: the provisioning_workspace transition
+        # plus the failed transition
+        assert len(event_inserts) >= 2
+
+        # The last event (or one of the last) should be the failed transition
+        failed_events = [
+            a for a in event_inserts if a[2] == "failed"
+        ]
+        assert len(failed_events) >= 1
+
+        failed_event = failed_events[0]
+        # event_type should be "failed"
+        assert failed_event[2] == "failed"
+        # previous_status should be the status before failure
+        assert failed_event[5] in ("pending", "provisioning_workspace")
+        # details should contain info about the failure
+        assert "Executor dispatch failed" in failed_event[4]
+
+    @pytest.mark.asyncio
+    async def test_policy_violation_records_failed_event(self, mock_conn, mock_executor):
+        """PolicyViolation records a pending→failed transition event."""
+        from unittest.mock import patch
+        from app.policy import ObservationBasedPolicy, PolicyViolation
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Policy fail",
+            status="pending",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner-99"})
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        with patch.object(
+            ObservationBasedPolicy, "check", new_callable=AsyncMock
+        ) as mock_check:
+            mock_check.side_effect = PolicyViolation(
+                resource="disk",
+                current_value=95.0,
+                threshold=80.0,
+                runner_id="test-runner-99",
+            )
+
+            async with client as c:
+                response = await c.post(
+                    "/jobs",
+                    json={
+                        "repo_url": "https://github.com/org/repo",
+                        "task_summary": "Policy fail",
+                    },
+                )
+
+        assert response.status_code == 503
+
+        # Find job_events inserts
+        event_inserts = [
+            args for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+
+        # Should have at least 1 event: pending→failed
+        assert len(event_inserts) >= 1
+
+        # The failed event
+        failed_events = [
+            a for a in event_inserts if a[2] == "failed"
+        ]
+        assert len(failed_events) >= 1
+
+        failed_event = failed_events[0]
+        assert failed_event[2] == "failed"
+        assert failed_event[5] == "pending"  # policy fails before any transition
+        assert "disk/memory pressure" in failed_event[4]
+
+    @pytest.mark.asyncio
+    async def test_approve_job_records_event(self, mock_conn):
+        """approve_job records needs_approval→running event."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Approve event",
+            status="needs_approval",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/approve")
+
+        assert response.status_code == 200
+
+        event_inserts = [
+            args for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) == 1
+
+        event_args = event_inserts[0]
+        assert event_args[2] == "running"           # event_type = to_status
+        assert event_args[3] == "api"               # actor
+        assert event_args[4] == "Job approved by api"
+        assert event_args[5] == "needs_approval"     # previous_status = from_status
+
+    @pytest.mark.asyncio
+    async def test_reject_job_records_event(self, mock_conn):
+        """reject_job records needs_approval→rejected event."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Reject event",
+            status="needs_approval",
+        )
+
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'rejected'" in sql:
+                row["status"] = "rejected"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/reject")
+
+        assert response.status_code == 200
+
+        event_inserts = [
+            args for sql, args in execute_calls
+            if "INSERT INTO job_events" in sql
+        ]
+        assert len(event_inserts) == 1
+
+        event_args = event_inserts[0]
+        assert event_args[2] == "rejected"          # event_type = to_status
+        assert event_args[3] == "api"               # actor
+        assert event_args[4] == "Job rejected by api"
+        assert event_args[5] == "needs_approval"     # previous_status = from_status
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Runner Selection & Job Pinning (issue #92)
 # ══════════════════════════════════════════════════════════════════════════
 
