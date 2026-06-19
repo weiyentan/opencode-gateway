@@ -184,6 +184,50 @@ def _resolve_workspace_id(workspace_name: str | None) -> uuid.UUID | None:
         return None
 
 
+async def _record_job_event(
+    conn: asyncpg.Connection,
+    job_id: uuid.UUID,
+    from_status: str,
+    to_status: str,
+    message: str,
+    actor: str = "system",
+) -> None:
+    """Insert a job lifecycle transition event into the ``job_events`` table.
+
+    Each event captures a state machine transition with the source and
+    target statuses, a human-readable message, and a timestamp.
+
+    Parameters
+    ----------
+    conn:
+        An active asyncpg database connection.
+    job_id:
+        UUID of the job whose status changed.
+    from_status:
+        The status the job was in before the transition.
+    to_status:
+        The status the job transitioned into.
+    message:
+        Human-readable description of the transition (stored as ``details``).
+    actor:
+        Entity that performed the transition (default ``"system"``).
+    """
+    event_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        job_id,
+        to_status,
+        actor,
+        message,
+        from_status,
+        now,
+    )
+
+
 async def select_runner(
     conn: asyncpg.Connection,
     runner_id: uuid.UUID | None = None,
@@ -352,19 +396,9 @@ async def create_job(
         body.workflow_run_id,
     )
 
-    # 2. Validate and perform pending → provisioning_workspace transition
-    if not can_transition(JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE):
-        logger.error(
-            "Lifecycle rejected transition pending→provisioning_workspace for job %s", job_id
-        )
-        raise HTTPException(status_code=500, detail="Internal state machine error")
-    await conn.execute(
-        "UPDATE gateway_jobs SET status = 'provisioning_workspace', updated_at = $2 WHERE id = $1",
-        job_id,
-        datetime.now(timezone.utc),  # noqa: UP017
-    )
-
     new_workspace_id = None
+    # Track current status for event recording in failure handlers
+    current_status = "pending"
 
     try:
         # Resolve the selected runner's text ID for pre-flight policy check.
@@ -380,7 +414,26 @@ async def create_job(
             policy = ObservationBasedPolicy(settings)
             await policy.check(runner_text_id, conn=conn)
 
-        # 4. Create workspace on the selected runner (only after policy passes)
+        # 2. Transition: pending → provisioning_workspace
+        if not can_transition(JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE):
+            logger.error(
+                "Lifecycle rejected transition pending→provisioning_workspace for job %s",
+                job_id,
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'provisioning_workspace', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, "pending", "provisioning_workspace",
+            "Provisioning workspace on runner",
+        )
+        current_status = "provisioning_workspace"
+
+        # 3. Create workspace on the selected runner
         ws_response = await executor.create_workspace(
             CreateWorkspaceRequest(
                 repo_url=str(body.repo_url),
@@ -439,7 +492,26 @@ async def create_job(
             new_workspace_id,
         )
 
-        # 5. Start OpenCode Serve
+        # 5. Transition: provisioning_workspace → starting_opencode
+        if not can_transition(JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE):
+            logger.error(
+                "Lifecycle rejected transition provisioning_workspace→starting_opencode for job %s",
+                job_id,
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'starting_opencode', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, "provisioning_workspace", "starting_opencode",
+            "Starting OpenCode Serve on workspace",
+        )
+        current_status = "starting_opencode"
+
+        # 6. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
@@ -457,17 +529,41 @@ async def create_job(
             session_id,
         )
 
-        # 5a. Transition: starting_opencode → running (NOT completed)
+        # 7. Transition: starting_opencode → running
         if not can_transition(JobStatus.STARTING_OPENCODE, JobStatus.RUNNING):
             logger.error(
-                "Lifecycle rejected transition starting_opencode→running for job %s", job_id
+                "Lifecycle rejected transition starting_opencode→running for job %s",
+                job_id,
             )
             raise HTTPException(status_code=500, detail="Internal state machine error")
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
         )
+        await _record_job_event(
+            conn, job_id, "starting_opencode", "running",
+            "Job is now running",
+        )
+        current_status = "running"
+
+        # 8. Mark completed
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        diff_summary = f"Job completed: {body.task_summary}"
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
+            "completed_at = $3, diff = $4 WHERE id = $1",
+            job_id,
+            now,
+            now,
+            diff_summary,
+        )
+        await _record_job_event(
+            conn, job_id, "running", "completed",
+            diff_summary,
+        )
+        current_status = "completed"
 
         # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
@@ -499,10 +595,15 @@ async def create_job(
             "Policy check rejected job %s before workspace creation",
             job_id,
         )
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            "Policy check rejected: disk/memory pressure",
         )
         # Fire webhooks asynchronously for policy-rejected jobs
         asyncio.create_task(
@@ -552,14 +653,18 @@ async def create_job(
         error_detail = "; ".join(details_parts)
 
         logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            error_detail,
         )
 
         # Record the artifact failure as a job event
-        now = datetime.now(timezone.utc)  # noqa: UP017
         event_id = uuid.uuid4()
         await conn.execute(
             "INSERT INTO job_events "
@@ -602,14 +707,18 @@ async def create_job(
 
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
             "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            f"Executor dispatch failed: {body.task_summary}",
         )
 
         # Record the failure as a job event
-        now = datetime.now(timezone.utc)  # noqa: UP017
         event_id = uuid.uuid4()
         await conn.execute(
             "INSERT INTO job_events "
@@ -720,6 +829,11 @@ async def approve_job(
         job_id,
         now,
     )
+    await _record_job_event(
+        conn, job_id, "needs_approval", "running",
+        "Job approved by api",
+        actor="api",
+    )
 
     # Return updated job
     row = await _fetch_job(conn, job_id)
@@ -790,6 +904,11 @@ async def reject_job(
         "UPDATE gateway_jobs SET status = 'rejected', updated_at = $2 WHERE id = $1",
         job_id,
         now,
+    )
+    await _record_job_event(
+        conn, job_id, "needs_approval", "rejected",
+        "Job rejected by api",
+        actor="api",
     )
 
     # Return updated job
