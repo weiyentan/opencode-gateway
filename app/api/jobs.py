@@ -104,6 +104,7 @@ class JobResponse(BaseModel):
     commit_sha: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
+    commit_sha: str | None = None
     diff_url: str | None = None
     failure_reason: str | None = None
 
@@ -597,9 +598,11 @@ async def create_job(
         )
         now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             now,
+            "Policy check rejected: disk/memory pressure",
         )
         await _record_job_event(
             conn, job_id, current_status, "failed",
@@ -655,15 +658,17 @@ async def create_job(
         logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
         now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             now,
+            error_detail,
         )
         await _record_job_event(
             conn, job_id, current_status, "failed",
             error_detail,
         )
-
+        
         # Record the artifact failure as a job event
         event_id = uuid.uuid4()
         await conn.execute(
@@ -709,15 +714,17 @@ async def create_job(
         logger.exception("Executor dispatch failed for job %s", job_id)
         now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
             now,
+            f"Executor dispatch failed: {body.task_summary}",
         )
         await _record_job_event(
             conn, job_id, current_status, "failed",
             f"Executor dispatch failed: {body.task_summary}",
         )
-
+        
         # Record the failure as a job event
         event_id = uuid.uuid4()
         await conn.execute(
