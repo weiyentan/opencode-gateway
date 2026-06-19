@@ -395,6 +395,55 @@ class TestIngestObservations:
             )
         assert response.status_code == 422
 
+    # ------------------------------------------------------------------
+    # Admin_status preservation (issue #130)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_observation_upsert_does_not_touch_admin_status(self, client, mock_conn):
+        """The observations upsert must not modify admin_status.
+
+        Admin status is set only by the operator via POST /runners/{id}/status.
+        The observations ingestion must leave it untouched — both on INSERT
+        and ON CONFLICT DO UPDATE.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _capture_fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_capture_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post(
+                "/observations",
+                json={
+                    "runner_id": "runner-admin-test",
+                    "hostname": "test.example.com",
+                    "executor_type": "awx",
+                },
+            )
+
+        assert response.status_code == 201
+
+        # The upsert SQL should NOT reference admin_status anywhere
+        upsert_sql = insert_sql_captured[0]
+        assert "admin_status" not in upsert_sql, (
+            "Observations upsert must not modify admin_status — found admin_status in SQL"
+        )
+
+        # Verify the ON CONFLICT SET clause does not include admin_status
+        assert "DO UPDATE SET" in upsert_sql
+        # Collect all columns being SET in the ON CONFLICT branch
+        set_clause = upsert_sql.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        assert "admin_status" not in set_clause, (
+            f"ON CONFLICT SET clause must not include admin_status. "
+            f"SET clause contents: {set_clause.strip()}"
+        )
+
     @pytest.mark.asyncio
     async def test_empty_body_returns_422(self, client):
         """Empty request body returns 422."""

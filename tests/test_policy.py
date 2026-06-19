@@ -895,6 +895,111 @@ class TestManualStatusPolicy:
         # Should be a disk violation, not a manual_status one
         assert exc_info.value.detail["resource"] == "disk"
 
+    @pytest.mark.asyncio
+    async def test_online_bypasses_policy_even_with_unhealthy_metrics(self) -> None:
+        """admin_status='online' skips all observation checks even with BLOCKED health_status.
+
+        This validates the split-fields invariant: operator-set ``online``
+        overrides any observation-derived health_status.
+        """
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="online",
+            admin_status="online",
+            health_status="BLOCKED_DISK_PRESSURE",
+            disk_used_percent=95.0,   # exceeds threshold — would block normally
+            memory_used_percent=95.0,  # exceeds threshold — would block normally
+        )
+
+        result = await policy.check("runner-1", conn=conn)
+        assert result is None, "online admin_status should bypass all observation checks"
+
+    @pytest.mark.asyncio
+    async def test_offline_rejected_even_with_healthy_health_status(self) -> None:
+        """A runner with admin_status='offline' is rejected even when
+        health_status is HEALTHY and metrics are good."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="offline",
+            admin_status="offline",
+            health_status="HEALTHY",
+            disk_used_percent=40.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+        assert exc_info.value.detail["runner_id"] == "runner-1"
+
+    @pytest.mark.asyncio
+    async def test_maintenance_rejected_even_with_healthy_health_status(self) -> None:
+        """A runner with admin_status='maintenance' is rejected even when
+        health_status is HEALTHY and metrics are good."""
+        policy = ObservationBasedPolicy()
+        conn = _make_mock_conn(
+            runner_status="maintenance",
+            admin_status="maintenance",
+            health_status="HEALTHY",
+            disk_used_percent=40.0,
+            memory_used_percent=50.0,
+        )
+
+        with pytest.raises(PolicyViolation) as exc_info:
+            await policy.check("runner-1", conn=conn)
+
+        assert exc_info.value.detail["resource"] == "manual_status"
+
+    @pytest.mark.asyncio
+    async def test_policy_status_update_does_not_touch_admin_status(self) -> None:
+        """When the policy updates a runner's health_status, the SQL must NOT
+        modify admin_status — it should only update health_status and the
+        legacy status column.
+
+        This is the core invariant: the policy engine owns health_status,
+        while admin_status belongs to the operator.
+        """
+        policy = ObservationBasedPolicy()
+        runner_uuid = uuid.uuid4()
+
+        execute_calls: list[tuple] = []
+
+        def _make_mock_conn_tracked(**kwargs):
+            c = _make_mock_conn(**kwargs)
+            async def _track_execute(sql, *args):
+                execute_calls.append((sql, args))
+                return None
+            c.execute = AsyncMock(side_effect=_track_execute)
+            return c
+
+        conn = _make_mock_conn_tracked(
+            runner_uuid=runner_uuid,
+            disk_used_percent=95.0,
+            memory_used_percent=50.0,
+        )
+
+        try:
+            await policy.check("runner-1", conn=conn)
+        except PolicyViolation:
+            pass
+
+        # Find the status update SQL
+        status_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "UPDATE runners SET" in sql
+        ]
+        assert len(status_updates) >= 1, "Expected at least one status UPDATE"
+
+        for sql, _args in status_updates:
+            assert "admin_status" not in sql, (
+                f"Policy status update must not reference admin_status. "
+                f"SQL: {sql}"
+            )
+            assert "health_status" in sql, (
+                f"Policy status update must set health_status. SQL: {sql}"
+            )
+
 
 class TestHealthStatusPolicy:
     """Tests for health_status enforcement in ObservationBasedPolicy."""

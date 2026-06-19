@@ -2975,6 +2975,177 @@ class TestRunnerSelection:
         assert response.status_code == 201
         data = response.json()["data"]
         assert data["status"] == "running"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Split-field runner selection tests (admin_status + health_status)
+    # ══════════════════════════════════════════════════════════════════════
+
+    @pytest.mark.asyncio
+    async def test_auto_selection_online_healthy_succeeds(
+        self, mock_conn, mock_executor
+    ):
+        """A runner with admin_status='online' and HEALTHY legacy status
+        is eligible for automatic selection and passes policy (online bypass)."""
+        job_id = uuid.uuid4()
+        runner_id = uuid.uuid4()
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Online healthy",
+            status="pending",
+        )
+
+        async def _fetchrow(sql, *args):
+            # select_runner auto-selection query (no labels)
+            if "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql and "r.labels" not in sql:
+                return mock_row({"id": runner_id, "active_workspaces": 0})
+            # Runner row for policy lookup (uses runner_id text)
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "runner-online-healthy"})
+            # Runner row for policy check (reads admin_status + health_status)
+            if "FROM runners WHERE runner_id" in sql:
+                return mock_row({
+                    "id": runner_id,
+                    "admin_status": "online",
+                    "health_status": "HEALTHY",
+                    "status": "HEALTHY",
+                })
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                return mock_row(row_data)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Online healthy",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_auto_selection_rejects_non_healthy_legacy_status(
+        self, mock_conn, mock_executor
+    ):
+        """A runner with non-HEALTHY legacy status (reflecting unhealthy
+        health_status) is rejected by select_runner before policy runs.
+
+        This validates that the split-field invariant flows through the
+        legacy column that select_runner checks.
+        """
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            # select_runner auto-selection — the runner has status != HEALTHY
+            if "LEFT JOIN workspaces w ON w.runner_id = r.id" in sql and "r.labels" not in sql:
+                return None  # no HEALTHY runner found
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "No healthy runners (split fields)",
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "no healthy runners" in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_pin_rejects_admin_status_offline(
+        self, mock_conn, mock_executor
+    ):
+        """Pinning to a runner with admin_status='offline' (and legacy
+        status='offline') returns 400 from select_runner."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "offline"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to offline runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "not healthy" in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_pin_rejects_admin_status_maintenance(
+        self, mock_conn, mock_executor
+    ):
+        """Pinning to a runner with admin_status='maintenance' (and legacy
+        status='maintenance') returns 400 from select_runner."""
+        runner_id = uuid.uuid4()
+
+        async def _fetchrow(sql, *args):
+            if "SELECT id, status FROM runners WHERE id" in sql:
+                return mock_row({"id": runner_id, "status": "maintenance"})
+            return None
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        client = create_client(mock_conn, mock_executor=mock_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Pin to maintenance runner",
+                    "runner_id": str(runner_id),
+                },
+            )
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "BAD_REQUEST"
+        assert "not healthy" in data["error"]["message"].lower()
+
+
 class TestJobLogs:
     """Tests for GET /jobs/{id}/logs (log retrieval via OpenCode Serve proxy)."""
 
