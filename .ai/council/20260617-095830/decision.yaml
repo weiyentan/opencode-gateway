@@ -1,0 +1,111 @@
+decision: refine
+confidence: 8
+clarified_problem: >
+  The Gateway currently stores only a session ID reference and diff output per job.
+  Operators and Paperclip have no visibility into which LLM model served a session,
+  how many tokens were consumed, what the estimated cost was, or how long the session
+  took. This limits cost allocation, budget enforcement, and operational observability.
+  The proposal asks whether the Gateway should store richer per-session metadata to
+  fill this gap. The Council confirms the gap is real but refines the scope: not
+  "all session information" but specifically aggregated job-level metrics (model,
+  tokens, duration, error count, tool-call count) for Paperclip cost-tracking, with
+  per-message/per-tool-call detail explicitly out of scope.
+main_assumptions:
+  - "OpenCode Serve's REST API exposes session metadata (model name, token counts, duration, tool-call counts) at session completion"
+  - "Paperclip (or another caller) will consume this data for cost allocation and budget enforcement"
+  - "Session-summary storage (~200 bytes/session) is negligible and won't impact operational query performance"
+  - "The session survives long enough on the Runner VM for the Gateway to pull metadata after job completion"
+  - "Cost computed at query time (from token counts + model pricing table) satisfies the primary use case"
+missing_information:
+  - "OpenCode Serve API contract — what fields does GET /session/{id} actually return? Are token counts, model name, and tool-call counts available?"
+  - "Paperclip's actual query patterns — does it query per-job, per-runner, per-time-window? What latency SLAs apply?"
+  - "Session cleanup timing — does the OpenCode Serve session on the Runner VM survive long enough for the Gateway to fetch metadata post-completion?"
+  - "Expected session volume and tool-call frequency — without this baseline, per-tool-call storage projections remain speculative"
+  - "Confirmed consumer — has an actual Paperclip or operator user requested this data, or is it speculative?"
+  - "Test engineering scope — how many of the existing 650+ tests touch the job completion flow and would need mock updates?"
+risks:
+  - "OpenCode Serve API gap: the data source may not exist. If OpenCode Serve doesn't expose token counts or model name, the Gateway has nothing to fetch. This would require cross-repository OpenCode Serve changes, turning a small Gateway task into a multi-sprint, cross-team initiative."
+  - "Session cleanup window: if the OpenCode Serve session is destroyed immediately after job completion, the Gateway's post-completion fetch will always fail. The pull becomes unreliable by design."
+  - "Scope creep from undefined consumer: without a confirmed persona and query pattern, the schema may be over-built (too many columns) or under-built (missing indexed fields for real queries), requiring a schema migration in the first month of use."
+non_goals:
+  - "Storing per-message or per-tool-call detail in Gateway Postgres (unanimously rejected)"
+  - "Replacing or duplicating OpenCode Serve's SQLite-based session store"
+  - "Building a general-purpose analytics warehouse inside the Gateway"
+  - "Real-time session telemetry streaming"
+  - "Storing model hyperparameters (temperature, max_tokens, system prompt)"
+architecture_concerns:
+  - "Gateway↔OpenCode Serve boundary: storing session execution metrics in Gateway Postgres extends the Gateway's responsibility beyond orchestration into session analytics. This needs a conscious ADR-level decision, not an implicit schema change."
+  - "Operational vs. analytical mixing: Gateway Postgres is an OLTP operational store for job dispatch. Session analytics data has different retention, query patterns, and consumers. A separate session_summaries table (per ADR 0001) mitigates this."
+  - "Observation pipeline misuse: pushing session summaries through POST /observations conflates machine-health telemetry with domain events. Rejected by consensus. A dedicated pull at job completion is the clean pattern."
+  - "Data gravity direction: session detail data naturally lives in OpenCode Serve's SQLite on the Runner VM. Pulling summaries into Gateway Postgres creates a sync channel and consistency dependency. Acceptable at aggregated granularity, rejected at fine granularity."
+delivery_concerns:
+  - "Phase 0 (API discovery) is the critical path gate — no credible delivery plan exists until we confirm which fields OpenCode Serve exposes"
+  - "Cross-repo coordination risk: if OpenCode Serve changes are required, the Gateway delivery timeline doubles and depends on external prioritization"
+  - "650+ test suite impact: every test that exercises job completion needs factory defaults, mock OpenCode Serve responses, or conditionalized behavior — estimated at 4-8 hours of test engineering alone"
+  - "Session cleanup ordering: the Gateway currently fetches the diff after job completion, but session cleanup could race ahead of the metadata fetch. Lifecycle reordering may be required."
+cost_concerns:
+  - "Storage cost is negligible (~200 bytes/session, ~2MB/month at 10K sessions) — not a concern"
+  - "Opportunity cost of building for an unconfirmed consumer is the real risk: 4-6 hours of senior engineer time for Phase 1 implementation, 4-8 hours for test updates, plus ongoing maintenance of the schema and fetch logic"
+  - "Per-tool-call storage (if reconsidered later) would multiply row count by 50-200× per session with no demonstrated need"
+  - "Query-time cost computation avoids stale-pricing migrations but may need a generated stored column if indexed cost queries are required"
+must_answer_before_prd:
+  - "What does OpenCode Serve's GET /session/{id} actually return? Inspect the real API response for token counts, model name, duration, and tool-call data."
+  - "Does the session survive long enough on the Runner VM for the Gateway to reliably pull metadata after job completion?"
+  - "Which consumer persona drives the first iteration? Paperclip cost-tracking is the candidate — confirm they actually need this data and what their query patterns are."
+  - "Who owns the OpenCode Serve API changes if the metadata fields don't exist yet? Is there a committed cross-repo timeline?"
+  - "What are the acceptance criteria for Phase 1? Define measurable outcomes (latency, schema contract, availability expectations) before implementation."
+recommended_prd_shape:
+  - section: "Problem Statement"
+    purpose: "Define the gap: Gateway operators and Paperclip lack visibility into per-session model usage, token consumption, and cost. Reference specific use cases (Paperclip budget enforcement, operational observability)."
+  - section: "Scope"
+    purpose: "Clearly delimit what is IN (aggregated job-level metrics in a separate session_summaries table) and what is OUT (per-message detail, per-tool-call detail, model hyperparameters, real-time streaming). Reference this Council's unanimous rejections."
+  - section: "Phase 0 — OpenCode Serve API Discovery"
+    purpose: "Document the findings from the API discovery spike. What fields exist? What's the data shape? What's missing? This section gates the rest of the PRD."
+  - section: "Data Model"
+    purpose: "Define the session_summaries table schema: llm_model, total_input_tokens, total_output_tokens, session_duration_seconds, tool_call_count, error_count, estimated_cost_cents (generated stored column). FK to gateway_jobs. Per ADR 0001 pattern."
+  - section: "Retrieval Mechanism"
+    purpose: "Specify the post-completion async pull pattern: non-blocking, best-effort, with warning-log fallback. Define where in the job lifecycle the fetch occurs (before session cleanup)."
+  - section: "Query Interface"
+    purpose: "Define how Paperclip/operators access the data: extend GET /jobs/{job_id} response with summary fields, optionally add GET /jobs/{job_id}/cost-summary. Document query-time cost computation from token counts + model pricing lookup."
+  - section: "Test Strategy"
+    purpose: "Audit existing 650+ tests for completion-flow impact. Document mock strategy for OpenCode Serve API responses. Estimate test engineering effort (4-8 hours)."
+  - section: "Delivery Plan"
+    purpose: "Two-phase delivery: Phase 0 (API discovery, 1 session), Phase 1 (schema + fetch + API, estimated 4-6 hours implementation + 4-8 hours tests). No Phase 2 until Paperclip validates Phase 1 with real usage."
+  - section: "ADR Requirements"
+    purpose: "Document the boundary extension decision: Gateway now stores session execution metrics, which is a deliberate extension of its responsibility beyond pure orchestration. Reference this Council session."
+suggested_issue_breakdown: []
+council_disagreements:
+  - topic: "Push vs. pull retrieval mechanism"
+    positions:
+      - member: "Cost Reviewer"
+        view: "Push via observation pipeline — reuses existing infrastructure, avoids new API surface and synchronous fetch code"
+        resolution: "Cost Reviewer conceded in Round 2 after Platform Architect, Senior Engineer, and Delivery Planner argued that observations are time-series machine telemetry, not discrete session events. Pull via best-effort async fetch at job completion is the consensus."
+      - member: "Platform Architect"
+        view: "Pull via Gateway-initiated fetch — keeps the observation pipeline clean and boundaries explicit"
+        resolution: "Consensus reached on pull. Cost Reviewer conceded."
+  - topic: "Separate table vs. extend gateway_jobs"
+    positions:
+      - member: "Platform Architect (Round 1)"
+        view: "Extend gateway_jobs with 6 aggregated columns — simpler, avoids JOIN, natural as job attributes"
+        resolution: "Shifted in Round 2. Senior Engineer and Delivery Planner also moved. Consensus on separate session_summaries table per ADR 0001 (different retention, query patterns, consumers)."
+      - member: "Delivery Planner (Round 1)"
+        view: "Separate session_metadata table — different query patterns and retention policy"
+        resolution: "Consensus on separate table after Round 2 deliberation."
+  - topic: "Compute cost at write time vs. query time"
+    positions:
+      - member: "Cost Reviewer"
+        view: "Don't store cost — compute at query time from token counts + model pricing lookup to avoid stale pricing migrations"
+        resolution: "Compromise: use a PostgreSQL generated stored column for estimated_cost_cents. Computed once at write time (indexable), updates automatically if rates change via migration."
+      - member: "Delivery Planner"
+        view: "Store computed cost — Paperclip needs to query 'all jobs > $5' without scanning every row"
+        resolution: "Compromise reached via generated stored column. Both concerns satisfied."
+  - topic: "Whether to proceed at all"
+    positions:
+      - member: "Skeptic"
+        view: "Lean reject — unverified API assumption, boundary violation, 4 bundled use cases, no user trigger, no cost estimate"
+        resolution: "Skeptic moved from 'reject' to 'proceed to Phase 0 only' in Round 2. The unanimous commitment to Phase 0 (API discovery) before any schema work satisfied the Skeptic's core concern about unverified assumptions."
+      - member: "All others"
+        view: "Proceed with aggregated metadata — real gap, low cost, clear Paperclip use case"
+        resolution: "Converged on 'refine — Phase 0 first, then proceed.' All members now agree Phase 0 is the non-negotiable prerequisite."
+next_action: "Execute Phase 0: inspect the OpenCode Serve REST API (GET /session/{id}) to verify what session metadata is actually exposed. This is a 15-minute investigation that de-risks the entire proposal. If the data exists, proceed with Phase 1 design. If not, evaluate cross-repo OpenCode Serve feature request."
+requires_human_review: false
