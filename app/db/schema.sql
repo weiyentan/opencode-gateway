@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     path            TEXT NOT NULL,
     repo_url        TEXT NOT NULL,
     branch          TEXT,
-    port            INTEGER,
+    port            INTEGER CHECK (port IS NULL OR (port >= 10000 AND port <= 10999)),
     service_name    TEXT,
     pinned          BOOLEAN NOT NULL DEFAULT FALSE,
     cleanup_after   TIMESTAMPTZ,

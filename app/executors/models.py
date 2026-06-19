@@ -65,11 +65,16 @@ class CreateWorkspaceResponse(BaseModel):
 class StartOpencodeRequest(BaseModel):
     """Request to start the OpenCode Serve process for a workspace.
 
+    *port* is the port number allocated by the Gateway's port-allocation
+    service (ADN 0003).  It is passed to the AWX playbook so it can bind
+    the OpenCode Serve process to the correct port.
+
     *env_vars* are environment variables to pass to the OpenCode session.
     """
 
     workspace_id: UUID
     workspace_path: Optional[str] = None
+    port: Optional[int] = None
     env_vars: dict[str, str] = {}
 
 

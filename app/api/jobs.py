@@ -18,6 +18,7 @@ from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
+from app.core.ports import PortExhaustedError, allocate_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -369,11 +370,40 @@ async def create_job(
             str(new_workspace_id),
         )
 
+        # 4a. Allocate a port and persist it against the workspace (ADR 0003).
+        try:
+            allocated_port = await allocate_port(conn)
+        except PortExhaustedError:
+            logger.error(
+                "Port exhaustion — no free ports in range 10000–10999 "
+                "for job %s (workspace %s)",
+                job_id,
+                new_workspace_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="No available ports — all 1000 ports in range 10000–10999 are in use",
+            )
+
+        await conn.execute(
+            "UPDATE workspaces SET port = $2, updated_at = $3 WHERE id = $1",
+            new_workspace_id,
+            allocated_port,
+            datetime.now(timezone.utc),  # noqa: UP017
+        )
+        logger.info(
+            "Allocated port %d for job %s (workspace %s)",
+            allocated_port,
+            job_id,
+            new_workspace_id,
+        )
+
         # 5. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
+                port=allocated_port,
                 env_vars=body.env_vars,
             )
         )

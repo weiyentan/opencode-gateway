@@ -15,6 +15,7 @@ from typing import Any
 
 import asyncpg
 
+from app.core.ports import release_port
 from app.executors import CleanupWorkspaceRequest, ExecutorPlugin
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,8 @@ class CleanupScheduler:
                         """,
                         ws_id,
                     )
+                    # Release the port so it becomes available for reuse (ADR 0003).
+                    await release_port(conn, ws_id)
                     logger.info("Workspace %s cleaned successfully", ws_id)
                 else:
                     logger.warning(

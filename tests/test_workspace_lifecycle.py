@@ -424,7 +424,14 @@ class TestCleanupWorkspace:
             (sql, args) for sql, args in execute_calls
             if "pg_advisory_unlock" in sql
         ]
-        assert len(unlock_calls) == 1
+        # Two unlocks: port release (47001) + cleanup lock (47002, workspace-id)
+        assert len(unlock_calls) == 2
+        # Verify the port lock key is released
+        port_unlocks = [
+            (sql, args) for sql, args in unlock_calls
+            if args == (47001,)
+        ]
+        assert len(port_unlocks) == 1
 
     @pytest.mark.asyncio
     async def test_cleanup_releases_lock_on_failure(
@@ -511,63 +518,57 @@ class TestPortAllocation:
     """Tests for the port allocation advisory lock pattern."""
 
     @pytest.mark.asyncio
-    async def test_allocate_port_returns_starting_port_when_no_ports_allocated(
+    async def test_allocate_port_returns_first_port_when_no_ports_allocated(
         self, mock_conn: AsyncMock
     ) -> None:
         """When no ports are allocated, allocate_port returns 10000."""
-        from app.api.workspaces import allocate_port
+        from app.core.ports import allocate_port
 
-        async def _fetchrow(sql: str, *args):
-            if "SELECT COALESCE(MAX(port)" in sql:
-                return mock_row({"max_port": 0})
-            return None
+        async def _fetch(sql: str, *args):
+            return []
 
         async def _execute(sql: str, *args):
             pass
 
-        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
         port = await allocate_port(mock_conn)
         assert port == 10000
 
     @pytest.mark.asyncio
-    async def test_allocate_port_returns_next_port(self, mock_conn: AsyncMock) -> None:
-        """When ports are already allocated, allocate_port returns max+1."""
-        from app.api.workspaces import allocate_port
+    async def test_allocate_port_finds_first_free_port(self, mock_conn: AsyncMock) -> None:
+        """When ports are already allocated, allocate_port finds the first gap."""
+        from app.core.ports import allocate_port
 
-        async def _fetchrow(sql: str, *args):
-            if "SELECT COALESCE(MAX(port)" in sql:
-                return mock_row({"max_port": 10042})
-            return None
+        async def _fetch(sql: str, *args):
+            return [mock_row({"port": p}) for p in (10000, 10001, 10002)]
 
         async def _execute(sql: str, *args):
             pass
 
-        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
         port = await allocate_port(mock_conn)
-        assert port == 10043
+        assert port == 10003
 
     @pytest.mark.asyncio
     async def test_allocate_port_acquires_and_releases_lock(
         self, mock_conn: AsyncMock
     ) -> None:
         """allocate_port must acquire then release the PG advisory lock."""
-        from app.api.workspaces import allocate_port
+        from app.core.ports import allocate_port
 
         execute_calls: list[tuple] = []
 
-        async def _fetchrow(sql: str, *args):
-            if "SELECT COALESCE(MAX(port)" in sql:
-                return mock_row({"max_port": 0})
-            return None
+        async def _fetch(sql: str, *args):
+            return []
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
 
-        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
         await allocate_port(mock_conn)
@@ -582,20 +583,18 @@ class TestPortAllocation:
         self, mock_conn: AsyncMock
     ) -> None:
         """The lock key must match PORT_LOCK_KEY (47001)."""
-        from app.api.workspaces import allocate_port
+        from app.core.ports import allocate_port
         from app.db.lock import PORT_LOCK_KEY
 
         execute_calls: list[tuple] = []
 
-        async def _fetchrow(sql: str, *args):
-            if "SELECT COALESCE(MAX(port)" in sql:
-                return mock_row({"max_port": 0})
-            return None
+        async def _fetch(sql: str, *args):
+            return []
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
 
-        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.fetch = AsyncMock(side_effect=_fetch)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
         await allocate_port(mock_conn)

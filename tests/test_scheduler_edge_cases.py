@@ -370,4 +370,6 @@ class TestMixedCleanupResults:
             (sql, args) for sql, args in conn.execute_calls
             if "UPDATE workspaces" in sql
         ]
-        assert len(update_calls) == 1
+        # Two UPDATEs for the successful workspace: cleanup_status update
+        # (line 231-237 of cleaner.py) and port release (release_port → SET port = NULL).
+        assert len(update_calls) == 2
