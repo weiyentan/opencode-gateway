@@ -134,10 +134,19 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
 async def get_opencode_client() -> OpenCodeClientProtocol | None:
     """Dependency that returns the OpenCode client for diff fetching.
 
-    Returns None by default; tests override this via
-    ``app.dependency_overrides`` to inject a mock.
+    Creates a real :class:`OpenCodeServeClient` when
+    ``GATEWAY_OPENCODE_BASE_URL`` is configured (non-empty).  Returns
+    ``None`` when the URL is empty so that callers can check for
+    availability.
+
+    Tests override this via ``app.dependency_overrides`` to inject a mock.
     """
-    return None
+    from app.opencode.serve_client import OpenCodeServeClient
+
+    settings = get_settings()
+    if not settings.opencode_base_url:
+        return None
+    return OpenCodeServeClient(base_url=settings.opencode_base_url)
 
 
 async def _set_workspace_cleanup_after(

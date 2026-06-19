@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     cleanup_interval_seconds: int = 900    # 15 minutes
     cleanup_batch_size: int = 10           # workspaces per tick
 
+    # OpenCode Serve — base URL of the OpenCode Serve REST API.
+    # The Gateway uses this to fetch session diffs, logs, and to abort sessions.
+    opencode_base_url: str = "http://localhost:8080"
+
     # AWX executor plugin — connection and authentication settings.
     awx_base_url: str = ""
     awx_token: str = ""
