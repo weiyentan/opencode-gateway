@@ -3,6 +3,19 @@
 This module defines the single source of truth for which Job state
 transitions are allowed.  API handlers and other callers use
 :func:`can_transition` to validate before performing state changes.
+
+Two-tier completion model
+-------------------------
+The Gateway supports two completion paths that coexist side by side:
+
+* **Review-gate path** (HITL): ``RUNNING → AWAITING_REVIEW → COMPLETED``.
+  For human-in-the-loop workflows where an operator must approve the
+  diff before the job is final.
+
+* **Direct-completion path** (external terminal callback): ``RUNNING →
+  COMPLETED``.  For automated / orchestrator-driven workflows where the
+  caller (e.g. Paperclip) has its own review mechanism and calls
+  ``POST /jobs/{id}/complete`` directly with ``target_status="completed"``.
 """
 
 from __future__ import annotations
@@ -41,7 +54,16 @@ VALID_TRANSITIONS: frozenset[tuple[JobStatus, JobStatus]] = frozenset(
         (JobStatus.AWAITING_REVIEW, JobStatus.ABORTING),
         # Abort finalisation
         (JobStatus.ABORTING, JobStatus.ABORTED),
-        # Backward-compatible legacy transitions (existing data)
+        # Direct completion paths (external terminal callback model)
+        # ``PENDING -> RUNNING`` supports older DB records that predate the
+        # granular provisioning stages (provisioning_workspace, starting_opencode).
+        #
+        # ``RUNNING -> COMPLETED`` supports the external-terminal-callback model
+        # where callers (e.g. Paperclip orchestration) call POST /jobs/{id}/complete
+        # directly with target_status="completed". This bypasses the human-in-the-loop
+        # review gate (RUNNING -> AWAITING_REVIEW -> COMPLETED). Both paths coexist:
+        # the review gate is for HITL workflows, the direct path is for automated
+        # or orchestrator-driven completion.
         (JobStatus.PENDING, JobStatus.RUNNING),
         (JobStatus.RUNNING, JobStatus.COMPLETED),
     },

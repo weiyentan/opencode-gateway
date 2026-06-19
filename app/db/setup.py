@@ -34,9 +34,11 @@ _REQUIRED_TABLES = [
     "job_events",
     "approvals",
     "runners",
+    "runner_events",
     "runner_observations",
     "workspace_observations",
     "opencode_instance_observations",
+    "webhooks",
 ]
 
 # Resolved once when the module is loaded.

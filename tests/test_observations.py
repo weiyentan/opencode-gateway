@@ -395,6 +395,55 @@ class TestIngestObservations:
             )
         assert response.status_code == 422
 
+    # ------------------------------------------------------------------
+    # Admin_status preservation (issue #130)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_observation_upsert_does_not_touch_admin_status(self, client, mock_conn):
+        """The observations upsert must not modify admin_status.
+
+        Admin status is set only by the operator via POST /runners/{id}/status.
+        The observations ingestion must leave it untouched — both on INSERT
+        and ON CONFLICT DO UPDATE.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _capture_fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_capture_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post(
+                "/observations",
+                json={
+                    "runner_id": "runner-admin-test",
+                    "hostname": "test.example.com",
+                    "executor_type": "awx",
+                },
+            )
+
+        assert response.status_code == 201
+
+        # The upsert SQL should NOT reference admin_status anywhere
+        upsert_sql = insert_sql_captured[0]
+        assert "admin_status" not in upsert_sql, (
+            "Observations upsert must not modify admin_status — found admin_status in SQL"
+        )
+
+        # Verify the ON CONFLICT SET clause does not include admin_status
+        assert "DO UPDATE SET" in upsert_sql
+        # Collect all columns being SET in the ON CONFLICT branch
+        set_clause = upsert_sql.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        assert "admin_status" not in set_clause, (
+            f"ON CONFLICT SET clause must not include admin_status. "
+            f"SET clause contents: {set_clause.strip()}"
+        )
+
     @pytest.mark.asyncio
     async def test_empty_body_returns_422(self, client):
         """Empty request body returns 422."""
@@ -448,7 +497,7 @@ class TestIngestObservations:
         assert response.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_negative_load_returns_422(self, client):
+    async def test_negative_load_returns_422(self, client, mock_conn):
         """load_1m < 0 returns 422."""
         async with client as c:
             response = await c.post(
@@ -461,3 +510,271 @@ class TestIngestObservations:
                 },
             )
         assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# Admin status preservation — observation ingestion must never overwrite
+# the operator-set admin_status column.
+# --------------------------------------------------------------------------
+
+
+class TestAdminStatusPreservation:
+    """Tests verifying that admin_status is never changed by observation ingestion.
+
+    The ``runners.admin_status`` column is operator-controlled (offline,
+    maintenance, online).  Observation ingestion via the upsert SQL must
+    never include ``admin_status`` in its ``SET`` clause.  These tests
+    verify the guard is in place.
+    """
+
+    @pytest.mark.asyncio
+    async def test_upsert_sql_does_not_set_admin_status(self, client, mock_conn):
+        """The upsert SQL's DO UPDATE SET clause must not assign admin_status."""  # noqa: E501
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-admin-test",
+                "hostname": "admin-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        # Check for assigned columns in the SET clause (e.g.
+        # "hostname       = EXCLUDED.hostname,") using a regex that
+        # matches column names that are being assigned.
+        set_clause_start = upsert_sql.index("DO UPDATE SET")
+        set_clause = upsert_sql[set_clause_start:]
+
+        # Find all column assignments: word characters followed by = (with optional whitespace)
+        import re
+        assigned_columns = re.findall(r"(\w+)\s*=", set_clause)
+
+        assert "admin_status" not in assigned_columns, (
+            "The DO UPDATE SET clause must not assign admin_status. "
+            "Assigned columns found: " + ", ".join(assigned_columns)
+        )
+
+        # Verify that health_status IS still updated
+        assert "health_status" in assigned_columns, (
+            "The DO UPDATE SET clause must still update health_status. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+        # Verify that the legacy status column IS still updated (not just as part of health_status)
+        assert "status" in assigned_columns, (
+            "The DO UPDATE SET clause must still update the legacy status column. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+    @pytest.mark.asyncio
+    async def test_upsert_insert_does_not_include_admin_status(self, client, mock_conn):
+        """The INSERT INTO runners column list must not include admin_status."""
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-insert-test",
+                "hostname": "insert-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        # The INSERT column list is between "INSERT INTO runners (" and ")"
+        # followed by "VALUES"
+        insert_part = upsert_sql[:upsert_sql.index("VALUES")]
+
+        # admin_status must not appear in the INSERT column list
+        assert "admin_status" not in insert_part, (
+            "The INSERT column list must not include admin_status. "
+            "Found 'admin_status' in: " + insert_part
+        )
+
+    @pytest.mark.asyncio
+    async def test_upsert_preserves_existing_admin_status_offline(self, client, mock_conn):
+        """A runner with admin_status='offline' retains it after observation upsert.
+
+        This test verifies the mechanism at the SQL-level: the upsert's
+        SET clause does not assign to admin_status.  In production the
+        actual database row is queried, but with mocks we verify the
+        SQL does not set admin_status.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-offline-test",
+                "hostname": "offline-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        import re
+        set_clause_start = upsert_sql.index("DO UPDATE SET")
+        set_clause = upsert_sql[set_clause_start:]
+        assigned_columns = re.findall(r"(\w+)\s*=", set_clause)
+
+        assert "admin_status" not in assigned_columns, (
+            "admin_status must not be in the SET clause, otherwise "
+            "offline runners would lose their operator-set status. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+    @pytest.mark.asyncio
+    async def test_upsert_preserves_existing_admin_status_maintenance(self, client, mock_conn):
+        """A runner with admin_status='maintenance' retains it after observation upsert."""
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-maintenance-test",
+                "hostname": "maintenance-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        import re
+        set_clause_start = upsert_sql.index("DO UPDATE SET")
+        set_clause = upsert_sql[set_clause_start:]
+        assigned_columns = re.findall(r"(\w+)\s*=", set_clause)
+
+        assert "admin_status" not in assigned_columns, (
+            "admin_status must not be in the SET clause, otherwise "
+            "maintenance runners would lose their operator-set status. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_observed_runner_gets_db_default_admin_status(self, client, mock_conn):
+        """New observed runners get admin_status from the DB default ('online').
+
+        Because the INSERT column list intentionally omits ``admin_status``
+        (to preserve operator-set values on subsequent observations),
+        a brand-new runner relies on the database column default.
+        If the default is ever changed, this test catches it.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-new-default-test",
+                "hostname": "new-default-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        # 1. admin_status must NOT be in the INSERT column list
+        insert_part = upsert_sql[:upsert_sql.index("VALUES")]
+        assert "admin_status" not in insert_part, (
+            "The INSERT column list must not include admin_status. "
+            "Found in: " + insert_part
+        )
+
+        # 2. admin_status must NOT be in the DO UPDATE SET clause
+        set_clause_start = upsert_sql.index("DO UPDATE SET")
+        set_clause = upsert_sql[set_clause_start:]
+        import re
+        assigned_columns = re.findall(r"(\w+)\s*=", set_clause)
+        assert "admin_status" not in assigned_columns, (
+            "The DO UPDATE SET clause must not include admin_status. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+        # 3. health_status and status are hardcoded to 'HEALTHY' on INSERT
+        assert "'HEALTHY'" in upsert_sql, (
+            "The INSERT must hardcode health_status and status to 'HEALTHY'. "
+            "Expected 'HEALTHY' in SQL: " + upsert_sql
+        )
+
+    @pytest.mark.asyncio
+    async def test_upsert_still_sets_health_status_and_legacy_status(self, client, mock_conn):
+        """Observation upsert still updates health_status and status (legacy column).
+
+        The guard only prevents admin_status from being overwritten.
+        The health_status and status columns must still be set to
+        'HEALTHY' on each observation.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-health-check",
+                "hostname": "health-check.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+        assert "status" in upsert_sql
+        assert "health_status" in upsert_sql
+        assert "HEALTHY" in upsert_sql

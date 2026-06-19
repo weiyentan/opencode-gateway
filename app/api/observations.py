@@ -102,6 +102,13 @@ async def ingest_observations(
 
     # ------------------------------------------------------------------
     # 1. Upsert runner (INSERT … ON CONFLICT)
+    #
+    # IMPORTANT: The DO UPDATE SET clause updates observation-derived
+    # statuses (status, health_status) only.  admin_status is NEVER
+    # included — operator-set values (offline, maintenance, online)
+    # must be preserved across observation ingestion.  The policy
+    # engine reads admin_status directly and is the sole authority
+    # for operator-controlled status enforcement.
     # ------------------------------------------------------------------
     runner_row = await conn.fetchrow(
         """
@@ -113,6 +120,7 @@ async def ingest_observations(
             hostname       = EXCLUDED.hostname,
             executor_type  = EXCLUDED.executor_type,
             labels         = EXCLUDED.labels,
+            -- Only update observation-derived statuses — never operator-set ones
             status         = 'HEALTHY',
             health_status  = 'HEALTHY',
             updated_at     = EXCLUDED.updated_at

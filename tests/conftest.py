@@ -191,7 +191,20 @@ def _skip_migrations_in_unit_tests() -> None:
 @pytest.fixture
 def mock_conn() -> AsyncMock:
     """Return a mock asyncpg connection."""
-    return AsyncMock()
+    from unittest.mock import MagicMock
+
+    conn = AsyncMock()
+    # Default fetch to empty list so port allocation queries in
+    # allocate_and_assign_port / allocate_port don't fail.
+    conn.fetch = AsyncMock(return_value=[])
+    # Mock conn.transaction() as an async context manager.
+    # Use MagicMock (not AsyncMock) because conn.transaction() is a
+    # synchronous call that returns a transaction object.
+    mock_tx = AsyncMock()
+    mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+    mock_tx.__aexit__ = AsyncMock(return_value=None)
+    conn.transaction = MagicMock(return_value=mock_tx)
+    return conn
 
 
 @pytest.fixture
@@ -225,7 +238,7 @@ def mock_executor() -> AsyncMock:
         return_value=StartOpencodeResponse(
             session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
             status="running",
-            port=8080,
+            port=10000,
         )
     )
     return executor

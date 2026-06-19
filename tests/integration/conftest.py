@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
+import httpx
 import pytest
 
 # Project root (parent of tests/)
@@ -273,21 +274,33 @@ async def create_runner(
     *,
     hostname: str = "test-runner.example.com",
     status: str = "HEALTHY",
+    admin_status: str | None = "online",
+    health_status: str | None = "HEALTHY",
     executor_type: str = "local",
     labels: dict | None = None,
 ) -> uuid.UUID:
-    """Insert a runner and return its UUID."""
+    """Insert a runner and return its UUID.
+
+    Sets all three status columns: the legacy *status* field, the
+    operator-set *admin_status* (default ``"online"``), and the
+    observation-derived *health_status* (default ``"HEALTHY"``).
+
+    Pass ``admin_status=None`` or ``health_status=None`` to leave the
+    column NULL (useful for tests that verify NULL handling).
+    """
     rid = uuid.uuid4()
     await conn.execute(
         "INSERT INTO runners (id, runner_id, hostname, executor_type, labels, "
-        "status, created_at, updated_at) "
-        "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $7)",
+        "status, admin_status, health_status, created_at, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $9)",
         rid,
         str(rid),
         hostname,
         executor_type,
         '{"env": "test"}' if labels is None else str(labels).replace("'", '"'),
         status,
+        admin_status,
+        health_status,
         datetime.now(timezone.utc),
     )
     return rid
@@ -343,3 +356,123 @@ async def create_job(
         datetime.now(timezone.utc),
     )
     return jid
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Fake client fixtures (wired via FastAPI dependency overrides)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def fake_awx_client():
+    """Return a :class:`FakeAWXClient` for integration tests.
+
+    Configured in ``"success"`` mode by default.  Individual tests can
+    adjust the mode and response data on the returned instance.
+    """
+    from tests.fakes.fake_awx_client import FakeAWXClient
+
+    return FakeAWXClient(mode="success")
+
+
+@pytest.fixture
+def fake_opencode_client():
+    """Return a :class:`FakeOpenCodeServeClient` for integration tests.
+
+    Configured in ``"success"`` mode with default response data.
+    Individual tests can adjust the mode and response data on the
+    returned instance.
+    """
+    from tests.fakes.fake_opencode_client import FakeOpenCodeServeClient
+
+    return FakeOpenCodeServeClient(mode="success")
+
+
+def create_test_client(
+    conn: asyncpg.Connection,
+    *,
+    fake_awx: FakeAWXClient | None = None,
+    fake_opencode: FakeOpenCodeServeClient | None = None,
+    api_key: str | None = "test-api-key",
+) -> httpx.AsyncClient:
+    """Build a FastAPI test application and return an ``httpx.AsyncClient``.
+
+    Wires the fake AWX and OpenCode clients via
+    ``app.dependency_overrides`` so all API endpoints use deterministic
+    responses instead of real HTTP calls.  Database-accessing endpoints
+    use *conn* for their queries.
+
+    Args:
+        conn: An asyncpg connection (typically from the ``db_conn``
+            fixture) used to override ``get_session``.
+        fake_awx: Optional :class:`FakeAWXClient` — if provided, its
+            public methods are wired into ``get_executor`` via a thin
+            fake executor plugin.
+        fake_opencode: Optional :class:`FakeOpenCodeServeClient` — if
+            provided, it replaces ``get_opencode_client``.
+        api_key: Bearer token placed in the ``Authorization`` header
+            (must match ``GATEWAY_API_KEY``).  Pass ``None`` for
+            unauthenticated requests.
+
+    Returns:
+        An ``httpx.AsyncClient`` configured with an ``ASGITransport``
+        pointed at a fresh FastAPI app instance.
+    """
+    from unittest.mock import AsyncMock
+
+    from fastapi import Request
+    from httpx import ASGITransport
+
+    from app.api.jobs import _get_pool, get_opencode_client
+    from app.core.factory import create_app
+    from app.db.session import get_session
+    from app.executors.factory import get_executor
+
+    # Push a test API key into the environment so auth middleware passes.
+    if api_key is not None:
+        os.environ.setdefault("GATEWAY_API_KEY", api_key)
+
+    app = create_app(configure_logging=False)
+    mock_pool = AsyncMock()
+    mock_pool.pool = None  # Suppress background webhook dispatch
+    app.state.pool = mock_pool
+
+    async def _override_get_session(request: Request):
+        yield conn
+
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[_get_pool] = lambda: mock_pool
+
+    # ── Fake executor (wraps FakeAWXClient) ───────────────────────────
+    if fake_awx is not None:
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        _fake_exec = AsyncMock()
+        _fake_exec.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/fake/workspace/path",
+                status="ready",
+            )
+        )
+        _fake_exec.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=18080,
+            )
+        )
+        app.dependency_overrides[get_executor] = lambda: _fake_exec
+
+    if fake_opencode is not None:
+        app.dependency_overrides[get_opencode_client] = lambda: fake_opencode
+
+    headers: dict[str, str] = {}
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    return httpx.AsyncClient(transport=transport, base_url="http://test", headers=headers)

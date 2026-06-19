@@ -237,6 +237,19 @@ class TestStartOpencodeModels:
         req = StartOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         assert req.workspace_path is None
 
+    def test_request_port_field_exists_and_defaults_to_none(self):
+        """StartOpencodeRequest has a port field (Optional[int]) defaulting to None."""
+        req = StartOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        assert req.port is None
+
+    def test_request_port_accepts_custom_value(self):
+        """port field should accept an explicit integer value."""
+        req = StartOpencodeRequest(
+            workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            port=9090,
+        )
+        assert req.port == 9090
+
     def test_response_fields(self):
         resp = StartOpencodeResponse(
             session_id="00000000-1111-2222-3333-444444444444",
@@ -440,6 +453,24 @@ class TestLocalExecutor:
         resp = await executor.start_opencode(req)
         assert resp.status == "running"
         assert executor._last_env_vars == {"MY_SECRET": "s3cret", "LOG_LEVEL": "debug"}
+
+    async def test_start_opencode_default_port_is_8080(self):
+        """When port is not provided, LocalExecutor defaults to 8080."""
+        executor = LocalExecutor()
+        req = StartOpencodeRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.start_opencode(req)
+        assert resp.port == 8080
+
+    async def test_start_opencode_uses_custom_port(self):
+        """When port is provided, LocalExecutor uses it."""
+        executor = LocalExecutor()
+        req = StartOpencodeRequest(
+            workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            port=9090,
+        )
+        resp = await executor.start_opencode(req)
+        assert resp.port == 9090
+        assert executor._last_port == 9090
 
     async def test_stop_opencode(self):
         executor = LocalExecutor()

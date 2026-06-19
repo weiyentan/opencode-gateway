@@ -286,3 +286,65 @@ class TestRunnerStatusEnum:
             "SELECT status FROM runners WHERE id = $1", rid
         )
         assert row["status"] == "BLOCKED_MEMORY_PRESSURE"
+
+    async def test_runner_default_admin_status_is_online(self, db_conn):
+        """When no admin_status is provided, create_runner defaults to 'online'."""
+        rid = await create_runner(db_conn, status="HEALTHY")
+
+        row = await db_conn.fetchrow(
+            "SELECT admin_status FROM runners WHERE id = $1", rid
+        )
+        assert row["admin_status"] == "online"
+
+    async def test_runner_default_health_status_is_healthy(self, db_conn):
+        """When no health_status is provided, create_runner defaults to 'HEALTHY'."""
+        rid = await create_runner(db_conn, status="HEALTHY")
+
+        row = await db_conn.fetchrow(
+            "SELECT health_status FROM runners WHERE id = $1", rid
+        )
+        assert row["health_status"] == "HEALTHY"
+
+    async def test_runner_explicit_admin_status_and_health_status(self, db_conn):
+        """Explicit admin_status='maintenance' and health_status='UNKNOWN'
+        are stored correctly."""
+        rid = await create_runner(
+            db_conn,
+            status="maintenance",
+            admin_status="maintenance",
+            health_status="UNKNOWN",
+        )
+
+        row = await db_conn.fetchrow(
+            "SELECT admin_status, health_status, status FROM runners WHERE id = $1",
+            rid,
+        )
+        assert row["admin_status"] == "maintenance"
+        assert row["health_status"] == "UNKNOWN"
+        assert row["status"] == "maintenance"
+
+    async def test_runner_null_admin_status(self, db_conn):
+        """Passing admin_status=None leaves the column NULL."""
+        rid = await create_runner(
+            db_conn,
+            status="HEALTHY",
+            admin_status=None,
+        )
+
+        row = await db_conn.fetchrow(
+            "SELECT admin_status FROM runners WHERE id = $1", rid
+        )
+        assert row["admin_status"] is None
+
+    async def test_runner_null_health_status(self, db_conn):
+        """Passing health_status=None leaves the column NULL."""
+        rid = await create_runner(
+            db_conn,
+            status="HEALTHY",
+            health_status=None,
+        )
+
+        row = await db_conn.fetchrow(
+            "SELECT health_status FROM runners WHERE id = $1", rid
+        )
+        assert row["health_status"] is None

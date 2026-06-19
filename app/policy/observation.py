@@ -162,14 +162,35 @@ class ObservationBasedPolicy:
                     f"No jobs can be dispatched to this runner."
                 ),
             )
-        if runner_admin_status == RUNNER_STATUS_ONLINE:
-            # Manually cleared for dispatch; allow the job but do NOT
-            # update the status based on observation data.
-            logger.info(
-                "policy_accept runner_id=%s reason=admin_online",
-                runner_id,
-            )
-            return None
+        # ------------------------------------------------------------------
+        # Health status guard — when the operator has not set an admin_status
+        # override, a previously-observed unhealthy condition (disk pressure,
+        # memory pressure, staleness) blocks dispatch.  Runners with
+        # admin_status=online fall through to fresh observation checks below.
+        # ------------------------------------------------------------------
+        if runner_admin_status is None and runner_health_status is not None:
+            _UNHEALTHY_HEALTH_STATUSES: frozenset[str] = frozenset({
+                RUNNER_STATUS_BLOCKED_DISK,
+                RUNNER_STATUS_BLOCKED_MEMORY,
+                RUNNER_STATUS_UNKNOWN,
+            })
+            if runner_health_status in _UNHEALTHY_HEALTH_STATUSES:
+                logger.warning(
+                    "policy_reject runner_id=%s reason=health_status status=%s",
+                    runner_id,
+                    runner_health_status,
+                )
+                raise PolicyViolation(
+                    resource="health_status",
+                    current_value=1.0,
+                    threshold=0.0,
+                    runner_id=runner_id,
+                    message=(
+                        f"Runner {runner_id} has unhealthy health_status: "
+                        f"{runner_health_status}. "
+                        f"No jobs can be dispatched to this runner."
+                    ),
+                )
 
         # Fetch the latest runner observation.
         obs_row = await conn.fetchrow(

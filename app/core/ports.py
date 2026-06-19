@@ -89,6 +89,74 @@ async def allocate_port(conn: asyncpg.Connection) -> int:
         await conn.execute("SELECT pg_advisory_unlock($1)", PORT_LOCK_KEY)
 
 
+async def allocate_and_assign_port(
+    conn: asyncpg.Connection,
+    workspace_id: asyncpg.UUID | str,
+) -> int:
+    """Atomically allocate a free port and assign it to a workspace.
+
+    Begins a database transaction, acquires the ``PORT_LOCK_KEY`` advisory
+    lock, calls :func:`allocate_port` to find the next free port, persists
+    the assignment by updating the workspace row, and commits.
+
+    The advisory lock is held for the entire operation — even though
+    :func:`allocate_port` internally acquires and releases its own instance
+    of the same lock (PG advisory locks are **reentrant per session**), the
+    outer acquisition ensures no concurrent caller can observe or modify
+    port state between allocation and persistence.
+
+    Args:
+        conn:         An asyncpg database connection.
+        workspace_id: The UUID (or string representation) of the target
+                      workspace.
+
+    Returns:
+        The allocated port number.
+
+    Raises:
+        PortExhaustedError:  If all 1000 ports in the range 10000–10999
+                             are currently allocated.
+        ValueError:          If no workspace with the given *workspace_id*
+                             exists in the database.
+    """
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_lock($1)", PORT_LOCK_KEY)
+        try:
+            port = await allocate_port(conn)
+
+            result = await conn.execute(
+                "UPDATE workspaces SET port = $1, updated_at = NOW() "
+                "WHERE id = $2",
+                port,
+                workspace_id,
+            )
+
+            if result == "UPDATE 0":
+                raise ValueError(
+                    f"Workspace {workspace_id} not found — "
+                    f"cannot assign port {port}"
+                )
+
+            logger.info(
+                "Assigned port %d to workspace %s",
+                port,
+                workspace_id,
+            )
+            return port
+
+        except PortExhaustedError:
+            logger.warning(
+                "Port exhaustion for workspace %s — all ports in range "
+                "%d–%d are in use",
+                workspace_id,
+                PORT_RANGE_START,
+                PORT_RANGE_END,
+            )
+            raise
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", PORT_LOCK_KEY)
+
+
 async def release_port(conn: asyncpg.Connection, workspace_id: asyncpg.UUID | str) -> None:
     """Release the port associated with a workspace, making it available for reuse.
 

@@ -18,7 +18,7 @@ from app.api.webhooks import dispatch_webhooks
 from app.core.config import get_settings
 from app.core.lifecycle import can_transition
 from app.core.models.job import JobStatus
-from app.core.ports import PortExhaustedError, allocate_port
+from app.core.ports import PortExhaustedError, allocate_and_assign_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.awx.exceptions import AWXArtifactError
@@ -31,6 +31,26 @@ from app.executors.models import (
 )
 from app.opencode.protocol import OpenCodeClientProtocol
 from app.policy import ObservationBasedPolicy, PolicyViolation
+
+
+class PortMismatchError(Exception):
+    """Raised when the AWX-executor returns a port that does not match the
+    Gateway-allocated port.
+
+    Attributes:
+        allocated_port: The port the Gateway assigned via
+            :func:`allocate_and_assign_port`.
+        returned_port: The port the AWX playbook reported back in
+            :class:`StartOpencodeResponse`.
+    """
+
+    def __init__(self, allocated_port: int, returned_port: int) -> None:
+        self.allocated_port = allocated_port
+        self.returned_port = returned_port
+        super().__init__(
+            f"Port mismatch: allocated {allocated_port}, "
+            f"AWX returned {returned_port}"
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +78,8 @@ class JobCreateRequest(BaseModel):
     runner_id: uuid.UUID | None = Field(
         default=None,
         description="UUID of the runner to pin this job to.  When set, the "
-        "runner must exist and be HEALTHY.",
+        "runner must exist, have admin_status='online', and "
+        "health_status='HEALTHY'.",
     )
     labels: list[str] | None = Field(
         default=None,
@@ -81,6 +102,30 @@ class JobCreateRequest(BaseModel):
         return value
 
 
+class JobCompleteRequest(BaseModel):
+    """Request body for POST /jobs/{id}/complete.
+
+    Callers provide the ``target_status`` (one of ``awaiting_review``,
+    ``completed``, or ``failed``) and optional metadata fields
+    (``branch_name``, ``commit_sha``, ``mr_url``, ``diff``) to record
+    on the job.
+
+    When transitioning to ``failed``, provide a ``failure_reason``.
+    When transitioning to ``completed``, an optional ``summary`` is
+    accepted for logging purposes.
+    """
+
+    target_status: str = Field(
+        description="Target status: awaiting_review, completed, or failed"
+    )
+    branch_name: str | None = Field(default=None)
+    commit_sha: str | None = Field(default=None)
+    mr_url: str | None = Field(default=None)
+    diff: str | None = Field(default=None)
+    summary: str | None = Field(default=None)
+    failure_reason: str | None = Field(default=None)
+
+
 class JobResponse(BaseModel):
     """Response body for job endpoints.
 
@@ -100,8 +145,11 @@ class JobResponse(BaseModel):
     opencode_session_id: str | None = None
     diff: str | None = None
     branch_name: str | None = None
+    commit_sha: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
+    diff_url: str | None = None
+    failure_reason: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -118,7 +166,8 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
+    "opencode_session_id, diff, workspace_name, branch_name, commit_sha, mr_url, "
+    "workflow_run_id, failure_reason"
 )
 
 
@@ -133,10 +182,19 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
 async def get_opencode_client() -> OpenCodeClientProtocol | None:
     """Dependency that returns the OpenCode client for diff fetching.
 
-    Returns None by default; tests override this via
-    ``app.dependency_overrides`` to inject a mock.
+    Creates a real :class:`OpenCodeServeClient` when
+    ``GATEWAY_OPENCODE_BASE_URL`` is configured (non-empty).  Returns
+    ``None`` when the URL is empty so that callers can check for
+    availability.
+
+    Tests override this via ``app.dependency_overrides`` to inject a mock.
     """
-    return None
+    from app.opencode.serve_client import OpenCodeServeClient
+
+    settings = get_settings()
+    if not settings.opencode_base_url:
+        return None
+    return OpenCodeServeClient(base_url=settings.opencode_base_url)
 
 
 async def _set_workspace_cleanup_after(
@@ -170,6 +228,50 @@ def _resolve_workspace_id(workspace_name: str | None) -> uuid.UUID | None:
         return None
 
 
+async def _record_job_event(
+    conn: asyncpg.Connection,
+    job_id: uuid.UUID,
+    from_status: str,
+    to_status: str,
+    message: str,
+    actor: str = "system",
+) -> None:
+    """Insert a job lifecycle transition event into the ``job_events`` table.
+
+    Each event captures a state machine transition with the source and
+    target statuses, a human-readable message, and a timestamp.
+
+    Parameters
+    ----------
+    conn:
+        An active asyncpg database connection.
+    job_id:
+        UUID of the job whose status changed.
+    from_status:
+        The status the job was in before the transition.
+    to_status:
+        The status the job transitioned into.
+    message:
+        Human-readable description of the transition (stored as ``details``).
+    actor:
+        Entity that performed the transition (default ``"system"``).
+    """
+    event_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        job_id,
+        to_status,
+        actor,
+        message,
+        from_status,
+        now,
+    )
+
+
 async def select_runner(
     conn: asyncpg.Connection,
     runner_id: uuid.UUID | None = None,
@@ -186,15 +288,18 @@ async def select_runner(
 
     1. Look up the runner by its UUID primary key in the ``runners`` table.
     2. If the runner does not exist → raise ``HTTPException(400)``.
-    3. If the runner's ``status`` is not ``HEALTHY`` → raise
+    3. If the runner's ``admin_status`` is not ``online`` → raise
        ``HTTPException(400)``.
-    4. Otherwise, return the runner's UUID.
+    4. If the runner's ``health_status`` is not ``HEALTHY`` → raise
+       ``HTTPException(400)``.
+    5. Otherwise, return the runner's UUID.
 
     **2. Label-Based Selection (``labels`` provided, ``runner_id`` absent)**
     When the caller provides ``labels`` but no ``runner_id``:
 
     1. Query all runners where:
-       - ``status = 'HEALTHY'``, AND
+       - ``admin_status = 'online'``, AND
+       - ``health_status = 'HEALTHY'``, AND
        - the ``labels`` JSONB column contains every requested label as a
          key (checked via PostgreSQL ``?&`` operator).
     2. Among the candidates, count each runner's active workspaces
@@ -208,7 +313,8 @@ async def select_runner(
     **3. Automatic Selection (neither ``runner_id`` nor ``labels``)**
     When the caller provides no constraints:
 
-    1. Query all runners with ``status = 'HEALTHY'``.
+    1. Query all runners with ``admin_status = 'online'`` AND
+       ``health_status = 'HEALTHY'``.
     2. Count each runner's active workspaces.
     3. Select the runner with the **fewest** active workspaces.
     4. Break ties by lowest UUID.
@@ -238,13 +344,14 @@ async def select_runner(
     Raises
     ------
     HTTPException(400)
-        If the requested runner is not found, is unhealthy, or no
-        matching healthy runner is available.
+        If the requested runner is not found, its ``admin_status`` is
+        not ``online``, its ``health_status`` is not ``HEALTHY``, or no
+        matching runner with the required statuses is available.
     """
     if runner_id is not None:
         # --- Mode 1: Explicit pinning ---
         row = await conn.fetchrow(
-            "SELECT id, status FROM runners WHERE id = $1",
+            "SELECT id, admin_status, health_status FROM runners WHERE id = $1",
             runner_id,
         )
         if row is None:
@@ -252,10 +359,17 @@ async def select_runner(
                 status_code=400,
                 detail=f"Runner not found: {runner_id}",
             )
-        if row["status"] != "HEALTHY":
+        admin_status = row["admin_status"]
+        if admin_status != "online":
             raise HTTPException(
                 status_code=400,
-                detail=f"Runner is not healthy (status={row['status']}): {runner_id}",
+                detail=f"Runner admin_status is '{admin_status}', expected 'online': {runner_id}",
+            )
+        health_status = row["health_status"]
+        if health_status != "HEALTHY":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Runner health_status is '{health_status}', expected 'HEALTHY': {runner_id}",
             )
         return runner_id
 
@@ -265,7 +379,7 @@ async def select_runner(
         "FROM runners r "
         "LEFT JOIN workspaces w ON w.runner_id = r.id "
         "   AND w.cleanup_status = 'active' "
-        "WHERE r.status = 'HEALTHY'"
+        "WHERE r.admin_status = 'online' AND r.health_status = 'HEALTHY'"
     )
     query_args: list[list[str]] = []
 
@@ -282,11 +396,12 @@ async def select_runner(
         if labels:
             raise HTTPException(
                 status_code=400,
-                detail=f"No healthy runner found matching labels: {labels}",
+                detail=f"No runner with admin_status='online' and health_status='HEALTHY' "
+                f"found matching labels: {labels}",
             )
         raise HTTPException(
             status_code=400,
-            detail="No healthy runners available",
+            detail="No runners with admin_status='online' and health_status='HEALTHY' available",
         )
     return row["id"]  # type: ignore[no-any-return]
 
@@ -294,6 +409,7 @@ async def select_runner(
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     body: JobCreateRequest,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
     pool: DatabasePool = Depends(_get_pool),
     executor: ExecutorPlugin = Depends(get_executor),
@@ -324,19 +440,9 @@ async def create_job(
         body.workflow_run_id,
     )
 
-    # 2. Validate and perform pending → running transition
-    if not can_transition(JobStatus.PENDING, JobStatus.RUNNING):
-        logger.error(
-            "Lifecycle rejected transition pending→running for job %s", job_id
-        )
-        raise HTTPException(status_code=500, detail="Internal state machine error")
-    await conn.execute(
-        "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
-        job_id,
-        datetime.now(timezone.utc),  # noqa: UP017
-    )
-
     new_workspace_id = None
+    # Track current status for event recording in failure handlers
+    current_status = "pending"
 
     try:
         # Resolve the selected runner's text ID for pre-flight policy check.
@@ -352,7 +458,26 @@ async def create_job(
             policy = ObservationBasedPolicy(settings)
             await policy.check(runner_text_id, conn=conn)
 
-        # 4. Create workspace on the selected runner (only after policy passes)
+        # 2. Transition: pending → provisioning_workspace
+        if not can_transition(JobStatus.PENDING, JobStatus.PROVISIONING_WORKSPACE):
+            logger.error(
+                "Lifecycle rejected transition pending→provisioning_workspace for job %s",
+                job_id,
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'provisioning_workspace', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, "pending", "provisioning_workspace",
+            "Provisioning workspace on runner",
+        )
+        current_status = "provisioning_workspace"
+
+        # 3. Create workspace on the selected runner
         ws_response = await executor.create_workspace(
             CreateWorkspaceRequest(
                 repo_url=str(body.repo_url),
@@ -371,9 +496,12 @@ async def create_job(
             str(new_workspace_id),
         )
 
-        # 4a. Allocate a port and persist it against the workspace (ADR 0003).
+        # 4. Allocate a port and persist it atomically against the workspace (ADR 0003).
+        # allocate_and_assign_port acquires an advisory lock, selects a free port,
+        # and updates the workspace row in a single transaction, eliminating the
+        # race window that existed with the old two-step allocate + UPDATE pattern.
         try:
-            allocated_port = await allocate_port(conn)
+            allocated_port = await allocate_and_assign_port(conn, new_workspace_id)
         except PortExhaustedError:
             logger.error(
                 "Port exhaustion — no free ports in range 10000–10999 "
@@ -385,13 +513,6 @@ async def create_job(
                 status_code=503,
                 detail="No available ports — all 1000 ports in range 10000–10999 are in use",
             )
-
-        await conn.execute(
-            "UPDATE workspaces SET port = $2, updated_at = $3 WHERE id = $1",
-            new_workspace_id,
-            allocated_port,
-            datetime.now(timezone.utc),  # noqa: UP017
-        )
         logger.info(
             "Allocated port %d for job %s (workspace %s)",
             allocated_port,
@@ -399,7 +520,26 @@ async def create_job(
             new_workspace_id,
         )
 
-        # 5. Start OpenCode Serve
+        # 5. Transition: provisioning_workspace → starting_opencode
+        if not can_transition(JobStatus.PROVISIONING_WORKSPACE, JobStatus.STARTING_OPENCODE):
+            logger.error(
+                "Lifecycle rejected transition provisioning_workspace→starting_opencode for job %s",
+                job_id,
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'starting_opencode', updated_at = $2 WHERE id = $1",
+            job_id,
+            now,
+        )
+        await _record_job_event(
+            conn, job_id, "provisioning_workspace", "starting_opencode",
+            "Starting OpenCode Serve on workspace",
+        )
+        current_status = "starting_opencode"
+
+        # 6. Start OpenCode Serve
         start_response = await executor.start_opencode(
             StartOpencodeRequest(
                 workspace_id=new_workspace_id,
@@ -417,41 +557,33 @@ async def create_job(
             session_id,
         )
 
-        # 5. Mark completed
+        # 6a. Validate that the AWX-returned port matches the allocated port.
+        # If the playbook overrides the port, health checks and cleanup would
+        # target the wrong session.  Fail the job immediately on mismatch.
+        if start_response.port != allocated_port:
+            raise PortMismatchError(
+                allocated_port=allocated_port,
+                returned_port=start_response.port,
+            )
+
+        # 7. Transition: starting_opencode → running
+        if not can_transition(JobStatus.STARTING_OPENCODE, JobStatus.RUNNING):
+            logger.error(
+                "Lifecycle rejected transition starting_opencode→running for job %s",
+                job_id,
+            )
+            raise HTTPException(status_code=500, detail="Internal state machine error")
         now = datetime.now(timezone.utc)  # noqa: UP017
-        diff_summary = f"Job completed: {body.task_summary}"
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'completed', updated_at = $2, "
-            "completed_at = $3, diff = $4 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'running', updated_at = $2 WHERE id = $1",
             job_id,
             now,
-            now,
-            diff_summary,
         )
-
-        # Fire webhooks asynchronously — non-blocking
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
-                job_id,
-                "job.completed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.completed",
-                    "status": "completed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": now.isoformat(),
-                    "diff": diff_summary,
-                },
-            )
+        await _record_job_event(
+            conn, job_id, "starting_opencode", "running",
+            "Job is now running",
         )
-
-        # 6. Set workspace cleanup_after for successful completion
-        if new_workspace_id is not None:
-            await _set_workspace_cleanup_after(
-                conn, new_workspace_id, settings.cleanup_success_retention_hours
-            )
+        current_status = "running"
 
         # 8. Fetch and persist the diff (non-blocking — failure does not fail the job)
         if opencode_client is not None:
@@ -483,10 +615,17 @@ async def create_job(
             "Policy check rejected job %s before workspace creation",
             job_id,
         )
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+            "Policy check rejected: disk/memory pressure",
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            "Policy check rejected: disk/memory pressure",
         )
         # Fire webhooks asynchronously for policy-rejected jobs
         asyncio.create_task(
@@ -536,14 +675,20 @@ async def create_job(
         error_detail = "; ".join(details_parts)
 
         logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
-            job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
-        )
-
-        # Record the artifact failure as a job event
         now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
+            job_id,
+            now,
+            error_detail,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            error_detail,
+        )
+        
+        # Record the artifact failure as a job event
         event_id = uuid.uuid4()
         await conn.execute(
             "INSERT INTO job_events "
@@ -584,16 +729,98 @@ async def create_job(
                     conn, ws_id, settings.cleanup_failure_retention_hours
                 )
 
-    except Exception:
-        logger.exception("Executor dispatch failed for job %s", job_id)
+    except PortMismatchError as exc:
+        # Port mismatch — the AWX playbook returned a port different from
+        # the one the Gateway allocated.  Fail the job, record the mismatch
+        # event, and clean up the workspace.
+        error_detail = (
+            f"Port mismatch: allocated port {exc.allocated_port}, "
+            f"AWX returned port {exc.returned_port}"
+        )
+        logger.error("Port mismatch for job %s: %s", job_id, error_detail)
+        now = datetime.now(timezone.utc)  # noqa: UP017
         await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2 WHERE id = $1",
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
             job_id,
-            datetime.now(timezone.utc),  # noqa: UP017
+            now,
+            error_detail,
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            error_detail,
         )
 
-        # Record the failure as a job event
+        # Record the port_mismatch event (separate from the status transition)
+        event_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO job_events "
+            "(id, job_id, event_type, actor, details, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event_id,
+            job_id,
+            "port_mismatch",
+            "gateway",
+            error_detail,
+            now,
+        )
+
+        # Fire webhooks asynchronously
+        asyncio.create_task(
+            dispatch_webhooks(
+                pool,
+                job_id,
+                "job.failed",
+                {
+                    "job_id": str(job_id),
+                    "event_type": "job.failed",
+                    "status": "failed",
+                    "repo_url": str(body.repo_url),
+                    "task_summary": body.task_summary,
+                    "completed_at": None,
+                    "error": error_detail,
+                },
+            )
+        )
+
+        # Set workspace cleanup_after for failure
+        row = await _fetch_job(conn, job_id)
+        if row is not None:
+            ws_id = _resolve_workspace_id(row.get("workspace_name"))
+            if ws_id is not None:
+                await _set_workspace_cleanup_after(
+                    conn, ws_id, settings.cleanup_failure_retention_hours
+                )
+
+        # Clean up the workspace (best-effort)
+        try:
+            await executor.cleanup_workspace(
+                CleanupWorkspaceRequest(workspace_id=new_workspace_id)
+            )
+        except Exception:
+            logger.exception(
+                "Failed to clean up workspace for port-mismatch job %s "
+                "(workspace %s)",
+                job_id,
+                new_workspace_id,
+            )
+
+    except Exception:
+        logger.exception("Executor dispatch failed for job %s", job_id)
         now = datetime.now(timezone.utc)  # noqa: UP017
+        await conn.execute(
+            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+            "failure_reason = $3 WHERE id = $1",
+            job_id,
+            now,
+            f"Executor dispatch failed: {body.task_summary}",
+        )
+        await _record_job_event(
+            conn, job_id, current_status, "failed",
+            f"Executor dispatch failed: {body.task_summary}",
+        )
+        
+        # Record the failure as a job event
         event_id = uuid.uuid4()
         await conn.execute(
             "INSERT INTO job_events "
@@ -647,14 +874,18 @@ async def create_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/approve", response_model=JobResponse)
 async def approve_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Approve a job that is waiting for approval, transitioning it to running."""
@@ -700,6 +931,11 @@ async def approve_job(
         job_id,
         now,
     )
+    await _record_job_event(
+        conn, job_id, "needs_approval", "running",
+        "Job approved by api",
+        actor="api",
+    )
 
     # Return updated job
     row = await _fetch_job(conn, job_id)
@@ -714,14 +950,18 @@ async def approve_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/reject", response_model=JobResponse)
 async def reject_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Reject a job that is waiting for approval, transitioning it to rejected."""
@@ -767,6 +1007,11 @@ async def reject_job(
         job_id,
         now,
     )
+    await _record_job_event(
+        conn, job_id, "needs_approval", "rejected",
+        "Job rejected by api",
+        actor="api",
+    )
 
     # Return updated job
     row = await _fetch_job(conn, job_id)
@@ -781,14 +1026,180 @@ async def reject_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
+    )
+
+
+@router.post("/jobs/{job_id}/complete", response_model=JobResponse)
+async def complete_job(
+    job_id: uuid.UUID,
+    body: JobCompleteRequest,
+    request: Request,
+    conn: asyncpg.Connection = Depends(get_session),
+    pool: DatabasePool = Depends(_get_pool),
+) -> JobResponse:
+    """Transition a job to a terminal or review state and store result metadata.
+
+    Accepts metadata (``branch_name``, ``commit_sha``, ``mr_url``, ``diff``)
+    to record on the job at completion time.
+
+    **Allowed transitions:**
+
+    * ``running`` → ``awaiting_review`` — move to review gate
+    * ``running`` → ``completed`` — immediate completion (backward compatible)
+    * ``running`` → ``failed`` — mark as failed
+    * ``awaiting_review`` → ``completed`` — approve reviewed work
+    * ``awaiting_review`` → ``failed`` — reject reviewed work
+
+    Other transitions (e.g. ``pending`` → ``completed``) are rejected
+    with 409.
+    """
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    current_status = row["status"]
+    target_status = body.target_status
+
+    # Validate the target status is one of the expected completion states
+    valid_targets = {"awaiting_review", "completed", "failed"}
+    if target_status not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid target_status '{target_status}'. "
+                f"Must be one of: {', '.join(sorted(valid_targets))}"
+            ),
+        )
+
+    # Validate the transition against the centralised state machine
+    try:
+        source = JobStatus(current_status)
+        target = JobStatus(target_status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid job status: {current_status}")
+
+    if not can_transition(source, target):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot transition job from '{current_status}' "
+                f"to '{target_status}'"
+            ),
+        )
+
+    now = datetime.now(timezone.utc)  # noqa: UP017
+
+    # Build the UPDATE with optional metadata fields
+    is_terminal = target_status in ("completed", "failed")
+    update_fields: list[str] = [
+        "status = $2",
+        "updated_at = $3",
+    ]
+    update_values: list = [
+        job_id,
+        target_status,
+        now,
+    ]
+    param_index = 4  # $4 onwards
+
+    # Optional metadata fields
+    metadata_fields = {
+        "branch_name": body.branch_name,
+        "commit_sha": body.commit_sha,
+        "mr_url": body.mr_url,
+        "diff": body.diff,
+    }
+    for field_name, field_value in metadata_fields.items():
+        if field_value is not None:
+            update_fields.append(f"{field_name} = ${param_index}")
+            update_values.append(field_value)
+            param_index += 1
+
+    if is_terminal:
+        update_fields.append(f"completed_at = ${param_index}")
+        update_values.append(now)
+        param_index += 1
+
+    if target_status == "failed" and body.failure_reason is not None:
+        update_fields.append(f"failure_reason = ${param_index}")
+        update_values.append(body.failure_reason)
+        param_index += 1
+
+    # Record the completion event
+    event_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        job_id,
+        target_status,
+        "api",
+        f"Job completed via /complete endpoint (target={target_status})",
+        current_status,
+        now,
+    )
+
+    # Execute the update
+    sql = (
+        "UPDATE gateway_jobs SET "
+        + ", ".join(update_fields)
+        + f" WHERE id = $1"
+    )
+    await conn.execute(sql, *update_values)
+
+    logger.info(
+        "Job %s transitioned %s → %s via /complete",
+        job_id,
+        current_status,
+        target_status,
+    )
+
+    # Fire webhooks asynchronously — non-blocking
+    asyncio.create_task(
+        dispatch_webhooks(
+            pool,
+            job_id,
+            f"job.{target_status}",
+            {
+                "job_id": str(job_id),
+                "event_type": f"job.{target_status}",
+                "status": target_status,
+                "current_status": current_status,
+            },
+        )
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.post("/jobs/{job_id}/abort", response_model=JobResponse)
 async def abort_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
     executor: ExecutorPlugin = Depends(get_executor),
     opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
@@ -932,14 +1343,18 @@ async def abort_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: uuid.UUID,
+    request: Request,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> JobResponse:
     """Retrieve a job by its ID."""
@@ -957,8 +1372,11 @@ async def get_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -973,6 +1391,7 @@ class JobListResponse(BaseModel):
 
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
+    request: Request,
     status: JobStatus | None = None,
     runner_id: uuid.UUID | None = None,
     workflow_run_id: str | None = None,
@@ -1044,8 +1463,11 @@ async def list_jobs(
             opencode_session_id=row.get("opencode_session_id"),
             diff=row.get("diff"),
             branch_name=row.get("branch_name"),
+            commit_sha=row.get("commit_sha"),
             mr_url=row.get("mr_url"),
             workflow_run_id=row.get("workflow_run_id"),
+            diff_url=str(request.url_for("get_job_diff", job_id=str(row["id"]))),
+            failure_reason=row.get("failure_reason"),
         )
         for row in rows
     ]
@@ -1120,39 +1542,53 @@ async def get_job_events(
 async def get_job_diff(
     job_id: uuid.UUID,
     conn: asyncpg.Connection = Depends(get_session),
+    opencode_client: OpenCodeClientProtocol | None = Depends(get_opencode_client),
 ) -> JSONResponse:
-    """Return the stored diff for a completed job.
+    """Return the diff for a completed job by fetching it from OpenCode Serve.
 
-    Returns the diff payload on success (200), a conflict response when the
-    job is still running (409), or 404 when the job does not exist or has no
-    diff available.
+    Fetches the diff from the OpenCode Serve instance via the stored
+    ``opencode_session_id``.  Returns 404 when the job or its session is
+    not found, and 503 when the OpenCode Serve instance is unreachable.
     """
     row = await conn.fetchrow(
-        "SELECT id, status, diff FROM gateway_jobs WHERE id = $1",
+        "SELECT id, status, opencode_session_id FROM gateway_jobs WHERE id = $1",
         job_id,
     )
 
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if row["status"] == "running":
-        return JSONResponse(
-            status_code=409,
-            content={
-                "job_id": str(job_id),
-                "diff": None,
-                "status": "running",
-            },
+    session_id: str | None = row.get("opencode_session_id")
+    if not session_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No session associated with this job",
         )
 
-    if row["diff"] is None:
-        raise HTTPException(status_code=404, detail="Diff not available")
+    if opencode_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve client not available",
+        )
+
+    try:
+        diff_response = await opencode_client.get_session_diff(session_id)
+    except Exception:
+        logger.exception(
+            "Failed to fetch diff for job %s (session %s)",
+            job_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCode Serve unreachable",
+        )
 
     return JSONResponse(
         status_code=200,
         content={
             "job_id": str(row["id"]),
-            "diff": row["diff"],
+            "diff": diff_response.diff,
         },
     )
 
@@ -1179,7 +1615,7 @@ async def get_job_logs(
     session_id: str | None = row.get("opencode_session_id")
     if not session_id:
         raise HTTPException(
-            status_code=409,
+            status_code=404,
             detail="No session associated with this job",
         )
 

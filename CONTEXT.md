@@ -40,17 +40,50 @@ _Avoid_: Log, event, heartbeat (in the telemetry sense)
 A pluggable pre-flight check system that inspects runner observations before a job is accepted. The default implementation (`ObservationBasedPolicy`) checks disk pressure, memory pressure, and telemetry staleness. Runners that exceed configured thresholds are rejected with HTTP 503 (`PolicyViolation`). The runner's database status is updated to reflect the pressure condition. Runners with operator-set statuses (`offline`, `maintenance`) are rejected immediately regardless of observation data; runners set to `online` bypass observation-based checks entirely.
 _Avoid_: Guard, validator, admission control
 
-**Runner Statuses** — The Gateway tracks runner health via these statuses:
+**Runner Statuses** — The Gateway uses a tripartite status model with three separate columns:
 
-| Status | Meaning |
-|--------|---------|
+### `admin_status` (operator-set)
+
+| Value | Meaning |
+|-------|---------|
+| `online` | Runner is cleared for dispatch (default for new runners) |
+| `offline` | Runner rejects all jobs immediately |
+| `maintenance` | Runner is under maintenance and rejects all jobs immediately |
+
+Set via `POST /runners/{id}/admin-status`. **Never overwritten by observation ingestion.**
+
+### `health_status` (observation-derived)
+
+| Value | Meaning |
+|-------|---------|
 | `HEALTHY` | Runner is accepting jobs |
 | `BLOCKED_DISK_PRESSURE` | Disk usage exceeds `disk_threshold_percent` |
 | `BLOCKED_MEMORY_PRESSURE` | Memory usage exceeds `memory_threshold_percent` |
 | `UNKNOWN` | No recent observations or telemetry is stale |
-| `offline` | Operator-set — runner is offline and rejects all jobs immediately |
-| `online` | Operator-set — runner is cleared for dispatch; observation thresholds are skipped |
-| `maintenance` | Operator-set — runner is under maintenance and rejects all jobs immediately |
+
+Set to `HEALTHY` on every observation upsert. The `ObservationBasedPolicy` engine checks disk/memory thresholds against observation data.
+
+### `status` (legacy)
+
+A single-column legacy status that mirrors `admin_status` on operator changes and `health_status` on observation updates. Retained for backward compatibility.
+
+### Runner Admission Model
+
+The Gateway uses **auto-admit** (Option B):
+
+- **New observed runners** — When a runner first appears via `POST /observations`, the upsert SQL omits `admin_status`, so the database column default (`'online'`) applies. `health_status` is hardcoded to `'HEALTHY'`. The runner is immediately eligible for job dispatch.
+- **Existing runners** — Observation ingestion never overwrites `admin_status`. An operator-set value of `offline` or `maintenance` persists across subsequent observations. Only `health_status` and the legacy `status` are updated to `HEALTHY` on each observation.
+- **Operator override** — `POST /runners/{id}/admin-status` explicitly sets `admin_status` to `online`, `offline`, or `maintenance`, overriding the DB default for that runner.
+
+### Scheduler eligibility
+
+A runner is eligible for job dispatch when:
+- `admin_status = 'online'` AND `health_status = 'HEALTHY'`
+- **OR** `admin_status = 'online'` (skips health check entirely — bypass mode)
+
+A runner is rejected when:
+- `admin_status = 'offline'` or `admin_status = 'maintenance'`
+- `admin_status = 'online'` but `health_status != 'HEALTHY'`
 
 ## Relationships
 
