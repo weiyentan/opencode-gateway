@@ -103,6 +103,60 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Database Initialization and Migrations
+
+Alembic is the **single source of truth** for the production database schema. All tables are created and evolved through versioned migration scripts in `alembic/versions/`.
+
+The Gateway automatically runs migrations at startup — no manual steps are required in development or production. If any required table is missing after migration, startup fails with a clear error message naming the missing tables.
+
+#### Manual migration (optional)
+
+For troubleshooting or CI pipelines, you can run migrations manually:
+
+```bash
+# Apply all pending migrations
+alembic upgrade head
+
+# View current revision
+alembic current
+
+# Generate a new migration after changing SQLAlchemy models
+alembic revision --autogenerate -m "description of change"
+
+# Roll back one migration
+alembic downgrade -1
+```
+
+#### Required tables
+
+The following tables are created by the migration chain and validated at startup:
+
+| Table | Migration | Purpose |
+|-------|-----------|---------|
+| `gateway_jobs` | 0000 | Core job tracking — status, repo, task, runner assignment, diff output |
+| `workspaces` | 0000 | Workspace lifecycle — path, repo, branch, port, cleanup status |
+| `job_events` | 0000 | Audit trail — event type, actor, previous status for state transitions |
+| `approvals` | 0000 | Approval gates — requested action, approver, decision timestamp |
+| `runners` | 0001 | Runner VM registry — hostname, executor type, labels, status |
+| `runner_observations` | 0001 | Time-series runner metrics — disk, memory, load averages |
+| `workspace_observations` | 0001 | Per-workspace snapshots — status, opencode status |
+| `opencode_instance_observations` | 0001 | Per-instance snapshots — version, status |
+
+The legacy `app/db/schema.sql` file is kept as a **static reference** for tests and documentation. Do not edit it manually — it is auto-generated from the migration chain.
+
+#### Fresh database setup
+
+```bash
+# 1. Create the database
+createdb opencode_gateway
+
+# 2. Run migrations (or just start the Gateway — it runs them automatically)
+alembic upgrade head
+
+# 3. (Optional) Seed with sample data
+python scripts/seed.py --runners 3 --workspaces 3 --jobs 5 --observations 10
+```
+
 ### Configuration
 
 Copy the example environment file and adjust values for your environment:
