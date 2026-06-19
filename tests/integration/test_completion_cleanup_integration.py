@@ -124,7 +124,7 @@ class TrackedFakeExecutorPlugin:
         self.calls["create_workspace"].append(request)
 
         # Snapshot job status from the DB while inside the request handler.
-        # At this point the job should already be "running".
+        # At this point the job should already be "provisioning_workspace".
         if self.db_conn is not None and request.job_id is not None:
             row = await self.db_conn.fetchrow(
                 "SELECT status FROM gateway_jobs WHERE id = $1",
@@ -246,13 +246,14 @@ async def app_client(
 
 
 class TestNoPrematureCompletion:
-    """Verify that jobs transition through ``running`` state on the way to
-    ``completed``, rather than jumping directly from ``pending``.
+    """Verify that jobs transition through the granular lifecycle states on the
+    way to ``running``, rather than jumping directly from ``pending``.
 
     The tracked executor queries the database at each lifecycle boundary,
-    capturing the job's status at that point.  If the job went through
-    ``running``, the snapshots taken inside ``create_workspace`` and
-    ``start_opencode`` will show ``running``.
+    capturing the job's status at that point.  If the job goes through the
+    granular lifecycle, the ``create_workspace`` snapshot shows
+    ``provisioning_workspace`` and the ``start_opencode`` snapshot shows
+    ``starting_opencode``.
     """
 
     @pytest.mark.asyncio
@@ -263,12 +264,13 @@ class TestNoPrematureCompletion:
         db_conn,
         runner_id: uuid.UUID,
     ):
-        """The job is in ``running`` state when the executor is called.
+        """The job is in intermediate provisioning states when the executor is called.
 
         The tracked executor records a DB snapshot during ``create_workspace``
-        and ``start_opencode``.  Both snapshots must show ``running``,
-        proving the job was NOT prematurely completed before the executor
-        finished its work.
+        (expecting ``provisioning_workspace``) and ``start_opencode``
+        (expecting ``starting_opencode``).  These snapshots prove the job
+        progresses through the granular lifecycle rather than jumping to
+        ``running`` before the executor finishes its work.
         """
         payload = {
             "repo_url": "https://github.com/example/no-premature.git",
@@ -287,15 +289,15 @@ class TestNoPrematureCompletion:
         assert data["status"] == "running"
 
         # ── Verify status snapshots captured during executor calls ────
-        # Both create_workspace and start_opencode should have been called
-        # while the job was in 'running' state.
+        # create_workspace snapshot shows provisioning_workspace;
+        # start_opencode snapshot shows starting_opencode.
         assert (
             len(tracked_executor.status_snapshots["create_workspace"]) == 1
         ), "Expected one snapshot during create_workspace"
         assert (
-            tracked_executor.status_snapshots["create_workspace"][0] == "running"
+            tracked_executor.status_snapshots["create_workspace"][0] == "provisioning_workspace"
         ), (
-            f"Expected 'running' during create_workspace, "
+            f"Expected 'provisioning_workspace' during create_workspace, "
             f"got '{tracked_executor.status_snapshots['create_workspace'][0]}'"
         )
 
@@ -303,9 +305,9 @@ class TestNoPrematureCompletion:
             len(tracked_executor.status_snapshots["start_opencode"]) == 1
         ), "Expected one snapshot during start_opencode"
         assert (
-            tracked_executor.status_snapshots["start_opencode"][0] == "running"
+            tracked_executor.status_snapshots["start_opencode"][0] == "starting_opencode"
         ), (
-            f"Expected 'running' during start_opencode, "
+            f"Expected 'starting_opencode' during start_opencode, "
             f"got '{tracked_executor.status_snapshots['start_opencode'][0]}'"
         )
 
@@ -381,14 +383,17 @@ class TestNoPrematureCompletion:
         db_conn,
         runner_id: uuid.UUID,
     ):
-        """Executor call count and snapshots together prove the running transition.
+        """Executor call count and snapshots together prove the granular lifecycle.
 
         The flow is::
-            pending → running → [create_workspace] → [start_opencode] → completed (via /complete)
+
+            pending → provisioning_workspace → [create_workspace] →
+            starting_opencode → [start_opencode] → running →
+            completed (via /complete)
 
         By verifying that create_workspace and start_opencode were called
-        AND that the DB showed 'running' during those calls, we prove
-        the job passed through the running state.
+        AND that the DB showed the correct intermediate states during those
+        calls, we prove the job passes through the granular lifecycle.
         """
         payload = {
             "repo_url": "https://github.com/example/prove-running.git",
@@ -407,12 +412,12 @@ class TestNoPrematureCompletion:
         assert len(tracked_executor.calls["create_workspace"]) == 1
         assert len(tracked_executor.calls["start_opencode"]) == 1
 
-        # Both snapshots must show 'running' — the job was NOT yet completed
-        # when these calls were made.
+        # create_workspace snapshot shows provisioning_workspace;
+        # start_opencode snapshot shows starting_opencode.
         ws_snapshots = tracked_executor.status_snapshots["create_workspace"]
         oc_snapshots = tracked_executor.status_snapshots["start_opencode"]
-        assert ws_snapshots == ["running"]
-        assert oc_snapshots == ["running"]
+        assert ws_snapshots == ["provisioning_workspace"]
+        assert oc_snapshots == ["starting_opencode"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -2,8 +2,8 @@
 
 Verifies the complete job lifecycle by observing intermediate states
 during execution: submit job → allocate workspace → allocate port →
-start OpenCode → job stays *running* until terminal result → completed
-→ cleanup succeeds.
+start OpenCode → job transitions through *starting_opencode* to *running*
+→ completed → cleanup succeeds.
 
 Uses the real PostgreSQL test database (``db_conn``) and fake
 executor/OpenCode clients with configurable blocking to let the test
@@ -12,7 +12,7 @@ inspect database state while the job is mid-flight.
 Acceptance Criteria
 -------------------
 1. Submit job → allocate workspace → allocate port → start OpenCode
-2. Job stays ``running`` until terminal result
+2. Job transitions through ``starting_opencode`` to ``running``
 3. Terminal result → completed
 4. Cleanup succeeds
 5. Uses fake clients and real test DB
@@ -196,7 +196,7 @@ class TestHappyPathLifecycle:
         1. Submit job (background task) — the controllable executor blocks
            inside *start_opencode* so we can inspect the DB mid-flight.
         2. While blocked, verify intermediate state:
-           - Job status is ``running``
+           - Job status is ``starting_opencode`` (still blocked in start_opencode)
            - Workspace is created and stored on the job
            - Port is allocated and persisted on the workspace
            - No session ID yet (OpenCode hasn't finished starting)
@@ -233,10 +233,10 @@ class TestHappyPathLifecycle:
 
         job_id: uuid.UUID = job_row["id"]
 
-        # Job must be in "running" state — start_opencode has been called
-        # but hasn't returned yet, so the job hasn't moved to "completed".
-        assert job_row["status"] == "running", (
-            f"Expected status 'running' while start_opencode is blocked, "
+        # Job must be in "starting_opencode" state — start_opencode has been called
+        # but hasn't returned yet, so the job hasn't moved to "running".
+        assert job_row["status"] == "starting_opencode", (
+            f"Expected status 'starting_opencode' while start_opencode is blocked, "
             f"got '{job_row['status']}'"
         )
 

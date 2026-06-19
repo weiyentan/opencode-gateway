@@ -111,18 +111,18 @@ The Gateway automatically runs migrations at startup — no manual steps are req
 
 The 10 required tables are:
 
-| Table | Purpose |
-|-------|---------|
-| `gateway_jobs` | Core job lifecycle tracking |
-| `workspaces` | Per-job workspace directories |
-| `job_events` | State transition audit trail |
-| `approvals` | Human approval records |
-| `runners` | Runner VM registry |
-| `runner_events` | Runner status change audit trail |
-| `runner_observations` | Runner telemetry snapshots |
-| `workspace_observations` | Per-workspace resource metrics |
-| `opencode_instance_observations` | Per-instance opencode serve state |
-| `webhooks` | Webhook endpoint configuration |
+| Table | Migration | Purpose |
+|-------|-----------|---------|
+| `gateway_jobs` | 0000 | Core job lifecycle tracking |
+| `workspaces` | 0000 | Per-job workspace directories |
+| `job_events` | 0000 | State transition audit trail |
+| `approvals` | 0000 | Human approval records |
+| `runners` | 0001 | Runner VM registry |
+| `runner_events` | 0006 | Runner status change audit trail |
+| `runner_observations` | 0001 | Runner telemetry snapshots |
+| `workspace_observations` | 0001 | Per-workspace resource metrics |
+| `opencode_instance_observations` | 0001 | Per-instance opencode serve state |
+| `webhooks` | 0002 | Webhook endpoint configuration |
 
 #### Manual migration (optional)
 
@@ -141,21 +141,6 @@ alembic revision --autogenerate -m "description of change"
 # Roll back one migration
 alembic downgrade -1
 ```
-
-#### Required tables
-
-The following tables are created by the migration chain and validated at startup:
-
-| Table | Migration | Purpose |
-|-------|-----------|---------|
-| `gateway_jobs` | 0000 | Core job tracking — status, repo, task, runner assignment, diff output |
-| `workspaces` | 0000 | Workspace lifecycle — path, repo, branch, port, cleanup status |
-| `job_events` | 0000 | Audit trail — event type, actor, previous status for state transitions |
-| `approvals` | 0000 | Approval gates — requested action, approver, decision timestamp |
-| `runners` | 0001 | Runner VM registry — hostname, executor type, labels, status |
-| `runner_observations` | 0001 | Time-series runner metrics — disk, memory, load averages |
-| `workspace_observations` | 0001 | Per-workspace snapshots — status, opencode status |
-| `opencode_instance_observations` | 0001 | Per-instance snapshots — version, status |
 
 The legacy `app/db/schema.sql` file is kept as a **static reference** for tests and documentation. Do not edit it manually — it is auto-generated from the migration chain.
 
