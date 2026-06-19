@@ -2,6 +2,11 @@
 
 Uses the AWXApiClient for API calls and translates between the typed
 Pydantic request/response models and AWX extra_vars / artifacts.
+
+Per issue #113, required artifact schemas are validated before
+constructing response models.  Missing or malformed artifacts raise
+:class:`AWXArtifactError` — the executor must **not** fall back to
+placeholder values such as zero UUID.
 """
 
 from __future__ import annotations
@@ -11,8 +16,14 @@ from typing import Any
 from uuid import UUID
 
 from app.executors import ExecutorPlugin
+from app.executors.awx.artifacts import (
+    CollectStateArtifacts,
+    CreateWorkspaceArtifacts,
+    StartOpencodeArtifacts,
+    validate_artifacts,
+)
 from app.executors.awx.client import AWXApiClient, AWXJobResult
-from app.executors.awx.exceptions import AWXClientError
+from app.executors.awx.exceptions import AWXArtifactError, AWXClientError
 from app.executors.models import (
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
@@ -44,13 +55,6 @@ def _workspace_path(
     if explicit_path:
         return explicit_path
     return f"{workspace_base_path}/{workspace_id}"
-
-
-def _artifacts_to_dict(artifacts: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a safe dictionary from AWX artifacts (handle None)."""
-    if artifacts is None:
-        return {}
-    return artifacts
 
 
 class AWXExecutorPlugin(ExecutorPlugin):
@@ -173,18 +177,26 @@ class AWXExecutorPlugin(ExecutorPlugin):
             logger.exception("create_workspace failed for repo=%s", request.repo_url)
             raise
 
-        artifacts = _artifacts_to_dict(result.artifacts)
-        workspace_id_str = artifacts.get("workspace_id", "")
-        workspace_path = artifacts.get("workspace_path", "")
-
+        # Validate artifacts — missing or malformed workspace_id / workspace_path
+        # is a hard failure.  No more zero-UUID fallback.
         try:
-            workspace_id = UUID(workspace_id_str) if workspace_id_str else UUID(int=0)
-        except (ValueError, AttributeError):
-            workspace_id = UUID(int=0)
+            validated = validate_artifacts(
+                CreateWorkspaceArtifacts,
+                result.artifacts,
+                template_name="gateway-create-workspace",
+            )
+        except AWXArtifactError:
+            logger.exception(
+                "create_workspace: invalid artifacts from AWX job %d "
+                "(repo=%s)",
+                result.job_id,
+                request.repo_url,
+            )
+            raise
 
         return CreateWorkspaceResponse(
-            workspace_id=workspace_id,
-            workspace_path=workspace_path,
+            workspace_id=validated.workspace_id,
+            workspace_path=validated.workspace_path,
             status=result.status,
         )
 
@@ -217,20 +229,27 @@ class AWXExecutorPlugin(ExecutorPlugin):
             )
             raise
 
-        artifacts = _artifacts_to_dict(result.artifacts)
-        session_id_str = artifacts.get("session_id", "")
-
+        # Validate artifacts — missing or malformed session_id / port
+        # is a hard failure.  No more zero-UUID / zero-port fallback.
         try:
-            session_id = UUID(session_id_str) if session_id_str else UUID(int=0)
-        except (ValueError, AttributeError):
-            session_id = UUID(int=0)
-
-        port = artifacts.get("port", 0)
+            validated = validate_artifacts(
+                StartOpencodeArtifacts,
+                result.artifacts,
+                template_name="gateway-opencode-lifecycle (action=start)",
+            )
+        except AWXArtifactError:
+            logger.exception(
+                "start_opencode: invalid artifacts from AWX job %d "
+                "(workspace=%s)",
+                result.job_id,
+                request.workspace_id,
+            )
+            raise
 
         return StartOpencodeResponse(
-            session_id=session_id,
+            session_id=validated.session_id,
             status=result.status,
-            port=port,
+            port=validated.port,
         )
 
     async def stop_opencode(
@@ -321,21 +340,41 @@ class AWXExecutorPlugin(ExecutorPlugin):
             )
             raise
 
-        artifacts = _artifacts_to_dict(result.artifacts)
-
-        # Map the AWX status to a WorkspaceState if possible.
-        raw_status = artifacts.get("status", result.status)
+        # Validate artifacts — status is required.  No more falling back
+        # to the AWX job status or silently defaulting to ERROR.
         try:
-            ws_state = WorkspaceState(raw_status)
+            validated = validate_artifacts(
+                CollectStateArtifacts,
+                result.artifacts,
+                template_name="gateway-workspace-teardown (action=collect)",
+            )
+        except AWXArtifactError:
+            logger.exception(
+                "collect_state: invalid artifacts from AWX job %d "
+                "(workspace=%s)",
+                result.job_id,
+                request.workspace_id,
+            )
+            raise
+
+        # Map the validated status to a WorkspaceState.
+        try:
+            ws_state = WorkspaceState(validated.status)
         except ValueError:
-            # Default to ERROR for unrecognised states.
+            logger.warning(
+                "collect_state: unrecognised workspace state %r "
+                "(workspace=%s, job=%d), defaulting to ERROR",
+                validated.status,
+                request.workspace_id,
+                result.job_id,
+            )
             ws_state = WorkspaceState.ERROR
 
         return CollectStateResponse(
             workspace_id=request.workspace_id,
             status=ws_state,
-            process_status=artifacts.get("process_status"),
-            port=artifacts.get("port"),
+            process_status=validated.process_status,
+            port=validated.port,
         )
 
     async def cleanup_workspace(
