@@ -47,6 +47,8 @@ class RunnerResponse(BaseModel):
     runner_id: str
     hostname: str
     status: str
+    admin_status: str | None = None
+    health_status: str | None = None
     executor_type: str
     labels: dict | None = None
     created_at: datetime
@@ -86,7 +88,8 @@ class RunnerDetailResponse(RunnerResponse):
 # ---------------------------------------------------------------------------
 
 _RUNNER_COLS = (
-    "r.id, r.runner_id, r.hostname, r.status, r.executor_type, "
+    "r.id, r.runner_id, r.hostname, r.status, "
+    "r.admin_status, r.health_status, r.executor_type, "
     "r.labels, r.created_at, r.updated_at"
 )
 
@@ -129,6 +132,8 @@ def _row_to_runner_response(row: asyncpg.Record) -> RunnerResponse:
         runner_id=row["runner_id"],
         hostname=row["hostname"],
         status=row["status"],
+        admin_status=row.get("admin_status"),
+        health_status=row.get("health_status"),
         executor_type=row["executor_type"],
         labels=row.get("labels"),
         created_at=row["created_at"],
@@ -188,20 +193,28 @@ def _row_to_opencode_instance_obs_item(
     )
 
 
-def _derive_policy_status(runner_status: str) -> tuple[str, str]:
-    """Derive the policy_status and policy_reason from the runner's DB status."""
-    if runner_status == RUNNER_STATUS_BLOCKED_DISK:
-        return ("BLOCKED_DISK_PRESSURE", "Runner has disk pressure")
-    if runner_status == RUNNER_STATUS_BLOCKED_MEMORY:
-        return ("BLOCKED_MEMORY_PRESSURE", "Runner has memory pressure")
-    if runner_status == RUNNER_STATUS_UNKNOWN:
-        return ("UNKNOWN", "Runner observations are stale")
-    if runner_status == RUNNER_STATUS_OFFLINE:
+def _derive_policy_status(
+    admin_status: str | None,
+    health_status: str | None,
+) -> tuple[str, str]:
+    """Derive policy_status and policy_reason from the runner's admin and health statuses.
+
+    Admin status (operator-set) takes priority: offline → OFFLINE,
+    maintenance → MAINTENANCE, online → ONLINE.
+    Otherwise the observation-derived health_status determines the result.
+    """
+    if admin_status == RUNNER_STATUS_OFFLINE:
         return ("OFFLINE", "Runner is manually set offline")
-    if runner_status == RUNNER_STATUS_MAINTENANCE:
+    if admin_status == RUNNER_STATUS_MAINTENANCE:
         return ("MAINTENANCE", "Runner is in maintenance mode")
-    if runner_status == RUNNER_STATUS_ONLINE:
+    if admin_status == RUNNER_STATUS_ONLINE:
         return ("ONLINE", "Runner is manually set online")
+    if health_status == RUNNER_STATUS_BLOCKED_DISK:
+        return ("BLOCKED_DISK_PRESSURE", "Runner has disk pressure")
+    if health_status == RUNNER_STATUS_BLOCKED_MEMORY:
+        return ("BLOCKED_MEMORY_PRESSURE", "Runner has memory pressure")
+    if health_status == RUNNER_STATUS_UNKNOWN:
+        return ("UNKNOWN", "Runner observations are stale")
     return ("HEALTHY", "Runner is healthy")
 
 
@@ -378,13 +391,17 @@ async def get_runner_detail(
             observed_at=obs_row["observed_at"],
         )
 
-    policy_status, policy_reason = _derive_policy_status(base.status)
+    policy_status, policy_reason = _derive_policy_status(
+        base.admin_status, base.health_status
+    )
 
     return RunnerDetailResponse(
         id=base.id,
         runner_id=base.runner_id,
         hostname=base.hostname,
         status=base.status,
+        admin_status=base.admin_status,
+        health_status=base.health_status,
         executor_type=base.executor_type,
         labels=base.labels,
         created_at=base.created_at,
@@ -422,9 +439,9 @@ async def set_runner_status(
     Returns 404 if the runner ID does not exist, and 422 if the
     requested transition is not allowed.
     """
-    # Fetch the current runner row
+    # Fetch the current runner row — use admin_status for transition validation
     row = await conn.fetchrow(
-        "SELECT id, runner_id, hostname, status FROM runners WHERE id = $1",
+        "SELECT id, runner_id, hostname, admin_status, status FROM runners WHERE id = $1",
         runner_id,
     )
     if row is None:
@@ -433,16 +450,16 @@ async def set_runner_status(
             detail=f"Runner {runner_id} not found",
         )
 
-    previous_status: str = row["status"]
+    previous_status: str = row["admin_status"] or row["status"]
     target_status: str = body.status
 
     # Validate the transition
     _validate_status_transition(previous_status, target_status, runner_id)
 
-    # Update the runner status
+    # Update both admin_status and the legacy status column
     now = datetime.now(timezone.utc)
     await conn.execute(
-        "UPDATE runners SET status = $1, updated_at = $2 WHERE id = $3",
+        "UPDATE runners SET admin_status = $1, status = $1, updated_at = $2 WHERE id = $3",
         target_status,
         now,
         runner_id,

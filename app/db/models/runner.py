@@ -35,6 +35,10 @@ class Runner(Base):
     executor_type: Mapped[str] = mapped_column(Text, nullable=False)
     labels: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="UNKNOWN")
+    # admin_status: operator-set (online, offline, maintenance), NULL initially
+    admin_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    # health_status: observation-derived (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN), NULL initially
+    health_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

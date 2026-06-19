@@ -30,6 +30,8 @@ def _make_mock_conn(
     runner_id="runner-1",
     runner_uuid=None,
     runner_status="HEALTHY",
+    admin_status=None,
+    health_status=None,
     disk_used_percent=None,
     memory_used_percent=None,
     observed_at=None,
@@ -44,6 +46,10 @@ def _make_mock_conn(
         The runner's UUID.  Auto-generated when None.
     runner_status:
         The runner's DB status (e.g. "HEALTHY", "offline", "maintenance").
+    admin_status:
+        The runner's admin_status value. Defaults to None.
+    health_status:
+        The runner's health_status value. Defaults to None.
     disk_used_percent:
         The disk_used_percent value to return from runner_observations.
         When None, the observation row is not returned (simulates
@@ -58,10 +64,18 @@ def _make_mock_conn(
     if runner_uuid is None:
         runner_uuid = uuid.uuid4()
 
-    # Runner lookup: SELECT id, status FROM runners WHERE runner_id = $1
+    def _make_runner_row():
+        return mock_row({
+            "id": runner_uuid,
+            "status": runner_status,
+            "admin_status": admin_status,
+            "health_status": health_status,
+        })
+
+    # Runner lookup: SELECT id, admin_status, health_status, status FROM runners
     async def _fetchrow_runner(sql, *args):
         if "FROM runners" in sql:
-            return mock_row({"id": runner_uuid, "status": runner_status})
+            return _make_runner_row()
         return None
 
     if disk_used_percent is not None or memory_used_percent is not None:
@@ -70,7 +84,7 @@ def _make_mock_conn(
 
         async def _fetchrow_obs(sql, *args):
             if "FROM runners" in sql:
-                return mock_row({"id": runner_uuid, "status": runner_status})
+                return _make_runner_row()
             if "FROM runner_observations" in sql:
                 return mock_row(
                     {
@@ -306,7 +320,7 @@ class TestCheckDiskPressure:
         # Verify the runner status update was invoked with the correct status
         status_updates = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET health_status" in sql
         ]
         assert len(status_updates) == 1, (
             f"Expected 1 status update, got {len(status_updates)}. "
@@ -405,7 +419,7 @@ class TestCheckMemoryPressure:
 
         status_updates = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET health_status" in sql
         ]
         assert len(status_updates) == 1
         _sql, args = status_updates[0]
@@ -607,7 +621,7 @@ class TestCheckStaleness:
 
         status_updates = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET health_status" in sql
         ]
         assert len(status_updates) == 1, (
             f"Expected 1 status update, got {len(status_updates)}. "
@@ -711,10 +725,11 @@ class TestManualStatusPolicy:
 
     @pytest.mark.asyncio
     async def test_offline_runner_rejects_with_policy_violation(self) -> None:
-        """When runner status is 'offline', check() raises PolicyViolation."""
+        """When admin_status is 'offline', check() raises PolicyViolation."""
         policy = ObservationBasedPolicy()
         conn = _make_mock_conn(
             runner_status="offline",
+            admin_status="offline",
             disk_used_percent=50.0,
             memory_used_percent=50.0,
         )
@@ -730,10 +745,11 @@ class TestManualStatusPolicy:
 
     @pytest.mark.asyncio
     async def test_maintenance_runner_rejects_with_policy_violation(self) -> None:
-        """When runner status is 'maintenance', check() raises PolicyViolation."""
+        """When admin_status is 'maintenance', check() raises PolicyViolation."""
         policy = ObservationBasedPolicy()
         conn = _make_mock_conn(
             runner_status="maintenance",
+            admin_status="maintenance",
             disk_used_percent=50.0,
             memory_used_percent=50.0,
         )
@@ -751,8 +767,8 @@ class TestManualStatusPolicy:
     async def test_online_runner_allows_dispatch_without_updating_status(
         self,
     ) -> None:
-        """When runner status is 'online', check() returns None and does NOT
-        update the runner status even if observation thresholds are exceeded."""
+        """When admin_status is 'online', check() returns None and does NOT
+        update the health_status even if observation thresholds are exceeded."""
         policy = ObservationBasedPolicy()
         runner_uuid = uuid.uuid4()
 
@@ -769,6 +785,7 @@ class TestManualStatusPolicy:
         conn = _make_mock_conn_tracked(
             runner_uuid=runner_uuid,
             runner_status="online",
+            admin_status="online",
             disk_used_percent=95.0,  # exceeds threshold but should be ignored
             memory_used_percent=95.0,  # exceeds threshold but should be ignored
         )
@@ -776,10 +793,10 @@ class TestManualStatusPolicy:
         result = await policy.check("runner-1", conn=conn)
         assert result is None
 
-        # Verify NO status update was issued (online status is preserved)
+        # Verify NO health_status update was issued (online status is preserved)
         status_updates = [
             (sql, args) for sql, args in execute_calls
-            if "UPDATE runners SET status" in sql
+            if "UPDATE runners SET health_status" in sql
         ]
         assert len(status_updates) == 0, (
             f"Expected 0 status updates for online runner, got {len(status_updates)}"
@@ -791,6 +808,7 @@ class TestManualStatusPolicy:
         policy = ObservationBasedPolicy()
         conn = _make_mock_conn(
             runner_status="offline",
+            admin_status="offline",
             disk_used_percent=10.0,
             memory_used_percent=20.0,
         )
@@ -806,6 +824,7 @@ class TestManualStatusPolicy:
         policy = ObservationBasedPolicy()
         conn = _make_mock_conn(
             runner_status="maintenance",
+            admin_status="maintenance",
             disk_used_percent=10.0,
             memory_used_percent=20.0,
         )
@@ -821,6 +840,7 @@ class TestManualStatusPolicy:
         policy = ObservationBasedPolicy()
         conn = _make_mock_conn(
             runner_status="HEALTHY",
+            health_status="HEALTHY",
             disk_used_percent=90.0,
             memory_used_percent=50.0,
         )

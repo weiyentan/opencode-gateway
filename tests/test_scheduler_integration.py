@@ -302,23 +302,27 @@ class TestFullTickFlow:
 class TestSchedulerConfigIntegration:
     """Verify that config values are wired through to scheduler behaviour."""
 
-    def test_default_interval_matches_config_default(self):
+    @pytest.mark.asyncio
+    async def test_default_interval_matches_config_default(self):
         from app.core.config import Settings
         settings = Settings()
         scheduler = CleanupScheduler()
         assert scheduler._interval == float(settings.cleanup_interval_seconds)
 
-    def test_default_batch_size_matches_config_default(self):
+    @pytest.mark.asyncio
+    async def test_default_batch_size_matches_config_default(self):
         from app.core.config import Settings
         settings = Settings()
         scheduler = CleanupScheduler()
         assert scheduler._batch_size == settings.cleanup_batch_size
 
-    def test_custom_interval_overrides_default(self):
+    @pytest.mark.asyncio
+    async def test_custom_interval_overrides_default(self):
         scheduler = CleanupScheduler(interval_seconds=42)
         assert scheduler._interval == 42.0
 
-    def test_custom_batch_size_overrides_default(self):
+    @pytest.mark.asyncio
+    async def test_custom_batch_size_overrides_default(self):
         scheduler = CleanupScheduler(batch_size=25)
         assert scheduler._batch_size == 25
 
