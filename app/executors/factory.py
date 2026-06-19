@@ -17,11 +17,31 @@ def _create_awx_executor(settings: Settings) -> ExecutorPlugin:
     token, timeout, and poll interval, then injects it together with
     the three template IDs into ``AWXExecutorPlugin``.
 
+    Validates that the AWX base URL, token, and all three template IDs
+    are configured before construction — missing values fail fast with
+    a clear error so misconfiguration is caught at startup rather than
+    at runtime.
+
     Raises:
-        ValueError: If any required AWX template ID is ``None`` or zero.
+        ValueError: If the AWX base URL or token is empty, or if any
+            required AWX template ID is ``None`` or zero.
     """
     from app.executors.awx import AWXApiClient, AWXExecutorPlugin
 
+    # ── Validate base URL and token ──────────────────────────────────
+    missing_conn: list[str] = []
+    if not settings.awx_base_url or not settings.awx_base_url.strip():
+        missing_conn.append("awx_base_url")
+    if not settings.awx_token or not settings.awx_token.strip():
+        missing_conn.append("awx_token")
+    if missing_conn:
+        raise ValueError(
+            f"AWX executor is configured but the following connection "
+            f"settings are missing or empty: {missing_conn!r}. "
+            f"Set the corresponding GATEWAY_AWX_* environment variables."
+        )
+
+    # ── Validate template IDs ───────────────────────────────────────
     template_ids = {
         "awx_create_workspace_template_id": settings.awx_create_workspace_template_id,
         "awx_opencode_lifecycle_template_id": settings.awx_opencode_lifecycle_template_id,
@@ -60,6 +80,37 @@ def _create_awx_executor(settings: Settings) -> ExecutorPlugin:
         opencode_lifecycle_template_id=settings.awx_opencode_lifecycle_template_id,
         workspace_teardown_template_id=settings.awx_workspace_teardown_template_id,
     )
+
+
+def create_executor_from_settings(settings: Settings) -> ExecutorPlugin | None:
+    """Build an executor plugin from settings for app startup.
+
+    This is the single construction path used by the Gateway app
+    factory at startup.  It routes to the correct executor
+    implementation based on ``settings.executor_type``, using
+    :func:`_create_awx_executor` for the ``"awx"`` type (which
+    validates all required settings and returns a fully-wired
+    instance) and no-arg construction for all other registered types.
+
+    Returns ``None`` when the executor type is unknown so the cleanup
+    scheduler can skip ticks gracefully instead of crashing.
+
+    Raises:
+        ValueError: If the executor type is ``"awx"`` and required
+            AWX settings (base URL, token, template IDs) are missing.
+    """
+    executor_cls = EXECUTOR_REGISTRY.get(settings.executor_type)
+    if executor_cls is None:
+        logger.warning(
+            "Unknown executor type %r — cleanup scheduler will skip ticks",
+            settings.executor_type,
+        )
+        return None
+
+    if settings.executor_type == "awx":
+        return _create_awx_executor(settings)
+
+    return executor_cls()
 
 
 def get_executor() -> ExecutorPlugin:
