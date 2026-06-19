@@ -54,35 +54,20 @@ class TestEnsureSchema:
 
     @pytest.mark.asyncio
     async def test_ensure_schema_executes_sql_against_pool(self):
-        """ensure_schema() should read schema.sql and execute it against the given pool."""
-        from unittest.mock import MagicMock, patch
+        """ensure_schema() should run Alembic migrations and check required tables."""
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         from app.db.schema import ensure_schema
 
-        mock_conn = AsyncMock()
-        mock_conn.execute = AsyncMock()
+        mock_pool = MagicMock(spec=AsyncMock)
 
-        # pool.acquire() is NOT a coroutine — it returns an async context manager.
-        mock_ctx = MagicMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_ctx.__aexit__ = AsyncMock(return_value=None)
-
-        mock_pool = MagicMock()
-        mock_pool.acquire.return_value = mock_ctx
-
-        fake_sql = (
-            "CREATE TABLE IF NOT EXISTS gateway_jobs (\n"
-            "    id UUID PRIMARY KEY\n"
-            ");\n"
-        )
-
-        with patch("app.db.schema._SCHEMA_SQL", fake_sql):
+        with patch("app.db.schema.run_migrations") as mock_run_migrations, patch(
+            "app.db.schema.check_required_tables"
+        ) as mock_check:
             await ensure_schema(mock_pool)
 
-        mock_pool.acquire.assert_called_once()
-        mock_conn.execute.assert_called_once()
-        executed_sql = mock_conn.execute.call_args[0][0]
-        assert "CREATE TABLE IF NOT EXISTS gateway_jobs" in executed_sql
+        mock_run_migrations.assert_awaited_once()
+        mock_check.assert_awaited_once_with(mock_pool)
 
 
 class TestSchemaLifespanIntegration:
