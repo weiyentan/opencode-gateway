@@ -29,6 +29,8 @@ async def _invoke_hook(hook: Callable[[], Any]) -> None:
 def create_app(
     on_startup: list[Callable[[], Any]] | None = None,
     on_shutdown: list[Callable[[], Any]] | None = None,
+    *,
+    configure_logging: bool = True,
 ) -> FastAPI:
     """Build the FastAPI Gateway application.
 
@@ -42,7 +44,20 @@ def create_app(
 
     A background cleanup scheduler is started during the boot sequence
     and stopped gracefully on shutdown.
+
+    Args:
+        on_startup: Optional list of callbacks to run on startup.
+        on_shutdown: Optional list of callbacks to run on shutdown.
+        configure_logging: If ``True`` (the default), install the
+            :class:`~app.core.logging.RedactingFormatter` on the root
+            logger so that secret-like values are redacted from all
+            log output.  Set to ``False`` in tests that need to
+            inspect raw log messages.
     """
+    if configure_logging:
+        from app.core.logging import configure_root_logger
+        configure_root_logger()
+
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
 

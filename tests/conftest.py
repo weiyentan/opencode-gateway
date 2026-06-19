@@ -127,7 +127,7 @@ def create_client(
     """
     from app.api.jobs import _get_pool, get_opencode_client
 
-    app = create_app()
+    app = create_app(configure_logging=False)
     mock_pool = AsyncMock()
     # Set pool.pool to None so background webhook dispatch exits early in tests.
     # The webhook dispatch is tested separately in test_webhooks.py with its own

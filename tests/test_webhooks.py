@@ -6,13 +6,9 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import Request
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
-from app.api.jobs import _get_pool
 from app.api.webhooks import _compute_signature
-from app.core.factory import create_app
-from app.db.session import get_session
 from tests.conftest import create_client, mock_row
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -68,19 +64,7 @@ class TestSignature:
 
 def _make_webhook_client(mock_conn: AsyncMock) -> AsyncClient:
     """Build a test client with webhook and pool dependencies overridden."""
-    app = create_app()
-    mock_pool = AsyncMock()
-    mock_pool.pool = None
-    app.state.pool = mock_pool
-
-    async def _override_get_session(request: Request):
-        yield mock_conn
-
-    app.dependency_overrides[get_session] = _override_get_session
-    app.dependency_overrides[_get_pool] = lambda: mock_pool
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return create_client(mock_conn)
 
 
 class TestCreateWebhook:
