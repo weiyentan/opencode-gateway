@@ -693,6 +693,60 @@ class TestAdminStatusPreservation:
         )
 
     @pytest.mark.asyncio
+    async def test_new_observed_runner_gets_db_default_admin_status(self, client, mock_conn):
+        """New observed runners get admin_status from the DB default ('online').
+
+        Because the INSERT column list intentionally omits ``admin_status``
+        (to preserve operator-set values on subsequent observations),
+        a brand-new runner relies on the database column default.
+        If the default is ever changed, this test catches it.
+        """
+        runner_uuid = uuid.uuid4()
+        insert_sql_captured: list[str] = []
+
+        async def _fetchrow(sql, *args):
+            insert_sql_captured.append(sql)
+            return mock_row({"id": runner_uuid})
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.post("/observations", json={
+                "runner_id": "runner-new-default-test",
+                "hostname": "new-default-test.example.com",
+                "executor_type": "awx",
+            })
+
+        assert response.status_code == 201
+        assert len(insert_sql_captured) == 1
+
+        upsert_sql = insert_sql_captured[0]
+
+        # 1. admin_status must NOT be in the INSERT column list
+        insert_part = upsert_sql[:upsert_sql.index("VALUES")]
+        assert "admin_status" not in insert_part, (
+            "The INSERT column list must not include admin_status. "
+            "Found in: " + insert_part
+        )
+
+        # 2. admin_status must NOT be in the DO UPDATE SET clause
+        set_clause_start = upsert_sql.index("DO UPDATE SET")
+        set_clause = upsert_sql[set_clause_start:]
+        import re
+        assigned_columns = re.findall(r"(\w+)\s*=", set_clause)
+        assert "admin_status" not in assigned_columns, (
+            "The DO UPDATE SET clause must not include admin_status. "
+            "Assigned columns: " + ", ".join(assigned_columns)
+        )
+
+        # 3. health_status and status are hardcoded to 'HEALTHY' on INSERT
+        assert "'HEALTHY'" in upsert_sql, (
+            "The INSERT must hardcode health_status and status to 'HEALTHY'. "
+            "Expected 'HEALTHY' in SQL: " + upsert_sql
+        )
+
+    @pytest.mark.asyncio
     async def test_upsert_still_sets_health_status_and_legacy_status(self, client, mock_conn):
         """Observation upsert still updates health_status and status (legacy column).
 
