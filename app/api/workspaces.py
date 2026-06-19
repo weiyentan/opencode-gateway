@@ -12,7 +12,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.config import get_settings
 from app.core.models.workspace import Workspace, WorkspaceStatus
-from app.db.lock import PORT_LOCK_KEY, release_cleanup_lock, try_acquire_cleanup_lock
+from app.core.ports import release_port
+from app.db.lock import release_cleanup_lock, try_acquire_cleanup_lock
 from app.db.session import get_session
 from app.executors import ExecutorPlugin
 from app.executors.factory import get_executor
@@ -155,31 +156,6 @@ async def _fetch_workspace(
         f"SELECT {_WORKSPACE_COLS} FROM workspaces WHERE id = $1",
         workspace_id,
     )
-
-
-async def allocate_port(conn: asyncpg.Connection) -> int:
-    """Allocate a free port using a PG advisory lock to avoid race conditions.
-
-    Acquires an exclusive advisory lock (key ``PORT_LOCK_KEY``), scans the
-    ``workspaces`` table for the highest port in the dynamic range
-    (10000–10999), and returns the next available number.
-
-    The lock is held for the duration of the call so that no two concurrent
-    requests can receive the same port.  It is released automatically when
-    the connection is returned to the pool.
-    """
-    await conn.execute("SELECT pg_advisory_lock($1)", PORT_LOCK_KEY)
-    try:
-        row = await conn.fetchrow(
-            "SELECT COALESCE(MAX(port), 0) AS max_port FROM workspaces "
-            "WHERE port IS NOT NULL AND port >= $1 AND port <= $2",
-            10000,
-            10999,
-        )
-        max_port: int = row["max_port"] if row else 0  # type: ignore[index]
-        return max_port + 1 if max_port > 0 else 10000
-    finally:
-        await conn.execute("SELECT pg_advisory_unlock($1)", PORT_LOCK_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +304,9 @@ async def cleanup_workspace(
                 now_done,
                 workspace_id,
             )
+
+        # Release the port so it becomes available for reuse (ADR 0003).
+        await release_port(conn, workspace_id)
 
         row = await _fetch_workspace(conn, workspace_id)
         return _build_response(row)

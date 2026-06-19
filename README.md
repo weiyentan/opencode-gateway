@@ -138,7 +138,6 @@ The following tables are created by the migration chain and validated at startup
 | `job_events` | 0000 | Audit trail — event type, actor, previous status for state transitions |
 | `approvals` | 0000 | Approval gates — requested action, approver, decision timestamp |
 | `runners` | 0001 | Runner VM registry — hostname, executor type, labels, status |
-| `runner_events` | 0006 | Runner status-change audit trail — event type, old/new status, reason |
 | `runner_observations` | 0001 | Time-series runner metrics — disk, memory, load averages |
 | `workspace_observations` | 0001 | Per-workspace snapshots — status, opencode status |
 | `opencode_instance_observations` | 0001 | Per-instance snapshots — version, status |
@@ -357,7 +356,7 @@ These endpoints are implemented and tested.
 | `POST` | `/observations` | Ingest a runner heartbeat observation — upserts the runner record, stores runner-level resource metrics (disk, memory, load), workspace snapshots, and OpenCode Serve instance status. Returns 201 on success. |
 | `GET` | `/runners` | List all registered Runner VMs with their latest observation summary (disk, memory, load, observed_at). Ordered by creation date descending. |
 | `GET` | `/runners/{id}` | Retrieve a single runner by UUID with full observation history (last 50 workspace observations + last 50 OpenCode instance observations) and derived policy status (HEALTHY, BLOCKED_DISK_PRESSURE, BLOCKED_MEMORY_PRESSURE, UNKNOWN, OFFLINE, MAINTENANCE, ONLINE). Returns 404 if not found. |
-| `POST` | `/runners/{id}/status` | Manually set a runner's status to `offline`, `online`, or `maintenance`. Validates the state machine transition, logs the change to `runner_events`. Returns 404 if runner not found, 422 for invalid transitions. |
+| `POST` | `/runners/{id}/status` | Manually set a runner's status to `offline`, `online`, or `maintenance`. Validates the state machine transition, logs the change to `job_events`. Returns 404 if runner not found, 422 for invalid transitions. |
 
 ### Planned Endpoints
 

@@ -278,6 +278,33 @@ class TestAWXExecutorPluginLifecycle:
         assert resp.port == 0
         assert resp.session_id == UUID(int=0)
 
+    async def test_start_opencode_passes_port_in_extra_vars(self):
+        """When port is provided in the request, it is passed as an extra_var."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={"session_id": "00000000-1111-2222-3333-444444444444",
+                       "port": 10042},
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            port=10042,
+        )
+        resp = await plugin.start_opencode(req)
+
+        assert resp.port == 10042
+        client.launch_job_template.assert_awaited_once_with(
+            _LIFECYCLE_TEMPLATE,
+            extra_vars={
+                "action": "start",
+                "workspace_path": f"{_BASE_PATH}/{ws_id}",
+                "port": 10042,
+            },
+        )
+
     async def test_stop_opencode(self):
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, status="successful")

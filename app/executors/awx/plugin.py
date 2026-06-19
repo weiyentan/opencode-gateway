@@ -194,7 +194,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
     ) -> StartOpencodeResponse:
         """Start OpenCode Serve via the gateway-opencode-lifecycle template.
 
-        Extra vars: ``action: start``, ``workspace_path``.
+        Extra vars: ``action: start``, ``workspace_path``, ``port`` (when set).
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -205,6 +205,8 @@ class AWXExecutorPlugin(ExecutorPlugin):
             "action": "start",
             "workspace_path": workspace_path,
         }
+        if request.port is not None:
+            extra_vars["port"] = request.port
 
         try:
             result = await self._launch_and_wait(
