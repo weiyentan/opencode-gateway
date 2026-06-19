@@ -30,6 +30,8 @@ router = APIRouter(tags=["workspaces"])
 _WORKSPACE_COLS = (
     "id, runner_id, workspace_name, path, repo_url, branch, "
     "port, service_name, pinned, cleanup_after, cleanup_status, "
+    "cleanup_started_at, cleanup_completed_at, cleanup_failed_at, "
+    "cleanup_failure_reason, "
     "created_at, updated_at"
 )
 
@@ -48,6 +50,10 @@ def _row_to_workspace(row: asyncpg.Record) -> Workspace:
         pinned=row["pinned"],
         cleanup_after=row.get("cleanup_after"),
         cleanup_status=WorkspaceStatus(row["cleanup_status"]),
+        cleanup_started_at=row.get("cleanup_started_at"),
+        cleanup_completed_at=row.get("cleanup_completed_at"),
+        cleanup_failed_at=row.get("cleanup_failed_at"),
+        cleanup_failure_reason=row.get("cleanup_failure_reason"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -72,6 +78,10 @@ def _build_response(row: asyncpg.Record) -> Workspace:
         pinned=row["pinned"],
         cleanup_after=row["cleanup_after"],
         cleanup_status=row["cleanup_status"],
+        cleanup_started_at=row["cleanup_started_at"],
+        cleanup_completed_at=row["cleanup_completed_at"],
+        cleanup_failed_at=row["cleanup_failed_at"],
+        cleanup_failure_reason=row["cleanup_failure_reason"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -228,18 +238,42 @@ async def cleanup_workspace(
 ) -> Workspace:
     """Trigger cleanup of a workspace via the executor plugin.
 
-    Transitions the workspace to ``'cleaning'`` status, acquires a
-    per-workspace PG advisory lock to serialise concurrent cleanup
-    requests, and delegates the actual teardown to the executor plugin.
+    Transitions the workspace through the cleanup state machine:
+
+        active ──► cleaning ──► cleaned
+                       │
+                       └──────► cleanup_failed
+
+    Cleanup is **idempotent**: calling this endpoint on a workspace that is
+    already ``cleaned`` or ``cleanup_failed`` is a no-op (returns 200 with
+    the current state).  Concurrent cleanup requests are serialised with a
+    per-workspace PG advisory lock.
     """
     row = await _fetch_workspace(conn, workspace_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    if row["cleanup_status"] == WorkspaceStatus.CLEANING.value:
+    current_status = row["cleanup_status"]
+
+    # -- Idempotency: already in a terminal state ------------------------
+    if current_status in (
+        WorkspaceStatus.CLEANED.value,
+        WorkspaceStatus.CLEANUP_FAILED.value,
+    ):
+        return _build_response(row)
+
+    # -- Already being cleaned by another process ------------------------
+    if current_status == WorkspaceStatus.CLEANING.value:
         raise HTTPException(
             status_code=409,
             detail="Workspace is already being cleaned",
+        )
+
+    # -- Pinned workspaces cannot be cleaned -----------------------------
+    if current_status == WorkspaceStatus.PINNED.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot clean a pinned workspace — unpin first",
         )
 
     # Serialise concurrent cleanup attempts
@@ -252,29 +286,50 @@ async def cleanup_workspace(
     try:
         now = datetime.now(timezone.utc)
         await conn.execute(
-            "UPDATE workspaces SET cleanup_status = $1, updated_at = $2 WHERE id = $3",
+            "UPDATE workspaces "
+            "SET cleanup_status = $1, cleanup_started_at = $2, updated_at = $3 "
+            "WHERE id = $4",
             WorkspaceStatus.CLEANING.value,
+            now,
             now,
             workspace_id,
         )
 
-        await executor.cleanup_workspace(
-            CleanupWorkspaceRequest(workspace_id=workspace_id)
-        )
+        try:
+            await executor.cleanup_workspace(
+                CleanupWorkspaceRequest(workspace_id=workspace_id)
+            )
+        except Exception as exc:
+            logger.exception("Cleanup failed for workspace %s", workspace_id)
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            # Truncate to prevent overly long messages in the database
+            if len(failure_reason) > 500:
+                failure_reason = failure_reason[:497] + "..."
+            now_fail = datetime.now(timezone.utc)
+            await conn.execute(
+                "UPDATE workspaces "
+                "SET cleanup_status = $1, cleanup_failed_at = $2, "
+                "cleanup_failure_reason = $3, updated_at = $4 "
+                "WHERE id = $5",
+                WorkspaceStatus.CLEANUP_FAILED.value,
+                now_fail,
+                failure_reason,
+                now_fail,
+                workspace_id,
+            )
+        else:
+            now_done = datetime.now(timezone.utc)
+            await conn.execute(
+                "UPDATE workspaces "
+                "SET cleanup_status = $1, cleanup_completed_at = $2, updated_at = $3 "
+                "WHERE id = $4",
+                WorkspaceStatus.CLEANED.value,
+                now_done,
+                now_done,
+                workspace_id,
+            )
 
         row = await _fetch_workspace(conn, workspace_id)
         return _build_response(row)
-    except Exception:
-        logger.exception("Cleanup failed for workspace %s", workspace_id)
-        await conn.execute(
-            "UPDATE workspaces SET cleanup_status = $1, updated_at = $2 WHERE id = $3",
-            WorkspaceStatus.ACTIVE.value,
-            datetime.now(timezone.utc),
-            workspace_id,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Cleanup failed",
-        )
     finally:
         await release_cleanup_lock(conn, workspace_id)

@@ -184,7 +184,12 @@ class CleanupScheduler:
     async def _query_expired(
         self, pool: asyncpg.Pool
     ) -> list[asyncpg.Record]:
-        """Return expired workspaces eligible for cleanup, up to batch_size."""
+        """Return expired workspaces eligible for cleanup, up to batch_size.
+
+        Only returns workspaces that are in ``active`` status — already
+        ``cleaned``, ``cleanup_failed``, or currently ``cleaning``
+        workspaces are excluded so cleanup is idempotent.
+        """
         async with pool.acquire() as conn:
             return await conn.fetch(
                 """
@@ -192,7 +197,7 @@ class CleanupScheduler:
                 FROM workspaces
                 WHERE cleanup_after < NOW()
                   AND pinned = FALSE
-                  AND cleanup_status != 'cleaned'
+                  AND cleanup_status = 'active'
                 ORDER BY cleanup_after ASC
                 LIMIT $1
                 """,
@@ -205,7 +210,17 @@ class CleanupScheduler:
         executor: ExecutorPlugin,
         row: asyncpg.Record,
     ) -> None:
-        """Acquire advisory lock, clean up one workspace, and update status."""
+        """Acquire advisory lock, clean up one workspace, and update status.
+
+        Records timestamps for each state transition:
+
+        * Sets ``cleanup_started_at`` when transitioning to ``cleaning``.
+        * Sets ``cleanup_completed_at`` when cleanup succeeds (→ ``cleaned``).
+        * Sets ``cleanup_failed_at`` and ``cleanup_failure_reason`` when
+          cleanup fails (→ ``cleanup_failed``).
+        """
+        from datetime import datetime, timezone
+
         ws_id = row["id"]
         lock_key = _uuid_to_lock_key(ws_id)
 
@@ -223,27 +238,78 @@ class CleanupScheduler:
 
             logger.debug("Acquired advisory lock for workspace %s (key=%d)", ws_id, lock_key)
             try:
-                request = CleanupWorkspaceRequest(workspace_id=ws_id)
-                response = await executor.cleanup_workspace(request)
+                now = datetime.now(timezone.utc)
+                await conn.execute(
+                    """
+                    UPDATE workspaces
+                    SET cleanup_status = 'cleaning',
+                        cleanup_started_at = $1,
+                        updated_at = $1
+                    WHERE id = $2
+                    """,
+                    now,
+                    ws_id,
+                )
 
-                if response.status == "cleaned":
+                request = CleanupWorkspaceRequest(workspace_id=ws_id)
+                try:
+                    response = await executor.cleanup_workspace(request)
+                except Exception as exc:
+                    logger.exception("Cleanup failed for workspace %s", ws_id)
+                    failure_reason = f"{type(exc).__name__}: {exc}"
+                    if len(failure_reason) > 500:
+                        failure_reason = failure_reason[:497] + "..."
+                    now_fail = datetime.now(timezone.utc)
                     await conn.execute(
                         """
                         UPDATE workspaces
-                        SET cleanup_status = 'cleaned'
-                        WHERE id = $1
+                        SET cleanup_status = 'cleanup_failed',
+                            cleanup_failed_at = $1,
+                            cleanup_failure_reason = $2,
+                            updated_at = $1
+                        WHERE id = $3
                         """,
+                        now_fail,
+                        failure_reason,
                         ws_id,
                     )
-                    logger.info("Workspace %s cleaned successfully", ws_id)
                 else:
-                    logger.warning(
-                        "Workspace %s cleanup returned unexpected status: %s",
-                        ws_id,
-                        response.status,
-                    )
-            except Exception:
-                logger.exception("Cleanup failed for workspace %s", ws_id)
+                    now_done = datetime.now(timezone.utc)
+                    if response.status == "cleaned":
+                        await conn.execute(
+                            """
+                            UPDATE workspaces
+                            SET cleanup_status = 'cleaned',
+                                cleanup_completed_at = $1,
+                                updated_at = $1
+                            WHERE id = $2
+                            """,
+                            now_done,
+                            ws_id,
+                        )
+                        logger.info("Workspace %s cleaned successfully", ws_id)
+                    else:
+                        logger.warning(
+                            "Workspace %s cleanup returned unexpected status: %s",
+                            ws_id,
+                            response.status,
+                        )
+                        # Treat unexpected status as a failure so the workspace
+                        # doesn't remain in 'cleaning' forever (idempotent query
+                        # excludes non-active workspaces).
+                        await conn.execute(
+                            """
+                            UPDATE workspaces
+                            SET cleanup_status = 'cleanup_failed',
+                                cleanup_failed_at = $1,
+                                cleanup_failure_reason = $2,
+                                updated_at = $1
+                            WHERE id = $3
+                            """,
+                            now_done,
+                            f"Unexpected cleanup status: {response.status}",
+                            ws_id,
+                        )
             finally:
                 try:
                     await conn.execute(
