@@ -115,6 +115,9 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `GATEWAY_ENV` | `production` | Deployment environment: `production` or `development`. See [Authentication](#authentication) below. |
+| `GATEWAY_API_KEY` | *(empty)* | API key for Bearer token authentication. **Required in production.** See [Authentication](#authentication). |
+| `GATEWAY_ALLOW_INSECURE_AUTH` | `false` | Explicit opt-in to run without an API key in production. Logs a loud warning. Prefer `GATEWAY_ENV=development` for local work. |
 | `GATEWAY_HOST` | `0.0.0.0` | Server bind address |
 | `GATEWAY_PORT` | `8000` | Server port |
 | `GATEWAY_DATABASE_HOST` | `localhost` | PostgreSQL host |
@@ -135,6 +138,44 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_STALENESS_SECONDS` | `600` | Maximum age in seconds of the last telemetry sample; runners with older data are treated as UNKNOWN |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing. This is by design.
+
+### Authentication
+
+The Gateway enforces Bearer-token authentication in production by default. Every request must include an `Authorization: Bearer <api-key>` header matching the configured `GATEWAY_API_KEY`.
+
+Three modes are supported:
+
+| Mode | `GATEWAY_ENV` | `GATEWAY_API_KEY` | `GATEWAY_ALLOW_INSECURE_AUTH` | Behaviour |
+|------|---------------|-------------------|-------------------------------|-----------|
+| **Production** (default) | `production` | *required* | `false` (default) | API key is required. The Gateway refuses to start without one. |
+| **Development** | `development` | *optional* | `false` (default) | API key is optional. Requests pass through without authentication — convenient for local work. |
+| **Insecure opt-in** | any | *optional* | `true` | API key is optional. The Gateway logs a loud warning at startup. Prefer `GATEWAY_ENV=development` for local work. |
+
+**Local development:**
+
+```bash
+# Run without an API key
+GATEWAY_ENV=development python -m app
+
+# Or run with a key for consistency with production
+GATEWAY_ENV=production GATEWAY_API_KEY=dev-key-123 python -m app
+```
+
+**Production deployment:**
+
+```bash
+# Required — the Gateway refuses to start without this
+export GATEWAY_API_KEY="$(openssl rand -hex 32)"
+python -m app
+```
+
+**Making authenticated requests:**
+
+```bash
+curl -H "Authorization: Bearer ${GATEWAY_API_KEY}" http://localhost:8000/health
+```
+
+> **Security note:** API key comparison uses constant-time comparison (`hmac.compare_digest`) to prevent timing side-channel attacks.
 
 ### AWX Executor Configuration
 

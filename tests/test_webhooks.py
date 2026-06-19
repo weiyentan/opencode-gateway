@@ -68,6 +68,8 @@ class TestSignature:
 
 def _make_webhook_client(mock_conn: AsyncMock) -> AsyncClient:
     """Build a test client with webhook and pool dependencies overridden."""
+    from tests.conftest import _TEST_API_KEY
+
     app = create_app()
     mock_pool = AsyncMock()
     mock_pool.pool = None
@@ -80,7 +82,11 @@ def _make_webhook_client(mock_conn: AsyncMock) -> AsyncClient:
     app.dependency_overrides[_get_pool] = lambda: mock_pool
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
-    return AsyncClient(transport=transport, base_url="http://test")
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {_TEST_API_KEY}"},
+    )
 
 
 class TestCreateWebhook:
