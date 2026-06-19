@@ -90,6 +90,10 @@ def make_workspace_row(
     pinned: bool = False,
     cleanup_after: datetime | None = None,
     cleanup_status: str = "active",
+    cleanup_started_at: datetime | None = None,
+    cleanup_completed_at: datetime | None = None,
+    cleanup_failed_at: datetime | None = None,
+    cleanup_failure_reason: str | None = None,
     created_at: datetime | None = None,
 ) -> dict:
     """Return a dict representing a workspaces table row."""
@@ -106,6 +110,10 @@ def make_workspace_row(
         "pinned": pinned,
         "cleanup_after": cleanup_after,
         "cleanup_status": cleanup_status,
+        "cleanup_started_at": cleanup_started_at,
+        "cleanup_completed_at": cleanup_completed_at,
+        "cleanup_failed_at": cleanup_failed_at,
+        "cleanup_failure_reason": cleanup_failure_reason,
         "created_at": now,
         "updated_at": now,
     }
