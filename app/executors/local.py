@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import uuid as _uuid
+from typing import Optional
 from uuid import UUID
 
 from app.core.secrets import redact_dict
@@ -79,10 +80,12 @@ class LocalExecutor(ExecutorPlugin):
             )
         # Store env_vars for test verification
         self._last_env_vars: dict[str, str] = dict(request.env_vars)
+        self._last_port: Optional[int] = request.port
+        resolved_port = request.port if request.port is not None else 8080
         return StartOpencodeResponse(
             session_id=session_id,
             status="running",
-            port=8080,
+            port=resolved_port,
         )
 
     async def stop_opencode(
