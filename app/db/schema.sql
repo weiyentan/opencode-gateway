@@ -33,8 +33,10 @@ CREATE TABLE IF NOT EXISTS gateway_jobs (
 
 ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS diff TEXT;
 ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS branch_name TEXT;
+ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS commit_sha TEXT;
 ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS mr_url TEXT;
 ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS workflow_run_id TEXT;
+ALTER TABLE gateway_jobs ADD COLUMN IF NOT EXISTS failure_reason TEXT;
 
 CREATE TABLE IF NOT EXISTS approvals (
     id              UUID PRIMARY KEY,

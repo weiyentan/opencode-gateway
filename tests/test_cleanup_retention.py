@@ -104,12 +104,14 @@ class TestSuccessfulJobCleanupAfter:
     async def test_completed_job_sets_cleanup_after_to_72h(
         self, mock_conn: AsyncMock, mock_executor: AsyncMock
     ) -> None:
-        """POST /jobs (success) → workspace cleanup_after = created_at + 72h."""
+        """POST /jobs/{id}/complete (→completed) → workspace cleanup_after = created_at + 72h."""
         job_id = uuid.uuid4()
         workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
         job_row_data = make_job_row(
-            job_id, "https://github.com/org/repo", "Fix a bug", status="pending"
+            job_id, "https://github.com/org/repo", "Fix a bug",
+            status="awaiting_review",
+            workspace_name=str(workspace_id),
         )
 
         execute_calls: list[tuple] = []
@@ -125,13 +127,15 @@ class TestSuccessfulJobCleanupAfter:
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                job_row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                job_row_data["status"] = "completed"
-                job_row_data["completed_at"] = datetime.now(timezone.utc)
-            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
-                job_row_data["status"] = "failed"
+            if "UPDATE gateway_jobs SET" in sql and "SET status" in sql:
+                job_row_data["status"] = args[1]
+                import re
+                if "completed_at" in sql:
+                    m = re.search(r"completed_at = \$(\d+)", sql)
+                    if m:
+                        pos = int(m.group(1))
+                        if pos <= len(args):
+                            job_row_data["completed_at"] = args[pos - 1]
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -140,14 +144,13 @@ class TestSuccessfulJobCleanupAfter:
 
         async with client as c:
             response = await c.post(
-                "/jobs",
+                f"/jobs/{job_id}/complete",
                 json={
-                    "repo_url": "https://github.com/org/repo",
-                    "task_summary": "Fix a bug",
+                    "target_status": "completed",
                 },
             )
 
-        assert response.status_code == 201
+        assert response.status_code == 200
 
         # Verify an UPDATE to workspaces was made with cleanup_after
         ws_updates = [
@@ -166,11 +169,14 @@ class TestSuccessfulJobCleanupAfter:
     async def test_completed_job_uses_configured_success_retention(
         self, mock_conn: AsyncMock, mock_executor: AsyncMock
     ) -> None:
-        """When config is overridden, successful job uses the configured value."""
+        """When config is overridden, successful completion uses the configured value."""
         job_id = uuid.uuid4()
+        workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
         job_row_data = make_job_row(
-            job_id, "https://github.com/org/repo", "Fix a bug", status="pending"
+            job_id, "https://github.com/org/repo", "Fix a bug",
+            status="awaiting_review",
+            workspace_name=str(workspace_id),
         )
 
         execute_calls: list[tuple] = []
@@ -186,13 +192,8 @@ class TestSuccessfulJobCleanupAfter:
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                job_row_data["status"] = "running"
-            elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
-                job_row_data["status"] = "completed"
-                job_row_data["completed_at"] = datetime.now(timezone.utc)
-            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
-                job_row_data["status"] = "failed"
+            if "UPDATE gateway_jobs SET" in sql and "SET status" in sql:
+                job_row_data["status"] = args[1]
 
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
@@ -207,14 +208,13 @@ class TestSuccessfulJobCleanupAfter:
             client = create_client(mock_conn, mock_executor=mock_executor)
             async with client as c:
                 response = await c.post(
-                    "/jobs",
+                    f"/jobs/{job_id}/complete",
                     json={
-                        "repo_url": "https://github.com/org/repo",
-                        "task_summary": "Fix a bug",
+                        "target_status": "completed",
                     },
                 )
 
-        assert response.status_code == 201
+        assert response.status_code == 200
 
         ws_updates = [
             (sql, args) for sql, args in execute_calls
@@ -253,8 +253,10 @@ class TestFailedJobCleanupAfter:
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                job_row_data["status"] = "running"
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                job_row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                job_row_data["status"] = "starting_opencode"
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
                 job_row_data["status"] = "failed"
             elif "UPDATE gateway_jobs SET status = 'completed'" in sql:
@@ -330,8 +332,10 @@ class TestFailedJobCleanupAfter:
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                job_row_data["status"] = "running"
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                job_row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                job_row_data["status"] = "starting_opencode"
             elif "UPDATE gateway_jobs SET workspace_name" in sql:
                 job_row_data["workspace_name"] = str(workspace_id)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
@@ -404,8 +408,10 @@ class TestFailedJobCleanupAfter:
 
         async def _execute(sql: str, *args):
             execute_calls.append((sql, args))
-            if "UPDATE gateway_jobs SET status = 'running'" in sql:
-                job_row_data["status"] = "running"
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                job_row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                job_row_data["status"] = "starting_opencode"
             elif "UPDATE gateway_jobs SET workspace_name" in sql:
                 job_row_data["workspace_name"] = str(workspace_id)
             elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
