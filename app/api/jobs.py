@@ -81,6 +81,30 @@ class JobCreateRequest(BaseModel):
         return value
 
 
+class JobCompleteRequest(BaseModel):
+    """Request body for POST /jobs/{id}/complete.
+
+    Callers provide the ``target_status`` (one of ``awaiting_review``,
+    ``completed``, or ``failed``) and optional metadata fields
+    (``branch_name``, ``commit_sha``, ``mr_url``, ``diff``) to record
+    on the job.
+
+    When transitioning to ``failed``, provide a ``failure_reason``.
+    When transitioning to ``completed``, an optional ``summary`` is
+    accepted for logging purposes.
+    """
+
+    target_status: str = Field(
+        description="Target status: awaiting_review, completed, or failed"
+    )
+    branch_name: str | None = Field(default=None)
+    commit_sha: str | None = Field(default=None)
+    mr_url: str | None = Field(default=None)
+    diff: str | None = Field(default=None)
+    summary: str | None = Field(default=None)
+    failure_reason: str | None = Field(default=None)
+
+
 class JobResponse(BaseModel):
     """Response body for job endpoints.
 
@@ -100,8 +124,10 @@ class JobResponse(BaseModel):
     opencode_session_id: str | None = None
     diff: str | None = None
     branch_name: str | None = None
+    commit_sha: str | None = None
     mr_url: str | None = None
     workflow_run_id: str | None = None
+    failure_reason: str | None = None
 
 
 class JobEvent(BaseModel):
@@ -118,7 +144,8 @@ class JobEvent(BaseModel):
 
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
-    "opencode_session_id, diff, workspace_name, branch_name, mr_url, workflow_run_id"
+    "opencode_session_id, diff, workspace_name, branch_name, commit_sha, "
+    "mr_url, workflow_run_id, failure_reason"
 )
 
 
@@ -647,8 +674,10 @@ async def create_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -714,8 +743,10 @@ async def approve_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -781,8 +812,170 @@ async def reject_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
+    )
+
+
+@router.post("/jobs/{job_id}/complete", response_model=JobResponse)
+async def complete_job(
+    job_id: uuid.UUID,
+    body: JobCompleteRequest,
+    conn: asyncpg.Connection = Depends(get_session),
+    pool: DatabasePool = Depends(_get_pool),
+) -> JobResponse:
+    """Transition a job to a terminal or review state and store result metadata.
+
+    Accepts metadata (``branch_name``, ``commit_sha``, ``mr_url``, ``diff``)
+    to record on the job at completion time.
+
+    **Allowed transitions:**
+
+    * ``running`` → ``awaiting_review`` — move to review gate
+    * ``running`` → ``completed`` — immediate completion (backward compatible)
+    * ``running`` → ``failed`` — mark as failed
+    * ``awaiting_review`` → ``completed`` — approve reviewed work
+    * ``awaiting_review`` → ``failed`` — reject reviewed work
+
+    Other transitions (e.g. ``pending`` → ``completed``) are rejected
+    with 409.
+    """
+    row = await _fetch_job(conn, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    current_status = row["status"]
+    target_status = body.target_status
+
+    # Validate the target status is one of the expected completion states
+    valid_targets = {"awaiting_review", "completed", "failed"}
+    if target_status not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid target_status '{target_status}'. "
+                f"Must be one of: {', '.join(sorted(valid_targets))}"
+            ),
+        )
+
+    # Validate the transition against the centralised state machine
+    try:
+        source = JobStatus(current_status)
+        target = JobStatus(target_status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid job status: {current_status}")
+
+    if not can_transition(source, target):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot transition job from '{current_status}' "
+                f"to '{target_status}'"
+            ),
+        )
+
+    now = datetime.now(timezone.utc)  # noqa: UP017
+
+    # Build the UPDATE with optional metadata fields
+    is_terminal = target_status in ("completed", "failed")
+    update_fields: list[str] = [
+        "status = $2",
+        "updated_at = $3",
+    ]
+    update_values: list = [
+        job_id,
+        target_status,
+        now,
+    ]
+    param_index = 4  # $4 onwards
+
+    # Optional metadata fields
+    metadata_fields = {
+        "branch_name": body.branch_name,
+        "commit_sha": body.commit_sha,
+        "mr_url": body.mr_url,
+        "diff": body.diff,
+    }
+    for field_name, field_value in metadata_fields.items():
+        if field_value is not None:
+            update_fields.append(f"{field_name} = ${param_index}")
+            update_values.append(field_value)
+            param_index += 1
+
+    if is_terminal:
+        update_fields.append(f"completed_at = ${param_index}")
+        update_values.append(now)
+        param_index += 1
+
+    if target_status == "failed" and body.failure_reason is not None:
+        update_fields.append(f"failure_reason = ${param_index}")
+        update_values.append(body.failure_reason)
+        param_index += 1
+
+    # Record the completion event
+    event_id = uuid.uuid4()
+    await conn.execute(
+        "INSERT INTO job_events "
+        "(id, job_id, event_type, actor, details, previous_status, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        event_id,
+        job_id,
+        target_status,
+        "api",
+        f"Job completed via /complete endpoint (target={target_status})",
+        current_status,
+        now,
+    )
+
+    # Execute the update
+    sql = (
+        "UPDATE gateway_jobs SET "
+        + ", ".join(update_fields)
+        + f" WHERE id = $1"
+    )
+    await conn.execute(sql, *update_values)
+
+    logger.info(
+        "Job %s transitioned %s → %s via /complete",
+        job_id,
+        current_status,
+        target_status,
+    )
+
+    # Fire webhooks asynchronously — non-blocking
+    asyncio.create_task(
+        dispatch_webhooks(
+            pool,
+            job_id,
+            f"job.{target_status}",
+            {
+                "job_id": str(job_id),
+                "event_type": f"job.{target_status}",
+                "status": target_status,
+                "current_status": current_status,
+            },
+        )
+    )
+
+    # Return updated job
+    row = await _fetch_job(conn, job_id)
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -932,8 +1125,10 @@ async def abort_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -957,8 +1152,10 @@ async def get_job(
         opencode_session_id=row.get("opencode_session_id"),
         diff=row.get("diff"),
         branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
         mr_url=row.get("mr_url"),
         workflow_run_id=row.get("workflow_run_id"),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -1044,8 +1241,10 @@ async def list_jobs(
             opencode_session_id=row.get("opencode_session_id"),
             diff=row.get("diff"),
             branch_name=row.get("branch_name"),
+            commit_sha=row.get("commit_sha"),
             mr_url=row.get("mr_url"),
             workflow_run_id=row.get("workflow_run_id"),
+            failure_reason=row.get("failure_reason"),
         )
         for row in rows
     ]
