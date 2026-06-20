@@ -482,7 +482,7 @@ class TestExecutorIntegration:
         assert args[0] == ws_id
 
     @pytest.mark.asyncio
-    async def test_unexpected_response_transitions_to_cleanup_failed(self, caplog):
+    async def test_unexpected_response_logs_warning_only(self, caplog):
         """If executor returns status != 'cleaned', the scheduler logs a warning."""
         caplog.set_level(logging.WARNING, logger="app.scheduler.cleaner")
 
@@ -679,7 +679,7 @@ class TestStatusResponseHandling:
     """Edge cases around executor status responses."""
 
     @pytest.mark.asyncio
-    async def test_empty_status_transitions_to_cleanup_failed(self, caplog):
+    async def test_empty_status_logs_warning_only(self, caplog):
         """If the response status is empty/blank, the scheduler logs a warning only."""
         caplog.set_level(logging.WARNING, logger="app.scheduler.cleaner")
 
