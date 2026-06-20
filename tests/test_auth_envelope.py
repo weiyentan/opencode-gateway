@@ -98,14 +98,14 @@ class TestAuthMissing:
     """Requests without an Authorization header must return 401."""
 
     @pytest.mark.asyncio
-    async def test_get_health_without_auth_returns_401(self, client_no_auth):
+    async def test_get_health_without_auth_returns_200(self, client_no_auth):
+        """Health endpoint is public — returns 200 even without auth."""
         async with client_no_auth as c:
             response = await c.get("/health")
-        assert response.status_code == 401
+        assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "UNAUTHORIZED"
-        assert "Missing" in data["error"]["message"]
+        assert data["status"] == "ok"
+        assert "data" in data
 
     @pytest.mark.asyncio
     async def test_post_jobs_without_auth_returns_401(self, client_no_auth):
@@ -133,7 +133,7 @@ class TestAuthMissing:
         """Authorization header without Bearer prefix is treated as missing."""
         async with client_no_auth as c:
             response = await c.get(
-                "/health",
+                "/runners",
                 headers={"Authorization": "Basic dXNlcjpwYXNz"},
             )
         assert response.status_code == 401
@@ -146,14 +146,14 @@ class TestAuthInvalid:
     """Requests with an invalid API key must return 401."""
 
     @pytest.mark.asyncio
-    async def test_get_health_with_invalid_key_returns_401(self, client_bad_auth):
+    async def test_get_health_with_invalid_key_returns_200(self, client_bad_auth):
+        """Health endpoint is public — returns 200 even with wrong key."""
         async with client_bad_auth as c:
             response = await c.get("/health")
-        assert response.status_code == 401
+        assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "UNAUTHORIZED"
-        assert "Invalid" in data["error"]["message"]
+        assert data["status"] == "ok"
+        assert "data" in data
 
     @pytest.mark.asyncio
     async def test_post_jobs_with_invalid_key_returns_401(self, client_bad_auth):
@@ -243,7 +243,7 @@ class TestEnvelopeShape:
     async def test_error_envelope_has_status_error_code_message(self, client_no_auth):
         """Error envelope contains status=error and error with code+message."""
         async with client_no_auth as c:
-            response = await c.get("/health")
+            response = await c.get("/runners")
         assert response.status_code == 401
         data = response.json()
 

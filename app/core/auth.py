@@ -40,10 +40,17 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
       checking.
     """
 
+    # Paths that bypass API key authentication (e.g., health checks)
+    EXEMPT_PATHS: frozenset[str] = frozenset({"/health"})
+
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
         settings = get_settings()
+
+        # Exempt paths bypass auth — kubelet/Docker health checks don't carry tokens
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
 
         # No API key configured → skip auth (development / insecure mode)
         # The Settings validator guarantees we cannot reach this branch
