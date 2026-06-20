@@ -200,7 +200,7 @@ class TestAuthInvalidKey:
         client = _make_client(app, api_key="wrong-key")
 
         async with client as c:
-            response = await c.get("/health")
+            response = await c.get("/runners")
         assert response.status_code == 401
         data = response.json()
         assert data["status"] == "error"
@@ -229,7 +229,7 @@ class TestAuthInvalidKey:
             base_url="http://test",
             headers={"Authorization": "Bearer  "},
         ) as c:
-            response = await c.get("/health")
+            response = await c.get("/runners")
         assert response.status_code == 401
 
     @pytest.mark.asyncio
@@ -247,7 +247,7 @@ class TestAuthInvalidKey:
         client = _make_client(app, api_key=None)
 
         async with client as c:
-            response = await c.get("/health")
+            response = await c.get("/runners")
         assert response.status_code == 401
 
 
