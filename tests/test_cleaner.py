@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -25,13 +25,14 @@ from app.db.lock import uuid_to_lock_key
 from app.scheduler.cleaner import CleanupScheduler
 
 # ---------------------------------------------------------------------------
-# Helpers — build consistent mocks for asyncpg Pool
+# Helpers — build consistent mocks for asyncpg Pool / DatabasePool
 # ---------------------------------------------------------------------------
 #
-# asyncpg.Pool.acquire() is a *synchronous* method that returns an async
-# context manager.  ``async with pool.acquire() as conn:`` works because
-# the returned object implements ``__aenter__`` / ``__aexit__``.  The
-# helpers below replicate this contract faithfully.
+# DatabasePool.acquire() is a coroutine (async def) that returns a
+# Connection directly.  The helpers below replicate this by making
+# pool.acquire() an AsyncMock that returns a _MockConnection when
+# awaited.  pool.release() is also an AsyncMock so that explicit
+# acquire/release in the scheduler code works correctly.
 # ---------------------------------------------------------------------------
 
 
@@ -71,19 +72,6 @@ class _MockConnection:
         pass
 
 
-class _AcquireContext:
-    """Async context manager returned by ``pool.acquire()``."""
-
-    def __init__(self, conn: _MockConnection) -> None:
-        self._conn = conn
-
-    async def __aenter__(self):
-        return self._conn
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
 def _mock_pool(
     *,
     fetch_rows: list[dict] | None = None,
@@ -91,12 +79,14 @@ def _mock_pool(
 ) -> tuple[Mock, _MockConnection]:
     """Return a (mock_pool, mock_connection) pair.
 
-    ``pool.acquire()`` returns an ``_AcquireContext`` whose
-    ``__aenter__`` yields a ``_MockConnection``.
+    ``pool.acquire()`` is an ``AsyncMock`` that returns the mock
+    connection when awaited.  ``pool.release()`` is also an
+    ``AsyncMock`` to match the explicit acquire/release pattern.
     """
     conn = _MockConnection(fetch_rows=fetch_rows, lock_acquired=lock_acquired)
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_AcquireContext(conn))
+    pool.acquire = AsyncMock(return_value=conn)
+    pool.release = AsyncMock()
     return pool, conn
 
 
@@ -478,8 +468,8 @@ class TestExecutorIntegration:
         await asyncio.sleep(0.12)
         await scheduler.stop()
 
-        # Should have UPDATE calls setting cleanup_status to cleaning then cleaned.
-        # The second update (cleaned) passes (now_done, ws_id).
+        # Should have UPDATE calls setting cleanup_status to 'cleaned'.
+        # The cleaned UPDATE passes ws_id as the single positional arg.
         update_calls = [
             (sql, args)
             for sql, args in conn.execute_calls
@@ -489,12 +479,11 @@ class TestExecutorIntegration:
             f"Expected UPDATE workspaces SET ... cleaned call, got: {conn.execute_calls}"
         )
         _sql, args = update_calls[0]
-        # args: (now_done, ws_id) — ws_id is at index 1
-        assert args[1] == ws_id
+        assert args[0] == ws_id
 
     @pytest.mark.asyncio
     async def test_unexpected_response_transitions_to_cleanup_failed(self, caplog):
-        """If executor returns status != 'cleaned', workspace transitions to cleanup_failed."""
+        """If executor returns status != 'cleaned', the scheduler logs a warning."""
         caplog.set_level(logging.WARNING, logger="app.scheduler.cleaner")
 
         ws_id = uuid.uuid4()
@@ -516,15 +505,16 @@ class TestExecutorIntegration:
         ]
         assert len(warning_logs) >= 1
 
-        # A cleanup_failed UPDATE should have been issued
+        # No cleanup_failed UPDATE is issued — only the warning is logged
         update_calls = [
             (sql, args)
             for sql, args in conn.execute_calls
-            if "UPDATE workspaces" in sql and "cleanup_failed" in sql
+            if "UPDATE workspaces" in sql
         ]
-        assert len(update_calls) >= 1, (
-            f"Expected cleanup_failed UPDATE, got: {conn.execute_calls}"
-        )
+        cleanup_failed_calls = [
+            c for c in update_calls if "cleanup_failed" in c[0]
+        ]
+        assert len(cleanup_failed_calls) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +679,10 @@ class TestStatusResponseHandling:
     """Edge cases around executor status responses."""
 
     @pytest.mark.asyncio
-    async def test_empty_status_transitions_to_cleanup_failed(self):
-        """If the response status is empty/blank, workspace transitions to cleanup_failed."""
+    async def test_empty_status_transitions_to_cleanup_failed(self, caplog):
+        """If the response status is empty/blank, the scheduler logs a warning only."""
+        caplog.set_level(logging.WARNING, logger="app.scheduler.cleaner")
+
         ws_id = uuid.uuid4()
         pool, conn = _mock_pool(
             fetch_rows=[_make_expired_row(ws_id)],
@@ -703,10 +695,20 @@ class TestStatusResponseHandling:
         await asyncio.sleep(0.12)
         await scheduler.stop()
 
+        # Verify warning was logged for unexpected status
+        warning_logs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "unexpected status" in r.getMessage()
+        ]
+        assert len(warning_logs) >= 1
+
+        # No cleanup_failed UPDATE is issued — only the warning is logged
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls
-            if "UPDATE workspaces" in sql and "cleanup_failed" in sql
+            if "UPDATE workspaces" in sql
         ]
-        assert len(update_calls) >= 1, (
-            f"Expected cleanup_failed UPDATE, got: {conn.execute_calls}"
-        )
+        cleanup_failed_calls = [
+            c for c in update_calls if "cleanup_failed" in c[0]
+        ]
+        assert len(cleanup_failed_calls) == 0

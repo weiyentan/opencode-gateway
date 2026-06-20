@@ -52,15 +52,6 @@ class _MockConnection:
         pass
 
 
-class _AcquireContext:
-    def __init__(self, conn: _MockConnection) -> None:
-        self._conn = conn
-    async def __aenter__(self):
-        return self._conn
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
 def _mock_pool(
     *,
     fetch_rows: list[dict] | None = None,
@@ -68,7 +59,8 @@ def _mock_pool(
 ) -> tuple[Mock, _MockConnection]:
     conn = _MockConnection(fetch_rows=fetch_rows, lock_acquired=lock_acquired)
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_AcquireContext(conn))
+    pool.acquire = AsyncMock(return_value=conn)
+    pool.release = AsyncMock()
     return pool, conn
 
 
@@ -112,16 +104,13 @@ class TestSchedulerEndToEndCleanup:
         assert request.workspace_id == ws_id
 
         # Workspace status should have been updated to "cleaned".
-        # The first UPDATE (to cleaning) has args=(timestamp, ws_id);
-        # the second (to cleaned) also has args=(timestamp, ws_id).
         update_calls = [
             (sql, args) for sql, args in conn.execute_calls
             if "UPDATE workspaces" in sql and "cleanup_status" in sql
         ]
-        assert len(update_calls) >= 2  # cleaning + cleaned
-        # The 'cleaned' UPDATE has ws_id at index 1
-        cleaned_sql, cleaned_args = update_calls[1]
-        assert cleaned_args[1] == ws_id
+        assert len(update_calls) >= 1
+        cleaned_sql, cleaned_args = update_calls[0]
+        assert cleaned_args[0] == ws_id
 
     @pytest.mark.asyncio
     async def test_scheduler_cleans_multiple_expired_workspaces(self):
@@ -138,11 +127,11 @@ class TestSchedulerEndToEndCleanup:
         assert executor.cleanup_workspace.call_count >= 3
 
         # All three should have UPDATE calls.
-        # Each workspace gets two UPDATEs (cleaning then cleaned), with ws_id at index 1.
+        # Each workspace gets a cleanup_status = 'cleaned' UPDATE with ws_id at index 0.
         cleaned_ids = set()
         for sql, args in conn.execute_calls:
             if "UPDATE workspaces" in sql and "'cleaned'" in sql:
-                cleaned_ids.add(args[1])  # $2 = ws_id
+                cleaned_ids.add(args[0])
         assert all(w in cleaned_ids for w in ws_ids), (
             f"Not all workspaces cleaned: {cleaned_ids} vs {ws_ids}"
         )

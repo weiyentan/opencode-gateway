@@ -186,7 +186,8 @@ class CleanupScheduler:
         self, pool: asyncpg.Pool
     ) -> list[asyncpg.Record]:
         """Return expired workspaces eligible for cleanup, up to batch_size."""
-        async with pool.acquire() as conn:
+        conn = await pool.acquire()
+        try:
             return await conn.fetch(
                 """
                 SELECT id
@@ -199,6 +200,8 @@ class CleanupScheduler:
                 """,
                 self._batch_size,
             )
+        finally:
+            await pool.release(conn)
 
     async def _process_one(
         self,
@@ -212,7 +215,8 @@ class CleanupScheduler:
 
         # Advisory locks are connection-scoped — we hold a single
         # connection for the entire lock→cleanup→unlock sequence.
-        async with pool.acquire() as conn:
+        conn = await pool.acquire()
+        try:
             acquired = await conn.fetchval(
                 "SELECT pg_try_advisory_lock($1::bigint)", lock_key
             )
@@ -256,3 +260,5 @@ class CleanupScheduler:
                     logger.exception(
                         "Failed to release advisory lock for workspace %s", ws_id
                     )
+        finally:
+            await pool.release(conn)

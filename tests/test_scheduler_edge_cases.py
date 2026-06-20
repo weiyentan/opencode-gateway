@@ -64,20 +64,6 @@ class _MockConnection:
         pass
 
 
-class _AcquireContext:
-    def __init__(self, conn: _MockConnection, raises: Exception | None = None) -> None:
-        self._conn = conn
-        self._raises = raises
-
-    async def __aenter__(self):
-        if self._raises is not None:
-            raise self._raises
-        return self._conn
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
 def _mock_pool(
     *,
     fetch_rows: list[dict] | None = None,
@@ -92,7 +78,11 @@ def _mock_pool(
         unlock_raises=unlock_raises,
     )
     pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_AcquireContext(conn, raises=acquire_raises))
+    if acquire_raises:
+        pool.acquire = AsyncMock(side_effect=acquire_raises)
+    else:
+        pool.acquire = AsyncMock(return_value=conn)
+    pool.release = AsyncMock()
     return pool, conn
 
 
