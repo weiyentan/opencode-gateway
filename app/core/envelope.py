@@ -82,10 +82,14 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
         try:
             data: Any = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
+            new_headers = {
+                k: v for k, v in dict(response.headers).items()
+                if k.lower() != "content-length"
+            }
             return Response(
                 content=body,
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=new_headers,
                 media_type=response.media_type,
             )
 
@@ -98,10 +102,14 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
             and data.get("status") in ("ok", "error")
             and ("data" in data or "error" in data)
         ):
+            new_headers = {
+                k: v for k, v in dict(response.headers).items()
+                if k.lower() != "content-length"
+            }
             return Response(
                 content=json.dumps(data),
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=new_headers,
                 media_type=response.media_type,
             )
 
@@ -117,10 +125,14 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
                 },
             }
 
+        new_headers = {
+            k: v for k, v in dict(response.headers).items()
+            if k.lower() != "content-length"
+        }
         return Response(
             content=json.dumps(wrapped),
             status_code=response.status_code,
-            headers=dict(response.headers),
+            headers=new_headers,
             media_type=response.media_type,
         )
 
