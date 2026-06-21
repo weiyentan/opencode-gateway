@@ -136,12 +136,15 @@ A runner is rejected when:
 
 **Lifecycle AWX Job ID Persistence** — The AWX executor tracks AWX job IDs for
 all lifecycle steps (not just `create_workspace`) via an `_executor_job_ids`
-mapping of Gateway job UUID → AWX job ID. After `start_opencode` launches
-successfully, the API layer persists this AWX job ID as `executor_job_id` on
-the `gateway_jobs` database row. The `abort_job` endpoint passes
-`gateway_job_id` to `stop_opencode` and `cleanup_workspace` as well, so
-cross-process cancellation can target the currently-active lifecycle AWX job
-even when the abort request lands in a different process than the one that
-launched it. Without this mechanism, only `create_workspace` would have its
-AWX job ID persisted, and cancellation of subsequent lifecycle jobs would
-rely solely on in-memory state that does not survive process boundaries.
+mapping of Gateway job UUID → AWX job ID. To make this ID available for
+cross-process cancellation while the job is still in-flight, the executor
+accepts an `on_awx_job_launched` callback on its lifecycle methods. The
+API layer passes a callback that writes the AWX job ID as `executor_job_id`
+to the `gateway_jobs` database row *before* `wait_for_job()` begins — inside
+`_launch_and_wait()` immediately after `launch_job_template()` returns.
+The `abort_job` endpoint reads this persisted `executor_job_id` from the
+database and passes it to `cancel_job`, so a concurrent abort request landing
+in a different process can still target the currently-active AWX job. Without
+this mechanism, the AWX job ID would only be available in the launching
+process's in-memory state, and cancellation of in-flight lifecycle jobs would
+fail across process boundaries.

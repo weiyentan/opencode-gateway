@@ -71,13 +71,17 @@ The ``CancelJobResponse`` status can be:
 
 **Cross-process cancellation** — The AWX executor persists AWX job IDs
 for all lifecycle steps via a ``_executor_job_ids`` mapping of Gateway
-job UUID to AWX job ID, and the API layer writes the most recent
-lifecycle AWX job ID to the ``executor_job_id`` column on the
-``gateway_jobs`` database row. When an abort request lands in a
-different process than the one that launched the lifecycle step, the
-in-memory ``_active_awx_jobs`` dict is empty; ``cancel_job`` falls back
-to the ``executor_job_id`` value from the ``CancelJobRequest`` (read
-from the database row) to cancel the correct AWX job.
+job UUID to AWX job ID. To make the ID available while the AWX job is
+still in-flight, the executor accepts an ``on_awx_job_launched`` callback
+on its lifecycle methods; the API layer passes a callback that writes
+the AWX job ID as ``executor_job_id`` to the ``gateway_jobs`` database
+row inside ``_launch_and_wait()`` immediately after
+``launch_job_template()`` returns, *before* ``wait_for_job()`` begins.
+When an abort request lands in a different process than the one that
+launched the lifecycle step, the in-memory ``_active_awx_jobs`` dict is
+empty; ``cancel_job`` falls back to the ``executor_job_id`` value from
+the ``CancelJobRequest`` (read from the database row) to cancel the
+correct AWX job.
 
 The remaining two future-surface methods are annotated as such in the
 source and remain required by the ABC so every executor provides a
