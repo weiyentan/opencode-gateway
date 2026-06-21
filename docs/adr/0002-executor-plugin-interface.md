@@ -12,7 +12,7 @@ The interface must be generic enough to support multiple backends but specific e
 
 ## Decision
 
-Use a six-method async interface with typed Pydantic request/response models:
+Use a seven-method async interface with typed Pydantic request/response models:
 
 ```python
 class ExecutorPlugin:
@@ -23,20 +23,21 @@ class ExecutorPlugin:
     async def restart_opencode(self, request): ...
     async def collect_state(self, request): ...
     async def cleanup_workspace(self, request): ...
+    async def cancel_job(self, request): ...
 ```
 
 Exclude `provision_runner` from the base interface — runner provisioning is an infrastructure bootstrap concern, not a per-job lifecycle action.
 
 ## Rationale
 
-- Six methods cover the full workspace/service lifecycle without over-abstracting
+- Seven methods cover the full workspace/service lifecycle without over-abstracting
 - Generic action names (not AWX-specific terms like `launch_job_template`) keep the interface backend-agnostic
 - Typed Pydantic models provide validation and documentation at the boundary
 - Leaving `provision_runner` out keeps the per-job interface focused and avoids mixing bootstrap concerns with operational ones
 
 ## Refinement (issue #70)
 
-The six-method interface was inspected to identify which methods are
+The seven-method interface was inspected to identify which methods are
 actually called at runtime by the Gateway.  Four methods are actively
 invoked:
 
@@ -45,14 +46,17 @@ invoked:
 * ``stop_opencode``
 * ``cleanup_workspace``
 
-The remaining two — ``restart_opencode`` and ``collect_state`` — are
-retained as **intentional future surface**:
+The remaining three — ``restart_opencode``, ``collect_state``, and
+``cancel_job`` — are retained as **intentional future surface**:
 
 * ``restart_opencode`` is a natural extension of the lifecycle (the
   operator may want to bounce the service without a full teardown).
 * ``collect_state`` supports a future monitoring / telemetry loop that
   would poll workspace health without joining it to a create/cleanup
   cycle.
+* ``cancel_job`` provides a generic cancellation mechanism for running
+  jobs (e.g. stopping an AWX workflow), ready for when a call site is
+  added in the Gateway.
 
 Both are annotated as future surface in the source and remain required
 by the ABC so every executor provides a uniform implementation when

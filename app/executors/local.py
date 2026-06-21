@@ -17,6 +17,8 @@ from uuid import UUID
 from app.core.secrets import redact_dict
 from app.executors import ExecutorPlugin
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -121,3 +123,14 @@ class LocalExecutor(ExecutorPlugin):
             "cleanup_workspace: workspace=%s path=%s", request.workspace_id, path
         )
         return CleanupWorkspaceResponse(status="cleaned")
+
+    async def cancel_job(
+        self, request: CancelJobRequest
+    ) -> CancelJobResponse:
+        """Stub implementation — always returns cancelled.
+
+        The local executor has no infrastructure job to cancel,
+        so this is a no-op that returns immediately.
+        """
+        logger.info("cancel_job: workspace=%s", request.workspace_id)
+        return CancelJobResponse(status="cancelled")

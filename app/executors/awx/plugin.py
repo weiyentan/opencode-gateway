@@ -1,4 +1,4 @@
-"""AWX executor plugin — maps the 6 lifecycle methods to AWX job templates.
+"""AWX executor plugin — maps the 7 lifecycle methods to AWX job templates.
 
 Uses the AWXApiClient for API calls and translates between the typed
 Pydantic request/response models and AWX extra_vars / artifacts.
@@ -26,6 +26,8 @@ from app.executors.awx.artifacts import (
 from app.executors.awx.client import AWXApiClient, AWXJobResult
 from app.executors.awx.exceptions import AWXArtifactError, AWXClientError
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -61,7 +63,7 @@ def _workspace_path(
 class AWXExecutorPlugin(ExecutorPlugin):
     """Executor that delegates lifecycle actions to AWX job templates.
 
-    Per ADR 0002, each of the six lifecycle methods maps to one of three
+    Per ADR 0002, each of the seven lifecycle methods maps to one of three
     AWX job templates:
 
     ===================================== ===============================
@@ -73,6 +75,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
     ``restart_opencode``                  ``gateway-opencode-lifecycle``
     ``collect_state``                     ``gateway-workspace-teardown``
     ``cleanup_workspace``                 ``gateway-workspace-teardown``
+    ``cancel_job``                        TBD future surface (no AWX template yet)
     ===================================== ===============================
 
     When ``gateway-opencode-lifecycle`` or ``gateway-workspace-teardown``
@@ -409,3 +412,13 @@ class AWXExecutorPlugin(ExecutorPlugin):
             raise
 
         return CleanupWorkspaceResponse(status=result.status)
+
+    async def cancel_job(
+        self, request: CancelJobRequest
+    ) -> CancelJobResponse:
+        """Future cancellation surface for an AWX-backed job.
+
+        Currently a stub until workspace_id → AWX job ID tracking is wired.
+        """
+        logger.info("cancel_job: workspace=%s", request.workspace_id)
+        return CancelJobResponse(status="cancelled")

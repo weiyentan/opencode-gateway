@@ -132,4 +132,4 @@ A runner is rejected when:
 
 **AWXApiClient** — Thin httpx-based client that calls the AWX REST API with a Bearer token. Uses the same pattern as `OpenCodeServeClient` with custom exception classes `AWXConnectionError`, `AWXTimeoutError`, `AWXHTTPError`, and `AWXJobError`.
 
-**AWXExecutorPlugin** — Concrete `ExecutorPlugin` implementation that maps the 6 lifecycle methods to AWX job template launches. Receives an `AWXApiClient` instance and template IDs via dependency injection from the executor factory. Does not read env vars directly.
+**AWXExecutorPlugin** — Concrete `ExecutorPlugin` implementation that maps the lifecycle methods to AWX job template launches. Receives an `AWXApiClient` instance and template IDs via dependency injection from the executor factory. Does not read env vars directly.

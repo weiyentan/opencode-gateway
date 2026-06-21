@@ -10,7 +10,7 @@ Methodology: issue-analyst (6-factor scoring: files touched, new concepts, patte
 | #1 | PRD: OpenCode Gateway | ✅ Done | — | Already published as docs/prd/opencode-gateway.md |
 | #2 | Gateway skeleton with health endpoint | 60–90 min | High | Pure greenfield FastAPI scaffold: main.py, app/core/config.py, app/db/session.py, app/api/health.py, Pydantic settings, Postgres pool |
 | #3 | Runner registration and observation ingestion | 90–150 min | High | 3 observation tables (ADR 0001). runners, runner_observations, workspace_observations, opencode_instance_observations models. Composite indexes. |
-| #4 | Job submission and tracking with local executor | 120–180 min | High | Core state machine (pending→running→completed/failed). ExecutorPlugin ABC with 6 methods. LocalExecutor no-op impl. Plugin loader. |
+| #4 | Job submission and tracking with local executor | 120–180 min | High | Core state machine (pending→running→completed/failed). ExecutorPlugin ABC with 7 methods. LocalExecutor no-op impl. Plugin loader. |
 | #5 | OpenCode client protocol and HTTP implementation | 120–180 min | Medium | httpx.AsyncClient wrapper. Protocol abstraction. Mock HTTP server tests. OpenCode Serve API discovery uncertainty. |
 | #6 | Workspace lifecycle management | 90–150 min | High | Workspaces table CRUD. Pin/cleanup lifecycle. Port allocation logic (ADR 0003). Depends on executor interface. |
 | #7 | Job diff retrieval via OpenCode client | 90–150 min | Medium | First integration of OpenCode client into job API. Diff storage decision (DB blob vs filesystem). |

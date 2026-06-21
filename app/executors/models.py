@@ -1,8 +1,9 @@
 """Pydantic request/response models for the ExecutorPlugin interface.
 
-Defined per ADR 0002 — typed request and response models for all six
+Defined per ADR 0002 — typed request and response models for all seven
 executor lifecycle methods: create_workspace, start_opencode,
-stop_opencode, restart_opencode, collect_state, cleanup_workspace.
+stop_opencode, restart_opencode, collect_state, cleanup_workspace,
+cancel_job.
 """
 
 from __future__ import annotations
@@ -153,5 +154,22 @@ class CleanupWorkspaceRequest(BaseModel):
 
 class CleanupWorkspaceResponse(BaseModel):
     """Result of cleaning up a workspace."""
+
+    status: str
+
+
+# ---------------------------------------------------------------------------
+# cancel_job
+# ---------------------------------------------------------------------------
+
+
+class CancelJobRequest(BaseModel):
+    """Request to cancel a running job for a workspace."""
+
+    workspace_id: UUID
+
+
+class CancelJobResponse(BaseModel):
+    """Result of cancelling a job."""
 
     status: str
