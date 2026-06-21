@@ -347,7 +347,7 @@ These endpoints are implemented and tested.
 | `POST` | `/workspaces/{id}/pin` | Toggle the pinned flag on a workspace. Pinned workspaces are excluded from automatic cleanup policies. |
 | `POST` | `/workspaces/{id}/cleanup` | Trigger cleanup of a workspace via the executor plugin. Transitions to `cleaning` status, uses a per-workspace PG advisory lock to serialise concurrent cleanup requests. |
 | `GET` | `/jobs/{job_id}/diff` | Retrieve the stored diff for a completed job. Returns 200 with the diff payload, 409 if the job is still running, or 404 if the job or its diff does not exist. |
-| `POST` | `/jobs/{id}/abort` | Abort a pending or running job. Transitions through `aborting` to `aborted`, with optional OpenCode session abort and executor cleanup. Returns 503 if the OpenCode session is unreachable (job stays in `aborting`). |
+| `POST` | `/jobs/{id}/abort` | Abort a pending or running job. Best-effort: transitions through `aborting` to `aborted` regardless of OpenCode session reachability. Logs WARNING on session failure and continues with executor cleanup (`cancel_job`, `stop_opencode`, `cleanup_workspace`). Already-aborted jobs return 200 idempotently. |
 
 > **Job lifecycle extension:** The approval gate feature introduces two new job statuses — `needs_approval` (job is paused awaiting a decision) and `rejected` (decision was negative). The abort feature introduces two additional statuses — `aborting` (abort in progress, OpenCode session being terminated) and `aborted` (final state after abort). These complement the existing statuses (`pending`, `running`, `completed`, `failed`).
 

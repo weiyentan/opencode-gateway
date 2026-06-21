@@ -38,29 +38,54 @@ Exclude `provision_runner` from the base interface — runner provisioning is an
 ## Refinement (issue #70)
 
 The seven-method interface was inspected to identify which methods are
-actually called at runtime by the Gateway.  Four methods are actively
+actually called at runtime by the Gateway.  Five methods are actively
 invoked:
 
 * ``create_workspace``
 * ``start_opencode``
 * ``stop_opencode``
 * ``cleanup_workspace``
+* ``cancel_job``
 
-The remaining three — ``restart_opencode``, ``collect_state``, and
-``cancel_job`` — are retained as **intentional future surface**:
+The remaining two — ``restart_opencode`` and ``collect_state`` — are
+retained as **intentional future surface**:
 
 * ``restart_opencode`` is a natural extension of the lifecycle (the
   operator may want to bounce the service without a full teardown).
 * ``collect_state`` supports a future monitoring / telemetry loop that
   would poll workspace health without joining it to a create/cleanup
   cycle.
-* ``cancel_job`` provides a generic cancellation mechanism for running
-  jobs (e.g. stopping an AWX workflow), ready for when a call site is
-  added in the Gateway.
 
-Both are annotated as future surface in the source and remain required
-by the ABC so every executor provides a uniform implementation when
-Gateway call sites are added.
+``cancel_job`` was originally future surface but is now actively called
+by the Gateway — the ``abort_job`` endpoint invokes ``cancel_job`` as
+the first step of executor cleanup (before ``stop_opencode`` and
+``cleanup_workspace``). The AWX executor tracks in-flight AWX job IDs
+per workspace via ``_active_awx_jobs`` and cancels them through the AWX
+API.
+
+The ``CancelJobResponse`` status can be:
+* ``"cancelled"`` — job was running and was cancelled
+* ``"no_active_job"`` — the tracked job already completed before the
+  cancel arrived (late cancel)
+* ``"cancelled"`` — LocalExecutor returns unconditionally as a no-op
+
+**Cross-process cancellation** — The AWX executor persists AWX job IDs
+for all lifecycle steps via a ``_executor_job_ids`` mapping of Gateway
+job UUID to AWX job ID. To make the ID available while the AWX job is
+still in-flight, the executor accepts an ``on_awx_job_launched`` callback
+on its lifecycle methods; the API layer passes a callback that writes
+the AWX job ID as ``executor_job_id`` to the ``gateway_jobs`` database
+row inside ``_launch_and_wait()`` immediately after
+``launch_job_template()`` returns, *before* ``wait_for_job()`` begins.
+When an abort request lands in a different process than the one that
+launched the lifecycle step, the in-memory ``_active_awx_jobs`` dict is
+empty; ``cancel_job`` falls back to the ``executor_job_id`` value from
+the ``CancelJobRequest`` (read from the database row) to cancel the
+correct AWX job.
+
+The remaining two future-surface methods are annotated as such in the
+source and remain required by the ABC so every executor provides a
+uniform implementation when Gateway call sites are added.
 
 Similarly, the ``OpenCodeClientProtocol`` has seven methods but only
 two — ``get_session_diff`` and ``abort_session`` — are called at

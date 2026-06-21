@@ -12,6 +12,8 @@ placeholder values such as zero UUID.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -48,6 +50,12 @@ logger = logging.getLogger(__name__)
 # Default base path on the Runner VM where workspace directories live.
 _DEFAULT_WORKSPACE_BASE_PATH = "/home/runner/workspaces"
 
+# Maximum number of workspace IDs to track in _ever_tracked_workspaces.
+# Prevents unbounded growth over the lifetime of the process.
+# Eviction from the LRU degrades gracefully — an evicted workspace is treated
+# as "never tracked" by cancel_job, which returns status="cancelled" (no-op).
+_MAX_TRACKED_WORKSPACES = 1000
+
 
 def _workspace_path(
     workspace_base_path: str,
@@ -66,17 +74,17 @@ class AWXExecutorPlugin(ExecutorPlugin):
     Per ADR 0002, each of the seven lifecycle methods maps to one of three
     AWX job templates:
 
-    ===================================== ===============================
-    Lifecycle method                      AWX job template
-    ===================================== ===============================
+    ===================================== ===============================================
+    Lifecycle method                      AWX job template / API
+    ===================================== ===============================================
     ``create_workspace``                  ``gateway-create-workspace``
     ``start_opencode``                    ``gateway-opencode-lifecycle``
     ``stop_opencode``                     ``gateway-opencode-lifecycle``
     ``restart_opencode``                  ``gateway-opencode-lifecycle``
     ``collect_state``                     ``gateway-workspace-teardown``
     ``cleanup_workspace``                 ``gateway-workspace-teardown``
-    ``cancel_job``                        TBD future surface (no AWX template yet)
-    ===================================== ===============================
+    ``cancel_job``                        AWX job cancel API (``POST /api/v2/jobs/{id}/cancel/``)
+    ===================================== ===============================================
 
     When ``gateway-opencode-lifecycle`` or ``gateway-workspace-teardown``
     is launched, an ``action`` extra_var distinguishes the operation.
@@ -116,14 +124,62 @@ class AWXExecutorPlugin(ExecutorPlugin):
         self._workspace_teardown_template_id = workspace_teardown_template_id
         self._workspace_base_path = workspace_base_path.rstrip("/")
 
+        # Mapping of workspace UUID → AWX job ID for in-flight jobs.
+        # Used by cancel_job to find the active AWX job for a workspace.
+        # Only accessed within async event-loop context — no locks needed.
+        self._active_awx_jobs: dict[UUID, int] = {}
+
+        # OrderedDict of workspace IDs that have ever been tracked in
+        # _active_awx_jobs.  Used by cancel_job to distinguish "never tracked"
+        # (no job was ever launched for this workspace) from "late cancel"
+        # (the job already completed and its tracking entry was cleaned up).
+        #
+        # Capped at _MAX_TRACKED_WORKSPACES entries using LRU eviction to
+        # prevent unbounded growth.  When the cap is reached the oldest
+        # (least recently added) entry is evicted.
+        self._ever_tracked_workspaces: OrderedDict[UUID, bool] = OrderedDict()
+
+        # Mapping of Gateway job UUID → AWX job ID for persisting the
+        # executor_job_id on the gateway_jobs row after a successful launch.
+        self._executor_job_ids: dict[UUID, int] = {}
+
     # ── Internal helpers ────────────────────────────────────────────────
 
     async def _launch_and_wait(
         self,
         template_id: int,
         extra_vars: dict[str, Any],
+        workspace_id: UUID | None = None,
+        gateway_job_id: UUID | None = None,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> AWXJobResult:
         """Launch a job template and wait for it to complete.
+
+        When *workspace_id* is provided, the AWX job is tracked in
+        :attr:`_active_awx_jobs` so that :meth:`cancel_job` can later
+        look up the in-flight job for a given workspace.
+
+        If the workspace already has a tracked job a warning is logged
+        and the mapping is replaced with the new AWX job ID.
+
+        The tracking entry is removed (popped) when the job reaches a
+        terminal state — whether via successful completion, job failure,
+        or timeout — **only** if the stored job ID still matches
+        ``summary.job_id``.  This prevents a stale waiter from deleting
+        the tracking entry of a concurrently launched job for the same
+        workspace (e.g. cleanup after cancel).
+
+        When *gateway_job_id* is provided, the AWX job ID is recorded in
+        :attr:`_executor_job_ids` so that the API layer can persist it
+        as ``executor_job_id`` on the ``gateway_jobs`` row.
+
+        When *on_awx_job_launched* is provided (along with
+        *gateway_job_id*), it is called immediately after
+        :meth:`~AWXApiClient.launch_job_template` returns and before
+        :meth:`~AWXApiClient.wait_for_job` begins.  This allows the
+        caller to persist the AWX job ID (e.g. to the database) while
+        the job is still in-flight, enabling cross-process cancellation
+        to target the currently active AWX job (issue #190).
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -149,7 +205,62 @@ class AWXExecutorPlugin(ExecutorPlugin):
             summary.status,
         )
 
-        result = await self._client.wait_for_job(summary.job_id)
+        # Record the AWX job ID for the Gateway job so it can be persisted
+        # as executor_job_id on the gateway_jobs row.
+        if gateway_job_id is not None:
+            self._executor_job_ids[gateway_job_id] = summary.job_id
+
+        # Call the persistence callback immediately after launch, before
+        # wait_for_job, so that the DB contains the active AWX job ID
+        # while the job is still in-flight (cross-process cancellation).
+        if gateway_job_id is not None and on_awx_job_launched is not None:
+            await on_awx_job_launched(gateway_job_id, summary.job_id)
+
+        # Track the in-flight job for cancellation lookups.
+        if workspace_id is not None:
+            if workspace_id in self._active_awx_jobs:
+                old_job_id = self._active_awx_jobs[workspace_id]
+                logger.warning(
+                    "Workspace %s already has active AWX job %d; "
+                    "replacing with %d",
+                    workspace_id,
+                    old_job_id,
+                    summary.job_id,
+                )
+            self._active_awx_jobs[workspace_id] = summary.job_id
+            # Track in the LRU — evict oldest entry if at capacity.
+            if len(self._ever_tracked_workspaces) >= _MAX_TRACKED_WORKSPACES:
+                self._ever_tracked_workspaces.popitem(last=False)
+            self._ever_tracked_workspaces[workspace_id] = True
+
+        try:
+            result = await self._client.wait_for_job(summary.job_id)
+        except Exception:
+            # Clean up tracking on any failure (timeout, job error, etc.).
+            # Only pop if the stored job ID still matches — otherwise a
+            # concurrently launched job (e.g. cleanup) may have replaced
+            # the tracking entry for this workspace.
+            if (
+                workspace_id is not None
+                and self._active_awx_jobs.get(workspace_id) == summary.job_id
+            ):
+                self._active_awx_jobs.pop(workspace_id)
+            if gateway_job_id is not None:
+                self._executor_job_ids.pop(gateway_job_id, None)
+            raise
+
+        # Clean up tracking on successful completion.
+        # Only pop if the stored job ID still matches — otherwise a
+        # concurrently launched job (e.g. cleanup) may have replaced
+        # the tracking entry for this workspace.
+        if (
+            workspace_id is not None
+            and self._active_awx_jobs.get(workspace_id) == summary.job_id
+        ):
+            self._active_awx_jobs.pop(workspace_id)
+        if gateway_job_id is not None:
+            self._executor_job_ids.pop(gateway_job_id, None)
+
         logger.info(
             "AWX job %d completed with status=%s",
             result.job_id,
@@ -160,11 +271,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
     # ── Lifecycle methods ───────────────────────────────────────────────
 
     async def create_workspace(
-        self, request: CreateWorkspaceRequest
+        self,
+        request: CreateWorkspaceRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> CreateWorkspaceResponse:
         """Provision a workspace directory via the gateway-create-workspace template.
 
         Extra vars: ``repo_url``, ``branch`` (optional), ``job_id`` (optional).
+
+        When *on_awx_job_launched* is provided along with ``request.job_id``,
+        it is passed through to :meth:`_launch_and_wait` so the AWX job ID
+        can be persisted immediately after launch, before waiting for the
+        job to complete.
         """
         extra_vars: dict[str, Any] = {"repo_url": request.repo_url}
         if request.branch is not None:
@@ -176,6 +294,9 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._create_workspace_template_id,
                 extra_vars,
+                # workspace_id is unknown until the AWX job returns artifacts.
+                gateway_job_id=request.job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception("create_workspace failed for repo=%s", request.repo_url)
@@ -205,11 +326,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def start_opencode(
-        self, request: StartOpencodeRequest
+        self,
+        request: StartOpencodeRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> StartOpencodeResponse:
         """Start OpenCode Serve via the gateway-opencode-lifecycle template.
 
         Extra vars: ``action: start``, ``workspace_path``, ``port`` (when set).
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -227,6 +355,9 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
@@ -259,11 +390,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def stop_opencode(
-        self, request: StopOpencodeRequest
+        self,
+        request: StopOpencodeRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> StopOpencodeResponse:
         """Stop OpenCode Serve via the gateway-opencode-lifecycle template.
 
         Extra vars: ``action: stop``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -278,6 +416,9 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
@@ -308,6 +449,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -338,6 +480,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._workspace_teardown_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -384,11 +527,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def cleanup_workspace(
-        self, request: CleanupWorkspaceRequest
+        self,
+        request: CleanupWorkspaceRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> CleanupWorkspaceResponse:
         """Tear down a workspace via the gateway-workspace-teardown template.
 
         Extra vars: ``action: cleanup``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -403,6 +553,9 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._workspace_teardown_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
@@ -416,9 +569,91 @@ class AWXExecutorPlugin(ExecutorPlugin):
     async def cancel_job(
         self, request: CancelJobRequest
     ) -> CancelJobResponse:
-        """Future cancellation surface for an AWX-backed job.
+        """Cancel an in-flight AWX job for a workspace.
 
-        Currently a stub until workspace_id → AWX job ID tracking is wired.
+        Looks up the tracked AWX job ID for the workspace in
+        :attr:`_active_awx_jobs`. If a live AWX job is tracked,
+        calls :meth:`AWXApiClient.cancel_job` to cancel it.
+
+        When *workspace_id* is ``None``, the in-memory tracking dict is
+        skipped and the method falls through to the ``executor_job_id``
+        fallback immediately.  This path is used for cancelling in-flight
+        lifecycle steps like ``create_workspace`` where the workspace UUID
+        is not yet known.
+
+        When the in-memory lookup misses (e.g. the abort request landed
+        in a different process), falls back to *executor_job_id* from
+        the request — the AWX job ID that was persisted on the
+        ``gateway_jobs`` row at launch time.
+
+        If neither an in-memory entry nor a request-level
+        ``executor_job_id`` is available:
+
+        * If the workspace **was** tracked but the tracking entry has
+          already been cleaned up (the job reached terminal status before
+          cancel_job was called), logs a warning and returns
+          ``CancelJobResponse(status="no_active_job")``.
+        * If the workspace was **never** tracked (no job was ever
+          launched for it via a lifecycle method that supplies a
+          workspace_id), logs a warning and returns
+          ``CancelJobResponse(status="cancelled")`` — there is nothing
+          to cancel so the operation is trivially done.
+
+        Raises:
+            AWXConnectionError: If the AWX instance is unreachable.
+            AWXHTTPError: If the server returns a non-2xx status.
+            AWXTimeoutError: If the cancel request times out.
         """
-        logger.info("cancel_job: workspace=%s", request.workspace_id)
+        logger.info("cancel_job: workspace=%s executor_job_id=%s",
+                    request.workspace_id, request.executor_job_id)
+
+        awx_job_id = self._active_awx_jobs.get(request.workspace_id) if request.workspace_id else None
+        if awx_job_id is not None:
+            # Active in-flight job found — cancel it via the AWX API.
+            # Pop the mapping only after a successful cancel so that
+            # transient API failures don't lose the tracked AWX job ID.
+            await self._client.cancel_job(awx_job_id)
+            self._active_awx_jobs.pop(request.workspace_id, None)
+            logger.info(
+                "cancel_job: AWX job %d cancelled for workspace %s",
+                awx_job_id,
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="cancelled")
+
+        # In-memory miss — fall back to executor_job_id from request
+        # (cross-process / multi-worker cancellation, or pre-workspace
+        # cancellation where workspace_id is None).
+        if request.executor_job_id is not None:
+            logger.info(
+                "cancel_job: using executor_job_id %d from request "
+                "for workspace %s (in-memory miss)",
+                request.executor_job_id,
+                request.workspace_id,
+            )
+            await self._client.cancel_job(request.executor_job_id)
+            logger.info(
+                "cancel_job: AWX job %d cancelled for workspace %s "
+                "(via executor_job_id fallback)",
+                request.executor_job_id,
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="cancelled")
+
+        # No active job tracked for this workspace.
+        if request.workspace_id and request.workspace_id in self._ever_tracked_workspaces:
+            # Was tracked before but the job already completed.
+            logger.warning(
+                "cancel_job: workspace %s had an active AWX job that already "
+                "completed (late cancel)",
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="no_active_job")
+
+        # Workspace was never tracked at all (or workspace_id is None
+        # and no executor_job_id was provided — trivially cancelled).
+        logger.warning(
+            "cancel_job: no AWX job was ever tracked for workspace %s",
+            request.workspace_id,
+        )
         return CancelJobResponse(status="cancelled")

@@ -70,12 +70,18 @@ class StartOpencodeRequest(BaseModel):
     service (ADN 0003).  It is passed to the AWX playbook so it can bind
     the OpenCode Serve process to the correct port.
 
+    *gateway_job_id* is the UUID of the Gateway job row so that the
+    executor can persist the AWX job ID immediately after launch,
+    enabling cross-process cancellation to target the currently active
+    AWX job rather than a completed lifecycle step.
+
     *env_vars* are environment variables to pass to the OpenCode session.
     """
 
     workspace_id: UUID
     workspace_path: Optional[str] = None
     port: Optional[int] = None
+    gateway_job_id: Optional[UUID] = None
     env_vars: dict[str, str] = {}
 
 
@@ -93,9 +99,16 @@ class StartOpencodeResponse(BaseModel):
 
 
 class StopOpencodeRequest(BaseModel):
-    """Request to stop the OpenCode Serve process for a workspace."""
+    """Request to stop the OpenCode Serve process for a workspace.
+
+    *gateway_job_id* is the UUID of the Gateway job row so that the
+    executor can persist the AWX job ID immediately after launch,
+    enabling cross-process cancellation to target the currently active
+    AWX job rather than a completed lifecycle step.
+    """
 
     workspace_id: UUID
+    gateway_job_id: Optional[UUID] = None
 
 
 class StopOpencodeResponse(BaseModel):
@@ -147,9 +160,16 @@ class CollectStateResponse(BaseModel):
 
 
 class CleanupWorkspaceRequest(BaseModel):
-    """Request to tear down a workspace, removing its directory."""
+    """Request to tear down a workspace, removing its directory.
+
+    *gateway_job_id* is the UUID of the Gateway job row so that the
+    executor can persist the AWX job ID immediately after launch,
+    enabling cross-process cancellation to target the currently active
+    AWX job rather than a completed lifecycle step.
+    """
 
     workspace_id: UUID
+    gateway_job_id: Optional[UUID] = None
 
 
 class CleanupWorkspaceResponse(BaseModel):
@@ -164,9 +184,33 @@ class CleanupWorkspaceResponse(BaseModel):
 
 
 class CancelJobRequest(BaseModel):
-    """Request to cancel a running job for a workspace."""
+    """Request to cancel a running job for a workspace.
 
-    workspace_id: UUID
+    *workspace_id* identifies the workspace whose AWX job should be
+    cancelled.  The cancellation path prefers the in-memory tracking
+    dict (``_active_awx_jobs``) on the executor plugin instance.  May
+    be ``None`` when cancelling by ``executor_job_id`` alone (e.g. during
+    ``create_workspace`` before the workspace UUID is known).
+
+    *executor_job_id* provides a fallback for cross-process cancellation:
+    when no in-memory entry exists (e.g. the abort request landed in a
+    different process), the caller passes the AWX job ID that was
+    persisted on the ``gateway_jobs`` row at launch time.  Also used
+    directly when *workspace_id* is ``None`` (pre-workspace cancellation).
+    """
+
+    workspace_id: UUID | None = Field(
+        default=None,
+        description="Workspace whose AWX job should be cancelled. "
+        "May be None when cancelling by executor_job_id alone "
+        "(e.g. during create_workspace before the workspace UUID is known).",
+    )
+    executor_job_id: int | None = Field(
+        default=None,
+        description="AWX job ID to cancel when the in-memory tracking dict has no "
+        "entry for this workspace, or when workspace_id is None "
+        "(cross-process / pre-workspace cancellation).",
+    )
 
 
 class CancelJobResponse(BaseModel):

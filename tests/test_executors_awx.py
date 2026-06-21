@@ -5,6 +5,7 @@ Covers normal flow, error paths, and template-ID validation.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -17,11 +18,14 @@ from app.executors.awx.exceptions import (
     AWXArtifactError,
     AWXClientError,
     AWXConnectionError,
+    AWXHTTPError,
     AWXJobError,
     AWXTimeoutError,
 )
 from app.executors.awx.plugin import AWXExecutorPlugin
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -213,6 +217,26 @@ class TestAWXExecutorPluginCreateWorkspace:
         assert err.template_name == "gateway-create-workspace"
         assert "workspace_id" in err.missing_fields
         assert "workspace_path" in err.missing_fields
+
+    async def test_executor_job_id_cleaned_up_after_completion(self):
+        """The AWX job ID is recorded in _executor_job_ids during launch
+        but cleaned up (popped) after the job completes successfully."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=42, status="successful",
+                              artifacts={"workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                                         "workspace_path": "/home/runner/workspaces/ws1"})
+        plugin = _make_plugin(client)
+
+        gw_job_id = UUID("00000000-0000-0000-0000-000000000001")
+        req = CreateWorkspaceRequest(
+            repo_url="https://example.com/repo.git",
+            job_id=gw_job_id,
+        )
+        await plugin.create_workspace(req)
+
+        # After successful completion, the entry is popped to prevent
+        # unbounded growth.
+        assert plugin._executor_job_ids.get(gw_job_id) is None
 
 
 # ── start / stop / restart ──────────────────────────────────────────────
@@ -883,3 +907,526 @@ class TestAWXExecutorFactory:
 
         with pytest.raises(ValueError, match="missing or zero"):
             get_executor()
+
+
+# ── Active AWX job tracking ──────────────────────────────────────────────
+
+
+class TestAWXActiveJobTracking:
+    """Tests for the _active_awx_jobs tracking dict.
+
+    Acceptance criteria:
+    1. __init__ initializes _active_awx_jobs as empty dict[UUID, int]
+    2. _launch_and_wait records workspace_id -> awx_job_id after launch succeeds
+    3. On job completion/failure, tracking entry is cleaned up (popped)
+    4. If workspace already tracked, log warning and replace mapping
+    5. No locks/synchronization needed (async event loop)
+    """
+
+    WS_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+    async def test_tracking_dict_starts_empty(self):
+        """Dict is initialized as empty."""
+        plugin = _make_plugin()
+        assert plugin._active_awx_jobs == {}
+
+    async def test_tracking_inserts_on_launch(self):
+        """After launch succeeds, workspace_id -> awx_job_id is recorded."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=42)
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # The entry should have been inserted after launch but removed
+        # after job completion.  We verify via the mock that the client
+        # interactions happened.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_success(self):
+        """Entry is popped after job completes successfully."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=99, status="successful")
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_job_failure(self):
+        """Entry is popped even when wait_for_job raises AWXJobError."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=55, status="pending"
+        )
+        client.wait_for_job.side_effect = AWXJobError("boom", job_id=55)
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXJobError):
+            await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_timeout(self):
+        """Entry is popped when wait_for_job raises AWXTimeoutError."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=77, status="pending"
+        )
+        client.wait_for_job.side_effect = AWXTimeoutError("timed out")
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXTimeoutError):
+            await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_duplicate_workspace_logs_warning_and_replaces(self, caplog):
+        """If workspace is already tracked, a warning is logged and
+        the mapping is replaced."""
+        client = AsyncMock(spec=AWXApiClient)
+
+        # First launch — job_id=100
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=100, status="pending"
+        )
+        client.wait_for_job.return_value = AWXJobResult(
+            job_id=100, status="successful", artifacts={}
+        )
+
+        plugin = _make_plugin(client)
+
+        # Manually insert a stale entry to simulate a previous in-flight job.
+        plugin._active_awx_jobs[self.WS_ID] = 50
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # A warning should have been logged about the duplicate.
+        warnings = [
+            r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "already has active AWX job" in str(r.message)
+        ]
+        assert len(warnings) >= 1
+        assert "50" in warnings[0]
+        assert "100" in warnings[0]
+
+        # After completion the tracking entry is cleaned up.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_create_workspace_does_not_track(self):
+        """create_workspace does not pass workspace_id (it is unknown
+        at launch time), so no tracking entry is created."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "workspace_path": "/some/path",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        await plugin.create_workspace(req)
+
+        # No tracking entries should have been created.
+        assert plugin._active_awx_jobs == {}
+
+    async def test_tracking_does_not_pop_mismatched_job_id_on_success(self):
+        """When the stored job ID differs from the completed job's ID
+        on the success path (e.g. a cleanup job was launched for the
+        same workspace while the original job completed), the old waiter
+        must not pop the new entry."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=100, status="pending"
+        )
+
+        # Simulate: another job (ID 200) replaces the tracking entry
+        # while wait_for_job is in-flight (or after it returns but
+        # before the pop).
+        async def _wait_and_replace(job_id):
+            plugin._active_awx_jobs[self.WS_ID] = 200
+            return AWXJobResult(job_id=100, status="successful", artifacts={})
+
+        client.wait_for_job.side_effect = _wait_and_replace
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # The waiter for job 100 should NOT have removed job 200's
+        # tracking entry (stored 200 != summary.job_id 100).
+        assert plugin._active_awx_jobs == {self.WS_ID: 200}
+
+    async def test_tracking_does_not_pop_mismatched_job_id_on_failure(self):
+        """Same as above but when wait_for_job raises — the except
+        branch's pop must also be conditional."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=77, status="pending"
+        )
+
+        async def _wait_and_replace(job_id):
+            plugin._active_awx_jobs[self.WS_ID] = 200
+            raise AWXJobError("boom", job_id=77)
+
+        client.wait_for_job.side_effect = _wait_and_replace
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXJobError):
+            await plugin.stop_opencode(req)
+
+        # The waiter for job 77 should NOT have removed job 200's
+        # tracking entry (stored 200 != summary.job_id 77).
+        assert plugin._active_awx_jobs == {self.WS_ID: 200}
+
+
+# ── Cancel job ──────────────────────────────────────────────────────────
+
+
+class TestAWXExecutorPluginCancelJob:
+    """Tests for AWXExecutorPlugin.cancel_job()."""
+
+    WS_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+    async def test_cancel_job_success(self):
+        """cancel_job finds an active AWX job and cancels it."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=42, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # Simulate an active tracked job.
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(42)
+        # Entry should have been popped from the tracking dict.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_cancel_job_not_tracked(self):
+        """cancel_job with a workspace that was never tracked
+        returns status='cancelled' without calling the API."""
+        client = AsyncMock(spec=AWXApiClient)
+        plugin = _make_plugin(client)
+
+        req = CancelJobRequest(workspace_id=UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_not_awaited()
+
+    async def test_cancel_job_late_cancel(self):
+        """cancel_job after the job has already completed (tracking
+        cleaned up) returns status='no_active_job'."""
+        client = AsyncMock(spec=AWXApiClient)
+        plugin = _make_plugin(client)
+
+        # Simulate a workspace that was tracked but the job finished.
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "no_active_job"
+        client.cancel_job.assert_not_awaited()
+
+    async def test_cancel_job_api_failure_preserves_mapping(self):
+        """When client.cancel_job raises, the mapping is preserved for retry."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.side_effect = AWXHTTPError("Server error", status_code=500)
+        plugin = _make_plugin(client)
+
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXHTTPError, match="Server error"):
+            await plugin.cancel_job(req)
+
+        client.cancel_job.assert_awaited_once_with(42)
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 42
+
+    async def test_cancel_job_connection_error_preserves_mapping(self):
+        """AWXConnectionError from cancel_job preserves the mapping for retry."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.side_effect = AWXConnectionError("Connection refused")
+        plugin = _make_plugin(client)
+
+        plugin._active_awx_jobs[self.WS_ID] = 99
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXConnectionError, match="refused"):
+            await plugin.cancel_job(req)
+
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 99
+
+    async def test_cancel_job_cross_process_success(self):
+        """cancel_job falls back to executor_job_id from request when
+        _active_awx_jobs has no entry for the workspace (cross-process)."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=42, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # No in-memory entry — simulate different process.
+        req = CancelJobRequest(
+            workspace_id=self.WS_ID,
+            executor_job_id=42,
+        )
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(42)
+
+    async def test_cancel_job_cross_process_with_ever_tracked(self):
+        """executor_job_id from request takes priority over the
+        'no_active_job' path when the workspace was previously tracked."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=55, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # Workspace was tracked before but no active job now.
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        # executor_job_id should still be used despite ever_tracked.
+        req = CancelJobRequest(
+            workspace_id=self.WS_ID,
+            executor_job_id=55,
+        )
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(55)
+
+
+# ── Executor job ID persistence for lifecycle methods ────────────────────
+
+
+class TestExecutorJobIdPersistence:
+    """Verify that lifecycle methods persist the AWX job ID via
+    gateway_job_id so that cross-process cancellation can find the
+    currently-active AWX job (issue #189)."""
+
+    GW_JOB_ID = UUID("11111111-1111-1111-1111-111111111111")
+
+    async def test_start_opencode_cleans_up_executor_job_id(self):
+        """After a successful start_opencode launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            job_id=201,
+            artifacts={
+                "session_id": "00000000-1111-2222-3333-444444444444",
+                "port": 9090,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.start_opencode(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
+
+    async def test_stop_opencode_cleans_up_executor_job_id(self):
+        """After a successful stop_opencode launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=202)
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StopOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.stop_opencode(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
+
+    async def test_cleanup_workspace_cleans_up_executor_job_id(self):
+        """After a successful cleanup_workspace launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=203)
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CleanupWorkspaceRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.cleanup_workspace(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
+
+    async def test_cross_process_cancel_uses_active_lifecycle_job(self):
+        """Simulate a cross-process cancel scenario:
+        1. Worker A launches start_opencode — AWX job 201 is stored
+           in _executor_job_ids (and _active_awx_jobs).
+        2. Worker A's start_opencode completes; both tracking dicts are
+           cleaned up.  The executor_job_id is persisted to the DB via
+           the on_awx_job_launched callback *before* wait_for_job.
+        3. Worker B receives the cancel — no in-memory tracking entries.
+        4. Worker B reads executor_job_id=201 from the DB and passes
+           it via CancelJobRequest.executor_job_id.
+        5. The cancel targets AWX job 201 (the active lifecycle job),
+           not the old create_workspace job.
+        """
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            job_id=201,
+            artifacts={
+                "session_id": "00000000-1111-2222-3333-444444444444",
+                "port": 9090,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.start_opencode(req)
+
+        # At this point, both _active_awx_jobs and _executor_job_ids
+        # are cleaned up (job completed).  The executor_job_id was
+        # already persisted to the DB by the on_awx_job_launched
+        # callback before wait_for_job began.
+        assert ws_id not in plugin._active_awx_jobs
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
+
+        # Simulate Worker B: no in-memory tracking, but has executor_job_id
+        # from the DB (201 — the start_opencode AWX job).
+        plugin2 = _make_plugin(client)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=201, status="canceled"
+        )
+
+        cancel_req = CancelJobRequest(
+            workspace_id=ws_id,
+            executor_job_id=201,
+        )
+        resp = await plugin2.cancel_job(cancel_req)
+
+        assert resp.status == "cancelled"
+        # Verify the correct AWX job was cancelled (not create_workspace's job).
+        client.cancel_job.assert_awaited_with(201)
+
+    async def test_db_contains_active_awx_job_id_while_start_opencode_is_blocked(
+        self,
+    ):
+        """Prove executor_job_id is persisted (via callback) while
+        start_opencode is in-flight and wait_for_job is still blocked.
+
+        This closes the cross-process cancellation race window — the
+        callback fires *before* wait_for_job blocks, so the executor_job_id
+        is ready for a concurrent abort request to read from the DB.
+        """
+        # ── Arrange ───────────────────────────────────────────────────────
+        # Blocking event for wait_for_job — simulates a long-running AWX job.
+        wait_blocker = asyncio.Event()
+
+        # Tracking for the on_awx_job_launched callback.
+        callback_fired = asyncio.Event()
+        callback_args: dict[str, int | UUID] = {}
+
+        async def on_awx_job_launched(
+            gw_job_id: UUID, awx_job_id: int
+        ) -> None:
+            callback_args["gw_job_id"] = gw_job_id
+            callback_args["awx_job_id"] = awx_job_id
+            callback_fired.set()
+
+        async def blocking_wait_for_job(job_id: int) -> AWXJobResult:
+            """Block until the test releases the blocker."""
+            await wait_blocker.wait()
+            return AWXJobResult(
+                job_id=job_id,
+                status="successful",
+                artifacts={
+                    "session_id": (
+                        "00000000-1111-2222-3333-444444444444"
+                    ),
+                    "port": 9090,
+                },
+            )
+
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=201, status="pending"
+        )
+        client.wait_for_job.side_effect = blocking_wait_for_job
+
+        plugin = _make_plugin(client)
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+
+        # ── Act ───────────────────────────────────────────────────────────
+        # Launch start_opencode as a background task — it will block
+        # inside wait_for_job while we inspect in-flight state.
+        bg_task = asyncio.create_task(
+            plugin.start_opencode(
+                req, on_awx_job_launched=on_awx_job_launched
+            )
+        )
+
+        # Wait for the callback to fire (before wait_for_job completes).
+        await callback_fired.wait()
+
+        # ── Assert while in-flight ────────────────────────────────────────
+        # 1. The callback received the correct AWX job ID.
+        assert callback_args["gw_job_id"] == self.GW_JOB_ID
+        assert callback_args["awx_job_id"] == 201
+
+        # 2. _executor_job_ids is populated before wait_for_job completes.
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+
+        # 3. _active_awx_jobs still tracks the in-flight job.
+        assert plugin._active_awx_jobs.get(ws_id) == 201
+
+        # ── Cleanup ──────────────────────────────────────────────────────
+        # Release the blocker so start_opencode can complete.
+        wait_blocker.set()
+        resp = await bg_task
+
+        # Verify the background task completed successfully.
+        assert isinstance(resp, StartOpencodeResponse)
+        assert resp.status == "successful"
+        assert resp.port == 9090

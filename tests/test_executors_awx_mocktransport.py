@@ -28,6 +28,8 @@ from app.executors.awx.exceptions import (
 )
 from app.executors.awx.plugin import AWXExecutorPlugin
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -941,3 +943,86 @@ class TestTemplateIDs:
         req = CollectStateRequest(workspace_id=self.WS_ID)
         with patch("app.executors.awx.client.asyncio.sleep", new_callable=AsyncMock):
             await plugin.collect_state(req)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6.  CANCEL JOB
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestCancelJob:
+    """AWXExecutorPlugin.cancel_job()."""
+
+    WS_ID = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    UNKNOWN_ID = UUID("ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb")
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_success(self) -> None:
+        """Cancel an active tracked AWX job via the cancel endpoint."""
+
+        plugin = _make_plugin(
+            _make_awx_handler(
+                cancel_response={
+                    "id": 42,
+                    "status": "canceled",
+                    "started": "2024-01-01T00:00:00Z",
+                    "finished": "2024-01-01T00:01:00Z",
+                },
+            ),
+        )
+
+        # Simulate an active tracked job.
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_not_tracked_returns_cancelled(self) -> None:
+        """cancel_job for a workspace never tracked returns 'cancelled'."""
+        plugin = _make_plugin(_make_awx_handler())
+
+        req = CancelJobRequest(workspace_id=self.UNKNOWN_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_late_cancel_returns_no_active_job(self) -> None:
+        """cancel_job after the job completed returns 'no_active_job'."""
+        plugin = _make_plugin(_make_awx_handler())
+
+        # Simulate a workspace that was tracked but the job finished.
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "no_active_job"
+
+    @pytest.mark.asyncio
+    async def test_cancel_job_http_error_preserves_mapping(self) -> None:
+        """HTTP error from the cancel endpoint preserves the mapping for retry."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/cancel/" in str(request.url):
+                return httpx.Response(500, json={"detail": "Internal error"})
+            return httpx.Response(404)
+
+        plugin = _make_plugin(handler)
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXHTTPError, match="500"):
+            await plugin.cancel_job(req)
+
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 42

@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone  # noqa: UP017
+from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -22,8 +24,10 @@ from app.core.ports import PortExhaustedError, allocate_and_assign_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.awx.exceptions import AWXArtifactError
+from app.executors.awx.plugin import AWXExecutorPlugin
 from app.executors.factory import get_executor
 from app.executors.models import (
+    CancelJobRequest,
     CleanupWorkspaceRequest,
     CreateWorkspaceRequest,
     StartOpencodeRequest,
@@ -167,7 +171,7 @@ class JobEvent(BaseModel):
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
     "opencode_session_id, diff, workspace_name, branch_name, commit_sha, mr_url, "
-    "workflow_run_id, failure_reason"
+    "workflow_run_id, failure_reason, executor_job_id"
 )
 
 
@@ -176,6 +180,68 @@ async def _fetch_job(conn: asyncpg.Connection, job_id: uuid.UUID):  # type: igno
     return await conn.fetchrow(
         f"SELECT {_FETCH_COLS} FROM gateway_jobs WHERE id = $1",
         job_id,
+    )
+
+
+async def _check_aborted(conn: asyncpg.Connection, job_id: uuid.UUID) -> bool:
+    """Re-read the job status; return True if already ``aborting`` or ``aborted``.
+
+    Call this *before* writing ``failed`` in an exception handler to guard
+    against the abort-race (issue #184): a concurrent abort sets the status
+    to ``aborted`` while the handler is about to overwrite it with
+    ``failed``.  When this function returns ``True`` the caller should skip
+    the failed-status update.
+    """
+    row = await _fetch_job(conn, job_id)
+    if row and row["status"] in ("aborting", "aborted"):
+        logger.warning(
+            "Job %s is already %s — skipping failed status update "
+            "(abort race guard)",
+            job_id,
+            row["status"],
+        )
+        return True
+    return False
+
+
+async def _fetch_and_check_aborted(
+    conn: asyncpg.Connection, job_id: uuid.UUID,
+) -> dict | None:
+    """Fetch the current job row; return it if status is aborting/aborted.
+
+    Call this after long-awaited lifecycle methods (create_workspace,
+    start_opencode) to detect a concurrent abort. When a row is returned
+    the caller should stop progressing and return ``_job_response(row)``
+    immediately.
+    """
+    row = await _fetch_job(conn, job_id)
+    if row and row["status"] in ("aborting", "aborted"):
+        logger.warning(
+            "Job %s was %s during lifecycle step — stopping progress",
+            job_id, row["status"],
+        )
+        return row
+    return None
+
+
+def _job_response(request: Request, row: dict) -> JobResponse:
+    """Construct a JobResponse from a database row."""
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(row["id"]))),
+        failure_reason=row.get("failure_reason"),
     )
 
 
@@ -477,16 +543,67 @@ async def create_job(
         )
         current_status = "provisioning_workspace"
 
-        # 3. Create workspace on the selected runner
-        ws_response = await executor.create_workspace(
-            CreateWorkspaceRequest(
-                repo_url=str(body.repo_url),
-                job_id=job_id,
-                runner_id=runner_text_id,
-                env_vars=body.env_vars,
-            )
+        # 3. Create workspace on the selected runner.
+        # Build the on_awx_job_launched callback that persists the
+        # executor_job_id immediately after the AWX job is launched
+        # (before wait_for_job), so that cross-process cancellation
+        # can target the currently-active AWX job (issue #190).
+        _on_launch_cb = None
+        if isinstance(executor, AWXExecutorPlugin):
+            async def _persist_cb(gw_job_id: UUID, awx_job_id: int) -> None:
+                await conn.execute(
+                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
+                    gw_job_id,
+                    str(awx_job_id),
+                )
+            _on_launch_cb = _persist_cb
+
+        ws_req = CreateWorkspaceRequest(
+            repo_url=str(body.repo_url),
+            job_id=job_id,
+            runner_id=runner_text_id,
+            env_vars=body.env_vars,
         )
+        if isinstance(executor, AWXExecutorPlugin):
+            ws_response = await executor.create_workspace(
+                ws_req, on_awx_job_launched=_on_launch_cb,
+            )
+        else:
+            ws_response = await executor.create_workspace(ws_req)
         new_workspace_id = ws_response.workspace_id
+
+        # Check for concurrent abort — if the job was aborted during
+        # create_workspace, return immediately without progressing.
+        if aborted := await _fetch_and_check_aborted(conn, job_id):
+            # Persist workspace_name so it's available for reference / cleanup
+            # even though the job won't progress to running.
+            await conn.execute(
+                "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
+                job_id, str(new_workspace_id),
+            )
+
+            # Clean up the newly-known workspace best-effort.
+            try:
+                await _set_workspace_cleanup_after(
+                    conn,
+                    new_workspace_id,
+                    settings.cleanup_failure_retention_hours,
+                )
+                await executor.cleanup_workspace(
+                    CleanupWorkspaceRequest(
+                        workspace_id=new_workspace_id,
+                        gateway_job_id=job_id,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up workspace for aborted job %s (workspace %s)",
+                    job_id,
+                    new_workspace_id,
+                )
+
+            row = await _fetch_job(conn, job_id)
+            return _job_response(request, row)
 
         # Store the workspace ID immediately so it is available even if
         # start_opencode fails and the job is marked "failed".
@@ -539,16 +656,28 @@ async def create_job(
         )
         current_status = "starting_opencode"
 
-        # 6. Start OpenCode Serve
-        start_response = await executor.start_opencode(
-            StartOpencodeRequest(
-                workspace_id=new_workspace_id,
-                workspace_path=ws_response.workspace_path,
-                port=allocated_port,
-                env_vars=body.env_vars,
-            )
+        # 6. Start OpenCode Serve.
+        # Persist executor_job_id via callback *before* wait_for_job
+        # so the DB contains the active AWX job ID while the job is
+        # still in-flight (issue #190).
+        start_req = StartOpencodeRequest(
+            workspace_id=new_workspace_id,
+            workspace_path=ws_response.workspace_path,
+            port=allocated_port,
+            gateway_job_id=job_id,
+            env_vars=body.env_vars,
         )
+        if isinstance(executor, AWXExecutorPlugin):
+            start_response = await executor.start_opencode(
+                start_req, on_awx_job_launched=_on_launch_cb,
+            )
+        else:
+            start_response = await executor.start_opencode(start_req)
         session_id = str(start_response.session_id)
+
+        # Check for concurrent abort after start_opencode.
+        if aborted := await _fetch_and_check_aborted(conn, job_id):
+            return _job_response(request, aborted)
 
         # Store the session ID so it is available for diff retrieval
         await conn.execute(
@@ -611,255 +740,280 @@ async def create_job(
     except PolicyViolation:
         # Policy rejected the job BEFORE any infrastructure action was taken.
         # Mark as failed and re-raise the 503 — no workspace to clean up.
-        logger.warning(
-            "Policy check rejected job %s before workspace creation",
-            job_id,
-        )
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
-            "failure_reason = $3 WHERE id = $1",
-            job_id,
-            now,
-            "Policy check rejected: disk/memory pressure",
-        )
-        await _record_job_event(
-            conn, job_id, current_status, "failed",
-            "Policy check rejected: disk/memory pressure",
-        )
-        # Fire webhooks asynchronously for policy-rejected jobs
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
+        # --- abort race guard (issue #184) ---
+        if await _check_aborted(conn, job_id):
+            # Status already set to aborting/aborted by a concurrent abort;
+            # do not overwrite with failed.  Skip the rest of the handler
+            # and let the normal path return the aborted job.
+            pass
+        else:
+            logger.warning(
+                "Policy check rejected job %s before workspace creation",
                 job_id,
-                "job.failed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.failed",
-                    "status": "failed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": None,
-                    "error": "Policy rejected: disk/memory pressure",
-                },
             )
-        )
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+                "failure_reason = $3 WHERE id = $1",
+                job_id,
+                now,
+                "Policy check rejected: disk/memory pressure",
+            )
+            await _record_job_event(
+                conn, job_id, current_status, "failed",
+                "Policy check rejected: disk/memory pressure",
+            )
+            # Fire webhooks asynchronously for policy-rejected jobs
+            asyncio.create_task(
+                dispatch_webhooks(
+                    pool,
+                    job_id,
+                    "job.failed",
+                    {
+                        "job_id": str(job_id),
+                        "event_type": "job.failed",
+                        "status": "failed",
+                        "repo_url": str(body.repo_url),
+                        "task_summary": body.task_summary,
+                        "completed_at": None,
+                        "error": "Policy rejected: disk/memory pressure",
+                    },
+                )
+            )
 
-        if new_workspace_id is not None:
-            await _set_workspace_cleanup_after(
-                conn, new_workspace_id, settings.cleanup_failure_retention_hours
+            if new_workspace_id is not None:
+                await _set_workspace_cleanup_after(
+                    conn, new_workspace_id, settings.cleanup_failure_retention_hours
+                )
+                try:
+                    await executor.cleanup_workspace(
+                        CleanupWorkspaceRequest(workspace_id=new_workspace_id)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up workspace for policy-rejected job %s "
+                        "(workspace %s)",
+                        job_id,
+                        new_workspace_id,
+                    )
+            raise
+
+    except AWXArtifactError as exc:
+        # Artifact validation failure — the AWX job completed but returned
+        # malformed or missing data.  Store a descriptive failure reason.
+        # --- abort race guard (issue #184) ---
+        if await _check_aborted(conn, job_id):
+            # Status already set to aborting/aborted by a concurrent abort;
+            # do not overwrite with failed.
+            pass
+        else:
+            details_parts = [f"AWX artifact validation failed: {exc}"]
+            if exc.template_name:
+                details_parts.append(f"template={exc.template_name}")
+            if exc.missing_fields:
+                details_parts.append(f"missing_fields={exc.missing_fields}")
+            if exc.invalid_fields:
+                details_parts.append(f"invalid_fields={exc.invalid_fields}")
+            error_detail = "; ".join(details_parts)
+
+            logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+                "failure_reason = $3 WHERE id = $1",
+                job_id,
+                now,
+                error_detail,
             )
+            await _record_job_event(
+                conn, job_id, current_status, "failed",
+                error_detail,
+            )
+            
+            # Record the artifact failure as a job event
+            event_id = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO job_events "
+                "(id, job_id, event_type, actor, details, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                event_id,
+                job_id,
+                "artifact_error",
+                "gateway",
+                error_detail,
+                now,
+            )
+
+            # Fire webhooks asynchronously with the error detail
+            asyncio.create_task(
+                dispatch_webhooks(
+                    pool,
+                    job_id,
+                    "job.failed",
+                    {
+                        "job_id": str(job_id),
+                        "event_type": "job.failed",
+                        "status": "failed",
+                        "repo_url": str(body.repo_url),
+                        "task_summary": body.task_summary,
+                        "completed_at": None,
+                        "error": error_detail,
+                    },
+                )
+            )
+
+            # Set workspace cleanup_after for failure (if a workspace was created)
+            row = await _fetch_job(conn, job_id)
+            if row is not None:
+                ws_id = _resolve_workspace_id(row.get("workspace_name"))
+                if ws_id is not None:
+                    await _set_workspace_cleanup_after(
+                        conn, ws_id, settings.cleanup_failure_retention_hours
+                    )
+
+    except PortMismatchError as exc:
+        # Port mismatch — the AWX playbook returned a port different from
+        # the one the Gateway allocated.  Fail the job, record the mismatch
+        # event, and clean up the workspace.
+        # --- abort race guard (issue #184) ---
+        if await _check_aborted(conn, job_id):
+            # Status already set to aborting/aborted by a concurrent abort;
+            # do not overwrite with failed.
+            pass
+        else:
+            error_detail = (
+                f"Port mismatch: allocated port {exc.allocated_port}, "
+                f"AWX returned port {exc.returned_port}"
+            )
+            logger.error("Port mismatch for job %s: %s", job_id, error_detail)
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+                "failure_reason = $3 WHERE id = $1",
+                job_id,
+                now,
+                error_detail,
+            )
+            await _record_job_event(
+                conn, job_id, current_status, "failed",
+                error_detail,
+            )
+
+            # Record the port_mismatch event (separate from the status transition)
+            event_id = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO job_events "
+                "(id, job_id, event_type, actor, details, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                event_id,
+                job_id,
+                "port_mismatch",
+                "gateway",
+                error_detail,
+                now,
+            )
+
+            # Fire webhooks asynchronously
+            asyncio.create_task(
+                dispatch_webhooks(
+                    pool,
+                    job_id,
+                    "job.failed",
+                    {
+                        "job_id": str(job_id),
+                        "event_type": "job.failed",
+                        "status": "failed",
+                        "repo_url": str(body.repo_url),
+                        "task_summary": body.task_summary,
+                        "completed_at": None,
+                        "error": error_detail,
+                    },
+                )
+            )
+
+            # Set workspace cleanup_after for failure
+            row = await _fetch_job(conn, job_id)
+            if row is not None:
+                ws_id = _resolve_workspace_id(row.get("workspace_name"))
+                if ws_id is not None:
+                    await _set_workspace_cleanup_after(
+                        conn, ws_id, settings.cleanup_failure_retention_hours
+                    )
+
+            # Clean up the workspace (best-effort)
             try:
                 await executor.cleanup_workspace(
                     CleanupWorkspaceRequest(workspace_id=new_workspace_id)
                 )
             except Exception:
                 logger.exception(
-                    "Failed to clean up workspace for policy-rejected job %s "
+                    "Failed to clean up workspace for port-mismatch job %s "
                     "(workspace %s)",
                     job_id,
                     new_workspace_id,
                 )
-        raise
-
-    except AWXArtifactError as exc:
-        # Artifact validation failure — the AWX job completed but returned
-        # malformed or missing data.  Store a descriptive failure reason.
-        details_parts = [f"AWX artifact validation failed: {exc}"]
-        if exc.template_name:
-            details_parts.append(f"template={exc.template_name}")
-        if exc.missing_fields:
-            details_parts.append(f"missing_fields={exc.missing_fields}")
-        if exc.invalid_fields:
-            details_parts.append(f"invalid_fields={exc.invalid_fields}")
-        error_detail = "; ".join(details_parts)
-
-        logger.error("Executor artifact error for job %s: %s", job_id, error_detail)
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
-            "failure_reason = $3 WHERE id = $1",
-            job_id,
-            now,
-            error_detail,
-        )
-        await _record_job_event(
-            conn, job_id, current_status, "failed",
-            error_detail,
-        )
-        
-        # Record the artifact failure as a job event
-        event_id = uuid.uuid4()
-        await conn.execute(
-            "INSERT INTO job_events "
-            "(id, job_id, event_type, actor, details, created_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            event_id,
-            job_id,
-            "artifact_error",
-            "gateway",
-            error_detail,
-            now,
-        )
-
-        # Fire webhooks asynchronously with the error detail
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
-                job_id,
-                "job.failed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.failed",
-                    "status": "failed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": None,
-                    "error": error_detail,
-                },
-            )
-        )
-
-        # Set workspace cleanup_after for failure (if a workspace was created)
-        row = await _fetch_job(conn, job_id)
-        if row is not None:
-            ws_id = _resolve_workspace_id(row.get("workspace_name"))
-            if ws_id is not None:
-                await _set_workspace_cleanup_after(
-                    conn, ws_id, settings.cleanup_failure_retention_hours
-                )
-
-    except PortMismatchError as exc:
-        # Port mismatch — the AWX playbook returned a port different from
-        # the one the Gateway allocated.  Fail the job, record the mismatch
-        # event, and clean up the workspace.
-        error_detail = (
-            f"Port mismatch: allocated port {exc.allocated_port}, "
-            f"AWX returned port {exc.returned_port}"
-        )
-        logger.error("Port mismatch for job %s: %s", job_id, error_detail)
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
-            "failure_reason = $3 WHERE id = $1",
-            job_id,
-            now,
-            error_detail,
-        )
-        await _record_job_event(
-            conn, job_id, current_status, "failed",
-            error_detail,
-        )
-
-        # Record the port_mismatch event (separate from the status transition)
-        event_id = uuid.uuid4()
-        await conn.execute(
-            "INSERT INTO job_events "
-            "(id, job_id, event_type, actor, details, created_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            event_id,
-            job_id,
-            "port_mismatch",
-            "gateway",
-            error_detail,
-            now,
-        )
-
-        # Fire webhooks asynchronously
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
-                job_id,
-                "job.failed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.failed",
-                    "status": "failed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": None,
-                    "error": error_detail,
-                },
-            )
-        )
-
-        # Set workspace cleanup_after for failure
-        row = await _fetch_job(conn, job_id)
-        if row is not None:
-            ws_id = _resolve_workspace_id(row.get("workspace_name"))
-            if ws_id is not None:
-                await _set_workspace_cleanup_after(
-                    conn, ws_id, settings.cleanup_failure_retention_hours
-                )
-
-        # Clean up the workspace (best-effort)
-        try:
-            await executor.cleanup_workspace(
-                CleanupWorkspaceRequest(workspace_id=new_workspace_id)
-            )
-        except Exception:
-            logger.exception(
-                "Failed to clean up workspace for port-mismatch job %s "
-                "(workspace %s)",
-                job_id,
-                new_workspace_id,
-            )
 
     except Exception:
         logger.exception("Executor dispatch failed for job %s", job_id)
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        await conn.execute(
-            "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
-            "failure_reason = $3 WHERE id = $1",
-            job_id,
-            now,
-            f"Executor dispatch failed: {body.task_summary}",
-        )
-        await _record_job_event(
-            conn, job_id, current_status, "failed",
-            f"Executor dispatch failed: {body.task_summary}",
-        )
-        
-        # Record the failure as a job event
-        event_id = uuid.uuid4()
-        await conn.execute(
-            "INSERT INTO job_events "
-            "(id, job_id, event_type, actor, details, created_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            event_id,
-            job_id,
-            "executor_error",
-            "gateway",
-            f"Executor dispatch failed: {body.task_summary}",
-            now,
-        )
-
-        # Fire webhooks asynchronously for failed jobs
-        asyncio.create_task(
-            dispatch_webhooks(
-                pool,
+        # --- abort race guard (issue #184) ---
+        if await _check_aborted(conn, job_id):
+            # Status already set to aborting/aborted by a concurrent abort;
+            # do not overwrite with failed.
+            pass
+        else:
+            now = datetime.now(timezone.utc)  # noqa: UP017
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'failed', updated_at = $2, "
+                "failure_reason = $3 WHERE id = $1",
                 job_id,
-                "job.failed",
-                {
-                    "job_id": str(job_id),
-                    "event_type": "job.failed",
-                    "status": "failed",
-                    "repo_url": str(body.repo_url),
-                    "task_summary": body.task_summary,
-                    "completed_at": None,
-                    "error": f"Executor dispatch failed: {body.task_summary}",
-                },
+                now,
+                f"Executor dispatch failed: {body.task_summary}",
             )
-        )
+            await _record_job_event(
+                conn, job_id, current_status, "failed",
+                f"Executor dispatch failed: {body.task_summary}",
+            )
+            
+            # Record the failure as a job event
+            event_id = uuid.uuid4()
+            await conn.execute(
+                "INSERT INTO job_events "
+                "(id, job_id, event_type, actor, details, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                event_id,
+                job_id,
+                "executor_error",
+                "gateway",
+                f"Executor dispatch failed: {body.task_summary}",
+                now,
+            )
 
-        # Set workspace cleanup_after for failure
-        row = await _fetch_job(conn, job_id)
-        if row is not None:
-            ws_id = _resolve_workspace_id(row.get("workspace_name"))
-            if ws_id is not None:
-                await _set_workspace_cleanup_after(
-                    conn, ws_id, settings.cleanup_failure_retention_hours
+            # Fire webhooks asynchronously for failed jobs
+            asyncio.create_task(
+                dispatch_webhooks(
+                    pool,
+                    job_id,
+                    "job.failed",
+                    {
+                        "job_id": str(job_id),
+                        "event_type": "job.failed",
+                        "status": "failed",
+                        "repo_url": str(body.repo_url),
+                        "task_summary": body.task_summary,
+                        "completed_at": None,
+                        "error": f"Executor dispatch failed: {body.task_summary}",
+                    },
                 )
+            )
+
+            # Set workspace cleanup_after for failure
+            row = await _fetch_job(conn, job_id)
+            if row is not None:
+                ws_id = _resolve_workspace_id(row.get("workspace_name"))
+                if ws_id is not None:
+                    await _set_workspace_cleanup_after(
+                        conn, ws_id, settings.cleanup_failure_retention_hours
+                    )
 
     # 9. Return final state
     row = await _fetch_job(conn, job_id)
@@ -1208,17 +1362,39 @@ async def abort_job(
 
     If the job has an active OpenCode session the endpoint transitions the job
     to ``aborting``, calls :meth:`OpenCodeClientProtocol.abort_session`, and on
-    success marks the job ``aborted``.  When the session is unreachable the job
-    stays in ``aborting`` and the caller receives a 503.
+    success marks the job ``aborted``.  When the session is unreachable the
+    failure is logged at WARNING level and the job transitions to ``aborted``
+    anyway (best-effort); executor cleanup (cancel_job, stop_opencode,
+    cleanup_workspace) follows.
 
     Jobs without a session (e.g. still *pending*) are immediately marked
-    ``aborted``.
+    ``aborted``.  Jobs already in ``aborted`` state return 200 idempotently.
     """
     row = await _fetch_job(conn, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
     current_status = JobStatus(row["status"])
+
+    # Idempotent — already aborted, return as-is
+    if current_status == JobStatus.ABORTED:
+        return JobResponse(
+            id=row["id"],
+            repo_url=row["repo_url"],
+            task_summary=row["task_summary"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+            opencode_session_id=row.get("opencode_session_id"),
+            diff=row.get("diff"),
+            branch_name=row.get("branch_name"),
+            commit_sha=row.get("commit_sha"),
+            mr_url=row.get("mr_url"),
+            workflow_run_id=row.get("workflow_run_id"),
+            diff_url=str(request.url_for("get_job_diff", job_id=str(job_id))),
+            failure_reason=row.get("failure_reason"),
+        )
 
     # Allow retry from aborting; otherwise validate via centralised transition table
     if current_status != JobStatus.ABORTING and not can_transition(
@@ -1256,16 +1432,19 @@ async def abort_job(
                 datetime.now(timezone.utc),  # noqa: UP017
             )
             aborted = True
-        except Exception:
-            logger.exception(
-                "Failed to abort OpenCode session %s for job %s",
+        except Exception as exc:
+            logger.warning(
+                "OpenCode session %s for job %s did not abort cleanly: %s",
                 session_id,
                 job_id,
+                exc,
             )
-            raise HTTPException(
-                status_code=503,
-                detail="OpenCode Serve unreachable; job remains in aborting state",
+            await conn.execute(
+                "UPDATE gateway_jobs SET status = 'aborted', updated_at = $2 WHERE id = $1",
+                job_id,
+                datetime.now(timezone.utc),  # noqa: UP017
             )
+            aborted = True
     else:
         # No session to cancel — mark aborted immediately
         await conn.execute(
@@ -1286,34 +1465,52 @@ async def abort_job(
 
     # Executor cleanup --- best effort, do not block the abort response
     workspace_name = row.get("workspace_name")
+    parsed_ws_id = None
     if workspace_name:
         try:
-            parsed_id = uuid.UUID(workspace_name)
+            parsed_ws_id = uuid.UUID(workspace_name)
         except (ValueError, TypeError):
-            logger.warning(
-                "Invalid workspace_name for job %s: %r", job_id, workspace_name
+            logger.warning("Invalid workspace_name for job %s: %r", job_id, workspace_name)
+
+    executor_job_id_raw = row.get("executor_job_id")
+    executor_job_id: int | None = None
+    if executor_job_id_raw is not None:
+        try:
+            executor_job_id = int(executor_job_id_raw)
+        except (ValueError, TypeError):
+            logger.warning("Invalid executor_job_id for job %s: %r", job_id, executor_job_id_raw)
+
+    # Cancel in-flight AWX job if we have any way to reach it.
+    if parsed_ws_id is not None or executor_job_id is not None:
+        cancel_req = CancelJobRequest(
+            workspace_id=parsed_ws_id,
+            executor_job_id=executor_job_id,
+        )
+        try:
+            await executor.cancel_job(cancel_req)
+        except Exception:
+            logger.exception("Failed to cancel job for workspace %s (job %s)", parsed_ws_id, job_id)
+
+    # stop_opencode and cleanup_workspace still require a known workspace.
+    if parsed_ws_id is not None:
+        try:
+            await executor.stop_opencode(
+                StopOpencodeRequest(
+                    workspace_id=parsed_ws_id,
+                    gateway_job_id=job_id,
+                )
             )
-        else:
-            try:
-                await executor.stop_opencode(
-                    StopOpencodeRequest(workspace_id=parsed_id)
+        except Exception:
+            logger.exception("Failed to stop OpenCode Serve for job %s (workspace %s)", job_id, parsed_ws_id)
+        try:
+            await executor.cleanup_workspace(
+                CleanupWorkspaceRequest(
+                    workspace_id=parsed_ws_id,
+                    gateway_job_id=job_id,
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to stop OpenCode Serve for job %s (workspace %s)",
-                    job_id,
-                    parsed_id,
-                )
-            try:
-                await executor.cleanup_workspace(
-                    CleanupWorkspaceRequest(workspace_id=parsed_id)
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to clean up workspace for job %s (workspace %s)",
-                    job_id,
-                    parsed_id,
-                )
+            )
+        except Exception:
+            logger.exception("Failed to clean up workspace for job %s (workspace %s)", job_id, parsed_ws_id)
 
     # Record abort event
     event_id = uuid.uuid4()
