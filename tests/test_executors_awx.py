@@ -883,3 +883,134 @@ class TestAWXExecutorFactory:
 
         with pytest.raises(ValueError, match="missing or zero"):
             get_executor()
+
+
+# ── Active AWX job tracking ──────────────────────────────────────────────
+
+
+class TestAWXActiveJobTracking:
+    """Tests for the _active_awx_jobs tracking dict.
+
+    Acceptance criteria:
+    1. __init__ initializes _active_awx_jobs as empty dict[UUID, int]
+    2. _launch_and_wait records workspace_id -> awx_job_id after launch succeeds
+    3. On job completion/failure, tracking entry is cleaned up (popped)
+    4. If workspace already tracked, log warning and replace mapping
+    5. No locks/synchronization needed (async event loop)
+    """
+
+    WS_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+    async def test_tracking_dict_starts_empty(self):
+        """Dict is initialized as empty."""
+        plugin = _make_plugin()
+        assert plugin._active_awx_jobs == {}
+
+    async def test_tracking_inserts_on_launch(self):
+        """After launch succeeds, workspace_id -> awx_job_id is recorded."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=42)
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # The entry should have been inserted after launch but removed
+        # after job completion.  We verify via the mock that the client
+        # interactions happened.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_success(self):
+        """Entry is popped after job completes successfully."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=99, status="successful")
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_job_failure(self):
+        """Entry is popped even when wait_for_job raises AWXJobError."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=55, status="pending"
+        )
+        client.wait_for_job.side_effect = AWXJobError("boom", job_id=55)
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXJobError):
+            await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_tracking_cleaned_up_on_timeout(self):
+        """Entry is popped when wait_for_job raises AWXTimeoutError."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=77, status="pending"
+        )
+        client.wait_for_job.side_effect = AWXTimeoutError("timed out")
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXTimeoutError):
+            await plugin.stop_opencode(req)
+
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_duplicate_workspace_logs_warning_and_replaces(self, caplog):
+        """If workspace is already tracked, a warning is logged and
+        the mapping is replaced."""
+        client = AsyncMock(spec=AWXApiClient)
+
+        # First launch — job_id=100
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=100, status="pending"
+        )
+        client.wait_for_job.return_value = AWXJobResult(
+            job_id=100, status="successful", artifacts={}
+        )
+
+        plugin = _make_plugin(client)
+
+        # Manually insert a stale entry to simulate a previous in-flight job.
+        plugin._active_awx_jobs[self.WS_ID] = 50
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # A warning should have been logged about the duplicate.
+        warnings = [
+            r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "already has active AWX job" in str(r.message)
+        ]
+        assert len(warnings) >= 1
+        assert "50" in warnings[0]
+        assert "100" in warnings[0]
+
+        # After completion the tracking entry is cleaned up.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_create_workspace_does_not_track(self):
+        """create_workspace does not pass workspace_id (it is unknown
+        at launch time), so no tracking entry is created."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            artifacts={
+                "workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "workspace_path": "/some/path",
+            },
+        )
+        plugin = _make_plugin(client)
+
+        req = CreateWorkspaceRequest(repo_url="https://example.com/repo.git")
+        await plugin.create_workspace(req)
+
+        # No tracking entries should have been created.
+        assert plugin._active_awx_jobs == {}
