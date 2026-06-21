@@ -127,6 +127,10 @@ class LocalExecutor(ExecutorPlugin):
     async def cancel_job(
         self, request: CancelJobRequest
     ) -> CancelJobResponse:
-        """Cancel a running job."""
+        """Stub implementation — always returns cancelled.
+
+        The local executor has no infrastructure job to cancel,
+        so this is a no-op that returns immediately.
+        """
         logger.info("cancel_job: workspace=%s", request.workspace_id)
         return CancelJobResponse(status="cancelled")

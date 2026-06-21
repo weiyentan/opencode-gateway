@@ -33,7 +33,7 @@ from app.executors.models import (
 
 
 class _FakeExecutor(ExecutorPlugin):
-    """Minimal concrete executor that implements all 6 abstract methods."""
+    """Minimal concrete executor that implements all 7 abstract methods."""
 
     name = "fake"
 
@@ -91,7 +91,7 @@ class TestExecutorPluginABC:
             Incomplete()  # type: ignore[abstract]
 
     def test_can_instantiate_full_implementation(self):
-        """A subclass that implements all 6 methods should instantiate fine."""
+        """A subclass that implements all 7 methods should instantiate fine."""
         executor = _FakeExecutor()
         assert executor.name == "fake"
 
@@ -110,6 +110,21 @@ class TestExecutorPluginABC:
 
         with pytest.raises(TypeError):
             MissingOne()  # type: ignore[abstract]
+
+    def test_missing_cancel_job_prevents_instantiation(self):
+        """A subclass missing only cancel_job should raise TypeError."""
+        class MissingCancelJob(ExecutorPlugin):
+            name = "missing-cancel-job"
+
+            async def create_workspace(self, request): ...
+            async def start_opencode(self, request): ...
+            async def stop_opencode(self, request): ...
+            async def restart_opencode(self, request): ...
+            async def collect_state(self, request): ...
+            async def cleanup_workspace(self, request): ...
+
+        with pytest.raises(TypeError):
+            MissingCancelJob()
 
     def test_abc_declares_name_annotation(self):
         """ExecutorPlugin ABC should declare name in its annotations."""

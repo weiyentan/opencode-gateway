@@ -1,8 +1,9 @@
 """Pydantic request/response models for the ExecutorPlugin interface.
 
-Defined per ADR 0002 — typed request and response models for all six
+Defined per ADR 0002 — typed request and response models for all seven
 executor lifecycle methods: create_workspace, start_opencode,
-stop_opencode, restart_opencode, collect_state, cleanup_workspace.
+stop_opencode, restart_opencode, collect_state, cleanup_workspace,
+cancel_job.
 """
 
 from __future__ import annotations
