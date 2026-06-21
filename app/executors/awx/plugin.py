@@ -12,7 +12,8 @@ placeholder values such as zero UUID.
 from __future__ import annotations
 
 import logging
-from typing import Any, Set
+from collections import OrderedDict
+from typing import Any
 from uuid import UUID
 
 from app.core.secrets import redact_dict
@@ -48,6 +49,12 @@ logger = logging.getLogger(__name__)
 # Default base path on the Runner VM where workspace directories live.
 _DEFAULT_WORKSPACE_BASE_PATH = "/home/runner/workspaces"
 
+# Maximum number of workspace IDs to track in _ever_tracked_workspaces.
+# Prevents unbounded growth over the lifetime of the process.
+# Eviction from the LRU degrades gracefully — an evicted workspace is treated
+# as "never tracked" by cancel_job, which returns status="cancelled" (no-op).
+_MAX_TRACKED_WORKSPACES = 1000
+
 
 def _workspace_path(
     workspace_base_path: str,
@@ -66,17 +73,17 @@ class AWXExecutorPlugin(ExecutorPlugin):
     Per ADR 0002, each of the seven lifecycle methods maps to one of three
     AWX job templates:
 
-    ===================================== ===============================
-    Lifecycle method                      AWX job template
-    ===================================== ===============================
+    ===================================== ===============================================
+    Lifecycle method                      AWX job template / API
+    ===================================== ===============================================
     ``create_workspace``                  ``gateway-create-workspace``
     ``start_opencode``                    ``gateway-opencode-lifecycle``
     ``stop_opencode``                     ``gateway-opencode-lifecycle``
     ``restart_opencode``                  ``gateway-opencode-lifecycle``
     ``collect_state``                     ``gateway-workspace-teardown``
     ``cleanup_workspace``                 ``gateway-workspace-teardown``
-    ``cancel_job``                        TBD future surface (no AWX template yet)
-    ===================================== ===============================
+    ``cancel_job``                        AWX job cancel API (``POST /api/v2/jobs/{id}/cancel/``)
+    ===================================== ===============================================
 
     When ``gateway-opencode-lifecycle`` or ``gateway-workspace-teardown``
     is launched, an ``action`` extra_var distinguishes the operation.
@@ -121,11 +128,15 @@ class AWXExecutorPlugin(ExecutorPlugin):
         # Only accessed within async event-loop context — no locks needed.
         self._active_awx_jobs: dict[UUID, int] = {}
 
-        # Set of workspace IDs that have ever been tracked in _active_awx_jobs.
-        # Used by cancel_job to distinguish "never tracked" (no job was ever
-        # launched for this workspace) from "late cancel" (the job already
-        # completed and its tracking entry was cleaned up).
-        self._ever_tracked_workspaces: Set[UUID] = set()
+        # OrderedDict of workspace IDs that have ever been tracked in
+        # _active_awx_jobs.  Used by cancel_job to distinguish "never tracked"
+        # (no job was ever launched for this workspace) from "late cancel"
+        # (the job already completed and its tracking entry was cleaned up).
+        #
+        # Capped at _MAX_TRACKED_WORKSPACES entries using LRU eviction to
+        # prevent unbounded growth.  When the cap is reached the oldest
+        # (least recently added) entry is evicted.
+        self._ever_tracked_workspaces: OrderedDict[UUID, bool] = OrderedDict()
 
         # Mapping of Gateway job UUID → AWX job ID for persisting the
         # executor_job_id on the gateway_jobs row after a successful launch.
@@ -201,7 +212,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
                     summary.job_id,
                 )
             self._active_awx_jobs[workspace_id] = summary.job_id
-            self._ever_tracked_workspaces.add(workspace_id)
+            # Track in the LRU — evict oldest entry if at capacity.
+            if len(self._ever_tracked_workspaces) >= _MAX_TRACKED_WORKSPACES:
+                self._ever_tracked_workspaces.popitem(last=False)
+            self._ever_tracked_workspaces[workspace_id] = True
 
         try:
             result = await self._client.wait_for_job(summary.job_id)
