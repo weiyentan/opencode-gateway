@@ -61,10 +61,23 @@ by the Gateway — the ``abort_job`` endpoint invokes ``cancel_job`` as
 the first step of executor cleanup (before ``stop_opencode`` and
 ``cleanup_workspace``). The AWX executor tracks in-flight AWX job IDs
 per workspace via ``_active_awx_jobs`` and cancels them through the AWX
-API. The ``CancelJobResponse`` status can be ``"cancelled"`` (job was
-running and was cancelled), ``"no_active_job"`` (the tracked job already
-completed before the cancel arrived — late cancel), or the
-LocalExecutor returns ``"cancelled"`` unconditionally as a no-op.
+API.
+
+The ``CancelJobResponse`` status can be:
+* ``"cancelled"`` — job was running and was cancelled
+* ``"no_active_job"`` — the tracked job already completed before the
+  cancel arrived (late cancel)
+* ``"cancelled"`` — LocalExecutor returns unconditionally as a no-op
+
+**Cross-process cancellation** — The AWX executor persists AWX job IDs
+for all lifecycle steps via a ``_executor_job_ids`` mapping of Gateway
+job UUID to AWX job ID, and the API layer writes the most recent
+lifecycle AWX job ID to the ``executor_job_id`` column on the
+``gateway_jobs`` database row. When an abort request lands in a
+different process than the one that launched the lifecycle step, the
+in-memory ``_active_awx_jobs`` dict is empty; ``cancel_job`` falls back
+to the ``executor_job_id`` value from the ``CancelJobRequest`` (read
+from the database row) to cancel the correct AWX job.
 
 The remaining two future-surface methods are annotated as such in the
 source and remain required by the ABC so every executor provides a

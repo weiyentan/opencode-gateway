@@ -133,3 +133,15 @@ A runner is rejected when:
 **AWXApiClient** — Thin httpx-based client that calls the AWX REST API with a Bearer token. Uses the same pattern as `OpenCodeServeClient` with custom exception classes `AWXConnectionError`, `AWXTimeoutError`, `AWXHTTPError`, and `AWXJobError`.
 
 **AWXExecutorPlugin** — Concrete `ExecutorPlugin` implementation that maps the lifecycle methods to AWX job template launches. Receives an `AWXApiClient` instance and template IDs via dependency injection from the executor factory. Does not read env vars directly.
+
+**Lifecycle AWX Job ID Persistence** — The AWX executor tracks AWX job IDs for
+all lifecycle steps (not just `create_workspace`) via an `_executor_job_ids`
+mapping of Gateway job UUID → AWX job ID. After `start_opencode` launches
+successfully, the API layer persists this AWX job ID as `executor_job_id` on
+the `gateway_jobs` database row. The `abort_job` endpoint passes
+`gateway_job_id` to `stop_opencode` and `cleanup_workspace` as well, so
+cross-process cancellation can target the currently-active lifecycle AWX job
+even when the abort request lands in a different process than the one that
+launched it. Without this mechanism, only `create_workspace` would have its
+AWX job ID persisted, and cancellation of subsequent lifecycle jobs would
+rely solely on in-memory state that does not survive process boundaries.
