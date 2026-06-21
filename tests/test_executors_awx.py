@@ -218,9 +218,9 @@ class TestAWXExecutorPluginCreateWorkspace:
         assert "workspace_id" in err.missing_fields
         assert "workspace_path" in err.missing_fields
 
-    async def test_executor_job_id_stored_after_launch(self):
-        """The AWX job ID is recorded in _executor_job_ids after a
-        successful launch via create_workspace."""
+    async def test_executor_job_id_cleaned_up_after_completion(self):
+        """The AWX job ID is recorded in _executor_job_ids during launch
+        but cleaned up (popped) after the job completes successfully."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, job_id=42, status="successful",
                               artifacts={"workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -234,8 +234,9 @@ class TestAWXExecutorPluginCreateWorkspace:
         )
         await plugin.create_workspace(req)
 
-        # The gateway_job_id should map to the AWX job ID.
-        assert plugin._executor_job_ids.get(gw_job_id) == 42
+        # After successful completion, the entry is popped to prevent
+        # unbounded growth.
+        assert plugin._executor_job_ids.get(gw_job_id) is None
 
 
 # ── start / stop / restart ──────────────────────────────────────────────
@@ -1234,9 +1235,9 @@ class TestExecutorJobIdPersistence:
 
     GW_JOB_ID = UUID("11111111-1111-1111-1111-111111111111")
 
-    async def test_start_opencode_stores_executor_job_id(self):
-        """After a successful start_opencode launch, the gateway_job_id
-        is mapped to the AWX job ID in _executor_job_ids."""
+    async def test_start_opencode_cleans_up_executor_job_id(self):
+        """After a successful start_opencode launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(
             client,
@@ -1255,11 +1256,11 @@ class TestExecutorJobIdPersistence:
         )
         await plugin.start_opencode(req)
 
-        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
 
-    async def test_stop_opencode_stores_executor_job_id(self):
-        """After a successful stop_opencode launch, the gateway_job_id
-        is mapped to the AWX job ID in _executor_job_ids."""
+    async def test_stop_opencode_cleans_up_executor_job_id(self):
+        """After a successful stop_opencode launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, job_id=202)
         plugin = _make_plugin(client)
@@ -1271,11 +1272,11 @@ class TestExecutorJobIdPersistence:
         )
         await plugin.stop_opencode(req)
 
-        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 202
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
 
-    async def test_cleanup_workspace_stores_executor_job_id(self):
-        """After a successful cleanup_workspace launch, the gateway_job_id
-        is mapped to the AWX job ID in _executor_job_ids."""
+    async def test_cleanup_workspace_cleans_up_executor_job_id(self):
+        """After a successful cleanup_workspace launch, the _executor_job_ids
+        mapping is cleaned up (popped) to prevent unbounded growth."""
         client = AsyncMock(spec=AWXApiClient)
         _mock_launch_and_wait(client, job_id=203)
         plugin = _make_plugin(client)
@@ -1287,15 +1288,16 @@ class TestExecutorJobIdPersistence:
         )
         await plugin.cleanup_workspace(req)
 
-        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 203
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
 
     async def test_cross_process_cancel_uses_active_lifecycle_job(self):
         """Simulate a cross-process cancel scenario:
         1. Worker A launches start_opencode — AWX job 201 is stored
            in _executor_job_ids (and _active_awx_jobs).
-        2. Worker A's start_opencode completes; _active_awx_jobs is
-           cleaned up but _executor_job_ids retains the mapping.
-        3. Worker B receives the cancel — no _active_awx_jobs entry.
+        2. Worker A's start_opencode completes; both tracking dicts are
+           cleaned up.  The executor_job_id is persisted to the DB via
+           the on_awx_job_launched callback *before* wait_for_job.
+        3. Worker B receives the cancel — no in-memory tracking entries.
         4. Worker B reads executor_job_id=201 from the DB and passes
            it via CancelJobRequest.executor_job_id.
         5. The cancel targets AWX job 201 (the active lifecycle job),
@@ -1319,10 +1321,12 @@ class TestExecutorJobIdPersistence:
         )
         await plugin.start_opencode(req)
 
-        # At this point, _active_awx_jobs is cleaned up (job completed),
-        # but _executor_job_ids still has the gateway_job_id → 201 mapping.
+        # At this point, both _active_awx_jobs and _executor_job_ids
+        # are cleaned up (job completed).  The executor_job_id was
+        # already persisted to the DB by the on_awx_job_launched
+        # callback before wait_for_job began.
         assert ws_id not in plugin._active_awx_jobs
-        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) is None
 
         # Simulate Worker B: no in-memory tracking, but has executor_job_id
         # from the DB (201 — the start_opencode AWX job).

@@ -204,6 +204,47 @@ async def _check_aborted(conn: asyncpg.Connection, job_id: uuid.UUID) -> bool:
     return False
 
 
+async def _fetch_and_check_aborted(
+    conn: asyncpg.Connection, job_id: uuid.UUID,
+) -> dict | None:
+    """Fetch the current job row; return it if status is aborting/aborted.
+
+    Call this after long-awaited lifecycle methods (create_workspace,
+    start_opencode) to detect a concurrent abort. When a row is returned
+    the caller should stop progressing and return ``_job_response(row)``
+    immediately.
+    """
+    row = await _fetch_job(conn, job_id)
+    if row and row["status"] in ("aborting", "aborted"):
+        logger.warning(
+            "Job %s was %s during lifecycle step — stopping progress",
+            job_id, row["status"],
+        )
+        return row
+    return None
+
+
+def _job_response(request: Request, row: dict) -> JobResponse:
+    """Construct a JobResponse from a database row."""
+    return JobResponse(
+        id=row["id"],
+        repo_url=row["repo_url"],
+        task_summary=row["task_summary"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+        opencode_session_id=row.get("opencode_session_id"),
+        diff=row.get("diff"),
+        branch_name=row.get("branch_name"),
+        commit_sha=row.get("commit_sha"),
+        mr_url=row.get("mr_url"),
+        workflow_run_id=row.get("workflow_run_id"),
+        diff_url=str(request.url_for("get_job_diff", job_id=str(row["id"]))),
+        failure_reason=row.get("failure_reason"),
+    )
+
+
 async def get_opencode_client() -> OpenCodeClientProtocol | None:
     """Dependency that returns the OpenCode client for diff fetching.
 
@@ -531,6 +572,17 @@ async def create_job(
             ws_response = await executor.create_workspace(ws_req)
         new_workspace_id = ws_response.workspace_id
 
+        # Check for concurrent abort — if the job was aborted during
+        # create_workspace, return immediately without progressing.
+        if aborted := await _fetch_and_check_aborted(conn, job_id):
+            # Still write the workspace_id so the abort handler can find it,
+            # but don't allocate a port or start OpenCode.
+            await conn.execute(
+                "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
+                job_id, str(new_workspace_id),
+            )
+            return _job_response(request, aborted)
+
         # Store the workspace ID immediately so it is available even if
         # start_opencode fails and the job is marked "failed".
         await conn.execute(
@@ -600,6 +652,10 @@ async def create_job(
         else:
             start_response = await executor.start_opencode(start_req)
         session_id = str(start_response.session_id)
+
+        # Check for concurrent abort after start_opencode.
+        if aborted := await _fetch_and_check_aborted(conn, job_id):
+            return _job_response(request, aborted)
 
         # Store the session ID so it is available for diff retrieval
         await conn.execute(
@@ -1387,65 +1443,52 @@ async def abort_job(
 
     # Executor cleanup --- best effort, do not block the abort response
     workspace_name = row.get("workspace_name")
+    parsed_ws_id = None
     if workspace_name:
         try:
-            parsed_id = uuid.UUID(workspace_name)
+            parsed_ws_id = uuid.UUID(workspace_name)
         except (ValueError, TypeError):
-            logger.warning(
-                "Invalid workspace_name for job %s: %r", job_id, workspace_name
-            )
-        else:
-            # Parse executor_job_id from DB row for cross-process cancellation.
-            executor_job_id_raw = row.get("executor_job_id")
-            executor_job_id: int | None = None
-            if executor_job_id_raw is not None:
-                try:
-                    executor_job_id = int(executor_job_id_raw)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Invalid executor_job_id for job %s: %r",
-                        job_id,
-                        executor_job_id_raw,
-                    )
+            logger.warning("Invalid workspace_name for job %s: %r", job_id, workspace_name)
 
-            cancel_req = CancelJobRequest(
-                workspace_id=parsed_id,
-                executor_job_id=executor_job_id,
+    executor_job_id_raw = row.get("executor_job_id")
+    executor_job_id: int | None = None
+    if executor_job_id_raw is not None:
+        try:
+            executor_job_id = int(executor_job_id_raw)
+        except (ValueError, TypeError):
+            logger.warning("Invalid executor_job_id for job %s: %r", job_id, executor_job_id_raw)
+
+    # Cancel in-flight AWX job if we have any way to reach it.
+    if parsed_ws_id is not None or executor_job_id is not None:
+        cancel_req = CancelJobRequest(
+            workspace_id=parsed_ws_id,
+            executor_job_id=executor_job_id,
+        )
+        try:
+            await executor.cancel_job(cancel_req)
+        except Exception:
+            logger.exception("Failed to cancel job for workspace %s (job %s)", parsed_ws_id, job_id)
+
+    # stop_opencode and cleanup_workspace still require a known workspace.
+    if parsed_ws_id is not None:
+        try:
+            await executor.stop_opencode(
+                StopOpencodeRequest(
+                    workspace_id=parsed_ws_id,
+                    gateway_job_id=job_id,
+                )
             )
-            try:
-                await executor.cancel_job(cancel_req)
-            except Exception:
-                logger.exception(
-                    "Failed to cancel job for workspace %s (job %s)",
-                    parsed_id,
-                    job_id,
+        except Exception:
+            logger.exception("Failed to stop OpenCode Serve for job %s (workspace %s)", job_id, parsed_ws_id)
+        try:
+            await executor.cleanup_workspace(
+                CleanupWorkspaceRequest(
+                    workspace_id=parsed_ws_id,
+                    gateway_job_id=job_id,
                 )
-            try:
-                await executor.stop_opencode(
-                    StopOpencodeRequest(
-                        workspace_id=parsed_id,
-                        gateway_job_id=job_id,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to stop OpenCode Serve for job %s (workspace %s)",
-                    job_id,
-                    parsed_id,
-                )
-            try:
-                await executor.cleanup_workspace(
-                    CleanupWorkspaceRequest(
-                        workspace_id=parsed_id,
-                        gateway_job_id=job_id,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to clean up workspace for job %s (workspace %s)",
-                    job_id,
-                    parsed_id,
-                )
+            )
+        except Exception:
+            logger.exception("Failed to clean up workspace for job %s (workspace %s)", job_id, parsed_ws_id)
 
     # Record abort event
     event_id = uuid.uuid4()

@@ -188,19 +188,28 @@ class CancelJobRequest(BaseModel):
 
     *workspace_id* identifies the workspace whose AWX job should be
     cancelled.  The cancellation path prefers the in-memory tracking
-    dict (``_active_awx_jobs``) on the executor plugin instance.
+    dict (``_active_awx_jobs``) on the executor plugin instance.  May
+    be ``None`` when cancelling by ``executor_job_id`` alone (e.g. during
+    ``create_workspace`` before the workspace UUID is known).
 
     *executor_job_id* provides a fallback for cross-process cancellation:
     when no in-memory entry exists (e.g. the abort request landed in a
     different process), the caller passes the AWX job ID that was
-    persisted on the ``gateway_jobs`` row at launch time.
+    persisted on the ``gateway_jobs`` row at launch time.  Also used
+    directly when *workspace_id* is ``None`` (pre-workspace cancellation).
     """
 
-    workspace_id: UUID
+    workspace_id: UUID | None = Field(
+        default=None,
+        description="Workspace whose AWX job should be cancelled. "
+        "May be None when cancelling by executor_job_id alone "
+        "(e.g. during create_workspace before the workspace UUID is known).",
+    )
     executor_job_id: int | None = Field(
         default=None,
         description="AWX job ID to cancel when the in-memory tracking dict has no "
-        "entry for this workspace (cross-process cancellation).",
+        "entry for this workspace, or when workspace_id is None "
+        "(cross-process / pre-workspace cancellation).",
     )
 
 

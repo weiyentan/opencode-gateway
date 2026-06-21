@@ -2236,6 +2236,77 @@ class TestAbortJob:
         mock_exec.cleanup_workspace.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_abort_during_create_workspace_calls_cancel_job_by_executor_id(
+        self, mock_conn,
+    ):
+        """Abort arriving while create_workspace is in-flight cancels the
+        AWX job via executor_job_id even though no workspace_name exists yet.
+        stop_opencode and cleanup_workspace are NOT called because there
+        is no known workspace."""
+        from app.executors.models import CancelJobRequest
+        from app.opencode.protocol import SessionAbortResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-executorid-abort"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "In-flight create_workspace",
+            status="provisioning_workspace", opencode_session_id=session_id,
+            workspace_name=None,
+        )
+        # Simulate that executor_job_id was persisted during launch.
+        row["executor_job_id"] = "99999"
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "aborted"
+
+        # cancel_job must be called even without workspace_id because
+        # executor_job_id is available.
+        mock_exec.cancel_job.assert_called_once()
+        cancel_call_arg = mock_exec.cancel_job.call_args[0][0]
+        assert isinstance(cancel_call_arg, CancelJobRequest)
+        assert cancel_call_arg.workspace_id is None
+        assert cancel_call_arg.executor_job_id == 99999
+
+        # stop_opencode and cleanup_workspace still require a workspace.
+        mock_exec.stop_opencode.assert_not_called()
+        mock_exec.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_abort_abort_session_not_called_when_no_session(self, mock_conn):
         """abort_session() is NOT called when the job has no opencode_session_id."""
         job_id = uuid.uuid4()

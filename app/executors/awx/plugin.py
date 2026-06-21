@@ -245,6 +245,8 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 and self._active_awx_jobs.get(workspace_id) == summary.job_id
             ):
                 self._active_awx_jobs.pop(workspace_id)
+            if gateway_job_id is not None:
+                self._executor_job_ids.pop(gateway_job_id, None)
             raise
 
         # Clean up tracking on successful completion.
@@ -256,6 +258,8 @@ class AWXExecutorPlugin(ExecutorPlugin):
             and self._active_awx_jobs.get(workspace_id) == summary.job_id
         ):
             self._active_awx_jobs.pop(workspace_id)
+        if gateway_job_id is not None:
+            self._executor_job_ids.pop(gateway_job_id, None)
 
         logger.info(
             "AWX job %d completed with status=%s",
@@ -571,6 +575,12 @@ class AWXExecutorPlugin(ExecutorPlugin):
         :attr:`_active_awx_jobs`. If a live AWX job is tracked,
         calls :meth:`AWXApiClient.cancel_job` to cancel it.
 
+        When *workspace_id* is ``None``, the in-memory tracking dict is
+        skipped and the method falls through to the ``executor_job_id``
+        fallback immediately.  This path is used for cancelling in-flight
+        lifecycle steps like ``create_workspace`` where the workspace UUID
+        is not yet known.
+
         When the in-memory lookup misses (e.g. the abort request landed
         in a different process), falls back to *executor_job_id* from
         the request — the AWX job ID that was persisted on the
@@ -594,9 +604,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
             AWXHTTPError: If the server returns a non-2xx status.
             AWXTimeoutError: If the cancel request times out.
         """
-        logger.info("cancel_job: workspace=%s", request.workspace_id)
+        logger.info("cancel_job: workspace=%s executor_job_id=%s",
+                    request.workspace_id, request.executor_job_id)
 
-        awx_job_id = self._active_awx_jobs.get(request.workspace_id)
+        awx_job_id = self._active_awx_jobs.get(request.workspace_id) if request.workspace_id else None
         if awx_job_id is not None:
             # Active in-flight job found — cancel it via the AWX API.
             # Pop the mapping only after a successful cancel so that
@@ -611,7 +622,8 @@ class AWXExecutorPlugin(ExecutorPlugin):
             return CancelJobResponse(status="cancelled")
 
         # In-memory miss — fall back to executor_job_id from request
-        # (cross-process / multi-worker cancellation).
+        # (cross-process / multi-worker cancellation, or pre-workspace
+        # cancellation where workspace_id is None).
         if request.executor_job_id is not None:
             logger.info(
                 "cancel_job: using executor_job_id %d from request "
@@ -629,7 +641,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             return CancelJobResponse(status="cancelled")
 
         # No active job tracked for this workspace.
-        if request.workspace_id in self._ever_tracked_workspaces:
+        if request.workspace_id and request.workspace_id in self._ever_tracked_workspaces:
             # Was tracked before but the job already completed.
             logger.warning(
                 "cancel_job: workspace %s had an active AWX job that already "
@@ -638,7 +650,8 @@ class AWXExecutorPlugin(ExecutorPlugin):
             )
             return CancelJobResponse(status="no_active_job")
 
-        # Workspace was never tracked at all.
+        # Workspace was never tracked at all (or workspace_id is None
+        # and no executor_job_id was provided — trivially cancelled).
         logger.warning(
             "cancel_job: no AWX job was ever tracked for workspace %s",
             request.workspace_id,

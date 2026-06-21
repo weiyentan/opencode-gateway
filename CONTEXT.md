@@ -136,7 +136,11 @@ A runner is rejected when:
 
 **Lifecycle AWX Job ID Persistence** — The AWX executor tracks AWX job IDs for
 all lifecycle steps (not just `create_workspace`) via an `_executor_job_ids`
-mapping of Gateway job UUID → AWX job ID. To make this ID available for
+mapping of Gateway job UUID → AWX job ID.  This mapping is populated
+immediately after `launch_job_template()` and cleaned up (popped) on both
+successful completion and failure — preventing unbounded growth over the
+lifetime of the process.
+To make this ID available for
 cross-process cancellation while the job is still in-flight, the executor
 accepts an `on_awx_job_launched` callback on its lifecycle methods. The
 API layer passes a callback that writes the AWX job ID as `executor_job_id`

@@ -415,9 +415,11 @@ class TestCancelJobModels:
         req = CancelJobRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         assert str(req.workspace_id) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
-    def test_request_missing_workspace_id_raises(self):
-        with pytest.raises(ValidationError):
-            CancelJobRequest()
+    async def test_request_missing_workspace_id_defaults_to_none(self):
+        """CancelJobRequest.workspace_id defaults to None when not provided."""
+        req = CancelJobRequest()
+        assert req.workspace_id is None
+        assert req.executor_job_id is None
 
     def test_request_rejects_non_uuid(self):
         """CancelJobRequest should reject non-UUID workspace_id values."""
