@@ -1037,7 +1037,7 @@ class TestAWXExecutorPluginCancelJob:
 
         # Simulate an active tracked job.
         plugin._active_awx_jobs[self.WS_ID] = 42
-        plugin._ever_tracked_workspaces.add(self.WS_ID)
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
 
         req = CancelJobRequest(workspace_id=self.WS_ID)
         resp = await plugin.cancel_job(req)
@@ -1068,7 +1068,7 @@ class TestAWXExecutorPluginCancelJob:
         plugin = _make_plugin(client)
 
         # Simulate a workspace that was tracked but the job finished.
-        plugin._ever_tracked_workspaces.add(self.WS_ID)
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
 
         req = CancelJobRequest(workspace_id=self.WS_ID)
         resp = await plugin.cancel_job(req)
@@ -1084,7 +1084,7 @@ class TestAWXExecutorPluginCancelJob:
         plugin = _make_plugin(client)
 
         plugin._active_awx_jobs[self.WS_ID] = 42
-        plugin._ever_tracked_workspaces.add(self.WS_ID)
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
 
         req = CancelJobRequest(workspace_id=self.WS_ID)
         with pytest.raises(AWXHTTPError, match="Server error"):
@@ -1099,7 +1099,7 @@ class TestAWXExecutorPluginCancelJob:
         plugin = _make_plugin(client)
 
         plugin._active_awx_jobs[self.WS_ID] = 99
-        plugin._ever_tracked_workspaces.add(self.WS_ID)
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
 
         req = CancelJobRequest(workspace_id=self.WS_ID)
         with pytest.raises(AWXConnectionError, match="refused"):
