@@ -116,14 +116,31 @@ class AWXExecutorPlugin(ExecutorPlugin):
         self._workspace_teardown_template_id = workspace_teardown_template_id
         self._workspace_base_path = workspace_base_path.rstrip("/")
 
+        # Mapping of workspace UUID → AWX job ID for in-flight jobs.
+        # Used by cancel_job to find the active AWX job for a workspace.
+        # Only accessed within async event-loop context — no locks needed.
+        self._active_awx_jobs: dict[UUID, int] = {}
+
     # ── Internal helpers ────────────────────────────────────────────────
 
     async def _launch_and_wait(
         self,
         template_id: int,
         extra_vars: dict[str, Any],
+        workspace_id: UUID | None = None,
     ) -> AWXJobResult:
         """Launch a job template and wait for it to complete.
+
+        When *workspace_id* is provided, the AWX job is tracked in
+        :attr:`_active_awx_jobs` so that :meth:`cancel_job` can later
+        look up the in-flight job for a given workspace.
+
+        If the workspace already has a tracked job a warning is logged
+        and the mapping is replaced with the new AWX job ID.
+
+        The tracking entry is removed (popped) when the job reaches a
+        terminal state — whether via successful completion, job failure,
+        or timeout.
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -149,7 +166,31 @@ class AWXExecutorPlugin(ExecutorPlugin):
             summary.status,
         )
 
-        result = await self._client.wait_for_job(summary.job_id)
+        # Track the in-flight job for cancellation lookups.
+        if workspace_id is not None:
+            if workspace_id in self._active_awx_jobs:
+                old_job_id = self._active_awx_jobs[workspace_id]
+                logger.warning(
+                    "Workspace %s already has active AWX job %d; "
+                    "replacing with %d",
+                    workspace_id,
+                    old_job_id,
+                    summary.job_id,
+                )
+            self._active_awx_jobs[workspace_id] = summary.job_id
+
+        try:
+            result = await self._client.wait_for_job(summary.job_id)
+        except Exception:
+            # Clean up tracking on any failure (timeout, job error, etc.)
+            if workspace_id is not None:
+                self._active_awx_jobs.pop(workspace_id, None)
+            raise
+
+        # Clean up tracking on successful completion.
+        if workspace_id is not None:
+            self._active_awx_jobs.pop(workspace_id, None)
+
         logger.info(
             "AWX job %d completed with status=%s",
             result.job_id,
@@ -176,6 +217,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._create_workspace_template_id,
                 extra_vars,
+                # workspace_id is unknown until the AWX job returns artifacts.
             )
         except AWXClientError:
             logger.exception("create_workspace failed for repo=%s", request.repo_url)
@@ -227,6 +269,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -278,6 +321,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -308,6 +352,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._opencode_lifecycle_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -338,6 +383,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._workspace_teardown_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
@@ -403,6 +449,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
             result = await self._launch_and_wait(
                 self._workspace_teardown_template_id,
                 extra_vars,
+                workspace_id=request.workspace_id,
             )
         except AWXClientError:
             logger.exception(
