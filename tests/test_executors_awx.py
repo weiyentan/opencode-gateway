@@ -217,6 +217,25 @@ class TestAWXExecutorPluginCreateWorkspace:
         assert "workspace_id" in err.missing_fields
         assert "workspace_path" in err.missing_fields
 
+    async def test_executor_job_id_stored_after_launch(self):
+        """The AWX job ID is recorded in _executor_job_ids after a
+        successful launch via create_workspace."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=42, status="successful",
+                              artifacts={"workspace_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                                         "workspace_path": "/home/runner/workspaces/ws1"})
+        plugin = _make_plugin(client)
+
+        gw_job_id = UUID("00000000-0000-0000-0000-000000000001")
+        req = CreateWorkspaceRequest(
+            repo_url="https://example.com/repo.git",
+            job_id=gw_job_id,
+        )
+        await plugin.create_workspace(req)
+
+        # The gateway_job_id should map to the AWX job ID.
+        assert plugin._executor_job_ids.get(gw_job_id) == 42
+
 
 # ── start / stop / restart ──────────────────────────────────────────────
 

@@ -22,6 +22,7 @@ from app.core.ports import PortExhaustedError, allocate_and_assign_port
 from app.db.session import DatabasePool, get_session
 from app.executors import ExecutorPlugin
 from app.executors.awx.exceptions import AWXArtifactError
+from app.executors.awx.plugin import AWXExecutorPlugin
 from app.executors.factory import get_executor
 from app.executors.models import (
     CancelJobRequest,
@@ -496,6 +497,16 @@ async def create_job(
             job_id,
             str(new_workspace_id),
         )
+
+        # Persist the AWX job ID on the gateway job row.
+        if isinstance(executor, AWXExecutorPlugin):
+            awx_job_id = executor._executor_job_ids.get(job_id)
+            if awx_job_id is not None:
+                await conn.execute(
+                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
+                    job_id,
+                    str(awx_job_id),
+                )
 
         # 4. Allocate a port and persist it atomically against the workspace (ADR 0003).
         # allocate_and_assign_port acquires an advisory lock, selects a free port,
