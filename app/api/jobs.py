@@ -169,7 +169,7 @@ class JobEvent(BaseModel):
 _FETCH_COLS = (
     "id, repo_url, task_summary, status, created_at, updated_at, completed_at, "
     "opencode_session_id, diff, workspace_name, branch_name, commit_sha, mr_url, "
-    "workflow_run_id, failure_reason"
+    "workflow_run_id, failure_reason, executor_job_id"
 )
 
 
@@ -1331,10 +1331,25 @@ async def abort_job(
                 "Invalid workspace_name for job %s: %r", job_id, workspace_name
             )
         else:
+            # Parse executor_job_id from DB row for cross-process cancellation.
+            executor_job_id_raw = row.get("executor_job_id")
+            executor_job_id: int | None = None
+            if executor_job_id_raw is not None:
+                try:
+                    executor_job_id = int(executor_job_id_raw)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid executor_job_id for job %s: %r",
+                        job_id,
+                        executor_job_id_raw,
+                    )
+
+            cancel_req = CancelJobRequest(
+                workspace_id=parsed_id,
+                executor_job_id=executor_job_id,
+            )
             try:
-                await executor.cancel_job(
-                    CancelJobRequest(workspace_id=parsed_id)
-                )
+                await executor.cancel_job(cancel_req)
             except Exception:
                 logger.exception(
                     "Failed to cancel job for workspace %s (job %s)",

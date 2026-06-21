@@ -1123,3 +1123,46 @@ class TestAWXExecutorPluginCancelJob:
         req = CancelJobRequest(workspace_id=self.WS_ID)
         with pytest.raises(AWXConnectionError, match="refused"):
             await plugin.cancel_job(req)
+
+    async def test_cancel_job_cross_process_success(self):
+        """cancel_job falls back to executor_job_id from request when
+        _active_awx_jobs has no entry for the workspace (cross-process)."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=42, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # No in-memory entry — simulate different process.
+        req = CancelJobRequest(
+            workspace_id=self.WS_ID,
+            executor_job_id=42,
+        )
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(42)
+
+    async def test_cancel_job_cross_process_with_ever_tracked(self):
+        """executor_job_id from request takes priority over the
+        'no_active_job' path when the workspace was previously tracked."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=55, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # Workspace was tracked before but no active job now.
+        plugin._ever_tracked_workspaces.add(self.WS_ID)
+
+        # executor_job_id should still be used despite ever_tracked.
+        req = CancelJobRequest(
+            workspace_id=self.WS_ID,
+            executor_job_id=55,
+        )
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(55)

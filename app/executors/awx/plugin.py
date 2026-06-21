@@ -491,15 +491,23 @@ class AWXExecutorPlugin(ExecutorPlugin):
         :attr:`_active_awx_jobs`. If a live AWX job is tracked,
         calls :meth:`AWXApiClient.cancel_job` to cancel it.
 
-        If the workspace was **never** tracked (no job was ever launched
-        for it via a lifecycle method that supplies a workspace_id),
-        logs a warning and returns ``CancelJobResponse(status="cancelled")``
-        — there is nothing to cancel so the operation is trivially done.
+        When the in-memory lookup misses (e.g. the abort request landed
+        in a different process), falls back to *executor_job_id* from
+        the request — the AWX job ID that was persisted on the
+        ``gateway_jobs`` row at launch time.
 
-        If the workspace **was** tracked but the tracking entry has
-        already been cleaned up (the job reached terminal status before
-        cancel_job was called), logs a warning and returns
-        ``CancelJobResponse(status="no_active_job")``.
+        If neither an in-memory entry nor a request-level
+        ``executor_job_id`` is available:
+
+        * If the workspace **was** tracked but the tracking entry has
+          already been cleaned up (the job reached terminal status before
+          cancel_job was called), logs a warning and returns
+          ``CancelJobResponse(status="no_active_job")``.
+        * If the workspace was **never** tracked (no job was ever
+          launched for it via a lifecycle method that supplies a
+          workspace_id), logs a warning and returns
+          ``CancelJobResponse(status="cancelled")`` — there is nothing
+          to cancel so the operation is trivially done.
 
         Raises:
             AWXConnectionError: If the AWX instance is unreachable.
@@ -515,6 +523,24 @@ class AWXExecutorPlugin(ExecutorPlugin):
             logger.info(
                 "cancel_job: AWX job %d cancelled for workspace %s",
                 awx_job_id,
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="cancelled")
+
+        # In-memory miss — fall back to executor_job_id from request
+        # (cross-process / multi-worker cancellation).
+        if request.executor_job_id is not None:
+            logger.info(
+                "cancel_job: using executor_job_id %d from request "
+                "for workspace %s (in-memory miss)",
+                request.executor_job_id,
+                request.workspace_id,
+            )
+            await self._client.cancel_job(request.executor_job_id)
+            logger.info(
+                "cancel_job: AWX job %d cancelled for workspace %s "
+                "(via executor_job_id fallback)",
+                request.executor_job_id,
                 request.workspace_id,
             )
             return CancelJobResponse(status="cancelled")
