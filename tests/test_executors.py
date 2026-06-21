@@ -554,6 +554,24 @@ class TestLocalExecutor:
         resp = await executor.collect_state(req)
         assert resp.workspace_id == req.workspace_id
 
+    async def test_cancel_job_returns_cancelled(self):
+        """cancel_job is a no-op that returns status='cancelled'."""
+        executor = LocalExecutor()
+        req = CancelJobRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        resp = await executor.cancel_job(req)
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+
+    async def test_cancel_job_no_side_effects(self):
+        """cancel_job does not mutate any executor state."""
+        executor = LocalExecutor()
+        req = CancelJobRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        # Snapshot initial state
+        before = dict(executor.__dict__)
+        await executor.cancel_job(req)
+        # State must be identical after the call
+        assert dict(executor.__dict__) == before
+
 
 # ---------------------------------------------------------------------------
 # Plugin loader / factory tests
