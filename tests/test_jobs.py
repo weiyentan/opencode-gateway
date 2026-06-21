@@ -556,8 +556,281 @@ class TestJobDispatch:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  AWX Port Mismatch Validation (issue #162)
+#  Abort-Race Guard (issue #184)
 # ══════════════════════════════════════════════════════════════════════════
+
+
+class TestAbortRaceGuard:
+    """Verify that exception handlers in create_job do NOT overwrite an
+    already-aborted job status with ``failed`` (abort-race guard).
+
+    The race: a concurrent ``POST /jobs/{id}/abort`` sets the gateway_jobs
+    status to ``aborted`` while the create_job failure handler is about to
+    write ``failed``.  The guard re-reads the status *before* writing
+    ``failed`` and skips the update when the status is ``aborting`` or
+    ``aborted``.
+
+    Each test injects a simulated concurrent abort by making the mock
+    ``_fetchrow`` return ``aborted`` for gateway_jobs queries once the
+    executor raises an exception.
+    """
+
+    @pytest.mark.asyncio
+    async def test_abort_race_artifact_error_does_not_overwrite(self, mock_conn):
+        """AWXArtifactError handler skips 'failed' write when status is already
+        'aborted'."""
+        from app.executors.awx.exceptions import AWXArtifactError
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Abort race artifact",
+            status="pending",
+        )
+
+        executed_failed_update = False
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                # Simulate concurrent abort: status is already aborted
+                row_data["status"] = "aborted"
+                return mock_row(row_data)
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            return None
+
+        async def _execute(sql, *args):
+            nonlocal executed_failed_update
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                executed_failed_update = True
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # Executor raises AWXArtifactError (e.g. workspace creation returns
+        # invalid artifacts) — this would normally trigger the failed write.
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=AWXArtifactError(
+                "artifacts missing",
+                template_name="gateway-create-workspace",
+                missing_fields=["workspace_id", "workspace_path"],
+            )
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Abort race artifact error",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        # The guard should have prevented the overwrite — status stays aborted
+        assert data["status"] == "aborted", (
+            f"Expected status 'aborted', got '{data['status']}'. "
+            "The abort-race guard should prevent the failed overwrite."
+        )
+        assert not executed_failed_update, (
+            "The 'failed' status update should NOT have been executed "
+            "when the job was already aborted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_abort_race_generic_exception_does_not_overwrite(self, mock_conn):
+        """Generic Exception handler skips 'failed' write when status is already
+        'aborted'."""
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Abort race generic",
+            status="pending",
+        )
+
+        executed_failed_update = False
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                row_data["status"] = "aborted"
+                return mock_row(row_data)
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            return None
+
+        async def _execute(sql, *args):
+            nonlocal executed_failed_update
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                executed_failed_update = True
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # Executor raises a generic RuntimeError
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=RuntimeError("Something went terribly wrong")
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Abort race generic error",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "aborted", (
+            f"Expected status 'aborted', got '{data['status']}'"
+        )
+        assert not executed_failed_update
+
+    @pytest.mark.asyncio
+    async def test_abort_race_port_mismatch_does_not_overwrite(self, mock_conn):
+        """PortMismatchError handler skips 'failed' write when status is already
+        'aborted'."""
+        from app.executors.models import (
+            CreateWorkspaceResponse,
+            StartOpencodeResponse,
+        )
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Abort race port mismatch",
+            status="pending",
+        )
+
+        started_opencode = False
+        executed_failed_update = False
+
+        async def _fetchrow(sql, *args):
+            nonlocal started_opencode
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                if started_opencode:
+                    # After start_opencode was called, simulate concurrent abort
+                    return mock_row({**row_data, "status": "aborted"})
+                return mock_row(row_data)
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            return None
+
+        async def _execute(sql, *args):
+            nonlocal executed_failed_update, started_opencode
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+                started_opencode = True
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                executed_failed_update = True
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        executor = AsyncMock()
+        executor.create_workspace = AsyncMock(
+            return_value=CreateWorkspaceResponse(
+                workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+        )
+        executor.start_opencode = AsyncMock(
+            return_value=StartOpencodeResponse(
+                session_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+                status="running",
+                port=9999,  # Different from allocated 10000 → PortMismatchError
+            )
+        )
+        executor.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Abort race port mismatch",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "aborted", (
+            f"Expected status 'aborted', got '{data['status']}'"
+        )
+        assert not executed_failed_update
+
+    @pytest.mark.asyncio
+    async def test_abort_race_does_not_affect_normal_failure(self, mock_conn):
+        """Normal failures (no concurrent abort) still write 'failed' as expected."""
+        from app.executors.awx.exceptions import AWXArtifactError
+
+        job_id = uuid.uuid4()
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Normal failure",
+            status="pending",
+        )
+
+        executed_failed_update = False
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper() and "gateway_jobs" in sql:
+                # No concurrent abort — status stays as set by _execute
+                return mock_row(row_data)
+            if "FROM runners WHERE id" in sql:
+                return mock_row({"runner_id": "test-runner"})
+            return None
+
+        async def _execute(sql, *args):
+            nonlocal executed_failed_update
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'failed'" in sql:
+                executed_failed_update = True
+                row_data["status"] = "failed"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        failing_executor = AsyncMock()
+        failing_executor.create_workspace = AsyncMock(
+            side_effect=AWXArtifactError(
+                "artifacts missing",
+                template_name="gateway-create-workspace",
+            )
+        )
+
+        client = create_client(mock_conn, mock_executor=failing_executor)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Normal failure test",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "failed"
+        assert executed_failed_update
 
 
 class TestPortMismatch:
