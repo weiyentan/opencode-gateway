@@ -1008,8 +1008,8 @@ class TestCancelJob:
         assert resp.status == "no_active_job"
 
     @pytest.mark.asyncio
-    async def test_cancel_job_http_error_propagates(self) -> None:
-        """HTTP error from the cancel endpoint propagates."""
+    async def test_cancel_job_http_error_preserves_mapping(self) -> None:
+        """HTTP error from the cancel endpoint preserves the mapping for retry."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             if "/cancel/" in str(request.url):
@@ -1023,3 +1023,6 @@ class TestCancelJob:
         req = CancelJobRequest(workspace_id=self.WS_ID)
         with pytest.raises(AWXHTTPError, match="500"):
             await plugin.cancel_job(req)
+
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 42

@@ -493,10 +493,13 @@ class AWXExecutorPlugin(ExecutorPlugin):
         """
         logger.info("cancel_job: workspace=%s", request.workspace_id)
 
-        awx_job_id = self._active_awx_jobs.pop(request.workspace_id, None)
+        awx_job_id = self._active_awx_jobs.get(request.workspace_id)
         if awx_job_id is not None:
             # Active in-flight job found — cancel it via the AWX API.
+            # Pop the mapping only after a successful cancel so that
+            # transient API failures don't lose the tracked AWX job ID.
             await self._client.cancel_job(awx_job_id)
+            self._active_awx_jobs.pop(request.workspace_id, None)
             logger.info(
                 "cancel_job: AWX job %d cancelled for workspace %s",
                 awx_job_id,

@@ -1077,8 +1077,8 @@ class TestAWXExecutorPluginCancelJob:
         assert resp.status == "no_active_job"
         client.cancel_job.assert_not_awaited()
 
-    async def test_cancel_job_api_failure_propagates(self):
-        """When client.cancel_job raises, the exception propagates."""
+    async def test_cancel_job_api_failure_preserves_mapping(self):
+        """When client.cancel_job raises, the mapping is preserved for retry."""
         client = AsyncMock(spec=AWXApiClient)
         client.cancel_job.side_effect = AWXHTTPError("Server error", status_code=500)
         plugin = _make_plugin(client)
@@ -1091,9 +1091,11 @@ class TestAWXExecutorPluginCancelJob:
             await plugin.cancel_job(req)
 
         client.cancel_job.assert_awaited_once_with(42)
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 42
 
-    async def test_cancel_job_connection_error_propagates(self):
-        """AWXConnectionError from cancel_job propagates."""
+    async def test_cancel_job_connection_error_preserves_mapping(self):
+        """AWXConnectionError from cancel_job preserves the mapping for retry."""
         client = AsyncMock(spec=AWXApiClient)
         client.cancel_job.side_effect = AWXConnectionError("Connection refused")
         plugin = _make_plugin(client)
@@ -1104,3 +1106,6 @@ class TestAWXExecutorPluginCancelJob:
         req = CancelJobRequest(workspace_id=self.WS_ID)
         with pytest.raises(AWXConnectionError, match="refused"):
             await plugin.cancel_job(req)
+
+        # Mapping must be preserved so a retry can still cancel the AWX job.
+        assert plugin._active_awx_jobs.get(self.WS_ID) == 99
