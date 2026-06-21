@@ -30,13 +30,13 @@ from app.executors.models import (
 class ExecutorPlugin(ABC):
     """Abstract base class for executor plugins.
 
-    Per ADR 0002, the executor exposes a six-method async lifecycle
+    Per ADR 0002, the executor exposes a seven-method async lifecycle
     interface.  Each method accepts and returns typed Pydantic models so
     the Gateway never needs to know backend-specific details.
 
     .. rubric:: Current active surface
 
-    The Gateway currently calls four of the six lifecycle methods at
+    The Gateway currently calls four of the seven lifecycle methods at
     runtime:
 
     * :meth:`create_workspace` — provision a workspace directory
@@ -46,13 +46,14 @@ class ExecutorPlugin(ABC):
 
     .. rubric:: Intentional future surface
 
-    The following two methods are part of the designed six-method
+    The following three methods are part of the designed seven-method
     lifecycle (ADR 0002) but are not yet invoked by the Gateway at
     runtime.  They exist so that concrete executors can provide them
     uniformly when the Gateway grows call sites that need them:
 
     * :meth:`restart_opencode` — restart the OpenCode Serve process
     * :meth:`collect_state`    — collect workspace / service state
+    * :meth:`cancel_job`       — cancel an in-flight executor job
     """
 
     name: str
