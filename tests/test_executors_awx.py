@@ -1018,6 +1018,56 @@ class TestAWXActiveJobTracking:
         # No tracking entries should have been created.
         assert plugin._active_awx_jobs == {}
 
+    async def test_tracking_does_not_pop_mismatched_job_id_on_success(self):
+        """When the stored job ID differs from the completed job's ID
+        on the success path (e.g. a cleanup job was launched for the
+        same workspace while the original job completed), the old waiter
+        must not pop the new entry."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=100, status="pending"
+        )
+
+        # Simulate: another job (ID 200) replaces the tracking entry
+        # while wait_for_job is in-flight (or after it returns but
+        # before the pop).
+        async def _wait_and_replace(job_id):
+            plugin._active_awx_jobs[self.WS_ID] = 200
+            return AWXJobResult(job_id=100, status="successful", artifacts={})
+
+        client.wait_for_job.side_effect = _wait_and_replace
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        await plugin.stop_opencode(req)
+
+        # The waiter for job 100 should NOT have removed job 200's
+        # tracking entry (stored 200 != summary.job_id 100).
+        assert plugin._active_awx_jobs == {self.WS_ID: 200}
+
+    async def test_tracking_does_not_pop_mismatched_job_id_on_failure(self):
+        """Same as above but when wait_for_job raises — the except
+        branch's pop must also be conditional."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=77, status="pending"
+        )
+
+        async def _wait_and_replace(job_id):
+            plugin._active_awx_jobs[self.WS_ID] = 200
+            raise AWXJobError("boom", job_id=77)
+
+        client.wait_for_job.side_effect = _wait_and_replace
+        plugin = _make_plugin(client)
+
+        req = StopOpencodeRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXJobError):
+            await plugin.stop_opencode(req)
+
+        # The waiter for job 77 should NOT have removed job 200's
+        # tracking entry (stored 200 != summary.job_id 77).
+        assert plugin._active_awx_jobs == {self.WS_ID: 200}
+
 
 # ── Cancel job ──────────────────────────────────────────────────────────
 

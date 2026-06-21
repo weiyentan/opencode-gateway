@@ -146,7 +146,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
 
         The tracking entry is removed (popped) when the job reaches a
         terminal state — whether via successful completion, job failure,
-        or timeout.
+        or timeout — **only** if the stored job ID still matches
+        ``summary.job_id``.  This prevents a stale waiter from deleting
+        the tracking entry of a concurrently launched job for the same
+        workspace (e.g. cleanup after cancel).
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -189,14 +192,26 @@ class AWXExecutorPlugin(ExecutorPlugin):
         try:
             result = await self._client.wait_for_job(summary.job_id)
         except Exception:
-            # Clean up tracking on any failure (timeout, job error, etc.)
-            if workspace_id is not None:
-                self._active_awx_jobs.pop(workspace_id, None)
+            # Clean up tracking on any failure (timeout, job error, etc.).
+            # Only pop if the stored job ID still matches — otherwise a
+            # concurrently launched job (e.g. cleanup) may have replaced
+            # the tracking entry for this workspace.
+            if (
+                workspace_id is not None
+                and self._active_awx_jobs.get(workspace_id) == summary.job_id
+            ):
+                self._active_awx_jobs.pop(workspace_id)
             raise
 
         # Clean up tracking on successful completion.
-        if workspace_id is not None:
-            self._active_awx_jobs.pop(workspace_id, None)
+        # Only pop if the stored job ID still matches — otherwise a
+        # concurrently launched job (e.g. cleanup) may have replaced
+        # the tracking entry for this workspace.
+        if (
+            workspace_id is not None
+            and self._active_awx_jobs.get(workspace_id) == summary.job_id
+        ):
+            self._active_awx_jobs.pop(workspace_id)
 
         logger.info(
             "AWX job %d completed with status=%s",
