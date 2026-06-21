@@ -2307,6 +2307,128 @@ class TestAbortJob:
         mock_exec.cleanup_workspace.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_create_job_cleans_up_workspace_when_abort_arrives_during_create_workspace(
+        self, mock_conn,
+    ):
+        """When create_workspace completes but the job was aborted
+        concurrently, create_job stores workspace_name and calls
+        cleanup_workspace before returning — no port allocation, no
+        start_opencode, no running transition."""
+        from app.executors.models import (
+            CleanupWorkspaceRequest,
+            CreateWorkspaceResponse,
+        )
+
+        job_id = uuid.uuid4()
+        workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+        row_data = make_job_row(
+            job_id, "https://github.com/org/repo", "Abort during create",
+            status="provisioning_workspace",
+        )
+
+        # Track execute calls for later assertions
+        execute_calls: list[tuple] = []
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                if "gateway_jobs" in sql:
+                    return mock_row(row_data)
+                return None
+            return None
+
+        async def _execute(sql, *args):
+            execute_calls.append((sql, args))
+            if "UPDATE gateway_jobs SET status = 'provisioning_workspace'" in sql:
+                row_data["status"] = "provisioning_workspace"
+            elif "UPDATE gateway_jobs SET status = 'starting_opencode'" in sql:
+                row_data["status"] = "starting_opencode"
+            elif "UPDATE gateway_jobs SET status = 'running'" in sql:
+                row_data["status"] = "running"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        # Executor mock: create_workspace succeeds but simulates
+        # a concurrent abort by flipping the row status to aborting.
+        mock_exec = AsyncMock()
+
+        async def _create_workspace_side_effect(*args, **kwargs):
+            row_data["status"] = "aborting"
+            return CreateWorkspaceResponse(
+                workspace_id=workspace_id,
+                workspace_path="/tmp/opencode/ws",
+                status="ready",
+            )
+
+        mock_exec.create_workspace = AsyncMock(
+            side_effect=_create_workspace_side_effect,
+        )
+        mock_exec.start_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = create_client(mock_conn, mock_executor=mock_exec)
+
+        async with client as c:
+            response = await c.post(
+                "/jobs",
+                json={
+                    "repo_url": "https://github.com/org/repo",
+                    "task_summary": "Abort during create",
+                },
+            )
+
+        assert response.status_code == 201
+        data = response.json()["data"]
+        assert data["status"] == "aborting"
+
+        # create_workspace was called
+        mock_exec.create_workspace.assert_called_once()
+
+        # cleanup_workspace was called with the correct workspace_id
+        mock_exec.cleanup_workspace.assert_called_once()
+        cleanup_call_arg = mock_exec.cleanup_workspace.call_args[0][0]
+        assert isinstance(cleanup_call_arg, CleanupWorkspaceRequest)
+        assert cleanup_call_arg.workspace_id == workspace_id
+        # gateway_job_id is generated internally by create_job (uuid.uuid4()),
+        # so we verify it's a valid UUID rather than matching the test's job_id.
+        assert cleanup_call_arg.gateway_job_id is not None
+        assert isinstance(cleanup_call_arg.gateway_job_id, uuid.UUID)
+
+        # start_opencode was NOT called
+        mock_exec.start_opencode.assert_not_called()
+
+        # Verify workspace_name was persisted
+        workspace_name_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "workspace_name" in sql
+        ]
+        assert len(workspace_name_updates) >= 1, (
+            "workspace_name should have been persisted in the abort branch"
+        )
+
+        # Verify no port allocation SQL was executed (allocate_and_assign_port
+        # queries the workspaces table and uses advisory locks)
+        port_allocation_sql = [
+            sql for sql, _args in execute_calls
+            if "pg_advisory" in sql or "allocate" in sql.lower()
+        ]
+        assert len(port_allocation_sql) == 0, (
+            f"Port allocation should not happen for aborted job, "
+            f"but found: {port_allocation_sql}"
+        )
+
+        # Verify no running transition
+        running_updates = [
+            (sql, args) for sql, args in execute_calls
+            if "running" in sql and "UPDATE gateway_jobs" in sql
+        ]
+        assert len(running_updates) == 0, (
+            f"Job should not transition to running when aborted, "
+            f"but found: {running_updates}"
+        )
+
+    @pytest.mark.asyncio
     async def test_abort_abort_session_not_called_when_no_session(self, mock_conn):
         """abort_session() is NOT called when the job has no opencode_session_id."""
         job_id = uuid.uuid4()

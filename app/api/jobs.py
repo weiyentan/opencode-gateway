@@ -575,13 +575,35 @@ async def create_job(
         # Check for concurrent abort — if the job was aborted during
         # create_workspace, return immediately without progressing.
         if aborted := await _fetch_and_check_aborted(conn, job_id):
-            # Still write the workspace_id so the abort handler can find it,
-            # but don't allocate a port or start OpenCode.
+            # Persist workspace_name so it's available for reference / cleanup
+            # even though the job won't progress to running.
             await conn.execute(
                 "UPDATE gateway_jobs SET workspace_name = $2 WHERE id = $1",
                 job_id, str(new_workspace_id),
             )
-            return _job_response(request, aborted)
+
+            # Clean up the newly-known workspace best-effort.
+            try:
+                await _set_workspace_cleanup_after(
+                    conn,
+                    new_workspace_id,
+                    settings.cleanup_failure_retention_hours,
+                )
+                await executor.cleanup_workspace(
+                    CleanupWorkspaceRequest(
+                        workspace_id=new_workspace_id,
+                        gateway_job_id=job_id,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up workspace for aborted job %s (workspace %s)",
+                    job_id,
+                    new_workspace_id,
+                )
+
+            row = await _fetch_job(conn, job_id)
+            return _job_response(request, row)
 
         # Store the workspace ID immediately so it is available even if
         # start_opencode fails and the job is marked "failed".
