@@ -501,14 +501,35 @@ async def create_job(
         current_status = "provisioning_workspace"
 
         # 3. Create workspace on the selected runner
-        ws_response = await executor.create_workspace(
-            CreateWorkspaceRequest(
-                repo_url=str(body.repo_url),
-                job_id=job_id,
-                runner_id=runner_text_id,
-                env_vars=body.env_vars,
+        # Build the callback that persists the AWX job ID to the DB immediately
+        # after a successful launch, *before* wait_for_job blocks.  This closes
+        # the cross-process cancellation race window (issue #192).
+        async def _persist_awx_job_id(gw_job_id: uuid.UUID, awx_job_id: int) -> None:
+            await conn.execute(
+                "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
+                gw_job_id,
+                str(awx_job_id),
             )
-        )
+
+        if isinstance(executor, AWXExecutorPlugin):
+            ws_response = await executor.create_workspace(
+                CreateWorkspaceRequest(
+                    repo_url=str(body.repo_url),
+                    job_id=job_id,
+                    runner_id=runner_text_id,
+                    env_vars=body.env_vars,
+                ),
+                on_awx_job_launched=_persist_awx_job_id,
+            )
+        else:
+            ws_response = await executor.create_workspace(
+                CreateWorkspaceRequest(
+                    repo_url=str(body.repo_url),
+                    job_id=job_id,
+                    runner_id=runner_text_id,
+                    env_vars=body.env_vars,
+                ),
+            )
         new_workspace_id = ws_response.workspace_id
 
         # Store the workspace ID immediately so it is available even if
@@ -518,16 +539,6 @@ async def create_job(
             job_id,
             str(new_workspace_id),
         )
-
-        # Persist the AWX job ID on the gateway job row.
-        if isinstance(executor, AWXExecutorPlugin):
-            awx_job_id = executor._executor_job_ids.get(job_id)
-            if awx_job_id is not None:
-                await conn.execute(
-                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
-                    job_id,
-                    str(awx_job_id),
-                )
 
         # 4. Allocate a port and persist it atomically against the workspace (ADR 0003).
         # allocate_and_assign_port acquires an advisory lock, selects a free port,
@@ -573,27 +584,28 @@ async def create_job(
         current_status = "starting_opencode"
 
         # 6. Start OpenCode Serve
-        start_response = await executor.start_opencode(
-            StartOpencodeRequest(
-                workspace_id=new_workspace_id,
-                workspace_path=ws_response.workspace_path,
-                port=allocated_port,
-                gateway_job_id=job_id,
-                env_vars=body.env_vars,
-            )
-        )
-        session_id = str(start_response.session_id)
-
-        # Persist the AWX job ID for start_opencode so that cross-process
-        # cancellation targets the currently-active AWX job (issue #189).
         if isinstance(executor, AWXExecutorPlugin):
-            awx_job_id = executor._executor_job_ids.get(job_id)
-            if awx_job_id is not None:
-                await conn.execute(
-                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
-                    job_id,
-                    str(awx_job_id),
-                )
+            start_response = await executor.start_opencode(
+                StartOpencodeRequest(
+                    workspace_id=new_workspace_id,
+                    workspace_path=ws_response.workspace_path,
+                    port=allocated_port,
+                    gateway_job_id=job_id,
+                    env_vars=body.env_vars,
+                ),
+                on_awx_job_launched=_persist_awx_job_id,
+            )
+        else:
+            start_response = await executor.start_opencode(
+                StartOpencodeRequest(
+                    workspace_id=new_workspace_id,
+                    workspace_path=ws_response.workspace_path,
+                    port=allocated_port,
+                    gateway_job_id=job_id,
+                    env_vars=body.env_vars,
+                ),
+            )
+        session_id = str(start_response.session_id)
 
         # Store the session ID so it is available for diff retrieval
         await conn.execute(
