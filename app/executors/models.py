@@ -164,9 +164,24 @@ class CleanupWorkspaceResponse(BaseModel):
 
 
 class CancelJobRequest(BaseModel):
-    """Request to cancel a running job for a workspace."""
+    """Request to cancel a running job for a workspace.
+
+    *workspace_id* identifies the workspace whose AWX job should be
+    cancelled.  The cancellation path prefers the in-memory tracking
+    dict (``_active_awx_jobs``) on the executor plugin instance.
+
+    *executor_job_id* provides a fallback for cross-process cancellation:
+    when no in-memory entry exists (e.g. the abort request landed in a
+    different process), the caller passes the AWX job ID that was
+    persisted on the ``gateway_jobs`` row at launch time.
+    """
 
     workspace_id: UUID
+    executor_job_id: int | None = Field(
+        default=None,
+        description="AWX job ID to cancel when the in-memory tracking dict has no "
+        "entry for this workspace (cross-process cancellation).",
+    )
 
 
 class CancelJobResponse(BaseModel):
