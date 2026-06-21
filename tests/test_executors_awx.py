@@ -1221,3 +1221,121 @@ class TestAWXExecutorPluginCancelJob:
         assert isinstance(resp, CancelJobResponse)
         assert resp.status == "cancelled"
         client.cancel_job.assert_awaited_once_with(55)
+
+
+# ── Executor job ID persistence for lifecycle methods ────────────────────
+
+
+class TestExecutorJobIdPersistence:
+    """Verify that lifecycle methods persist the AWX job ID via
+    gateway_job_id so that cross-process cancellation can find the
+    currently-active AWX job (issue #189)."""
+
+    GW_JOB_ID = UUID("11111111-1111-1111-1111-111111111111")
+
+    async def test_start_opencode_stores_executor_job_id(self):
+        """After a successful start_opencode launch, the gateway_job_id
+        is mapped to the AWX job ID in _executor_job_ids."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            job_id=201,
+            artifacts={
+                "session_id": "00000000-1111-2222-3333-444444444444",
+                "port": 9090,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.start_opencode(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+
+    async def test_stop_opencode_stores_executor_job_id(self):
+        """After a successful stop_opencode launch, the gateway_job_id
+        is mapped to the AWX job ID in _executor_job_ids."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=202)
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StopOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.stop_opencode(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 202
+
+    async def test_cleanup_workspace_stores_executor_job_id(self):
+        """After a successful cleanup_workspace launch, the gateway_job_id
+        is mapped to the AWX job ID in _executor_job_ids."""
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(client, job_id=203)
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = CleanupWorkspaceRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.cleanup_workspace(req)
+
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 203
+
+    async def test_cross_process_cancel_uses_active_lifecycle_job(self):
+        """Simulate a cross-process cancel scenario:
+        1. Worker A launches start_opencode — AWX job 201 is stored
+           in _executor_job_ids (and _active_awx_jobs).
+        2. Worker A's start_opencode completes; _active_awx_jobs is
+           cleaned up but _executor_job_ids retains the mapping.
+        3. Worker B receives the cancel — no _active_awx_jobs entry.
+        4. Worker B reads executor_job_id=201 from the DB and passes
+           it via CancelJobRequest.executor_job_id.
+        5. The cancel targets AWX job 201 (the active lifecycle job),
+           not the old create_workspace job.
+        """
+        client = AsyncMock(spec=AWXApiClient)
+        _mock_launch_and_wait(
+            client,
+            job_id=201,
+            artifacts={
+                "session_id": "00000000-1111-2222-3333-444444444444",
+                "port": 9090,
+            },
+        )
+        plugin = _make_plugin(client)
+
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+        await plugin.start_opencode(req)
+
+        # At this point, _active_awx_jobs is cleaned up (job completed),
+        # but _executor_job_ids still has the gateway_job_id → 201 mapping.
+        assert ws_id not in plugin._active_awx_jobs
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+
+        # Simulate Worker B: no in-memory tracking, but has executor_job_id
+        # from the DB (201 — the start_opencode AWX job).
+        plugin2 = _make_plugin(client)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=201, status="canceled"
+        )
+
+        cancel_req = CancelJobRequest(
+            workspace_id=ws_id,
+            executor_job_id=201,
+        )
+        resp = await plugin2.cancel_job(cancel_req)
+
+        assert resp.status == "cancelled"
+        # Verify the correct AWX job was cancelled (not create_workspace's job).
+        client.cancel_job.assert_awaited_with(201)

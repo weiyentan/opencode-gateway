@@ -578,10 +578,22 @@ async def create_job(
                 workspace_id=new_workspace_id,
                 workspace_path=ws_response.workspace_path,
                 port=allocated_port,
+                gateway_job_id=job_id,
                 env_vars=body.env_vars,
             )
         )
         session_id = str(start_response.session_id)
+
+        # Persist the AWX job ID for start_opencode so that cross-process
+        # cancellation targets the currently-active AWX job (issue #189).
+        if isinstance(executor, AWXExecutorPlugin):
+            awx_job_id = executor._executor_job_ids.get(job_id)
+            if awx_job_id is not None:
+                await conn.execute(
+                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
+                    job_id,
+                    str(awx_job_id),
+                )
 
         # Store the session ID so it is available for diff retrieval
         await conn.execute(
@@ -1404,7 +1416,10 @@ async def abort_job(
                 )
             try:
                 await executor.stop_opencode(
-                    StopOpencodeRequest(workspace_id=parsed_id)
+                    StopOpencodeRequest(
+                        workspace_id=parsed_id,
+                        gateway_job_id=job_id,
+                    )
                 )
             except Exception:
                 logger.exception(
@@ -1414,7 +1429,10 @@ async def abort_job(
                 )
             try:
                 await executor.cleanup_workspace(
-                    CleanupWorkspaceRequest(workspace_id=parsed_id)
+                    CleanupWorkspaceRequest(
+                        workspace_id=parsed_id,
+                        gateway_job_id=job_id,
+                    )
                 )
             except Exception:
                 logger.exception(

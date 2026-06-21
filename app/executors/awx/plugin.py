@@ -321,6 +321,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 self._opencode_lifecycle_template_id,
                 extra_vars,
                 workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
             )
         except AWXClientError:
             logger.exception(
@@ -373,6 +374,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 self._opencode_lifecycle_template_id,
                 extra_vars,
                 workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
             )
         except AWXClientError:
             logger.exception(
@@ -501,6 +503,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 self._workspace_teardown_template_id,
                 extra_vars,
                 workspace_id=request.workspace_id,
+                gateway_job_id=request.gateway_job_id,
             )
         except AWXClientError:
             logger.exception(
