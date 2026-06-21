@@ -174,11 +174,12 @@ class AWXExecutorPlugin(ExecutorPlugin):
         as ``executor_job_id`` on the ``gateway_jobs`` row.
 
         When *on_awx_job_launched* is provided (along with
-        *gateway_job_id*), the callable is awaited *before*
-        :meth:`wait_for_job` so that the caller can persist the AWX job
-        ID (e.g. to the database) immediately after launch — before
-        blocking on job completion.  This closes the cross-process
-        cancellation race window (issue #189 / #192).
+        *gateway_job_id*), it is called immediately after
+        :meth:`~AWXApiClient.launch_job_template` returns and before
+        :meth:`~AWXApiClient.wait_for_job` begins.  This allows the
+        caller to persist the AWX job ID (e.g. to the database) while
+        the job is still in-flight, enabling cross-process cancellation
+        to target the currently active AWX job (issue #190).
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -209,9 +210,9 @@ class AWXExecutorPlugin(ExecutorPlugin):
         if gateway_job_id is not None:
             self._executor_job_ids[gateway_job_id] = summary.job_id
 
-        # Invoke the on_awx_job_launched callback (if provided) so the
-        # caller can persist the AWX job ID *before* wait_for_job blocks.
-        # This closes the cross-process cancellation race window.
+        # Call the persistence callback immediately after launch, before
+        # wait_for_job, so that the DB contains the active AWX job ID
+        # while the job is still in-flight (cross-process cancellation).
         if gateway_job_id is not None and on_awx_job_launched is not None:
             await on_awx_job_launched(gateway_job_id, summary.job_id)
 
@@ -274,9 +275,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
 
         Extra vars: ``repo_url``, ``branch`` (optional), ``job_id`` (optional).
 
-        When *on_awx_job_launched* is provided it is forwarded to
-        :meth:`_launch_and_wait` so the AWX job ID can be persisted
-        before blocking on job completion.
+        When *on_awx_job_launched* is provided along with ``request.job_id``,
+        it is passed through to :meth:`_launch_and_wait` so the AWX job ID
+        can be persisted immediately after launch, before waiting for the
+        job to complete.
         """
         extra_vars: dict[str, Any] = {"repo_url": request.repo_url}
         if request.branch is not None:
@@ -328,9 +330,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
 
         Extra vars: ``action: start``, ``workspace_path``, ``port`` (when set).
 
-        When *on_awx_job_launched* is provided it is forwarded to
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
         :meth:`_launch_and_wait` so the AWX job ID can be persisted
-        before blocking on job completion.
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -390,6 +393,11 @@ class AWXExecutorPlugin(ExecutorPlugin):
         """Stop OpenCode Serve via the gateway-opencode-lifecycle template.
 
         Extra vars: ``action: stop``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -522,6 +530,11 @@ class AWXExecutorPlugin(ExecutorPlugin):
         """Tear down a workspace via the gateway-workspace-teardown template.
 
         Extra vars: ``action: cleanup``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
