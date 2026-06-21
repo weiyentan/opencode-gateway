@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone  # noqa: UP017
+from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -500,15 +502,33 @@ async def create_job(
         )
         current_status = "provisioning_workspace"
 
-        # 3. Create workspace on the selected runner
-        ws_response = await executor.create_workspace(
-            CreateWorkspaceRequest(
-                repo_url=str(body.repo_url),
-                job_id=job_id,
-                runner_id=runner_text_id,
-                env_vars=body.env_vars,
-            )
+        # 3. Create workspace on the selected runner.
+        # Build the on_awx_job_launched callback that persists the
+        # executor_job_id immediately after the AWX job is launched
+        # (before wait_for_job), so that cross-process cancellation
+        # can target the currently-active AWX job (issue #190).
+        _on_launch_cb = None
+        if isinstance(executor, AWXExecutorPlugin):
+            async def _persist_cb(gw_job_id: UUID, awx_job_id: int) -> None:
+                await conn.execute(
+                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
+                    gw_job_id,
+                    str(awx_job_id),
+                )
+            _on_launch_cb = _persist_cb
+
+        ws_req = CreateWorkspaceRequest(
+            repo_url=str(body.repo_url),
+            job_id=job_id,
+            runner_id=runner_text_id,
+            env_vars=body.env_vars,
         )
+        if isinstance(executor, AWXExecutorPlugin):
+            ws_response = await executor.create_workspace(
+                ws_req, on_awx_job_launched=_on_launch_cb,
+            )
+        else:
+            ws_response = await executor.create_workspace(ws_req)
         new_workspace_id = ws_response.workspace_id
 
         # Store the workspace ID immediately so it is available even if
@@ -518,16 +538,6 @@ async def create_job(
             job_id,
             str(new_workspace_id),
         )
-
-        # Persist the AWX job ID on the gateway job row.
-        if isinstance(executor, AWXExecutorPlugin):
-            awx_job_id = executor._executor_job_ids.get(job_id)
-            if awx_job_id is not None:
-                await conn.execute(
-                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
-                    job_id,
-                    str(awx_job_id),
-                )
 
         # 4. Allocate a port and persist it atomically against the workspace (ADR 0003).
         # allocate_and_assign_port acquires an advisory lock, selects a free port,
@@ -572,28 +582,24 @@ async def create_job(
         )
         current_status = "starting_opencode"
 
-        # 6. Start OpenCode Serve
-        start_response = await executor.start_opencode(
-            StartOpencodeRequest(
-                workspace_id=new_workspace_id,
-                workspace_path=ws_response.workspace_path,
-                port=allocated_port,
-                gateway_job_id=job_id,
-                env_vars=body.env_vars,
-            )
+        # 6. Start OpenCode Serve.
+        # Persist executor_job_id via callback *before* wait_for_job
+        # so the DB contains the active AWX job ID while the job is
+        # still in-flight (issue #190).
+        start_req = StartOpencodeRequest(
+            workspace_id=new_workspace_id,
+            workspace_path=ws_response.workspace_path,
+            port=allocated_port,
+            gateway_job_id=job_id,
+            env_vars=body.env_vars,
         )
-        session_id = str(start_response.session_id)
-
-        # Persist the AWX job ID for start_opencode so that cross-process
-        # cancellation targets the currently-active AWX job (issue #189).
         if isinstance(executor, AWXExecutorPlugin):
-            awx_job_id = executor._executor_job_ids.get(job_id)
-            if awx_job_id is not None:
-                await conn.execute(
-                    "UPDATE gateway_jobs SET executor_job_id = $2 WHERE id = $1",
-                    job_id,
-                    str(awx_job_id),
-                )
+            start_response = await executor.start_opencode(
+                start_req, on_awx_job_launched=_on_launch_cb,
+            )
+        else:
+            start_response = await executor.start_opencode(start_req)
+        session_id = str(start_response.session_id)
 
         # Store the session ID so it is available for diff retrieval
         await conn.execute(

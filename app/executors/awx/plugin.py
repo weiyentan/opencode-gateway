@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
@@ -150,6 +151,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
         extra_vars: dict[str, Any],
         workspace_id: UUID | None = None,
         gateway_job_id: UUID | None = None,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> AWXJobResult:
         """Launch a job template and wait for it to complete.
 
@@ -170,6 +172,14 @@ class AWXExecutorPlugin(ExecutorPlugin):
         When *gateway_job_id* is provided, the AWX job ID is recorded in
         :attr:`_executor_job_ids` so that the API layer can persist it
         as ``executor_job_id`` on the ``gateway_jobs`` row.
+
+        When *on_awx_job_launched* is provided (along with
+        *gateway_job_id*), it is called immediately after
+        :meth:`~AWXApiClient.launch_job_template` returns and before
+        :meth:`~AWXApiClient.wait_for_job` begins.  This allows the
+        caller to persist the AWX job ID (e.g. to the database) while
+        the job is still in-flight, enabling cross-process cancellation
+        to target the currently active AWX job (issue #190).
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -199,6 +209,12 @@ class AWXExecutorPlugin(ExecutorPlugin):
         # as executor_job_id on the gateway_jobs row.
         if gateway_job_id is not None:
             self._executor_job_ids[gateway_job_id] = summary.job_id
+
+        # Call the persistence callback immediately after launch, before
+        # wait_for_job, so that the DB contains the active AWX job ID
+        # while the job is still in-flight (cross-process cancellation).
+        if gateway_job_id is not None and on_awx_job_launched is not None:
+            await on_awx_job_launched(gateway_job_id, summary.job_id)
 
         # Track the in-flight job for cancellation lookups.
         if workspace_id is not None:
@@ -251,11 +267,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
     # ── Lifecycle methods ───────────────────────────────────────────────
 
     async def create_workspace(
-        self, request: CreateWorkspaceRequest
+        self,
+        request: CreateWorkspaceRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> CreateWorkspaceResponse:
         """Provision a workspace directory via the gateway-create-workspace template.
 
         Extra vars: ``repo_url``, ``branch`` (optional), ``job_id`` (optional).
+
+        When *on_awx_job_launched* is provided along with ``request.job_id``,
+        it is passed through to :meth:`_launch_and_wait` so the AWX job ID
+        can be persisted immediately after launch, before waiting for the
+        job to complete.
         """
         extra_vars: dict[str, Any] = {"repo_url": request.repo_url}
         if request.branch is not None:
@@ -269,6 +292,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 extra_vars,
                 # workspace_id is unknown until the AWX job returns artifacts.
                 gateway_job_id=request.job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception("create_workspace failed for repo=%s", request.repo_url)
@@ -298,11 +322,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def start_opencode(
-        self, request: StartOpencodeRequest
+        self,
+        request: StartOpencodeRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> StartOpencodeResponse:
         """Start OpenCode Serve via the gateway-opencode-lifecycle template.
 
         Extra vars: ``action: start``, ``workspace_path``, ``port`` (when set).
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -322,6 +353,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 extra_vars,
                 workspace_id=request.workspace_id,
                 gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
@@ -354,11 +386,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def stop_opencode(
-        self, request: StopOpencodeRequest
+        self,
+        request: StopOpencodeRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> StopOpencodeResponse:
         """Stop OpenCode Serve via the gateway-opencode-lifecycle template.
 
         Extra vars: ``action: stop``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -375,6 +414,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 extra_vars,
                 workspace_id=request.workspace_id,
                 gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
@@ -483,11 +523,18 @@ class AWXExecutorPlugin(ExecutorPlugin):
         )
 
     async def cleanup_workspace(
-        self, request: CleanupWorkspaceRequest
+        self,
+        request: CleanupWorkspaceRequest,
+        on_awx_job_launched: Callable[[UUID, int], Awaitable[None]] | None = None,
     ) -> CleanupWorkspaceResponse:
         """Tear down a workspace via the gateway-workspace-teardown template.
 
         Extra vars: ``action: cleanup``, ``workspace_path``.
+
+        When *on_awx_job_launched* is provided along with
+        ``request.gateway_job_id``, it is passed through to
+        :meth:`_launch_and_wait` so the AWX job ID can be persisted
+        immediately after launch, before waiting for the job to complete.
         """
         workspace_path = _workspace_path(
             self._workspace_base_path,
@@ -504,6 +551,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 extra_vars,
                 workspace_id=request.workspace_id,
                 gateway_job_id=request.gateway_job_id,
+                on_awx_job_launched=on_awx_job_launched,
             )
         except AWXClientError:
             logger.exception(
