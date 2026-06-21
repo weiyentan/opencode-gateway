@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Protocol
 
 import asyncpg
 
@@ -22,6 +23,19 @@ logger = logging.getLogger(__name__)
 # Defaults when settings are not explicitly provided.
 DEFAULT_INTERVAL_SECONDS: float = 900.0  # 15 minutes
 DEFAULT_BATCH_SIZE: int = 10
+
+
+class SupportsAcquireRelease(Protocol):
+    """Minimal pool interface required by the cleanup scheduler.
+
+    Matches ``DatabasePool.acquire()`` / ``DatabasePool.release()``
+    as well as any other connection-pool wrapper that exposes explicit
+    coroutine-based acquire/release (rather than the async context
+    manager protocol used by ``asyncpg.Pool.acquire()``).
+    """
+
+    async def acquire(self) -> asyncpg.Connection: ...
+    async def release(self, conn: asyncpg.Connection) -> None: ...
 
 
 class CleanupScheduler:
@@ -43,13 +57,13 @@ class CleanupScheduler:
 
     def __init__(
         self,
-        pool: asyncpg.Pool | None = None,
+        pool: SupportsAcquireRelease | None = None,
         executor: ExecutorPlugin | None = None,
         interval_seconds: float | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
         # --- Dependencies (may also be supplied via start()) ---
-        self._pool: asyncpg.Pool | None = pool
+        self._pool: SupportsAcquireRelease | None = pool
         self._executor: ExecutorPlugin | None = executor
 
         # --- Scheduler loop state ---
@@ -64,7 +78,7 @@ class CleanupScheduler:
 
     async def start(
         self,
-        pool: asyncpg.Pool | None = None,
+        pool: SupportsAcquireRelease | None = None,
         executor: ExecutorPlugin | None = None,
     ) -> None:
         """Begin the background loop.
@@ -166,7 +180,7 @@ class CleanupScheduler:
     # ------------------------------------------------------------------
 
     async def _query_expired(
-        self, pool: asyncpg.Pool
+        self, pool: SupportsAcquireRelease
     ) -> list[asyncpg.Record]:
         """Return expired workspaces eligible for cleanup, up to batch_size."""
         conn = await pool.acquire()
@@ -188,7 +202,7 @@ class CleanupScheduler:
 
     async def _process_one(
         self,
-        pool: asyncpg.Pool,
+        pool: SupportsAcquireRelease,
         executor: ExecutorPlugin,
         row: asyncpg.Record,
     ) -> None:
