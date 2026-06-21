@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid as _uuid
-from typing import Any
 
 import asyncpg
 
 from app.core.ports import release_port
+from app.db.lock import release_cleanup_lock, try_acquire_cleanup_lock
 from app.executors import CleanupWorkspaceRequest, ExecutorPlugin
 
 logger = logging.getLogger(__name__)
@@ -23,22 +22,6 @@ logger = logging.getLogger(__name__)
 # Defaults when settings are not explicitly provided.
 DEFAULT_INTERVAL_SECONDS: float = 900.0  # 15 minutes
 DEFAULT_BATCH_SIZE: int = 10
-
-
-def _uuid_to_lock_key(workspace_id: Any) -> int:
-    """Convert a workspace UUID value to a positive bigint for advisory locks.
-
-    PostgreSQL advisory locks accept ``bigint`` keys (signed 64-bit on the
-    wire).  We derive the key by taking the low 63 bits of the UUID's
-    128-bit integer representation so the result is always a non-negative
-    bigint.
-    """
-    if isinstance(workspace_id, _uuid.UUID):
-        uid = workspace_id
-    else:
-        uid = _uuid.UUID(str(workspace_id))
-    # Mask to 63 bits to guarantee a non-negative bigint.
-    return uid.int & 0x7FFFFFFFFFFFFFFF
 
 
 class CleanupScheduler:
@@ -211,22 +194,19 @@ class CleanupScheduler:
     ) -> None:
         """Acquire advisory lock, clean up one workspace, and update status."""
         ws_id = row["id"]
-        lock_key = _uuid_to_lock_key(ws_id)
 
         # Advisory locks are connection-scoped — we hold a single
         # connection for the entire lock→cleanup→unlock sequence.
         conn = await pool.acquire()
         try:
-            acquired = await conn.fetchval(
-                "SELECT pg_try_advisory_lock($1::bigint)", lock_key
-            )
+            acquired = await try_acquire_cleanup_lock(conn, ws_id)
             if not acquired:
                 logger.info(
                     "Advisory lock unavailable for workspace %s — skipping", ws_id
                 )
                 return
 
-            logger.debug("Acquired advisory lock for workspace %s (key=%d)", ws_id, lock_key)
+            logger.debug("Acquired advisory lock for workspace %s", ws_id)
             try:
                 request = CleanupWorkspaceRequest(workspace_id=ws_id)
                 response = await executor.cleanup_workspace(request)
@@ -253,9 +233,7 @@ class CleanupScheduler:
                 logger.exception("Cleanup failed for workspace %s", ws_id)
             finally:
                 try:
-                    await conn.execute(
-                        "SELECT pg_advisory_unlock($1::bigint)", lock_key
-                    )
+                    await release_cleanup_lock(conn, ws_id)
                 except Exception:
                     logger.exception(
                         "Failed to release advisory lock for workspace %s", ws_id
