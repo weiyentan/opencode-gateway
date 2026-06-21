@@ -24,6 +24,7 @@ from app.executors import ExecutorPlugin
 from app.executors.awx.exceptions import AWXArtifactError
 from app.executors.factory import get_executor
 from app.executors.models import (
+    CancelJobRequest,
     CleanupWorkspaceRequest,
     CreateWorkspaceRequest,
     StartOpencodeRequest,
@@ -1256,11 +1257,12 @@ async def abort_job(
                 datetime.now(timezone.utc),  # noqa: UP017
             )
             aborted = True
-        except Exception:
-            logger.exception(
-                "Failed to abort OpenCode session %s for job %s",
+        except Exception as exc:
+            logger.warning(
+                "OpenCode session %s for job %s did not abort cleanly: %s",
                 session_id,
                 job_id,
+                exc,
             )
             raise HTTPException(
                 status_code=503,
@@ -1294,6 +1296,16 @@ async def abort_job(
                 "Invalid workspace_name for job %s: %r", job_id, workspace_name
             )
         else:
+            try:
+                await executor.cancel_job(
+                    CancelJobRequest(workspace_id=parsed_id)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to cancel job for workspace %s (job %s)",
+                    parsed_id,
+                    job_id,
+                )
             try:
                 await executor.stop_opencode(
                     StopOpencodeRequest(workspace_id=parsed_id)

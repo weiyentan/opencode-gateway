@@ -1392,6 +1392,15 @@ class TestAbortJob:
         self, mock_conn
     ):
         """When no OpenCode client is available, the job is marked aborted directly."""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.jobs import _get_pool, get_opencode_client
+        from app.core.factory import create_app
+        from app.db.session import get_session
+        from app.executors.factory import get_executor
+        from fastapi import Request
+        from tests.conftest import _TEST_API_KEY
+
         job_id = uuid.uuid4()
         session_id = "sess-no-client"
         row = make_job_row(
@@ -1413,11 +1422,27 @@ class TestAbortJob:
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
         mock_conn.execute = AsyncMock(side_effect=_execute)
 
-        # No opencode client injected — default get_opencode_client returns None
-        client = create_client(mock_conn)
+        # Build a minimal app with get_opencode_client forced to None
+        app = create_app(configure_logging=False)
+        mock_pool = AsyncMock()
+        mock_pool.pool = None
+        app.state.pool = mock_pool
 
-        async with client as c:
-            response = await c.post(f"/jobs/{job_id}/abort")
+        async def _override_get_session(request: Request):  # noqa: F811
+            yield mock_conn
+
+        app.dependency_overrides[get_session] = _override_get_session
+        app.dependency_overrides[_get_pool] = lambda: mock_pool
+        app.dependency_overrides[get_executor] = lambda: AsyncMock()
+        app.dependency_overrides[get_opencode_client] = lambda: None
+
+        headers = {"Authorization": f"Bearer {_TEST_API_KEY}"}
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+        async with AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
+            response = await client.post(f"/jobs/{job_id}/abort")
 
         assert response.status_code == 200
         data = response.json()["data"]
