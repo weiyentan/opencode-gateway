@@ -10,6 +10,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -111,6 +113,18 @@ class ExecutorPlugin(ABC):
         """
         ...
 
+    @abstractmethod
+    async def cancel_job(
+        self, request: CancelJobRequest
+    ) -> CancelJobResponse:
+        """Cancel a running job for a workspace.
+
+        **Future surface.**  Not yet called by the Gateway at runtime;
+        included so every executor provides a uniform implementation
+        when a call site is added.
+        """
+        ...
+
 
 # --- Executor plugin registry ------------------------------------------------
 # Imported after ExecutorPlugin is defined to avoid circular imports
@@ -125,6 +139,8 @@ EXECUTOR_REGISTRY: dict[str, type[ExecutorPlugin]] = {
 }
 
 __all__ = [
+    "CancelJobRequest",
+    "CancelJobResponse",
     "CleanupWorkspaceRequest",
     "CleanupWorkspaceResponse",
     "CollectStateRequest",

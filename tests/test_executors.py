@@ -10,6 +10,8 @@ from pydantic import BaseModel, ValidationError
 from app.executors import ExecutorPlugin
 from app.executors.local import LocalExecutor
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -65,6 +67,9 @@ class _FakeExecutor(ExecutorPlugin):
 
     async def cleanup_workspace(self, request: CleanupWorkspaceRequest) -> CleanupWorkspaceResponse:
         return CleanupWorkspaceResponse(status="cleaned")
+
+    async def cancel_job(self, request: CancelJobRequest) -> CancelJobResponse:
+        return CancelJobResponse(status="cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +153,12 @@ class TestExecutorPluginIsAsync:
     def test_cleanup_workspace_is_async(self):
         result = _FakeExecutor().cleanup_workspace(
             CleanupWorkspaceRequest(workspace_id="00000000-0000-0000-0000-000000000001")
+        )
+        assert isinstance(result, Awaitable)
+
+    def test_cancel_job_is_async(self):
+        result = _FakeExecutor().cancel_job(
+            CancelJobRequest(workspace_id="00000000-0000-0000-0000-000000000001")
         )
         assert isinstance(result, Awaitable)
 
@@ -378,6 +389,42 @@ class TestCleanupWorkspaceModels:
 
 
 # ---------------------------------------------------------------------------
+# Pydantic model tests — CancelJob
+# ---------------------------------------------------------------------------
+
+
+class TestCancelJobModels:
+    """Tests for CancelJobRequest / CancelJobResponse."""
+
+    def test_request_required_fields(self):
+        req = CancelJobRequest(workspace_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        assert str(req.workspace_id) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def test_request_missing_workspace_id_raises(self):
+        with pytest.raises(ValidationError):
+            CancelJobRequest()
+
+    def test_request_rejects_non_uuid(self):
+        """CancelJobRequest should reject non-UUID workspace_id values."""
+        with pytest.raises(ValidationError):
+            CancelJobRequest(workspace_id="not-a-uuid")
+
+    def test_response_fields(self):
+        resp = CancelJobResponse(status="cancelled")
+        assert resp.status == "cancelled"
+
+    def test_response_accepts_any_string_status(self):
+        """CancelJobResponse.status should accept any string."""
+        resp = CancelJobResponse(status="already_done")
+        assert resp.status == "already_done"
+
+    def test_response_serializes_to_json(self):
+        resp = CancelJobResponse(status="cancelled")
+        data = resp.model_dump(mode="json")
+        assert data == {"status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
 # Model type enforcement
 # ---------------------------------------------------------------------------
 
@@ -392,6 +439,7 @@ class TestModelsArePydantic:
         assert issubclass(RestartOpencodeRequest, BaseModel)
         assert issubclass(CollectStateRequest, BaseModel)
         assert issubclass(CleanupWorkspaceRequest, BaseModel)
+        assert issubclass(CancelJobRequest, BaseModel)
 
     def test_response_models_are_pydantic(self):
         assert issubclass(CreateWorkspaceResponse, BaseModel)
@@ -400,6 +448,7 @@ class TestModelsArePydantic:
         assert issubclass(RestartOpencodeResponse, BaseModel)
         assert issubclass(CollectStateResponse, BaseModel)
         assert issubclass(CleanupWorkspaceResponse, BaseModel)
+        assert issubclass(CancelJobResponse, BaseModel)
 
 
 # ---------------------------------------------------------------------------

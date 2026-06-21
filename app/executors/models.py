@@ -155,3 +155,20 @@ class CleanupWorkspaceResponse(BaseModel):
     """Result of cleaning up a workspace."""
 
     status: str
+
+
+# ---------------------------------------------------------------------------
+# cancel_job
+# ---------------------------------------------------------------------------
+
+
+class CancelJobRequest(BaseModel):
+    """Request to cancel a running job for a workspace."""
+
+    workspace_id: UUID
+
+
+class CancelJobResponse(BaseModel):
+    """Result of cancelling a job."""
+
+    status: str

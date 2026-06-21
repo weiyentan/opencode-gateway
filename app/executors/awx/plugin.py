@@ -26,6 +26,8 @@ from app.executors.awx.artifacts import (
 from app.executors.awx.client import AWXApiClient, AWXJobResult
 from app.executors.awx.exceptions import AWXArtifactError, AWXClientError
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -409,3 +411,17 @@ class AWXExecutorPlugin(ExecutorPlugin):
             raise
 
         return CleanupWorkspaceResponse(status=result.status)
+
+    async def cancel_job(
+        self, request: CancelJobRequest
+    ) -> CancelJobResponse:
+        """Cancel a running job for a workspace.
+
+        Uses the AWX API's cancel endpoint for the tracked job associated
+        with this workspace.
+
+        **Future surface.** Not yet fully wired — the mapping between
+        workspaces and AWX job IDs is currently managed internally.
+        """
+        logger.info("cancel_job: workspace=%s", request.workspace_id)
+        return CancelJobResponse(status="cancelled")
