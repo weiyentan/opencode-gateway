@@ -127,6 +127,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
         # completed and its tracking entry was cleaned up).
         self._ever_tracked_workspaces: Set[UUID] = set()
 
+        # Mapping of Gateway job UUID → AWX job ID for persisting the
+        # executor_job_id on the gateway_jobs row after a successful launch.
+        self._executor_job_ids: dict[UUID, int] = {}
+
     # ── Internal helpers ────────────────────────────────────────────────
 
     async def _launch_and_wait(
@@ -134,6 +138,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
         template_id: int,
         extra_vars: dict[str, Any],
         workspace_id: UUID | None = None,
+        gateway_job_id: UUID | None = None,
     ) -> AWXJobResult:
         """Launch a job template and wait for it to complete.
 
@@ -150,6 +155,10 @@ class AWXExecutorPlugin(ExecutorPlugin):
         ``summary.job_id``.  This prevents a stale waiter from deleting
         the tracking entry of a concurrently launched job for the same
         workspace (e.g. cleanup after cancel).
+
+        When *gateway_job_id* is provided, the AWX job ID is recorded in
+        :attr:`_executor_job_ids` so that the API layer can persist it
+        as ``executor_job_id`` on the ``gateway_jobs`` row.
 
         Wraps errors in AWX-specific exceptions with logging for
         observability.
@@ -174,6 +183,11 @@ class AWXExecutorPlugin(ExecutorPlugin):
             template_id,
             summary.status,
         )
+
+        # Record the AWX job ID for the Gateway job so it can be persisted
+        # as executor_job_id on the gateway_jobs row.
+        if gateway_job_id is not None:
+            self._executor_job_ids[gateway_job_id] = summary.job_id
 
         # Track the in-flight job for cancellation lookups.
         if workspace_id is not None:
@@ -240,6 +254,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                 self._create_workspace_template_id,
                 extra_vars,
                 # workspace_id is unknown until the AWX job returns artifacts.
+                gateway_job_id=request.job_id,
             )
         except AWXClientError:
             logger.exception("create_workspace failed for repo=%s", request.repo_url)
