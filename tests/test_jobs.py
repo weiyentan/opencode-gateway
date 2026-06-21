@@ -1196,15 +1196,22 @@ class TestAbortJob:
         mock_opencode.abort_session.assert_called_once_with(session_id)
 
     @pytest.mark.asyncio
-    async def test_abort_with_session_opencode_unreachable_stays_aborting(
-        self, mock_conn
+    async def test_abort_with_session_opencode_unreachable_transitions_to_aborted(
+        self, mock_conn, caplog,
     ):
-        """When OpenCode Serve is unreachable, job stays aborting and returns 503."""
+        """When OpenCode Serve is unreachable, the error is logged at WARNING and
+        the job transitions to aborted (best-effort). Returns 200, not 503."""
+        import logging
+
+        from app.api import jobs as jobs_module
+
         job_id = uuid.uuid4()
         session_id = "sess-unreachable"
+        workspace_id = uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
         row = make_job_row(
             job_id, "https://github.com/org/repo", "Running unreachable",
             status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
         )
 
         async def _fetchrow(sql, *args):
@@ -1226,22 +1233,43 @@ class TestAbortJob:
             side_effect=RuntimeError("Connection refused")
         )
 
-        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+        # Executor mock — all cleanup methods succeed by default
+        mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        # Enable logging capture on the jobs module
+        jobs_module.logger.setLevel(logging.WARNING)
+        caplog.set_level(logging.WARNING, logger=jobs_module.logger.name)
+
+        client = create_client(
+            mock_conn,
+            mock_opencode_client=mock_opencode,
+            mock_executor=mock_exec,
+        )
 
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
 
-        assert response.status_code == 503
-        data = response.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
-        assert "unreachable" in data["error"]["message"].lower()
+        # Behaviour change: returns 200 (not 503) — best-effort abort
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "aborted"
+        assert data["id"] == str(job_id)
 
-        # Job should remain in aborting state
-        assert row["status"] == "aborting"
+        # Job should transition to aborted (not stay aborting)
+        assert row["status"] == "aborted"
 
         # Verify OpenCode client was called
         mock_opencode.abort_session.assert_called_once_with(session_id)
+
+        # Verify WARNING was logged with 'did not abort cleanly'
+        assert any("did not abort cleanly" in msg for msg in caplog.messages)
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "did not abort cleanly" in r.message for r in warning_records
+        ), f"Expected WARNING with 'did not abort cleanly', got: {caplog.messages}"
 
     @pytest.mark.asyncio
     async def test_abort_unknown_job_returns_404(self, client, mock_conn):
@@ -1258,13 +1286,16 @@ class TestAbortJob:
         "completed",
         "failed",
         "rejected",
-        "aborted",
         "needs_approval",
     ])
     async def test_abort_terminal_state_returns_409(
         self, terminal_status, mock_conn
     ):
-        """Abort on a job in a terminal/non-abortable state returns 409."""
+        """Abort on a job in a terminal/non-abortable state returns 409.
+        
+        ``aborted`` is excluded because the endpoint now returns 200 
+        idempotently for already-aborted jobs.
+        """
         job_id = uuid.uuid4()
         row = make_job_row(
             job_id, "https://github.com/org/repo", f"{terminal_status} job",
@@ -1293,8 +1324,9 @@ class TestAbortJob:
         assert response.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_double_abort_first_succeeds_second_returns_409(self, mock_conn):
-        """First abort succeeds, second abort on aborted job returns 409."""
+    async def test_double_abort_both_return_200(self, mock_conn):
+        """First abort succeeds, second abort on already-aborted job returns 200
+        (idempotent)."""
         from app.opencode.protocol import SessionAbortResponse
 
         job_id = uuid.uuid4()
@@ -1334,13 +1366,11 @@ class TestAbortJob:
             data1 = response1.json()["data"]
             assert data1["status"] == "aborted"
 
-            # Second abort - job is now aborted, should get 409
+            # Second abort - job is already aborted, should return 200 (idempotent)
             response2 = await c.post(f"/jobs/{job_id}/abort")
-            assert response2.status_code == 409
-            data2 = response2.json()
-            assert data2["status"] == "error"
-            assert data2["error"]["code"] == "CONFLICT"
-            assert "aborted" in data2["error"]["message"]
+            assert response2.status_code == 200
+            data2 = response2.json()["data"]
+            assert data2["status"] == "aborted"
 
     @pytest.mark.asyncio
     async def test_abort_retry_from_aborting_succeeds(self, mock_conn):
@@ -1681,9 +1711,9 @@ class TestAbortJob:
         mock_exec.cleanup_workspace.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_abort_idempotent_after_cleanup_failure(self, mock_conn):
+    async def test_abort_idempotent_after_aborted(self, mock_conn):
         """First abort succeeds (executor cleanup fails silently), second abort
-        returns 409 because the job is already aborted."""
+        returns 200 because the job is already aborted (idempotent)."""
         from app.opencode.protocol import SessionAbortResponse
 
         workspace_id = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
@@ -1715,6 +1745,7 @@ class TestAbortJob:
         )
 
         mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock()
         mock_exec.stop_opencode = AsyncMock(
             side_effect=RuntimeError("Infrastructure unavailable")
         )
@@ -1732,13 +1763,241 @@ class TestAbortJob:
             assert response1.json()["data"]["status"] == "aborted"
 
             response2 = await c.post(f"/jobs/{job_id}/abort")
-            assert response2.status_code == 409
-            data2 = response2.json()
-            assert data2["status"] == "error"
-            assert data2["error"]["code"] == "CONFLICT"
-            assert "aborted" in data2["error"]["message"]
+            assert response2.status_code == 200
+            data2 = response2.json()["data"]
+            assert data2["status"] == "aborted"
 
+            # Executor stop should only have been called once (first abort)
             assert mock_exec.stop_opencode.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_abort_cancel_job_success_path(self, mock_conn):
+        """cancel_job() is called with the correct workspace_id and the job
+        still transitions to aborted."""
+        from app.executors.models import CancelJobRequest
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        job_id = uuid.uuid4()
+        session_id = "sess-cancel-ok"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Cancel job OK",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "aborted"
+
+        # Verify cancel_job was called with the correct workspace_id
+        mock_exec.cancel_job.assert_called_once()
+        cancel_call_arg = mock_exec.cancel_job.call_args[0][0]
+        assert isinstance(cancel_call_arg, CancelJobRequest)
+        assert cancel_call_arg.workspace_id == workspace_id
+
+    @pytest.mark.asyncio
+    async def test_abort_cancel_job_failure_still_transitions_to_aborted(
+        self, mock_conn, caplog,
+    ):
+        """When cancel_job() raises, the error is logged but the job still
+        transitions to aborted (best-effort)."""
+        import logging
+
+        from app.api import jobs as jobs_module
+        from app.opencode.protocol import SessionAbortResponse
+
+        workspace_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        job_id = uuid.uuid4()
+        session_id = "sess-cancel-fail"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "Cancel job fail",
+            status="running", opencode_session_id=session_id,
+            workspace_name=str(workspace_id),
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock(
+            side_effect=RuntimeError("AWX unreachable for cancel")
+        )
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        # Enable logging capture
+        jobs_module.logger.setLevel(logging.WARNING)
+        caplog.set_level(logging.WARNING, logger=jobs_module.logger.name)
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "aborted"
+
+        # cancel_job was attempted
+        mock_exec.cancel_job.assert_called_once()
+
+        # Subsequent cleanup should still be attempted (best-effort)
+        mock_exec.stop_opencode.assert_called_once()
+        mock_exec.cleanup_workspace.assert_called_once()
+
+        # Verify WARNING was logged for the cancel_job failure
+        assert any(
+            "Failed to cancel job" in msg for msg in caplog.messages
+        ), f"Expected 'Failed to cancel job' in log messages: {caplog.messages}"
+
+    @pytest.mark.asyncio
+    async def test_abort_cancel_job_not_called_when_no_workspace(self, mock_conn):
+        """cancel_job() is NOT called when the job has no workspace_name."""
+        from app.opencode.protocol import SessionAbortResponse
+
+        job_id = uuid.uuid4()
+        session_id = "sess-no-ws-cancel"
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "No workspace cancel",
+            status="running", opencode_session_id=session_id,
+            workspace_name=None,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            if "UPDATE gateway_jobs SET status = 'aborting'" in sql:
+                row["status"] = "aborting"
+            elif "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock(
+            return_value=SessionAbortResponse(
+                session_id=session_id, aborted=True, message="OK",
+            )
+        )
+
+        mock_exec = AsyncMock()
+        mock_exec.cancel_job = AsyncMock()
+        mock_exec.stop_opencode = AsyncMock()
+        mock_exec.cleanup_workspace = AsyncMock()
+
+        client = create_client(
+            mock_conn,
+            mock_executor=mock_exec,
+            mock_opencode_client=mock_opencode,
+        )
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "aborted"
+
+        # cancel_job should NOT be called when there is no workspace
+        mock_exec.cancel_job.assert_not_called()
+        mock_exec.stop_opencode.assert_not_called()
+        mock_exec.cleanup_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_abort_abort_session_not_called_when_no_session(self, mock_conn):
+        """abort_session() is NOT called when the job has no opencode_session_id."""
+        job_id = uuid.uuid4()
+        row = make_job_row(
+            job_id, "https://github.com/org/repo", "No session to abort",
+            status="running", opencode_session_id=None,
+        )
+
+        async def _fetchrow(sql, *args):
+            if "SELECT" in sql.upper():
+                return mock_row(row)
+            return None
+
+        async def _execute(sql, *args):
+            # When there's no session, the endpoint marks aborted directly
+            # (no aborting state transition)
+            if "UPDATE gateway_jobs SET status = 'aborted'" in sql:
+                row["status"] = "aborted"
+
+        mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        mock_conn.execute = AsyncMock(side_effect=_execute)
+
+        mock_opencode = AsyncMock()
+        mock_opencode.abort_session = AsyncMock()
+
+        client = create_client(mock_conn, mock_opencode_client=mock_opencode)
+
+        async with client as c:
+            response = await c.post(f"/jobs/{job_id}/abort")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "aborted"
+
+        # abort_session should NOT be called when there's no session_id
+        mock_opencode.abort_session.assert_not_called()
 
 
 class TestJobEvents:
@@ -3204,15 +3463,13 @@ class TestAbortEvents:
         assert data[2]["actor"] == "system"
 
     @pytest.mark.asyncio
-    async def test_events_for_unreachable_abort_does_not_record_event(self, mock_conn):
-        """When OpenCode is unreachable during abort, no event is recorded.
-
-        Job stays in aborting state, 503 is returned, no event persisted.
-        """
+    async def test_events_for_unreachable_abort_records_event(self, mock_conn):
+        """When OpenCode is unreachable during abort, an abort event IS now
+        recorded because the job transitions to aborted (best-effort)."""
         job_id = uuid.uuid4()
         session_id = "sess-unreachable-events"
         row = make_job_row(
-            job_id, "https://github.com/org/repo", "Unreachable no event",
+            job_id, "https://github.com/org/repo", "Unreachable event recorded",
             status="running", opencode_session_id=session_id,
         )
 
@@ -3242,15 +3499,17 @@ class TestAbortEvents:
         async with client as c:
             response = await c.post(f"/jobs/{job_id}/abort")
 
-        assert response.status_code == 503
-        assert row["status"] == "aborting"
+        assert response.status_code == 200
+        assert row["status"] == "aborted"
 
-        # No INSERT into job_events should have happened
+        # An abort event IS now recorded even when OpenCode is unreachable
         insert_calls = [
             (sql, args) for sql, args in execute_args_list
             if "INSERT INTO job_events" in sql
         ]
-        assert len(insert_calls) == 0
+        assert len(insert_calls) == 1
+        insert_args = insert_calls[0][1]
+        assert insert_args[2] == "aborted"  # event_type
 
     @pytest.mark.asyncio
     async def test_abort_event_recorded_for_no_session_job(self, mock_conn):
