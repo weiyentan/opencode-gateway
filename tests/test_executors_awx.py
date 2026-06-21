@@ -1209,7 +1209,7 @@ class TestAWXExecutorPluginCancelJob:
         plugin = _make_plugin(client)
 
         # Workspace was tracked before but no active job now.
-        plugin._ever_tracked_workspaces.add(self.WS_ID)
+        plugin._ever_tracked_workspaces[self.WS_ID] = True
 
         # executor_job_id should still be used despite ever_tracked.
         req = CancelJobRequest(
