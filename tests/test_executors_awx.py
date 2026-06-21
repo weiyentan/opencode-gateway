@@ -5,6 +5,7 @@ Covers normal flow, error paths, and template-ID validation.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -1339,3 +1340,89 @@ class TestExecutorJobIdPersistence:
         assert resp.status == "cancelled"
         # Verify the correct AWX job was cancelled (not create_workspace's job).
         client.cancel_job.assert_awaited_with(201)
+
+    async def test_db_contains_active_awx_job_id_while_start_opencode_is_blocked(
+        self,
+    ):
+        """Prove executor_job_id is persisted (via callback) while
+        start_opencode is in-flight and wait_for_job is still blocked.
+
+        This closes the cross-process cancellation race window — the
+        callback fires *before* wait_for_job blocks, so the executor_job_id
+        is ready for a concurrent abort request to read from the DB.
+        """
+        # ── Arrange ───────────────────────────────────────────────────────
+        # Blocking event for wait_for_job — simulates a long-running AWX job.
+        wait_blocker = asyncio.Event()
+
+        # Tracking for the on_awx_job_launched callback.
+        callback_fired = asyncio.Event()
+        callback_args: dict[str, int | UUID] = {}
+
+        async def on_awx_job_launched(
+            gw_job_id: UUID, awx_job_id: int
+        ) -> None:
+            callback_args["gw_job_id"] = gw_job_id
+            callback_args["awx_job_id"] = awx_job_id
+            callback_fired.set()
+
+        async def blocking_wait_for_job(job_id: int) -> AWXJobResult:
+            """Block until the test releases the blocker."""
+            await wait_blocker.wait()
+            return AWXJobResult(
+                job_id=job_id,
+                status="successful",
+                artifacts={
+                    "session_id": (
+                        "00000000-1111-2222-3333-444444444444"
+                    ),
+                    "port": 9090,
+                },
+            )
+
+        client = AsyncMock(spec=AWXApiClient)
+        client.launch_job_template.return_value = AWXJobSummary(
+            job_id=201, status="pending"
+        )
+        client.wait_for_job.side_effect = blocking_wait_for_job
+
+        plugin = _make_plugin(client)
+        ws_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        req = StartOpencodeRequest(
+            workspace_id=ws_id,
+            gateway_job_id=self.GW_JOB_ID,
+        )
+
+        # ── Act ───────────────────────────────────────────────────────────
+        # Launch start_opencode as a background task — it will block
+        # inside wait_for_job while we inspect in-flight state.
+        bg_task = asyncio.create_task(
+            plugin.start_opencode(
+                req, on_awx_job_launched=on_awx_job_launched
+            )
+        )
+
+        # Wait for the callback to fire (before wait_for_job completes).
+        await callback_fired.wait()
+
+        # ── Assert while in-flight ────────────────────────────────────────
+        # 1. The callback received the correct AWX job ID.
+        assert callback_args["gw_job_id"] == self.GW_JOB_ID
+        assert callback_args["awx_job_id"] == 201
+
+        # 2. _executor_job_ids is populated before wait_for_job completes.
+        assert plugin._executor_job_ids.get(self.GW_JOB_ID) == 201
+
+        # 3. _active_awx_jobs still tracks the in-flight job.
+        assert plugin._active_awx_jobs.get(ws_id) == 201
+
+        # ── Cleanup ──────────────────────────────────────────────────────
+        # Release the blocker so start_opencode can complete.
+        wait_blocker.set()
+        resp = await bg_task
+
+        # Verify the background task completed successfully.
+        assert isinstance(resp, StartOpencodeResponse)
+        assert resp.status == "successful"
+        assert resp.port == 9090
