@@ -12,7 +12,7 @@ placeholder values such as zero UUID.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Set
 from uuid import UUID
 
 from app.core.secrets import redact_dict
@@ -121,6 +121,12 @@ class AWXExecutorPlugin(ExecutorPlugin):
         # Only accessed within async event-loop context — no locks needed.
         self._active_awx_jobs: dict[UUID, int] = {}
 
+        # Set of workspace IDs that have ever been tracked in _active_awx_jobs.
+        # Used by cancel_job to distinguish "never tracked" (no job was ever
+        # launched for this workspace) from "late cancel" (the job already
+        # completed and its tracking entry was cleaned up).
+        self._ever_tracked_workspaces: Set[UUID] = set()
+
     # ── Internal helpers ────────────────────────────────────────────────
 
     async def _launch_and_wait(
@@ -178,6 +184,7 @@ class AWXExecutorPlugin(ExecutorPlugin):
                     summary.job_id,
                 )
             self._active_awx_jobs[workspace_id] = summary.job_id
+            self._ever_tracked_workspaces.add(workspace_id)
 
         try:
             result = await self._client.wait_for_job(summary.job_id)
@@ -463,9 +470,53 @@ class AWXExecutorPlugin(ExecutorPlugin):
     async def cancel_job(
         self, request: CancelJobRequest
     ) -> CancelJobResponse:
-        """Future cancellation surface for an AWX-backed job.
+        """Cancel an in-flight AWX job for a workspace.
 
-        Currently a stub until workspace_id → AWX job ID tracking is wired.
+        Looks up the tracked AWX job ID for the workspace in
+        :attr:`_active_awx_jobs`. If a live AWX job is tracked,
+        calls :meth:`AWXApiClient.cancel_job` to cancel it.
+
+        If the workspace was **never** tracked (no job was ever launched
+        for it via a lifecycle method that supplies a workspace_id),
+        logs a warning and returns ``CancelJobResponse(status="cancelled")``
+        — there is nothing to cancel so the operation is trivially done.
+
+        If the workspace **was** tracked but the tracking entry has
+        already been cleaned up (the job reached terminal status before
+        cancel_job was called), logs a warning and returns
+        ``CancelJobResponse(status="no_active_job")``.
+
+        Raises:
+            AWXConnectionError: If the AWX instance is unreachable.
+            AWXHTTPError: If the server returns a non-2xx status.
+            AWXTimeoutError: If the cancel request times out.
         """
         logger.info("cancel_job: workspace=%s", request.workspace_id)
+
+        awx_job_id = self._active_awx_jobs.pop(request.workspace_id, None)
+        if awx_job_id is not None:
+            # Active in-flight job found — cancel it via the AWX API.
+            await self._client.cancel_job(awx_job_id)
+            logger.info(
+                "cancel_job: AWX job %d cancelled for workspace %s",
+                awx_job_id,
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="cancelled")
+
+        # No active job tracked for this workspace.
+        if request.workspace_id in self._ever_tracked_workspaces:
+            # Was tracked before but the job already completed.
+            logger.warning(
+                "cancel_job: workspace %s had an active AWX job that already "
+                "completed (late cancel)",
+                request.workspace_id,
+            )
+            return CancelJobResponse(status="no_active_job")
+
+        # Workspace was never tracked at all.
+        logger.warning(
+            "cancel_job: no AWX job was ever tracked for workspace %s",
+            request.workspace_id,
+        )
         return CancelJobResponse(status="cancelled")

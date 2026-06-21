@@ -17,11 +17,14 @@ from app.executors.awx.exceptions import (
     AWXArtifactError,
     AWXClientError,
     AWXConnectionError,
+    AWXHTTPError,
     AWXJobError,
     AWXTimeoutError,
 )
 from app.executors.awx.plugin import AWXExecutorPlugin
 from app.executors.models import (
+    CancelJobRequest,
+    CancelJobResponse,
     CleanupWorkspaceRequest,
     CleanupWorkspaceResponse,
     CollectStateRequest,
@@ -1014,3 +1017,90 @@ class TestAWXActiveJobTracking:
 
         # No tracking entries should have been created.
         assert plugin._active_awx_jobs == {}
+
+
+# ── Cancel job ──────────────────────────────────────────────────────────
+
+
+class TestAWXExecutorPluginCancelJob:
+    """Tests for AWXExecutorPlugin.cancel_job()."""
+
+    WS_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+    async def test_cancel_job_success(self):
+        """cancel_job finds an active AWX job and cancels it."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.return_value = AWXJobResult(
+            job_id=42, status="canceled"
+        )
+        plugin = _make_plugin(client)
+
+        # Simulate an active tracked job.
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces.add(self.WS_ID)
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_awaited_once_with(42)
+        # Entry should have been popped from the tracking dict.
+        assert self.WS_ID not in plugin._active_awx_jobs
+
+    async def test_cancel_job_not_tracked(self):
+        """cancel_job with a workspace that was never tracked
+        returns status='cancelled' without calling the API."""
+        client = AsyncMock(spec=AWXApiClient)
+        plugin = _make_plugin(client)
+
+        req = CancelJobRequest(workspace_id=UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "cancelled"
+        client.cancel_job.assert_not_awaited()
+
+    async def test_cancel_job_late_cancel(self):
+        """cancel_job after the job has already completed (tracking
+        cleaned up) returns status='no_active_job'."""
+        client = AsyncMock(spec=AWXApiClient)
+        plugin = _make_plugin(client)
+
+        # Simulate a workspace that was tracked but the job finished.
+        plugin._ever_tracked_workspaces.add(self.WS_ID)
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        resp = await plugin.cancel_job(req)
+
+        assert isinstance(resp, CancelJobResponse)
+        assert resp.status == "no_active_job"
+        client.cancel_job.assert_not_awaited()
+
+    async def test_cancel_job_api_failure_propagates(self):
+        """When client.cancel_job raises, the exception propagates."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.side_effect = AWXHTTPError("Server error", status_code=500)
+        plugin = _make_plugin(client)
+
+        plugin._active_awx_jobs[self.WS_ID] = 42
+        plugin._ever_tracked_workspaces.add(self.WS_ID)
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXHTTPError, match="Server error"):
+            await plugin.cancel_job(req)
+
+        client.cancel_job.assert_awaited_once_with(42)
+
+    async def test_cancel_job_connection_error_propagates(self):
+        """AWXConnectionError from cancel_job propagates."""
+        client = AsyncMock(spec=AWXApiClient)
+        client.cancel_job.side_effect = AWXConnectionError("Connection refused")
+        plugin = _make_plugin(client)
+
+        plugin._active_awx_jobs[self.WS_ID] = 99
+        plugin._ever_tracked_workspaces.add(self.WS_ID)
+
+        req = CancelJobRequest(workspace_id=self.WS_ID)
+        with pytest.raises(AWXConnectionError, match="refused"):
+            await plugin.cancel_job(req)
