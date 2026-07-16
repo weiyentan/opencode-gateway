@@ -164,10 +164,11 @@ class TestListClients:
 
     @pytest.mark.asyncio
     async def test_list_clients_returns_list(self):
-        """Listing clients returns a list of client objects."""
+        """Listing clients returns a paginated response with client objects."""
         mock_conn = AsyncMock()
         c1 = _client_row(id=uuid.uuid4(), name="alpha")
         c2 = _client_row(id=uuid.uuid4(), name="beta")
+        mock_conn.fetchval = AsyncMock(return_value=2)
         mock_conn.fetch = AsyncMock(return_value=[c1, c2])
         client = _build_client(mock_conn)
 
@@ -177,14 +178,19 @@ class TestListClients:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert len(data["data"]) == 2
-        assert data["data"][0]["name"] == "alpha"
-        assert data["data"][1]["name"] == "beta"
+        page = data["data"]
+        assert page["total"] == 2
+        assert page["limit"] == 50
+        assert page["offset"] == 0
+        assert len(page["items"]) == 2
+        assert page["items"][0]["name"] == "alpha"
+        assert page["items"][1]["name"] == "beta"
 
     @pytest.mark.asyncio
     async def test_list_clients_empty(self):
-        """Listing clients when none exist returns empty list."""
+        """Listing clients when none exist returns empty paginated response."""
         mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=0)
         mock_conn.fetch = AsyncMock(return_value=[])
         client = _build_client(mock_conn)
 
@@ -193,7 +199,11 @@ class TestListClients:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["data"] == []
+        page = data["data"]
+        assert page["items"] == []
+        assert page["total"] == 0
+        assert page["limit"] == 50
+        assert page["offset"] == 0
 
 
 class TestGetClient:

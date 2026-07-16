@@ -358,8 +358,10 @@ async def _fetch_sessions(
     params: list = []
 
     filters: list[str] = []
-    filters.append("s.first_message_at >= $1")
+    # Overlap: session started before or at range end
     filters.append("s.first_message_at <= $2")
+    # Session ended after range start, or is still ongoing
+    filters.append("(s.last_message_at >= $1 OR s.last_message_at IS NULL)")
 
     if client_id is not None:
         filters.append(f"s.client_id = ${len(params) + 3}")

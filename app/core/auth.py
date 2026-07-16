@@ -192,9 +192,7 @@ async def require_collector_token(
         except Exception:
             logger.debug("Failed to update last_used_at for credential %s", row["credential_id"])
 
-    import asyncio
-
-    asyncio.ensure_future(_touch_last_used())
+    await _touch_last_used()
 
     # Attach identity to request state for downstream handlers
     request.state.client_id = str(row["client_id"])

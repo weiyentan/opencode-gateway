@@ -12,15 +12,14 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from app.core.config import get_settings
 from app.db.session import DatabasePool
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 router = APIRouter(tags=["health"])
 
-# Default heartbeat threshold in seconds — collectors that haven't pushed
-# within this window are considered stale.
-_DEFAULT_HEARTBEAT_THRESHOLD = 300
 
 
 def _get_version() -> str:
@@ -85,7 +84,7 @@ class HealthResponse(BaseModel):
 def _derive_health(
     last_ts: datetime | None,
     now: datetime,
-    threshold: int = _DEFAULT_HEARTBEAT_THRESHOLD,
+    threshold: int = settings.heartbeat_threshold,
 ) -> str:
     """Return 'healthy', 'stale', or 'unknown' based on last activity timestamp."""
     if last_ts is None:
@@ -99,7 +98,7 @@ def _derive_health(
 async def _collector_health_summary(
     db_pool: DatabasePool,
     now: datetime,
-    threshold: int = _DEFAULT_HEARTBEAT_THRESHOLD,
+    threshold: int = settings.heartbeat_threshold,
 ) -> list[CollectorHealth]:
     """Query collectors and their most recent ingest-batch activity."""
     try:
@@ -145,7 +144,7 @@ async def _collector_health_summary(
 async def _source_db_health_summary(
     db_pool: DatabasePool,
     now: datetime,
-    threshold: int = _DEFAULT_HEARTBEAT_THRESHOLD,
+    threshold: int = settings.heartbeat_threshold,
 ) -> list[SourceDatabaseHealth]:
     """Query source databases and their last-seen / record-count activity."""
     try:

@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.identity import generate_collector_token
 from app.core.schemas.identity import (
@@ -21,6 +21,7 @@ from app.core.schemas.identity import (
     TokenProvisionResponse,
     TokenRead,
 )
+from app.core.schemas.usage import PaginatedResponse
 from app.db.session import get_session
 
 router = APIRouter(prefix="/admin/clients", tags=["admin"])
@@ -77,16 +78,24 @@ async def create_client(
     return _row_to_client_read(row)
 
 
-@router.get("", response_model=list[ClientRead])
+@router.get("", response_model=PaginatedResponse[ClientRead])
 async def list_clients(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
-) -> list[ClientRead]:
-    """List all registered OpenCode clients."""
+) -> PaginatedResponse[ClientRead]:
+    """List registered OpenCode clients with pagination."""
+    total: int = await conn.fetchval("SELECT COUNT(*) FROM opencode_clients")
+
     rows = await conn.fetch(
         "SELECT id, name, description, is_active, created_at, updated_at "
-        "FROM opencode_clients ORDER BY name"
+        "FROM opencode_clients ORDER BY name "
+        "LIMIT $1 OFFSET $2",
+        limit,
+        offset,
     )
-    return [_row_to_client_read(r) for r in rows]
+    items = [_row_to_client_read(r) for r in rows]
+    return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{client_id}", response_model=ClientWithTokens)

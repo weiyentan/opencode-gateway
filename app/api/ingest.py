@@ -94,7 +94,7 @@ def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
     if a is None or b is None:
         return False
     try:
-        return abs(float(a) - float(b)) < 0.0001
+        return abs(a - b) < Decimal('0.0001')
     except (ValueError, TypeError, InvalidOperation):
         return False
 

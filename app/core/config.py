@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"
 
+    # Heartbeat monitoring
+    # Collectors that haven't pushed telemetry within this many seconds
+    # are considered stale. Maps to env var GATEWAY_HEARTBEAT_THRESHOLD.
+    heartbeat_threshold: int = 300
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
