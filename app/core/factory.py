@@ -126,8 +126,10 @@ def create_app(
 
     from app.api.admin_clients import router as admin_clients_router
     from app.api.health import router as health_router
+    from app.api.ingest import router as ingest_router
 
     app.include_router(health_router)
     app.include_router(admin_clients_router)
+    app.include_router(ingest_router)
 
     return app
