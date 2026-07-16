@@ -124,8 +124,10 @@ def create_app(
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
 
+    from app.api.admin_clients import router as admin_clients_router
     from app.api.health import router as health_router
 
     app.include_router(health_router)
+    app.include_router(admin_clients_router)
 
     return app

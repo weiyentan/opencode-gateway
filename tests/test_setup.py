@@ -2,10 +2,9 @@
 
 Tests the ``check_required_tables()`` function which verifies that all
 required tables exist in the database after Alembic migrations have been
-applied.  After the execution-era cleanup (issue #207), the required
-tables list is empty — observability tables will be added in future
-slices.  Each test simulates different table sets by controlling what
-``information_schema.tables`` returns.
+applied.  The identity-layer tables (opencode_clients,
+collector_credentials) are now required.  Each test simulates different
+table sets by controlling what ``information_schema.tables`` returns.
 """
 
 from __future__ import annotations
@@ -45,47 +44,65 @@ def _make_mock_pool(existing_tables: set[str]) -> MagicMock:
 class TestCheckRequiredTables:
     """Tests for ``check_required_tables()`` startup validation.
 
-    After the execution-era cleanup, the required tables list is empty.
-    The function should always pass regardless of what tables exist.
+    After slice 2, the required tables list includes the identity-layer
+    tables: ``opencode_clients`` and ``collector_credentials``.
     """
 
     @pytest.mark.asyncio
-    async def test_success_when_required_list_is_empty(self) -> None:
-        """Should pass silently when _REQUIRED_TABLES is empty (current state)."""
+    async def test_success_when_all_required_present(self) -> None:
+        """Should pass silently when all required tables exist."""
+        existing = {"opencode_clients", "collector_credentials"}
+        mock_pool = _make_mock_pool(existing)
+
+        result = await check_required_tables(mock_pool)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_success_with_extra_tables(self) -> None:
+        """Should pass when required tables exist alongside extra tables."""
+        existing = {
+            "opencode_clients",
+            "collector_credentials",
+            "alembic_version",
+            "some_other_table",
+        }
+        mock_pool = _make_mock_pool(existing)
+
+        result = await check_required_tables(mock_pool)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_when_required_tables_missing(self) -> None:
+        """Should raise ``RuntimeError`` when required tables are missing."""
         existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)
 
-        result = await check_required_tables(mock_pool)
+        with pytest.raises(RuntimeError) as excinfo:
+            await check_required_tables(mock_pool)
 
-        assert result is None
+        msg = str(excinfo.value)
+        assert "opencode_clients" in msg
+        assert "collector_credentials" in msg
+        assert "alembic upgrade head" in msg
 
     @pytest.mark.asyncio
-    async def test_success_even_when_database_is_empty(self) -> None:
-        """Should pass when database has no tables and required list is empty."""
-        existing: set[str] = set()
+    async def test_raises_when_partial_tables_present(self) -> None:
+        """Should raise when only some required tables exist."""
+        existing = {"opencode_clients"}  # missing collector_credentials
         mock_pool = _make_mock_pool(existing)
 
-        result = await check_required_tables(mock_pool)
+        with pytest.raises(RuntimeError) as excinfo:
+            await check_required_tables(mock_pool)
 
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_success_when_database_has_extra_tables(self) -> None:
-        """Should pass when database has tables but required list is empty."""
-        existing = {"alembic_version", "some_other_table"}
-        mock_pool = _make_mock_pool(existing)
-
-        result = await check_required_tables(mock_pool)
-
-        assert result is None
+        msg = str(excinfo.value)
+        assert "collector_credentials" in msg
+        assert "alembic upgrade head" in msg
 
     @pytest.mark.asyncio
-    async def test_raises_when_tables_required_but_missing(self) -> None:
-        """Should raise ``RuntimeError`` when required tables are missing.
-
-        Patches ``_REQUIRED_TABLES`` to include a table that doesn't exist
-        (future-slice behavior, not current state).
-        """
+    async def test_raises_when_patched_tables_missing(self) -> None:
+        """Should raise ``RuntimeError`` when patched required tables are missing."""
         required = ["future_sessions"]
         existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)

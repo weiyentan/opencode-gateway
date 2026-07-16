@@ -27,9 +27,12 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 # Tables that MUST exist after migrations have been applied.
-# Currently empty — observability tables will be added in future slices
-# of the refactor.  The Alembic version table is managed by Alembic itself.
-_REQUIRED_TABLES: list[str] = []
+# Identity-layer tables are the first observability tables in the refactor.
+# Additional observability tables will be added in future slices.
+_REQUIRED_TABLES: list[str] = [
+    "opencode_clients",
+    "collector_credentials",
+]
 
 # Resolved once when the module is loaded.
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
