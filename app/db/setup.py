@@ -8,10 +8,12 @@ On startup the Gateway:
 
 1. Runs ``alembic upgrade head`` to bring the database to the latest
    migration revision.
-2. Checks that all required tables (core domain tables + observation
-   tables from ADR 0001) exist in the database.
+2. Checks that all required tables exist in the database.
 3. Fails fast with a clear error message if any required table is
    missing, so operators can diagnose the problem immediately.
+
+After the execution-era cleanup (issue #207), the required tables list
+is empty — observability tables will be added in future slices.
 """
 
 from __future__ import annotations
@@ -25,21 +27,9 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 # Tables that MUST exist after migrations have been applied.
-# This list covers the four core domain tables (created by migration
-# 0000), the runner/observation tables (created by 0001), and webhooks
-# (created by 0002).
-_REQUIRED_TABLES = [
-    "gateway_jobs",
-    "workspaces",
-    "job_events",
-    "approvals",
-    "runners",
-    "runner_events",
-    "runner_observations",
-    "workspace_observations",
-    "opencode_instance_observations",
-    "webhooks",
-]
+# Currently empty — observability tables will be added in future slices
+# of the refactor.  The Alembic version table is managed by Alembic itself.
+_REQUIRED_TABLES: list[str] = []
 
 # Resolved once when the module is loaded.
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent

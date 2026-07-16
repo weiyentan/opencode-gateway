@@ -13,7 +13,6 @@ from fastapi import FastAPI
 from app.core.config import get_settings
 from app.db.schema import ensure_schema
 from app.db.session import DatabasePool
-from app.scheduler import CleanupScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +31,15 @@ def create_app(
     *,
     configure_logging: bool = True,
 ) -> FastAPI:
-    """Build the FastAPI Gateway application.
+    """Build the FastAPI Gateway observability application.
 
     Accepts optional startup/shutdown callbacks that are invoked inside
     an ``@asynccontextmanager`` lifespan handler.  The callbacks may be
     either synchronous or asynchronous.
 
-    The application also initialises a Postgres connection pool on
-    startup and closes it on shutdown.  If Postgres is unreachable the
-    app logs a warning and continues without a pool.
-
-    A background cleanup scheduler is started during the boot sequence
-    and stopped gracefully on shutdown.
+    The application initialises a Postgres connection pool on startup
+    and closes it on shutdown.  If Postgres is unreachable the app logs
+    a warning and continues without a pool.
 
     Args:
         on_startup: Optional list of callbacks to run on startup.
@@ -88,24 +84,7 @@ def create_app(
         if app.state.pool is not None and app.state.pool.pool is not None:  # type: ignore[attr-defined]
             await ensure_schema(app.state.pool.pool)  # type: ignore[attr-defined]
 
-        # --- Executor plugin ---
-        executor = _create_executor(settings)
-
-        # --- Cleanup scheduler ---
-        scheduler = CleanupScheduler(
-            interval_seconds=settings.cleanup_interval_seconds,
-            batch_size=settings.cleanup_batch_size,
-        )
-        app.state.scheduler = scheduler  # type: ignore[attr-defined]
-        await scheduler.start(
-            pool=app.state.pool,  # type: ignore[attr-defined]
-            executor=executor,
-        )
-
         yield
-
-        # --- Cleanup scheduler shutdown ---
-        await scheduler.stop()
 
         # --- Postgres pool shutdown ---
         db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]
@@ -146,38 +125,7 @@ def create_app(
     app.add_exception_handler(HTTPException, http_exception_handler)
 
     from app.api.health import router as health_router
-    from app.api.jobs import router as jobs_router
-    from app.api.observations import router as observations_router
-    from app.api.runners import router as runners_router
-    from app.api.webhooks import router as webhooks_router
-    from app.api.workspaces import router as workspaces_router
 
     app.include_router(health_router)
-    app.include_router(jobs_router)
-    app.include_router(observations_router)
-    app.include_router(runners_router)
-    app.include_router(webhooks_router)
-    app.include_router(workspaces_router)
 
     return app
-
-
-def _create_executor(settings: Any) -> Any:
-    """Instantiate the configured executor plugin.
-
-    Delegates to :func:`app.executors.factory.create_executor_from_settings`
-    so all executor types follow the same construction path.  The AWX
-    executor receives a fully-configured ``AWXApiClient`` and validated
-    template IDs rather than being instantiated with no arguments.
-
-    Returns ``None`` if the executor type is not found in the registry
-    so the scheduler can skip cleanup ticks gracefully instead of
-    crashing the Gateway process.
-
-    Raises:
-        ValueError: If the executor type is ``"awx"`` and required
-            AWX settings are missing (fail-fast at startup).
-    """
-    from app.executors.factory import create_executor_from_settings
-
-    return create_executor_from_settings(settings)

@@ -1,7 +1,7 @@
 [project]
 name = "opencode-gateway"
 version = "0.1.0"
-description = "OpenCode Gateway — portable execution control plane for headless OpenCode"
+description = "OpenCode Gateway — observability service for headless OpenCode"
 requires-python = ">=3.12"
 
 [tool.pytest.ini_options]

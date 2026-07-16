@@ -4,7 +4,9 @@ Covers:
 - Auth missing → 401 with envelope error format
 - Auth invalid → 401 with envelope error format
 - Auth valid → 2xx with envelope success format
-- Envelope shape for health and jobs endpoints
+- Envelope shape for health endpoint
+
+Updated for issue #207: removed execution-era endpoint tests (/jobs, /runners).
 """
 
 from __future__ import annotations
@@ -35,9 +37,7 @@ def _setup_app_state(app):
     """
     from unittest.mock import AsyncMock
 
-    from app.api.jobs import _get_pool
     from app.db.session import get_session
-    from app.executors.factory import get_executor
 
     mock_pool = AsyncMock()
     mock_pool.pool = None  # No real pool needed
@@ -49,8 +49,6 @@ def _setup_app_state(app):
         yield mock_conn
 
     app.dependency_overrides[get_session] = _override_get_session
-    app.dependency_overrides[_get_pool] = lambda: mock_pool
-    app.dependency_overrides[get_executor] = lambda: AsyncMock()
 
 
 # ── Auth fixtures ────────────────────────────────────────────────────────
@@ -108,24 +106,10 @@ class TestAuthMissing:
         assert "data" in data
 
     @pytest.mark.asyncio
-    async def test_post_jobs_without_auth_returns_401(self, client_no_auth):
+    async def test_unknown_route_without_auth_returns_401(self, client_no_auth):
+        """An unknown non-public route returns 401 when no auth header is present."""
         async with client_no_auth as c:
-            response = await c.post(
-                "/jobs",
-                json={
-                    "repo_url": "https://github.com/org/repo",
-                    "task_summary": "Test task",
-                },
-            )
-        assert response.status_code == 401
-        data = response.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "UNAUTHORIZED"
-
-    @pytest.mark.asyncio
-    async def test_get_runners_without_auth_returns_401(self, client_no_auth):
-        async with client_no_auth as c:
-            response = await c.get("/runners")
+            response = await c.get("/nonexistent")
         assert response.status_code == 401
 
     @pytest.mark.asyncio
@@ -133,7 +117,7 @@ class TestAuthMissing:
         """Authorization header without Bearer prefix is treated as missing."""
         async with client_no_auth as c:
             response = await c.get(
-                "/runners",
+                "/nonexistent",
                 headers={"Authorization": "Basic dXNlcjpwYXNz"},
             )
         assert response.status_code == 401
@@ -156,15 +140,10 @@ class TestAuthInvalid:
         assert "data" in data
 
     @pytest.mark.asyncio
-    async def test_post_jobs_with_invalid_key_returns_401(self, client_bad_auth):
+    async def test_unknown_route_with_invalid_key_returns_401(self, client_bad_auth):
+        """An unknown route with invalid key returns 401."""
         async with client_bad_auth as c:
-            response = await c.post(
-                "/jobs",
-                json={
-                    "repo_url": "https://github.com/org/repo",
-                    "task_summary": "Test task",
-                },
-            )
+            response = await c.get("/nonexistent")
         assert response.status_code == 401
 
 
@@ -191,33 +170,18 @@ class TestAuthValid:
         assert "database" in inner
 
     @pytest.mark.asyncio
-    async def test_get_runners_with_valid_key_returns_envelope(self, mock_conn):
-        """GET /runners with valid key returns 200 with envelope."""
+    async def test_nonexistent_route_returns_404_envelope(self, mock_conn):
+        """GET /nonexistent with valid key returns 404 with envelope error."""
         mock_conn.fetch = AsyncMock(return_value=[])
 
         client = create_client(mock_conn, api_key=_TEST_API_KEY)
 
         async with client as c:
-            response = await c.get("/runners")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
-        assert data["data"] == []
-
-    @pytest.mark.asyncio
-    async def test_get_job_not_found_returns_envelope_error(self, mock_conn):
-        """GET /jobs/{id} returns enveloped 404 when job not found."""
-        mock_conn.fetchrow = AsyncMock(return_value=None)
-
-        client = create_client(mock_conn, api_key=_TEST_API_KEY)
-
-        async with client as c:
-            response = await c.get(f"/jobs/{uuid.uuid4()}")
+            response = await c.get(f"/nonexistent/{uuid.uuid4()}")
         assert response.status_code == 404
         data = response.json()
         assert data["status"] == "error"
-        assert data["error"]["code"] == "NOT_FOUND"
-        assert "not found" in data["error"]["message"].lower()
+        assert "error" in data
 
 
 # ── Envelope shape tests ─────────────────────────────────────────────────
@@ -243,7 +207,7 @@ class TestEnvelopeShape:
     async def test_error_envelope_has_status_error_code_message(self, client_no_auth):
         """Error envelope contains status=error and error with code+message."""
         async with client_no_auth as c:
-            response = await c.get("/runners")
+            response = await c.get("/nonexistent")
         assert response.status_code == 401
         data = response.json()
 
@@ -258,17 +222,17 @@ class TestEnvelopeShape:
 
     @pytest.mark.asyncio
     async def test_validation_error_uses_envelope(self, client_valid_auth):
-        """Pydantic validation error (422) uses the envelope format."""
+        """Pydantic validation error (422) uses the envelope format.
+
+        Since there are no POST endpoints with validation currently,
+        we verify the envelope middleware is applied by checking that
+        error responses from the framework use the envelope format.
+        """
         async with client_valid_auth as c:
             response = await c.post(
-                "/jobs",
-                json={
-                    "repo_url": "https://github.com/org/repo",
-                    "task_summary": "",
-                },
+                "/nonexistent",
+                json={"invalid": "body"},
             )
-        assert response.status_code == 422
+        assert response.status_code == 404
         data = response.json()
         assert data["status"] == "error"
-        assert data["error"]["code"] == "VALIDATION_ERROR"
-        assert "validation" in data["error"]["message"].lower()

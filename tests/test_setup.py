@@ -2,7 +2,9 @@
 
 Tests the ``check_required_tables()`` function which verifies that all
 required tables exist in the database after Alembic migrations have been
-applied.  Each test simulates different table sets by controlling what
+applied.  After the execution-era cleanup (issue #207), the required
+tables list is empty — observability tables will be added in future
+slices.  Each test simulates different table sets by controlling what
 ``information_schema.tables`` returns.
 """
 
@@ -43,133 +45,71 @@ def _make_mock_pool(existing_tables: set[str]) -> MagicMock:
 class TestCheckRequiredTables:
     """Tests for ``check_required_tables()`` startup validation.
 
-    Each test verifies that ``check_required_tables()`` raises a
-    ``RuntimeError`` with a clear message naming the missing table(s)
-    when required tables are absent, and passes silently when all
-    required tables are present.
+    After the execution-era cleanup, the required tables list is empty.
+    The function should always pass regardless of what tables exist.
     """
 
-    # -- Success case ---------------------------------------------------
-
     @pytest.mark.asyncio
-    async def test_success_when_all_tables_exist(self) -> None:
-        """Should pass silently when the live ``_REQUIRED_TABLES`` are present."""
-        existing = set(_REQUIRED_TABLES)
+    async def test_success_when_required_list_is_empty(self) -> None:
+        """Should pass silently when _REQUIRED_TABLES is empty (current state)."""
+        existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)
 
         result = await check_required_tables(mock_pool)
 
         assert result is None
 
-    # -- Single-table missing cases -------------------------------------
-
     @pytest.mark.asyncio
-    async def test_raises_when_gateway_jobs_missing(self) -> None:
-        """Should raise ``RuntimeError`` naming *gateway_jobs* when absent."""
-        required = set(_REQUIRED_TABLES)
-        existing = required - {"gateway_jobs"}
+    async def test_success_even_when_database_is_empty(self) -> None:
+        """Should pass when database has no tables and required list is empty."""
+        existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)
 
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
-            with pytest.raises(RuntimeError) as excinfo:
-                await check_required_tables(mock_pool)
+        result = await check_required_tables(mock_pool)
 
-        msg = str(excinfo.value)
-        assert "gateway_jobs" in msg
-        assert "alembic upgrade head" in msg
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_raises_when_workspaces_missing(self) -> None:
-        """Should raise ``RuntimeError`` naming *workspaces* when absent."""
-        required = set(_REQUIRED_TABLES)
-        existing = required - {"workspaces"}
+    async def test_success_when_database_has_extra_tables(self) -> None:
+        """Should pass when database has tables but required list is empty."""
+        existing = {"alembic_version", "some_other_table"}
         mock_pool = _make_mock_pool(existing)
 
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
-            with pytest.raises(RuntimeError) as excinfo:
-                await check_required_tables(mock_pool)
+        result = await check_required_tables(mock_pool)
 
-        msg = str(excinfo.value)
-        assert "workspaces" in msg
-        assert "alembic upgrade head" in msg
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_raises_when_runner_events_missing(self) -> None:
-        """Should raise ``RuntimeError`` naming *runner_events* when absent.
+    async def test_raises_when_tables_required_but_missing(self) -> None:
+        """Should raise ``RuntimeError`` when required tables are missing.
 
-        *runner_events* is not yet in the production ``_REQUIRED_TABLES``
-        list (it will be added by a separate issue), so we patch the list
-        to include it for this test.
+        Patches ``_REQUIRED_TABLES`` to include a table that doesn't exist
+        (future-slice behavior, not current state).
         """
-        required = set(_REQUIRED_TABLES) | {"runner_events", "webhooks"}
-        existing = required - {"runner_events"}
+        required = ["future_sessions"]
+        existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)
 
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
+        with patch("app.db.setup._REQUIRED_TABLES", required):
             with pytest.raises(RuntimeError) as excinfo:
                 await check_required_tables(mock_pool)
 
         msg = str(excinfo.value)
-        assert "runner_events" in msg
+        assert "future_sessions" in msg
         assert "alembic upgrade head" in msg
-
-    @pytest.mark.asyncio
-    async def test_raises_when_webhooks_missing(self) -> None:
-        """Should raise ``RuntimeError`` naming *webhooks* when absent.
-
-        *webhooks* is not yet in the production ``_REQUIRED_TABLES`` list
-        (it will be added by a separate issue), so we patch the list to
-        include it for this test.
-        """
-        required = set(_REQUIRED_TABLES) | {"runner_events", "webhooks"}
-        existing = required - {"webhooks"}
-        mock_pool = _make_mock_pool(existing)
-
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
-            with pytest.raises(RuntimeError) as excinfo:
-                await check_required_tables(mock_pool)
-
-        msg = str(excinfo.value)
-        assert "webhooks" in msg
-        assert "alembic upgrade head" in msg
-
-    # -- Multi-table missing case ---------------------------------------
 
     @pytest.mark.asyncio
     async def test_error_message_lists_all_missing_tables(self) -> None:
         """Error message should name **all** missing tables, not just the first."""
-        required = set(_REQUIRED_TABLES) | {"runner_events", "webhooks"}
-        missing = {"runner_events", "webhooks", "approvals"}
-        existing = required - missing
-        mock_pool = _make_mock_pool(existing)
-
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
-            with pytest.raises(RuntimeError) as excinfo:
-                await check_required_tables(mock_pool)
-
-        msg = str(excinfo.value)
-        for table in missing:
-            assert table in msg, f"Missing table '{table}' not found in error message"
-        assert "alembic upgrade head" in msg
-
-    # -- Edge cases -----------------------------------------------------
-
-    @pytest.mark.asyncio
-    async def test_raises_when_database_is_empty(self) -> None:
-        """Should raise when the *required* list is not empty, even if DB is empty.
-
-        If the database has no tables at all, all required tables should
-        be reported as missing.
-        """
-        required = set(_REQUIRED_TABLES)
+        required = ["table_a", "table_b", "table_c"]
         existing: set[str] = set()
         mock_pool = _make_mock_pool(existing)
 
-        with patch("app.db.setup._REQUIRED_TABLES", list(required)):
+        with patch("app.db.setup._REQUIRED_TABLES", required):
             with pytest.raises(RuntimeError) as excinfo:
                 await check_required_tables(mock_pool)
 
         msg = str(excinfo.value)
-        for table in sorted(required):
-            assert table in msg, f"Table '{table}' should appear in error message"
+        for table in required:
+            assert table in msg, f"Missing table '{table}' not found in error message"
         assert "alembic upgrade head" in msg
