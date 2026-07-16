@@ -1,59 +1,15 @@
-"""Tests for database schema management — schema.sql and ensure_schema()."""
+"""Tests for database schema management — ensure_schema()."""
 
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 
-class TestSchemaSqlFile:
-    """Tests that schema.sql exists and contains the expected DDL."""
-
-    def test_schema_sql_file_exists(self):
-        """schema.sql should be present in the app/db/ directory."""
-        from pathlib import Path
-
-        schema_path = Path(__file__).parent.parent / "app" / "db" / "schema.sql"
-        assert schema_path.is_file(), f"schema.sql not found at {schema_path}"
-
-    def test_schema_sql_contains_gateway_jobs_table(self):
-        """schema.sql must contain CREATE TABLE IF NOT EXISTS gateway_jobs."""
-        from pathlib import Path
-
-        schema_path = Path(__file__).parent.parent / "app" / "db" / "schema.sql"
-        sql = schema_path.read_text()
-
-        assert "CREATE TABLE IF NOT EXISTS gateway_jobs" in sql
-        # Verify all required columns exist in the DDL
-        required_columns = [
-            "id",
-            "status",
-            "repo_url",
-            "task_summary",
-            "runner_id",
-            "workspace_name",
-            "opencode_url",
-            "opencode_session_id",
-            "executor_type",
-            "executor_job_id",
-            "branch_name",
-            "commit_sha",
-            "mr_url",
-            "workflow_run_id",
-            "failure_reason",
-            "created_at",
-            "updated_at",
-            "completed_at",
-            "diff",
-        ]
-        for col in required_columns:
-            assert col in sql, f"Column '{col}' missing from schema.sql"
-
-
 class TestEnsureSchema:
-    """Tests for ensure_schema() which loads and executes schema.sql."""
+    """Tests for ensure_schema() which runs Alembic migrations and checks required tables."""
 
     @pytest.mark.asyncio
-    async def test_ensure_schema_executes_sql_against_pool(self):
+    async def test_ensure_schema_runs_migrations_and_checks_tables(self):
         """ensure_schema() should run Alembic migrations and check required tables."""
         from unittest.mock import AsyncMock, MagicMock, patch
 

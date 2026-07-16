@@ -1,17 +1,20 @@
-"""API key authentication middleware for the OpenCode Gateway.
+"""API key authentication middleware and collector token auth for the
+OpenCode Gateway.
 
-Validates an ``Authorization: Bearer <api-key>`` header against the
-``GATEWAY_API_KEY`` setting using constant-time comparison.
+Two authentication layers:
 
-Authentication modes:
+1. **ApiKeyMiddleware** — Validates every request against the
+   ``GATEWAY_API_KEY`` setting (with exempt paths for health checks).
+   Used for admin/management endpoints.
 
-* **Production** (``GATEWAY_ENV=production``, default) — API key is
-  **required**.  The Gateway refuses to start without one.
-* **Development** (``GATEWAY_ENV=development``) — API key is optional;
-  requests pass through unauthenticated.
-* **Insecure opt-in** (``GATEWAY_ALLOW_INSECURE_AUTH=true``) —
-  explicitly allows production to run without an API key.  A loud
-  warning is logged at startup.  Not recommended for real deployments.
+2. **require_collector_token** — FastAPI dependency that validates
+   collector bearer tokens.  Used by future collector-facing endpoints.
+   Tokens are hashed with SHA-256 and checked against the
+   ``collector_credentials`` table.  Revoked tokens and tokens for
+   inactive clients are rejected with 401.
+
+These two layers are independent — the collector token dependency does
+not alter or interact with the API-key middleware.
 """
 
 from __future__ import annotations
@@ -19,12 +22,15 @@ from __future__ import annotations
 import hmac
 import logging
 
-from fastapi import Request
+import asyncpg
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
 from app.core.config import get_settings
+from app.core.identity import hash_token
+from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +101,112 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
             )
 
         return await call_next(request)
+
+
+# ── Collector token auth dependency ───────────────────────────────────────
+
+
+async def require_collector_token(
+    request: Request,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> dict[str, str]:
+    """FastAPI dependency — validate a collector bearer token.
+
+    Reads ``Authorization: Bearer <token>``, hashes the token with
+    SHA-256, and looks it up in ``collector_credentials``.
+
+    Returns a dict with ``client_id``, ``credential_id``, and
+    ``client_name`` for use by downstream handlers (attached to
+    ``request.state`` if desired).
+
+    Raises:
+        HTTPException(401): If the token is missing, malformed, not
+            found, revoked, or belongs to an inactive client.
+
+    .. note::
+
+        ``last_used_at`` is updated synchronously within the request
+        lifecycle.  The UPDATE is lightweight and adds minimal latency.
+        If the update fails it is logged but never surfaced to the caller.
+    """
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+        )
+
+    raw_token = auth_header.removeprefix("Bearer ").strip()
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Empty bearer token",
+        )
+
+    token_hash = hash_token(raw_token)
+
+    row = await conn.fetchrow(
+        """
+        SELECT cc.id         AS credential_id,
+               cc.revoked_at,
+               cc.last_used_at,
+               c.id          AS client_id,
+               c.name        AS client_name,
+               c.is_active   AS client_is_active
+        FROM collector_credentials cc
+        JOIN opencode_clients c ON c.id = cc.client_id
+        WHERE cc.token_hash = $1
+        """,
+        token_hash,
+    )
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
+    if row["revoked_at"] is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+        )
+
+    if not row["client_is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Client is deactivated",
+        )
+
+    # Synchronous last_used_at update (the UPDATE is fast — safe within request lifecycle)
+    from datetime import datetime, timezone
+
+    async def _touch_last_used() -> None:
+        """Update last_used_at for this credential synchronously.
+
+        The UPDATE is lightweight and runs within the request lifecycle.
+        If it fails it is silently logged — failures are best-effort
+        and never surfaced to the caller.
+        """
+        try:
+            await conn.execute(
+                "UPDATE collector_credentials SET last_used_at = $1 WHERE id = $2",
+                datetime.now(timezone.utc),
+                row["credential_id"],
+            )
+        except Exception:
+            logger.debug("Failed to update last_used_at for credential %s", row["credential_id"])
+
+    await _touch_last_used()
+
+    # Attach identity to request state for downstream handlers
+    request.state.client_id = str(row["client_id"])
+    request.state.credential_id = str(row["credential_id"])
+    request.state.client_name = row["client_name"]
+
+    return {
+        "client_id": str(row["client_id"]),
+        "credential_id": str(row["credential_id"]),
+        "client_name": row["client_name"],
+    }

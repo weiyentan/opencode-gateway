@@ -30,9 +30,7 @@ def _setup_app_state(app):
     the ASGI transport does not run the lifespan handler that normally
     initialises ``app.state.pool``.
     """
-    from app.api.jobs import _get_pool
     from app.db.session import get_session
-    from app.executors.factory import get_executor
 
     mock_pool = AsyncMock()
     mock_pool.pool = None
@@ -44,8 +42,6 @@ def _setup_app_state(app):
         yield mock_conn
 
     app.dependency_overrides[get_session] = _override_get_session
-    app.dependency_overrides[_get_pool] = lambda: mock_pool
-    app.dependency_overrides[get_executor] = lambda: AsyncMock()
 
 
 def _make_client(app, api_key: str | None) -> AsyncClient:

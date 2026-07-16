@@ -1,19 +1,24 @@
-"""SQLAlchemy ORM models — new pattern coexisting with existing asyncpg schema.sql."""
+"""SQLAlchemy ORM models — observability models added in later slices."""
 
 from app.db.models.base import Base
-from app.db.models.runner import (
-    OpenCodeInstanceObservation,
-    Runner,
-    RunnerEvent,
-    RunnerObservation,
-    WorkspaceObservation,
+from app.db.models.identity import CollectorCredential, OpenCodeClient
+from app.db.models.ingest import (
+    IngestAudit,
+    IngestBatch,
+    ObservedModel,
+    OpenCodeUsageRecord,
+    Session,
+    SourceDatabase,
 )
 
 __all__ = [
     "Base",
-    "OpenCodeInstanceObservation",
-    "Runner",
-    "RunnerEvent",
-    "RunnerObservation",
-    "WorkspaceObservation",
+    "CollectorCredential",
+    "IngestAudit",
+    "IngestBatch",
+    "ObservedModel",
+    "OpenCodeClient",
+    "OpenCodeUsageRecord",
+    "Session",
+    "SourceDatabase",
 ]

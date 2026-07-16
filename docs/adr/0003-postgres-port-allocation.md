@@ -1,8 +1,18 @@
 # ADR 0003: Port Allocation in Postgres
 
+> **Status: SUPERSEDED (2026-07-16, issue #207)**
+>
+> This ADR has been superseded by the observability service refactor.
+> Port allocation was an execution-era concern — the Gateway no longer
+> manages workspace provisioning or opencode serve instances.  The
+> `workspaces` table and port allocation logic have been removed from
+> the codebase.
+
 ## Status
 
-Accepted
+Superseded (was Accepted) - removed during issue #207 observability refactor.
+
+## Original Body (retained for historical reference)
 
 ## Context
 

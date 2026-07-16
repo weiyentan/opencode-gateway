@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import warnings
 
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Top-level settings for the OpenCode Gateway."""
+    """Top-level settings for the OpenCode Gateway observability service."""
 
     model_config = SettingsConfigDict(
         env_prefix="GATEWAY_",
@@ -67,9 +67,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Executor plugin
-    executor_type: str = "local"
-
     # Database
     database_host: str = "localhost"
     database_port: int = 5432
@@ -80,43 +77,13 @@ class Settings(BaseSettings):
     database_max_connections: int = 10
     database_connection_timeout: int = 30
 
-    # Pre-flight policy thresholds — used by ObservationBasedPolicy to
-    # decide whether a runner VM is healthy enough to accept a new job.
-    # Values are expressed as percentages (0–100) or seconds.
-    disk_threshold_percent: float = Field(
-        default=80.0,
-        description="Maximum disk-usage percentage allowed on a runner VM (0–100).",
-    )
-    memory_threshold_percent: float = Field(
-        default=85.0,
-        description="Maximum memory-usage percentage allowed on a runner VM (0–100).",
-    )
-    staleness_seconds: int = Field(
-        default=600,
-        description="Maximum age (in seconds) of the last telemetry sample from a runner.",
-    )
+    # Grafana/Loki
+    grafana_base_url: str = "http://localhost:3000"
 
-    # Cleanup retention — duration after which a workspace is eligible for
-    # automatic deletion, keyed by job outcome.
-    cleanup_success_retention_hours: int = 72       # 3 days
-    cleanup_failure_retention_hours: int = 168       # 7 days
-
-    # Cleanup scheduler — controls the background cleanup loop.
-    cleanup_interval_seconds: int = 900    # 15 minutes
-    cleanup_batch_size: int = 10           # workspaces per tick
-
-    # OpenCode Serve — base URL of the OpenCode Serve REST API.
-    # The Gateway uses this to fetch session diffs, logs, and to abort sessions.
-    opencode_base_url: str = "http://localhost:8080"
-
-    # AWX executor plugin — connection and authentication settings.
-    awx_base_url: str = ""
-    awx_token: str = ""
-    awx_create_workspace_template_id: int = 0
-    awx_opencode_lifecycle_template_id: int = 0
-    awx_workspace_teardown_template_id: int = 0
-    awx_poll_interval_seconds: int = 5
-    awx_timeout_seconds: int = 300
+    # Heartbeat monitoring
+    # Collectors that haven't pushed telemetry within this many seconds
+    # are considered stale. Maps to env var GATEWAY_HEARTBEAT_THRESHOLD.
+    heartbeat_threshold: int = 300
 
 
 def get_settings() -> Settings:

@@ -1,3 +1,4 @@
-"""API route modules for the OpenCode Gateway."""
+"""API route modules for the OpenCode Gateway observability service."""
 
-# Route stubs — routes will be registered in create_app() as they are built.
+# Routes are registered in create_app().  New observability routes will
+# be added in future slices.

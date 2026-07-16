@@ -210,49 +210,33 @@ def test_insecure_auth_opt_in_without_key(monkeypatch):
     assert settings.api_key == ""
 
 
-# ── Issue #142: OpenCode base URL setting ──────────────────────────────
+# ── Issue #207: Execution-era settings removed ─────────────────────────
 
 
-def test_opencode_base_url_default(monkeypatch):
-    """opencode_base_url defaults to http://localhost:8080."""
+def test_settings_no_execution_era_fields(monkeypatch):
+    """After the execution-era cleanup, settings should not have removed fields."""
     monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
     from app.core.config import Settings
 
     settings = Settings()
-    assert settings.opencode_base_url == "http://localhost:8080"
-
-
-def test_opencode_base_url_override(monkeypatch):
-    """GATEWAY_OPENCODE_BASE_URL can be overridden via environment variable."""
-    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "http://opencode-serve:8080")
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
-    from app.core.config import Settings
-
-    settings = Settings()
-    assert settings.opencode_base_url == "http://opencode-serve:8080"
-
-
-def test_opencode_base_url_empty_disables_client(monkeypatch):
-    """When GATEWAY_OPENCODE_BASE_URL is empty, get_opencode_client returns None."""
-    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "")
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
-    from app.api.jobs import get_opencode_client
-
-    import asyncio
-
-    result = asyncio.run(get_opencode_client())
-    assert result is None
-
-
-def test_opencode_base_url_creates_client(monkeypatch):
-    """When GATEWAY_OPENCODE_BASE_URL is set, get_opencode_client returns a client."""
-    monkeypatch.setenv("GATEWAY_OPENCODE_BASE_URL", "http://opencode-serve:8080")
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
-    from app.api.jobs import get_opencode_client
-    from app.opencode.serve_client import OpenCodeServeClient
-
-    import asyncio
-
-    result = asyncio.run(get_opencode_client())
-    assert isinstance(result, OpenCodeServeClient)
-    assert result._base_url == "http://opencode-serve:8080"
+    # Verify server and database settings are still present
+    assert settings.host == "0.0.0.0"
+    assert settings.port == 8000
+    assert settings.database_host == "localhost"
+    # Verify execution-era fields are absent
+    for removed_field in (
+        "executor_type",
+        "opencode_base_url",
+        "disk_threshold_percent",
+        "memory_threshold_percent",
+        "staleness_seconds",
+        "cleanup_success_retention_hours",
+        "cleanup_failure_retention_hours",
+        "cleanup_interval_seconds",
+        "cleanup_batch_size",
+        "awx_base_url",
+        "awx_token",
+    ):
+        assert not hasattr(settings, removed_field), (
+            f"Execution-era field '{removed_field}' should not exist on Settings"
+        )

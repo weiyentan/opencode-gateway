@@ -1,8 +1,17 @@
 # ADR 0002: Executor Plugin Interface Design
 
+> **Status: SUPERSEDED (2026-07-16, issue #207)**
+>
+> This ADR has been superseded by the observability service refactor.
+> The executor plugin interface and all execution-era subsystems (AWX,
+> local, scheduler, policy engine) have been removed from the codebase.
+> Infrastructure actions are no longer in the Gateway's scope.
+
 ## Status
 
-Accepted
+Superseded (was Accepted) - removed during issue #207 observability refactor.
+
+## Original Body (retained for historical reference)
 
 ## Context
 
