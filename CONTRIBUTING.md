@@ -209,9 +209,7 @@ opencode-gateway/
 │   ├── seed.py                   # Database seeding script (runners, jobs, observations)
 │   └── worktree-manager.sh       # Git worktree management helper
 ├── docs/
-│   ├── adr/                      # Architecture Decision Records (4 ADRs)
-│   ├── prd/                      # Product Requirements Document
-│   └── issues/                   # Planning and effort estimates
+│   └── adr/                      # Architecture Decision Records (4 ADRs)
 ├── docker-compose.test.yml       # Standalone Postgres for integration tests
 ├── pyproject.toml                # Project metadata, pytest, ruff, mypy config
 ├── requirements.txt              # Runtime and dev dependencies
