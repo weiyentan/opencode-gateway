@@ -4,7 +4,7 @@
 
 OpenCode Gateway provides monitoring, telemetry collection, and health tracking for OpenCode serve instances. It ingests observations from Runner VMs, stores time-series metrics in PostgreSQL, and exposes them through a clean REST API. Platform engineers and agent orchestrators (like Paperclip) use the Gateway to monitor OpenCode deployments at scale.
 
-> **Note:** This project is currently undergoing a refactor from an execution control plane into an observability service. Execution-era subsystems (executor plugins, job scheduling, workspace lifecycle) were removed in issue #207. Observability features will be built out in subsequent slices.
+> **Note:** This project has been refactored from an execution control plane into an observability service. Execution-era subsystems (executor plugins, job scheduling, workspace lifecycle) were removed in issue #207. Observability features (client registry, token auth, usage ingest, reporting API) were added in issues #208–#210.
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+">
@@ -21,11 +21,11 @@ The Gateway is built as layered concerns:
 
 | Layer | Location | Responsibility |
 |-------|----------|----------------|
-| **API Layer** | `app/api/` | REST endpoints (currently: `/health`). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
-| **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, and auth middleware. |
-| **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM base (for future models), Alembic migrations, and advisory lock utilities. |
+| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, and reporting (aggregates, records, sessions). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
+| **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
+| **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
 
-Additional layers will be added as observability features are built out in future slices.
+Additional layers can be added as the observability service grows.
 
 ---
 
@@ -90,6 +90,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MIN_CONNECTIONS` | `2` | asyncpg pool minimum size |
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
+| `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -119,10 +120,10 @@ pytest tests/ -v
 curl http://localhost:8000/health
 ```
 
-Expected response:
+Expected response (example):
 
 ```json
-{"status": "ok", "data": {"status": "ok", "version": "0.1.0-dev", "database": "connected"}}
+{"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
 ---
@@ -146,11 +147,43 @@ curl -f http://localhost:8000/health
 
 ## API Reference
 
+### Health
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Application health check. Returns `status`, `version`, and `database` connectivity. Graceful — always returns 200 even if the database is down. |
+| `GET` | `/health` | Application health check. Returns `status`, `version`, `database` connectivity, collector status (healthy/stale/unknown per credential), source-database health, and last-ingest timestamp. Graceful — always returns 200 even if the database is down. |
 
-Additional endpoints will be added in future slices as observability features are built out.
+### Admin — Client Registry
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/clients` | Register a new OpenCode client (name + optional description). |
+| `GET` | `/admin/clients` | List all registered clients. |
+| `GET` | `/admin/clients/{id}` | Get a client by ID, including its credential tokens (metadata only). |
+| `PATCH` | `/admin/clients/{id}` | Update a client (supplied fields only). |
+| `DELETE` | `/admin/clients/{id}` | Soft-delete a client (sets `is_active=false`). |
+
+### Admin — Token Management
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/clients/{id}/tokens` | Provision a new collector bearer token. **The raw token is returned once.** |
+| `GET` | `/admin/clients/{id}/tokens` | List credential tokens for a client — metadata only, no raw tokens. |
+| `POST` | `/admin/clients/{id}/tokens/{token_id}/revoke` | Revoke a collector credential token immediately. |
+
+### Telemetry Ingest
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. Uses first-write-wins idempotency, supports partial-success semantics (per-record accepted/rejected/conflict), and empty-batch heartbeats. Authenticated via collector bearer token. |
+
+### Usage Reporting
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month` — comma-separated). Date-range filterable. |
+| `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Includes `loki_search_url` for Grafana drill-down. |
+| `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, and Loki drill-down URLs. Paginated. |
 
 ---
 
@@ -184,14 +217,24 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py
-│   │   └── health.py             # GET /health endpoint
+│   │   ├── health.py             # GET /health endpoint
+│   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
+│   │   ├── ingest.py             # POST /ingest telemetry endpoint
+│   │   └── usage.py              # GET aggregates, records, sessions
 │   ├── core/
+│   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
-│   │   ├── auth.py               # API key middleware
+│   │   ├── auth.py               # API key + collector token middleware
 │   │   ├── envelope.py           # Response envelope middleware
 │   │   ├── factory.py            # create_app() FastAPI factory
+│   │   ├── identity.py           # Token generation & SHA-256 hashing
+│   │   ├── loki.py               # Grafana Explore URL builder
 │   │   ├── logging.py            # RedactingFormatter
-│   │   └── secrets.py            # Secret detection utilities
+│   │   ├── secrets.py            # Secret detection utilities
+│   │   └── schemas/
+│   │       ├── __init__.py
+│   │       ├── identity.py       # Pydantic schemas for clients & tokens
+│   │       └── usage.py          # Pydantic schemas for usage reporting
 │   └── db/
 │       ├── session.py            # DatabasePool (asyncpg wrapper)
 │       ├── schema.py             # Schema management (delegates to Alembic)
@@ -199,7 +242,9 @@ opencode-gateway/
 │       ├── lock.py               # Advisory locks
 │       └── models/
 │           ├── __init__.py
-│           └── base.py           # SQLAlchemy declarative base
+│           ├── base.py           # SQLAlchemy declarative base
+│           ├── identity.py       # ORM models: OpenCodeClient, CollectorCredential
+│           └── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
 ├── tests/                        # Foundation tests (more to be added)
 ├── docs/
 │   └── adr/                      # Architecture Decision Records
