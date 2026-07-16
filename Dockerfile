@@ -42,7 +42,7 @@ COPY alembic/ /app/alembic/
 USER gateway
 
 # Verify the application can be imported at build time.
-RUN python -c "from app.main import app; print(f'Gateway {app.title} v{app.version} ready')"
+RUN GATEWAY_ENV=development python -c "from app.main import app; print(f'Gateway {app.title} v{app.version} ready')"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
