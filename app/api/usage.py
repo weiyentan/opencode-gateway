@@ -354,7 +354,13 @@ async def _fetch_sessions(
     offset: int,
     grafana_base_url: str,
 ) -> PaginatedResponse[SessionSummary]:
-    """Execute count + data queries for sessions and return paginated response."""
+    """Return sessions whose interval overlaps *start_date*–*end_date*.
+
+    Uses interval-overlap semantics: a session is included when
+    ``first_message_at <= end_date`` **and** ``last_message_at >= start_date``.
+    This captures sessions that started before the query range but were still
+    active during it.
+    """
     params: list = []
 
     filters: list[str] = []

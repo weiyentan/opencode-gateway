@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     database_max_connections: int = 10
     database_connection_timeout: int = 30
 
+    # Heartbeat threshold in seconds — collectors that haven't pushed
+    # within this window are considered stale.
+    heartbeat_threshold: int = 300
+
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"
 

@@ -125,9 +125,9 @@ async def require_collector_token(
 
     .. note::
 
-        ``last_used_at`` is updated as a fire-and-forget task so that
-        auth latency is not affected by the write.  If the update fails
-        it is logged but never surfaced to the caller.
+        ``last_used_at`` is updated synchronously within the request
+        lifecycle.  The UPDATE is lightweight and adds minimal latency.
+        If the update fails it is logged but never surfaced to the caller.
     """
     auth_header = request.headers.get("Authorization", "")
 
@@ -179,10 +179,16 @@ async def require_collector_token(
             detail="Client is deactivated",
         )
 
-    # Fire-and-forget last_used_at update
+    # Synchronous last_used_at update (the UPDATE is fast — safe within request lifecycle)
     from datetime import datetime, timezone
 
     async def _touch_last_used() -> None:
+        """Update last_used_at for this credential synchronously.
+
+        The UPDATE is lightweight and runs within the request lifecycle.
+        If it fails it is silently logged — failures are best-effort
+        and never surfaced to the caller.
+        """
         try:
             await conn.execute(
                 "UPDATE collector_credentials SET last_used_at = $1 WHERE id = $2",

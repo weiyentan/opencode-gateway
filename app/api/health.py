@@ -85,6 +85,7 @@ def _derive_health(
     last_ts: datetime | None,
     now: datetime,
     threshold: int = settings.heartbeat_threshold,
+
 ) -> str:
     """Return 'healthy', 'stale', or 'unknown' based on last activity timestamp."""
     if last_ts is None:
@@ -99,6 +100,7 @@ async def _collector_health_summary(
     db_pool: DatabasePool,
     now: datetime,
     threshold: int = settings.heartbeat_threshold,
+
 ) -> list[CollectorHealth]:
     """Query collectors and their most recent ingest-batch activity."""
     try:
@@ -145,6 +147,7 @@ async def _source_db_health_summary(
     db_pool: DatabasePool,
     now: datetime,
     threshold: int = settings.heartbeat_threshold,
+
 ) -> list[SourceDatabaseHealth]:
     """Query source databases and their last-seen / record-count activity."""
     try:
@@ -205,6 +208,7 @@ async def health(request: Request) -> HealthResponse:
     """
     db_pool: DatabasePool | None = getattr(request.app.state, "pool", None)
     now = datetime.now(timezone.utc)
+    threshold = get_settings().heartbeat_threshold
 
     if db_pool is None:
         return HealthResponse(
@@ -222,8 +226,8 @@ async def health(request: Request) -> HealthResponse:
         return HealthResponse(version=_get_version(), database="disconnected")
 
     # Enrich with collector / source-database health when connected
-    collectors = await _collector_health_summary(db_pool, now)
-    source_dbs = await _source_db_health_summary(db_pool, now)
+    collectors = await _collector_health_summary(db_pool, now, threshold)
+    source_dbs = await _source_db_health_summary(db_pool, now, threshold)
     last_ingest = await _last_ingest_timestamp(db_pool)
 
     return HealthResponse(
