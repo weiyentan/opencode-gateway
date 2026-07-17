@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aurora Glass &mdash; OpenCode Gateway</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <div class="aurora-bg"></div>
+
+  <header class="header">
+    <div class="header-left">
+      <h1 class="logo">Aurora Glass</h1>
+      <span class="subtitle">OpenCode Gateway Observatory</span>
+    </div>
+    <div class="header-right">
+      <span class="live-indicator" id="live-indicator">LIVE</span>
+      <span class="timestamp" id="timestamp">--</span>
+      <span class="db-status" id="db-status">--</span>
+    </div>
+  </header>
+
+  <main class="dashboard">
+
+    <!-- KPI Row -->
+    <section class="kpi-row" id="kpi-row">
+      <div class="kpi-card kpi-tokens">
+        <span class="kpi-label">Total Tokens</span>
+        <span class="kpi-value" id="kpi-tokens">--</span>
+        <span class="kpi-sub" id="kpi-tokens-detail">--</span>
+      </div>
+      <div class="kpi-card kpi-cost">
+        <span class="kpi-label">Est. Cost (USD)</span>
+        <span class="kpi-value" id="kpi-cost">--</span>
+        <span class="kpi-sub" id="kpi-cost-detail">--</span>
+      </div>
+      <div class="kpi-card kpi-sessions">
+        <span class="kpi-label">Sessions</span>
+        <span class="kpi-value" id="kpi-sessions">--</span>
+        <span class="kpi-sub" id="kpi-sessions-detail">last 7 days</span>
+      </div>
+      <div class="kpi-card kpi-collectors">
+        <span class="kpi-label">Healthy Collectors</span>
+        <span class="kpi-value" id="kpi-collectors">--</span>
+        <span class="kpi-sub" id="kpi-collectors-detail">--</span>
+      </div>
+      <div class="kpi-card kpi-source-dbs">
+        <span class="kpi-label">Source Databases</span>
+        <span class="kpi-value" id="kpi-source-dbs">--</span>
+        <span class="kpi-sub" id="kpi-source-dbs-detail">--</span>
+      </div>
+    </section>
+
+    <!-- Two-column content grid -->
+    <div class="content-grid">
+
+      <!-- Left Column -->
+      <div class="col-left">
+
+        <!-- Model Mix -->
+        <section class="glass-panel panel-model-mix">
+          <h2 class="panel-title">Model Mix</h2>
+          <div class="chart-container" id="model-mix-chart">
+            <p class="empty-state">Loading model distribution&hellip;</p>
+          </div>
+        </section>
+
+        <!-- Collectors Table -->
+        <section class="glass-panel panel-collectors">
+          <h2 class="panel-title">Collectors</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th>Last Ingest</th>
+                  <th>Records</th>
+                  <th>Health</th>
+                </tr>
+              </thead>
+              <tbody id="collectors-tbody">
+                <tr><td colspan="5" class="empty-state">Loading&hellip;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div><!-- .col-left -->
+
+      <!-- Right Column -->
+      <div class="col-right">
+
+        <!-- Live Events -->
+        <section class="glass-panel panel-events">
+          <h2 class="panel-title">
+            Live Events
+            <span class="event-badge" id="event-badge"></span>
+          </h2>
+          <div class="events-feed" id="events-feed">
+            <p class="empty-state">Waiting for events&hellip;</p>
+          </div>
+        </section>
+
+        <!-- Collector Distribution -->
+        <section class="glass-panel panel-collector-dist">
+          <h2 class="panel-title">Collector Distribution</h2>
+          <div id="collector-dist-chart">
+            <p class="empty-state">Loading&hellip;</p>
+          </div>
+        </section>
+
+        <!-- Agents & LLMs In Use -->
+        <section class="glass-panel panel-agents">
+          <h2 class="panel-title">Agents &amp; LLMs In Use</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Agent / Client</th>
+                  <th>Provider</th>
+                  <th>Model</th>
+                  <th>Requests</th>
+                  <th>Tokens</th>
+                  <th>Cost</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="agents-tbody">
+                <tr><td colspan="7" class="empty-state">Loading&hellip;</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div><!-- .col-right -->
+
+    </div><!-- .content-grid -->
+
+    <!-- Recent Sessions (full width) -->
+    <section class="glass-panel panel-sessions">
+      <h2 class="panel-title">Recent Sessions</h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Client</th>
+              <th>First Message</th>
+              <th>Last Message</th>
+              <th>Duration</th>
+              <th>Messages</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-tbody">
+            <tr><td colspan="8" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <span>OpenCode Gateway v<span id="footer-version">--</span></span>
+    <span class="footer-sep">&middot;</span>
+    <span>Auto-refresh every <strong id="footer-interval">30</strong>s</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
