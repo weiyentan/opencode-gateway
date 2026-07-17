@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse, HTMLResponse
+from starlette.staticfiles import StaticFiles
 
 from app.core.config import get_settings
 from app.db.schema import ensure_schema
@@ -133,5 +136,30 @@ def create_app(
     app.include_router(admin_clients_router)
     app.include_router(ingest_router)
     app.include_router(usage_router, prefix="/api/v1/usage")
+
+    # ── Frontend static files (Aurora Glass dashboard) ──────────────────
+    settings = get_settings()
+    static_dir = os.path.abspath(settings.static_dir)
+
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    # Root route — serves the dashboard ``index.html``.
+    @app.get("/", include_in_schema=False)
+    async def spa_root():
+        index_path = os.path.join(static_dir, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+        return HTMLResponse(
+            "<html><body><h1>404 Not Found</h1></body></html>",
+            status_code=404,
+        )
+
+    # Note: No SPA catch-all route is registered because:
+    #   (a) the current dashboard has no client-side routing, and
+    #   (b) a bare catch-all breaks the 404 response-envelope contract
+    #       for unknown API paths.
+    # If future SPA routes are needed, register them explicitly here or
+    # add a catch-all that excludes known API prefixes.
 
     return app

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenCode Gateway — Aurora Glass</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔮</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="aurora-bg"></div>
+
+  <!-- Loading overlay -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loading-spinner"></div>
+    <p class="loading-text">Loading telemetry...</p>
+  </div>
+
+  <!-- Error banner -->
+  <div id="error-banner" class="error-banner hidden">
+    <span class="error-icon">⚠</span>
+    <span id="error-message" class="error-message"></span>
+    <button id="error-dismiss" class="error-dismiss" aria-label="Dismiss">&times;</button>
+  </div>
+
+  <!-- Header -->
+  <header class="dashboard-header">
+    <div class="header-left">
+      <h1 class="header-title">OpenCode Gateway</h1>
+      <span class="header-subtitle">Aurora Glass Telemetry</span>
+    </div>
+    <div class="header-right">
+      <span id="last-updated" class="last-updated">—</span>
+      <span id="refresh-indicator" class="refresh-indicator"></span>
+      <button id="refresh-btn" class="btn-refresh" aria-label="Refresh now">⟳</button>
+    </div>
+  </header>
+
+  <!-- Dashboard grid -->
+  <main class="dashboard-grid">
+
+    <!-- 1. KPI Row -->
+    <section class="kpi-row" id="kpi-row">
+      <article class="kpi-card accent-indigo">
+        <div class="kpi-label">Total Tokens</div>
+        <div class="kpi-value" id="kpi-total-tokens">—</div>
+        <div class="kpi-sub" id="kpi-total-tokens-sub"></div>
+      </article>
+      <article class="kpi-card accent-cyan">
+        <div class="kpi-label">Est. Cost</div>
+        <div class="kpi-value" id="kpi-cost">—</div>
+        <div class="kpi-sub" id="kpi-cost-sub"></div>
+      </article>
+      <article class="kpi-card accent-pink">
+        <div class="kpi-label">Sessions</div>
+        <div class="kpi-value" id="kpi-sessions">—</div>
+        <div class="kpi-sub">last 7 days</div>
+      </article>
+      <article class="kpi-card accent-gold">
+        <div class="kpi-label">Healthy Collectors</div>
+        <div class="kpi-value" id="kpi-healthy-collectors">—</div>
+        <div class="kpi-sub" id="kpi-total-collectors"></div>
+      </article>
+      <article class="kpi-card accent-indigo">
+        <div class="kpi-label">Source DBs</div>
+        <div class="kpi-value" id="kpi-source-dbs">—</div>
+        <div class="kpi-sub" id="kpi-source-dbs-sub"></div>
+      </article>
+    </section>
+
+    <!-- 2. Model Mix -->
+    <section class="glass-panel panel-model-mix">
+      <h2 class="panel-title">
+        <span class="title-dot accent-cyan"></span>
+        Model Mix
+      </h2>
+      <div id="model-mix-chart" class="model-mix-chart">
+        <div class="empty-state">No model data available</div>
+      </div>
+    </section>
+
+    <!-- 3. Live Events -->
+    <section class="glass-panel panel-live-events">
+      <h2 class="panel-title">
+        <span class="title-dot accent-pink"></span>
+        Live Events
+        <span id="live-events-count" class="badge">0</span>
+      </h2>
+      <div id="live-events-feed" class="live-events-feed">
+        <div class="empty-state">Waiting for events...</div>
+      </div>
+    </section>
+
+    <!-- 4. Collector Distribution -->
+    <section class="glass-panel panel-collector-dist">
+      <h2 class="panel-title">
+        <span class="title-dot accent-gold"></span>
+        Collector Distribution
+      </h2>
+      <div id="collector-dist-grid" class="collector-dist-grid">
+        <div class="empty-state">No collectors connected</div>
+      </div>
+    </section>
+
+    <!-- 5. Collectors Table -->
+    <section class="glass-panel panel-collectors-table full-width">
+      <h2 class="panel-title">
+        <span class="title-dot accent-indigo"></span>
+        Collectors
+      </h2>
+      <div class="table-wrapper">
+        <table class="data-table" id="collectors-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Status</th>
+              <th>Last Ingest</th>
+              <th>Sessions</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+            </tr>
+          </thead>
+          <tbody id="collectors-tbody">
+            <tr class="empty-row"><td colspan="6">No collectors registered</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 6. Agents & LLMs Table -->
+    <section class="glass-panel panel-agents-table full-width">
+      <h2 class="panel-title">
+        <span class="title-dot accent-cyan"></span>
+        Agents &amp; LLMs In Use
+      </h2>
+      <div class="table-wrapper">
+        <table class="data-table" id="agents-table">
+          <thead>
+            <tr>
+              <th>Agent / Client</th>
+              <th>Model</th>
+              <th>Requests</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="agents-tbody">
+            <tr class="empty-row"><td colspan="6">No agent activity detected</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 7. Recent Sessions -->
+    <section class="glass-panel panel-sessions-table full-width">
+      <h2 class="panel-title">
+        <span class="title-dot accent-pink"></span>
+        Recent Sessions
+      </h2>
+      <div class="table-wrapper">
+        <table class="data-table" id="sessions-table">
+          <thead>
+            <tr>
+              <th>Client</th>
+              <th>Model</th>
+              <th>Tokens</th>
+              <th>Cost</th>
+              <th>Duration</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-tbody">
+            <tr class="empty-row"><td colspan="6">No sessions recorded</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
