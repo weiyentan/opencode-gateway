@@ -131,7 +131,7 @@ opencode-gateway/
 ├── app/
 │   ├── __init__.py               # Package init
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn)
+│   ├── main.py                   # Production entry point (uvicorn) + static file mount
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
 │   │   ├── health.py             # GET /health endpoint
@@ -173,6 +173,7 @@ opencode-gateway/
 │       ├── __init__.py           # Scheduler package
 │       ├── cleaner.py            # CleanupScheduler — background workspace cleanup
 │       └── engine.py             # Scheduler engine base class
+├── frontend/                     # Aurora Glass dashboard (HTML/CSS/JS, no build step)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py               # Shared fixtures (mock_conn, client, async test helpers)

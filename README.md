@@ -40,6 +40,7 @@ Additional layers can be added as the observability service grows.
 | **Validation** | Pydantic v2 + `pydantic-settings` | Configuration and boundary models |
 | **Linting** | `ruff` | Replaces flake8, isort, pyupgrade. Selects: E, F, I, UP |
 | **Type Checking** | `mypy` (strict mode) | Full strict checking; Python 3.12 target |
+| **Frontend** | Vanilla HTML/CSS/JS | Aurora Glass dashboard — no build step, served at `/` via Starlette `StaticFiles` |
 | **Testing** | `pytest` + `pytest-asyncio` | `asyncio_mode = auto` |
 
 ---
@@ -125,6 +126,8 @@ Expected response (example):
 ```json
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
+
+**Dashboard:** Open [http://localhost:8000/](http://localhost:8000/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. No build step is required; the frontend is served directly by the Gateway as static files.
 
 ---
 
@@ -214,7 +217,7 @@ opencode-gateway/
 ├── app/
 │   ├── __init__.py
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn)
+│   ├── main.py                   # Production entry point (uvicorn) + static file mount
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint
@@ -245,6 +248,7 @@ opencode-gateway/
 │           ├── base.py           # SQLAlchemy declarative base
 │           ├── identity.py       # ORM models: OpenCodeClient, CollectorCredential
 │           └── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
+├── frontend/                     # Aurora Glass dashboard (HTML/CSS/JS, no build step)
 ├── tests/                        # Foundation tests (more to be added)
 ├── docs/
 │   └── adr/                      # Architecture Decision Records
