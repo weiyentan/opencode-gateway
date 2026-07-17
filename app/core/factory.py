@@ -60,6 +60,9 @@ def create_app(
     startup_hooks = on_startup or []
     shutdown_hooks = on_shutdown or []
 
+    # Read settings once — reused by lifespan and route registration
+    settings = get_settings()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # --- user-provided startup hooks ---
@@ -67,7 +70,6 @@ def create_app(
             await _invoke_hook(hook)
 
         # --- Postgres pool ---
-        settings = get_settings()
         pool = DatabasePool(settings)
         try:
             await pool.connect()
@@ -138,7 +140,6 @@ def create_app(
     app.include_router(usage_router, prefix="/api/v1/usage")
 
     # ── Frontend static files (Aurora Glass dashboard) ──────────────────
-    settings = get_settings()
     static_dir = os.path.abspath(settings.static_dir)
 
     if os.path.isdir(static_dir):

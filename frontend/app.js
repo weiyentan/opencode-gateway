@@ -270,14 +270,14 @@ function buildClientNameMap() {
   // From sessions (client_id lookup)
   for (const s of state.sessions) {
     if (s.client_id && !map[s.client_id]) {
-      map[s.client_id] = map[s.client_id] || s.client_id;
+      map[s.client_id] = s.client_id;
     }
   }
 
   // From records (client_id lookup)
   for (const r of state.records) {
     if (r.client_id && !map[r.client_id]) {
-      map[r.client_id] = map[r.client_id] || r.client_id;
+      map[r.client_id] = r.client_id;
     }
   }
 
@@ -486,12 +486,6 @@ function renderCollectorDistribution(nameMap) {
   if (collectors.length === 0) {
     container.innerHTML = '<div class="empty-state">No collectors connected</div>';
     return;
-  }
-
-  // Compute total tokens from model aggregates for distribution
-  let grandTotal = 0;
-  for (const m of state.modelAggregates) {
-    grandTotal += (m.total_input_tokens || 0) + (m.total_output_tokens || 0);
   }
 
   // Use collector record counts as proxy for token share
