@@ -34,6 +34,9 @@ WORKDIR /app
 # Copy application source (production entry point + all packages).
 COPY app/ /app/app/
 
+# Copy frontend static files (Aurora Glass dashboard).
+COPY frontend/ /app/frontend/
+
 # Copy Alembic migration configuration (needed for startup auto-migration).
 COPY alembic.ini /app/alembic.ini
 COPY alembic/ /app/alembic/
@@ -42,7 +45,7 @@ COPY alembic/ /app/alembic/
 USER gateway
 
 # Verify the application can be imported at build time.
-RUN GATEWAY_ENV=development python -c "from app.main import app; print(f'Gateway {app.title} v{app.version} ready')"
+RUN GATEWAY_ENV=development python -c "from app.main import app; assert (__import__('pathlib').Path('/app/frontend/index.html')).exists(), 'frontend/index.html missing'; print(f'Gateway {app.title} v{app.version} ready — frontend included')"
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
