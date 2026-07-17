@@ -8,18 +8,27 @@
 
   // ── Configuration ──────────────────────────────────────────────────────
 
-  const REFRESH_INTERVAL_MS = 30000; // 30s auto-refresh
+  const REFRESH_INTERVAL_MS = parseInt(
+    document.querySelector('meta[name="refresh-interval"]')?.getAttribute('content'),
+    10
+  ) || 30000; // 30s default; override via <meta name="refresh-interval" content="...">
   const AGG_WINDOW_DAYS = 30;        // window for aggregates (KPIs + model mix)
   const SESSION_WINDOW_DAYS = 7;     // window for sessions
   const RECORD_LIMIT = 100;
   const SESSION_LIMIT = 20;
   const CLIENT_LIMIT = 100;
+  /** Session is considered "active" if last_message_at is within this window.
+   *  This is a heuristic — long-running but infrequent sessions may be
+   *  incorrectly marked as "ended", and very recent sessions that have
+   *  completed may briefly show as "active". */
+  const SESSION_ACTIVE_WINDOW_MS = 3600000; // 1 hour
 
   // ── Element refs ───────────────────────────────────────────────────────
 
   const $ = function (id) { return document.getElementById(id); };
 
   const els = {
+    dashboard:      document.querySelector('.dashboard'),
     liveIndicator:  $('live-indicator'),
     timestamp:      $('timestamp'),
     dbStatus:       $('db-status'),
@@ -51,6 +60,7 @@
 
   let clientMap = {};      // client_id → name
   let refreshTimer = null;
+  let fetchErrors = {};    // endpoint_key → error_message, per-fetch-cycle tracking
 
   // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -163,6 +173,7 @@
     const sessEnd = nowISO();
 
     const results = {};
+    fetchErrors = {};  // Clear previous errors
 
     try {
       // Parallel fetches
@@ -182,6 +193,15 @@
       results.sessions  = sessions.status  === 'fulfilled' ? sessions.value  : null;
       results.records   = records.status   === 'fulfilled' ? records.value   : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
+
+      // Track per-endpoint errors
+      fetchErrors = {};
+      if (health.status    !== 'fulfilled') fetchErrors.health    = health.reason?.message    || 'Health check failed';
+      if (aggTotal.status  !== 'fulfilled') fetchErrors.aggTotal  = aggTotal.reason?.message  || 'Aggregates (total) failed';
+      if (aggByModel.status!== 'fulfilled') fetchErrors.aggByModel= aggByModel.reason?.message|| 'Aggregates (by model) failed';
+      if (sessions.status  !== 'fulfilled') fetchErrors.sessions  = sessions.reason?.message  || 'Sessions query failed';
+      if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
+      if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
 
       // Build client lookup from admin/clients
       if (results.clients && results.clients.items) {
@@ -287,7 +307,7 @@
   function renderModelMix(data) {
     var models = data.aggByModel || [];
     if (models.length === 0) {
-      els.modelMixChart.innerHTML = '<p class="empty-state">No model data available</p>';
+      els.modelMixChart.innerHTML = '<p class="empty-state">No model data available' + errorIndicator('aggByModel') + '</p>';
       return;
     }
 
@@ -326,7 +346,7 @@
     var now = new Date().toISOString();
 
     if (!data.health) {
-      els.eventsFeed.innerHTML = '<p class="empty-state">No health data — events unavailable</p>';
+      els.eventsFeed.innerHTML = '<p class="empty-state">No health data — events unavailable' + errorIndicator('health') + '</p>';
       els.eventBadge.textContent = '--';
       els.eventBadge.className = 'event-badge empty';
       return;
@@ -436,7 +456,7 @@
   /** Collector Distribution — health bar per collector */
   function renderCollectorDistribution(data) {
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
-      els.collectorDist.innerHTML = '<p class="empty-state">No collectors registered</p>';
+      els.collectorDist.innerHTML = '<p class="empty-state">No collectors registered' + errorIndicator('health') + '</p>';
       return;
     }
 
@@ -467,7 +487,7 @@
   /** Collectors Table */
   function renderCollectorsTable(data) {
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
-      els.collectorsTbody.innerHTML = '<tr><td colspan="5" class="empty-state">No collectors</td></tr>';
+      els.collectorsTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No collectors' + errorIndicator('health') + '</td></tr>';
       return;
     }
 
@@ -479,7 +499,6 @@
         '<td>' + badge(c.health, badgeCls).outerHTML + '</td>' +
         '<td>' + fmtRelative(c.last_heartbeat) + '</td>' +
         '<td>' + fmtNum(c.total_records_ingested) + '</td>' +
-        '<td>' + badge(c.health, badgeCls).outerHTML + '</td>' +
         '</tr>';
     });
 
@@ -489,7 +508,7 @@
   /** Agents & LLMs In Use */
   function renderAgentsTable(data) {
     if (!data.aggByModel || data.aggByModel.length === 0) {
-      els.agentsTbody.innerHTML = '<tr><td colspan="7" class="empty-state">No agent data</td></tr>';
+      els.agentsTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No agent data' + errorIndicator('aggByModel') + '</td></tr>';
       return;
     }
 
@@ -511,7 +530,6 @@
       }
 
       html += '<tr>' +
-        '<td>--</td>' +
         '<td>' + escHtml(provider) + '</td>' +
         '<td>' + escHtml(modelName) + '</td>' +
         '<td>' + fmtNum(requests) + '</td>' +
@@ -527,7 +545,7 @@
   /** Recent Sessions */
   function renderSessionsTable(data) {
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
-      els.sessionsTbody.innerHTML = '<tr><td colspan="8" class="empty-state">No sessions in the last ' + SESSION_WINDOW_DAYS + ' days</td></tr>';
+      els.sessionsTbody.innerHTML = '<tr><td colspan="8" class="empty-state">No sessions in the last ' + SESSION_WINDOW_DAYS + ' days' + errorIndicator('sessions') + '</td></tr>';
       return;
     }
 
@@ -537,7 +555,7 @@
       var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
       var cost = s.total_estimated_cost_usd;
       var duration = fmtDuration(s.first_message_at, s.last_message_at);
-      var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < 3600000;
+      var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
       html += '<tr>' +
         '<td>' + escHtml(clientName) + '</td>' +
@@ -566,10 +584,22 @@
       .replace(/'/g, '&#39;');
   }
 
+  /**
+   * Return a small error indicator HTML snippet if the given endpoint
+   * had a fetch error, so the user can distinguish "no data" from "fetch failed".
+   */
+  function errorIndicator(endpointKey) {
+    if (fetchErrors[endpointKey]) {
+      return ' <span class="fetch-error" title="' + escHtml(fetchErrors[endpointKey]) + '">\u26A0 Fetch error</span>';
+    }
+    return '';
+  }
+
   // ── Orchestration ─────────────────────────────────────────────────────
 
   async function refreshDashboard() {
     try {
+      if (els.dashboard) els.dashboard.classList.add('refreshing');
       var data = await fetchAll();
       renderHeader(data);
       renderKPIs(data);
@@ -582,12 +612,20 @@
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
+    } finally {
+      if (els.dashboard) els.dashboard.classList.remove('refreshing');
     }
   }
 
   function startAutoRefresh() {
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
+    updateFooterInterval();
+  }
+
+  function updateFooterInterval() {
+    var el = document.getElementById('footer-interval');
+    if (el) el.textContent = Math.round(REFRESH_INTERVAL_MS / 1000);
   }
 
   // ── Bootstrap ─────────────────────────────────────────────────────────

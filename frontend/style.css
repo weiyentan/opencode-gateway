@@ -202,6 +202,12 @@ body {
   padding: 24px 24px 40px;
 }
 
+/* Refresh indicator — subtle opacity change during data fetch */
+.dashboard.refreshing {
+  opacity: 0.85;
+  transition: opacity 0.2s ease;
+}
+
 /* ── KPI Row ──────────────────────────────────────────────────────────── */
 
 .kpi-row {
@@ -522,6 +528,19 @@ tbody tr:hover td {
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
 .badge-active   { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-inactive { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
+
+/* Fetch error indicator — shown inline in empty states when an endpoint failed */
+.fetch-error {
+  display: inline-block;
+  font-style: normal;
+  font-size: 0.7rem;
+  color: var(--status-error);
+  background: rgba(248, 113, 113, 0.10);
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  margin-left: 8px;
+  cursor: help;
+}
 
 /* ── Footer ───────────────────────────────────────────────────────────── */
 
