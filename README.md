@@ -91,6 +91,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
+| `GATEWAY_STATIC_DIR` | `frontend` | Path to the Aurora Glass dashboard static files directory |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -187,6 +188,44 @@ curl -f http://localhost:8000/health
 
 ---
 
+## Frontend Dashboard (Aurora Glass)
+
+The Gateway ships with **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript.
+
+### Access
+
+Once the Gateway is running, open the dashboard at:
+
+```
+http://localhost:8000/
+```
+
+No separate build step or server is required — the Gateway serves the static files automatically.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets. Relative to the working directory. Point this to a custom dashboard build if needed. |
+
+### Dashboard Sections
+
+The dashboard polls the Gateway REST API every 30 seconds and renders:
+
+| Section | Data Source | Description |
+|---------|-------------|-------------|
+| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Total tokens, estimated cost, session count, healthy collectors, source databases |
+| **Model Mix** | `/api/v1/usage/aggregates?group_by=model` | Token/cost breakdown by LLM model |
+| **Live Events** | Recent usage records | Real-time feed of incoming telemetry events |
+| **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
+| **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
+| **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
+| **Recent Sessions** | `/api/v1/usage/sessions` | Client, model, token/cost totals, duration, and status |
+
+The dashboard uses the same authentication as the REST API — if the Gateway runs in production mode (`GATEWAY_ENV=production`) with an API key, the dashboard will need one. For local development, use `GATEWAY_ENV=development` to run without authentication.
+
+---
+
 ## Database Migrations
 
 Alembic is the **single source of truth** for the production database schema. The Gateway automatically runs migrations at startup — no manual steps are required.
@@ -245,6 +284,7 @@ opencode-gateway/
 │           ├── base.py           # SQLAlchemy declarative base
 │           ├── identity.py       # ORM models: OpenCodeClient, CollectorCredential
 │           └── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
+├── frontend/                     # Aurora Glass telemetry dashboard (HTML/CSS/JS SPA)
 ├── tests/                        # Foundation tests (more to be added)
 ├── docs/
 │   └── adr/                      # Architecture Decision Records
