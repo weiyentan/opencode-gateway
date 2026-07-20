@@ -34,7 +34,7 @@ jobs:
             dockerfile: Dockerfile
           - name: aurora-glass
             context: ./frontend
-            dockerfile: frontend/Dockerfile
+            dockerfile: Dockerfile
     steps:
       - uses: actions/checkout@v4
 
