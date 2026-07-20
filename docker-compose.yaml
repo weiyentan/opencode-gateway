@@ -19,17 +19,6 @@ services:
       - gateway-net
     restart: unless-stopped
 
-  frontend:
-    build: ./frontend
-    container_name: opencode-frontend
-    ports:
-      - "${FRONTEND_PORT:-8080}:80"
-    depends_on:
-      - gateway
-    networks:
-      - gateway-net
-    restart: unless-stopped
-
   postgres:
     image: postgres:15-alpine
     container_name: opencode-gateway-db
