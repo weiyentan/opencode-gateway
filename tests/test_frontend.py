@@ -66,33 +66,33 @@ class TestNginxProxyConfiguration:
     # ── Proxy location blocks ──────────────────────────────────────────
 
     def test_proxies_api_to_gateway(self):
-        """/api/ requests must be proxied to http://gateway:8000."""
-        assert self._has_proxy_pass("/api/", "gateway:8000"), (
-            "nginx.conf must proxy /api/ to gateway:8000"
+        """/api/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/api/", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /api/ to ${GATEWAY_UPSTREAM}"
         )
 
     def test_proxies_health_to_gateway(self):
-        """/health requests must be proxied to http://gateway:8000."""
-        assert self._has_proxy_pass("/health", "gateway:8000"), (
-            "nginx.conf must proxy /health to gateway:8000"
+        """/health requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/health", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /health to ${GATEWAY_UPSTREAM}"
         )
 
     def test_proxies_admin_to_gateway(self):
-        """/admin/ requests must be proxied to http://gateway:8000."""
-        assert self._has_proxy_pass("/admin/", "gateway:8000"), (
-            "nginx.conf must proxy /admin/ to gateway:8000"
+        """/admin/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/admin/", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /admin/ to ${GATEWAY_UPSTREAM}"
         )
 
     def test_proxies_openapi_to_gateway(self):
-        """/openapi.json requests must be proxied to http://gateway:8000."""
-        assert self._has_proxy_pass("/openapi.json", "gateway:8000"), (
-            "nginx.conf must proxy /openapi.json to gateway:8000"
+        """/openapi.json requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/openapi.json", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /openapi.json to ${GATEWAY_UPSTREAM}"
         )
 
     def test_proxies_docs_to_gateway(self):
-        """/docs requests must be proxied to http://gateway:8000."""
-        assert self._has_proxy_pass("/docs", "gateway:8000"), (
-            "nginx.conf must proxy /docs to gateway:8000"
+        """/docs requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/docs", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /docs to ${GATEWAY_UPSTREAM}"
         )
 
     # ── Static file serving ────────────────────────────────────────────
@@ -114,12 +114,23 @@ class TestNginxProxyConfiguration:
     # ── Helper ─────────────────────────────────────────────────────────
 
     def _has_proxy_pass(self, location: str, upstream: str) -> bool:
-        """Check if a location block proxies to the given upstream."""
+        """Check if a location block proxies to the given upstream.
+
+        Supports both literal URLs (``http://gateway:8000``) and nginx
+        template variables (``${GATEWAY_UPSTREAM}``), since the nginx
+        config uses ``envsubst`` at container start to substitute the
+        real upstream URL.
+        """
         import re
-        # Match: location <location> { ... proxy_pass http://<upstream>; ... }
+        # If the upstream is an nginx variable (starts with $), match
+        # it directly; otherwise expect http:// prefix.
+        if upstream.startswith("$"):
+            prefix = ""
+        else:
+            prefix = r"http://"
         pattern = re.compile(
             r"location\s+" + re.escape(location) +
-            r"\s*\{(?:[^}]*?)proxy_pass\s+http://" + re.escape(upstream) + r"\s*;",
+            r"\s*\{(?:[^}]*?)proxy_pass\s+" + prefix + re.escape(upstream) + r"\s*;",
             re.DOTALL,
         )
         return bool(pattern.search(self.config))
@@ -183,8 +194,18 @@ class TestDockerComposeSameOriginStack:
         assert "gateway" in deps, "Frontend must depend_on gateway"
 
     def test_frontend_builds_from_frontend_dir(self):
-        """The frontend service must build from ./frontend."""
+        """The frontend service must build from the frontend/Dockerfile.
+
+        The docker-compose uses ``context: .`` and ``dockerfile: frontend/Dockerfile``
+        so both the Gateway and frontend can share the repo-root build context.
+        """
         build = self.compose["services"]["frontend"].get("build")
-        assert build in ("./frontend", {"context": "./frontend"}), (
-            "Frontend service must build from the ./frontend directory"
+        valid_configs = (
+            "./frontend",
+            {"context": "./frontend"},
+            {"context": ".", "dockerfile": "frontend/Dockerfile"},
+        )
+        assert build in valid_configs, (
+            "Frontend service must build from the frontend directory "
+            f"(got: {build!r})"
         )
