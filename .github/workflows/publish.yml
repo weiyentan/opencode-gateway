@@ -1,3 +1,16 @@
+# ── Publish Container Images ─────────────────────────────────────────────
+# Single CI workflow that builds and publishes both Gateway and Aurora Glass
+# container images. Both artifacts share the same version tags for a given
+# repository revision, reflecting the split architecture: the Gateway serves
+# the API and Aurora Glass serves the frontend dashboard.
+#
+# Image naming (configurable via DOCKER_IMAGE_NAME secret):
+#   docker.io/<image-name>-gateway        — API service
+#   docker.io/<image-name>-aurora-glass   — Frontend dashboard
+#
+# On pull_request events the images are built but not pushed (no login).
+# On push/tag events they are built, tagged, and pushed to DockerHub.
+
 name: Publish Container Images
 
 on:
@@ -20,7 +33,7 @@ jobs:
             context: .
             dockerfile: Dockerfile
           - name: aurora-glass
-            context: .
+            context: ./frontend
             dockerfile: frontend/Dockerfile
     steps:
       - uses: actions/checkout@v4
