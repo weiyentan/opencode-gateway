@@ -9,13 +9,13 @@ Thank you for your interest in contributing! This document covers how to set up 
 - **Python 3.12** or later
 - **PostgreSQL 15** or later (or Docker for a local instance)
 
-> **Quick start with Docker Compose:** If you have Docker (20.10+) and Docker Compose (v2+), you can skip the manual setup below and run the entire Gateway stack in containers:
+> **Quick start with Docker Compose:** If you have Docker (20.10+) and Docker Compose (v2+), you can skip the manual setup below and run the entire same-origin stack in containers:
 > ```bash
 > cp .env.example .env
 > docker compose up -d
-> curl http://localhost:8000/health
+> curl http://localhost:8080/health    # proxied to gateway by frontend nginx
 > ```
-> See [Running with Docker](README.md#running-with-docker) in the README for details.
+> See [Running with Docker](README.md#running-with-docker-same-origin-local-stack) in the README for details.
 
 ---
 
@@ -81,21 +81,30 @@ Expected response: `{"status": "ok", "data": {"status": "ok", "version": "0.1.0-
 ## Running Tests
 
 ```bash
-pytest tests/ -v                 # Run all tests (unit + integration)
+pytest tests/ -v                 # Run all tests
 pytest tests/ -v -k "db"         # Run only database-related tests (requires Postgres)
-pytest tests/integration/ -v -m integration  # Integration tests only (requires Postgres)
 ```
 
-Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). Unit tests mock the database layer; integration tests (marked with `@pytest.mark.integration`) require a running PostgreSQL instance.
+Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). Most tests mock the database layer; tests tagged with `test_db` or `test_schema` require a running PostgreSQL instance.
 
 ### Integration test database
 
-A dedicated Docker Compose file starts a Postgres container on port 5433 for integration tests:
+A dedicated Docker Compose file starts a Postgres container on port 5433 for tests that need a real database:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
-pytest tests/integration/ -v -m integration
+pytest tests/ -v -k "db"
 docker compose -f docker-compose.test.yml down -v
+```
+
+### E2E smoke test
+
+An end-to-end smoke test validates the same-origin local stack (frontend nginx + Gateway + Postgres):
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.smoke.yml up -d
+pytest tests/test_smoke_local_stack.py -v
+docker compose -f docker-compose.yaml -f docker-compose.smoke.yml down -v
 ```
 
 ### Database seeding
@@ -103,10 +112,10 @@ docker compose -f docker-compose.test.yml down -v
 The `scripts/seed.py` tool populates the database with sample data for manual testing:
 
 ```bash
-python scripts/seed.py --runners 3 --workspaces 5 --jobs 10 --observations 20
+python scripts/seed.py --help
 ```
 
-See `python scripts/seed.py --help` for all options. The script is idempotent and safe to run multiple times.
+See the script's help for all available options. It is idempotent and safe to run multiple times.
 
 ---
 
@@ -129,92 +138,86 @@ Run these before submitting a pull request. All CI checks must pass.
 ```
 opencode-gateway/
 ├── app/
-│   ├── __init__.py               # Package init
+│   ├── __init__.py
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn) + static file mount
+│   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
-│   │   ├── __init__.py           # Router stubs
+│   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint
-│   │   ├── jobs.py               # Job CRUD, dispatch, approval, abort
-│   │   ├── runners.py            # Runner list, detail, status management
-│   │   └── workspaces.py         # Workspace endpoints (list, get, pin, cleanup)
+│   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
+│   │   ├── ingest.py             # POST /ingest telemetry endpoint
+│   │   └── usage.py              # GET aggregates, records, sessions
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)
+│   │   ├── auth.py               # API key + collector token middleware
+│   │   ├── envelope.py           # Response envelope middleware
 │   │   ├── factory.py            # create_app() FastAPI factory
-│   │   └── lifecycle.py          # State machine transition rules
-│   ├── db/
-│   │   ├── __init__.py
-│   │   ├── schema.py             # Schema migration utility
-│   │   ├── session.py            # DatabasePool (asyncpg wrapper)
-│   │   └── models/               # SQLAlchemy ORM models
+│   │   ├── identity.py           # Token generation & SHA-256 hashing
+│   │   ├── loki.py               # Grafana Explore URL builder
+│   │   ├── logging.py            # RedactingFormatter
+│   │   ├── secrets.py            # Secret detection utilities
+│   │   └── schemas/
 │   │       ├── __init__.py
-│   │       ├── base.py           # DeclarativeBase with naming convention
-│   │       └── runner.py         # Runner, RunnerObservation, WorkspaceObservation, etc.
-│   ├── executors/
-│   │   ├── __init__.py           # ExecutorPlugin ABC, EXECUTOR_REGISTRY, model exports
-│   │   ├── factory.py            # get_executor() — config-driven registry lookup
-│   │   ├── local.py              # LocalExecutor (default, shell-based)
-│   │   ├── models.py             # Pydantic request/response models
-│   │   └── awx/
-│   │       ├── __init__.py       # AWX executor package exports
-│   │       ├── client.py         # AWXApiClient — httpx REST API client
-│   │       ├── exceptions.py     # AWX exception hierarchy
-│   │       └── plugin.py         # AWXExecutorPlugin — lifecycle implementation
-│   ├── policy/
-│   │   ├── __init__.py           # Exports ObservationBasedPolicy, PolicyViolation
-│   │   ├── base.py               # PreflightPolicy protocol + PolicyViolation exception
-│   │   └── observation.py        # ObservationBasedPolicy — disk/memory/staleness guardrails
-│   ├── opencode/
-│   │   ├── __init__.py           # Package init, exports OpenCodeServeClient
-│   │   ├── protocol.py           # OpenCodeClientProtocol ABC and Pydantic response models
-│   │   └── serve_client.py       # httpx-based OpenCode Serve REST API client
-│   └── scheduler/
-│       ├── __init__.py           # Scheduler package
-│       ├── cleaner.py            # CleanupScheduler — background workspace cleanup
-│       └── engine.py             # Scheduler engine base class
+│   │       ├── identity.py       # Pydantic schemas for clients & tokens
+│   │       └── usage.py          # Pydantic schemas for usage reporting
+│   └── db/
+│       ├── __init__.py
+│       ├── session.py            # DatabasePool (asyncpg wrapper)
+│       ├── schema.py             # Schema management (delegates to Alembic)
+│       ├── setup.py              # Migration runner + table validation
+│       ├── lock.py               # Advisory locks
+│       └── models/
+│           ├── __init__.py
+│           ├── base.py           # SQLAlchemy declarative base
+│           ├── identity.py       # ORM models: OpenCodeClient, CollectorCredential
+│           └── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
 ├── frontend/                     # Aurora Glass telemetry dashboard (HTML/CSS/JS SPA)
+│   ├── index.html
+│   ├── app.js
+│   ├── style.css
+│   ├── Dockerfile                # nginx:alpine container for frontend + API proxy
+│   ├── nginx.conf                # Reverse proxy config (envsubst template)
+│   ├── docker-entrypoint.sh      # Substitutes GATEWAY_UPSTREAM at runtime
+│   └── tests/
 ├── tests/
 │   ├── __init__.py
-│   ├── conftest.py               # Shared fixtures (mock_conn, client, async test helpers)
-│   ├── integration/              # Integration tests requiring Postgres
-│   │   ├── __init__.py
-│   │   ├── conftest.py           # DB fixtures, helper factories
-│   │   ├── test_job_crud.py      # Job CRUD integration tests
-│   │   ├── test_runner.py        # Runner + observation integration tests
-│   │   └── test_schema.py        # Schema migration smoke tests
+│   ├── conftest.py               # Shared fixtures
 │   ├── test_app_factory.py       # Application factory lifecycle tests
-│   ├── test_awx_client.py        # AWXApiClient unit tests
+│   ├── test_auth.py              # API key authentication tests
+│   ├── test_auth_envelope.py     # Response envelope with auth
 │   ├── test_config.py            # Settings defaults, env overrides, .env loading
 │   ├── test_db_pool.py           # DatabasePool connect/acquire/release/close
 │   ├── test_entry_points.py      # main.py exports app, title matches
-│   ├── test_executor_loader.py   # Executor registry and factory resolution
-│   ├── test_executors.py         # Executor plugin interface and models
-│   ├── test_executors_awx.py     # AWXExecutorPlugin unit tests
+│   ├── test_factory.py           # Factory tests
+│   ├── test_frontend.py          # Frontend container and proxy tests
 │   ├── test_health.py            # Health endpoint: connected, disconnected, broken
-│   ├── test_job_model.py         # Job Pydantic models
-│   ├── test_jobs.py              # Job API endpoints
-│   ├── test_local_executor.py    # LocalExecutor implementation
-│   ├── test_policy.py            # Policy engine unit tests
-│   ├── test_runners.py           # Runner API endpoints
+│   ├── test_identity.py          # Token generation and hashing
+│   ├── test_ingest.py            # Telemetry ingest endpoint
 │   ├── test_schema.py            # Database schema tests
-│   ├── test_serve_client.py      # OpenCode Serve httpx client
-│   ├── test_workspace_lifecycle.py # Workspace pin/cleanup lifecycle
-│   ├── test_workspace_model.py   # Workspace Pydantic models
-│   ├── test_workspaces.py        # Workspace list/get API endpoints
-│   └── test_clients/             # Client test suites with mock transport
-│       ├── __init__.py
-│       ├── test_awx_client_mocktransport.py
-│       └── test_serve_client_comprehensive.py
+│   ├── test_secrets.py           # Secret detection utilities
+│   ├── test_setup.py             # Migration runner tests
+│   ├── test_smoke_local_stack.py # E2E smoke test for same-origin Docker stack
+│   └── test_usage.py             # Usage reporting endpoint tests
 ├── scripts/
-│   ├── seed.py                   # Database seeding script (runners, jobs, observations)
-│   └── worktree-manager.sh       # Git worktree management helper
+│   ├── seed.py                   # Database seeding script
+│   ├── worktree-manager.sh       # Git worktree management helper
+│   └── worktree-manager.ps1      # Git worktree management helper (PowerShell)
 ├── docs/
-│   └── adr/                      # Architecture Decision Records (4 ADRs)
+│   └── adr/                      # Architecture Decision Records
+├── alembic/                      # Alembic migrations
+├── .env.example
+├── .github/
+│   └── workflows/
+│       └── publish.yml           # Builds and publishes Gateway + Aurora Glass images
+├── docker-compose.yaml           # Same-origin local development stack
+├── docker-compose.smoke.yml      # E2E smoke test override (GATEWAY_ENV=development)
 ├── docker-compose.test.yml       # Standalone Postgres for integration tests
+├── Dockerfile                    # Gateway image (Python/FastAPI)
 ├── pyproject.toml                # Project metadata, pytest, ruff, mypy config
 ├── requirements.txt              # Runtime and dev dependencies
-└── README.md
+├── README.md
+└── CONTRIBUTING.md
 ```
 
 ---

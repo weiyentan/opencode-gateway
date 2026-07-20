@@ -1,16 +1,18 @@
-"""Tests for the Aurora Glass frontend.
+"""Tests for the Aurora Glass frontend and the same-origin local stack.
 
-Verifies that the frontend files exist for the nginx container build.
-The frontend is now served by a separate nginx container (not mounted
-via FastAPI StaticFiles in the Gateway process).
+Verifies that:
+- Frontend files exist for the nginx container build
+- The nginx proxy configuration correctly routes API calls to the Gateway
+- The docker-compose same-origin stack is properly configured
+- The frontend nginx container is the sole browser entrypoint
 """
 
 from pathlib import Path
 
 import pytest
 
-
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+REPO_DIR = Path(__file__).resolve().parent.parent
 
 
 class TestFrontendFilesExist:
@@ -45,3 +47,157 @@ class TestFrontendFilesExist:
         """The subtitle should read 'OpenCode Gateway Observability'."""
         content = (FRONTEND_DIR / "index.html").read_text()
         assert "OpenCode Gateway Observability" in content
+
+
+class TestNginxProxyConfiguration:
+    """The frontend nginx.conf must proxy API paths to the Gateway backend.
+
+    In the same-origin local stack, the frontend nginx container is the
+    sole browser entrypoint.  API, health, and admin requests are proxied
+    to the internal Gateway service at http://gateway:8000.
+    """
+
+    NGINX_CONF = FRONTEND_DIR / "nginx.conf"
+
+    @pytest.fixture(autouse=True)
+    def _load_nginx_config(self):
+        self.config = self.NGINX_CONF.read_text()
+
+    # ── Proxy location blocks ──────────────────────────────────────────
+
+    def test_proxies_api_to_gateway(self):
+        """/api/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/api/", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /api/ to ${GATEWAY_UPSTREAM}"
+        )
+
+    def test_proxies_health_to_gateway(self):
+        """/health requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/health", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /health to ${GATEWAY_UPSTREAM}"
+        )
+
+    def test_proxies_admin_to_gateway(self):
+        """/admin/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/admin/", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /admin/ to ${GATEWAY_UPSTREAM}"
+        )
+
+    def test_proxies_openapi_to_gateway(self):
+        """/openapi.json requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/openapi.json", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /openapi.json to ${GATEWAY_UPSTREAM}"
+        )
+
+    def test_proxies_docs_to_gateway(self):
+        """/docs requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        assert self._has_proxy_pass("/docs", "${GATEWAY_UPSTREAM}"), (
+            "nginx.conf must proxy /docs to ${GATEWAY_UPSTREAM}"
+        )
+
+    # ── Static file serving ────────────────────────────────────────────
+
+    def test_serves_static_files_at_root(self):
+        """The root location must serve static files with index.html fallback."""
+        assert "try_files $uri $uri/ /index.html;" in self.config, (
+            "nginx.conf root location must have SPA fallback"
+        )
+
+    # ── Security headers ───────────────────────────────────────────────
+
+    def test_has_security_headers(self):
+        """nginx.conf must include security headers."""
+        assert "X-Content-Type-Options" in self.config
+        assert "X-Frame-Options" in self.config
+        assert "X-XSS-Protection" in self.config
+
+    # ── Helper ─────────────────────────────────────────────────────────
+
+    def _has_proxy_pass(self, location: str, upstream: str) -> bool:
+        """Check if a location block proxies to the given upstream.
+
+        Supports both literal URLs (``http://gateway:8000``) and nginx
+        template variables (``${GATEWAY_UPSTREAM}``), since the nginx
+        config uses ``envsubst`` at container start to substitute the
+        real upstream URL.
+        """
+        import re
+        # If the upstream is an nginx variable (starts with $), match
+        # it directly; otherwise expect http:// prefix.
+        if upstream.startswith("$"):
+            prefix = ""
+        else:
+            prefix = r"http://"
+        pattern = re.compile(
+            r"location\s+" + re.escape(location) +
+            r"\s*\{(?:[^}]*?)proxy_pass\s+" + prefix + re.escape(upstream) + r"\s*;",
+            re.DOTALL,
+        )
+        return bool(pattern.search(self.config))
+
+
+class TestDockerComposeSameOriginStack:
+    """The docker-compose.yaml must implement the same-origin local stack.
+
+    Gateway must NOT expose host ports (only internal 'expose').  The
+    frontend nginx container must be the sole entrypoint from the host.
+    """
+
+    COMPOSE_FILE = REPO_DIR / "docker-compose.yaml"
+
+    @pytest.fixture(autouse=True)
+    def _load_compose(self):
+        import yaml
+        with open(self.COMPOSE_FILE) as f:
+            self.compose = yaml.safe_load(f)
+
+    def test_gateway_has_no_host_ports(self):
+        """The gateway service must NOT expose ports to the host."""
+        gateway = self.compose["services"]["gateway"]
+        assert "ports" not in gateway, (
+            "Gateway must not expose ports to the host "
+            "(it is only reachable internally via Docker DNS)"
+        )
+
+    def test_gateway_exposes_internal_port(self):
+        """The gateway service should expose port 8000 internally."""
+        gateway = self.compose["services"]["gateway"]
+        expose = gateway.get("expose", [])
+        assert "8000" in expose, (
+            "Gateway must expose port 8000 for internal Docker DNS access"
+        )
+
+    def test_frontend_is_sole_entrypoint(self):
+        """Only the frontend service should expose ports to the host."""
+        frontend = self.compose["services"]["frontend"]
+        assert "ports" in frontend, "Frontend must expose ports to the host"
+
+        # Check no other service (except postgres for DB tooling) has ports
+        for name, svc in self.compose["services"].items():
+            if name in ("frontend", "postgres"):
+                continue
+            assert "ports" not in svc, (
+                f"Service '{name}' must not expose ports to the host"
+            )
+
+    def test_frontend_depends_on_gateway(self):
+        """The frontend service must depend on the gateway."""
+        deps = self.compose["services"]["frontend"].get("depends_on", [])
+        assert "gateway" in deps, "Frontend must depend_on gateway"
+
+    def test_frontend_builds_from_frontend_dir(self):
+        """The frontend service must build from the frontend/Dockerfile.
+
+        The docker-compose uses ``context: .`` and ``dockerfile: frontend/Dockerfile``
+        so both the Gateway and frontend can share the repo-root build context.
+        """
+        build = self.compose["services"]["frontend"].get("build")
+        valid_configs = (
+            "./frontend",
+            {"context": "./frontend"},
+            {"context": ".", "dockerfile": "frontend/Dockerfile"},
+        )
+        assert build in valid_configs, (
+            "Frontend service must build from the frontend directory "
+            f"(got: {build!r})"
+        )
