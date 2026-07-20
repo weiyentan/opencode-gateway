@@ -33,7 +33,7 @@ jobs:
             context: .
             dockerfile: Dockerfile
           - name: aurora-glass
-            context: .
+            context: ./frontend
             dockerfile: frontend/Dockerfile
 
     steps:
