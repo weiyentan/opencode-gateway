@@ -66,61 +66,33 @@ async def test_health_endpoint_works(monkeypatch):
     assert payload["status"] == "ok"
 
 
-# ── Static file serving (Aurora Glass dashboard) ───────────────────────
+# ── API-only behaviour (Aurora Glass static serving removed) ──────────
 
 
-def test_app_registers_root_static_route():
-    """The factory-built app should have the root `/` route registered."""
+@pytest.mark.asyncio
+async def test_root_returns_404():
+    """The factory-built app no longer registers a root route — GET / returns 404."""
     from app.core.factory import create_app
 
     app = create_app(configure_logging=False)
     routes = [r.path for r in app.routes]
-    assert "/" in routes
+    assert "/" not in routes
 
 
-def test_app_registers_static_mount():
-    """When frontend/ directory exists, the `/static` mount should be present."""
+@pytest.mark.asyncio
+async def test_no_static_mount_exists():
+    """The app no longer mounts a /static route for frontend files."""
     from app.core.factory import create_app
 
     app = create_app(configure_logging=False)
 
-    # Check for a Starlette StaticFiles mount at /static
     static_routes = [r for r in app.routes if getattr(r, "path", None) == "/static"]
-    assert len(static_routes) > 0, "Expected a /static route mount"
+    assert len(static_routes) == 0, "Unexpected /static mount found"
 
 
 @pytest.mark.asyncio
-async def test_static_root_returns_index_html(monkeypatch):
-    """The `/` route should serve index.html when frontend/ exists."""
-    import os
-
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-api-key")
-    from httpx import ASGITransport, AsyncClient
-
-    from app.core.factory import create_app
-
-    # Verify the frontend directory exists (it's part of the repo)
-    assert os.path.isdir("frontend"), "frontend/ directory must exist for this test"
-
-    app = create_app(configure_logging=False)
-    app.state.pool = None
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-        headers={"Authorization": "Bearer test-api-key"},
-    ) as ac:
-        response = await ac.get("/")
-
-    assert response.status_code == 200
-    assert "text/html" in response.headers.get("content-type", "")
-    assert "Aurora Glass" in response.text
-
-
-@pytest.mark.asyncio
-async def test_static_serves_css(monkeypatch):
-    """The /static mount should serve CSS files from frontend/."""
+async def test_root_returns_404_via_client(monkeypatch):
+    """GET / should return 404 (FastAPI default)."""
     monkeypatch.setenv("GATEWAY_API_KEY", "test-api-key")
     from httpx import ASGITransport, AsyncClient
 
@@ -135,54 +107,30 @@ async def test_static_serves_css(monkeypatch):
         base_url="http://test",
         headers={"Authorization": "Bearer test-api-key"},
     ) as ac:
-        response = await ac.get("/static/style.css")
-
-    assert response.status_code == 200
-    assert "text/css" in response.headers.get("content-type", "")
-
-
-@pytest.mark.asyncio
-async def test_static_root_graceful_degradation(monkeypatch):
-    """When static_dir does not exist, the app still works and health endpoint responds."""
-    monkeypatch.setenv("GATEWAY_STATIC_DIR", "/tmp/nonexistent-opencode-test-dir")
-    from httpx import ASGITransport, AsyncClient
-
-    from app.core.factory import create_app
-
-    app = create_app(configure_logging=False)
-    app.state.pool = None
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-        headers={"Authorization": "Bearer test-api-key"},
-    ) as ac:
-        # Health endpoint should still work even without frontend dir
-        health_resp = await ac.get("/health")
-        assert health_resp.status_code == 200
-
-        # Root route returns 404 when index.html is missing
-        root_resp = await ac.get("/")
-        assert root_resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_static_root_missing_index_html(monkeypatch):
-    """When static_dir exists but has no index.html, the root route returns 404."""
-    monkeypatch.setenv("GATEWAY_STATIC_DIR", "tests")
-    from httpx import ASGITransport, AsyncClient
-
-    from app.core.factory import create_app
-
-    app = create_app(configure_logging=False)
-    app.state.pool = None
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-        headers={"Authorization": "Bearer test-api-key"},
-    ) as ac:
         response = await ac.get("/")
+
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_still_works_after_static_removal(monkeypatch):
+    """The /health API endpoint continues to work after static serving is removed."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-api-key")
+    from httpx import ASGITransport, AsyncClient
+
+    from app.core.factory import create_app
+
+    app = create_app(configure_logging=False)
+    app.state.pool = None
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer test-api-key"},
+    ) as ac:
+        response = await ac.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
