@@ -14,8 +14,14 @@ telemetry, monitors health, and provides a REST API for observability data.
 
 **Gateway**:
 The observability service. Collects telemetry from Runner VMs, stores
-metrics in Postgres, and exposes them through a REST API.
+metrics in Postgres, and exposes them through a REST API. It serves the
+API, not the Aurora Glass frontend.
 _Avoid_: Backend, server, controller
+
+**Aurora Glass**:
+The browser-based telemetry dashboard for Gateway observability data.
+Consumes the Gateway API, but is not part of the Gateway service itself.
+_Avoid_: Gateway UI, embedded dashboard
 
 **OpenCode Serve**:
 A long-running headless API process managed by systemd on the Runner VM.
@@ -42,7 +48,9 @@ The Gateway uses a layered architecture:
 - **app/api/** — REST endpoints
 - **app/core/** — Configuration, auth, logging, factory
 - **app/db/** — Postgres pool, migrations, ORM models
-- **frontend/** — Aurora Glass telemetry dashboard (vanilla HTML/CSS/JS SPA served at `/`)
+
+Aurora Glass is related to the Gateway, but is not part of the Gateway's
+service layers.
 
 Additional layers will be added in future slices.
 
@@ -53,6 +61,15 @@ layers. Paperclip coordinates agents and higher-level work. The Gateway
 provides observability into the OpenCode infrastructure that Paperclip
 manages.
 
+## Relationships
+
+- **Aurora Glass** consumes the **Gateway** API
+- **Aurora Glass** is delivered as a separate frontend from the **Gateway** service
+- **Aurora Glass** and the **Gateway** are intended to share one public origin even
+  when deployed as separate containers
+
 ## Flagged Ambiguities
 
-- (none yet)
+- "frontend layer inside the Gateway" was used to mean **Aurora Glass**.
+  Resolved: **Aurora Glass** is a separate frontend that consumes the
+  **Gateway** API.
