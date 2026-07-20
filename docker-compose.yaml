@@ -27,10 +27,6 @@ services:
       GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
       GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
       GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
-      # The Gateway no longer serves the frontend — Aurora Glass is
-      # served by its own nginx container. Set STATIC_DIR to a
-      # non-existent path to prevent accidental frontend serving.
-      GATEWAY_STATIC_DIR: /nonexistent
     depends_on:
       postgres:
         condition: service_healthy

@@ -167,14 +167,6 @@ class TestDockerComposeSameOriginStack:
             "Gateway must expose port 8000 for internal Docker DNS access"
         )
 
-    def test_gateway_has_static_dir_disabled(self):
-        """The gateway must have GATEWAY_STATIC_DIR set to a non-existent path."""
-        env = self.compose["services"]["gateway"]["environment"]
-        assert env.get("GATEWAY_STATIC_DIR") == "/nonexistent", (
-            "Gateway must have GATEWAY_STATIC_DIR=/nonexistent "
-            "to prevent accidental frontend serving"
-        )
-
     def test_frontend_is_sole_entrypoint(self):
         """Only the frontend service should expose ports to the host."""
         frontend = self.compose["services"]["frontend"]
