@@ -43,9 +43,7 @@ services:
   # requests to the internal gateway service. This is the sole browser
   # entrypoint — the single origin for same-origin local development.
   frontend:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
+    build: ./frontend
     container_name: opencode-frontend
     ports:
       - "${FRONTEND_PORT:-8080}:80"

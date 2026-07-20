@@ -92,7 +92,6 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the Aurora Glass dashboard static files directory |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -130,7 +129,7 @@ Expected response (example):
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
-**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway. A standalone Gateway also serves the dashboard at `/` if static files are present — but the Docker Compose stack is the recommended local development workflow.
+**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway.
 
 ---
 
@@ -200,7 +199,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 ## Frontend Dashboard (Aurora Glass)
 
-The Gateway ships with **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript.
+The repository includes **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript, delivered as a standalone container published alongside the Gateway.
 
 ### Access
 
@@ -213,16 +212,6 @@ http://localhost:8080/
 ```
 
 The frontend is the sole browser entrypoint — the Gateway runs internally and is not directly accessible from the host.
-
-**Standalone Gateway (without Docker):**
-
-A standalone Gateway also serves the dashboard at `http://localhost:8000/` if the `frontend/` directory is present. This mode is intended for development without Docker.
-
-### Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets (standalone Gateway only — not used in the Docker Compose stack where the frontend nginx serves static files). |
 
 ### Dashboard Sections
 

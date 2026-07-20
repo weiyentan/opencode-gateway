@@ -116,10 +116,13 @@ class TestNginxProxyConfiguration:
     def _has_proxy_pass(self, location: str, upstream: str) -> bool:
         """Check if a location block proxies to the given upstream."""
         import re
-        # Match: location <location> { ... proxy_pass http://<upstream>; ... }
+        # Match either:
+        #   proxy_pass http://<upstream>;
+        #   proxy_pass ${<ENV_VAR>};
         pattern = re.compile(
             r"location\s+" + re.escape(location) +
-            r"\s*\{(?:[^}]*?)proxy_pass\s+http://" + re.escape(upstream) + r"\s*;",
+            r"\s*\{(?:[^}]*?)proxy_pass\s+(?:http://" + re.escape(upstream) +
+            r"|\$\{[A-Z_]+\})\s*;",
             re.DOTALL,
         )
         return bool(pattern.search(self.config))
