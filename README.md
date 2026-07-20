@@ -40,7 +40,7 @@ Additional layers can be added as the observability service grows.
 | **Validation** | Pydantic v2 + `pydantic-settings` | Configuration and boundary models |
 | **Linting** | `ruff` | Replaces flake8, isort, pyupgrade. Selects: E, F, I, UP |
 | **Type Checking** | `mypy` (strict mode) | Full strict checking; Python 3.12 target |
-| **Frontend** | Vanilla HTML/CSS/JS | Aurora Glass dashboard — no build step, served at `/` via Starlette `StaticFiles` |
+| **Frontend** | Vanilla HTML/CSS/JS | Aurora Glass dashboard — delivered as a standalone nginx container (see [Standalone Container](#standalone-container)) |
 | **Testing** | `pytest` + `pytest-asyncio` | `asyncio_mode = auto` |
 
 ---
@@ -92,7 +92,6 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the Aurora Glass dashboard static files directory |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -128,7 +127,7 @@ Expected response (example):
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
-**Dashboard:** Open [http://localhost:8000/](http://localhost:8000/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. No build step is required; the frontend is served directly by the Gateway as static files.
+**Dashboard:** If you have the Aurora Glass frontend container running, open its URL in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. See [Standalone Container](#standalone-container) for instructions on running the frontend.
 
 ---
 
@@ -193,23 +192,40 @@ curl -f http://localhost:8000/health
 
 ## Frontend Dashboard (Aurora Glass)
 
-The Gateway ships with **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript.
+**Aurora Glass** is a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript.
 
-### Access
+> **Note:** As of the architectural split (see [ADR 0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md)), Aurora Glass is delivered as a **standalone nginx container** separate from the API Gateway. The Gateway no longer serves the frontend directly.
 
-Once the Gateway is running, open the dashboard at:
+### Standalone Container
 
+Aurora Glass can be built and run as an independent nginx container, separate from the Gateway. This is useful for deployments where the frontend is served from a different host or scaled independently.
+
+**Build the image:**
+
+```bash
+# From the repository root:
+docker build -f frontend/Dockerfile frontend/ -t aurora-glass
 ```
-http://localhost:8000/
+
+**Run standalone:**
+
+```bash
+# Point at a Gateway running on the Docker host:
+docker run -d \
+  -e GATEWAY_API_URL=http://host.docker.internal:8000 \
+  -p 8080:80 \
+  aurora-glass
+
+# Point at a remote Gateway:
+docker run -d \
+  -e GATEWAY_API_URL=https://gateway.example.com \
+  -p 8080:80 \
+  aurora-glass
 ```
 
-No separate build step or server is required — the Gateway serves the static files automatically.
+The `GATEWAY_API_URL` environment variable controls which Gateway instance the frontend proxies API requests to. It defaults to `http://gateway:8000` (the docker-compose service name) when not set.
 
-### Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets. Relative to the working directory. Point this to a custom dashboard build if needed. |
+The container does **not** require direct access to Postgres, collector credentials, or infrastructure secrets — it is a pure static frontend with an nginx reverse proxy to the Gateway API.
 
 ### Dashboard Sections
 
@@ -256,7 +272,7 @@ opencode-gateway/
 ├── app/
 │   ├── __init__.py
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn) + static file mount
+│   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint
@@ -310,6 +326,7 @@ opencode-gateway/
 | [0002](docs/adr/0002-executor-plugin-interface.md) | Executor Plugin Interface | Superseded (#207) |
 | [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | Superseded (#207) |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | Accepted |
+| [0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md) | Separate Aurora Glass from Gateway Service | Accepted |
 
 ---
 
