@@ -1,0 +1,19 @@
+# docker-compose.smoke.yml
+# ────────────────────────────────────────────────────────────────────────────
+#  Override for the end-to-end same-origin smoke test
+#  (tests/test_smoke_local_stack.py)
+#
+#  Sets GATEWAY_ENV=development so the Gateway container runs without
+#  requiring an API key.  The main docker-compose.yaml does not set this
+#  variable, and the Gateway defaults to "production" mode which demands a
+#  configured GATEWAY_API_KEY.  This override enables the smoke test to
+#  start the stack without needing a .env file or manual configuration.
+#
+#  Usage:
+#    docker compose -f docker-compose.yaml -f docker-compose.smoke.yml up -d
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+  gateway:
+    environment:
+      GATEWAY_ENV: development
