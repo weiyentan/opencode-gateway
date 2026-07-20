@@ -1,0 +1,7 @@
+{
+  "name": "aurora-glass",
+  "private": true,
+  "scripts": {
+    "test": "node tests/test_pure_functions.js"
+  }
+}
