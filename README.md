@@ -211,6 +211,40 @@ No separate build step or server is required — the Gateway serves the static f
 |----------|---------|-------------|
 | `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets. Relative to the working directory. Point this to a custom dashboard build if needed. |
 
+### Standalone Container
+
+Aurora Glass can be built and run as an independent nginx container, separate from the Gateway. This is useful for deployments where the frontend is served from a different host or scaled independently.
+
+**Build the image:**
+
+```bash
+# From the repository root:
+docker build -f frontend/Dockerfile frontend/ -t aurora-glass
+
+# Or using docker-compose (includes Gateway and Postgres):
+docker compose up -d
+```
+
+**Run standalone:**
+
+```bash
+# Point at a Gateway running on the Docker host:
+docker run -d \
+  -e GATEWAY_API_URL=http://host.docker.internal:8000 \
+  -p 8080:80 \
+  aurora-glass
+
+# Point at a remote Gateway:
+docker run -d \
+  -e GATEWAY_API_URL=https://gateway.example.com \
+  -p 8080:80 \
+  aurora-glass
+```
+
+The `GATEWAY_API_URL` environment variable controls which Gateway instance the frontend proxies API requests to. It defaults to `http://gateway:8000` (the docker-compose service name) when not set.
+
+The container does **not** require direct access to Postgres, collector credentials, or infrastructure secrets — it is a pure static frontend with an nginx reverse proxy to the Gateway API.
+
 ### Dashboard Sections
 
 The dashboard polls the Gateway REST API every 30 seconds and renders:
