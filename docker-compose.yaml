@@ -1,9 +1,24 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Same-origin local development stack for Aurora Glass and Gateway
+#
+# Architecture:
+#   Browser (single origin) ──→ frontend (nginx, port 8080)
+#     ├── /api/*, /health, /admin/*, /docs  ──→ gateway (port 8000, internal)
+#     └── /*  (static files)                  ──→ served by nginx directly
+#
+# The gateway is NOT exposed to the host — all traffic flows through the
+# frontend nginx proxy. This provides a same-origin experience (no CORS)
+# with Aurora Glass and the Gateway as separate containers.
+# ═══════════════════════════════════════════════════════════════════════════
+
 services:
   gateway:
     build: .
     container_name: opencode-gateway
-    ports:
-      - "8000:8000"
+    # No host ports: gateway is only reachable internally via Docker DNS
+    # at http://gateway:8000. The frontend nginx proxies API calls here.
+    expose:
+      - "8000"
     environment:
       GATEWAY_HOST: "0.0.0.0"
       GATEWAY_PORT: "8000"
@@ -12,6 +27,10 @@ services:
       GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
       GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
       GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      # The Gateway no longer serves the frontend — Aurora Glass is
+      # served by its own nginx container. Set STATIC_DIR to a
+      # non-existent path to prevent accidental frontend serving.
+      GATEWAY_STATIC_DIR: /nonexistent
     depends_on:
       postgres:
         condition: service_healthy
@@ -19,6 +38,10 @@ services:
       - gateway-net
     restart: unless-stopped
 
+  # ── Aurora Glass + Reverse Proxy ─────────────────────────────────────
+  # Serves the Aurora Glass dashboard static files AND proxies API
+  # requests to the internal gateway service. This is the sole browser
+  # entrypoint — the single origin for same-origin local development.
   frontend:
     build: ./frontend
     container_name: opencode-frontend
