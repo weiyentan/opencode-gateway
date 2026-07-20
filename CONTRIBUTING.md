@@ -173,6 +173,7 @@ opencode-gateway/
 │       ├── __init__.py           # Scheduler package
 │       ├── cleaner.py            # CleanupScheduler — background workspace cleanup
 │       └── engine.py             # Scheduler engine base class
+├── frontend/                     # Aurora Glass telemetry dashboard (HTML/CSS/JS SPA)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py               # Shared fixtures (mock_conn, client, async test helpers)

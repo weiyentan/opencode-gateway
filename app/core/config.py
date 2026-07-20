@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"
 
+    # Frontend static files
+    # Path to the directory containing the Aurora Glass dashboard SPA.
+    # Defaults to "frontend/" relative to the working directory.
+    # Maps to env var GATEWAY_STATIC_DIR.
+    static_dir: str = "frontend"
+
     # Heartbeat monitoring
     # Collectors that haven't pushed telemetry within this many seconds
     # are considered stale. Maps to env var GATEWAY_HEARTBEAT_THRESHOLD.

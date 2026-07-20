@@ -42,6 +42,7 @@ The Gateway uses a layered architecture:
 - **app/api/** — REST endpoints
 - **app/core/** — Configuration, auth, logging, factory
 - **app/db/** — Postgres pool, migrations, ORM models
+- **frontend/** — Aurora Glass telemetry dashboard (vanilla HTML/CSS/JS SPA served at `/`)
 
 Additional layers will be added in future slices.
 
