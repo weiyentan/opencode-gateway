@@ -131,7 +131,7 @@ opencode-gateway/
 ├── app/
 │   ├── __init__.py               # Package init
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn) + static file mount
+│   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py           # Router stubs
 │   │   ├── health.py             # GET /health endpoint
