@@ -40,7 +40,7 @@ Additional layers can be added as the observability service grows.
 | **Validation** | Pydantic v2 + `pydantic-settings` | Configuration and boundary models |
 | **Linting** | `ruff` | Replaces flake8, isort, pyupgrade. Selects: E, F, I, UP |
 | **Type Checking** | `mypy` (strict mode) | Full strict checking; Python 3.12 target |
-| **Frontend** | Vanilla HTML/CSS/JS | Aurora Glass dashboard — no build step, served at `/` via Starlette `StaticFiles` |
+| **Frontend** | Vanilla HTML/CSS/JS + nginx | Aurora Glass dashboard — no build step, served by a separate nginx container. In Docker Compose, the frontend nginx is the sole browser entrypoint and proxies API requests to the Gateway. |
 | **Testing** | `pytest` + `pytest-asyncio` | `asyncio_mode = auto` |
 
 ---
@@ -92,13 +92,12 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the Aurora Glass dashboard static files directory |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
 ### Run
 
-**Development** (with auto-reload):
+**Development (standalone Gateway)** — starts the API server without the frontend container:
 
 ```bash
 python -m app
@@ -118,6 +117,8 @@ pytest tests/ -v
 
 ### Verify
 
+When running the Gateway standalone:
+
 ```bash
 curl http://localhost:8000/health
 ```
@@ -128,24 +129,29 @@ Expected response (example):
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
-**Dashboard:** Open [http://localhost:8000/](http://localhost:8000/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. No build step is required; the frontend is served directly by the Gateway as static files.
+**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway.
 
 ---
 
-## Running with Docker
+## Running with Docker (Same-Origin Local Stack)
+
+The Docker Compose stack runs Aurora Glass and the Gateway as separate containers behind a single browser origin. The frontend nginx is the sole entrypoint — it serves the Aurora Glass dashboard and proxies API requests to the Gateway.
 
 ```bash
 cp .env.example .env
 docker compose up -d
-curl -f http://localhost:8000/health
+curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 ```
 
 ### Services
 
-| Service     | Container               | Port | Description                                       |
-|-------------|-------------------------|------|---------------------------------------------------|
-| **gateway** | `opencode-gateway`      | 8000 | FastAPI application (built from this `Dockerfile`) |
-| **postgres**| `opencode-gateway-db`   | 5432 | PostgreSQL 15 (Alpine) with persistent volume     |
+| Service     | Container               | Host Port | Internal Port | Description                                            |
+|-------------|-------------------------|-----------|---------------|--------------------------------------------------------|
+| **frontend**| `opencode-frontend`     | 8080      | 80            | Aurora Glass dashboard + nginx reverse proxy for API   |
+| **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
+| **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
+
+> **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
 ---
 
@@ -193,23 +199,19 @@ curl -f http://localhost:8000/health
 
 ## Frontend Dashboard (Aurora Glass)
 
-The Gateway ships with **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript.
+The repository includes **Aurora Glass**, a browser-based telemetry dashboard that visualizes observability data collected from OpenCode Serve instances. It is a single-page application (SPA) built with vanilla HTML, CSS, and JavaScript, delivered as a standalone container published alongside the Gateway.
 
 ### Access
 
-Once the Gateway is running, open the dashboard at:
+**Docker Compose stack (recommended for local development):**
+
+The frontend nginx container serves Aurora Glass and proxies API requests to the Gateway. Open the dashboard at:
 
 ```
-http://localhost:8000/
+http://localhost:8080/
 ```
 
-No separate build step or server is required — the Gateway serves the static files automatically.
-
-### Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets. Relative to the working directory. Point this to a custom dashboard build if needed. |
+The frontend is the sole browser entrypoint — the Gateway runs internally and is not directly accessible from the host.
 
 ### Dashboard Sections
 

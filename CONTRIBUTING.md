@@ -9,13 +9,13 @@ Thank you for your interest in contributing! This document covers how to set up 
 - **Python 3.12** or later
 - **PostgreSQL 15** or later (or Docker for a local instance)
 
-> **Quick start with Docker Compose:** If you have Docker (20.10+) and Docker Compose (v2+), you can skip the manual setup below and run the entire Gateway stack in containers:
+> **Quick start with Docker Compose:** If you have Docker (20.10+) and Docker Compose (v2+), you can skip the manual setup below and run the entire same-origin stack in containers:
 > ```bash
 > cp .env.example .env
 > docker compose up -d
-> curl http://localhost:8000/health
+> curl http://localhost:8080/health    # proxied to gateway by frontend nginx
 > ```
-> See [Running with Docker](README.md#running-with-docker) in the README for details.
+> See [Running with Docker](README.md#running-with-docker-same-origin-local-stack) in the README for details.
 
 ---
 
