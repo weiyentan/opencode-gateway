@@ -194,4 +194,9 @@ class TestDockerComposeSameOriginStack:
             f"Frontend build must reference frontend/ in dockerfile, got {dockerfile!r}"
         )
 
+    def test_frontend_configures_gateway_upstream(self):
+        """The frontend service must pass the runtime proxy target."""
+        env = self.compose["services"]["frontend"].get("environment", {})
+        assert env.get("GATEWAY_UPSTREAM") == "http://gateway:8000"
+
 
