@@ -213,19 +213,6 @@ http://localhost:8080/
 
 The frontend is the sole browser entrypoint — the Gateway runs internally and is not directly accessible from the host.
 
-**Standalone Gateway (without Docker):**
-
-The Gateway is API-only and no longer serves the Aurora Glass dashboard directly. For dashboard access, use the Docker Compose stack (see [Running with Docker](#running-with-docker-same-origin-local-stack)) which runs both the Gateway and the Aurora Glass nginx container.
-
-### Configuration
-
-The Docker Compose stack exposes the following frontend-related variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FRONTEND_PORT` | `8080` | Host port for the frontend nginx container (maps to container port 80) |
-| `GATEWAY_UPSTREAM` | `http://gateway:8000` | Internal URL of the Gateway service (set in the frontend container environment) |
-
 ### Dashboard Sections
 
 The dashboard polls the Gateway REST API every 30 seconds and renders:
@@ -325,6 +312,7 @@ opencode-gateway/
 | [0002](docs/adr/0002-executor-plugin-interface.md) | Executor Plugin Interface | Superseded (#207) |
 | [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | Superseded (#207) |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | Accepted |
+| [0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md) | Separate Aurora Glass from Gateway Service | Accepted |
 
 ---
 

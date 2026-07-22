@@ -81,8 +81,10 @@ Expected response: `{"status": "ok", "data": {"status": "ok", "version": "0.1.0-
 ## Running Tests
 
 ```bash
-pytest tests/ -v                 # Run all tests
-pytest tests/ -v -k "db"         # Run only database-related tests (requires Postgres)
+pytest tests/ -v                         # Run all tests
+pytest tests/ -v -m "not integration"    # Run only unit tests (no Docker/Postgres)
+pytest tests/ -v -m integration          # Run integration tests only (requires Docker/Postgres)
+pytest tests/ -v -k "db"                 # Run only database-related tests (requires Postgres)
 ```
 
 Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). Most tests mock the database layer; tests tagged with `test_db` or `test_schema` require a running PostgreSQL instance.
@@ -180,6 +182,7 @@ opencode-gateway/
 │   ├── nginx.conf                # Reverse proxy config (envsubst template)
 │   ├── docker-entrypoint.sh      # Substitutes GATEWAY_UPSTREAM at runtime
 │   └── tests/
+│       └── test_pure_functions.js
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py               # Shared fixtures
@@ -273,7 +276,7 @@ Before contributing, familiarise yourself with the project's design philosophy:
 - **Application factory pattern** — `create_app()` builds FastAPI with injectable startup/shutdown hooks.
 - **Graceful degradation** — The app starts without PostgreSQL and reports degraded status rather than crashing.
 - **Async-first** — All I/O uses `async`/`await`: `asyncpg`, `httpx`, `asyncio`.
-- **Pydantic at every boundary** — Settings, API responses, and executor interfaces all use typed Pydantic models.
+- **Pydantic at every boundary** — Settings, API responses, and data models all use typed Pydantic models.
 - **Stub-first development** — Packages exist as stubs with docstrings before full implementation.
 
 ---

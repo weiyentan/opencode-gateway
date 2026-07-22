@@ -27,7 +27,7 @@ class DatabasePool:
 
     async def connect(self) -> None:
         """Initialize the connection pool from settings."""
-        self._pool = await asyncpg.create_pool(
+        pool_kwargs = dict(
             host=self._settings.database_host,
             port=self._settings.database_port,
             database=self._settings.database_name,
@@ -36,8 +36,10 @@ class DatabasePool:
             min_size=self._settings.database_min_connections,
             max_size=self._settings.database_max_connections,
             timeout=self._settings.database_connection_timeout,
-            ssl=self._settings.database_ssl,
         )
+        if self._settings.database_ssl:
+            pool_kwargs["ssl"] = self._settings.database_ssl
+        self._pool = await asyncpg.create_pool(**pool_kwargs)
 
     async def close(self) -> None:
         """Close the connection pool gracefully."""

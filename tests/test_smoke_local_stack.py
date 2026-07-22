@@ -54,20 +54,6 @@ def _docker_compose_available() -> bool:
         return False
 
 
-def _docker_daemon_available() -> bool:
-    """Return True if the local Docker daemon is reachable."""
-    try:
-        result = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
 def _stack_up(env: dict[str, str]) -> None:
     """Start the stack with both compose files."""
     subprocess.run(
@@ -143,8 +129,6 @@ def stack_url() -> str:
     """
     if not _docker_compose_available():
         pytest.skip("docker compose is not installed; cannot run smoke test")
-    if not _docker_daemon_available():
-        pytest.skip("docker daemon is not available; cannot run smoke test")
 
     # Ensure GATEWAY_ENV is set for the shell (used by docker-compose.smoke.yml)
     env = os.environ.copy()
@@ -161,6 +145,7 @@ def stack_url() -> str:
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 class TestSmokeSameOriginStack:
     """End-to-end smoke tests for the local same-origin Aurora Glass stack.
 
