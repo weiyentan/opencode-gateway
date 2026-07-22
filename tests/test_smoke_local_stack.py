@@ -145,6 +145,7 @@ def stack_url() -> str:
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 class TestSmokeSameOriginStack:
     """End-to-end smoke tests for the local same-origin Aurora Glass stack.
 
