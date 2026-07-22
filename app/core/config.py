@@ -76,7 +76,6 @@ class Settings(BaseSettings):
     database_min_connections: int = 2
     database_max_connections: int = 10
     database_connection_timeout: int = 30
-    database_ssl: str = "require"
 
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"

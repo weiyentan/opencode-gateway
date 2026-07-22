@@ -38,7 +38,7 @@ def test_app_registers_health_router():
     app = create_app(configure_logging=False)
 
     # Check that the health route is registered
-    routes = [getattr(r, "path", None) for r in app.routes]
+    routes = [r.path for r in app.routes]
     assert "/health" in routes
 
 
@@ -86,7 +86,7 @@ async def test_no_static_mount_exists():
 
     app = create_app(configure_logging=False)
 
-    static_routes = [r for r in app.routes if getattr(r, "path", None) == "/static"]
+    static_routes = [r for r in app.routes if r.path == "/static"]
     assert len(static_routes) == 0, "Unexpected /static mount found"
 
 

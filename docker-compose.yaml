@@ -27,6 +27,7 @@ services:
       GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
       GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
       GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      GATEWAY_STATIC_DIR: /nonexistent
     depends_on:
       postgres:
         condition: service_healthy

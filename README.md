@@ -213,19 +213,6 @@ http://localhost:8080/
 
 The frontend is the sole browser entrypoint — the Gateway runs internally and is not directly accessible from the host.
 
-**Standalone Gateway (without Docker):**
-
-The Gateway is API-only and no longer serves the Aurora Glass dashboard directly. For dashboard access, use the Docker Compose stack (see [Running with Docker](#running-with-docker-same-origin-local-stack)) which runs both the Gateway and the Aurora Glass nginx container.
-
-### Configuration
-
-The Docker Compose stack exposes the following frontend-related variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FRONTEND_PORT` | `8080` | Host port for the frontend nginx container (maps to container port 80) |
-| `GATEWAY_UPSTREAM` | `http://gateway:8000` | Internal URL of the Gateway service (set in the frontend container environment) |
-
 ### Dashboard Sections
 
 The dashboard polls the Gateway REST API every 30 seconds and renders:
