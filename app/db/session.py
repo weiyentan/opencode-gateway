@@ -36,6 +36,7 @@ class DatabasePool:
             min_size=self._settings.database_min_connections,
             max_size=self._settings.database_max_connections,
             timeout=self._settings.database_connection_timeout,
+            ssl="require",
         )
 
     async def close(self) -> None:
