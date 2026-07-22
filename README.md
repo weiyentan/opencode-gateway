@@ -92,7 +92,6 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the Aurora Glass dashboard static files directory |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -130,7 +129,7 @@ Expected response (example):
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
-**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway. A standalone Gateway also serves the dashboard at `/` if static files are present — but the Docker Compose stack is the recommended local development workflow.
+**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway.
 
 ---
 
@@ -216,13 +215,16 @@ The frontend is the sole browser entrypoint — the Gateway runs internally and 
 
 **Standalone Gateway (without Docker):**
 
-A standalone Gateway also serves the dashboard at `http://localhost:8000/` if the `frontend/` directory is present. This mode is intended for development without Docker.
+The Gateway is API-only and no longer serves the Aurora Glass dashboard directly. For dashboard access, use the Docker Compose stack (see [Running with Docker](#running-with-docker-same-origin-local-stack)) which runs both the Gateway and the Aurora Glass nginx container.
 
 ### Configuration
 
+The Docker Compose stack exposes the following frontend-related variables:
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GATEWAY_STATIC_DIR` | `frontend` | Path to the directory containing the Aurora Glass SPA assets (standalone Gateway only — not used in the Docker Compose stack where the frontend nginx serves static files). |
+| `FRONTEND_PORT` | `8080` | Host port for the frontend nginx container (maps to container port 80) |
+| `GATEWAY_UPSTREAM` | `http://gateway:8000` | Internal URL of the Gateway service (set in the frontend container environment) |
 
 ### Dashboard Sections
 
@@ -269,7 +271,7 @@ opencode-gateway/
 ├── app/
 │   ├── __init__.py
 │   ├── __main__.py               # Dev entry point (python -m app)
-│   ├── main.py                   # Production entry point (uvicorn) + static file mount
+│   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint

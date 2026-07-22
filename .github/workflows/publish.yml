@@ -1,29 +1,32 @@
-# ── Publish Container Images ─────────────────────────────────────────────
-# Single CI workflow that builds and publishes both Gateway and Aurora Glass
-# container images. Both artifacts share the same version tags for a given
-# repository revision, reflecting the split architecture: the Gateway serves
-# the API and Aurora Glass serves the frontend dashboard.
+# ── Publish Gateway and Aurora Glass ──────────────────────────────────────────
+# Builds and publishes separate container images for the two modules that
+# together form the OpenCode Gateway observability platform:
 #
-# Image naming (configurable via DOCKER_IMAGE_NAME secret):
-#   docker.io/<image-name>-gateway        — API service
-#   docker.io/<image-name>-aurora-glass   — Frontend dashboard
+#   Gateway      (root Dockerfile)           — Python/FastAPI REST API
+#   Aurora Glass (frontend/Dockerfile)       — browser-based telemetry dashboard
 #
-# On pull_request events the images are built but not pushed (no login).
-# On push/tag events they are built, tagged, and pushed to DockerHub.
-name: Publish Container Images
+# Both images are built from the same repository revision and receive
+# identical version tags (semver, SHA) so they are always deployed together.
+# On pull_request events the images are built but not pushed.
+#
+# Architecture: Gateway serves the observability API; Aurora Glass is a
+# separate frontend that consumes the Gateway API — see CONTEXT.md.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Publish Gateway and Aurora Glass
 
 on:
   push:
-    branches: ["master", "weiyentan-patch-1"]
+    branches: [ "master", "weiyentan-patch-1" ]
     tags: ["v*"]
   pull_request:
-    branches: ["master"]
+    branches: [ "master" ]
 
 env:
   REGISTRY: docker.io
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:

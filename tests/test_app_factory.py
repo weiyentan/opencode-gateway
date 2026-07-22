@@ -38,7 +38,7 @@ def test_app_registers_health_router():
     app = create_app(configure_logging=False)
 
     # Check that the health route is registered
-    routes = [r.path for r in app.routes]
+    routes = [getattr(r, "path", None) for r in app.routes]
     assert "/health" in routes
 
 
