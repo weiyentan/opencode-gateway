@@ -53,8 +53,8 @@ class TestNginxProxyConfiguration:
     """The frontend nginx.conf must proxy API paths to the Gateway backend.
 
     In the same-origin local stack, the frontend nginx container is the
-    sole browser entrypoint.  API, health, and admin requests are proxied
-    to the internal Gateway service at http://gateway:8000.
+    sole browser entrypoint. API, health, and admin requests are proxied
+    to the internal Gateway service.
     """
 
     NGINX_CONF = FRONTEND_DIR / "nginx.conf"
@@ -66,34 +66,38 @@ class TestNginxProxyConfiguration:
     # ── Proxy location blocks ──────────────────────────────────────────
 
     def test_proxies_api_to_gateway(self):
-        """/api/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        """/api/ requests must be proxied through the configured upstream."""
         assert self._has_proxy_pass("/api/", "${GATEWAY_UPSTREAM}"), (
-            "nginx.conf must proxy /api/ to ${GATEWAY_UPSTREAM}"
+            "nginx.conf must proxy /api/ through GATEWAY_UPSTREAM"
         )
 
     def test_proxies_health_to_gateway(self):
-        """/health requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        """/health requests must be proxied through the configured upstream."""
         assert self._has_proxy_pass("/health", "${GATEWAY_UPSTREAM}"), (
-            "nginx.conf must proxy /health to ${GATEWAY_UPSTREAM}"
+            "nginx.conf must proxy /health through GATEWAY_UPSTREAM"
         )
 
     def test_proxies_admin_to_gateway(self):
-        """/admin/ requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        """/admin/ requests must be proxied through the configured upstream."""
         assert self._has_proxy_pass("/admin/", "${GATEWAY_UPSTREAM}"), (
-            "nginx.conf must proxy /admin/ to ${GATEWAY_UPSTREAM}"
+            "nginx.conf must proxy /admin/ through GATEWAY_UPSTREAM"
         )
 
     def test_proxies_openapi_to_gateway(self):
-        """/openapi.json requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        """/openapi.json requests must be proxied through the configured upstream."""
         assert self._has_proxy_pass("/openapi.json", "${GATEWAY_UPSTREAM}"), (
-            "nginx.conf must proxy /openapi.json to ${GATEWAY_UPSTREAM}"
+            "nginx.conf must proxy /openapi.json through GATEWAY_UPSTREAM"
         )
 
     def test_proxies_docs_to_gateway(self):
-        """/docs requests must be proxied to the GATEWAY_UPSTREAM variable."""
+        """/docs requests must be proxied through the configured upstream."""
         assert self._has_proxy_pass("/docs", "${GATEWAY_UPSTREAM}"), (
-            "nginx.conf must proxy /docs to ${GATEWAY_UPSTREAM}"
+            "nginx.conf must proxy /docs through GATEWAY_UPSTREAM"
         )
+
+    def test_declares_runtime_upstream_placeholder(self):
+        """nginx.conf must keep the runtime-substituted upstream variable."""
+        assert "${GATEWAY_UPSTREAM}" in self.config
 
     # ── Static file serving ────────────────────────────────────────────
 
@@ -114,23 +118,11 @@ class TestNginxProxyConfiguration:
     # ── Helper ─────────────────────────────────────────────────────────
 
     def _has_proxy_pass(self, location: str, upstream: str) -> bool:
-        """Check if a location block proxies to the given upstream.
-
-        Supports both literal URLs (``http://gateway:8000``) and nginx
-        template variables (``${GATEWAY_UPSTREAM}``), since the nginx
-        config uses ``envsubst`` at container start to substitute the
-        real upstream URL.
-        """
+        """Check if a location block proxies to the given upstream."""
         import re
-        # If the upstream is an nginx variable (starts with $), match
-        # it directly; otherwise expect http:// prefix.
-        if upstream.startswith("$"):
-            prefix = ""
-        else:
-            prefix = r"http://"
         pattern = re.compile(
             r"location\s+" + re.escape(location) +
-            r"\s*\{(?:[^}]*?)proxy_pass\s+" + prefix + re.escape(upstream) + r"\s*;",
+            r"\s*\{(?:[^}]*?)proxy_pass\s+" + re.escape(upstream) + r"\s*;",
             re.DOTALL,
         )
         return bool(pattern.search(self.config))
@@ -148,7 +140,7 @@ class TestDockerComposeSameOriginStack:
     @pytest.fixture(autouse=True)
     def _load_compose(self):
         import yaml
-        with open(self.COMPOSE_FILE) as f:
+        with open(self.COMPOSE_FILE, encoding="utf-8") as f:
             self.compose = yaml.safe_load(f)
 
     def test_gateway_has_no_host_ports(self):
@@ -165,6 +157,13 @@ class TestDockerComposeSameOriginStack:
         expose = gateway.get("expose", [])
         assert "8000" in expose, (
             "Gateway must expose port 8000 for internal Docker DNS access"
+        )
+
+    def test_gateway_does_not_set_removed_static_dir(self):
+        """The compose stack must not set the removed gateway static-dir setting."""
+        env = self.compose["services"]["gateway"]["environment"]
+        assert "GATEWAY_STATIC_DIR" not in env, (
+            "Gateway compose config must not set removed GATEWAY_STATIC_DIR"
         )
 
     def test_frontend_is_sole_entrypoint(self):
@@ -186,18 +185,13 @@ class TestDockerComposeSameOriginStack:
         assert "gateway" in deps, "Frontend must depend_on gateway"
 
     def test_frontend_builds_from_frontend_dir(self):
-        """The frontend service must build from the frontend/Dockerfile.
-
-        The docker-compose uses ``context: .`` and ``dockerfile: frontend/Dockerfile``
-        so both the Gateway and frontend can share the repo-root build context.
-        """
+        """The frontend service must use the repo root with the frontend Dockerfile."""
         build = self.compose["services"]["frontend"].get("build")
-        valid_configs = (
-            "./frontend",
-            {"context": "./frontend"},
-            {"context": ".", "dockerfile": "frontend/Dockerfile"},
+        assert build == {"context": ".", "dockerfile": "frontend/Dockerfile"}, (
+            "Frontend service must build from repo root with frontend/Dockerfile"
         )
-        assert build in valid_configs, (
-            "Frontend service must build from the frontend directory "
-            f"(got: {build!r})"
-        )
+
+    def test_frontend_configures_gateway_upstream(self):
+        """The frontend service must pass the runtime proxy target."""
+        env = self.compose["services"]["frontend"].get("environment", {})
+        assert env.get("GATEWAY_UPSTREAM") == "http://gateway:8000"

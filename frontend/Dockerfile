@@ -22,11 +22,10 @@ RUN chmod +x /docker-entrypoint.sh
 
 # Verify the frontend files are in place.
 RUN test -f /usr/share/nginx/html/index.html && \
-    test -f /usr/share/nginx/html/app.js && \
     test -f /usr/share/nginx/html/style.css
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:80/ || exit 1
+  CMD curl -f http://localhost/health || exit 1
 
 EXPOSE 80
 
