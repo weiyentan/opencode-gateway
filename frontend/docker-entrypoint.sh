@@ -15,7 +15,7 @@ DEFAULT_UPSTREAM="http://gateway:8000"
 : "${GATEWAY_UPSTREAM:=${DEFAULT_UPSTREAM}}"
 export GATEWAY_UPSTREAM
 
-envsubst '${GATEWAY_UPSTREAM}' \
+envsubst '${GATEWAY_UPSTREAM}${GATEWAY_API_KEY}' \
   < /etc/nginx/conf.d/default.conf \
   > /tmp/default.conf \
   && mv /tmp/default.conf /etc/nginx/conf.d/default.conf
