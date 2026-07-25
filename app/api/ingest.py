@@ -181,40 +181,30 @@ async def _resolve_session(
 ) -> uuid.UUID:
     """Map (source_database_id, external_session_id) to internal sessions.id UUID.
 
-    If a session row already exists for this (source DB, external ID) pair,
-    returns the existing UUID after updating ``last_message_at``.  Otherwise,
-    creates a new row with a fresh UUID and returns it.
+    Uses ``INSERT ... ON CONFLICT`` for an atomic upsert that is safe under
+    concurrent ingestion from multiple collectors or overlapping batches.
+    The first caller inserts a new row; subsequent callers hit the unique
+    constraint and receive the existing ``id`` via ``RETURNING``.
 
     Scoped per source database so the same external session ID resolves to
     different internal UUIDs when originating from different databases.
     """
-    existing = await conn.fetchrow(
-        "SELECT id FROM sessions WHERE source_database_id = $1 AND external_session_id = $2",
-        source_database_id,
-        external_session_id,
-    )
-    if existing is not None:
-        await conn.execute(
-            "UPDATE sessions SET last_message_at = $2 WHERE id = $1",
-            existing["id"],
-            now,
-        )
-        return existing["id"]
-
-    # Not found — create new session row
     new_id = uuid.uuid4()
-    await conn.execute(
+    row = await conn.fetchrow(
         """INSERT INTO sessions
            (id, client_id, source_database_id, external_session_id,
             first_message_at, last_message_at, message_count)
-           VALUES ($1, $2, $3, $4, $5, $5, 0)""",
+           VALUES ($1, $2, $3, $4, $5, $5, 0)
+           ON CONFLICT ON CONSTRAINT uq_sessions_external_session_id
+           DO UPDATE SET last_message_at = EXCLUDED.last_message_at
+           RETURNING id""",
         new_id,
         client_id,
         source_database_id,
         external_session_id,
         now,
     )
-    return new_id
+    return row["id"]
 
 
 # ── Record processor ──────────────────────────────────────────────────────
