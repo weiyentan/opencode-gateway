@@ -27,7 +27,7 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 # ── Known schema versions ─────────────────────────────────────────────────
 
-KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1"})
+KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2"})
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────
@@ -46,6 +46,14 @@ class IngestRecord(BaseModel):
         default=None, description="Estimated cost in USD (nullable)"
     )
     reported_at: datetime = Field(description="When the collector recorded this usage")
+
+    # ── Optional enrichment fields (v1.2+) ────────────────────────────
+    provider: str | None = Field(default=None, description="LLM provider name")
+    mode: str | None = Field(default=None, description="Execution mode (e.g. code, chat)")
+    finish_reason: str | None = Field(default=None, description="Reason the LLM finished")
+    reasoning_tokens: int | None = Field(default=0, description="Reasoning tokens used")
+    cache_read_tokens: int | None = Field(default=0, description="Cache read tokens")
+    cache_write_tokens: int | None = Field(default=0, description="Cache write tokens")
 
 
 class IngestRequest(BaseModel):
