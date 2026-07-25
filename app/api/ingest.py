@@ -27,7 +27,7 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 # ── Known schema versions ─────────────────────────────────────────────────
 
-KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
+KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1"})
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ class IngestRecord(BaseModel):
     """A single usage record from a collector."""
 
     source_record_id: str = Field(description="Unique record ID within the source database")
-    session_id: uuid.UUID = Field(description="Session this record belongs to")
+    session_id: str = Field(description="External session identifier (e.g. OpenCode ses_* ID)")
     model: str = Field(description="Model name used for this request")
     input_tokens: int = Field(ge=0, description="Prompt tokens consumed")
     output_tokens: int = Field(ge=0, description="Completion tokens produced")
@@ -172,55 +172,49 @@ async def _upsert_model(
         return row["id"]
 
 
-async def _upsert_session(
+async def _resolve_session(
     conn: asyncpg.Connection,
-    session_id: uuid.UUID,
+    source_database_id: uuid.UUID,
     client_id: uuid.UUID,
-    source_db_id: uuid.UUID,
-    input_tokens: int,
-    output_tokens: int,
-    cached_tokens: int,
-    cost: Decimal | None,
+    external_session_id: str,
     now: datetime,
-) -> None:
-    """Create or update a session row, incrementing aggregate counters."""
+) -> uuid.UUID:
+    """Map (source_database_id, external_session_id) to internal sessions.id UUID.
+
+    If a session row already exists for this (source DB, external ID) pair,
+    returns the existing UUID after updating ``last_message_at``.  Otherwise,
+    creates a new row with a fresh UUID and returns it.
+
+    Scoped per source database so the same external session ID resolves to
+    different internal UUIDs when originating from different databases.
+    """
     existing = await conn.fetchrow(
-        "SELECT id FROM sessions WHERE id = $1", session_id
+        "SELECT id FROM sessions WHERE source_database_id = $1 AND external_session_id = $2",
+        source_database_id,
+        external_session_id,
     )
-    if existing is None:
+    if existing is not None:
         await conn.execute(
-            """INSERT INTO sessions
-               (id, client_id, source_database_id, first_message_at, last_message_at,
-                message_count, total_input_tokens, total_output_tokens,
-                total_cached_tokens, total_estimated_cost_usd)
-               VALUES ($1, $2, $3, $4, $4, 1, $5, $6, $7, $8)""",
-            session_id,
-            client_id,
-            source_db_id,
+            "UPDATE sessions SET last_message_at = $2 WHERE id = $1",
+            existing["id"],
             now,
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            cost,
         )
-    else:
-        await conn.execute(
-            """UPDATE sessions
-               SET last_message_at = $2,
-                   message_count = message_count + 1,
-                   total_input_tokens = total_input_tokens + $3,
-                   total_output_tokens = total_output_tokens + $4,
-                   total_cached_tokens = total_cached_tokens + $5,
-                   total_estimated_cost_usd = COALESCE(total_estimated_cost_usd, 0)
-                                              + COALESCE($6, 0)
-               WHERE id = $1""",
-            session_id,
-            now,
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            cost,
-        )
+        return existing["id"]
+
+    # Not found — create new session row
+    new_id = uuid.uuid4()
+    await conn.execute(
+        """INSERT INTO sessions
+           (id, client_id, source_database_id, external_session_id,
+            first_message_at, last_message_at, message_count)
+           VALUES ($1, $2, $3, $4, $5, $5, 0)""",
+        new_id,
+        client_id,
+        source_database_id,
+        external_session_id,
+        now,
+    )
+    return new_id
 
 
 # ── Record processor ──────────────────────────────────────────────────────
@@ -285,17 +279,9 @@ async def _process_one_record(
     # ── 3. Upsert observed model ─────────────────────────────────────
     model_id = await _upsert_model(conn, record.model, now)
 
-    # ── 4. Upsert session ────────────────────────────────────────────
-    await _upsert_session(
-        conn,
-        record.session_id,
-        client_id,
-        source_db_id,
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-        record.estimated_cost_usd,
-        now,
+    # ── 4. Resolve session ────────────────────────────────────────────
+    internal_session_id = await _resolve_session(
+        conn, source_db_id, client_id, record.session_id, now
     )
 
     # ── 5. Insert usage record ───────────────────────────────────────
@@ -310,7 +296,7 @@ async def _process_one_record(
         client_id,
         source_db_id,
         record.source_record_id,
-        record.session_id,
+        internal_session_id,
         model_id,
         input_tokens,
         output_tokens,
