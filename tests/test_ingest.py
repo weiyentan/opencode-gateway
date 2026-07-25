@@ -127,10 +127,17 @@ def _build_ingest_app(
 def _new_record_side_effect(record_count: int = 1) -> list:
     """Build a fetchrow side-effect list for ``record_count`` new records.
 
-    Order per record: source_db check | dedup | model | session.
+    Structure: [sd_check] + [dedup, model, session_upsert] * record_count.
+
+    The session upsert always returns a row with ``id`` (the new or existing
+    internal session UUID).
     """
-    per_record = [None, None, None, None]  # sd, dedup, model, session
-    return per_record * record_count
+    per_record: list = [None]  # sd check (once per batch)
+    for _ in range(record_count):
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        per_record.extend([None, None, session_row])  # dedup, model, session
+    return per_record
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -530,12 +537,15 @@ class TestSourceDatabaseUpsert:
         existing_sd = MagicMock()
         existing_sd.__getitem__.side_effect = {"id": _SOURCE_DB_ID}.__getitem__
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
         mock_conn.fetchrow.side_effect = [
             auth,          # 1. auth
             existing_sd,   # 2. source_database check → exists (UPDATE)
             None,          # 3. dedup check → not found
             None,          # 4. model check → not found
-            None,          # 5. session check → not found
+            session_row,   # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -597,14 +607,17 @@ class TestModelUpsert:
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": model_id}.__getitem__
 
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
-        # Order: auth | sd_check | dedup | model_check | session_check
+        # Order: auth | sd_check | dedup | model_check | session upsert
         mock_conn.fetchrow.side_effect = [
             auth,            # 1. auth
             None,            # 2. source_database check → not found
             None,            # 3. dedup check → not found (proceed)
             existing_model,  # 4. model check → found (UPDATE)
-            None,            # 5. session check → not found
+            session_row,     # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -717,12 +730,14 @@ class TestSessionIdAcceptsSesString:
         mock_conn = AsyncMock()
         auth = _auth_row()
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
             None,          # dedup check (new)
             None,          # model check (new)
-            None,          # session resolve (new)
+            session_row,    # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -763,8 +778,10 @@ class TestSessionIdAcceptsSesString:
         mock_conn = AsyncMock()
         auth = _auth_row()
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, None,
+            auth, None, None, None, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -805,12 +822,14 @@ class TestResolveSessionCreatesNewRow:
         mock_conn = AsyncMock()
         auth = _auth_row()
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
             None,          # dedup check (new)
             None,          # model check (new)
-            None,          # session resolve → no existing session
+            session_row,    # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -825,12 +844,12 @@ class TestResolveSessionCreatesNewRow:
 
         assert response.status_code == 200
 
-        # Verify an INSERT INTO sessions was called with external_session_id
-        session_inserts = [
-            call for call in mock_conn.execute.call_args_list
+        # Verify the upsert (INSERT … ON CONFLICT … RETURNING id) was called
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO sessions" in str(call)
         ]
-        assert len(session_inserts) == 1
+        assert len(session_upserts) == 1
 
         # Verify the usage record INSERT received a resolved session UUID,
         # not the raw external session ID string
@@ -852,7 +871,7 @@ class TestResolveSessionReturnsExisting:
     @pytest.mark.asyncio
     async def test_existing_session_returned(self, monkeypatch):
         """When a session with the same (source_db, external_id) exists,
-        it is reused and last_message_at is updated."""
+        the ON CONFLICT path updates counters and returns the existing UUID."""
         mock_conn = AsyncMock()
         auth = _auth_row()
         existing_session_id = uuid.uuid4()
@@ -865,7 +884,7 @@ class TestResolveSessionReturnsExisting:
             None,           # source_database check (new)
             None,           # dedup check (new)
             None,           # model check (new)
-            session_row,    # session resolve → existing session found
+            session_row,    # session upsert → returns existing id (ON CONFLICT path)
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -880,19 +899,14 @@ class TestResolveSessionReturnsExisting:
 
         assert response.status_code == 200
 
-        # Verify no INSERT INTO sessions (existing row was found)
-        session_inserts = [
-            call for call in mock_conn.execute.call_args_list
+        # Verify the upsert (INSERT … ON CONFLICT … DO UPDATE … RETURNING)
+        # was called — this handles both new and existing sessions.
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO sessions" in str(call)
         ]
-        assert len(session_inserts) == 0
-
-        # Verify an UPDATE sessions SET last_message_at was called
-        session_updates = [
-            call for call in mock_conn.execute.call_args_list
-            if "UPDATE sessions SET last_message_at" in str(call)
-        ]
-        assert len(session_updates) == 1
+        assert len(session_upserts) == 1
+        assert "ON CONFLICT" in str(session_upserts[0])
 
         # Verify the usage record was inserted with the existing session UUID
         record_inserts = [
@@ -914,56 +928,66 @@ class TestDifferentSourceDbSameExternalId:
     ):
         """Two ingests with the same external session ID but different
         source_database_id produce different internal session UUIDs."""
-        # Note: This is inherently proven by the lookup being scoped to
-        # (source_database_id, external_session_id).  We verify by
-        # checking the SQL query in _resolve_session uses both columns.
         from app.api.ingest import _resolve_session
 
+        from decimal import Decimal
+
         mock_conn = AsyncMock()
-        # Simulate: source DB A has session with ses_abc → returns UUID-A
-        # Source DB B with same ses_abc → returns None → creates UUID-B
         session_a_id = uuid.uuid4()
 
-        # First call: source_db_a, ses_abc → found (returns existing)
+        # First call: source_db_a, ses_abc → ON CONFLICT path returns existing UUID
         row_a = MagicMock()
         row_a.__getitem__.side_effect = {"id": session_a_id}.__getitem__
         mock_conn.fetchrow = AsyncMock(return_value=row_a)
-        mock_conn.execute = AsyncMock()
 
         result_a = await _resolve_session(
             mock_conn,
             source_database_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
             client_id=_CLIENT_ID,
             external_session_id="ses_abc",
+            input_tokens=100,
+            output_tokens=50,
+            cached_tokens=0,
+            estimated_cost_usd=None,
             now=_utcnow(),
         )
         assert result_a == session_a_id
-        # Should have executed an UPDATE (not INSERT)
-        updates = [
-            c for c in mock_conn.execute.call_args_list
-            if "UPDATE sessions" in str(c)
-        ]
-        assert len(updates) == 1
 
-        # Second call: source_db_b, same ses_abc → not found (creates new)
-        mock_conn.fetchrow = AsyncMock(return_value=None)
-        mock_conn.execute = AsyncMock()
+        # Verify the upsert was made via fetchrow (INSERT … ON CONFLICT … RETURNING)
+        upserts_a = [
+            c for c in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(c)
+        ]
+        assert len(upserts_a) == 1
+        assert "ON CONFLICT" in str(upserts_a[0])
+
+        # Second call: source_db_b, same ses_abc → INSERT path (new UUID)
+        new_b_id = uuid.uuid4()
+        row_b = MagicMock()
+        row_b.__getitem__.side_effect = {"id": new_b_id}.__getitem__
+        mock_conn.fetchrow.return_value = row_b
 
         result_b = await _resolve_session(
             mock_conn,
             source_database_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
             client_id=_CLIENT_ID,
             external_session_id="ses_abc",
+            input_tokens=200,
+            output_tokens=75,
+            cached_tokens=10,
+            estimated_cost_usd=Decimal("0.0070"),
             now=_utcnow(),
         )
         assert isinstance(result_b, uuid.UUID)
+        assert result_b == new_b_id
         assert result_b != session_a_id
-        # Should have executed an INSERT (not UPDATE)
-        inserts = [
-            c for c in mock_conn.execute.call_args_list
+
+        # Verify the upsert was made for source B too
+        upserts_b = [
+            c for c in mock_conn.fetchrow.call_args_list
             if "INSERT INTO sessions" in str(c)
         ]
-        assert len(inserts) == 1
+        assert len(upserts_b) == 2  # both calls
 
 
 class TestIdempotencyWithSessionResolution:
@@ -1010,7 +1034,7 @@ class TestIdempotencyWithSessionResolution:
         # Verify session resolution was never called (dedup short-circuits)
         session_calls = [
             call for call in mock_conn.fetchrow.call_args_list
-            if "SELECT id FROM sessions" in str(call)
+            if "INSERT INTO sessions" in str(call) or "SELECT id FROM sessions" in str(call)
         ]
         assert len(session_calls) == 0
 
@@ -1024,8 +1048,10 @@ class TestSchemaVersion11Accepted:
         mock_conn = AsyncMock()
         auth = _auth_row()
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, None,
+            auth, None, None, None, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
