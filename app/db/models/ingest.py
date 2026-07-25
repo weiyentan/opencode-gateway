@@ -18,10 +18,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -87,6 +89,16 @@ class Session(Base):
     """
 
     __tablename__ = "sessions"
+
+    __table_args__ = (
+        Index(
+            "uq_sessions_external_session_id",
+            "source_database_id",
+            "external_session_id",
+            unique=True,
+            postgresql_where=text("external_session_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
