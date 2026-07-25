@@ -131,6 +131,10 @@ class Session(Base):
     total_estimated_cost_usd: Mapped[Optional[Decimal]] = mapped_column(
         Numeric, nullable=True
     )
+    project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    workspace_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    parent_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
 
 class OpenCodeUsageRecord(Base):
@@ -177,6 +181,18 @@ class OpenCodeUsageRecord(Base):
     )
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    mode: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    finish_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    reasoning_tokens: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0
+    )
+    cache_read_tokens: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0
+    )
+    cache_write_tokens: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=0
     )
 
 
