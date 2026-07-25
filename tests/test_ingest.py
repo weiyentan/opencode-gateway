@@ -1086,3 +1086,74 @@ class TestSessionModelIndex:
             assert len(indexes) >= 1, "Should have at least one unique Index"
             idx = indexes[0]
             assert idx.name == "uq_sessions_external_session_id"
+
+
+class TestResolveSessionConcurrentSafety:
+    """Concurrent calls to _resolve_session() with the same external
+    session ID return the same internal UUID (no race condition)."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_same_external_id(self, monkeypatch):
+        """Two concurrent _resolve_session() calls with the same
+        (source_database_id, external_session_id) return the same UUID."""
+        from app.api.ingest import _resolve_session
+        from decimal import Decimal
+        import asyncio
+
+        expected_id = uuid.uuid4()
+
+        # Mock fetchrow to always return the same UUID — simulating
+        # the upsert (INSERT … ON CONFLICT … RETURNING) that resolves
+        # to the same internal session UUID regardless of which caller
+        # wins the race.
+        mock_conn = AsyncMock()
+        row = MagicMock()
+        row.__getitem__.side_effect = {"id": expected_id}.__getitem__
+        mock_conn.fetchrow = AsyncMock(return_value=row)
+
+        source_db_id = uuid.uuid4()
+        external_id = "ses_concurrent_test"
+        now = _utcnow()
+
+        # Fire two calls concurrently
+        results = await asyncio.gather(
+            _resolve_session(
+                mock_conn,
+                source_database_id=source_db_id,
+                client_id=_CLIENT_ID,
+                external_session_id=external_id,
+                input_tokens=100,
+                output_tokens=50,
+                cached_tokens=0,
+                estimated_cost_usd=None,
+                now=now,
+            ),
+            _resolve_session(
+                mock_conn,
+                source_database_id=source_db_id,
+                client_id=_CLIENT_ID,
+                external_session_id=external_id,
+                input_tokens=200,
+                output_tokens=75,
+                cached_tokens=10,
+                estimated_cost_usd=Decimal("0.0070"),
+                now=now,
+            ),
+        )
+
+        # Both must return UUIDs
+        assert all(isinstance(r, uuid.UUID) for r in results)
+
+        # Both must return the SAME UUID (same session identity)
+        assert results[0] == results[1] == expected_id
+
+        # Verify INSERT … ON CONFLICT … RETURNING was called twice
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_upserts) == 2
+
+        # Verify both calls used the ON CONFLICT pattern
+        for call in session_upserts:
+            assert "ON CONFLICT" in str(call)

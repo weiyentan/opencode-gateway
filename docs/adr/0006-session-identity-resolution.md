@@ -78,7 +78,7 @@ Negative:
 
 ```sql
 -- Unique index (to be applied via migration)
-CREATE UNIQUE INDEX ix_sessions_external_id_per_source
+CREATE UNIQUE INDEX uq_sessions_external_session_id
     ON sessions (source_database_id, external_session_id)
     WHERE external_session_id IS NOT NULL;
 ```
@@ -88,12 +88,24 @@ handler) performs:
 
 ```sql
 INSERT INTO sessions (id, client_id, source_database_id, external_session_id,
-                      first_message_at, last_message_at)
-VALUES (gen_random_uuid(), :client_id, :source_database_id, :external_session_id,
-        :reported_at, :reported_at)
+                      first_message_at, last_message_at, message_count,
+                      total_input_tokens, total_output_tokens, total_cached_tokens,
+                      total_estimated_cost_usd)
+VALUES (:new_id, :client_id, :source_database_id, :external_session_id,
+        :reported_at, :reported_at, 1,
+        :input_tokens, :output_tokens, :cached_tokens,
+        :estimated_cost_usd)
 ON CONFLICT (source_database_id, external_session_id)
     WHERE external_session_id IS NOT NULL
-DO UPDATE SET last_message_at = GREATEST(sessions.last_message_at, :reported_at)
+DO UPDATE SET
+    last_message_at = GREATEST(sessions.last_message_at, :reported_at),
+    message_count = sessions.message_count + 1,
+    total_input_tokens = sessions.total_input_tokens + :input_tokens,
+    total_output_tokens = sessions.total_output_tokens + :output_tokens,
+    total_cached_tokens = sessions.total_cached_tokens + :cached_tokens,
+    total_estimated_cost_usd =
+        COALESCE(sessions.total_estimated_cost_usd, 0)
+        + COALESCE(:estimated_cost_usd, 0)
 RETURNING id;
 ```
 
