@@ -10,10 +10,12 @@ Covers:
 - Schema version mismatch → 400
 - Source database upsert
 - Model upsert
+- Validation detail logging (issue #238)
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -1157,3 +1159,209 @@ class TestResolveSessionConcurrentSafety:
         # Verify both calls used the ON CONFLICT pattern
         for call in session_upserts:
             assert "ON CONFLICT" in str(call)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #238 — Validation detail logging
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestValidationDetailLogging:
+    """GATEWAY_LOG_VALIDATION_DETAIL controls structured 422 logging."""
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _setup_env(monkeypatch, set_env_val: str | None = None):
+        """Configure env vars and reload config.
+
+        Args:
+            set_env_val: If a string, set GATEWAY_LOG_VALIDATION_DETAIL
+                to that value.  If ``None``, delete the env var.
+        """
+        if set_env_val is not None:
+            monkeypatch.setenv("GATEWAY_LOG_VALIDATION_DETAIL", set_env_val)
+        else:
+            monkeypatch.delenv("GATEWAY_LOG_VALIDATION_DETAIL", raising=False)
+        monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
+        monkeypatch.setenv("GATEWAY_ENV", "development")
+
+        import importlib
+        import app.core.config as _cfg
+        importlib.reload(_cfg)
+
+    @staticmethod
+    def _build_app_and_client(mock_conn):
+        """Build a test app with mocked DB session."""
+        app = create_app(configure_logging=False)
+
+        async def _override(request: Request):
+            yield mock_conn
+
+        app.dependency_overrides[get_session] = _override
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        return AsyncClient(transport=transport, base_url="http://test")
+
+    @staticmethod
+    def _bad_payload(**overrides: object) -> dict:
+        """Return a payload that triggers a 422 validation error."""
+        payload = {
+            "schema_version": "1.0",
+            "collector_version": "0.1.0",
+            "source_database_id": str(uuid.uuid4()),
+            "records": [
+                {
+                    "source_record_id": "rec-bad",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": "not-a-number",
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+                },
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def _make_auth() -> MagicMock:
+        auth = MagicMock()
+        auth.__getitem__.side_effect = {
+            "credential_id": uuid.uuid4(),
+            "revoked_at": None,
+            "last_used_at": None,
+            "client_id": uuid.uuid4(),
+            "client_name": "test-client",
+            "client_is_active": True,
+        }.__getitem__
+        return auth
+
+    # ── Tests ──────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_default_disabled_no_validation_log(self, monkeypatch, caplog):
+        """When GATEWAY_LOG_VALIDATION_DETAIL is not set, no validation
+        detail is logged on 422."""
+        self._setup_env(monkeypatch)
+        caplog.set_level(logging.INFO)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=self._make_auth())
+
+        async with self._build_app_and_client(mock_conn) as client:
+            response = await client.post(
+                "/ingest",
+                json=self._bad_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 422
+        detail_messages = [
+            r for r in caplog.records
+            if r.name == "app.core.envelope" and "Validation detail" in r.getMessage()
+        ]
+        assert len(detail_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_enabled_logs_validation_detail(self, monkeypatch, caplog):
+        """When GATEWAY_LOG_VALIDATION_DETAIL=true, validation details
+        are logged on 422."""
+        self._setup_env(monkeypatch, set_env_val="true")
+        caplog.set_level(logging.INFO)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=self._make_auth())
+
+        async with self._build_app_and_client(mock_conn) as client:
+            response = await client.post(
+                "/ingest",
+                json=self._bad_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 422
+        detail_messages = [
+            r for r in caplog.records
+            if r.name == "app.core.envelope" and "Validation detail" in r.getMessage()
+        ]
+        assert len(detail_messages) >= 1
+
+        message = detail_messages[0].getMessage()
+        # Verify structured fields are present
+        assert "input_tokens" in message
+        assert "not-a-number" in message
+        assert "int_parsing" in message
+
+    @pytest.mark.asyncio
+    async def test_disabled_explicit_false_no_log(self, monkeypatch, caplog):
+        """When GATEWAY_LOG_VALIDATION_DETAIL=false explicitly, no
+        validation detail is logged on 422."""
+        self._setup_env(monkeypatch, set_env_val="false")
+        caplog.set_level(logging.INFO)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=self._make_auth())
+
+        async with self._build_app_and_client(mock_conn) as client:
+            response = await client.post(
+                "/ingest",
+                json=self._bad_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 422
+        detail_messages = [
+            r for r in caplog.records
+            if r.name == "app.core.envelope" and "Validation detail" in r.getMessage()
+        ]
+        assert len(detail_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_enabled_redacts_nested_secrets(self, monkeypatch, caplog):
+        """When validation detail logging is enabled, secret-like values
+        inside nested dict `input` fields are redacted."""
+        self._setup_env(monkeypatch, set_env_val="true")
+        caplog.set_level(logging.INFO)
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=self._make_auth())
+
+        async with self._build_app_and_client(mock_conn) as client:
+            # Send a malformed payload where a scalar field receives a
+            # dict with a secret-like key to verify redaction.
+            payload = self._bad_payload(
+                records=[
+                    {
+                        "source_record_id": "rec-secret",
+                        "session_id": str(uuid.uuid4()),
+                        "model": "gpt-4",
+                        "input_tokens": {"api_key": "super-secret-value", "value": 100},
+                        "output_tokens": 50,
+                        "cached_tokens": 0,
+                        "estimated_cost_usd": "0.0035",
+                        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+                    },
+                ],
+            )
+            response = await client.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 422
+
+        detail_messages = [
+            r for r in caplog.records
+            if r.name == "app.core.envelope" and "Validation detail" in r.getMessage()
+        ]
+        assert len(detail_messages) >= 1
+
+        message = detail_messages[0].getMessage()
+        # The redacted placeholder should appear for the secret-like key
+        from app.core.secrets import REDACTED
+        assert REDACTED in message
+        # The raw secret value should NOT appear in the log
+        assert "super-secret-value" not in message
