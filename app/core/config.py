@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     # are considered stale. Maps to env var GATEWAY_HEARTBEAT_THRESHOLD.
     heartbeat_threshold: int = 300
 
+    # Validation detail logging
+    # When ``true``, structured field-level validation details are logged
+    # for 422 validation errors on the ingest endpoint.  Field values are
+    # passed through the existing redaction path before logging, but DO
+    # NOT enable this in production unless you have reviewed what data
+    # your collectors send — the redaction patterns may not catch all
+    # sensitive information embedded in field values.
+    log_validation_detail: bool = False
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

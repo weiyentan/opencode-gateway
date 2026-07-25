@@ -18,6 +18,9 @@ from starlette.exceptions import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from app.core.config import get_settings
+from app.core.secrets import redact_dict
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -170,7 +173,36 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Return envelope-formatted error for Pydantic validation failures (422)."""
+    """Return envelope-formatted error for Pydantic validation failures (422).
+
+    When ``GATEWAY_LOG_VALIDATION_DETAIL`` is ``true``, structured
+    field-level validation details are logged through the redaction path.
+    """
+    settings = get_settings()
+    if settings.log_validation_detail:
+        errors = exc.errors()
+        safe_errors = []
+        for err in errors:
+            safe_err: dict[str, Any] = {
+                "loc": list(err.get("loc", [])),
+                "type": err.get("type", ""),
+                "msg": err.get("msg", ""),
+            }
+            # Include the input value (the submitted data that failed
+            # validation) but redact any nested secret-like keys via
+            # the existing redaction helper.
+            raw_input = err.get("input")
+            if isinstance(raw_input, dict):
+                safe_err["input"] = redact_dict(raw_input)
+            else:
+                safe_err["input"] = raw_input
+            safe_errors.append(safe_err)
+
+        logger.info(
+            "Validation detail: %s",
+            json.dumps(safe_errors, default=str),
+        )
+
     return JSONResponse(
         status_code=422,
         content={
