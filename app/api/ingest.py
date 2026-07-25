@@ -39,9 +39,9 @@ class IngestRecord(BaseModel):
     source_record_id: str = Field(description="Unique record ID within the source database")
     session_id: str = Field(description="External session identifier (e.g. OpenCode ses_* ID)")
     model: str = Field(description="Model name used for this request")
-    input_tokens: int = Field(ge=0, description="Prompt tokens consumed")
-    output_tokens: int = Field(ge=0, description="Completion tokens produced")
-    cached_tokens: int = Field(default=0, ge=0, description="Cached/prompt-cache tokens")
+    input_tokens: int = Field(description="Prompt tokens consumed")
+    output_tokens: int = Field(description="Completion tokens produced")
+    cached_tokens: int = Field(default=0, description="Cached/prompt-cache tokens")
     estimated_cost_usd: Decimal | None = Field(
         default=None, description="Estimated cost in USD (nullable)"
     )
@@ -254,6 +254,13 @@ async def _process_one_record(
             index=index,
             status="rejected",
             reason=f"Non-numeric token value: {exc}",
+        )
+
+    if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
+        return IngestRecordResult(
+            index=index,
+            status="rejected",
+            reason="Negative token value",
         )
 
     # ── 2. Idempotency check ─────────────────────────────────────────

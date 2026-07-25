@@ -385,7 +385,7 @@ class TestMalformedRecord:
                     "source_record_id": "rec-neg",
                     "session_id": str(_SESSION_ID),
                     "model": "gpt-4",
-                    "input_tokens": -10,   # Pydantic will reject (ge=0)
+                    "input_tokens": -10,
                     "output_tokens": 50,
                     "cached_tokens": 0,
                     "estimated_cost_usd": "0.0035",
@@ -401,8 +401,12 @@ class TestMalformedRecord:
                 headers={"Authorization": "Bearer collector-token"},
             )
 
-        # Pydantic catches negative values (ge=0 constraint)
-        assert response.status_code == 422
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 0
+        assert data["rejected_count"] == 1
+        assert data["results"][0]["status"] == "rejected"
+        assert data["results"][0]["reason"] == "Negative token value"
 
 
 class TestEmptyBatchHeartbeat:
