@@ -35,6 +35,23 @@ can sit above the Gateway, calling the Gateway API to retrieve
 observability data.
 _Avoid_: Gateway, execution control plane
 
+**External Session ID**:
+The source system's native session identifier (e.g., OpenCode's `ses_*`
+IDs from SQLite `session.id`). Stored in `sessions.external_session_id`.
+Not a UUID.
+_Avoid_: Session ID (ambiguous)
+
+**Internal Session ID**:
+The gateway's own UUID primary key (`sessions.id`). Generated at ingest
+time when an external session ID is first seen.
+_Avoid_: Session ID (ambiguous)
+
+**Session Resolution**:
+The process at ingest time of mapping an external session ID to an
+internal gateway session UUID, scoped by
+`(source_database_id, external_session_id)`. Creates a new internal
+session row if not found; reuses existing if found.
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
