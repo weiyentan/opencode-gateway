@@ -26,6 +26,9 @@ class AggregateRow(BaseModel):
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
+    total_reasoning_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     record_count: int = Field(default=0, ge=0)
 
@@ -60,6 +63,12 @@ class RecordRow(BaseModel):
     input_tokens: int
     output_tokens: int
     cached_tokens: int
+    provider: str | None = None
+    mode: str | None = None
+    finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
     estimated_cost_usd: Decimal | None = None
     reported_at: datetime
     ingested_at: datetime
@@ -98,6 +107,10 @@ class SessionSummary(BaseModel):
     total_input_tokens: int
     total_output_tokens: int
     total_cached_tokens: int
+    project_id: str | None = None
+    workspace_id: str | None = None
+    agent: str | None = None
+    parent_session_id: str | None = None
     total_estimated_cost_usd: Decimal | None = None
     loki_search_url: str | None = Field(
         default=None,
