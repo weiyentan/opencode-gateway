@@ -127,10 +127,17 @@ def _build_ingest_app(
 def _new_record_side_effect(record_count: int = 1) -> list:
     """Build a fetchrow side-effect list for ``record_count`` new records.
 
-    Order per record: source_db check | dedup | model | session.
+    Structure: [sd_check] + [dedup, model, session_upsert] * record_count.
+
+    The session upsert always returns a row with ``id`` (the new or existing
+    internal session UUID).
     """
-    per_record = [None, None, None, None]  # sd, dedup, model, session
-    return per_record * record_count
+    per_record: list = [None]  # sd check (once per batch)
+    for _ in range(record_count):
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        per_record.extend([None, None, session_row])  # dedup, model, session
+    return per_record
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -530,12 +537,15 @@ class TestSourceDatabaseUpsert:
         existing_sd = MagicMock()
         existing_sd.__getitem__.side_effect = {"id": _SOURCE_DB_ID}.__getitem__
         mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
         mock_conn.fetchrow.side_effect = [
             auth,          # 1. auth
             existing_sd,   # 2. source_database check → exists (UPDATE)
             None,          # 3. dedup check → not found
             None,          # 4. model check → not found
-            None,          # 5. session check → not found
+            session_row,   # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -597,14 +607,17 @@ class TestModelUpsert:
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": model_id}.__getitem__
 
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
-        # Order: auth | sd_check | dedup | model_check | session_check
+        # Order: auth | sd_check | dedup | model_check | session upsert
         mock_conn.fetchrow.side_effect = [
             auth,            # 1. auth
             None,            # 2. source_database check → not found
             None,            # 3. dedup check → not found (proceed)
             existing_model,  # 4. model check → found (UPDATE)
-            None,            # 5. session check → not found
+            session_row,     # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -701,3 +714,446 @@ class TestHealthExtended:
         assert "source_databases" in data
         assert "last_ingest_timestamp" in data
         assert data["last_ingest_timestamp"] is not None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #236 — Session resolution tests
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionIdAcceptsSesString:
+    """IngestRecord.session_id accepts ses_* strings (no 422)."""
+
+    @pytest.mark.asyncio
+    async def test_ses_string_accepted(self, monkeypatch):
+        """A ses_* external session ID is accepted without validation error."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth,          # auth
+            None,          # source_database check (new)
+            None,          # dedup check (new)
+            None,          # model check (new)
+            session_row,    # session upsert → returns new id
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-ses-001",
+                    "session_id": "ses_abc123def456",
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+
+
+    @pytest.mark.asyncio
+    async def test_random_string_session_id_accepted(self, monkeypatch):
+        """Any string (not just ses_*) is accepted as external session ID."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, None, None, session_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-custom-001",
+                    "session_id": "my-custom-session-id!",
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+
+class TestResolveSessionCreatesNewRow:
+    """_resolve_session() creates a new sessions row when external ID is new."""
+
+    @pytest.mark.asyncio
+    async def test_creates_session_with_external_id(self, monkeypatch):
+        """When no session matches the external ID, a new row is inserted."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth,          # auth
+            None,          # source_database check (new)
+            None,          # dedup check (new)
+            None,          # model check (new)
+            session_row,    # session upsert → returns new id
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify the upsert (INSERT … ON CONFLICT … RETURNING id) was called
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_upserts) == 1
+
+        # Verify the usage record INSERT received a resolved session UUID,
+        # not the raw external session ID string
+        record_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(record_inserts) == 1
+        # The session_id argument in the usage record INSERT should be a UUID,
+        # not a string (the 6th positional arg after VALUES)
+        usage_insert_call = record_inserts[0]
+        session_id_arg = usage_insert_call.args[5]  # 6th positional arg (after SQL) = session_id
+        assert isinstance(session_id_arg, uuid.UUID)
+
+
+class TestResolveSessionReturnsExisting:
+    """_resolve_session() returns existing UUID when external ID matches."""
+
+    @pytest.mark.asyncio
+    async def test_existing_session_returned(self, monkeypatch):
+        """When a session with the same (source_db, external_id) exists,
+        the ON CONFLICT path updates counters and returns the existing UUID."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_session_id = uuid.uuid4()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": existing_session_id}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,           # auth
+            None,           # source_database check (new)
+            None,           # dedup check (new)
+            None,           # model check (new)
+            session_row,    # session upsert → returns existing id (ON CONFLICT path)
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify the upsert (INSERT … ON CONFLICT … DO UPDATE … RETURNING)
+        # was called — this handles both new and existing sessions.
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_upserts) == 1
+        assert "ON CONFLICT" in str(session_upserts[0])
+
+        # Verify the usage record was inserted with the existing session UUID
+        record_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(record_inserts) == 1
+        usage_insert_call = record_inserts[0]
+        session_id_arg = usage_insert_call.args[5]
+        assert session_id_arg == existing_session_id
+
+
+class TestDifferentSourceDbSameExternalId:
+    """Same external session ID from different source DBs resolves to different UUIDs."""
+
+    @pytest.mark.asyncio
+    async def test_different_source_db_produces_different_internal_uuid(
+        self, monkeypatch
+    ):
+        """Two ingests with the same external session ID but different
+        source_database_id produce different internal session UUIDs."""
+        from app.api.ingest import _resolve_session
+
+        from decimal import Decimal
+
+        mock_conn = AsyncMock()
+        session_a_id = uuid.uuid4()
+
+        # First call: source_db_a, ses_abc → ON CONFLICT path returns existing UUID
+        row_a = MagicMock()
+        row_a.__getitem__.side_effect = {"id": session_a_id}.__getitem__
+        mock_conn.fetchrow = AsyncMock(return_value=row_a)
+
+        result_a = await _resolve_session(
+            mock_conn,
+            source_database_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+            client_id=_CLIENT_ID,
+            external_session_id="ses_abc",
+            input_tokens=100,
+            output_tokens=50,
+            cached_tokens=0,
+            estimated_cost_usd=None,
+            now=_utcnow(),
+        )
+        assert result_a == session_a_id
+
+        # Verify the upsert was made via fetchrow (INSERT … ON CONFLICT … RETURNING)
+        upserts_a = [
+            c for c in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(c)
+        ]
+        assert len(upserts_a) == 1
+        assert "ON CONFLICT" in str(upserts_a[0])
+
+        # Second call: source_db_b, same ses_abc → INSERT path (new UUID)
+        new_b_id = uuid.uuid4()
+        row_b = MagicMock()
+        row_b.__getitem__.side_effect = {"id": new_b_id}.__getitem__
+        mock_conn.fetchrow.return_value = row_b
+
+        result_b = await _resolve_session(
+            mock_conn,
+            source_database_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+            client_id=_CLIENT_ID,
+            external_session_id="ses_abc",
+            input_tokens=200,
+            output_tokens=75,
+            cached_tokens=10,
+            estimated_cost_usd=Decimal("0.0070"),
+            now=_utcnow(),
+        )
+        assert isinstance(result_b, uuid.UUID)
+        assert result_b == new_b_id
+        assert result_b != session_a_id
+
+        # Verify the upsert was made for source B too
+        upserts_b = [
+            c for c in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(c)
+        ]
+        assert len(upserts_b) == 2  # both calls
+
+
+class TestIdempotencyWithSessionResolution:
+    """Idempotency still works after session resolution change."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_batch_after_resolve_is_idempotent(self, monkeypatch):
+        """Re-posting identical records returns accepted via idempotency,
+        without triggering session resolution again."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        # Existing record with matching values — dedup will short-circuit
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,            # 1. auth
+            None,            # 2. source_database check (new)
+            existing_dedup,  # 3. dedup → match (returns early, no session resolve)
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        # Verify session resolution was never called (dedup short-circuits)
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call) or "SELECT id FROM sessions" in str(call)
+        ]
+        assert len(session_calls) == 0
+
+
+class TestSchemaVersion11Accepted:
+    """schema_version \"1.1\" is accepted by the schema validation gate."""
+
+    @pytest.mark.asyncio
+    async def test_schema_version_1_1_accepted(self, monkeypatch):
+        """A payload with schema_version 1.1 is accepted (not 400)."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, None, None, session_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(schema_version="1.1")
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+
+class TestSessionModelIndex:
+    """The ORM Session model includes the unique partial index."""
+
+    def test_model_has_partial_unique_index(self):
+        """Verify Session.__table_args__ includes the index."""
+        from app.db.models.ingest import Session
+
+        args = getattr(Session, "__table_args__", None)
+        assert args is not None, "Session should have __table_args__"
+
+        if isinstance(args, tuple):
+            # Find the Index entry
+            indexes = [a for a in args if hasattr(a, "unique") and a.unique]
+            assert len(indexes) >= 1, "Should have at least one unique Index"
+            idx = indexes[0]
+            assert idx.name == "uq_sessions_external_session_id"
+
+
+class TestResolveSessionConcurrentSafety:
+    """Concurrent calls to _resolve_session() with the same external
+    session ID return the same internal UUID (no race condition)."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_same_external_id(self, monkeypatch):
+        """Two concurrent _resolve_session() calls with the same
+        (source_database_id, external_session_id) return the same UUID."""
+        from app.api.ingest import _resolve_session
+        from decimal import Decimal
+        import asyncio
+
+        expected_id = uuid.uuid4()
+
+        # Mock fetchrow to always return the same UUID — simulating
+        # the upsert (INSERT … ON CONFLICT … RETURNING) that resolves
+        # to the same internal session UUID regardless of which caller
+        # wins the race.
+        mock_conn = AsyncMock()
+        row = MagicMock()
+        row.__getitem__.side_effect = {"id": expected_id}.__getitem__
+        mock_conn.fetchrow = AsyncMock(return_value=row)
+
+        source_db_id = uuid.uuid4()
+        external_id = "ses_concurrent_test"
+        now = _utcnow()
+
+        # Fire two calls concurrently
+        results = await asyncio.gather(
+            _resolve_session(
+                mock_conn,
+                source_database_id=source_db_id,
+                client_id=_CLIENT_ID,
+                external_session_id=external_id,
+                input_tokens=100,
+                output_tokens=50,
+                cached_tokens=0,
+                estimated_cost_usd=None,
+                now=now,
+            ),
+            _resolve_session(
+                mock_conn,
+                source_database_id=source_db_id,
+                client_id=_CLIENT_ID,
+                external_session_id=external_id,
+                input_tokens=200,
+                output_tokens=75,
+                cached_tokens=10,
+                estimated_cost_usd=Decimal("0.0070"),
+                now=now,
+            ),
+        )
+
+        # Both must return UUIDs
+        assert all(isinstance(r, uuid.UUID) for r in results)
+
+        # Both must return the SAME UUID (same session identity)
+        assert results[0] == results[1] == expected_id
+
+        # Verify INSERT … ON CONFLICT … RETURNING was called twice
+        session_upserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_upserts) == 2
+
+        # Verify both calls used the ON CONFLICT pattern
+        for call in session_upserts:
+            assert "ON CONFLICT" in str(call)

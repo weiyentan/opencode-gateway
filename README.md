@@ -313,6 +313,7 @@ opencode-gateway/
 | [0003](docs/adr/0003-postgres-port-allocation.md) | PostgreSQL Port Allocation | Superseded (#207) |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | Accepted |
 | [0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md) | Separate Aurora Glass from Gateway Service | Accepted |
+| [0006](docs/adr/0006-session-identity-resolution.md) | Session Identity Resolution | Accepted |
 
 ---
 
