@@ -55,6 +55,12 @@ class IngestRecord(BaseModel):
     cache_read_tokens: int | None = Field(default=0, description="Cache read tokens")
     cache_write_tokens: int | None = Field(default=0, description="Cache write tokens")
 
+    # ── Optional session-level fields (v1.2+) ────────────────────────
+    project_id: str | None = Field(default=None, description="Project identifier for the session")
+    workspace_id: str | None = Field(default=None, description="Workspace identifier for the session")
+    agent: str | None = Field(default=None, description="Agent name used for the session")
+    parent_session_id: str | None = Field(default=None, description="Parent session identifier, if any")
+
 
 class IngestRequest(BaseModel):
     """A batch of usage records pushed by a collector."""
@@ -190,6 +196,10 @@ async def _resolve_session(
     cached_tokens: int,
     estimated_cost_usd: Decimal | None,
     now: datetime,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
+    agent: str | None = None,
+    parent_session_id: str | None = None,
 ) -> uuid.UUID:
     """Map (source_database_id, external_session_id) to internal sessions.id UUID.
 
@@ -208,8 +218,9 @@ async def _resolve_session(
            (id, client_id, source_database_id, external_session_id,
             first_message_at, last_message_at, message_count,
             total_input_tokens, total_output_tokens, total_cached_tokens,
-            total_estimated_cost_usd)
-           VALUES ($1, $2, $3, $4, $5, $5, 1, $6, $7, $8, $9)
+            total_estimated_cost_usd,
+            project_id, workspace_id, agent, parent_session_id)
+           VALUES ($1, $2, $3, $4, $5, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13)
            ON CONFLICT (source_database_id, external_session_id)
                WHERE external_session_id IS NOT NULL
            DO UPDATE SET
@@ -220,7 +231,11 @@ async def _resolve_session(
                total_cached_tokens = sessions.total_cached_tokens + $8,
                total_estimated_cost_usd =
                    COALESCE(sessions.total_estimated_cost_usd, 0)
-                   + COALESCE($9, 0)
+                   + COALESCE($9, 0),
+               project_id = COALESCE($10, sessions.project_id),
+               workspace_id = COALESCE($11, sessions.workspace_id),
+               agent = COALESCE($12, sessions.agent),
+               parent_session_id = COALESCE($13, sessions.parent_session_id)
            RETURNING id""",
         new_id,
         client_id,
@@ -231,6 +246,10 @@ async def _resolve_session(
         output_tokens,
         cached_tokens,
         estimated_cost_usd,
+        project_id,
+        workspace_id,
+        agent,
+        parent_session_id,
     )
     return row["id"]
 
@@ -271,6 +290,14 @@ async def _process_one_record(
             reason="Negative token value",
         )
 
+    # ── v1.2 cached_tokens computation ────────────────────────────
+    # For v1.2 payloads, cached_tokens = cache_read_tokens + cache_write_tokens
+    # For v1.0/v1.1 payloads, use the wire value directly
+    if record.cache_read_tokens is not None and record.cache_write_tokens is not None:
+        effective_cached_tokens = record.cache_read_tokens + record.cache_write_tokens
+    else:
+        effective_cached_tokens = cached_tokens
+
     # ── 2. Idempotency check ─────────────────────────────────────────
     existing = await conn.fetchrow(
         """SELECT id, input_tokens, output_tokens, cached_tokens, estimated_cost_usd
@@ -307,8 +334,12 @@ async def _process_one_record(
     # ── 4. Resolve session (upsert + increment aggregates) ───────────
     internal_session_id = await _resolve_session(
         conn, source_db_id, client_id, record.session_id,
-        input_tokens, output_tokens, cached_tokens,
+        input_tokens, output_tokens, effective_cached_tokens,
         record.estimated_cost_usd, now,
+        project_id=record.project_id,
+        workspace_id=record.workspace_id,
+        agent=record.agent,
+        parent_session_id=record.parent_session_id,
     )
 
     # ── 5. Insert usage record ───────────────────────────────────────
@@ -317,8 +348,11 @@ async def _process_one_record(
         """INSERT INTO opencode_usage_records
            (id, client_id, source_database_id, source_record_id, session_id,
             model_id, input_tokens, output_tokens, cached_tokens,
-            estimated_cost_usd, reported_at, ingested_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
+            estimated_cost_usd, reported_at, ingested_at,
+            provider, mode, finish_reason, reasoning_tokens,
+            cache_read_tokens, cache_write_tokens)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                   $13, $14, $15, $16, $17, $18)""",
         record_uuid,
         client_id,
         source_db_id,
@@ -327,10 +361,16 @@ async def _process_one_record(
         model_id,
         input_tokens,
         output_tokens,
-        cached_tokens,
+        effective_cached_tokens,
         record.estimated_cost_usd,
         record.reported_at,
         now,
+        record.provider,
+        record.mode,
+        record.finish_reason,
+        record.reasoning_tokens,
+        record.cache_read_tokens,
+        record.cache_write_tokens,
     )
 
     # ── 6. Bump source database record count ─────────────────────────
