@@ -58,6 +58,17 @@ internal gateway session UUID, scoped by
 `(source_database_id, external_session_id)`. Creates a new internal
 session row if not found; reuses existing if found.
 
+**Session Context**:
+Descriptive metadata about an OpenCode session read from the source SQLite database, such as title, agent, external project ID, project worktree, parent external session ID, workspace ID, model, and code-change summary counts. Session Context explains what a session was doing; usage records explain what model usage it consumed.
+_Avoid_: Usage Record, Session aggregate
+
+**Todo Snapshot**:
+The latest observed set of OpenCode `todo` rows for an external session, read from the source SQLite database and stored by the Gateway for agent run reporting. Todo Snapshots summarize planned, in-progress, completed, and cancelled work items; they are not event timelines.
+
+**Agent Run Summary**:
+A Gateway API/view model that answers what happened during an OpenCode agent or subagent session using Session Context, Todo Snapshots, project snapshots, parent/child session relationships, and usage aggregates. It is a summary view, not a replay of OpenCode events or message parts.
+_Avoid_: Event Timeline, transcript replay
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
