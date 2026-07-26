@@ -31,15 +31,17 @@ async def test_lifespan_calls_startup_shutdown_in_order():
     assert events == ["startup", "shutdown"]
 
 
-def test_app_registers_health_router():
-    """The factory-built app should have the /health endpoint."""
+def test_app_registers_health_router(monkeypatch):
+    """The factory-built app should serve the /health endpoint."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-api-key")
+    from fastapi.testclient import TestClient
+
     from app.core.factory import create_app
 
     app = create_app(configure_logging=False)
 
-    # Check that the health route is registered
-    routes = [getattr(r, "path", None) for r in app.routes]
-    assert "/health" in routes
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
