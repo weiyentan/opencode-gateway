@@ -622,9 +622,8 @@ async def _process_session_context(
                    $24, $25, $26, $27,
                    $28, $29, $30, $31,
                    $32, $32, $33)
-           ON CONFLICT (client_id, source_database_id, external_session_id)
-               WHERE client_id IS NOT NULL AND source_database_id IS NOT NULL AND external_session_id IS NOT NULL
-           DO UPDATE SET
+            ON CONFLICT (client_id, source_database_id, external_session_id)
+            DO UPDATE SET
                session_id = COALESCE(EXCLUDED.session_id, opencode_session_contexts.session_id),
                parent_external_session_id = COALESCE(EXCLUDED.parent_external_session_id, opencode_session_contexts.parent_external_session_id),
                parent_session_id = COALESCE(EXCLUDED.parent_session_id, opencode_session_contexts.parent_session_id),
@@ -731,9 +730,8 @@ async def _process_project(
                    $11, $12, $13, $14,
                    $15, $16, $17, $18,
                    $19, $19, $20)
-           ON CONFLICT (client_id, source_database_id, external_project_id)
-               WHERE client_id IS NOT NULL AND source_database_id IS NOT NULL AND external_project_id IS NOT NULL
-           DO UPDATE SET
+            ON CONFLICT (client_id, source_database_id, external_project_id)
+            DO UPDATE SET
                source_project_id = COALESCE(EXCLUDED.source_project_id, opencode_source_projects.source_project_id),
                worktree = COALESCE(EXCLUDED.worktree, opencode_source_projects.worktree),
                vcs = COALESCE(EXCLUDED.vcs, opencode_source_projects.vcs),
