@@ -165,7 +165,71 @@
       </div>
     </section>
 
+    <!-- Agent Runs (full width) -->
+    <section class="glass-panel panel-agent-runs">
+      <h2 class="panel-title">Agent Runs</h2>
+      <div class="agent-runs-filters" id="agent-runs-filters">
+        <div class="filter-group">
+          <label for="ar-filter-from">From</label>
+          <input type="date" id="ar-filter-from" class="filter-input">
+        </div>
+        <div class="filter-group">
+          <label for="ar-filter-to">To</label>
+          <input type="date" id="ar-filter-to" class="filter-input">
+        </div>
+        <div class="filter-group">
+          <label for="ar-filter-agent">Agent</label>
+          <input type="text" id="ar-filter-agent" class="filter-input" placeholder="Any agent">
+        </div>
+        <div class="filter-group">
+          <label for="ar-filter-status">Status</label>
+          <select id="ar-filter-status" class="filter-input">
+            <option value="">All</option>
+            <option value="running">Running</option>
+            <option value="completed">Completed</option>
+            <option value="blocked">Blocked</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </div>
+        <button class="filter-apply" id="ar-filter-apply">Apply</button>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Status</th>
+              <th>Agent</th>
+              <th>Project / Worktree</th>
+              <th>Todo</th>
+              <th>Files</th>
+              <th>Cost</th>
+              <th>Tokens</th>
+              <th>Last Updated</th>
+              <th>Children</th>
+            </tr>
+          </thead>
+          <tbody id="agent-runs-tbody">
+            <tr><td colspan="10" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
   </main>
+
+  <!-- Agent Run Detail Panel -->
+  <div class="detail-overlay" id="ar-detail-overlay">
+    <div class="detail-panel glass-panel" id="ar-detail-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="ar-detail-title">Agent Run Detail</h2>
+        <button class="detail-close" id="ar-detail-close">&times;</button>
+      </div>
+      <div class="detail-body" id="ar-detail-body">
+        <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
 
   <footer class="footer">
     <span>OpenCode Gateway v<span id="footer-version">--</span></span>

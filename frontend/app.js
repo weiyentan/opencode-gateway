@@ -22,6 +22,7 @@
    *  incorrectly marked as "ended", and very recent sessions that have
    *  completed may briefly show as "active". */
   const SESSION_ACTIVE_WINDOW_MS = 3600000; // 1 hour
+  const AGENT_RUN_LIMIT = 50;
 
   // ── Element refs ───────────────────────────────────────────────────────
 
@@ -54,6 +55,18 @@
     collectorsTbody: $('collectors-tbody'),
     agentsTbody:    $('agents-tbody'),
     sessionsTbody:  $('sessions-tbody'),
+
+    // Agent Runs
+    arTbody:        $('agent-runs-tbody'),
+    arFilterFrom:   $('ar-filter-from'),
+    arFilterTo:     $('ar-filter-to'),
+    arFilterAgent:  $('ar-filter-agent'),
+    arFilterStatus: $('ar-filter-status'),
+    arFilterApply:  $('ar-filter-apply'),
+    arDetailOverlay: $('ar-detail-overlay'),
+    arDetailTitle:  $('ar-detail-title'),
+    arDetailBody:   $('ar-detail-body'),
+    arDetailClose:  $('ar-detail-close'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -61,6 +74,10 @@
   let clientMap = {};      // client_id → name
   let refreshTimer = null;
   let fetchErrors = {};    // endpoint_key → error_message, per-fetch-cycle tracking
+  let agentRunsData = null;       // latest agent runs response
+  let agentRunFilters = {};       // current filter values
+  let agentRunDetail = null;      // current detail view data
+  let agentRunsFetchError = null; // per-cycle fetch error for agent runs
 
   // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -149,6 +166,40 @@
     return s;
   }
 
+  /** Format todo progress string — completed/total */
+  function fmtTodoProgress(completed, total) {
+    if (total == null || total <= 0) return '--';
+    var c = completed || 0;
+    return c + '/' + total;
+  }
+
+  /** Get a CSS status badge class for agent run status */
+  function statusBadgeClass(status) {
+    if (status === 'running') return 'badge-running';
+    if (status === 'completed') return 'badge-completed';
+    if (status === 'blocked') return 'badge-blocked';
+    return 'badge-unknown';
+  }
+
+  /** Format code changes count */
+  function fmtCodeChanges(n) {
+    if (n == null || n <= 0) return '--';
+    return fmtNum(n);
+  }
+
+  /** Truncate a string with ellipsis if longer than maxLen */
+  function truncate(str, maxLen) {
+    if (!str) return '--';
+    if (str.length <= maxLen) return escHtml(str);
+    return escHtml(str.substring(0, maxLen)) + '&hellip;';
+  }
+
+  /** Format a short UUID for display */
+  function shortUUID(id) {
+    if (!id) return '--';
+    return String(id).substring(0, 8);
+  }
+
   // ── API Fetch (with envelope unwrapping) ──────────────────────────────
 
   async function apiFetch(path) {
@@ -166,6 +217,28 @@
 
   // ── Data Fetching ─────────────────────────────────────────────────────
 
+  /** Build the agent runs URL from current filter state */
+  function buildAgentRunsUrl() {
+    var params = [];
+    var filters = agentRunFilters;
+
+    if (filters.from_date) {
+      params.push('from_date=' + encodeURIComponent(filters.from_date));
+    }
+    if (filters.to_date) {
+      params.push('to_date=' + encodeURIComponent(filters.to_date));
+    }
+    if (filters.agent) {
+      params.push('agent=' + encodeURIComponent(filters.agent));
+    }
+    if (filters.status) {
+      params.push('status=' + encodeURIComponent(filters.status));
+    }
+    params.push('limit=' + AGENT_RUN_LIMIT);
+
+    return '/api/v1/usage/agent-runs?' + params.join('&');
+  }
+
   async function fetchAll() {
     const aggStart = daysAgo(AGG_WINDOW_DAYS);
     const aggEnd = nowISO();
@@ -176,8 +249,11 @@
     fetchErrors = {};  // Clear previous errors
 
     try {
+      // Build agent runs URL with current filters
+      var arUrl = buildAgentRunsUrl();
+
       // Parallel fetches
-      const [health, aggTotal, aggByModel, sessions, records, clients] =
+      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -185,6 +261,7 @@
           apiFetch('/api/v1/usage/sessions?start_date=' + sessStart + '&end_date=' + sessEnd + '&limit=' + SESSION_LIMIT),
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
           apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
+          apiFetch(arUrl),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -193,6 +270,7 @@
       results.sessions  = sessions.status  === 'fulfilled' ? sessions.value  : null;
       results.records   = records.status   === 'fulfilled' ? records.value   : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
+      results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -202,6 +280,7 @@
       if (sessions.status  !== 'fulfilled') fetchErrors.sessions  = sessions.reason?.message  || 'Sessions query failed';
       if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
+      agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
 
       // Build client lookup from admin/clients
       if (results.clients && results.clients.items) {
@@ -572,6 +651,200 @@
     els.sessionsTbody.innerHTML = html;
   }
 
+  /** Agent Runs Table */
+  function renderAgentRunsTable(data) {
+    var runs = data && data.items;
+    if (!runs || runs.length === 0) {
+      var errSuffix = agentRunsFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(agentRunsFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      els.arTbody.innerHTML = '<tr><td colspan="10" class="empty-state">No agent runs' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    runs.forEach(function (r) {
+      var todoProgress = fmtTodoProgress(r.todo_completed, r.todo_total);
+      var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
+      var projectStr = r.project_id || r.workspace_id || '--';
+      if (r.project_id && r.workspace_id && r.workspace_id !== r.project_id) {
+        projectStr = r.project_id + ' / ' + r.workspace_id;
+      }
+      var statusCls = statusBadgeClass(r.status);
+
+      html += '<tr class="ar-row" data-id="' + r.id + '">' +
+        '<td class="clickable ar-title">' + escHtml(r.title || '(untitled)') + '</td>' +
+        '<td>' + badge(r.status, statusCls).outerHTML + '</td>' +
+        '<td>' + escHtml(r.agent || '--') + '</td>' +
+        '<td>' + escHtml(projectStr) + '</td>' +
+        '<td>' + todoProgress + '</td>' +
+        '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
+        '<td>' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
+        '<td>' + fmtNum(tokens) + '</td>' +
+        '<td>' + fmtRelative(r.last_updated_at) + '</td>' +
+        '<td>' + (r.child_run_count || 0) + '</td>' +
+        '</tr>';
+    });
+
+    els.arTbody.innerHTML = html;
+
+    // Attach click handlers for detail view
+    var rows = els.arTbody.querySelectorAll('.ar-row');
+    rows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-id');
+        if (id) openAgentRunDetail(id);
+      });
+    });
+  }
+
+  /** Fetch and display agent run detail */
+  async function openAgentRunDetail(sessionId) {
+    // Show overlay
+    els.arDetailOverlay.classList.add('visible');
+    els.arDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    els.arDetailTitle.textContent = 'Agent Run Detail';
+
+    try {
+      var data = await apiFetch('/api/v1/usage/agent-runs/' + encodeURIComponent(sessionId));
+      agentRunDetail = data;
+      renderAgentRunDetail(data);
+    } catch (e) {
+      els.arDetailBody.innerHTML = '<p class="empty-state">Failed to load detail: ' + escHtml(e.message) + '</p>';
+      console.error('Agent run detail fetch error:', e);
+    }
+  }
+
+  /** Render Agent Run Detail Panel */
+  function renderAgentRunDetail(d) {
+    if (!d) {
+      els.arDetailBody.innerHTML = '<p class="empty-state">No detail data available</p>';
+      return;
+    }
+
+    els.arDetailTitle.textContent = escHtml(d.title || 'Agent Run Detail');
+
+    var tokens = (d.total_input_tokens || 0) + (d.total_output_tokens || 0);
+    var duration = fmtDuration(d.first_message_at, d.last_message_at);
+    var projectStr = d.project_id || d.workspace_id || '--';
+    if (d.project_id && d.workspace_id && d.workspace_id !== d.project_id) {
+      projectStr = d.project_id + ' / ' + d.workspace_id;
+    }
+    var statusCls = statusBadgeClass(d.status);
+
+    // ── Session Metadata ──
+    var html = '<div class="detail-section">' +
+      '<div class="detail-section-title">Session Metadata</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Status', badge(d.status, statusCls).outerHTML) +
+        fieldHtml('Title', escHtml(d.title || '--')) +
+        fieldHtml('Internal ID', shortUUID(d.id)) +
+        fieldHtml('External ID', escHtml(d.external_session_id || '--')) +
+        fieldHtml('Client ID', shortUUID(d.client_id)) +
+        fieldHtml('Source DB', shortUUID(d.source_database_id)) +
+        fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
+        fieldHtml('Duration', duration) +
+      '</div></div>';
+
+    // ── Agent & Project ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Agent &amp; Project</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Agent', escHtml(d.agent || '--')) +
+        fieldHtml('Project / Worktree', escHtml(projectStr)) +
+      '</div></div>';
+
+    // ── Parent Run ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Parent Run</div>';
+    if (d.parent_session_id) {
+      var parentStr = escHtml(d.parent_session_id);
+      if (d.parent_internal_id) {
+        parentStr += ' <span class="detail-field-label">(internal: ' + shortUUID(d.parent_internal_id) + ')</span>';
+      }
+      html += '<div class="detail-field-value">' + parentStr + '</div>';
+    } else {
+      html += '<div class="detail-field-value" style="color:var(--text-muted)">No parent run</div>';
+    }
+    html += '</div>';
+
+    // ── Child Runs ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Child Runs (' + (d.child_summaries ? d.child_summaries.length : 0) + ')</div>';
+    if (d.child_summaries && d.child_summaries.length > 0) {
+      html += '<div class="detail-child-list">';
+      d.child_summaries.forEach(function (c) {
+        var cStatusCls = statusBadgeClass(c.status);
+        html += '<div class="detail-child-item">' +
+          '<span>' + shortUUID(c.id) + '</span>' +
+          '<span>' + badge(c.status, cStatusCls).outerHTML + '</span>' +
+          '<span style="color:var(--text-primary)">' + escHtml(c.agent || '--') + '</span>' +
+          '<span style="color:var(--text-muted)">' + (c.message_count || 0) + ' msgs</span>' +
+          '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div class="detail-field-value" style="color:var(--text-muted)">No child runs</div>';
+    }
+    html += '</div>';
+
+    // ── Todos ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
+    if (d.todo_rows && d.todo_rows.length > 0) {
+      html += '<div class="detail-todo-list">';
+      d.todo_rows.forEach(function (t) {
+        var iconCls = t.status || 'pending';
+        var iconMap = { completed: '\u2713', blocked: '\u2717', in_progress: '\u25D4', pending: '\u25CB' };
+        var icon = iconMap[iconCls] || '\u25CB';
+        html += '<div class="detail-todo-item">' +
+          '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
+          '<span>' + escHtml(t.description) + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div class="detail-field-value" style="color:var(--text-muted)">No todos recorded</div>';
+    }
+    html += '</div>';
+
+    // ── Usage Totals ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Usage Totals</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
+        fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
+        fieldHtml('Cached Tokens', fmtNum(d.total_cached_tokens)) +
+        fieldHtml('Total Tokens', fmtNum(tokens)) +
+        fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
+        fieldHtml('Code Changes', fmtCodeChanges(d.code_changes_total)) +
+      '</div></div>';
+
+    // ── Drill-down Link ──
+    if (d.loki_search_url) {
+      html += '<div class="detail-section">' +
+        '<a href="' + escHtml(d.loki_search_url) + '" target="_blank" rel="noopener" class="detail-loki-link">' +
+        '\u2197 Open in Grafana Explore</a></div>';
+    }
+
+    // ── Session Context placeholder ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Session Context</div>' +
+      '<div class="detail-field-value" style="color:var(--text-muted)">' +
+        (d.session_context ? 'Session context available' : 'No Session Context recorded (placeholder)') +
+      '</div></div>';
+
+    els.arDetailBody.innerHTML = html;
+  }
+
+  /** Helper: build a detail grid field row */
+  function fieldHtml(label, value) {
+    return '<div class="detail-field">' +
+      '<span class="detail-field-label">' + label + '</span>' +
+      '<span class="detail-field-value">' + value + '</span>' +
+      '</div>';
+  }
+
   // ── HTML-escape utility ───────────────────────────────────────────────
 
   function escHtml(str) {
@@ -609,6 +882,7 @@
       renderCollectorsTable(data);
       renderAgentsTable(data);
       renderSessionsTable(data);
+      renderAgentRunsTable(data.agentRuns);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -617,7 +891,74 @@
     }
   }
 
+  // ── Agent Run Filter Handlers ──────────────────────────────────────────
+
+  function readFiltersFromUI() {
+    var filters = {};
+    if (els.arFilterFrom && els.arFilterFrom.value) {
+      filters.from_date = els.arFilterFrom.value + 'T00:00:00Z';
+    }
+    if (els.arFilterTo && els.arFilterTo.value) {
+      filters.to_date = els.arFilterTo.value + 'T23:59:59Z';
+    }
+    if (els.arFilterAgent && els.arFilterAgent.value) {
+      filters.agent = els.arFilterAgent.value.trim();
+    }
+    if (els.arFilterStatus && els.arFilterStatus.value) {
+      filters.status = els.arFilterStatus.value;
+    }
+    return filters;
+  }
+
+  function applyFilters() {
+    agentRunFilters = readFiltersFromUI();
+    // Re-fetch agent runs with new filters, update table
+    var url = buildAgentRunsUrl();
+    apiFetch(url).then(function (data) {
+      agentRunsData = data;
+      agentRunsFetchError = null;
+      renderAgentRunsTable(data);
+    }).catch(function (e) {
+      agentRunsFetchError = e.message || 'Agent runs query failed';
+      renderAgentRunsTable(null);
+      console.error('Agent runs filter fetch error:', e);
+    });
+  }
+
+  function setupAgentRunEventHandlers() {
+    // Apply button
+    if (els.arFilterApply) {
+      els.arFilterApply.addEventListener('click', applyFilters);
+    }
+
+    // Detail close button
+    if (els.arDetailClose) {
+      els.arDetailClose.addEventListener('click', function () {
+        els.arDetailOverlay.classList.remove('visible');
+        agentRunDetail = null;
+      });
+    }
+
+    // Overlay click to close
+    if (els.arDetailOverlay) {
+      els.arDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.arDetailOverlay) {
+          els.arDetailOverlay.classList.remove('visible');
+          agentRunDetail = null;
+        }
+      });
+    }
+
+    // Enter key on agent filter triggers apply
+    if (els.arFilterAgent) {
+      els.arFilterAgent.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') applyFilters();
+      });
+    }
+  }
+
   function startAutoRefresh() {
+    setupAgentRunEventHandlers();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();
