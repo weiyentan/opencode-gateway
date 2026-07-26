@@ -43,6 +43,12 @@ def _mk_record_row(
     input_tokens: int = 100,
     output_tokens: int = 50,
     cached_tokens: int = 0,
+    provider: str | None = None,
+    mode: str | None = None,
+    finish_reason: str | None = None,
+    reasoning_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
     cost: Decimal | None = Decimal("0.0035"),
     reported_at: datetime = _A_TS,
     ingested_at: datetime = _A_TS,
@@ -58,6 +64,12 @@ def _mk_record_row(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_tokens": cached_tokens,
+        "provider": provider,
+        "mode": mode,
+        "finish_reason": finish_reason,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "estimated_cost_usd": cost,
         "reported_at": reported_at,
         "ingested_at": ingested_at,
@@ -78,6 +90,10 @@ def _mk_session_row(
     total_input_tokens: int = 500,
     total_output_tokens: int = 250,
     total_cached_tokens: int = 0,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
+    agent: str | None = None,
+    parent_session_id: str | None = None,
     cost: Decimal | None = Decimal("0.0175"),
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions."""
@@ -92,6 +108,10 @@ def _mk_session_row(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "total_cached_tokens": total_cached_tokens,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        "agent": agent,
+        "parent_session_id": parent_session_id,
         "total_estimated_cost_usd": cost,
     }
     row.__getitem__.side_effect = data.__getitem__
@@ -105,6 +125,9 @@ def _mk_aggregate_row(
     total_input_tokens: int = 300,
     total_output_tokens: int = 150,
     total_cached_tokens: int = 10,
+    total_reasoning_tokens: int = 5,
+    total_cache_read_tokens: int = 3,
+    total_cache_write_tokens: int = 2,
     cost: Decimal | None = Decimal("0.0105"),
     record_count: int = 3,
 ) -> MagicMock:
@@ -115,6 +138,9 @@ def _mk_aggregate_row(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "total_cached_tokens": total_cached_tokens,
+        "total_reasoning_tokens": total_reasoning_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
         "total_estimated_cost_usd": cost,
         "record_count": record_count,
     }
@@ -421,6 +447,38 @@ class TestRecords:
         assert "explore" in item["loki_search_url"]
 
     @pytest.mark.asyncio
+    async def test_records_include_enrichment_fields(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Records include v1.2 enrichment fields (provider, mode, finish_reason, reasoning_tokens, cache_read_tokens, cache_write_tokens)."""
+        row = _mk_record_row(
+            provider="openai",
+            mode="chat",
+            finish_reason="stop",
+            reasoning_tokens=20,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["provider"] == "openai"
+        assert item["mode"] == "chat"
+        assert item["finish_reason"] == "stop"
+        assert item["reasoning_tokens"] == 20
+        assert item["cache_read_tokens"] == 10
+        assert item["cache_write_tokens"] == 5
+
+    @pytest.mark.asyncio
     async def test_limit_and_offset_are_respected(self, client: AsyncClient, mock_conn: AsyncMock):
         """The SQL query includes LIMIT and OFFSET placeholders."""
         rows = [_mk_record_row() for _ in range(2)]
@@ -625,6 +683,35 @@ class TestSessions:
         assert "loki_search_url" in item
         assert item["loki_search_url"] is not None
         assert "explore" in item["loki_search_url"]
+
+    @pytest.mark.asyncio
+    async def test_sessions_include_enrichment_fields(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Session summaries include v1.2 enrichment fields (project_id, workspace_id, agent, parent_session_id)."""
+        parent_id = str(uuid.uuid4())
+        row = _mk_session_row(
+            project_id="proj-123",
+            workspace_id="ws-456",
+            agent="code-editor",
+            parent_session_id=parent_id,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["project_id"] == "proj-123"
+        assert item["workspace_id"] == "ws-456"
+        assert item["agent"] == "code-editor"
+        assert item["parent_session_id"] == parent_id
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):

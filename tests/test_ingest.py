@@ -285,6 +285,68 @@ class TestDuplicateBatchIdempotent:
         ]
         assert len(insert_calls) == 0
 
+    @pytest.mark.asyncio
+    async def test_v12_duplicate_uses_effective_cached_tokens(self, monkeypatch):
+        """v1.2 duplicates compare against stored cache_read + cache_write tokens."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_row = MagicMock()
+        existing_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,
+            existing_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(insert_calls) == 0
+
 
 class TestDivergentDuplicate:
     """Same dedup key but different values → conflict status."""
@@ -1369,3 +1431,394 @@ class TestValidationDetailLogging:
         assert REDACTED in message
         # The raw secret value should NOT appear in the log
         assert "super-secret-value" not in message
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #247 — Enriched telemetry ingest (v1.2)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestV12HappyPath:
+    """v1.2 payloads with enrichment fields are accepted without error."""
+
+    @pytest.mark.asyncio
+    async def test_v12_payload_accepted(self, monkeypatch):
+        """A full v1.2 payload with all enrichment fields is accepted."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-v12-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "openai",
+                    "mode": "chat",
+                    "finish_reason": "stop",
+                    "reasoning_tokens": 20,
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_v12_missing_optional_fields_defaults_to_none(self, monkeypatch):
+        """v1.2 payload without enrichment fields still works (defaults to None/0)."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-v12-minimal-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+
+class TestV10BackwardCompat:
+    """v1.0 payloads continue to work with the new schema."""
+
+    @pytest.mark.asyncio
+    async def test_v10_payload_accepted(self, monkeypatch):
+        """A standard v1.0 payload is accepted (no enrichment fields needed)."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(schema_version="1.0")
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+
+class TestV11BackwardCompat:
+    """v1.1 payloads continue to work with the new schema."""
+
+    @pytest.mark.asyncio
+    async def test_v11_payload_accepted(self, monkeypatch):
+        """A standard v1.1 payload is accepted."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(schema_version="1.1")
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+
+class TestMixedBatchV10AndV12:
+    """Mixed batches with v1.0 and v1.2 records are handled correctly."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_v10_and_v12_records(self, monkeypatch):
+        """A batch with both v1.0 and v1.2 records accepts both."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=2),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-v10-001",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-v12-001",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "claude-3",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "anthropic",
+                    "mode": "chat",
+                    "finish_reason": "stop",
+                    "reasoning_tokens": 30,
+                    "cache_read_tokens": 15,
+                    "cache_write_tokens": 8,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["rejected_count"] == 0
+
+
+class TestSessionUpsertAgent:
+    """Session-level fields follow last-write-wins semantics."""
+
+    @pytest.mark.asyncio
+    async def test_second_record_overrides_agent(self, monkeypatch):
+        """Two records for the same session: the second agent value wins."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+
+        # First record: creates session with agent="agent-a"
+        session_id = _SESSION_ID
+        internal_session = MagicMock()
+        internal_session.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        mock_conn.fetchrow.side_effect = [
+            auth,              # auth
+            None,              # sd check (batch level)
+            None,              # dedup rec-1
+            None,              # model rec-1
+            internal_session,  # session upsert rec-1 (ON CONFLICT inserted)
+            None,              # dedup rec-2
+            None,              # model rec-2
+            internal_session,  # session upsert rec-2 (ON CONFLICT updated)
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(session_id),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "agent": "agent-a",
+                },
+                {
+                    "source_record_id": "rec-002",
+                    "session_id": str(session_id),
+                    "model": "gpt-4",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                    "agent": "agent-b",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+
+
+class TestCachedTokensComputation:
+    """v1.2 computes cached_tokens as cache_read + cache_write."""
+
+    @pytest.mark.asyncio
+    async def test_v12_cached_tokens_is_sum_of_read_and_write(self, monkeypatch):
+        """A v1.2 record with cache_read_tokens=10 and cache_write_tokens=5 succeeds."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-cache-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_v10_uses_wire_cached_tokens_directly(self, monkeypatch):
+        """v1.0 payload uses the wire cached_tokens directly."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.0",
+            records=[
+                {
+                    "source_record_id": "rec-cache-v10-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 42,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+
+        # Verify the wire cached_tokens=42 was persisted (not 0 from enrichment defaults)
+        # The execute call should use effective_cached_tokens=$9=42 for v1.0 payload
+        execute_call = next(
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        )
+        # args[0] = SQL, args[1..18] = $1..$18 parameters
+        # $9 = effective_cached_tokens at args[9]
+        assert execute_call is not None
+        cached_tokens_param = execute_call[0][9]
+        assert cached_tokens_param == 42, (
+            f"Expected effective_cached_tokens=42 for v1.0 wire value, "
+            f"got {cached_tokens_param}"
+        )

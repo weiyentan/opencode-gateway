@@ -156,6 +156,9 @@ async def _fetch_aggregates(
                 COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
                 COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
                 COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+                COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+                COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+                COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
                 SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
                 COUNT(*) AS record_count
             FROM opencode_usage_records our
@@ -170,6 +173,9 @@ async def _fetch_aggregates(
                 total_input_tokens=row["total_input_tokens"] if row else 0,
                 total_output_tokens=row["total_output_tokens"] if row else 0,
                 total_cached_tokens=row["total_cached_tokens"] if row else 0,
+                total_reasoning_tokens=row["total_reasoning_tokens"] if row else 0,
+                total_cache_read_tokens=row["total_cache_read_tokens"] if row else 0,
+                total_cache_write_tokens=row["total_cache_write_tokens"] if row else 0,
                 total_estimated_cost_usd=(
                     row["total_estimated_cost_usd"] if row else Decimal("0")
                 ),
@@ -184,6 +190,9 @@ async def _fetch_aggregates(
             COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
             COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
             COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+            COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+            COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+            COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
             SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
             COUNT(*) AS record_count
         FROM opencode_usage_records our
@@ -200,6 +209,9 @@ async def _fetch_aggregates(
             total_input_tokens=r["total_input_tokens"],
             total_output_tokens=r["total_output_tokens"],
             total_cached_tokens=r["total_cached_tokens"],
+            total_reasoning_tokens=r["total_reasoning_tokens"],
+            total_cache_read_tokens=r["total_cache_read_tokens"],
+            total_cache_write_tokens=r["total_cache_write_tokens"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
             record_count=r["record_count"],
         )
@@ -297,6 +309,12 @@ async def _fetch_records(
             our.input_tokens,
             our.output_tokens,
             our.cached_tokens,
+            our.provider,
+            our.mode,
+            our.finish_reason,
+            our.reasoning_tokens,
+            our.cache_read_tokens,
+            our.cache_write_tokens,
             our.estimated_cost_usd,
             our.reported_at,
             our.ingested_at
@@ -319,6 +337,12 @@ async def _fetch_records(
             input_tokens=r["input_tokens"],
             output_tokens=r["output_tokens"],
             cached_tokens=r["cached_tokens"],
+            provider=r["provider"],
+            mode=r["mode"],
+            finish_reason=r["finish_reason"],
+            reasoning_tokens=r["reasoning_tokens"],
+            cache_read_tokens=r["cache_read_tokens"],
+            cache_write_tokens=r["cache_write_tokens"],
             estimated_cost_usd=r["estimated_cost_usd"],
             reported_at=r["reported_at"],
             ingested_at=r["ingested_at"],
@@ -392,6 +416,10 @@ async def _fetch_sessions(
             s.total_input_tokens,
             s.total_output_tokens,
             s.total_cached_tokens,
+            s.project_id,
+            s.workspace_id,
+            s.agent,
+            s.parent_session_id,
             s.total_estimated_cost_usd
         FROM sessions s
         WHERE {where_clause}
@@ -412,6 +440,10 @@ async def _fetch_sessions(
             total_input_tokens=r["total_input_tokens"],
             total_output_tokens=r["total_output_tokens"],
             total_cached_tokens=r["total_cached_tokens"],
+            project_id=r["project_id"],
+            workspace_id=r["workspace_id"],
+            agent=r["agent"],
+            parent_session_id=r["parent_session_id"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
             loki_search_url=build_loki_search_url(
                 client_id=r["client_id"],
