@@ -58,6 +58,30 @@ internal gateway session UUID, scoped by
 `(source_database_id, external_session_id)`. Creates a new internal
 session row if not found; reuses existing if found.
 
+**Admin API Key**:
+The `GATEWAY_API_KEY` environment variable. A master bearer token used by
+the `ApiKeyMiddleware` to protect ALL non-`/health` routes. Also serves
+as a bootstrap collector token when its SHA-256 hash is inserted into
+`collector_credentials`.
+_Avoid_: gateway API key, master token
+
+**Collector Credential**:
+A row in the `collector_credentials` table, owned by an OpenCode Client.
+Stores a SHA-256 `token_hash` of the collector's bearer token. Validated
+by the `require_collector_token` dependency on `/ingest`. A client may
+have multiple credentials (tokens). Each credential tracks `last_used_at`
+and supports revocation.
+_Avoid_: collector token row, API key row
+
+**Two-Layer Auth**:
+The auth model protecting the Gateway: (1) `ApiKeyMiddleware` checks
+every request (except `/health`) against `GATEWAY_API_KEY`;
+(2) `require_collector_token` (on `/ingest` only) additionally looks up
+the token hash in `collector_credentials`. A collector's bearer token
+must pass BOTH layers — either by using the Admin API Key itself (with
+its hash registered in `collector_credentials`), or by using a
+provisioned collector token that also matches `GATEWAY_API_KEY`.
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
@@ -84,6 +108,10 @@ manages.
 - **Aurora Glass** is delivered as a separate frontend from the **Gateway** service
 - **Aurora Glass** and the **Gateway** are intended to share one public origin even
   when deployed as separate containers
+- An **OpenCode Client** owns **0..N Collector Credentials**, each with one token
+- A **Collector Credential** belongs to exactly one **OpenCode Client**
+- The **Admin API Key** MAY also serve as a **Collector Credential** when its hash is registered in `collector_credentials`
+- The `ApiKeyMiddleware` runs before `require_collector_token` — a request must pass the **Admin API Key** check before **Collector Credential** lookup occurs
 
 ## Flagged Ambiguities
 
