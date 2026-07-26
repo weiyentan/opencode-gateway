@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "OpenCode Gateway — observability service for headless OpenCode"
 requires-python = ">=3.12"
 
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["alembic*", "frontend*", "tests*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
