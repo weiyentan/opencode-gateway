@@ -323,7 +323,7 @@ async def _process_one_record(
         if (
             existing["input_tokens"] == input_tokens
             and existing["output_tokens"] == output_tokens
-            and existing["cached_tokens"] == cached_tokens
+            and existing["cached_tokens"] == effective_cached_tokens
             and _decimal_equal(existing["estimated_cost_usd"], record.estimated_cost_usd)
         ):
             return IngestRecordResult(

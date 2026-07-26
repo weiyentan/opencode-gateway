@@ -285,6 +285,68 @@ class TestDuplicateBatchIdempotent:
         ]
         assert len(insert_calls) == 0
 
+    @pytest.mark.asyncio
+    async def test_v12_duplicate_uses_effective_cached_tokens(self, monkeypatch):
+        """v1.2 duplicates compare against stored cache_read + cache_write tokens."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_row = MagicMock()
+        existing_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,
+            existing_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(insert_calls) == 0
+
 
 class TestDivergentDuplicate:
     """Same dedup key but different values → conflict status."""
@@ -1748,7 +1810,10 @@ class TestCachedTokensComputation:
 
         # Verify the wire cached_tokens=42 was persisted (not 0 from enrichment defaults)
         # The execute call should use effective_cached_tokens=$9=42 for v1.0 payload
-        execute_call = mock_conn.execute.call_args
+        execute_call = next(
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        )
         # args[0] = SQL, args[1..18] = $1..$18 parameters
         # $9 = effective_cached_tokens at args[9]
         assert execute_call is not None
