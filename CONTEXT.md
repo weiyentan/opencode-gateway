@@ -58,6 +58,27 @@ internal gateway session UUID, scoped by
 `(source_database_id, external_session_id)`. Creates a new internal
 session row if not found; reuses existing if found.
 
+**Session Context**:
+Descriptive metadata about an OpenCode session read from the source
+SQLite database, such as title, agent, external project ID, project
+worktree, parent external session ID, workspace ID, model, and code-change
+summary counts. Session Context explains what a session was doing;
+usage records explain what model usage it consumed.
+_Avoid_: Usage Record, Session aggregate
+
+**Todo Snapshot**:
+The latest observed set of OpenCode `todo` rows for an external session,
+read from the source SQLite database and stored by the Gateway for agent
+run reporting. Todo Snapshots summarize planned, in-progress, completed,
+and cancelled work items; they are not event timelines.
+
+**Agent Run Summary**:
+A Gateway API/view model that answers what happened during an OpenCode
+agent or subagent session using Session Context, Todo Snapshots, project
+snapshots, parent/child session relationships, and usage aggregates. It is
+a summary view, not a replay of OpenCode events or message parts.
+_Avoid_: Event Timeline, transcript replay
+
 **Admin API Key**:
 The `GATEWAY_API_KEY` environment variable. A master bearer token used by
 the `ApiKeyMiddleware` to protect ALL non-`/health` routes. Also serves
@@ -110,6 +131,10 @@ manages.
   when deployed as separate containers
 - An **OpenCode Client** owns **0..N Collector Credentials**, each with one token
 - A **Collector Credential** belongs to exactly one **OpenCode Client**
+- A **Session Context** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id)`
+- **Session Context** is sent as a separate batch-level collection, not duplicated onto each **Usage Record**
+- A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
+- An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
 - The **Admin API Key** MAY also serve as a **Collector Credential** when its hash is registered in `collector_credentials`
 - The `ApiKeyMiddleware` runs before `require_collector_token` — a request must pass the **Admin API Key** check before **Collector Credential** lookup occurs
 
