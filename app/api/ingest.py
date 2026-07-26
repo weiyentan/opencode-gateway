@@ -51,9 +51,9 @@ class IngestRecord(BaseModel):
     provider: str | None = Field(default=None, description="LLM provider name")
     mode: str | None = Field(default=None, description="Execution mode (e.g. code, chat)")
     finish_reason: str | None = Field(default=None, description="Reason the LLM finished")
-    reasoning_tokens: int | None = Field(default=0, description="Reasoning tokens used")
-    cache_read_tokens: int | None = Field(default=0, description="Cache read tokens")
-    cache_write_tokens: int | None = Field(default=0, description="Cache write tokens")
+    reasoning_tokens: int | None = Field(default=None, description="Reasoning tokens used")
+    cache_read_tokens: int | None = Field(default=None, description="Cache read tokens")
+    cache_write_tokens: int | None = Field(default=None, description="Cache write tokens")
 
     # ── Optional session-level fields (v1.2+) ────────────────────────
     project_id: str | None = Field(default=None, description="Project identifier for the session")
@@ -284,6 +284,16 @@ async def _process_one_record(
         )
 
     if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
+        return IngestRecordResult(
+            index=index,
+            status="rejected",
+            reason="Negative token value",
+        )
+
+    # ── Negative validation for enrichment token fields ───────────────
+    if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
+        or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
+        or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
         return IngestRecordResult(
             index=index,
             status="rejected",

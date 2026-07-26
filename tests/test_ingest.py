@@ -1742,4 +1742,18 @@ class TestCachedTokensComputation:
             )
 
         assert response.status_code == 200
-        assert response.json()["data"]["accepted_count"] == 1
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+
+        # Verify the wire cached_tokens=42 was persisted (not 0 from enrichment defaults)
+        # The execute call should use effective_cached_tokens=$9=42 for v1.0 payload
+        execute_call = mock_conn.execute.call_args
+        # args[0] = SQL, args[1..18] = $1..$18 parameters
+        # $9 = effective_cached_tokens at args[9]
+        assert execute_call is not None
+        cached_tokens_param = execute_call[0][9]
+        assert cached_tokens_param == 42, (
+            f"Expected effective_cached_tokens=42 for v1.0 wire value, "
+            f"got {cached_tokens_param}"
+        )

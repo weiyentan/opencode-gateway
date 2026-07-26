@@ -447,6 +447,38 @@ class TestRecords:
         assert "explore" in item["loki_search_url"]
 
     @pytest.mark.asyncio
+    async def test_records_include_enrichment_fields(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Records include v1.2 enrichment fields (provider, mode, finish_reason, reasoning_tokens, cache_read_tokens, cache_write_tokens)."""
+        row = _mk_record_row(
+            provider="openai",
+            mode="chat",
+            finish_reason="stop",
+            reasoning_tokens=20,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["provider"] == "openai"
+        assert item["mode"] == "chat"
+        assert item["finish_reason"] == "stop"
+        assert item["reasoning_tokens"] == 20
+        assert item["cache_read_tokens"] == 10
+        assert item["cache_write_tokens"] == 5
+
+    @pytest.mark.asyncio
     async def test_limit_and_offset_are_respected(self, client: AsyncClient, mock_conn: AsyncMock):
         """The SQL query includes LIMIT and OFFSET placeholders."""
         rows = [_mk_record_row() for _ in range(2)]
@@ -651,6 +683,35 @@ class TestSessions:
         assert "loki_search_url" in item
         assert item["loki_search_url"] is not None
         assert "explore" in item["loki_search_url"]
+
+    @pytest.mark.asyncio
+    async def test_sessions_include_enrichment_fields(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Session summaries include v1.2 enrichment fields (project_id, workspace_id, agent, parent_session_id)."""
+        parent_id = str(uuid.uuid4())
+        row = _mk_session_row(
+            project_id="proj-123",
+            workspace_id="ws-456",
+            agent="code-editor",
+            parent_session_id=parent_id,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["project_id"] == "proj-123"
+        assert item["workspace_id"] == "ws-456"
+        assert item["agent"] == "code-editor"
+        assert item["parent_session_id"] == parent_id
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):
