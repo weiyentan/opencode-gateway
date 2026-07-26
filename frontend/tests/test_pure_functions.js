@@ -68,6 +68,35 @@ function escHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
+function fmtTodoProgress(completed, total) {
+  if (total == null || total <= 0) return '--';
+  var c = completed || 0;
+  return c + '/' + total;
+}
+
+function statusBadgeClass(status) {
+  if (status === 'running') return 'badge-running';
+  if (status === 'completed') return 'badge-completed';
+  if (status === 'blocked') return 'badge-blocked';
+  return 'badge-unknown';
+}
+
+function fmtCodeChanges(n) {
+  if (n == null || n <= 0) return '--';
+  return fmtNum(n);
+}
+
+function truncate(str, maxLen) {
+  if (!str) return '--';
+  if (str.length <= maxLen) return escHtml(str);
+  return escHtml(str.substring(0, maxLen)) + '&hellip;';
+}
+
+function shortUUID(id) {
+  if (!id) return '--';
+  return String(id).substring(0, 8);
+}
+
 // ── Simple test runner ──────────────────────────────────────────────────
 
 let passed = 0;
@@ -162,6 +191,63 @@ assert(escHtml('a&b') === 'a&amp;b', '& escaped');
 assert(escHtml('"quote"') === '&quot;quote&quot;', 'double quotes escaped');
 assert(escHtml("it's") === 'it&#39;s', 'single quotes escaped');
 assert(escHtml('<a href="x">') === '&lt;a href=&quot;x&quot;&gt;', 'combined escaping');
+
+// ── Tests for fmtTodoProgress ───────────────────────────────────────────
+
+console.log('\u25B6 fmtTodoProgress');
+
+assert(fmtTodoProgress(null, null) === '--', 'null inputs → --');
+assert(fmtTodoProgress(undefined, undefined) === '--', 'undefined inputs → --');
+assert(fmtTodoProgress(0, 0) === '--', 'zero total → --');
+assert(fmtTodoProgress(3, 5) === '3/5', '3/5 → 3/5');
+assert(fmtTodoProgress(0, 10) === '0/10', '0/10 → 0/10');
+assert(fmtTodoProgress(5, 5) === '5/5', '5/5 → 5/5');
+assert(fmtTodoProgress(2, null) === '--', 'null total → --');
+
+// ── Tests for statusBadgeClass ──────────────────────────────────────────
+
+console.log('\u25B6 statusBadgeClass');
+
+assert(statusBadgeClass('running') === 'badge-running', 'running → badge-running');
+assert(statusBadgeClass('completed') === 'badge-completed', 'completed → badge-completed');
+assert(statusBadgeClass('blocked') === 'badge-blocked', 'blocked → badge-blocked');
+assert(statusBadgeClass('unknown') === 'badge-unknown', 'unknown → badge-unknown');
+assert(statusBadgeClass('anything-else') === 'badge-unknown', 'anything else → badge-unknown');
+assert(statusBadgeClass(null) === 'badge-unknown', 'null → badge-unknown');
+assert(statusBadgeClass('') === 'badge-unknown', 'empty → badge-unknown');
+
+// ── Tests for fmtCodeChanges ────────────────────────────────────────────
+
+console.log('\u25B6 fmtCodeChanges');
+
+assert(fmtCodeChanges(null) === '--', 'null → --');
+assert(fmtCodeChanges(undefined) === '--', 'undefined → --');
+assert(fmtCodeChanges(0) === '--', '0 → --');
+assert(fmtCodeChanges(1) === '1', '1 → 1');
+assert(fmtCodeChanges(42) === '42', '42 → 42');
+assert(fmtCodeChanges(1000) === '1.0K', '1000 → 1.0K');
+assert(fmtCodeChanges(-1) === '--', '-1 → --');
+
+// ── Tests for truncate ──────────────────────────────────────────────────
+
+console.log('\u25B6 truncate');
+
+assert(truncate(null, 10) === '--', 'null → --');
+assert(truncate('', 10) === '--', 'empty → --');
+assert(truncate('hello', 10) === 'hello', 'short string unchanged');
+assert(truncate('hello world', 5) === 'hello&hellip;', 'long string truncated with ellipsis');
+assert(truncate('hello', 5) === 'hello', 'exact length unchanged');
+assert(truncate('<script>', 10) === '&lt;script&gt;', 'html escaped');
+
+// ── Tests for shortUUID ─────────────────────────────────────────────────
+
+console.log('\u25B6 shortUUID');
+
+assert(shortUUID(null) === '--', 'null → --');
+assert(shortUUID(undefined) === '--', 'undefined → --');
+assert(shortUUID('') === '--', 'empty → --');
+assert(shortUUID('550e8400-e29b-41d4-a716-446655440000') === '550e8400', 'UUID truncated to 8 chars');
+assert(shortUUID('abc') === 'abc', 'short string returned as-is');
 
 // ── Summary ─────────────────────────────────────────────────────────────
 

@@ -118,6 +118,172 @@ class SessionSummary(BaseModel):
     )
 
 
+# ── Agent Run schemas ─────────────────────────────────────────────────────
+
+
+class TodoRow(BaseModel):
+    """A single todo item snapshot within an agent run detail view.
+
+    Note: Todo snapshots are not yet persisted by the ingest pipeline.
+    These fields return empty results until the Todo Snapshot projection
+    table is introduced in a future schema migration.
+    """
+
+    description: str = Field(description="Todo description text")
+    status: str = Field(
+        description="Todo status: pending, in_progress, completed, blocked"
+    )
+
+
+class ChildRunSummary(BaseModel):
+    """A summary of a child agent run — used in the detail view."""
+
+    id: uuid.UUID = Field(description="Internal Gateway session UUID")
+    external_session_id: str | None = Field(
+        default=None,
+        description="External OpenCode session identifier",
+    )
+    status: str = Field(
+        description="Computed status: running, completed, blocked, unknown"
+    )
+    agent: str | None = Field(default=None)
+    message_count: int = Field(default=0, ge=0)
+
+
+class AgentRunSummary(BaseModel):
+    """A single row in the paginated Agent Run list.
+
+    Provides both internal Gateway identifiers and external OpenCode
+    identifiers.  Status and child_run_count are computed on read —
+    they are never stored.
+    """
+
+    id: uuid.UUID = Field(description="Internal Gateway session UUID")
+    external_session_id: str | None = Field(
+        default=None,
+        description="External OpenCode session identifier (e.g. ses_* ID)",
+    )
+    client_id: uuid.UUID = Field(description="OpenCode client UUID")
+    source_database_id: uuid.UUID = Field(description="Source database UUID")
+    title: str | None = Field(
+        default=None,
+        description="Derived title from agent name and external session ID",
+    )
+    status: str = Field(
+        description="Computed status on read: running, completed, blocked, unknown"
+    )
+    agent: str | None = Field(default=None, description="Agent name")
+    project_id: str | None = Field(default=None, description="Project identifier")
+    workspace_id: str | None = Field(
+        default=None, description="Worktree/workspace identifier"
+    )
+    todo_total: int = Field(
+        default=0,
+        ge=0,
+        description="Total todo items (placeholder — 0 until todo snapshots exist)",
+    )
+    todo_completed: int = Field(
+        default=0,
+        ge=0,
+        description="Completed todo items (placeholder — 0 until todo snapshots exist)",
+    )
+    todo_blocked: int = Field(
+        default=0,
+        ge=0,
+        description="Blocked todo items (placeholder — 0 until todo snapshots exist)",
+    )
+    code_changes_total: int = Field(
+        default=0,
+        ge=0,
+        description="Total code changes (placeholder — 0 until change tracking exists)",
+    )
+    total_input_tokens: int = Field(default=0, ge=0)
+    total_output_tokens: int = Field(default=0, ge=0)
+    total_cached_tokens: int = Field(default=0, ge=0)
+    total_estimated_cost_usd: Decimal | None = Field(default=None)
+    message_count: int = Field(default=0, ge=0)
+    last_updated_at: datetime = Field(
+        description="Timestamp of the last message (last_message_at)"
+    )
+    child_run_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of child sessions whose parent_session_id references this session",
+    )
+
+
+class AgentRunDetail(BaseModel):
+    """Full detail view for a single agent run, keyed by internal session UUID.
+
+    Includes parent identifiers, child summaries, todo rows, project
+    details, Session Context (placeholder), and usage totals.
+    """
+
+    id: uuid.UUID = Field(description="Internal Gateway session UUID")
+    external_session_id: str | None = Field(
+        default=None,
+        description="External OpenCode session identifier",
+    )
+    client_id: uuid.UUID = Field(description="OpenCode client UUID")
+    source_database_id: uuid.UUID = Field(description="Source database UUID")
+    title: str | None = Field(
+        default=None,
+        description="Derived title from agent name and external session ID",
+    )
+    status: str = Field(
+        description="Computed status on read: running, completed, blocked, unknown"
+    )
+    agent: str | None = Field(default=None, description="Agent name")
+    project_id: str | None = Field(default=None, description="Project identifier")
+    workspace_id: str | None = Field(
+        default=None, description="Worktree/workspace identifier"
+    )
+    parent_session_id: str | None = Field(
+        default=None,
+        description="External session ID of the parent run, if any",
+    )
+    parent_internal_id: uuid.UUID | None = Field(
+        default=None,
+        description="Internal Gateway UUID of the parent session, if resolved",
+    )
+    child_summaries: list[ChildRunSummary] = Field(
+        default_factory=list,
+        description="Summaries of child agent runs",
+    )
+    todo_rows: list[TodoRow] = Field(
+        default_factory=list,
+        description="Todo items for this run (placeholder — empty until todo snapshots exist)",
+    )
+    todo_total: int = Field(default=0, ge=0)
+    todo_completed: int = Field(default=0, ge=0)
+    todo_blocked: int = Field(default=0, ge=0)
+    code_changes_total: int = Field(default=0, ge=0)
+    session_context: dict[str, object] | None = Field(
+        default=None,
+        description="Session Context data (placeholder — null until session_context table exists)",
+    )
+    message_count: int = Field(default=0, ge=0)
+    total_input_tokens: int = Field(default=0, ge=0)
+    total_output_tokens: int = Field(default=0, ge=0)
+    total_cached_tokens: int = Field(default=0, ge=0)
+    total_estimated_cost_usd: Decimal | None = Field(default=None)
+    first_message_at: datetime | None = Field(
+        default=None, description="Timestamp of the first message"
+    )
+    last_message_at: datetime | None = Field(
+        default=None, description="Timestamp of the last message"
+    )
+    loki_search_url: str | None = Field(
+        default=None,
+        description="Grafana Explore URL for drill-down into Loki logs",
+    )
+
+
+VALID_AGENT_RUN_STATUSES: frozenset[str] = frozenset(
+    {"running", "completed", "blocked", "unknown"}
+)
+
+
 # ── Paginated response ────────────────────────────────────────────────────
 
 

@@ -142,6 +142,101 @@ def _new_record_side_effect(record_count: int = 1) -> list:
     return per_record
 
 
+def _projection_payload(
+    *,
+    schema_version: str = "1.0",
+    collector_version: str = "0.1.0",
+    source_database_id: uuid.UUID = _SOURCE_DB_ID,
+    records: list[dict] | None = None,
+    session_contexts: list[dict] | None = None,
+    projects: list[dict] | None = None,
+    project_directories: list[dict] | None = None,
+    session_todos: list[dict] | None = None,
+) -> dict:
+    """Return a valid ingest request with projection arrays — defaults to empty."""
+    payload = _valid_ingest_payload(
+        schema_version=schema_version,
+        collector_version=collector_version,
+        source_database_id=source_database_id,
+        records=records or [],
+    )
+    payload["session_contexts"] = session_contexts or []
+    payload["projects"] = projects or []
+    payload["project_directories"] = project_directories or []
+    payload["session_todos"] = session_todos or []
+    return payload
+
+
+def _mk_session_context_payload(
+    *,
+    external_session_id: str = "ses_ctx_test",
+    title: str = "Test Session",
+    session_model: str = "gpt-4",
+    external_project_id: str | None = None,
+    parent_external_session_id: str | None = None,
+    **kwargs,
+) -> dict:
+    defaults: dict = {
+        "external_session_id": external_session_id,
+        "title": title,
+        "session_model": session_model,
+        "source_input_tokens": 1000,
+        "source_output_tokens": 500,
+        "source_payload": {"summary": "test session context"},
+    }
+    if external_project_id is not None:
+        defaults["external_project_id"] = external_project_id
+    if parent_external_session_id is not None:
+        defaults["parent_external_session_id"] = parent_external_session_id
+    defaults.update(kwargs)
+    return defaults
+
+
+def _mk_project_payload(
+    *,
+    external_project_id: str = "proj_test",
+    name: str = "Test Project",
+    **kwargs,
+) -> dict:
+    defaults: dict = {
+        "external_project_id": external_project_id,
+        "name": name,
+        "source_payload": {"summary": "test project"},
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
+def _mk_directory_payload(
+    *,
+    directory: str = "/tmp/test",
+    directory_type: str = "workspace",
+    **kwargs,
+) -> dict:
+    defaults: dict = {
+        "directory": directory,
+        "directory_type": directory_type,
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
+def _mk_todo_payload(
+    *,
+    external_session_id: str = "ses_todo_test",
+    content: str = "Test todo item",
+    position: int = 1,
+    **kwargs,
+) -> dict:
+    defaults: dict = {
+        "external_session_id": external_session_id,
+        "content": content,
+        "position": position,
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Tests
 # ════════════════════════════════════════════════════════════════════════════
@@ -1822,3 +1917,933 @@ class TestCachedTokensComputation:
             f"Expected effective_cached_tokens=42 for v1.0 wire value, "
             f"got {cached_tokens_param}"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #252 — Projection payload ingestion
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestProjectionBackwardCompat:
+    """Payloads without projection arrays return projection counts of 0."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_projection_arrays_produce_zero_counts(self, monkeypatch):
+        """A payload with no projection arrays returns projection_accepted_count=0."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Use the standard payload without projection arrays
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 0
+        # Ensure usage-record fields are unchanged
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_payload_with_empty_projection_arrays(self, monkeypatch):
+        """Explicitly empty projection arrays also produce zero counts."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload()
+        # Add empty projection arrays explicitly
+        payload["session_contexts"] = []
+        payload["projects"] = []
+        payload["project_directories"] = []
+        payload["session_todos"] = []
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_with_no_projections_returns_200(self, monkeypatch):
+        """Empty batch with no projection arrays returns 200 with zero counts."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,       # auth
+            None,       # source_database check (new)
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(records=[])
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 0
+
+
+class TestSessionContextUpsert:
+    """Session context projections are upserted by (source_database_id, external_session_id)."""
+
+    @pytest.mark.asyncio
+    async def test_single_session_context_accepted(self, monkeypatch):
+        """A single session context item is accepted via upsert."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        # Side-effect: auth, sd check (new), resolve session (not found),
+        # resolve parent (not present), resolve project (not present)
+        mock_conn.fetchrow.side_effect = [
+            auth,  # 1. auth
+            None,  # 2. sd check
+            None,  # 3. resolve session_id for ctx
+            None,  # 4. resolve source_project_id for ctx
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[_mk_session_context_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        # Verify INSERT INTO opencode_session_contexts was called
+        sc_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_contexts" in str(call)
+        ]
+        assert len(sc_inserts) == 1
+        assert "ON CONFLICT" in str(sc_inserts[0])
+
+    @pytest.mark.asyncio
+    async def test_session_context_preserves_first_seen_on_upsert(self, monkeypatch):
+        """On conflict, first_seen_at is NOT in the DO UPDATE SET clause."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,  # sd check
+            None,  # resolve session_id
+            None,  # resolve source_project_id
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[_mk_session_context_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify that first_seen_at is NOT in the DO UPDATE SET clause
+        sc_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_contexts" in str(call)
+        ]
+        sql = str(sc_inserts[0])
+        assert "last_seen_at = EXCLUDED.last_seen_at" in sql
+        assert "first_seen_at" not in (sql.split("DO UPDATE SET")[1] if "DO UPDATE SET" in sql else sql)
+
+    @pytest.mark.asyncio
+    async def test_session_context_resolves_parent_session(self, monkeypatch):
+        """When parent_external_session_id is provided and a matching session
+        exists, parent_session_id is resolved to the internal UUID."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        parent_session_id = uuid.uuid4()
+
+        # We need: auth, sd check, resolve session_id (not found), resolve parent (found!)
+        mock_conn.fetchrow.side_effect = [
+            auth,                      # 1. auth
+            None,                      # 2. sd check
+            None,                      # 3. resolve session_id for ctx → not found
+            MagicMock(__getitem__=({"id": parent_session_id}).__getitem__),  # 4. resolve parent_session_id → found
+            None,                      # 5. resolve source_project_id → not found
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[
+                _mk_session_context_payload(
+                    parent_external_session_id="ses_parent",
+                ),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Check that parent session resolve was called
+        resolve_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "SELECT id FROM sessions WHERE source_database_id" in str(call)
+        ]
+        assert len(resolve_calls) >= 2  # one for session, one for parent
+
+    @pytest.mark.asyncio
+    async def test_session_context_resolves_source_project(self, monkeypatch):
+        """When external_project_id is provided and a matching project exists,
+        source_project_id is resolved to the internal UUID."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        project_id = uuid.uuid4()
+
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,  # sd check
+            None,  # resolve session_id → not found
+            None,  # resolve parent → not applicable (no parent)
+            MagicMock(__getitem__=({"id": project_id}).__getitem__),  # resolve source_project_id → found
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[
+                _mk_session_context_payload(external_project_id="proj_abc"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["projection_accepted_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_session_contexts_accepted(self, monkeypatch):
+        """Two session contexts in the same batch are both accepted."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+
+        # Side-effects for each context: resolve session, resolve source_project
+        mock_conn.fetchrow.side_effect = [
+            auth, None,  # auth, sd
+            None,             # ctx1: resolve session_id → not found
+            None,             # ctx1: resolve source_project → not found
+            None,             # ctx2: resolve session_id → not found
+            None,             # ctx2: resolve source_project → not found
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[
+                _mk_session_context_payload(external_session_id="ses_ctx_1"),
+                _mk_session_context_payload(external_session_id="ses_ctx_2"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 2
+        assert data["projection_rejected_count"] == 0
+
+
+class TestProjectUpsert:
+    """Source projects are upserted by (source_database_id, external_project_id)."""
+
+    @pytest.mark.asyncio
+    async def test_single_project_accepted(self, monkeypatch):
+        """A single project item is accepted via upsert."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,       # auth
+            None,       # sd check
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            projects=[_mk_project_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        # Verify INSERT INTO opencode_source_projects was called
+        proj_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_source_projects" in str(call)
+        ]
+        assert len(proj_inserts) == 1
+        assert "ON CONFLICT" in str(proj_inserts[0])
+
+    @pytest.mark.asyncio
+    async def test_multiple_projects_accepted(self, monkeypatch):
+        """Two projects in the same batch are both upserted."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth, None,  # auth, sd check
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            projects=[
+                _mk_project_payload(external_project_id="proj_1"),
+                _mk_project_payload(external_project_id="proj_2"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 2
+
+        proj_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_source_projects" in str(call)
+        ]
+        assert len(proj_inserts) == 2
+
+    @pytest.mark.asyncio
+    async def test_project_preserves_first_seen_on_upsert(self, monkeypatch):
+        """On conflict, first_seen_at is not in the DO UPDATE SET clause."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            projects=[_mk_project_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        proj_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_source_projects" in str(call)
+        ]
+        sql = str(proj_inserts[0])
+        assert "last_seen_at = EXCLUDED.last_seen_at" in sql
+        do_update = sql.split("DO UPDATE SET")[1]
+        assert "first_seen_at" not in do_update
+
+
+class TestProjectDirectoryReplace:
+    """Project directories are replaced per source_database scope."""
+
+    @pytest.mark.asyncio
+    async def test_single_directory_accepted(self, monkeypatch):
+        """A single directory item triggers DELETE + INSERT."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[_mk_directory_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        # Verify DELETE was called before INSERT
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_directories_replace(self, monkeypatch):
+        """A batch of directories deletes old rows once then inserts all new ones."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="/tmp/b"),
+                _mk_directory_payload(directory="/tmp/c"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 3
+        assert data["projection_rejected_count"] == 0
+
+        # Only one DELETE, 3 INSERTs
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 3
+
+
+class TestSessionTodoReplace:
+    """Session todos are replaced per external session within the batch."""
+
+    @pytest.mark.asyncio
+    async def test_single_todo_accepted(self, monkeypatch):
+        """A single todo item triggers DELETE per session + INSERT."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth, None,                     # auth, sd check
+            None,                            # resolve session_id → not found
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_todos=[_mk_todo_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        # Verify DELETE per session + INSERT
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_session_todos" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_todos" in str(call)
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_todos_across_sessions(self, monkeypatch):
+        """Todos across different sessions are independently replaced per session."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        # For each distinct session: one resolve call
+        mock_conn.fetchrow.side_effect = [
+            auth, None,   # auth, sd check
+            None,         # resolve session_id for ses_a → not found
+            None,         # resolve session_id for ses_b → not found
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_todos=[
+                _mk_todo_payload(external_session_id="ses_a", position=1, content="Task A1"),
+                _mk_todo_payload(external_session_id="ses_a", position=2, content="Task A2"),
+                _mk_todo_payload(external_session_id="ses_b", position=1, content="Task B1"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 3
+        assert data["projection_rejected_count"] == 0
+
+        # Two DELETEs (one per session), 3 INSERTs
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_session_todos" in str(call)
+        ]
+        assert len(delete_calls) == 2
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_todos" in str(call)
+        ]
+        assert len(insert_calls) == 3
+
+
+class TestProjectionPartialFailure:
+    """Malformed or rejected projection data does not block usage records."""
+
+    @pytest.mark.asyncio
+    async def test_usage_records_accepted_when_projections_fail(self, monkeypatch):
+        """When a projection processing call raises an exception, usage records
+        are still accepted and the projection is counted as rejected."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        # execute works for usage records, then raises on first projection execute
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        # Override the project processing to fail at the DB level
+        # We'll monkeypatch _process_project to raise
+        import app.api.ingest as ingest_module
+        original_process = ingest_module._process_project
+
+        async def _failing_process(*args, **kwargs):
+            raise ValueError("Simulated DB failure in project processing")
+
+        monkeypatch.setattr(ingest_module, "_process_project", _failing_process)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+            projects=[_mk_project_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # Usage records must still be accepted
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+        # Projection must be counted as rejected
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 1
+
+        # Restore original
+        monkeypatch.setattr(ingest_module, "_process_project", original_process)
+
+    @pytest.mark.asyncio
+    async def test_some_projections_fail_others_succeed(self, monkeypatch):
+        """When some projection items fail and others succeed, counts reflect both."""
+        import app.api.ingest as ingest_module
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth, None,  # auth, sd check
+        ]
+
+        # Patch _process_project directly: first call succeeds, second fails
+        proj_call_count = [0]
+
+        async def _failing_process(conn, proj, client_id, source_db_id, now):
+            proj_call_count[0] += 1
+            if proj.external_project_id == "proj_fail":
+                raise RuntimeError("Simulated DB failure for project 2")
+            return True
+
+        monkeypatch.setattr(ingest_module, "_process_project", _failing_process)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            projects=[
+                _mk_project_payload(external_project_id="proj_ok"),
+                _mk_project_payload(external_project_id="proj_fail"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # One accepted, one rejected
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_directory_replace_nonexistent_scope_succeeds(self, monkeypatch):
+        """Replacing directories when none exist is a no-op + insert."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/new-project"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+
+
+class TestProjectionIndependentPaths:
+    """Projection and usage-record paths are truly independent."""
+
+    @pytest.mark.asyncio
+    async def test_projection_errors_dont_block_usage(self, monkeypatch):
+        """A full projection failure does not affect usage record success."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=2),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        import app.api.ingest as ingest_module
+
+        # Make ALL projection paths fail
+        async def _failing(*args, **kwargs):
+            raise RuntimeError("All projections failed")
+
+        monkeypatch.setattr(ingest_module, "_process_project", _failing)
+        monkeypatch.setattr(ingest_module, "_process_session_context", _failing)
+        monkeypatch.setattr(ingest_module, "_process_project_directories", _failing)
+        monkeypatch.setattr(ingest_module, "_process_session_todos", _failing)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+            session_contexts=[_mk_session_context_payload()],
+            projects=[_mk_project_payload()],
+            project_directories=[_mk_directory_payload()],
+            session_todos=[_mk_todo_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # Usage record MUST be accepted
+        assert data["accepted_count"] == 1
+        # All projections rejected
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] > 0
+
+    @pytest.mark.asyncio
+    async def test_usage_failure_doesnt_block_projections(self, monkeypatch):
+        """When usage records fail, projections are still processed."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        # auth, sd check, resolve (not found), resolve (not found)
+        mock_conn.fetchrow.side_effect = [
+            auth, None,  None, None,
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Empty records, but include projections
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[_mk_session_context_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # No usage records
+        assert data["accepted_count"] == 0
+        # Projection still processed
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+
+class TestProjectionCombinedPayloads:
+    """Payloads with both usage records and multiple projection types."""
+
+    @pytest.mark.asyncio
+    async def test_full_payload_all_accepted(self, monkeypatch):
+        """A payload with usage records, session contexts, projects,
+        directories, and todos all succeed."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+
+        # Side effects: auth, sd, usage record (dedup, model, session=3 items)
+        # Then: 2 session contexts (resolve session, resolve proj each = 4)
+        # Then: 1 todo resolve
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth,                   # auth
+            None,                   # sd check
+            None, None, session_row,  # usage record: dedup, model, session
+            None, None,             # ctx1: resolve session_id, resolve source_project
+            None, None,             # ctx2: resolve session_id, resolve source_project
+            None,                   # todo: resolve session_id
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+            session_contexts=[
+                _mk_session_context_payload(
+                    external_session_id="ses_ctx_1",
+                    external_project_id="proj_1",
+                ),
+                _mk_session_context_payload(
+                    external_session_id="ses_ctx_2",
+                ),
+            ],
+            projects=[_mk_project_payload()],
+            project_directories=[_mk_directory_payload()],
+            session_todos=[_mk_todo_payload()],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["projection_accepted_count"] == 5  # 1 proj + 2 ctx + 1 dir + 1 todo
+        assert data["projection_rejected_count"] == 0

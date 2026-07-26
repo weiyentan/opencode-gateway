@@ -18,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from app.core.config import get_settings
 from app.core.loki import build_loki_search_url
 from app.core.schemas.usage import (
+    AgentRunDetail,
+    AgentRunSummary,
     AggregateRow,
     PaginatedResponse,
     RecordRow,
@@ -560,4 +562,509 @@ async def get_sessions(
         limit,
         offset,
         settings.grafana_base_url,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Agent Run helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default quiet threshold in minutes — a session whose last message is
+# within this window is considered "running" rather than "completed".
+# Exposed as a module-level constant so tests can reference it.
+_QUIET_THRESHOLD_MINUTES: int = 60
+
+# Default unknown threshold in hours — a session whose last message is
+# older than this is considered "unknown" rather than "completed".
+_UNKNOWN_THRESHOLD_HOURS: int = 24
+
+
+def _compute_status(
+    last_message_at: datetime | None,
+    message_count: int,
+    has_parent: bool,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Compute agent run status from available session facts.
+
+    **Status derivation (in priority order):**
+
+    1. **unknown** — No messages recorded (``message_count == 0``)
+       OR ``last_message_at`` is ``None`` OR the session is so old it
+       exceeds the unknown threshold (``_UNKNOWN_THRESHOLD_HOURS``).
+
+    2. **running** — ``last_message_at`` is within the quiet threshold
+       (``_QUIET_THRESHOLD_MINUTES``), indicating the session may still
+       be producing telemetry.
+
+    3. **blocked** — The session is beyond the quiet threshold AND has a
+       ``parent_session_id``, suggesting it may be waiting on a parent.
+
+    4. **completed** — The session is beyond the quiet threshold, has no
+       parent, and has recorded messages.
+
+    The quiet threshold and unknown threshold are module-level constants
+    (``_QUIET_THRESHOLD_MINUTES``, ``_UNKNOWN_THRESHOLD_HOURS``) that
+    can be adjusted as the system's behaviour is tuned.
+    """
+    if now is None:
+        now = _utcnow()
+
+    if message_count == 0 or last_message_at is None:
+        return "unknown"
+
+    age_minutes = (now - last_message_at).total_seconds() / 60.0
+
+    if age_minutes <= _QUIET_THRESHOLD_MINUTES:
+        return "running"
+
+    if age_minutes > _UNKNOWN_THRESHOLD_HOURS * 60:
+        return "unknown"
+
+    if has_parent:
+        return "blocked"
+
+    return "completed"
+
+
+def _derive_title(
+    agent: str | None,
+    external_session_id: str | None,
+) -> str | None:
+    """Derive a human-readable title from agent name and external session ID.
+
+    If neither is available, returns ``None``.  The external session ID
+    is truncated to 12 characters for readability.
+    """
+    if agent and external_session_id:
+        return f"{agent} — {external_session_id[:12]}"
+    if agent:
+        return agent
+    if external_session_id:
+        return external_session_id[:12]
+    return None
+
+
+def _build_agent_run_filters(
+    client_id: uuid.UUID | None,
+    from_date: datetime | None,
+    to_date: datetime | None,
+    agent: str | None,
+    external_project_id: str | None,
+) -> tuple[str, list]:
+    """Build WHERE clause and params for agent run list queries.
+
+    Returns ``(where_clause, params)``.  Placeholders start at ``$1``
+    and increment with each filter.
+    """
+    params: list = []
+    filters: list[str] = ["TRUE"]
+
+    if client_id is not None:
+        filters.append(f"s.client_id = ${len(params) + 1}")
+        params.append(client_id)
+
+    if from_date is not None:
+        filters.append(f"s.last_message_at >= ${len(params) + 1}")
+        params.append(from_date)
+
+    if to_date is not None:
+        filters.append(f"s.last_message_at <= ${len(params) + 1}")
+        params.append(to_date)
+
+    if agent is not None:
+        filters.append(f"s.agent = ${len(params) + 1}")
+        params.append(agent)
+
+    if external_project_id is not None:
+        filters.append(f"s.project_id = ${len(params) + 1}")
+        params.append(external_project_id)
+
+    return " AND ".join(filters), params
+
+
+def _status_case_expression() -> str:
+    """Return a SQL CASE expression that computes status from session columns.
+
+    Mirrors the logic in :func:`_compute_status` but expressed in SQL
+    so the database can filter rows by computed status.
+
+    Uses ``now()`` as the reference time and the same threshold constants
+    as the Python implementation.
+    """
+    quiet_interval = f"interval '{_QUIET_THRESHOLD_MINUTES} minutes'"
+    unknown_interval = f"interval '{_UNKNOWN_THRESHOLD_HOURS} hours'"
+    return f"""
+        CASE
+            WHEN s.message_count = 0 OR s.last_message_at IS NULL THEN 'unknown'
+            WHEN s.last_message_at >= now() - {quiet_interval} THEN 'running'
+            WHEN s.last_message_at < now() - {unknown_interval} THEN 'unknown'
+            WHEN s.parent_session_id IS NOT NULL THEN 'blocked'
+            ELSE 'completed'
+        END
+    """
+
+
+# ── Agent Run list query ──────────────────────────────────────────────────
+
+
+async def _fetch_agent_runs(
+    conn: asyncpg.Connection,
+    client_id: uuid.UUID | None,
+    from_date: datetime | None,
+    to_date: datetime | None,
+    agent: str | None,
+    external_project_id: str | None,
+    status_filter: str | None,
+    limit: int,
+    offset: int,
+    grafana_base_url: str,
+) -> PaginatedResponse[AgentRunSummary]:
+    """Query sessions table, compute status, join child counts, return paginated."""
+    from app.core.schemas.usage import AgentRunSummary
+
+    where_clause, params = _build_agent_run_filters(
+        client_id, from_date, to_date, agent, external_project_id
+    )
+    status_expr = _status_case_expression()
+
+    # ── Build the status filter as a CTE wrapper ────────────────────
+    if status_filter is not None:
+        # Wrap in a subquery that computes status, then filter
+        base_query = f"""
+            SELECT * FROM (
+                SELECT
+                    s.id,
+                    s.client_id,
+                    s.source_database_id,
+                    s.external_session_id,
+                    s.project_id,
+                    s.workspace_id,
+                    s.agent,
+                    s.parent_session_id,
+                    s.message_count,
+                    s.total_input_tokens,
+                    s.total_output_tokens,
+                    s.total_cached_tokens,
+                    s.total_estimated_cost_usd,
+                    s.last_message_at,
+                    ({status_expr}) AS _status
+                FROM sessions s
+                WHERE {where_clause}
+            ) sub
+            WHERE sub._status = ${len(params) + 1}
+        """
+        params.append(status_filter)
+        count_from = f"""
+            FROM sessions s
+            WHERE {where_clause} AND ({status_expr}) = ${len(params)}
+        """
+    else:
+        base_query = f"""
+            SELECT
+                s.id,
+                s.client_id,
+                s.source_database_id,
+                s.external_session_id,
+                s.project_id,
+                s.workspace_id,
+                s.agent,
+                s.parent_session_id,
+                s.message_count,
+                s.total_input_tokens,
+                s.total_output_tokens,
+                s.total_cached_tokens,
+                s.total_estimated_cost_usd,
+                s.last_message_at,
+                ({status_expr}) AS _status
+            FROM sessions s
+            WHERE {where_clause}
+        """
+        count_from = f"FROM sessions s WHERE {where_clause}"
+
+    # ── Count query ─────────────────────────────────────────────────
+    count_sql = f"SELECT COUNT(*) {count_from}"
+    total = await conn.fetchval(count_sql, *params)
+
+    # ── Child count subquery ────────────────────────────────────────
+    child_subquery = """
+        SELECT COUNT(*) FROM sessions child
+        WHERE child.parent_session_id = s.external_session_id
+    """
+
+    # ── Data query ──────────────────────────────────────────────────
+    data_sql = f"""
+        SELECT *, ({child_subquery}) AS child_run_count
+        FROM ({base_query}) s
+        ORDER BY s.last_message_at DESC NULLS LAST
+        LIMIT ${len(params) + 1}
+        OFFSET ${len(params) + 2}
+    """
+    rows = await conn.fetch(data_sql, *params, limit, offset)
+
+    items: list[AgentRunSummary] = []
+    for r in rows:
+        status_val = r["_status"]
+        items.append(
+            AgentRunSummary(
+                id=r["id"],
+                external_session_id=r["external_session_id"],
+                client_id=r["client_id"],
+                source_database_id=r["source_database_id"],
+                title=_derive_title(r["agent"], r["external_session_id"]),
+                status=status_val,
+                agent=r["agent"],
+                project_id=r["project_id"],
+                workspace_id=r["workspace_id"],
+                todo_total=0,
+                todo_completed=0,
+                todo_blocked=0,
+                code_changes_total=0,
+                total_input_tokens=r["total_input_tokens"],
+                total_output_tokens=r["total_output_tokens"],
+                total_cached_tokens=r["total_cached_tokens"],
+                total_estimated_cost_usd=r["total_estimated_cost_usd"],
+                message_count=r["message_count"],
+                last_updated_at=r["last_message_at"],
+                child_run_count=r["child_run_count"],
+            )
+        )
+
+    return PaginatedResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+# ── Agent Run detail query ────────────────────────────────────────────────
+
+
+async def _fetch_agent_run_detail(
+    conn: asyncpg.Connection,
+    session_id: uuid.UUID,
+    grafana_base_url: str,
+) -> AgentRunDetail:
+    """Fetch a single agent run detail by internal session UUID."""
+    from app.core.schemas.usage import (
+        AgentRunDetail,
+        ChildRunSummary,
+        TodoRow,
+    )
+
+    # ── Fetch the session row ────────────────────────────────────────
+    session_row = await conn.fetchrow(
+        """SELECT
+            s.id,
+            s.client_id,
+            s.source_database_id,
+            s.external_session_id,
+            s.first_message_at,
+            s.last_message_at,
+            s.message_count,
+            s.total_input_tokens,
+            s.total_output_tokens,
+            s.total_cached_tokens,
+            s.total_estimated_cost_usd,
+            s.project_id,
+            s.workspace_id,
+            s.agent,
+            s.parent_session_id
+        FROM sessions s
+        WHERE s.id = $1""",
+        session_id,
+    )
+
+    if session_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent run not found: {session_id}",
+        )
+
+    # ── Resolve parent internal ID if parent_session_id is set ───────
+    parent_internal_id: uuid.UUID | None = None
+    parent_external_id: str | None = session_row["parent_session_id"]
+    if parent_external_id:
+        parent_row = await conn.fetchrow(
+            "SELECT id FROM sessions WHERE external_session_id = $1 LIMIT 1",
+            parent_external_id,
+        )
+        if parent_row:
+            parent_internal_id = parent_row["id"]
+
+    # ── Fetch child sessions ─────────────────────────────────────────
+    child_rows = await conn.fetch(
+        """SELECT
+            id, external_session_id, agent, message_count,
+            last_message_at
+        FROM sessions
+        WHERE parent_session_id = $1
+        ORDER BY last_message_at DESC""",
+        session_row["external_session_id"],
+    )
+
+    child_summaries: list[ChildRunSummary] = []
+    for cr in child_rows:
+        child_status = _compute_status(
+            last_message_at=cr["last_message_at"],
+            message_count=cr["message_count"],
+            has_parent=True,
+        )
+        child_summaries.append(
+            ChildRunSummary(
+                id=cr["id"],
+                external_session_id=cr["external_session_id"],
+                status=child_status,
+                agent=cr["agent"],
+                message_count=cr["message_count"],
+            )
+        )
+
+    # ── Compute status ────────────────────────────────────────────────
+    computed_status = _compute_status(
+        last_message_at=session_row["last_message_at"],
+        message_count=session_row["message_count"],
+        has_parent=session_row["parent_session_id"] is not None,
+    )
+
+    # ── Build detail ─────────────────────────────────────────────────
+    return AgentRunDetail(
+        id=session_row["id"],
+        external_session_id=session_row["external_session_id"],
+        client_id=session_row["client_id"],
+        source_database_id=session_row["source_database_id"],
+        title=_derive_title(
+            session_row["agent"], session_row["external_session_id"]
+        ),
+        status=computed_status,
+        agent=session_row["agent"],
+        project_id=session_row["project_id"],
+        workspace_id=session_row["workspace_id"],
+        parent_session_id=parent_external_id,
+        parent_internal_id=parent_internal_id,
+        child_summaries=child_summaries,
+        todo_rows=[],  # placeholder — no todo snapshots table yet
+        todo_total=0,
+        todo_completed=0,
+        todo_blocked=0,
+        code_changes_total=0,
+        session_context=None,  # placeholder — no session_context table yet
+        message_count=session_row["message_count"],
+        total_input_tokens=session_row["total_input_tokens"],
+        total_output_tokens=session_row["total_output_tokens"],
+        total_cached_tokens=session_row["total_cached_tokens"],
+        total_estimated_cost_usd=session_row["total_estimated_cost_usd"],
+        first_message_at=session_row["first_message_at"],
+        last_message_at=session_row["last_message_at"],
+        loki_search_url=build_loki_search_url(
+            client_id=session_row["client_id"],
+            source_database_id=session_row["source_database_id"],
+            session_id=session_row["id"],
+            start_time=session_row["first_message_at"],
+            end_time=session_row["last_message_at"] or _utcnow(),
+            grafana_base_url=grafana_base_url,
+        ),
+    )
+
+
+# ── Agent Run endpoints ───────────────────────────────────────────────────
+
+
+@router.get("/agent-runs")
+async def get_agent_runs(
+    request: Request,
+    client_id: uuid.UUID | None = Query(default=None),
+    from_date: datetime | None = Query(
+        default=None,
+        description="ISO-8601 start date — filter sessions last active on or after this date",
+    ),
+    to_date: datetime | None = Query(
+        default=None,
+        description="ISO-8601 end date — filter sessions last active on or before this date",
+    ),
+    agent: str | None = Query(
+        default=None,
+        description="Filter by agent name (exact match)",
+    ),
+    external_project_id: str | None = Query(
+        default=None,
+        description="Filter by external project identifier (exact match on project_id)",
+    ),
+    filter_status: str | None = Query(
+        default=None,
+        alias="status",
+        description="Filter by computed status: running, completed, blocked, unknown",
+    ),
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> PaginatedResponse[AgentRunSummary]:
+    """Return paginated Agent Run Summary rows computed on read.
+
+    Each row includes internal/external session IDs, a derived title,
+    calculated status, agent name, project/worktree identity, usage
+    totals, and child run count.
+
+    **Computed fields**: ``status`` and ``child_run_count`` are never
+    stored — they are calculated at query time from session facts and
+    parent/child relationships.
+
+    **Status derivation** uses a quiet-threshold heuristic (60 min by
+    default) and a todo-state mapping to produce one of four values:
+    ``running``, ``completed``, ``blocked``, or ``unknown``.  See
+    :func:`_compute_status` for the full derivation rules.
+    """
+    from app.core.schemas.usage import (
+        VALID_AGENT_RUN_STATUSES,
+        AgentRunSummary,
+    )
+
+    # Validate date range if both provided
+    if from_date is not None and to_date is not None:
+        _validate_date_range(from_date, to_date)
+
+    # Validate status filter
+    if filter_status is not None and filter_status not in VALID_AGENT_RUN_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status: '{filter_status}'. "
+            f"Valid values: {', '.join(sorted(VALID_AGENT_RUN_STATUSES))}",
+        )
+
+    settings = get_settings()
+    return await _fetch_agent_runs(
+        conn,
+        client_id,
+        from_date,
+        to_date,
+        agent,
+        external_project_id,
+        filter_status,
+        limit,
+        offset,
+        settings.grafana_base_url,
+    )
+
+
+@router.get("/agent-runs/{session_id}")
+async def get_agent_run_detail(
+    session_id: uuid.UUID,
+    request: Request,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AgentRunDetail:
+    """Return a full agent run detail view keyed by internal Gateway session UUID.
+
+    Includes parent identifiers, child summaries, project details,
+    Session Context (placeholder), and usage totals.
+
+    No OpenCode event, transcript, or message-part replay data is
+    included — this endpoint returns aggregated facts only.
+    """
+    from app.core.schemas.usage import AgentRunDetail
+
+    settings = get_settings()
+    return await _fetch_agent_run_detail(
+        conn, session_id, settings.grafana_base_url
     )

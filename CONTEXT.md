@@ -102,7 +102,6 @@ the token hash in `collector_credentials`. A collector's bearer token
 must pass BOTH layers — either by using the Admin API Key itself (with
 its hash registered in `collector_credentials`), or by using a
 provisioned collector token that also matches `GATEWAY_API_KEY`.
-
 ## Architecture Note
 
 The Gateway uses a layered architecture:

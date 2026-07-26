@@ -10,6 +10,12 @@ from app.db.models.ingest import (
     Session,
     SourceDatabase,
 )
+from app.db.models.projection import (
+    OpenCodeProjectDirectory,
+    OpenCodeSessionContext,
+    OpenCodeSessionTodo,
+    OpenCodeSourceProject,
+)
 
 __all__ = [
     "Base",
@@ -18,6 +24,10 @@ __all__ = [
     "IngestBatch",
     "ObservedModel",
     "OpenCodeClient",
+    "OpenCodeProjectDirectory",
+    "OpenCodeSessionContext",
+    "OpenCodeSessionTodo",
+    "OpenCodeSourceProject",
     "OpenCodeUsageRecord",
     "Session",
     "SourceDatabase",
