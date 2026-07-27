@@ -1,0 +1,89 @@
+---
+# Kubernetes Deployment for the OpenCode Gateway Kafka Consumer.
+#
+# This consumer reads usage records from the ``opencode-usage`` Kafka topic
+# and POSTs them to the Gateway's ``/ingest`` endpoint.  It runs as a
+# separate container in the same namespace.
+#
+#   kubectl apply -f k8s/consumer-deployment.yaml
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencode-gateway-consumer
+  labels:
+    app: opencode-gateway-consumer
+    component: kafka-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode-gateway-consumer
+  template:
+    metadata:
+      labels:
+        app: opencode-gateway-consumer
+        component: kafka-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: opencode-gateway-consumer:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.consumer.consumer"]
+          env:
+            # ── Kafka connectivity ──────────────────────────────
+            - name: GATEWAY_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-consumer-secrets
+                  key: kafka-brokers
+                  optional: false
+            - name: GATEWAY_KAFKA_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-consumer-config
+                  key: kafka-topic
+                  optional: true
+            - name: GATEWAY_KAFKA_DLQ_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-consumer-config
+                  key: kafka-dlq-topic
+                  optional: true
+            - name: GATEWAY_CONSUMER_GROUP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-consumer-config
+                  key: consumer-group-id
+                  optional: true
+
+            # ── Gateway /auth (reuses existing Gateway credential config) ──
+            - name: GATEWAY_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-consumer-config
+                  key: gateway-base-url
+                  optional: true
+            - name: GATEWAY_COLLECTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-consumer-secrets
+                  key: collector-token
+                  optional: false
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 30
+            periodSeconds: 30
