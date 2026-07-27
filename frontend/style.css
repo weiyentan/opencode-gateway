@@ -192,13 +192,87 @@ body {
   color: var(--status-error);
 }
 
-/* ── Dashboard Layout ─────────────────────────────────────────────────── */
+/* ── App Layout (sidebar + main) ─────────────────────────────────────── */
+
+.app-layout {
+  display: flex;
+  min-height: calc(100vh - 56px); /* header height */
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Sidebar Navigation ─────────────────────────────────────────────── */
+
+.sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  background: rgba(13, 19, 38, 0.75);
+  backdrop-filter: blur(20px) saturate(120%);
+  -webkit-backdrop-filter: blur(20px) saturate(120%);
+  border-right: 1px solid var(--glass-border);
+  padding: 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sidebar-nav {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 20px;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+}
+
+.sidebar-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.sidebar-item.active {
+  background: rgba(124, 140, 255, 0.10);
+  color: var(--accent-cyan);
+  border-left-color: var(--accent-cyan);
+}
+
+.sidebar-icon {
+  font-size: 0.68rem;
+  flex-shrink: 0;
+}
+
+.sidebar-label {
+  white-space: nowrap;
+}
+
+/* ── Tab Content ─────────────────────────────────────────────────────── */
+
+.tab-content {
+  display: none;
+}
+
+.tab-content.active {
+  display: block;
+}
+
+/* ── Dashboard (inside tabs) ─────────────────────────────────────────── */
 
 .dashboard {
+  flex: 1;
   position: relative;
   z-index: 1;
   max-width: var(--max-width);
-  margin: 0 auto;
+  margin: 0;
   padding: 24px 24px 40px;
 }
 
@@ -883,6 +957,70 @@ td.clickable:hover {
   text-decoration: underline;
 }
 
+/* ── Client/Project Panel ────────────────────────────────────────────── */
+
+.panel-subtitle {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+  margin-top: -8px;
+  font-style: italic;
+}
+
+.cp-table tbody td {
+  vertical-align: middle;
+}
+
+/* Client-level row */
+.cp-client-row {
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.02);
+  transition: background var(--transition);
+}
+
+.cp-client-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.cp-client-row td {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Expand/collapse indicator */
+.cp-expand-icon {
+  display: inline-block;
+  width: 16px;
+  font-size: 0.65rem;
+  margin-right: 4px;
+  text-align: center;
+  transition: transform 0.2s ease;
+  color: var(--accent-cyan);
+}
+
+.cp-expand-icon.expanded {
+  transform: rotate(90deg);
+}
+
+/* Project-level row (nested) */
+.cp-project-row {
+  background: rgba(13, 19, 38, 0.40);
+}
+
+.cp-project-row td {
+  font-weight: 400;
+  color: var(--text-secondary);
+  padding-left: 40px !important;
+}
+
+.cp-project-row td:first-child {
+  padding-left: 44px !important;
+}
+
+.cp-project-row:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    RESPONSIVE BREAKPOINTS
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -891,6 +1029,16 @@ td.clickable:hover {
 @media (max-width: 1024px) {
   .kpi-row {
     grid-template-columns: repeat(3, 1fr);
+  }
+
+  .sidebar {
+    width: 160px;
+    padding: 14px 0;
+  }
+
+  .sidebar-item {
+    padding: 10px 14px;
+    font-size: 0.76rem;
   }
 }
 
@@ -1003,5 +1151,51 @@ td.clickable:hover {
 
   .footer {
     padding: 0 12px 14px;
+  }
+
+  .app-layout {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    flex-direction: row;
+    padding: 8px 0;
+    border-right: none;
+    border-bottom: 1px solid var(--glass-border);
+    overflow-x: auto;
+  }
+
+  .sidebar-nav {
+    display: flex;
+    flex-direction: row;
+    gap: 4px;
+    padding: 0 12px;
+  }
+
+  .sidebar-item {
+    padding: 8px 14px;
+    font-size: 0.74rem;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 8px 8px 0 0;
+    flex-shrink: 0;
+  }
+
+  .sidebar-item.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent-cyan);
+  }
+
+  .sidebar-label {
+    font-size: 0.72rem;
+  }
+
+  .cp-project-row td {
+    padding-left: 28px !important;
+  }
+
+  .cp-project-row td:first-child {
+    padding-left: 32px !important;
   }
 }

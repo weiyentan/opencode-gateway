@@ -31,6 +31,8 @@ class AggregateRow(BaseModel):
     total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     record_count: int = Field(default=0, ge=0)
+    session_count: int = Field(default=0, ge=0)
+    model_count: int = Field(default=0, ge=0)
 
 
 class AggregateQuery(BaseModel):

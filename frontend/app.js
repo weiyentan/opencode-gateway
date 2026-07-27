@@ -67,6 +67,10 @@
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
     arDetailClose:  $('ar-detail-close'),
+
+    // Client/Project
+    cpTbody:        $('cp-tbody'),
+    cpWindowDays:   $('cp-window-days'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -78,6 +82,7 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
+  let aggClientProject = null;    // client+project aggregate rows
 
   // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -253,7 +258,7 @@
       var arUrl = buildAgentRunsUrl();
 
       // Parallel fetches
-      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns] =
+      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns, aggClientProjectResult] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -262,6 +267,7 @@
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
           apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
           apiFetch(arUrl),
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -271,6 +277,7 @@
       results.records   = records.status   === 'fulfilled' ? records.value   : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
+      results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -281,6 +288,7 @@
       if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
+      fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
 
       // Build client lookup from admin/clients
       if (results.clients && results.clients.items) {
@@ -698,7 +706,115 @@
     });
   }
 
-  /** Fetch and display agent run detail */
+  /** Render Client/Project Usage Breakdown two-level expandable table */
+  function renderClientProjectBreakdown(data) {
+    var rows = data && data.aggClientProject || [];
+
+    // Update window days display
+    if (els.cpWindowDays) {
+      els.cpWindowDays.textContent = AGG_WINDOW_DAYS;
+    }
+
+    if (rows.length === 0) {
+      var errSuffix = errorIndicator('aggClientProject');
+      els.cpTbody.innerHTML = '<tr><td colspan="5" class="empty-state">No data available' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    // Parse flat pipe-delimited rows into a two-level client→projects tree
+    var clientMap = {}; // client_name → { rows: [project_rows], totals: {...} }
+
+    rows.forEach(function (r) {
+      var parts = (r.group_value || '').split('|');
+      var clientName = parts[0] || 'Unknown';
+      var projectId = parts[1] || 'unknown';
+
+      if (!clientMap[clientName]) {
+        clientMap[clientName] = {
+          projectRows: [],
+          totalTokens: 0,
+          totalCost: 0,
+          totalSessions: 0,
+          totalModels: 0
+        };
+      }
+
+      var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
+      var projectRow = {
+        projectId: projectId,
+        tokens: tokens,
+        cost: r.total_estimated_cost_usd,
+        sessions: r.session_count || 0,
+        models: r.model_count || 0
+      };
+
+      clientMap[clientName].projectRows.push(projectRow);
+      clientMap[clientName].totalTokens += tokens;
+      clientMap[clientName].totalCost += (r.total_estimated_cost_usd || 0);
+      clientMap[clientName].totalSessions += (r.session_count || 0);
+      clientMap[clientName].totalModels += (r.model_count || 0);
+    });
+
+    // Sort clients by totalTokens descending
+    var clientNames = Object.keys(clientMap).sort(function (a, b) {
+      return clientMap[b].totalTokens - clientMap[a].totalTokens;
+    });
+
+    var html = '';
+    var rowId = 0;
+    clientNames.forEach(function (clientName) {
+      var c = clientMap[clientName];
+      var cid = 'cp-client-' + (rowId++);
+
+      // Sort project rows by tokens descending
+      c.projectRows.sort(function (a, b) {
+        return b.tokens - a.tokens;
+      });
+
+      html += '<tr class="cp-client-row" data-cp-id="' + cid + '">' +
+        '<td><span class="cp-expand-icon" id="' + cid + '-icon">&#9654;</span>' + escHtml(clientName) + '</td>' +
+        '<td>' + fmtNum(c.totalTokens) + '</td>' +
+        '<td>' + fmtCost(c.totalCost) + '</td>' +
+        '<td>' + fmtNum(c.totalSessions) + '</td>' +
+        '<td>' + fmtNum(c.totalModels) + '</td>' +
+        '</tr>';
+
+      // Project sub-rows (hidden by default)
+      c.projectRows.forEach(function (p) {
+        html += '<tr class="cp-project-row" data-cp-parent="' + cid + '" style="display:none">' +
+          '<td>' + escHtml(p.projectId) + '</td>' +
+          '<td>' + fmtNum(p.tokens) + '</td>' +
+          '<td>' + fmtCost(p.cost) + '</td>' +
+          '<td>' + fmtNum(p.sessions) + '</td>' +
+          '<td>' + fmtNum(p.models) + '</td>' +
+          '</tr>';
+      });
+    });
+
+    els.cpTbody.innerHTML = html;
+
+    // Attach expand/collapse handlers
+    var clientRows = els.cpTbody.querySelectorAll('.cp-client-row');
+    clientRows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-cp-id');
+        var icon = document.getElementById(id + '-icon');
+        var subRows = els.cpTbody.querySelectorAll('[data-cp-parent="' + id + '"]');
+
+        var isExpanded = icon && icon.classList.contains('expanded');
+        subRows.forEach(function (sr) {
+          sr.style.display = isExpanded ? 'none' : '';
+        });
+        if (icon) {
+          icon.classList.toggle('expanded');
+          icon.innerHTML = isExpanded ? '&#9654;' : '&#9660;';
+        }
+      });
+    });
+
+    // Store for later re-rendering
+    aggClientProject = data.aggClientProject;
+  }
   async function openAgentRunDetail(sessionId) {
     // Show overlay
     els.arDetailOverlay.classList.add('visible');
@@ -883,6 +999,7 @@
       renderAgentsTable(data);
       renderSessionsTable(data);
       renderAgentRunsTable(data.agentRuns);
+      renderClientProjectBreakdown(data);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -957,8 +1074,33 @@
     }
   }
 
+  function setupTabNavigation() {
+    var sidebarItems = document.querySelectorAll('.sidebar-item');
+    var tabContents = document.querySelectorAll('.tab-content');
+
+    function activateTab(tabName) {
+      // Deactivate all
+      sidebarItems.forEach(function (item) { item.classList.remove('active'); });
+      tabContents.forEach(function (tab) { tab.classList.remove('active'); });
+
+      // Activate target
+      var targetItem = document.querySelector('.sidebar-item[data-tab="' + tabName + '"]');
+      var targetTab = document.getElementById('tab-' + tabName);
+      if (targetItem) targetItem.classList.add('active');
+      if (targetTab) targetTab.classList.add('active');
+    }
+
+    sidebarItems.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var tabName = item.getAttribute('data-tab');
+        if (tabName) activateTab(tabName);
+      });
+    });
+  }
+
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
+    setupTabNavigation();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();

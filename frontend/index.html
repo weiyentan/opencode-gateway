@@ -26,7 +26,29 @@
     </div>
   </header>
 
+  <div class="app-layout">
+    <!-- Sidebar Navigation -->
+    <nav class="sidebar" id="sidebar">
+      <ul class="sidebar-nav">
+        <li class="sidebar-item active" data-tab="overview">
+          <span class="sidebar-icon">&#9632;</span>
+          <span class="sidebar-label">Overview</span>
+        </li>
+        <li class="sidebar-item" data-tab="agent-runs-tab">
+          <span class="sidebar-icon">&#9654;</span>
+          <span class="sidebar-label">Agent Runs</span>
+        </li>
+        <li class="sidebar-item" data-tab="clients-projects">
+          <span class="sidebar-icon">&#9733;</span>
+          <span class="sidebar-label">Clients / Projects</span>
+        </li>
+      </ul>
+    </nav>
+
   <main class="dashboard">
+
+    <!-- ── Tab: Overview ──────────────────────────────────────────────── -->
+    <div class="tab-content active" id="tab-overview">
 
     <!-- KPI Row -->
     <section class="kpi-row" id="kpi-row">
@@ -165,6 +187,11 @@
       </div>
     </section>
 
+    </div><!-- #tab-overview -->
+
+    <!-- ── Tab: Agent Runs ─────────────────────────────────────────────── -->
+    <div class="tab-content" id="tab-agent-runs">
+
     <!-- Agent Runs (full width) -->
     <section class="glass-panel panel-agent-runs">
       <h2 class="panel-title">Agent Runs</h2>
@@ -216,7 +243,37 @@
       </div>
     </section>
 
+    </div><!-- #tab-agent-runs -->
+
+    <!-- ── Tab: Clients / Projects ─────────────────────────────────────── -->
+    <div class="tab-content" id="tab-clients-projects">
+
+    <section class="glass-panel panel-client-project">
+      <h2 class="panel-title">Client / Project Usage Breakdown</h2>
+      <p class="panel-subtitle">Last <span id="cp-window-days">--</span> days</p>
+      <div class="table-scroll">
+        <table class="cp-table" id="cp-table">
+          <thead>
+            <tr>
+              <th>Client / Project</th>
+              <th>Total Tokens</th>
+              <th>Est. Cost</th>
+              <th>Sessions</th>
+              <th>Models</th>
+            </tr>
+          </thead>
+          <tbody id="cp-tbody">
+            <tr><td colspan="5" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    </div><!-- #tab-clients-projects -->
+
   </main>
+
+  </div><!-- .app-layout -->
 
   <!-- Agent Run Detail Panel -->
   <div class="detail-overlay" id="ar-detail-overlay">

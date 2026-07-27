@@ -34,7 +34,7 @@ router = APIRouter(tags=["usage"])
 # ── Valid group-by dimensions ─────────────────────────────────────────────
 
 VALID_GROUP_BY: frozenset[str] = frozenset(
-    {"client", "model", "session", "day", "week", "month"}
+    {"client", "model", "session", "day", "week", "month", "project"}
 )
 
 
@@ -93,6 +93,8 @@ def _group_expression(parts: list[str]) -> str:
             fragments.append("date_trunc('week', our.reported_at)::text")
         elif part == "month":
             fragments.append("date_trunc('month', our.reported_at)::text")
+        elif part == "project":
+            fragments.append("COALESCE(s.project_id, 'unknown')")
 
     if len(fragments) == 1:
         return fragments[0]
@@ -162,7 +164,9 @@ async def _fetch_aggregates(
                 COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
                 COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
                 SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-                COUNT(*) AS record_count
+                COUNT(*) AS record_count,
+                0 AS session_count,
+                0 AS model_count
             FROM opencode_usage_records our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
@@ -182,10 +186,20 @@ async def _fetch_aggregates(
                     row["total_estimated_cost_usd"] if row else Decimal("0")
                 ),
                 record_count=row["record_count"] if row else 0,
+                session_count=row["session_count"] if row else 0,
+                model_count=row["model_count"] if row else 0,
             )
         ]
 
     group_expr = _group_expression(group_parts)
+
+    # Conditionally join sessions when the project dimension is in use
+    sessions_join = (
+        "LEFT JOIN sessions s ON s.id = our.session_id"
+        if "project" in group_parts
+        else ""
+    )
+
     sql = f"""
         SELECT
             {group_expr} AS group_value,
@@ -196,10 +210,13 @@ async def _fetch_aggregates(
             COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
             COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
             SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-            COUNT(*) AS record_count
+            COUNT(*) AS record_count,
+            COUNT(DISTINCT our.session_id) AS session_count,
+            COUNT(DISTINCT om.model_name) AS model_count
         FROM opencode_usage_records our
         JOIN observed_models om ON om.id = our.model_id
         LEFT JOIN opencode_clients oc ON oc.id = our.client_id
+        {sessions_join}
         WHERE {where_clause}
         GROUP BY {group_expr}
         ORDER BY group_value
@@ -216,6 +233,8 @@ async def _fetch_aggregates(
             total_cache_write_tokens=r["total_cache_write_tokens"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
             record_count=r["record_count"],
+            session_count=r["session_count"],
+            model_count=r["model_count"],
         )
         for r in rows
     ]
@@ -483,7 +502,7 @@ async def get_aggregates(
     group_by: str | None = Query(
         default=None,
         description="Comma-separated group-by dimensions: "
-        "client,model,session,day,week,month",
+        "client,model,session,day,week,month,project",
     ),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> list[AggregateRow]:
