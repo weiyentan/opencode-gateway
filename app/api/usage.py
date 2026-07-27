@@ -441,8 +441,10 @@ async def _fetch_sessions(
             s.workspace_id,
             s.agent,
             s.parent_session_id,
-            s.total_estimated_cost_usd
+            s.total_estimated_cost_usd,
+            osc.title AS session_title
         FROM sessions s
+        LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
         WHERE {where_clause}
         ORDER BY s.last_message_at DESC
         LIMIT ${len(query_params) + 1}
@@ -466,6 +468,7 @@ async def _fetch_sessions(
             agent=r["agent"],
             parent_session_id=r["parent_session_id"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
+            session_title=r["session_title"],
             loki_search_url=build_loki_search_url(
                 client_id=r["client_id"],
                 source_database_id=r["source_database_id"],
@@ -768,8 +771,10 @@ async def _fetch_agent_runs(
                     s.total_cached_tokens,
                     s.total_estimated_cost_usd,
                     s.last_message_at,
-                    ({status_expr}) AS _status
+                    ({status_expr}) AS _status,
+                    osc.title AS session_title
                 FROM sessions s
+                LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
                 WHERE {where_clause}
             ) sub
             WHERE sub._status = ${len(params) + 1}
@@ -796,8 +801,10 @@ async def _fetch_agent_runs(
                 s.total_cached_tokens,
                 s.total_estimated_cost_usd,
                 s.last_message_at,
-                ({status_expr}) AS _status
+                ({status_expr}) AS _status,
+                osc.title AS session_title
             FROM sessions s
+            LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
             WHERE {where_clause}
         """
         count_from = f"FROM sessions s WHERE {where_clause}"
@@ -847,6 +854,7 @@ async def _fetch_agent_runs(
                 message_count=r["message_count"],
                 last_updated_at=r["last_message_at"],
                 child_run_count=r["child_run_count"],
+                session_title=r["session_title"],
             )
         )
 

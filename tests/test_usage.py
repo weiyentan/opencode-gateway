@@ -95,6 +95,7 @@ def _mk_session_row(
     agent: str | None = None,
     parent_session_id: str | None = None,
     cost: Decimal | None = Decimal("0.0175"),
+    session_title: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions."""
     row = MagicMock()
@@ -113,6 +114,54 @@ def _mk_session_row(
         "agent": agent,
         "parent_session_id": parent_session_id,
         "total_estimated_cost_usd": cost,
+        "session_title": session_title,
+    }
+    row.__getitem__.side_effect = data.__getitem__
+    row.__iter__ = MagicMock(return_value=iter(data.keys()))
+    return row
+
+
+def _mk_agent_run_row(
+    *,
+    session_id: uuid.UUID | None = None,
+    client_id: uuid.UUID = _CLIENT_ID,
+    source_database_id: uuid.UUID = _SOURCE_DB_ID,
+    external_session_id: str | None = None,
+    project_id: str | None = None,
+    workspace_id: str | None = None,
+    agent: str | None = None,
+    parent_session_id: str | None = None,
+    message_count: int = 5,
+    total_input_tokens: int = 500,
+    total_output_tokens: int = 250,
+    total_cached_tokens: int = 0,
+    cost: Decimal | None = Decimal("0.0175"),
+    last_message_at: datetime = _B_TS,
+    status: str = "completed",
+    child_run_count: int = 0,
+    session_title: str | None = None,
+) -> MagicMock:
+    """Return a MagicMock that looks like an asyncpg Record row for agent runs."""
+    row = MagicMock()
+    _external_session_id = external_session_id or str(uuid.uuid4())
+    data = {
+        "id": session_id or uuid.uuid4(),
+        "client_id": client_id,
+        "source_database_id": source_database_id,
+        "external_session_id": _external_session_id,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        "agent": agent,
+        "parent_session_id": parent_session_id,
+        "message_count": message_count,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cached_tokens": total_cached_tokens,
+        "total_estimated_cost_usd": cost,
+        "last_message_at": last_message_at,
+        "_status": status,
+        "child_run_count": child_run_count,
+        "session_title": session_title,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.__iter__ = MagicMock(return_value=iter(data.keys()))
@@ -907,6 +956,121 @@ class TestSessions:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["limit"] == 50
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Session title enrichment tests
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionTitle:
+    """Tests for session_title enrichment on GET /sessions and GET /agent-runs."""
+
+    @pytest.mark.asyncio
+    async def test_sessions_include_session_title(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Session summaries include session_title from opencode_session_contexts."""
+        row = _mk_session_row(session_title="My Test Session")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] == "My Test Session"
+
+    @pytest.mark.asyncio
+    async def test_sessions_session_title_null_when_no_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Session summary has null session_title when no Session Context exists."""
+        row = _mk_session_row(session_title=None)
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] is None
+
+    @pytest.mark.asyncio
+    async def test_agent_runs_include_session_title(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Agent run summaries include session_title from opencode_session_contexts."""
+        row = _mk_agent_run_row(session_title="Agent Run Session")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": 10},
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] == "Agent Run Session"
+
+    @pytest.mark.asyncio
+    async def test_agent_runs_session_title_null_when_no_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Agent run summary has null session_title when no Session Context exists."""
+        row = _mk_agent_run_row(session_title=None)
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": 10},
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] is None
+
+    @pytest.mark.asyncio
+    async def test_sessions_mixed_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Sessions with and without context both appear in the same response."""
+        row_with = _mk_session_row(session_title="Titled Session")
+        row_without = _mk_session_row(session_title=None)
+        mock_conn.fetch = AsyncMock(return_value=[row_with, row_without])
+        mock_conn.fetchval = AsyncMock(return_value=2)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        items = response.json()["data"]["items"]
+        assert items[0]["session_title"] == "Titled Session"
+        assert items[1]["session_title"] is None
 
 
 # ══════════════════════════════════════════════════════════════════════════

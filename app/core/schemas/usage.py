@@ -113,6 +113,10 @@ class SessionSummary(BaseModel):
     workspace_id: str | None = None
     agent: str | None = None
     parent_session_id: str | None = None
+    session_title: str | None = Field(
+        default=None,
+        description="Session title from opencode_session_contexts (null if no context)",
+    )
     total_estimated_cost_usd: Decimal | None = None
     loki_search_url: str | None = Field(
         default=None,
@@ -215,6 +219,10 @@ class AgentRunSummary(BaseModel):
         default=0,
         ge=0,
         description="Number of child sessions whose parent_session_id references this session",
+    )
+    session_title: str | None = Field(
+        default=None,
+        description="Session title from opencode_session_contexts (null if no context)",
     )
 
 
