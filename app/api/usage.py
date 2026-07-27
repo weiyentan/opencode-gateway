@@ -34,7 +34,7 @@ router = APIRouter(tags=["usage"])
 # ── Valid group-by dimensions ─────────────────────────────────────────────
 
 VALID_GROUP_BY: frozenset[str] = frozenset(
-    {"client", "model", "session", "day", "week", "month"}
+    {"client", "model", "session", "day", "week", "month", "project"}
 )
 
 
@@ -93,6 +93,8 @@ def _group_expression(parts: list[str]) -> str:
             fragments.append("date_trunc('week', our.reported_at)::text")
         elif part == "month":
             fragments.append("date_trunc('month', our.reported_at)::text")
+        elif part == "project":
+            fragments.append("COALESCE(s.project_id, 'unknown')")
 
     if len(fragments) == 1:
         return fragments[0]
@@ -162,7 +164,9 @@ async def _fetch_aggregates(
                 COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
                 COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
                 SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-                COUNT(*) AS record_count
+                COUNT(*) AS record_count,
+                COUNT(DISTINCT our.session_id) AS session_count,
+                COUNT(DISTINCT om.model_name) AS model_count
             FROM opencode_usage_records our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
@@ -182,10 +186,20 @@ async def _fetch_aggregates(
                     row["total_estimated_cost_usd"] if row else Decimal("0")
                 ),
                 record_count=row["record_count"] if row else 0,
+                session_count=row["session_count"] if row else 0,
+                model_count=row["model_count"] if row else 0,
             )
         ]
 
     group_expr = _group_expression(group_parts)
+
+    # Conditionally join sessions when the project dimension is in use
+    sessions_join = (
+        "LEFT JOIN sessions s ON s.id = our.session_id"
+        if "project" in group_parts
+        else ""
+    )
+
     sql = f"""
         SELECT
             {group_expr} AS group_value,
@@ -196,10 +210,13 @@ async def _fetch_aggregates(
             COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
             COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
             SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-            COUNT(*) AS record_count
+            COUNT(*) AS record_count,
+            COUNT(DISTINCT our.session_id) AS session_count,
+            COUNT(DISTINCT om.model_name) AS model_count
         FROM opencode_usage_records our
         JOIN observed_models om ON om.id = our.model_id
         LEFT JOIN opencode_clients oc ON oc.id = our.client_id
+        {sessions_join}
         WHERE {where_clause}
         GROUP BY {group_expr}
         ORDER BY group_value
@@ -216,6 +233,8 @@ async def _fetch_aggregates(
             total_cache_write_tokens=r["total_cache_write_tokens"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
             record_count=r["record_count"],
+            session_count=r["session_count"],
+            model_count=r["model_count"],
         )
         for r in rows
     ]
@@ -483,7 +502,7 @@ async def get_aggregates(
     group_by: str | None = Query(
         default=None,
         description="Comma-separated group-by dimensions: "
-        "client,model,session,day,week,month",
+        "client,model,session,day,week,month,project",
     ),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> list[AggregateRow]:
@@ -929,6 +948,71 @@ async def _fetch_agent_run_detail(
         has_parent=session_row["parent_session_id"] is not None,
     )
 
+    # ── Query session context projection ────────────────────────────
+    ctx_row = await conn.fetchrow(
+        """SELECT
+            code_change_count,
+            code_change_additions,
+            code_change_deletions,
+            session_model,
+            session_cost,
+            title,
+            source_directory,
+            source_path,
+            source_input_tokens,
+            source_output_tokens,
+            source_cached_tokens,
+            source_reasoning_tokens
+        FROM opencode_session_contexts
+        WHERE source_database_id = $1 AND external_session_id = $2""",
+        session_row["source_database_id"],
+        session_row["external_session_id"],
+    )
+
+    # ── Query todo snapshots ──────────────────────────────────────
+    todo_rows_raw = await conn.fetch(
+        """SELECT content, status, priority, position
+        FROM opencode_session_todos
+        WHERE source_database_id = $1 AND external_session_id = $2
+        ORDER BY position""",
+        session_row["source_database_id"],
+        session_row["external_session_id"],
+    )
+
+    # ── Compute todo aggregates ────────────────────────────────────
+    todos: list[TodoRow] = [
+        TodoRow(
+            description=tr["content"],
+            status=tr["status"] or "pending",
+            priority=tr["priority"],
+        )
+        for tr in todo_rows_raw
+    ]
+    todo_total = len(todos)
+    todo_completed = sum(
+        1 for tr in todo_rows_raw if tr["status"] == "completed"
+    )
+    todo_blocked = sum(
+        1 for tr in todo_rows_raw if tr["status"] == "blocked"
+    )
+
+    # ── Code change totals from session context ─────────────────────
+    code_changes_total: int = (
+        ctx_row["code_change_count"] if ctx_row else 0
+    ) or 0
+
+    # ── Build session context dict ──────────────────────────────────
+    session_context: dict[str, object] | None = None
+    if ctx_row:
+        session_context = {
+            "session_model": ctx_row["session_model"],
+            "title": ctx_row["title"],
+            "source_directory": ctx_row["source_directory"],
+            "source_path": ctx_row["source_path"],
+            "code_change_additions": ctx_row["code_change_additions"],
+            "code_change_deletions": ctx_row["code_change_deletions"],
+        }
+
     # ── Build detail ─────────────────────────────────────────────────
     return AgentRunDetail(
         id=session_row["id"],
@@ -945,12 +1029,12 @@ async def _fetch_agent_run_detail(
         parent_session_id=parent_external_id,
         parent_internal_id=parent_internal_id,
         child_summaries=child_summaries,
-        todo_rows=[],  # placeholder — no todo snapshots table yet
-        todo_total=0,
-        todo_completed=0,
-        todo_blocked=0,
-        code_changes_total=0,
-        session_context=None,  # placeholder — no session_context table yet
+        todo_rows=todos,
+        todo_total=todo_total,
+        todo_completed=todo_completed,
+        todo_blocked=todo_blocked,
+        code_changes_total=code_changes_total,
+        session_context=session_context,
         message_count=session_row["message_count"],
         total_input_tokens=session_row["total_input_tokens"],
         total_output_tokens=session_row["total_output_tokens"],

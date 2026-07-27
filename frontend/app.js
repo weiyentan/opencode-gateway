@@ -67,6 +67,16 @@
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
     arDetailClose:  $('ar-detail-close'),
+
+    // Client/Project
+    cpTbody:        $('cp-tbody'),
+    cpWindowDays:   $('cp-window-days'),
+
+    // Session detail
+    sdDetailOverlay: $('sd-detail-overlay'),
+    sdDetailTitle:   $('sd-detail-title'),
+    sdDetailBody:    $('sd-detail-body'),
+    sdDetailClose:   $('sd-detail-close'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -78,7 +88,6 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
-
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /** ISO-8601 date string for N days ago at midnight UTC */
@@ -253,7 +262,7 @@
       var arUrl = buildAgentRunsUrl();
 
       // Parallel fetches
-      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns] =
+      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns, aggClientProjectResult] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -262,6 +271,7 @@
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
           apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
           apiFetch(arUrl),
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -271,6 +281,7 @@
       results.records   = records.status   === 'fulfilled' ? records.value   : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
+      results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -281,6 +292,7 @@
       if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
+      fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
 
       // Build client lookup from admin/clients
       if (results.clients && results.clients.items) {
@@ -636,7 +648,7 @@
       var duration = fmtDuration(s.first_message_at, s.last_message_at);
       var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
-      html += '<tr>' +
+      html += '<tr class="session-row" data-id="' + s.id + '">' +
         '<td>' + escHtml(clientName) + '</td>' +
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
         '<td>' + fmtDT(s.last_message_at) + '</td>' +
@@ -649,6 +661,15 @@
     });
 
     els.sessionsTbody.innerHTML = html;
+
+    // Attach click handlers for session detail view
+    var sessionRows = els.sessionsTbody.querySelectorAll('.session-row');
+    sessionRows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-id');
+        if (id) openSessionDetail(id);
+      });
+    });
   }
 
   /** Agent Runs Table */
@@ -698,7 +719,113 @@
     });
   }
 
-  /** Fetch and display agent run detail */
+  /** Render Client/Project Usage Breakdown two-level expandable table */
+  function renderClientProjectBreakdown(data) {
+    var rows = data && data.aggClientProject || [];
+
+    // Update window days display
+    if (els.cpWindowDays) {
+      els.cpWindowDays.textContent = AGG_WINDOW_DAYS;
+    }
+
+    if (rows.length === 0) {
+      var errSuffix = errorIndicator('aggClientProject');
+      els.cpTbody.innerHTML = '<tr><td colspan="5" class="empty-state">No data available' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    // Parse flat pipe-delimited rows into a two-level client→projects tree
+    var clientMap = {}; // client_name → { rows: [project_rows], totals: {...} }
+
+    rows.forEach(function (r) {
+      var parts = (r.group_value || '').split('|');
+      var clientName = parts[0] || 'Unknown';
+      var projectId = parts[1] || 'unknown';
+
+      if (!clientMap[clientName]) {
+        clientMap[clientName] = {
+          projectRows: [],
+          totalTokens: 0,
+          totalCost: 0,
+          totalSessions: 0,
+          totalModels: 0
+        };
+      }
+
+      var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
+      var projectRow = {
+        projectId: projectId,
+        tokens: tokens,
+        cost: r.total_estimated_cost_usd,
+        sessions: r.session_count || 0,
+        models: r.model_count || 0
+      };
+
+      clientMap[clientName].projectRows.push(projectRow);
+      clientMap[clientName].totalTokens += tokens;
+      clientMap[clientName].totalCost += (r.total_estimated_cost_usd || 0);
+      clientMap[clientName].totalSessions += (r.session_count || 0);
+      clientMap[clientName].totalModels += (r.model_count || 0);
+    });
+
+    // Sort clients by totalTokens descending
+    var clientNames = Object.keys(clientMap).sort(function (a, b) {
+      return clientMap[b].totalTokens - clientMap[a].totalTokens;
+    });
+
+    var html = '';
+    var rowId = 0;
+    clientNames.forEach(function (clientName) {
+      var c = clientMap[clientName];
+      var cid = 'cp-client-' + (rowId++);
+
+      // Sort project rows by tokens descending
+      c.projectRows.sort(function (a, b) {
+        return b.tokens - a.tokens;
+      });
+
+      html += '<tr class="cp-client-row" data-cp-id="' + cid + '">' +
+        '<td><span class="cp-expand-icon" id="' + cid + '-icon">&#9654;</span>' + escHtml(clientName) + '</td>' +
+        '<td>' + fmtNum(c.totalTokens) + '</td>' +
+        '<td>' + fmtCost(c.totalCost) + '</td>' +
+        '<td>' + fmtNum(c.totalSessions) + '</td>' +
+        '<td>' + fmtNum(c.totalModels) + '</td>' +
+        '</tr>';
+
+      // Project sub-rows (hidden by default)
+      c.projectRows.forEach(function (p) {
+        html += '<tr class="cp-project-row" data-cp-parent="' + cid + '" style="display:none">' +
+          '<td>' + escHtml(p.projectId) + '</td>' +
+          '<td>' + fmtNum(p.tokens) + '</td>' +
+          '<td>' + fmtCost(p.cost) + '</td>' +
+          '<td>' + fmtNum(p.sessions) + '</td>' +
+          '<td>' + fmtNum(p.models) + '</td>' +
+          '</tr>';
+      });
+    });
+
+    els.cpTbody.innerHTML = html;
+
+    // Attach expand/collapse handlers
+    var clientRows = els.cpTbody.querySelectorAll('.cp-client-row');
+    clientRows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-cp-id');
+        var icon = document.getElementById(id + '-icon');
+        var subRows = els.cpTbody.querySelectorAll('[data-cp-parent="' + id + '"]');
+
+        var isExpanded = icon && icon.classList.contains('expanded');
+        subRows.forEach(function (sr) {
+          sr.style.display = isExpanded ? 'none' : '';
+        });
+        if (icon) {
+          icon.classList.toggle('expanded');
+          icon.innerHTML = isExpanded ? '&#9654;' : '&#9660;';
+        }
+      });
+    });
+
+  }
   async function openAgentRunDetail(sessionId) {
     // Show overlay
     els.arDetailOverlay.classList.add('visible');
@@ -837,6 +964,117 @@
     els.arDetailBody.innerHTML = html;
   }
 
+  /** Fetch and display session detail */
+  async function openSessionDetail(sessionId) {
+    els.sdDetailOverlay.classList.add('visible');
+    els.sdDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    els.sdDetailTitle.textContent = 'Session Detail';
+
+    try {
+      var data = await apiFetch('/api/v1/usage/agent-runs/' + encodeURIComponent(sessionId));
+      renderSessionDetail(data);
+    } catch (e) {
+      els.sdDetailBody.innerHTML = '<p class="empty-state">Failed to load detail: ' + escHtml(e.message) + '</p>';
+      console.error('Session detail fetch error:', e);
+    }
+  }
+
+  /** Close the session detail overlay */
+  function closeSessionDetail() {
+    els.sdDetailOverlay.classList.remove('visible');
+  }
+
+  /** Render Session Detail Panel */
+  function renderSessionDetail(d) {
+    if (!d) {
+      els.sdDetailBody.innerHTML = '<p class="empty-state">No detail data available</p>';
+      return;
+    }
+
+    els.sdDetailTitle.textContent = escHtml(d.title || 'Session Detail');
+
+    var duration = fmtDuration(d.first_message_at, d.last_message_at);
+    var projectStr = d.project_id || d.workspace_id || '--';
+    if (d.project_id && d.workspace_id && d.workspace_id !== d.project_id) {
+      projectStr = d.project_id + ' / ' + d.workspace_id;
+    }
+
+    // Extract session context fields
+    var ctx = d.session_context || {};
+    var model = ctx.session_model || '--';
+    var additions = ctx.code_change_additions != null ? Number(ctx.code_change_additions) : 0;
+    var deletions = ctx.code_change_deletions != null ? Number(ctx.code_change_deletions) : 0;
+    var netChange = additions - deletions;
+    var netLabel = netChange >= 0 ? '+' + fmtNum(netChange) : fmtNum(netChange);
+
+    var html = '';
+
+    // ── Project ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Project</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Project / Worktree', escHtml(projectStr)) +
+        fieldHtml('Source Directory', escHtml(ctx.source_directory || '--')) +
+      '</div></div>';
+
+    // ── Code Changes ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Code Changes</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Files Changed', fmtCodeChanges(d.code_changes_total)) +
+        fieldHtml('Additions', fmtNum(additions || 0)) +
+        fieldHtml('Deletions', fmtNum(deletions || 0)) +
+        fieldHtml('Net Change', netLabel) +
+      '</div></div>';
+
+    // ── Todos ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
+    if (d.todo_rows && d.todo_rows.length > 0) {
+      html += '<div class="detail-todo-list">';
+      d.todo_rows.forEach(function (t) {
+        var iconCls = t.status || 'pending';
+        var iconMap = { completed: '\u2713', blocked: '\u2717', in_progress: '\u25D4', pending: '\u25CB' };
+        var icon = iconMap[iconCls] || '\u25CB';
+        var priorityMark = t.priority
+          ? ' <span class="detail-todo-priority">[' + escHtml(t.priority) + ']</span>'
+          : '';
+        html += '<div class="detail-todo-item">' +
+          '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
+          '<span>' + escHtml(t.description) + priorityMark + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div class="detail-field-value" style="color:var(--text-muted)">No todos recorded</div>';
+    }
+    html += '</div>';
+
+    // ── Session Metadata ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Session Metadata</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Model', escHtml(model)) +
+        fieldHtml('Agent', escHtml(d.agent || '--')) +
+        fieldHtml('Duration', duration) +
+        fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
+        fieldHtml('First Message', fmtDT(d.first_message_at)) +
+        fieldHtml('Last Message', fmtDT(d.last_message_at)) +
+        fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
+        fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
+        fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
+      '</div></div>';
+
+    // ── Drill-down Link ──
+    if (d.loki_search_url) {
+      html += '<div class="detail-section">' +
+        '<a href="' + escHtml(d.loki_search_url) + '" target="_blank" rel="noopener" class="detail-loki-link">' +
+        '\u2197 Open in Grafana Explore</a></div>';
+    }
+
+    els.sdDetailBody.innerHTML = html;
+  }
+
   /** Helper: build a detail grid field row */
   function fieldHtml(label, value) {
     return '<div class="detail-field">' +
@@ -883,6 +1121,7 @@
       renderAgentsTable(data);
       renderSessionsTable(data);
       renderAgentRunsTable(data.agentRuns);
+      renderClientProjectBreakdown(data);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -931,7 +1170,7 @@
       els.arFilterApply.addEventListener('click', applyFilters);
     }
 
-    // Detail close button
+    // Agent run detail close button
     if (els.arDetailClose) {
       els.arDetailClose.addEventListener('click', function () {
         els.arDetailOverlay.classList.remove('visible');
@@ -939,7 +1178,7 @@
       });
     }
 
-    // Overlay click to close
+    // Agent run detail overlay click to close
     if (els.arDetailOverlay) {
       els.arDetailOverlay.addEventListener('click', function (e) {
         if (e.target === els.arDetailOverlay) {
@@ -949,6 +1188,32 @@
       });
     }
 
+    // Session detail close button
+    if (els.sdDetailClose) {
+      els.sdDetailClose.addEventListener('click', closeSessionDetail);
+    }
+
+    // Session detail overlay click to close
+    if (els.sdDetailOverlay) {
+      els.sdDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.sdDetailOverlay) {
+          closeSessionDetail();
+        }
+      });
+    }
+
+    // ESC key to close any open overlay
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        if (els.sdDetailOverlay && els.sdDetailOverlay.classList.contains('visible')) {
+          closeSessionDetail();
+        } else if (els.arDetailOverlay && els.arDetailOverlay.classList.contains('visible')) {
+          els.arDetailOverlay.classList.remove('visible');
+          agentRunDetail = null;
+        }
+      }
+    });
+
     // Enter key on agent filter triggers apply
     if (els.arFilterAgent) {
       els.arFilterAgent.addEventListener('keydown', function (e) {
@@ -957,8 +1222,33 @@
     }
   }
 
+  function setupTabNavigation() {
+    var sidebarItems = document.querySelectorAll('.sidebar-item');
+    var tabContents = document.querySelectorAll('.tab-content');
+
+    function activateTab(tabName) {
+      // Deactivate all
+      sidebarItems.forEach(function (item) { item.classList.remove('active'); });
+      tabContents.forEach(function (tab) { tab.classList.remove('active'); });
+
+      // Activate target
+      var targetItem = document.querySelector('.sidebar-item[data-tab="' + tabName + '"]');
+      var targetTab = document.getElementById('tab-' + tabName);
+      if (targetItem) targetItem.classList.add('active');
+      if (targetTab) targetTab.classList.add('active');
+    }
+
+    sidebarItems.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var tabName = item.getAttribute('data-tab');
+        if (tabName) activateTab(tabName);
+      });
+    });
+  }
+
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
+    setupTabNavigation();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();

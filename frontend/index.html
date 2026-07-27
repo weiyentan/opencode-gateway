@@ -26,7 +26,47 @@
     </div>
   </header>
 
+  <div class="app-layout">
+    <!-- Sidebar Navigation -->
+    <nav class="sidebar" id="sidebar">
+      <ul class="sidebar-nav">
+        <li class="sidebar-item active" data-tab="overview">
+          <span class="sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <rect x="4" y="4" width="6" height="6" rx="1.5"></rect>
+              <rect x="14" y="4" width="6" height="6" rx="1.5"></rect>
+              <rect x="4" y="14" width="6" height="6" rx="1.5"></rect>
+              <rect x="14" y="14" width="6" height="6" rx="1.5"></rect>
+            </svg>
+          </span>
+          <span class="sidebar-label">Overview</span>
+        </li>
+        <li class="sidebar-item" data-tab="agent-runs">
+          <span class="sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M8 5.5v13l10-6.5z"></path>
+            </svg>
+          </span>
+          <span class="sidebar-label">Agent Runs</span>
+        </li>
+        <li class="sidebar-item" data-tab="clients-projects">
+          <span class="sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <circle cx="7" cy="12" r="2.5"></circle>
+              <circle cx="17" cy="7" r="2.5"></circle>
+              <circle cx="17" cy="17" r="2.5"></circle>
+              <path d="M9.2 10.8 14.8 8.2M9.2 13.2l5.6 2.6"></path>
+            </svg>
+          </span>
+          <span class="sidebar-label">Clients / Projects</span>
+        </li>
+      </ul>
+    </nav>
+
   <main class="dashboard">
+
+    <!-- ── Tab: Overview ──────────────────────────────────────────────── -->
+    <div class="tab-content active" id="tab-overview">
 
     <!-- KPI Row -->
     <section class="kpi-row" id="kpi-row">
@@ -165,6 +205,11 @@
       </div>
     </section>
 
+    </div><!-- #tab-overview -->
+
+    <!-- ── Tab: Agent Runs ─────────────────────────────────────────────── -->
+    <div class="tab-content" id="tab-agent-runs">
+
     <!-- Agent Runs (full width) -->
     <section class="glass-panel panel-agent-runs">
       <h2 class="panel-title">Agent Runs</h2>
@@ -216,7 +261,48 @@
       </div>
     </section>
 
+    </div><!-- #tab-agent-runs -->
+
+    <!-- ── Tab: Clients / Projects ─────────────────────────────────────── -->
+    <div class="tab-content" id="tab-clients-projects">
+
+    <section class="glass-panel panel-client-project">
+      <h2 class="panel-title">Client / Project Usage Breakdown</h2>
+      <p class="panel-subtitle">Last <span id="cp-window-days">--</span> days</p>
+      <div class="table-scroll">
+        <table class="cp-table" id="cp-table">
+          <thead>
+            <tr>
+              <th>Client / Project</th>
+              <th>Total Tokens</th>
+              <th>Est. Cost</th>
+              <th>Sessions</th>
+              <th>Models</th>
+            </tr>
+          </thead>
+          <tbody id="cp-tbody">
+            <tr><td colspan="5" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    </div><!-- #tab-clients-projects -->
+
   </main>
+
+  <!-- Session Detail Panel -->
+  <div class="detail-overlay" id="sd-detail-overlay">
+    <div class="detail-panel glass-panel" id="sd-detail-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="sd-detail-title">Session Detail</h2>
+        <button class="detail-close" id="sd-detail-close">&times;</button>
+      </div>
+      <div class="detail-body" id="sd-detail-body">
+        <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
 
   <!-- Agent Run Detail Panel -->
   <div class="detail-overlay" id="ar-detail-overlay">
@@ -230,6 +316,8 @@
       </div>
     </div>
   </div>
+
+  </div><!-- .app-layout -->
 
   <footer class="footer">
     <span>OpenCode Gateway v<span id="footer-version">--</span></span>
