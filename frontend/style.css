@@ -372,6 +372,103 @@ body {
 .kpi-collectors .kpi-value { color: var(--status-healthy); }
 .kpi-source-dbs .kpi-value { color: var(--accent-pink); }
 
+/* ── Date Range Bar ───────────────────────────────────────────────────── */
+
+.date-range-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 24px;
+  padding: 14px 20px;
+  background: var(--glass);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-panel);
+  flex-wrap: wrap;
+}
+
+.dr-preset-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dr-label {
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.dr-preset {
+  font-family: var(--font);
+  font-size: 0.85rem;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  outline: none;
+  cursor: pointer;
+  min-width: 160px;
+  transition: border-color var(--transition);
+  appearance: auto;
+  -webkit-appearance: auto;
+}
+
+.dr-preset:focus {
+  border-color: var(--accent-cyan);
+}
+
+.dr-preset option {
+  background: var(--bg-deep);
+  color: var(--text-primary);
+}
+
+.dr-custom-inputs {
+  display: none;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.dr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dr-field label {
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.dr-date-input {
+  font-family: var(--font);
+  font-size: 0.85rem;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color var(--transition);
+  color-scheme: dark;
+}
+
+.dr-date-input:focus {
+  border-color: var(--accent-cyan);
+}
+
+.dr-date-input::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
+  cursor: pointer;
+}
+
 /* ── Content Grid ─────────────────────────────────────────────────────── */
 
 .content-grid {
@@ -1249,5 +1346,25 @@ td.clickable:hover {
 
   .cp-project-row td:first-child {
     padding-left: 32px !important;
+  }
+
+  .date-range-bar {
+    padding: 10px 14px;
+    gap: 10px;
+  }
+
+  .dr-preset {
+    min-width: 120px;
+    font-size: 0.78rem;
+    padding: 6px 10px;
+  }
+
+  .dr-date-input {
+    font-size: 0.78rem;
+    padding: 6px 10px;
+  }
+
+  .dr-custom-inputs {
+    gap: 8px;
   }
 }

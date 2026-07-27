@@ -68,6 +68,30 @@
     <!-- ── Tab: Overview ──────────────────────────────────────────────── -->
     <div class="tab-content active" id="tab-overview">
 
+    <!-- Date Range Bar -->
+    <div class="date-range-bar" id="date-range-bar">
+      <div class="dr-preset-group">
+        <label class="dr-label" for="dr-preset">Time Range</label>
+        <select id="dr-preset" class="dr-preset">
+          <option value="this-month">This month</option>
+          <option value="last-month">Last month</option>
+          <option value="last-30-days">Last 30 days</option>
+          <option value="last-7-days">Last 7 days</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div class="dr-custom-inputs" id="dr-custom-inputs" style="display:none">
+        <div class="dr-field">
+          <label for="dr-start-date">Start</label>
+          <input type="date" id="dr-start-date" class="dr-date-input">
+        </div>
+        <div class="dr-field">
+          <label for="dr-end-date">End</label>
+          <input type="date" id="dr-end-date" class="dr-date-input">
+        </div>
+      </div>
+    </div>
+
     <!-- KPI Row -->
     <section class="kpi-row" id="kpi-row">
       <div class="kpi-card kpi-tokens">
@@ -83,7 +107,7 @@
       <div class="kpi-card kpi-sessions">
         <span class="kpi-label">Sessions</span>
         <span class="kpi-value" id="kpi-sessions">--</span>
-        <span class="kpi-sub" id="kpi-sessions-detail">last 7 days</span>
+        <span class="kpi-sub" id="kpi-sessions-detail">--</span>
       </div>
       <div class="kpi-card kpi-collectors">
         <span class="kpi-label">Healthy Collectors</span>
@@ -268,7 +292,7 @@
 
     <section class="glass-panel panel-client-project">
       <h2 class="panel-title">Client / Project Usage Breakdown</h2>
-      <p class="panel-subtitle">Last <span id="cp-window-days">--</span> days</p>
+      <p class="panel-subtitle" id="cp-panel-subtitle">--</p>
       <div class="table-scroll">
         <table class="cp-table" id="cp-table">
           <thead>
