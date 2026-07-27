@@ -151,6 +151,9 @@ class IngestRequest(BaseModel):
 
     schema_version: str = Field(description="Schema version of the payload")
     collector_version: str = Field(description="Version of the collector software")
+    client_hostname: str = Field(
+        default="", description="Hostname of the collector that sent this batch"
+    )
     source_database_id: uuid.UUID = Field(
         description="Source database identifier assigned by the collector"
     )
