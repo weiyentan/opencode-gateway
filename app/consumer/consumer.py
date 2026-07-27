@@ -21,7 +21,6 @@ from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from app.consumer.models import IngestRequest
-
 logger = logging.getLogger(__name__)
 
 # ── Defaults ────────────────────────────────────────────────────────────────
