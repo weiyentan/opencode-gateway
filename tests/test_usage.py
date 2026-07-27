@@ -1505,11 +1505,16 @@ class TestRecordsWithContextRaw:
             )
 
         assert response.status_code == 200
-        # Verify date params were passed to the query
+        # Verify date params were passed to the query at positions $1 and $2
         call_args = mock_conn.fetch.call_args
         assert call_args is not None
         params = call_args[0][1:]
         assert len(params) >= 2
+        # Check that $1 is the start_date and $2 is the end_date
+        assert isinstance(params[0], datetime)
+        assert isinstance(params[1], datetime)
+        assert params[0].isoformat().startswith("2025-06-01")
+        assert params[1].isoformat().startswith("2025-06-30")
 
     @pytest.mark.asyncio
     async def test_start_after_end_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -1889,6 +1894,32 @@ class TestRecordsWithContextAuth:
                 params={
                     "start_date": "2025-07-01T00:00:00Z",
                     "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.asyncio
+    async def test_requires_auth_grouped(self, mock_conn: AsyncMock):
+        """GET /api/v1/usage/records-with-context with group_by without auth returns 401."""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        app.state.pool = None
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
                 },
             )
 

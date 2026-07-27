@@ -11,6 +11,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Union
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -23,6 +24,7 @@ from app.core.schemas.usage import (
     AggregateRow,
     PaginatedResponse,
     RecordRow,
+    RecordWithContextGroupedRow,
     SessionSummary,
 )
 from app.db.session import get_session
@@ -972,9 +974,8 @@ async def _fetch_agent_run_detail(
             source_cached_tokens,
             source_reasoning_tokens
         FROM opencode_session_contexts
-        WHERE source_database_id = $1 AND external_session_id = $2""",
-        session_row["source_database_id"],
-        session_row["external_session_id"],
+        WHERE session_id = $1""",
+        session_row["id"],
     )
 
     # ── Query todo snapshots ──────────────────────────────────────
@@ -1222,6 +1223,8 @@ def _parse_records_with_context_group_by(raw: str | None) -> list[str]:
 
 
 def _build_records_with_context_filters(
+    start_date: datetime,
+    end_date: datetime,
     project_id: str | None,
     session_id: uuid.UUID | None,
     agent: str | None,
@@ -1229,31 +1232,30 @@ def _build_records_with_context_filters(
 ) -> tuple[str, list]:
     """Build WHERE clause fragments and parameter list.
 
-    Returns ``(where_clause, params)``.  Date-range placeholders are
-    always ``$1`` and ``$2``.  Additional filters use incrementing
-    placeholders.
+    Date-range params are placed first (``$1``, ``$2``) and included
+    in the returned param list so callers do not need to prepend them.
+    Additional filters use incrementing placeholders (``$3``, ``$4``, …).
     """
-    params: list = []
     filters: list[str] = []
+    params: list = [start_date, end_date]
 
-    # Date range is always present (positional: $1, $2)
     filters.append("our.reported_at >= $1")
     filters.append("our.reported_at <= $2")
 
     if project_id is not None:
-        filters.append(f"s.project_id = ${len(params) + 3}")
+        filters.append(f"s.project_id = ${len(params) + 1}")
         params.append(project_id)
 
     if session_id is not None:
-        filters.append(f"our.session_id = ${len(params) + 3}")
+        filters.append(f"our.session_id = ${len(params) + 1}")
         params.append(session_id)
 
     if agent is not None:
-        filters.append(f"s.agent = ${len(params) + 3}")
+        filters.append(f"s.agent = ${len(params) + 1}")
         params.append(agent)
 
     if model is not None:
-        filters.append(f"om.model_name = ${len(params) + 3}")
+        filters.append(f"om.model_name = ${len(params) + 1}")
         params.append(model)
 
     return " AND ".join(filters), params
@@ -1278,10 +1280,9 @@ async def _fetch_records_with_context(
     """
     from app.core.schemas.usage import RecordWithContextRow
 
-    where_clause, params = _build_records_with_context_filters(
-        project_id, session_id, agent, model
+    where_clause, query_params = _build_records_with_context_filters(
+        start_date, end_date, project_id, session_id, agent, model
     )
-    query_params = [start_date, end_date, *params]
 
     # ── Total count ─────────────────────────────────────────────────
     count_sql = f"""
@@ -1423,12 +1424,9 @@ async def _fetch_records_with_context_grouped(
 
     Returns aggregated rows grouped by the requested dimensions.
     """
-    from app.core.schemas.usage import RecordWithContextGroupedRow
-
-    where_clause, params = _build_records_with_context_filters(
-        project_id, session_id, agent, model
+    where_clause, query_params = _build_records_with_context_filters(
+        start_date, end_date, project_id, session_id, agent, model
     )
-    query_params = [start_date, end_date, *params]
 
     group_expr = _rwc_group_expression(group_parts)
     extra_cols = _rwc_group_by_columns(group_parts)
@@ -1480,7 +1478,7 @@ async def _fetch_records_with_context_grouped(
 # ── Records-with-context endpoint ─────────────────────────────────────────
 
 
-@router.get("/records-with-context")
+@router.get("/records-with-context", response_model=Union[PaginatedResponse, list[RecordWithContextGroupedRow]])
 async def get_records_with_context(
     request: Request,
     start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
@@ -1506,7 +1504,7 @@ async def get_records_with_context(
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
-):
+) -> PaginatedResponse | list[RecordWithContextGroupedRow]:
     """Return usage records enriched with project label, session title, and agent.
 
     **Raw mode** (no ``group_by``): returns paginated per-message rows with
