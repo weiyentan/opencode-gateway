@@ -35,6 +35,12 @@
     dbStatus:       $('db-status'),
     versionFooter:  $('footer-version'),
 
+    // Sidebar / Navigation
+    sidebar:        $('sidebar'),
+    sidebarToggle:  $('sidebar-toggle'),
+    sidebarBackdrop:$('sidebar-backdrop'),
+    contentPanel:   $('content-panel'),
+
     // KPIs
     kpiTokens:      $('kpi-tokens'),
     kpiTokensDetail:$('kpi-tokens-detail'),
@@ -883,6 +889,16 @@
       renderAgentsTable(data);
       renderSessionsTable(data);
       renderAgentRunsTable(data.agentRuns);
+
+      // Copy table content to standalone tab copies (Collectors & LLMs tabs)
+      var collectorsCopy = $('collectors-standalone-tbody');
+      if (collectorsCopy && els.collectorsTbody) {
+        collectorsCopy.innerHTML = els.collectorsTbody.innerHTML;
+      }
+      var agentsCopy = $('agents-standalone-tbody');
+      if (agentsCopy && els.agentsTbody) {
+        agentsCopy.innerHTML = els.agentsTbody.innerHTML;
+      }
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -957,8 +973,94 @@
     }
   }
 
+  // ── Tab / Sidebar Navigation ──────────────────────────────────────────
+
+  /** Get the tab ID from the URL hash, defaulting to 'overview' */
+  function getTabFromHash() {
+    var hash = window.location.hash.replace('#', '');
+    var valid = ['overview', 'sessions', 'agent-runs', 'collectors', 'llms'];
+    return valid.indexOf(hash) !== -1 ? hash : 'overview';
+  }
+
+  /** Switch the visible tab content and update sidebar active state */
+  function switchTab(tabId) {
+    // Update tab content visibility
+    var tabs = document.querySelectorAll('.tab-content');
+    tabs.forEach(function (el) {
+      if (el.getAttribute('data-tab') === tabId) {
+        el.classList.add('active');
+      } else {
+        el.classList.remove('active');
+      }
+    });
+
+    // Update sidebar link active state
+    var links = document.querySelectorAll('.sidebar-link');
+    links.forEach(function (el) {
+      if (el.getAttribute('data-tab') === tabId) {
+        el.classList.add('active');
+      } else {
+        el.classList.remove('active');
+      }
+    });
+
+    // Update URL hash without triggering scroll
+    if (window.location.hash !== '#' + tabId) {
+      history.pushState(null, '', '#' + tabId);
+    }
+
+    // Close sidebar on mobile after selecting a tab
+    if (els.sidebar && els.sidebar.classList.contains('open')) {
+      els.sidebar.classList.remove('open');
+      if (els.sidebarBackdrop) els.sidebarBackdrop.classList.remove('open');
+    }
+  }
+
+  /** Set up sidebar event handlers and hash routing */
+  function setupSidebar() {
+    // Nav link click handlers
+    var links = document.querySelectorAll('.sidebar-link');
+    links.forEach(function (el) {
+      el.addEventListener('click', function (e) {
+        e.preventDefault();
+        var tab = el.getAttribute('data-tab');
+        if (tab) switchTab(tab);
+      });
+    });
+
+    // Hash change (browser back/forward)
+    window.addEventListener('hashchange', function () {
+      switchTab(getTabFromHash());
+    });
+
+    // Initialize from URL hash (with a small delay to ensure DOM is ready)
+    var initialTab = getTabFromHash();
+    if (initialTab !== 'overview') {
+      switchTab(initialTab);
+    }
+
+    // Hamburger toggle
+    if (els.sidebarToggle) {
+      els.sidebarToggle.addEventListener('click', function () {
+        var isOpen = els.sidebar.classList.toggle('open');
+        if (els.sidebarBackdrop) {
+          els.sidebarBackdrop.classList.toggle('open', isOpen);
+        }
+      });
+    }
+
+    // Backdrop click closes sidebar
+    if (els.sidebarBackdrop) {
+      els.sidebarBackdrop.addEventListener('click', function () {
+        els.sidebar.classList.remove('open');
+        els.sidebarBackdrop.classList.remove('open');
+      });
+    }
+  }
+
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
+    setupSidebar();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();

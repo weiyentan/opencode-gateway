@@ -77,6 +77,34 @@ body {
   100% { opacity: 0.85; }
 }
 
+/* ── Sidebar Toggle (Hamburger) ──────────────────────────────────────── */
+
+.sidebar-toggle {
+  display: none; /* hidden by default, shown on mobile */
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  margin-right: 8px;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  justify-content: center;
+}
+
+.hamburger-line {
+  display: block;
+  width: 20px;
+  height: 2px;
+  background: var(--text-secondary);
+  border-radius: 2px;
+  transition: background var(--transition);
+}
+
+.sidebar-toggle:hover .hamburger-line {
+  background: var(--text-primary);
+}
+
 /* ── Header ───────────────────────────────────────────────────────────── */
 
 .header {
@@ -199,13 +227,120 @@ body {
   z-index: 1;
   max-width: var(--max-width);
   margin: 0 auto;
-  padding: 24px 24px 40px;
+  padding: 0;
 }
 
 /* Refresh indicator — subtle opacity change during data fetch */
 .dashboard.refreshing {
   opacity: 0.85;
   transition: opacity 0.2s ease;
+}
+
+/* ── Dashboard Layout (sidebar + content) ────────────────────────────── */
+
+.dashboard-layout {
+  display: flex;
+  min-height: calc(100vh - 70px); /* fill viewport minus header */
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────── */
+
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: rgba(8, 17, 31, 0.6);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-right: 1px solid var(--glass-border);
+  padding: 16px 0;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  max-height: calc(100vh - 70px);
+  overflow-y: auto;
+  z-index: 5;
+  transition: transform var(--transition), width var(--transition);
+}
+
+.sidebar-nav {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border-radius: 0;
+  transition: background var(--transition), color var(--transition);
+  border-left: 3px solid transparent;
+}
+
+.sidebar-link:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+
+.sidebar-link.active {
+  background: rgba(124, 140, 255, 0.10);
+  color: var(--accent-indigo);
+  border-left-color: var(--accent-indigo);
+}
+
+.sidebar-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+}
+
+.sidebar-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Sidebar backdrop (mobile overlay) */
+.sidebar-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 4;
+  background: rgba(8, 17, 31, 0.5);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+/* ── Content Panel ──────────────────────────────────────────────────── */
+
+.content-panel {
+  flex: 1;
+  min-width: 0;
+  padding: 24px 24px 0;
+  overflow: hidden;
+}
+
+/* ── Tab Content ──────────────────────────────────────────────────────── */
+
+.tab-content {
+  display: none;
+}
+
+.tab-content.active {
+  display: block;
+}
+
+/* Ensure tabs with flex content still work */
+.tab-content.active.flex-tab {
+  display: flex;
 }
 
 /* ── KPI Row ──────────────────────────────────────────────────────────── */
@@ -672,6 +807,13 @@ tbody tr:hover td {
   background: rgba(124, 140, 255, 0.25);
 }
 
+/* ── Standalone Tab Panels ──────────────────────────────────────────────── */
+
+.panel-collectors-standalone,
+.panel-agents-standalone {
+  margin-bottom: 24px;
+}
+
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
 
 .panel-agent-runs {
@@ -883,6 +1025,93 @@ td.clickable:hover {
   text-decoration: underline;
 }
 
+/* ── Sidebar icon-only mode (≤900px) ────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .sidebar {
+    width: 64px;
+  }
+
+  .sidebar-label {
+    display: none;
+  }
+
+  .sidebar-link {
+    justify-content: center;
+    padding: 12px 8px;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+  }
+
+  .sidebar-link.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent-indigo);
+  }
+
+  .sidebar-icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .content-panel {
+    padding: 20px 16px 0;
+  }
+}
+
+/* ── Hamburger mode (≤600px) ────────────────────────────────────────── */
+
+@media (max-width: 600px) {
+  .sidebar-toggle {
+    display: flex;
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    max-height: 100vh;
+    z-index: 20;
+    transform: translateX(-100%);
+    border-right: 1px solid var(--glass-border);
+    padding-top: 70px; /* offset for header */
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .sidebar.open ~ .sidebar-backdrop,
+  .sidebar-backdrop.open {
+    display: block;
+  }
+
+  .sidebar-link {
+    justify-content: flex-start;
+    padding: 12px 18px;
+    border-left: 3px solid transparent;
+    border-bottom: none;
+  }
+
+  .sidebar-link.active {
+    border-left-color: var(--accent-indigo);
+    border-bottom-color: transparent;
+  }
+
+  .sidebar-label {
+    display: inline;
+  }
+
+  .content-panel {
+    padding: 16px 12px 0;
+  }
+
+  .dashboard-layout {
+    min-height: auto;
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    RESPONSIVE BREAKPOINTS
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -921,10 +1150,6 @@ td.clickable:hover {
   .col-left,
   .col-right {
     gap: 16px;
-  }
-
-  .dashboard {
-    padding: 16px 12px 30px;
   }
 
   .header {
