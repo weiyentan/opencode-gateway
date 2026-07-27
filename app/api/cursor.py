@@ -54,7 +54,7 @@ async def get_cursor(
     source_database_id: uuid.UUID = Query(
         ..., description="Source database UUID to query cursor for"
     ),
-    auth: dict = Depends(require_collector_token),
+    _auth: dict = Depends(require_collector_token),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> CursorResponse:
     """Return cursor state for a source database.

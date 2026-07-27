@@ -244,3 +244,24 @@ class TestCursorUnauthenticated:
             )
 
         assert response.status_code == 401
+
+
+class TestCursorValidation:
+    """GET /cursor returns 422 for invalid query parameter formats."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_uuid_format_returns_422(self, monkeypatch):
+        """Non-UUID source_database_id → 422 from FastAPI type validation."""
+        mock_conn = AsyncMock()
+        client = _build_cursor_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.get(
+                "/cursor?source_database_id=not-a-uuid",
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 422
+        body = response.json()
+        # FastAPI validation error structure
+        assert "detail" in body

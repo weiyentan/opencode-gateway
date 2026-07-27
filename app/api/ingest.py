@@ -154,6 +154,7 @@ class IngestRequest(BaseModel):
     client_hostname: str = Field(
         default="", description="Hostname of the collector that sent this batch"
     )
+    # TODO: store client_hostname in ingest_batches table for operational visibility
     source_database_id: uuid.UUID = Field(
         description="Source database identifier assigned by the collector"
     )
@@ -954,6 +955,10 @@ async def ingest_usage(
     client_id = uuid.UUID(auth["client_id"])
     credential_id = uuid.UUID(auth["credential_id"])
     source_db_id = body.source_database_id
+
+    if body.client_hostname:
+        logger.info("Ingest from collector hostname=%s", body.client_hostname)
+
     now = _utcnow()
 
     # ── Schema version validation ────────────────────────────────────
