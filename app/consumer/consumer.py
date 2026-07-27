@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import signal
 from typing import Any
 
@@ -249,14 +250,17 @@ class Consumer:
         """Stop and recreate the Kafka consumer after a connection error.
 
         Uses exponential backoff with jitter to avoid reconnect storms.
+        Respects the ``_running`` flag — exits early if the consumer is
+        shutting down.
         """
         if self._consumer:
             await self._consumer.stop()
 
-        import random
-
-        delay = 1.0
-        for attempt in range(10):
+        delay = self._initial_backoff
+        max_attempts = max(1, self._max_retries * 2)
+        for attempt in range(max_attempts):
+            if not self._running:
+                return
             try:
                 self._consumer = AIOKafkaConsumer(
                     self._kafka_topic,
@@ -269,10 +273,10 @@ class Consumer:
                 await self._consumer.start()
                 return
             except KafkaError:
-                if attempt < 9:
+                if attempt < max_attempts - 1 and self._running:
                     jitter = random.uniform(0.5, 1.5)
-                    await asyncio.sleep(delay * jitter)
-                    delay = min(delay * 2, 60.0)
+                    await asyncio.sleep(min(delay * jitter, self._max_backoff))
+                    delay = min(delay * 2, self._max_backoff)
                     continue
                 raise
 

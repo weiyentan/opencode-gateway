@@ -52,11 +52,6 @@ spec:
               value: "opencode-usage-dlq"
             - name: GATEWAY_CONSUMER_GROUP_ID
               value: "opencode-gateway"
-            - name: GATEWAY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: opencode-gateway-secrets
-                  key: gateway-api-key
           resources:
             requests:
               cpu: 100m
