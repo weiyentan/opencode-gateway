@@ -24,8 +24,7 @@ The Gateway is built as layered concerns:
 | **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, and reporting (aggregates, records, sessions, agent runs). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
 | **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
-
-Additional layers can be added as the observability service grows.
+| **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. |
 
 ---
 
@@ -42,6 +41,7 @@ Additional layers can be added as the observability service grows.
 | **Type Checking** | `mypy` (strict mode) | Full strict checking; Python 3.12 target |
 | **Frontend** | Vanilla HTML/CSS/JS + nginx | Aurora Glass dashboard — no build step, served by a separate nginx container. In Docker Compose, the frontend nginx is the sole browser entrypoint and proxies API requests to the Gateway. |
 | **Testing** | `pytest` + `pytest-asyncio` | `asyncio_mode = auto` |
+| **Streaming** | `aiokafka` | Kafka consumer for usage-record bridge; separate companion container |
 
 ---
 
@@ -92,6 +92,12 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
+| `GATEWAY_KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap brokers (comma-separated) — used by the consumer bridge |
+| `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |
+| `GATEWAY_KAFKA_DLQ_TOPIC` | `opencode-usage-dlq` | Dead-letter queue topic for unprocessable messages |
+| `GATEWAY_CONSUMER_GROUP_ID` | `opencode-gateway` | Kafka consumer group ID |
+| `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
+| `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -268,6 +274,10 @@ opencode-gateway/
 │   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
 │   │   ├── ingest.py             # POST /ingest telemetry endpoint
 │   │   └── usage.py              # GET aggregates, records, sessions
+│   ├── consumer/
+│   │   ├── __init__.py           # Module init, exports Consumer class
+│   │   ├── consumer.py           # Kafka consumer bridge (separate container)
+│   │   └── models.py             # Consumer-side Pydantic models for ingest payloads
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py             # Pydantic Settings (GATEWAY_ prefix)

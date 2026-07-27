@@ -102,6 +102,21 @@ the token hash in `collector_credentials`. A collector's bearer token
 must pass BOTH layers — either by using the Admin API Key itself (with
 its hash registered in `collector_credentials`), or by using a
 provisioned collector token that also matches `GATEWAY_API_KEY`.
+
+**Usage Record Consumer**:
+A companion container that reads JSON-serialised usage records from the
+``opencode-usage`` Kafka topic and POSTs each one to the Gateway's
+``/ingest`` endpoint. Runs as a separate Kubernetes Deployment alongside
+the Gateway — it is not part of the Gateway API process.
+_Avoid_: Kafka consumer, ingestion bridge (in generic sense)
+
+**Dead Letter Queue (DLQ)**:
+The ``opencode-usage-dlq`` Kafka topic where the Usage Record Consumer
+sends messages that cannot be processed — invalid payloads (Pydantic
+validation failure) or requests that received a 4xx response from the
+Gateway ingest endpoint. DLQ messages include the original payload and a
+reason string describing the failure.
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
@@ -109,6 +124,7 @@ The Gateway uses a layered architecture:
 - **app/api/** — REST endpoints
 - **app/core/** — Configuration, auth, logging, factory
 - **app/db/** — Postgres pool, migrations, ORM models
+- **app/consumer/** — Kafka consumer bridge that reads usage records from Kafka and POSTs them to the Gateway ingest API (separate container)
 
 Aurora Glass is related to the Gateway, but is not part of the Gateway's
 service layers.
@@ -136,6 +152,9 @@ manages.
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
 - The **Admin API Key** MAY also serve as a **Collector Credential** when its hash is registered in `collector_credentials`
 - The `ApiKeyMiddleware` runs before `require_collector_token` — a request must pass the **Admin API Key** check before **Collector Credential** lookup occurs
+- A **Usage Record Consumer** reads from the ``opencode-usage`` Kafka topic
+- A **Usage Record Consumer** POSTs to the Gateway's ``/ingest`` endpoint using a **Collector Credential**
+- Unprocessable messages are sent to the **Dead Letter Queue (DLQ)** topic ``opencode-usage-dlq``
 
 ## Flagged Ambiguities
 
