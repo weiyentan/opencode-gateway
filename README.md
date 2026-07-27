@@ -223,18 +223,17 @@ The frontend is the sole browser entrypoint — the Gateway runs internally and 
 
 ### Dashboard Sections
 
+The dashboard uses a **sidebar navigation** layout with five tabs, organized below the sticky header. Content switching uses URL hash persistence (`#overview`, `#sessions`, etc.) for deep-linkable tabs. Responsive breakpoints reduce the sidebar to icon-only at ≤900 px and a hamburger menu at ≤600 px.
+
 The dashboard polls the Gateway REST API every 30 seconds and renders:
 
-| Section | Data Source | Description |
-|---------|-------------|-------------|
-| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Total tokens, estimated cost, session count, healthy collectors, source databases |
-| **Model Mix** | `/api/v1/usage/aggregates?group_by=model` | Token/cost breakdown by LLM model |
-| **Live Events** | Recent usage records | Real-time feed of incoming telemetry events |
-| **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
-| **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
-| **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
-| **Recent Sessions** | `/api/v1/usage/sessions` | Client, model, token/cost totals, duration, and status |
-| **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with goal, status, costs, and session detail panel |
+| Tab | Sections | Data Source |
+|-----|----------|-------------|
+| **Overview** | KPI Cards, Model Mix, Live Events, Collector Distribution, Collectors Table, Agents &amp; LLMs | `/health`, `/api/v1/usage/aggregates`, `/api/v1/usage/aggregates?group_by=model`, `/admin/clients`, `/api/v1/usage/records` |
+| **Sessions** | Recent Sessions table | `/api/v1/usage/sessions` |
+| **Agent Runs** | Agent Runs table with date/agent/status filters and session detail overlay | `/api/v1/usage/agent-runs` |
+| **Collectors** | Collectors Table (standalone view) | `/admin/clients` + health data |
+| **LLMs** | Agents &amp; LLMs In Use table | `/api/v1/usage/records` |
 
 The dashboard uses the same authentication as the REST API — if the Gateway runs in production mode (`GATEWAY_ENV=production`) with an API key, the dashboard will need one. For local development, use `GATEWAY_ENV=development` to run without authentication.
 
