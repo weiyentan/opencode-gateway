@@ -10,67 +10,48 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: opencode-gateway-consumer
+  name: opencode-usage-consumer
   labels:
-    app: opencode-gateway-consumer
-    component: kafka-consumer
+    app: opencode-gateway
+    component: usage-consumer
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: opencode-gateway-consumer
+      app: opencode-gateway
+      component: usage-consumer
   template:
     metadata:
       labels:
-        app: opencode-gateway-consumer
-        component: kafka-consumer
+        app: opencode-gateway
+        component: usage-consumer
     spec:
       containers:
-        - name: consumer
-          image: opencode-gateway-consumer:latest
-          imagePullPolicy: IfNotPresent
-          command: ["python", "-m", "app.consumer.consumer"]
+        - name: opencode-usage-consumer
+          image: ${REGISTRY}/opencode-gateway-consumer:${IMAGE_TAG}
+          command: ["python", "-m", "app.consumer"]
           env:
-            # ── Kafka connectivity ──────────────────────────────
-            - name: GATEWAY_KAFKA_BROKERS
-              valueFrom:
-                secretKeyRef:
-                  name: gateway-consumer-secrets
-                  key: kafka-brokers
-                  optional: false
-            - name: GATEWAY_KAFKA_TOPIC
-              valueFrom:
-                configMapKeyRef:
-                  name: gateway-consumer-config
-                  key: kafka-topic
-                  optional: true
-            - name: GATEWAY_KAFKA_DLQ_TOPIC
-              valueFrom:
-                configMapKeyRef:
-                  name: gateway-consumer-config
-                  key: kafka-dlq-topic
-                  optional: true
-            - name: GATEWAY_CONSUMER_GROUP_ID
-              valueFrom:
-                configMapKeyRef:
-                  name: gateway-consumer-config
-                  key: consumer-group-id
-                  optional: true
-
-            # ── Gateway /auth (reuses existing Gateway credential config) ──
             - name: GATEWAY_BASE_URL
               valueFrom:
-                configMapKeyRef:
-                  name: gateway-consumer-config
+                secretKeyRef:
+                  name: opencode-gateway-secrets
                   key: gateway-base-url
-                  optional: true
             - name: GATEWAY_COLLECTOR_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: gateway-consumer-secrets
-                  key: collector-token
-                  optional: false
-
+                  name: opencode-gateway-secrets
+                  key: gateway-collector-token
+            - name: GATEWAY_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: kafka-brokers
+            - name: GATEWAY_KAFKA_TOPIC
+              value: "opencode-usage"
+            - name: GATEWAY_KAFKA_DLQ_TOPIC
+              value: "opencode-usage-dlq"
+            - name: GATEWAY_CONSUMER_GROUP_ID
+              value: "opencode-gateway"
           resources:
             requests:
               cpu: 100m
@@ -78,18 +59,12 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-
           livenessProbe:
             exec:
               command:
-                - python
-                - -c
-                - |
-                  import sys
-                  try:
-                      from app.consumer.consumer import Consumer
-                  except ImportError:
-                      sys.exit(1)
-                  sys.exit(0)
-            initialDelaySeconds: 15
+                - pgrep
+                - "-f"
+                - "python -m app.consumer"
+            initialDelaySeconds: 30
             periodSeconds: 30
+      restartPolicy: Always
