@@ -965,6 +965,7 @@ async def _fetch_agent_run_detail(
         TodoRow(
             description=tr["content"],
             status=tr["status"] or "pending",
+            priority=tr["priority"],
         )
         for tr in todo_rows_raw
     ]
