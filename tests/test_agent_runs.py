@@ -537,8 +537,9 @@ class TestAgentRunsDetail:
             agent="code-editor",
             project_id="proj-1",
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])  # no children
+        # fetchrow: session → context (not found) → parent (not called — no parent)
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])  # children, todos
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -554,8 +555,8 @@ class TestAgentRunsDetail:
     async def test_detail_includes_loki_url(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail includes a loki_search_url."""
         session_row = _mk_session_row(session_id=_SESSION_ID)
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -579,11 +580,12 @@ class TestAgentRunsDetail:
 
         # First fetchrow: session row
         # Second fetchrow: parent resolution
+        # Third fetchrow: session context
         parent_row = MagicMock()
         parent_row.__getitem__.side_effect = {"id": parent_internal_id}.__getitem__
 
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, parent_row])
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, parent_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -600,8 +602,8 @@ class TestAgentRunsDetail:
             session_id=_SESSION_ID,
             parent_session_id=None,
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -639,8 +641,8 @@ class TestAgentRunsDetail:
             ),
         ]
 
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=child_rows)
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[child_rows, []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -663,8 +665,8 @@ class TestAgentRunsDetail:
             session_id=_SESSION_ID,
             external_session_id=_EXTERNAL_ID_A,
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -677,8 +679,8 @@ class TestAgentRunsDetail:
     async def test_detail_placeholder_fields(self, client: AsyncClient, mock_conn: AsyncMock):
         """Placeholder fields (todo_rows, session_context, todo counts) return empty/null."""
         session_row = _mk_session_row(session_id=_SESSION_ID)
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -714,8 +716,8 @@ class TestAgentRunsDetail:
             cost=Decimal("0.0250"),
             message_count=20,
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -737,8 +739,8 @@ class TestAgentRunsDetail:
             agent="code-editor",
             external_session_id="ses_abc123def456",
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -759,8 +761,8 @@ class TestAgentRunsDetail:
             last_message_at=recent,
             message_count=10,
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -784,8 +786,9 @@ class TestAgentRunsDetail:
 
         # First fetchrow: session row
         # Second fetchrow: parent resolution (not found)
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
-        mock_conn.fetch = AsyncMock(return_value=[])
+        # Third fetchrow: session context (not found)
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
@@ -804,8 +807,8 @@ class TestAgentRunsDetail:
             agent=None,
             external_session_id=None,
         )
-        mock_conn.fetchrow = AsyncMock(return_value=session_row)
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
             response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")

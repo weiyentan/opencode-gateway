@@ -135,6 +135,10 @@ class TodoRow(BaseModel):
     status: str = Field(
         description="Todo status: pending, in_progress, completed, blocked"
     )
+    priority: str | None = Field(
+        default=None,
+        description="Todo priority (e.g. high, medium, low)",
+    )
 
 
 class ChildRunSummary(BaseModel):

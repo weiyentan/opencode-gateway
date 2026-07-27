@@ -273,7 +273,18 @@
 
   </main>
 
-  </div><!-- .app-layout -->
+  <!-- Session Detail Panel -->
+  <div class="detail-overlay" id="sd-detail-overlay">
+    <div class="detail-panel glass-panel" id="sd-detail-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="sd-detail-title">Session Detail</h2>
+        <button class="detail-close" id="sd-detail-close">&times;</button>
+      </div>
+      <div class="detail-body" id="sd-detail-body">
+        <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
 
   <!-- Agent Run Detail Panel -->
   <div class="detail-overlay" id="ar-detail-overlay">
@@ -287,6 +298,8 @@
       </div>
     </div>
   </div>
+
+  </div><!-- .app-layout -->
 
   <footer class="footer">
     <span>OpenCode Gateway v<span id="footer-version">--</span></span>
