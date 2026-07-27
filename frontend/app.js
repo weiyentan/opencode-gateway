@@ -740,7 +740,7 @@
   /** Recent Sessions */
   function renderSessionsTable(data) {
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
-      els.sessionsTbody.innerHTML = '<tr><td colspan="8" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
+      els.sessionsTbody.innerHTML = '<tr><td colspan="9" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
       return;
     }
 
@@ -750,10 +750,12 @@
       var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
       var cost = s.total_estimated_cost_usd;
       var duration = fmtDuration(s.first_message_at, s.last_message_at);
+      var title = s.session_title || '--';
       var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
       html += '<tr class="session-row" data-id="' + s.id + '">' +
         '<td>' + escHtml(clientName) + '</td>' +
+        '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
         '<td>' + fmtDT(s.last_message_at) + '</td>' +
         '<td>' + duration + '</td>' +
@@ -796,9 +798,10 @@
         projectStr = r.project_id + ' / ' + r.workspace_id;
       }
       var statusCls = statusBadgeClass(r.status);
+      var displayTitle = r.session_title || r.title || '(untitled)';
 
       html += '<tr class="ar-row" data-id="' + r.id + '">' +
-        '<td class="clickable ar-title">' + escHtml(r.title || '(untitled)') + '</td>' +
+        '<td class="clickable ar-title">' + escHtml(displayTitle) + '</td>' +
         '<td>' + badge(r.status, statusCls).outerHTML + '</td>' +
         '<td>' + escHtml(r.agent || '--') + '</td>' +
         '<td>' + escHtml(projectStr) + '</td>' +

@@ -59,6 +59,7 @@ def _mk_session_row(
     cost: Decimal | None = Decimal("0.0100"),
     computed_status: str = "running",
     child_run_count: int = 0,
+    session_title: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions.
 
@@ -84,6 +85,7 @@ def _mk_session_row(
         "total_estimated_cost_usd": cost,
         "_status": computed_status,
         "child_run_count": child_run_count,
+        "session_title": session_title,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.get.side_effect = data.get
