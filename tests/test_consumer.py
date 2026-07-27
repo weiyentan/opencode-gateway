@@ -476,3 +476,41 @@ async def test_import_from_consumer_module():
     from app.consumer import Consumer as ImportedConsumer
 
     assert ImportedConsumer is Consumer
+
+
+# ── Snappy compression support ─────────────────────────────────────────────
+
+
+def test_snappy_codec_available():
+    """Verify that the snappy compression library is installed and importable.
+
+    aiokafka relies on ``cramjam`` (or ``python-snappy``) to decompress
+    snappy-compressed Kafka records. If the library is missing, the consumer
+    will raise ``UnsupportedCodecError`` at group-join time and the consumer
+    group will continuously rebalance.
+    """
+    try:
+        import cramjam
+
+        assert hasattr(cramjam, "snappy"), (
+            "cramjam is installed but does not expose a snappy module"
+        )
+    except ImportError:
+        pytest.fail("cramjam (snappy codec support) is not installed")
+
+
+def test_snappy_roundtrip():
+    """Verify that cramjam can actually compress and decompress data.
+
+    This goes beyond a simple import check — it confirms the snappy codec
+    works end-to-end, which is what aiokafka will use at runtime.
+    """
+    import cramjam
+
+    original = b"Hello from OpenCode Gateway consumer - snappy test"
+    compressed = cramjam.snappy.compress_raw(original)
+    decompressed = bytes(cramjam.snappy.decompress_raw(compressed))
+
+    assert decompressed == original, (
+        "Snappy roundtrip failed: decompressed data does not match original"
+    )
