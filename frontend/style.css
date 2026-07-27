@@ -200,12 +200,77 @@ body {
   max-width: var(--max-width);
   margin: 0 auto;
   padding: 24px 24px 40px;
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
 }
 
 /* Refresh indicator — subtle opacity change during data fetch */
 .dashboard.refreshing {
   opacity: 0.85;
   transition: opacity 0.2s ease;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────── */
+
+.sidebar {
+  flex-shrink: 0;
+  width: 190px;
+  position: sticky;
+  top: 80px;
+  background: var(--glass);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-panel);
+  padding: 10px 0;
+  overflow: hidden;
+}
+
+.sidebar-nav {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-link {
+  display: block;
+  padding: 10px 18px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border-left: 3px solid transparent;
+  transition: color var(--transition), background var(--transition), border-color var(--transition);
+  cursor: pointer;
+}
+
+.sidebar-link:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sidebar-link.active {
+  color: var(--accent-cyan);
+  border-left-color: var(--accent-cyan);
+  background: rgba(94, 242, 255, 0.06);
+}
+
+/* ── Dashboard Content ────────────────────────────────────────────────── */
+
+.dashboard-content {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Tab content visibility — only show content for the active tab */
+[data-tab-content] {
+  display: none;
+}
+
+[data-tab-content].active {
+  display: block;
 }
 
 /* ── KPI Row ──────────────────────────────────────────────────────────── */
@@ -672,6 +737,93 @@ tbody tr:hover td {
   background: rgba(124, 140, 255, 0.25);
 }
 
+/* ── Clients/Projects Panel ────────────────────────────────────────────── */
+
+.panel-clients-projects {
+  margin-top: 0;
+}
+
+.clients-projects-summary {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+/* Expand/collapse column */
+.col-expand {
+  width: 32px;
+  min-width: 32px;
+}
+
+.expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  transition: color var(--transition), background var(--transition);
+  user-select: none;
+}
+
+.expand-toggle:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.expand-toggle.expanded {
+  color: var(--accent-cyan);
+}
+
+/* Client-level row */
+.client-row {
+  cursor: pointer;
+}
+
+.client-row td:first-child {
+  padding-left: 4px;
+}
+
+.client-row:hover td {
+  background: rgba(255, 255, 255, 0.04) !important;
+}
+
+.client-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Project-level row (nested, hidden by default) */
+.project-row {
+  display: none;
+}
+
+.project-row.visible {
+  display: table-row;
+}
+
+.project-row td {
+  padding-left: 28px !important;
+  font-size: 0.76rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.project-row:hover td {
+  background: rgba(255, 255, 255, 0.05) !important;
+}
+
+.project-name {
+  color: var(--text-secondary);
+}
+
+/* Client-level aggregate sub-row for total (optional visual grouping) */
+.client-subtotal td {
+  border-top: 2px solid rgba(255, 255, 255, 0.06);
+}
+
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
 
 .panel-agent-runs {
@@ -891,6 +1043,37 @@ td.clickable:hover {
 @media (max-width: 1024px) {
   .kpi-row {
     grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+/* ≤1024px — sidebar goes horizontal at top */
+@media (max-width: 1024px) {
+  .dashboard {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    position: static;
+    padding: 8px 0;
+  }
+
+  .sidebar-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 0;
+  }
+
+  .sidebar-link {
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+    padding: 8px 16px;
+  }
+
+  .sidebar-link.active {
+    border-bottom-color: var(--accent-cyan);
+    border-left-color: transparent;
   }
 }
 

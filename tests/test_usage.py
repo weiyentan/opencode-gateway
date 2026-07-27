@@ -130,6 +130,8 @@ def _mk_aggregate_row(
     total_cache_write_tokens: int = 2,
     cost: Decimal | None = Decimal("0.0105"),
     record_count: int = 3,
+    session_count: int = 2,
+    model_count: int = 1,
 ) -> MagicMock:
     """Return a MagicMock for an aggregate query result row."""
     row = MagicMock()
@@ -143,6 +145,8 @@ def _mk_aggregate_row(
         "total_cache_write_tokens": total_cache_write_tokens,
         "total_estimated_cost_usd": cost,
         "record_count": record_count,
+        "session_count": session_count,
+        "model_count": model_count,
     }
     row.__getitem__.side_effect = data.__getitem__
     return row
@@ -360,6 +364,60 @@ class TestAggregates:
         assert response.status_code == 400
         payload = response.json()
         assert payload["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_groups_by_client_project(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=client,project returns pipe-delimited composite group values."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|project-alpha",
+                total_input_tokens=200,
+                total_output_tokens=100,
+                record_count=5,
+                cost=Decimal("0.0070"),
+            ),
+            _mk_aggregate_row(
+                group_value="ClientA|project-beta",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                record_count=2,
+                cost=Decimal("0.0035"),
+            ),
+            _mk_aggregate_row(
+                group_value="ClientB|project-gamma",
+                total_input_tokens=50,
+                total_output_tokens=25,
+                record_count=1,
+                cost=Decimal("0.0010"),
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 3
+        # Verify composite group values
+        assert data[0]["group_value"] == "ClientA|project-alpha"
+        assert data[1]["group_value"] == "ClientA|project-beta"
+        assert data[2]["group_value"] == "ClientB|project-gamma"
+        # Verify token counts
+        assert data[0]["total_input_tokens"] == 200
+        assert data[0]["total_output_tokens"] == 100
+        assert data[0]["record_count"] == 5
+        # Verify new fields
+        assert data[0]["session_count"] == 2
+        assert data[0]["model_count"] == 1
 
     @pytest.mark.asyncio
     async def test_empty_results(self, client: AsyncClient, mock_conn: AsyncMock):

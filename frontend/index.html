@@ -28,8 +28,18 @@
 
   <main class="dashboard">
 
+    <!-- Sidebar Navigation -->
+    <nav class="sidebar" id="sidebar">
+      <ul class="sidebar-nav">
+        <li><a class="sidebar-link active" data-tab="overview" href="#overview">Overview</a></li>
+        <li><a class="sidebar-link" data-tab="clients-projects" href="#clients-projects">Clients / Projects</a></li>
+      </ul>
+    </nav>
+
+    <div class="dashboard-content">
+
     <!-- KPI Row -->
-    <section class="kpi-row" id="kpi-row">
+    <section class="kpi-row" id="kpi-row" data-tab-content="overview">
       <div class="kpi-card kpi-tokens">
         <span class="kpi-label">Total Tokens</span>
         <span class="kpi-value" id="kpi-tokens">--</span>
@@ -58,7 +68,7 @@
     </section>
 
     <!-- Two-column content grid -->
-    <div class="content-grid">
+    <div class="content-grid" data-tab-content="overview">
 
       <!-- Left Column -->
       <div class="col-left">
@@ -142,7 +152,7 @@
     </div><!-- .content-grid -->
 
     <!-- Recent Sessions (full width) -->
-    <section class="glass-panel panel-sessions">
+    <section class="glass-panel panel-sessions" data-tab-content="overview">
       <h2 class="panel-title">Recent Sessions</h2>
       <div class="table-scroll">
         <table>
@@ -166,7 +176,7 @@
     </section>
 
     <!-- Agent Runs (full width) -->
-    <section class="glass-panel panel-agent-runs">
+    <section class="glass-panel panel-agent-runs" data-tab-content="overview">
       <h2 class="panel-title">Agent Runs</h2>
       <div class="agent-runs-filters" id="agent-runs-filters">
         <div class="filter-group">
@@ -215,6 +225,33 @@
         </table>
       </div>
     </section>
+
+    <!-- Clients / Projects (tabbed) -->
+    <section class="glass-panel panel-clients-projects" data-tab-content="clients-projects">
+      <h2 class="panel-title">Clients / Projects</h2>
+      <div class="clients-projects-summary" id="clients-projects-summary">
+        <span class="kpi-label">30-day aggregate window</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th class="col-expand"></th>
+              <th>Client / Project</th>
+              <th>Total Tokens</th>
+              <th>Est. Cost</th>
+              <th>Session Count</th>
+              <th>Model Count</th>
+            </tr>
+          </thead>
+          <tbody id="clients-projects-tbody">
+            <tr><td colspan="6" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    </div><!-- .dashboard-content -->
 
   </main>
 
