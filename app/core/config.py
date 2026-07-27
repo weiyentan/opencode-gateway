@@ -95,6 +95,29 @@ class Settings(BaseSettings):
     # sensitive information embedded in field values.
     log_validation_detail: bool = False
 
+    # ── Kafka Consumer settings ───────────────────────────────────────
+
+    # Base URL of the Gateway (used by the Kafka consumer to POST ingested
+    # records to the ingest endpoint).  Example: ``http://gateway:8000``.
+    base_url: str = ""
+
+    # Collector bearer token used by the Kafka consumer to authenticate
+    # against the Gateway's /ingest endpoint.
+    collector_token: str = ""
+
+    # Comma-separated list of Kafka bootstrap servers, e.g.
+    # ``kafka:9092`` or ``broker1:9092,broker2:9092``.
+    kafka_brokers: str = ""
+
+    # Source Kafka topic to consume usage records from.
+    kafka_topic: str = "opencode-usage"
+
+    # DLQ topic where messages with 4xx responses are sent.
+    kafka_dlq_topic: str = "opencode-usage-dlq"
+
+    # Consumer group ID for Kafka consumer offset management.
+    consumer_group_id: str = "opencode-gateway"
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
