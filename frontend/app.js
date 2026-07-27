@@ -1028,9 +1028,12 @@
         var iconCls = t.status || 'pending';
         var iconMap = { completed: '\u2713', blocked: '\u2717', in_progress: '\u25D4', pending: '\u25CB' };
         var icon = iconMap[iconCls] || '\u25CB';
+        var priorityMark = t.priority
+          ? ' <span class="detail-todo-priority">[' + escHtml(t.priority) + ']</span>'
+          : '';
         html += '<div class="detail-todo-item">' +
           '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
-          '<span>' + escHtml(t.description) + '</span>' +
+          '<span>' + escHtml(t.description) + priorityMark + '</span>' +
           '</div>';
       });
       html += '</div>';
@@ -1058,11 +1061,17 @@
         '\u2197 Open in Grafana Explore</a></div>';
     }
 
-    // ── Session Context placeholder ──
+    // ── Session Context ──
+    var ctx = d.session_context || {};
     html += '<div class="detail-section">' +
       '<div class="detail-section-title">Session Context</div>' +
-      '<div class="detail-field-value" style="color:var(--text-muted)">' +
-        (d.session_context ? 'Session context available' : 'No Session Context recorded (placeholder)') +
+      '<div class="detail-grid">' +
+        fieldHtml('Title', escHtml(ctx.title || '--')) +
+        fieldHtml('Model', escHtml(ctx.session_model || '--')) +
+        fieldHtml('Source Directory', escHtml(ctx.source_directory || '--')) +
+        fieldHtml('Source Path', escHtml(ctx.source_path || '--')) +
+        fieldHtml('Additions', ctx.code_change_additions != null ? fmtNum(ctx.code_change_additions) : '--') +
+        fieldHtml('Deletions', ctx.code_change_deletions != null ? fmtNum(ctx.code_change_deletions) : '--') +
       '</div></div>';
 
     els.arDetailBody.innerHTML = html;
