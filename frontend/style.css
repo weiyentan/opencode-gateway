@@ -225,12 +225,12 @@ body {
 .sidebar-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 11px 20px;
+  gap: 12px;
+  padding: 12px 20px;
   cursor: pointer;
   transition: background var(--transition), color var(--transition);
   color: var(--text-secondary);
-  font-size: 0.82rem;
+  font-size: 0.94rem;
   font-weight: 500;
   border-left: 3px solid transparent;
 }
@@ -247,8 +247,44 @@ body {
 }
 
 .sidebar-icon {
-  font-size: 0.68rem;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  color: var(--accent-indigo);
+  transition: color var(--transition), filter var(--transition);
+}
+
+.sidebar-icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+  fill: currentColor;
+}
+
+.sidebar-icon path {
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+}
+
+.sidebar-icon path:first-child,
+.sidebar-icon svg path:only-child {
+  fill: currentColor;
+  stroke: none;
+}
+
+.sidebar-item:hover .sidebar-icon {
+  color: var(--accent-cyan);
+}
+
+.sidebar-item.active .sidebar-icon {
+  color: var(--accent-cyan);
+  filter: drop-shadow(0 0 6px rgba(94, 242, 255, 0.35));
 }
 
 .sidebar-label {
