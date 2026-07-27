@@ -21,7 +21,7 @@ The Gateway is built as layered concerns:
 
 | Layer | Location | Responsibility |
 |-------|----------|----------------|
-| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, and reporting (aggregates, records, sessions, agent runs). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
+| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, and reporting (aggregates, records, sessions, agent runs). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
 | **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
 | **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. |
@@ -193,6 +193,12 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 |--------|------|-------------|
 | `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. Uses first-write-wins idempotency, supports partial-success semantics (per-record accepted/rejected/conflict), and empty-batch heartbeats. Authenticated via collector bearer token. |
 
+### Collector Cursor
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/cursor` | Return cursor state (last ingestion timestamp, record count, active status) for a source database. Called by collectors on startup to determine where to begin reading from the SQLite database. Authenticated via collector bearer token. Returns 404 for unknown source database IDs. |
+
 ### Usage Reporting
 
 | Method | Path | Description |
@@ -273,6 +279,7 @@ opencode-gateway/
 │   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint
 │   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
+│   │   ├── cursor.py             # GET /cursor collector cursor endpoint
 │   │   ├── ingest.py             # POST /ingest telemetry endpoint
 │   │   └── usage.py              # GET aggregates, records, sessions
 │   ├── consumer/
