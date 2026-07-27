@@ -253,6 +253,9 @@ class TestCursorValidation:
     async def test_invalid_uuid_format_returns_422(self, monkeypatch):
         """Non-UUID source_database_id → 422 from FastAPI type validation."""
         mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [auth]
         client = _build_cursor_app(mock_conn, monkeypatch=monkeypatch)
 
         async with client as c:
@@ -263,5 +266,6 @@ class TestCursorValidation:
 
         assert response.status_code == 422
         body = response.json()
-        # FastAPI validation error structure
-        assert "detail" in body
+        # App uses custom validation_exception_handler → envelope format
+        assert body["status"] == "error"
+        assert body["error"]["code"] == "VALIDATION_ERROR"
