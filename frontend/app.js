@@ -39,7 +39,7 @@
     sidebar:        $('sidebar'),
     sidebarToggle:  $('sidebar-toggle'),
     sidebarBackdrop:$('sidebar-backdrop'),
-    contentPanel:   $('content-panel'),
+
 
     // KPIs
     kpiTokens:      $('kpi-tokens'),
@@ -1033,7 +1033,7 @@
       switchTab(getTabFromHash());
     });
 
-    // Initialize from URL hash (with a small delay to ensure DOM is ready)
+    // Initialize from URL hash
     var initialTab = getTabFromHash();
     if (initialTab !== 'overview') {
       switchTab(initialTab);
