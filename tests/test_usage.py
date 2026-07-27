@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import AsyncClient
@@ -1051,6 +1051,723 @@ class TestEnvelopeFormat:
                 params={
                     "start_date": "2025-07-01T00:00:00Z",
                     "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert "data" in payload
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Records-with-context endpoint tests
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _mk_rwc_record_row(
+    *,
+    record_id: uuid.UUID | None = None,
+    client_id: uuid.UUID = _CLIENT_ID,
+    source_database_id: uuid.UUID = _SOURCE_DB_ID,
+    session_id: uuid.UUID = _SESSION_ID,
+    model_name: str = "gpt-4",
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    cached_tokens: int = 0,
+    provider: str | None = None,
+    mode: str | None = None,
+    finish_reason: str | None = None,
+    reasoning_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
+    cost: Decimal | None = Decimal("0.0035"),
+    reported_at: datetime = _A_TS,
+    ingested_at: datetime = _A_TS,
+    agent: str | None = "coder-v1",
+    session_title: str | None = "Fix login bug",
+    project_label: str = "my-project",
+) -> MagicMock:
+    """Return a MagicMock for a records-with-context raw query row."""
+    row = MagicMock()
+    data = {
+        "id": record_id or uuid.uuid4(),
+        "client_id": client_id,
+        "source_database_id": source_database_id,
+        "session_id": session_id,
+        "model_name": model_name,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached_tokens,
+        "provider": provider,
+        "mode": mode,
+        "finish_reason": finish_reason,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "estimated_cost_usd": cost,
+        "reported_at": reported_at,
+        "ingested_at": ingested_at,
+        "agent": agent,
+        "session_title": session_title,
+        "project_label": project_label,
+    }
+    row.__getitem__.side_effect = data.__getitem__
+    row.__iter__ = MagicMock(return_value=iter(data.keys()))
+    return row
+
+
+def _mk_rwc_grouped_row(
+    *,
+    group_value: str = "gpt-4",
+    project_label: str | None = None,
+    session_title: str | None = None,
+    agent: str | None = None,
+    model_name: str | None = None,
+    total_input_tokens: int = 300,
+    total_output_tokens: int = 150,
+    total_cached_tokens: int = 10,
+    total_reasoning_tokens: int = 5,
+    total_cache_read_tokens: int = 3,
+    total_cache_write_tokens: int = 2,
+    cost: Decimal | None = Decimal("0.0105"),
+    record_count: int = 3,
+) -> MagicMock:
+    """Return a MagicMock for a records-with-context grouped query row."""
+    row = MagicMock()
+    data: dict[str, object] = {
+        "group_value": group_value,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cached_tokens": total_cached_tokens,
+        "total_reasoning_tokens": total_reasoning_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
+        "total_estimated_cost_usd": cost,
+        "record_count": record_count,
+    }
+    if project_label is not None:
+        data["project_label"] = project_label
+    if session_title is not None:
+        data["session_title"] = session_title
+    if agent is not None:
+        data["agent"] = agent
+    if model_name is not None:
+        data["model_name"] = model_name
+    row.__getitem__.side_effect = data.__getitem__
+    row.get.side_effect = data.get
+    return row
+
+
+class TestRecordsWithContextRaw:
+    """Tests for GET /api/v1/usage/records-with-context (raw mode)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_paginated_records(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Raw mode returns items with pagination metadata."""
+        rows = [_mk_rwc_record_row() for _ in range(3)]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchval = AsyncMock(return_value=3)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data["items"]) == 3
+        assert data["total"] == 3
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+
+    @pytest.mark.asyncio
+    async def test_includes_context_fields(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Each item has session_title, project_label, and agent."""
+        row = _mk_rwc_record_row(
+            agent="coder-v1",
+            session_title="Fix login bug",
+            project_label="my-project",
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] == "Fix login bug"
+        assert item["project_label"] == "my-project"
+        assert item["agent"] == "coder-v1"
+
+    @pytest.mark.asyncio
+    async def test_includes_loki_url(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Each item has a loki_search_url."""
+        mock_conn.fetch = AsyncMock(return_value=[_mk_rwc_record_row()])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert "loki_search_url" in item
+        assert item["loki_search_url"] is not None
+        assert "explore" in item["loki_search_url"]
+
+    @pytest.mark.asyncio
+    async def test_pagination_parameters(self, client: AsyncClient, mock_conn: AsyncMock):
+        """limit and offset query params are passed through."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "limit": 10,
+                    "offset": 5,
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["limit"] == 10
+        assert data["offset"] == 5
+
+    @pytest.mark.asyncio
+    async def test_filters_by_project_id(self, client: AsyncClient, mock_conn: AsyncMock):
+        """project_id filter is accepted."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "project_id": "proj-abc",
+                },
+            )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_filters_by_agent(self, client: AsyncClient, mock_conn: AsyncMock):
+        """agent filter is accepted."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "agent": "coder-v1",
+                },
+            )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_filters_by_session_id(self, client: AsyncClient, mock_conn: AsyncMock):
+        """session_id filter is accepted."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "session_id": str(_SESSION_ID),
+                },
+            )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_filters_by_model(self, client: AsyncClient, mock_conn: AsyncMock):
+        """model filter is accepted."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "model": "gpt-4",
+                },
+            )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_date_range_filtering(self, client: AsyncClient, mock_conn: AsyncMock):
+        """start_date and end_date filtering works in raw mode."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-06-01T00:00:00Z",
+                    "end_date": "2025-06-30T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        # Verify date params were passed to the query
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        params = call_args[0][1:]
+        assert len(params) >= 2
+
+    @pytest.mark.asyncio
+    async def test_start_after_end_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
+        """When start_date > end_date, return 400."""
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-08-01T00:00:00Z",
+                    "end_date": "2025-07-01T00:00:00Z",
+                },
+            )
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_empty_results(self, client: AsyncClient, mock_conn: AsyncMock):
+        """When no records match, items is empty and total is 0."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["items"] == []
+        assert data["total"] == 0
+
+
+class TestRecordsWithContextGroupBy:
+    """Tests for GET /api/v1/usage/records-with-context with group_by."""
+
+    @pytest.mark.asyncio
+    async def test_group_by_project(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=project returns aggregated subtotals per project with project_label."""
+        rows = [
+            _mk_rwc_grouped_row(
+                group_value="my-project",
+                project_label="my-project",
+                record_count=2,
+            ),
+            _mk_rwc_grouped_row(
+                group_value="other-project",
+                project_label="other-project",
+                record_count=1,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        assert data[0]["group_value"] == "my-project"
+        assert data[0]["project_label"] == "my-project"
+        assert data[0]["record_count"] == 2
+        assert data[1]["group_value"] == "other-project"
+
+    @pytest.mark.asyncio
+    async def test_group_by_agent(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=agent returns aggregated subtotals per agent."""
+        rows = [
+            _mk_rwc_grouped_row(
+                group_value="coder-v1",
+                agent="coder-v1",
+                record_count=5,
+            ),
+            _mk_rwc_grouped_row(
+                group_value="code-reviewer",
+                agent="code-reviewer",
+                record_count=3,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        assert data[0]["group_value"] == "coder-v1"
+        assert data[0]["agent"] == "coder-v1"
+        assert data[0]["record_count"] == 5
+        assert data[1]["group_value"] == "code-reviewer"
+
+    @pytest.mark.asyncio
+    async def test_group_by_project_agent(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=project,agent returns cross-product aggregation."""
+        rows = [
+            _mk_rwc_grouped_row(
+                group_value="my-project|coder-v1",
+                project_label="my-project",
+                agent="coder-v1",
+                record_count=4,
+            ),
+            _mk_rwc_grouped_row(
+                group_value="my-project|code-reviewer",
+                project_label="my-project",
+                agent="code-reviewer",
+                record_count=2,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project,agent",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        assert data[0]["group_value"] == "my-project|coder-v1"
+        assert data[0]["project_label"] == "my-project"
+        assert data[0]["agent"] == "coder-v1"
+        assert data[1]["group_value"] == "my-project|code-reviewer"
+
+    @pytest.mark.asyncio
+    async def test_group_by_session(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=session returns per-session subtotals with session_title."""
+        rows = [
+            _mk_rwc_grouped_row(
+                group_value=str(_SESSION_ID),
+                session_title="Fix login bug",
+                record_count=3,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "session",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["session_title"] == "Fix login bug"
+        assert data[0]["record_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_group_by_model(self, client: AsyncClient, mock_conn: AsyncMock):
+        """group_by=model returns per-model subtotals."""
+        rows = [
+            _mk_rwc_grouped_row(
+                group_value="gpt-4",
+                model_name="gpt-4",
+                record_count=10,
+            ),
+            _mk_rwc_grouped_row(
+                group_value="claude-3",
+                model_name="claude-3",
+                record_count=5,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        assert data[0]["model_name"] == "gpt-4"
+        assert data[0]["record_count"] == 10
+        assert data[1]["model_name"] == "claude-3"
+
+    @pytest.mark.asyncio
+    async def test_date_range_filtering_in_grouped_mode(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Date range filtering works in grouped mode."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-06-01T00:00:00Z",
+                    "end_date": "2025-06-30T23:59:59Z",
+                    "group_by": "project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_group_by_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
+        """An unrecognised group_by value yields 400."""
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "invalid_dim",
+                },
+            )
+
+        assert response.status_code == 400
+        payload = response.json()
+        assert payload["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_group_by_project_empty(self, client: AsyncClient, mock_conn: AsyncMock):
+        """When no records match, grouped mode returns empty list."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data == []
+
+
+class TestRecordsWithContextLabelEdgeCases:
+    """Edge cases for project label resolution."""
+
+    @pytest.mark.asyncio
+    async def test_project_worktree_is_root_resolves_to_external_project_id(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Project with worktree='/' resolves to external_project_id 'global'."""
+        row = _mk_rwc_record_row(project_label="global")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["project_label"] == "global"
+
+    @pytest.mark.asyncio
+    async def test_project_with_only_worktree_resolves_to_basename(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Project with only worktree set resolves to basename(worktree)."""
+        row = _mk_rwc_record_row(project_label="my-repo")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["project_label"] == "my-repo"
+
+    @pytest.mark.asyncio
+    async def test_all_label_columns_null_resolves_to_external_project_id(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """When all label columns are null, fallback to external_project_id."""
+        row = _mk_rwc_record_row(project_label="ext-proj-42")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["project_label"] == "ext-proj-42"
+
+    @pytest.mark.asyncio
+    async def test_context_fields_null_when_no_join_match(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """session_title is None when no matching opencode_session_contexts row."""
+        row = _mk_rwc_record_row(session_title=None, project_label="unknown")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["session_title"] is None
+        assert item["project_label"] == "unknown"
+
+
+class TestRecordsWithContextAuth:
+    """Auth tests for records-with-context endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_requires_auth(self, mock_conn: AsyncMock):
+        """GET /api/v1/usage/records-with-context without auth returns 401."""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        app.state.pool = None
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+
+
+class TestRecordsWithContextEnvelope:
+    """Envelope format tests for records-with-context endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_raw_envelope(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Raw mode response has status: ok and data wrapper."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert "data" in payload
+
+    @pytest.mark.asyncio
+    async def test_grouped_envelope(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Grouped mode response has status: ok and data wrapper (list)."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records-with-context",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
                 },
             )
 
