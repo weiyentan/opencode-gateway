@@ -199,9 +199,10 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 |--------|------|-------------|
 | `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month` — comma-separated). Date-range filterable. |
 | `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Includes `loki_search_url` for Grafana drill-down. |
-| `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, and Loki drill-down URLs. Paginated. |
-| `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries, computed from Gateway facts. |
-| `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including goal, status, costs, and timeline. |
+| `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, Loki drill-down URLs, and `session_title` from Session Context. Paginated. |
+| `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` enrichment from Session Context. |
+| `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including `session_context` (title, model, code changes) and `todo_rows` (latest OpenCode todo snapshot) alongside usage data. |
+| `GET` | `/api/v1/usage/records-with-context` | Paginated usage records enriched with `session_title`, `project_label`, and `agent`. Supports `group_by` aggregation by `project`, `agent`, `session`, or `model`. |
 
 ---
 
@@ -233,8 +234,8 @@ The dashboard polls the Gateway REST API every 30 seconds and renders:
 | **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
 | **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
-| **Recent Sessions** | `/api/v1/usage/sessions` | Client, model, token/cost totals, duration, and status |
-| **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with goal, status, costs, and session detail panel |
+| **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status |
+| **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with session title, status, costs, and a detail overlay showing session context (title, model, code changes) and todo progress |
 
 The dashboard uses the same authentication as the REST API — if the Gateway runs in production mode (`GATEWAY_ENV=production`) with an API key, the dashboard will need one. For local development, use `GATEWAY_ENV=development` to run without authentication.
 
