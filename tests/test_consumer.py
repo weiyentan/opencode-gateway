@@ -13,6 +13,7 @@ Covers all error-handling paths and lifecycle behaviours:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,7 +29,7 @@ from app.consumer.consumer import Consumer
 def _mk_msg(value: dict) -> MagicMock:
     """Build a MagicMock that quacks like an aiokafka ConsumerRecord."""
     msg = MagicMock(spec=ConsumerRecord)
-    msg.value = value
+    msg.value = json.dumps(value).encode("utf-8")
     msg.offset = 42
     msg.partition = 0
     msg.topic = "opencode-usage"
@@ -291,6 +292,43 @@ async def test_invalid_message_sends_to_dlq():
     assert "Invalid message shape" in dlq_payload["reason"]
 
 
+@pytest.mark.asyncio
+async def test_unparseable_json_sends_to_dlq():
+    """Messages with malformed JSON bytes are sent to DLQ, offset committed."""
+    consumer = Consumer(
+        kafka_brokers="broker:9092",
+        gateway_base_url="http://gateway:8000",
+        gateway_collector_token="tok",
+    )
+
+    consumer._http_client = AsyncMock()
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    # Create a msg with raw unparseable bytes
+    msg = MagicMock(spec=ConsumerRecord)
+    msg.value = b"not valid json at all"
+    msg.offset = 101
+    msg.partition = 0
+    msg.topic = "opencode-usage"
+    msg.key = None
+    msg.headers = ()
+
+    await consumer._process_message(msg)
+
+    # Never POST to Gateway — bad message
+    consumer._http_client.post.assert_not_called()
+    # Sent to DLQ and offset committed
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "JSON decode failure" in dlq_payload["reason"]
+    assert "raw" in dlq_payload["payload"]
+
+
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 
 
@@ -396,6 +434,7 @@ async def test_stop_handles_in_flight_timeout():
 async def test_from_env_reads_all_vars():
     """from_env() reads both required and optional environment variables."""
     env_vars = {
+        "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker1:9092,broker2:9092",
         "GATEWAY_BASE_URL": "http://gateway.example.com",
         "GATEWAY_COLLECTOR_TOKEN": "secret-token",
@@ -418,6 +457,7 @@ async def test_from_env_reads_all_vars():
 async def test_from_env_falls_back_to_defaults():
     """from_env() uses hard-coded defaults when optional vars are absent."""
     env_vars = {
+        "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker:9092",
         "GATEWAY_BASE_URL": "http://gw:8000",
         "GATEWAY_COLLECTOR_TOKEN": "tok",

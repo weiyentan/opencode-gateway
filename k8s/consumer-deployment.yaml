@@ -84,6 +84,12 @@ spec:
               command:
                 - python
                 - -c
-                - "import sys; sys.exit(0)"
-            initialDelaySeconds: 30
+                - |
+                  import sys
+                  try:
+                      from app.consumer.consumer import Consumer
+                  except ImportError:
+                      sys.exit(1)
+                  sys.exit(0)
+            initialDelaySeconds: 15
             periodSeconds: 30

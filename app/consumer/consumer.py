@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import signal
 from typing import Any
 
@@ -20,6 +19,7 @@ from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from app.consumer.models import IngestRequest
+from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,10 @@ class Consumer:
 
     @classmethod
     def from_env(cls) -> Consumer:
-        """Create a Consumer from environment variables.
+        """Create a Consumer from environment variables using the Settings class.
+
+        Uses :class:`Settings` from ``app.core.config`` as the single source
+        of truth for env-var mappings, defaults, and validation.
 
         Required env vars:
             ``GATEWAY_KAFKA_BROKERS``, ``GATEWAY_BASE_URL``,
@@ -91,19 +94,28 @@ class Consumer:
             ``GATEWAY_KAFKA_TOPIC``, ``GATEWAY_KAFKA_DLQ_TOPIC``,
             ``GATEWAY_CONSUMER_GROUP_ID``
         """
+        settings = Settings()
+
+        missing: list[str] = []
+        if not settings.kafka_brokers:
+            missing.append("GATEWAY_KAFKA_BROKERS")
+        if not settings.base_url:
+            missing.append("GATEWAY_BASE_URL")
+        if not settings.collector_token:
+            missing.append("GATEWAY_COLLECTOR_TOKEN")
+
+        if missing:
+            raise ValueError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
+
         return cls(
-            kafka_brokers=os.environ["GATEWAY_KAFKA_BROKERS"],
-            gateway_base_url=os.environ["GATEWAY_BASE_URL"],
-            gateway_collector_token=os.environ["GATEWAY_COLLECTOR_TOKEN"],
-            kafka_topic=os.environ.get(
-                "GATEWAY_KAFKA_TOPIC", _DEFAULT_KAFKA_TOPIC
-            ),
-            kafka_dlq_topic=os.environ.get(
-                "GATEWAY_KAFKA_DLQ_TOPIC", _DEFAULT_KAFKA_DLQ_TOPIC
-            ),
-            consumer_group_id=os.environ.get(
-                "GATEWAY_CONSUMER_GROUP_ID", _DEFAULT_CONSUMER_GROUP_ID
-            ),
+            kafka_brokers=settings.kafka_brokers,
+            gateway_base_url=settings.base_url,
+            gateway_collector_token=settings.collector_token,
+            kafka_topic=settings.kafka_topic,
+            kafka_dlq_topic=settings.kafka_dlq_topic,
+            consumer_group_id=settings.consumer_group_id,
         )
 
     # ── Lifecycle ──────────────────────────────────────────────────────
@@ -120,7 +132,7 @@ class Consumer:
             group_id=self._consumer_group_id,
             enable_auto_commit=False,
             auto_offset_reset="earliest",
-            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            value_deserializer=None,  # Deserialization is done in _process_message
         )
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._kafka_brokers,
@@ -151,21 +163,42 @@ class Consumer:
         Blocks until :meth:`stop` is called or a fatal error occurs.
         Gracefully handles Kafka connection errors by re-creating the
         consumer after a brief back-off.
+
+        Uses an explicit iterator with a 1-second timeout so that
+        ``self._running`` is checked even when no messages arrive
+        (SIGTERM/SIGINT can interrupt the loop cleanly).
         """
         if self._consumer is None or self._http_client is None:
             raise RuntimeError("Consumer not started — call start() first")
 
         while self._running:
             try:
-                async for msg in self._consumer:  # type: ignore[union-attr]
-                    if not self._running:
+                iterator = self._consumer.__aiter__()  # type: ignore[union-attr]
+                while self._running:
+                    try:
+                        msg = await asyncio.wait_for(
+                            iterator.__anext__(),
+                            timeout=1.0,
+                        )
+                    except asyncio.TimeoutError:
+                        continue  # re-check _running
+                    except StopAsyncIteration:
                         break
-                    # Track in-flight task so stop() can await it
-                    self._in_flight = asyncio.ensure_future(
-                        self._process_message(msg)
-                    )
-                    await self._in_flight
-                    self._in_flight = None
+
+                    # ── Process the message with exception safety ──────
+                    try:
+                        self._in_flight = asyncio.ensure_future(
+                            self._process_message(msg)
+                        )
+                        await self._in_flight
+                    except Exception:
+                        logger.exception(
+                            "Unhandled exception processing message "
+                            "at offset %d — skipping",
+                            msg.offset,
+                        )
+                    finally:
+                        self._in_flight = None
             except KafkaError:
                 if self._running:
                     logger.exception(
@@ -214,25 +247,58 @@ class Consumer:
     # ── Internal helpers ────────────────────────────────────────────────
 
     async def _recreate_consumer(self) -> None:
-        """Stop and recreate the Kafka consumer after a connection error."""
+        """Stop and recreate the Kafka consumer after a connection error.
+
+        Uses exponential backoff with jitter to avoid reconnect storms.
+        """
         if self._consumer:
             await self._consumer.stop()
-        await asyncio.sleep(1.0)
-        self._consumer = AIOKafkaConsumer(
-            self._kafka_topic,
-            bootstrap_servers=self._kafka_brokers,
-            group_id=self._consumer_group_id,
-            enable_auto_commit=False,
-            auto_offset_reset="earliest",
-            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-        )
-        await self._consumer.start()
+
+        import random
+
+        delay = 1.0
+        for attempt in range(10):
+            try:
+                self._consumer = AIOKafkaConsumer(
+                    self._kafka_topic,
+                    bootstrap_servers=self._kafka_brokers,
+                    group_id=self._consumer_group_id,
+                    enable_auto_commit=False,
+                    auto_offset_reset="earliest",
+                    value_deserializer=None,  # Deserialization is done in _process_message
+                )
+                await self._consumer.start()
+                return
+            except KafkaError:
+                if attempt < 9:
+                    jitter = random.uniform(0.5, 1.5)
+                    await asyncio.sleep(delay * jitter)
+                    delay = min(delay * 2, 60.0)
+                    continue
+                raise
 
     async def _process_message(self, msg: ConsumerRecord) -> None:
-        """Process a single Kafka message — validate, POST, handle outcome."""
-        # ── Deserialise and validate the payload ─────────────────
+        """Process a single Kafka message — deserialize JSON, validate, POST, handle outcome."""
+        # ── Deserialise JSON ────────────────────────────────────────
         try:
-            payload = IngestRequest.model_validate(msg.value)
+            raw_value = json.loads(msg.value.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError) as exc:
+            logger.warning(
+                "Unparseable message (key=%s offset=%d) — sending to DLQ: %s",
+                msg.key,
+                msg.offset,
+                exc,
+            )
+            await self._send_to_dlq(
+                {"raw": msg.value.decode("utf-8", errors="replace")},
+                reason=f"JSON decode failure: {exc}",
+            )
+            await self._commit()
+            return
+
+        # ── Validate the payload ────────────────────────────────────
+        try:
+            payload = IngestRequest.model_validate(raw_value)
         except Exception:
             logger.warning(
                 "Invalid message shape — sending to DLQ (key=%s offset=%d)",
@@ -240,7 +306,7 @@ class Consumer:
                 msg.offset,
             )
             await self._send_to_dlq(
-                msg.value if isinstance(msg.value, dict) else {},
+                raw_value if isinstance(raw_value, dict) else {},
                 reason="Invalid message shape — failed Pydantic validation",
             )
             await self._commit()
@@ -288,7 +354,7 @@ class Consumer:
                     resp.text[:500],
                 )
                 await self._send_to_dlq(
-                    msg.value if isinstance(msg.value, dict) else {},
+                    request_json,
                     reason=f"HTTP {resp.status_code}",
                 )
                 await self._commit()
