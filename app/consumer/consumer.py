@@ -212,7 +212,7 @@ class KafkaConsumer:
                         continue
 
                     if not should_commit:
-                        continue
+                        break
 
                     # Commit after each successfully processed or DLQ'd message.
                     # Must extract TopicPartition from the record for explicit commit.
