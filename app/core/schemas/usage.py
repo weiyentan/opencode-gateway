@@ -113,6 +113,10 @@ class SessionSummary(BaseModel):
     workspace_id: str | None = None
     agent: str | None = None
     parent_session_id: str | None = None
+    session_title: str | None = Field(
+        default=None,
+        description="Session title from opencode_session_contexts (null if no context)",
+    )
     total_estimated_cost_usd: Decimal | None = None
     loki_search_url: str | None = Field(
         default=None,
@@ -216,6 +220,10 @@ class AgentRunSummary(BaseModel):
         ge=0,
         description="Number of child sessions whose parent_session_id references this session",
     )
+    session_title: str | None = Field(
+        default=None,
+        description="Session title from opencode_session_contexts (null if no context)",
+    )
 
 
 class AgentRunDetail(BaseModel):
@@ -296,6 +304,88 @@ class AgentRunDetail(BaseModel):
 VALID_AGENT_RUN_STATUSES: frozenset[str] = frozenset(
     {"running", "completed", "blocked", "unknown"}
 )
+
+
+# ── Records-with-context schemas ──────────────────────────────────────────
+
+
+class RecordWithContextRow(BaseModel):
+    """A single usage record enriched with session title, project label, and agent.
+
+    This is the per-message row returned when ``group_by`` is *not* used.
+    """
+
+    id: uuid.UUID
+    client_id: uuid.UUID
+    source_database_id: uuid.UUID
+    session_id: uuid.UUID
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int = 0
+    provider: str | None = None
+    mode: str | None = None
+    finish_reason: str | None = None
+    reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    estimated_cost_usd: Decimal | None = None
+    reported_at: datetime
+    ingested_at: datetime
+    session_title: str | None = Field(
+        default=None,
+        description="Session title from opencode_session_contexts",
+    )
+    project_label: str = Field(
+        description="Resolved project label via COALESCE(display_name, name, "
+        "basename(worktree), external_project_id)",
+    )
+    agent: str | None = Field(
+        default=None,
+        description="Agent name from sessions table",
+    )
+    loki_search_url: str | None = Field(
+        default=None,
+        description="Grafana Explore URL for drill-down into Loki logs",
+    )
+
+
+class RecordWithContextGroupedRow(BaseModel):
+    """An aggregated row returned when ``group_by`` is used.
+
+    Only the fields relevant to the requested group-by dimensions are
+    populated — additional context fields (``project_label``,
+    ``session_title``, ``agent``, ``model_name``) are included when the
+    respective dimension is in the group set.
+    """
+
+    group_value: str = Field(
+        description="Value of the group-by dimension(s), pipe-separated for multi-dimension"
+    )
+    project_label: str | None = Field(
+        default=None,
+        description="Resolved project label (present when group includes 'project')",
+    )
+    session_title: str | None = Field(
+        default=None,
+        description="Session title (present when group includes 'session')",
+    )
+    agent: str | None = Field(
+        default=None,
+        description="Agent name (present when group includes 'agent')",
+    )
+    model_name: str | None = Field(
+        default=None,
+        description="Model name (present when group includes 'model')",
+    )
+    total_input_tokens: int = Field(default=0, ge=0)
+    total_output_tokens: int = Field(default=0, ge=0)
+    total_cached_tokens: int = Field(default=0, ge=0)
+    total_reasoning_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
+    total_estimated_cost_usd: Decimal | None = Field(default=None)
+    record_count: int = Field(default=0, ge=0)
 
 
 # ── Paginated response ────────────────────────────────────────────────────

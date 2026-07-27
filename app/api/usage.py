@@ -11,6 +11,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Union
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -23,6 +24,7 @@ from app.core.schemas.usage import (
     AggregateRow,
     PaginatedResponse,
     RecordRow,
+    RecordWithContextGroupedRow,
     SessionSummary,
 )
 from app.db.session import get_session
@@ -441,8 +443,10 @@ async def _fetch_sessions(
             s.workspace_id,
             s.agent,
             s.parent_session_id,
-            s.total_estimated_cost_usd
+            s.total_estimated_cost_usd,
+            osc.title AS session_title
         FROM sessions s
+        LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
         WHERE {where_clause}
         ORDER BY s.last_message_at DESC
         LIMIT ${len(query_params) + 1}
@@ -466,6 +470,7 @@ async def _fetch_sessions(
             agent=r["agent"],
             parent_session_id=r["parent_session_id"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
+            session_title=r["session_title"],
             loki_search_url=build_loki_search_url(
                 client_id=r["client_id"],
                 source_database_id=r["source_database_id"],
@@ -768,8 +773,10 @@ async def _fetch_agent_runs(
                     s.total_cached_tokens,
                     s.total_estimated_cost_usd,
                     s.last_message_at,
-                    ({status_expr}) AS _status
+                    ({status_expr}) AS _status,
+                    osc.title AS session_title
                 FROM sessions s
+                LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
                 WHERE {where_clause}
             ) sub
             WHERE sub._status = ${len(params) + 1}
@@ -796,8 +803,10 @@ async def _fetch_agent_runs(
                 s.total_cached_tokens,
                 s.total_estimated_cost_usd,
                 s.last_message_at,
-                ({status_expr}) AS _status
+                ({status_expr}) AS _status,
+                osc.title AS session_title
             FROM sessions s
+            LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
             WHERE {where_clause}
         """
         count_from = f"FROM sessions s WHERE {where_clause}"
@@ -847,6 +856,7 @@ async def _fetch_agent_runs(
                 message_count=r["message_count"],
                 last_updated_at=r["last_message_at"],
                 child_run_count=r["child_run_count"],
+                session_title=r["session_title"],
             )
         )
 
@@ -964,9 +974,8 @@ async def _fetch_agent_run_detail(
             source_cached_tokens,
             source_reasoning_tokens
         FROM opencode_session_contexts
-        WHERE source_database_id = $1 AND external_session_id = $2""",
-        session_row["source_database_id"],
-        session_row["external_session_id"],
+        WHERE session_id = $1""",
+        session_row["id"],
     )
 
     # ── Query todo snapshots ──────────────────────────────────────
@@ -1151,4 +1160,384 @@ async def get_agent_run_detail(
     settings = get_settings()
     return await _fetch_agent_run_detail(
         conn, session_id, settings.grafana_base_url
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Records-with-context helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Valid group-by dimensions for the records-with-context endpoint
+RECORDS_WITH_CONTEXT_GROUP_BY: frozenset[str] = frozenset(
+    {"project", "session", "agent", "model"}
+)
+
+# SQL expression for project label resolution
+# COALESCE(display_name, name, basename(NULLIF(worktree, '/')), external_project_id, 'unknown')
+_PROJECT_LABEL_SQL = """
+    COALESCE(
+        osp.display_name,
+        osp.name,
+        CASE
+            WHEN osp.worktree IS NULL
+                  OR osp.worktree = ''
+                  OR osp.worktree = '/' THEN NULL
+            ELSE substring(osp.worktree, '([^/]+)$')
+        END,
+        s.project_id,
+        'unknown'
+    )
+"""
+
+# Common join fragments for records-with-context queries
+_RWC_SESSION_JOIN = "JOIN sessions s ON s.id = our.session_id"
+_RWC_CONTEXT_JOIN = """
+    LEFT JOIN opencode_session_contexts osc
+        ON osc.source_database_id = our.source_database_id
+        AND osc.external_session_id = s.external_session_id
+"""
+_RWC_PROJECT_JOIN = """
+    LEFT JOIN opencode_source_projects osp
+        ON osp.source_database_id = our.source_database_id
+        AND osp.external_project_id = s.project_id
+"""
+
+
+def _parse_records_with_context_group_by(raw: str | None) -> list[str]:
+    """Parse and validate a comma-separated group_by string.
+
+    Returns an empty list when *raw* is ``None`` or empty.
+    Raises ``HTTPException(400)`` on invalid values.
+    """
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    invalid = [p for p in parts if p not in RECORDS_WITH_CONTEXT_GROUP_BY]
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid group_by value(s): {', '.join(invalid)}. "
+            f"Valid values: {', '.join(sorted(RECORDS_WITH_CONTEXT_GROUP_BY))}",
+        )
+    return parts
+
+
+def _build_records_with_context_filters(
+    start_date: datetime,
+    end_date: datetime,
+    project_id: str | None,
+    session_id: uuid.UUID | None,
+    agent: str | None,
+    model: str | None,
+) -> tuple[str, list]:
+    """Build WHERE clause fragments and parameter list.
+
+    Date-range params are placed first (``$1``, ``$2``) and included
+    in the returned param list so callers do not need to prepend them.
+    Additional filters use incrementing placeholders (``$3``, ``$4``, …).
+    """
+    filters: list[str] = []
+    params: list = [start_date, end_date]
+
+    filters.append("our.reported_at >= $1")
+    filters.append("our.reported_at <= $2")
+
+    if project_id is not None:
+        filters.append(f"s.project_id = ${len(params) + 1}")
+        params.append(project_id)
+
+    if session_id is not None:
+        filters.append(f"our.session_id = ${len(params) + 1}")
+        params.append(session_id)
+
+    if agent is not None:
+        filters.append(f"s.agent = ${len(params) + 1}")
+        params.append(agent)
+
+    if model is not None:
+        filters.append(f"om.model_name = ${len(params) + 1}")
+        params.append(model)
+
+    return " AND ".join(filters), params
+
+
+async def _fetch_records_with_context(
+    conn: asyncpg.Connection,
+    start_date: datetime,
+    end_date: datetime,
+    project_id: str | None,
+    session_id: uuid.UUID | None,
+    agent: str | None,
+    model: str | None,
+    limit: int,
+    offset: int,
+    grafana_base_url: str,
+) -> PaginatedResponse:
+    """Execute count + data queries for raw (non-grouped) mode.
+
+    Returns paginated records enriched with project label, session title,
+    and agent.
+    """
+    from app.core.schemas.usage import RecordWithContextRow
+
+    where_clause, query_params = _build_records_with_context_filters(
+        start_date, end_date, project_id, session_id, agent, model
+    )
+
+    # ── Total count ─────────────────────────────────────────────────
+    count_sql = f"""
+        SELECT COUNT(*)
+        FROM opencode_usage_records our
+        JOIN observed_models om ON om.id = our.model_id
+        {_RWC_SESSION_JOIN}
+        WHERE {where_clause}
+    """
+    total = await conn.fetchval(count_sql, *query_params)
+
+    # ── Data query ──────────────────────────────────────────────────
+    data_sql = f"""
+        SELECT
+            our.id,
+            our.client_id,
+            our.source_database_id,
+            our.session_id,
+            om.model_name,
+            our.input_tokens,
+            our.output_tokens,
+            our.cached_tokens,
+            our.provider,
+            our.mode,
+            our.finish_reason,
+            our.reasoning_tokens,
+            our.cache_read_tokens,
+            our.cache_write_tokens,
+            our.estimated_cost_usd,
+            our.reported_at,
+            our.ingested_at,
+            s.agent,
+            osc.title AS session_title,
+            {_PROJECT_LABEL_SQL} AS project_label
+        FROM opencode_usage_records our
+        JOIN observed_models om ON om.id = our.model_id
+        {_RWC_SESSION_JOIN}
+        {_RWC_CONTEXT_JOIN}
+        {_RWC_PROJECT_JOIN}
+        WHERE {where_clause}
+        ORDER BY our.reported_at DESC
+        LIMIT ${len(query_params) + 1}
+        OFFSET ${len(query_params) + 2}
+    """
+    rows = await conn.fetch(data_sql, *query_params, limit, offset)
+
+    items = [
+        RecordWithContextRow(
+            id=r["id"],
+            client_id=r["client_id"],
+            source_database_id=r["source_database_id"],
+            session_id=r["session_id"],
+            model_name=r["model_name"],
+            input_tokens=r["input_tokens"],
+            output_tokens=r["output_tokens"],
+            cached_tokens=r["cached_tokens"],
+            provider=r["provider"],
+            mode=r["mode"],
+            finish_reason=r["finish_reason"],
+            reasoning_tokens=r["reasoning_tokens"],
+            cache_read_tokens=r["cache_read_tokens"],
+            cache_write_tokens=r["cache_write_tokens"],
+            estimated_cost_usd=r["estimated_cost_usd"],
+            reported_at=r["reported_at"],
+            ingested_at=r["ingested_at"],
+            agent=r["agent"],
+            session_title=r["session_title"],
+            project_label=r["project_label"],
+            loki_search_url=build_loki_search_url(
+                client_id=r["client_id"],
+                source_database_id=r["source_database_id"],
+                session_id=r["session_id"],
+                start_time=start_date,
+                end_time=end_date,
+                grafana_base_url=grafana_base_url,
+            ),
+        )
+        for r in rows
+    ]
+
+    return PaginatedResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _rwc_group_expression(parts: list[str]) -> str:
+    """Build a SQL GROUP BY expression and corresponding select expression.
+
+    Each part contributes a SQL fragment.  When there are multiple parts
+    the group value is concatenated with a pipe separator.
+    """
+    fragments: list[str] = []
+    for part in parts:
+        if part == "project":
+            fragments.append(_PROJECT_LABEL_SQL)
+        elif part == "session":
+            fragments.append("CAST(our.session_id AS text)")
+        elif part == "agent":
+            fragments.append("COALESCE(s.agent, 'unknown')")
+        elif part == "model":
+            fragments.append("om.model_name")
+
+    if len(fragments) == 1:
+        return fragments[0]
+    return " || '|' || ".join(fragments)
+
+
+def _rwc_group_by_columns(parts: list[str]) -> list[str]:
+    """Return the list of output column names needed for this grouping.
+
+    Each dimension may contribute a context column to the result row.
+    """
+    cols: list[str] = []
+    if "project" in parts:
+        cols.append(f"{_PROJECT_LABEL_SQL} AS project_label")
+    if "session" in parts:
+        cols.append("osc.title AS session_title")
+    if "agent" in parts:
+        cols.append("COALESCE(s.agent, 'unknown') AS agent")
+    if "model" in parts:
+        cols.append("om.model_name AS model_name")
+    return cols
+
+
+async def _fetch_records_with_context_grouped(
+    conn: asyncpg.Connection,
+    start_date: datetime,
+    end_date: datetime,
+    project_id: str | None,
+    session_id: uuid.UUID | None,
+    agent: str | None,
+    model: str | None,
+    group_parts: list[str],
+) -> list:
+    """Execute aggregated query for grouped mode.
+
+    Returns aggregated rows grouped by the requested dimensions.
+    """
+    where_clause, query_params = _build_records_with_context_filters(
+        start_date, end_date, project_id, session_id, agent, model
+    )
+
+    group_expr = _rwc_group_expression(group_parts)
+    extra_cols = _rwc_group_by_columns(group_parts)
+    extra_cols_sql = ",\n            ".join(extra_cols) if extra_cols else ""
+
+    sql = f"""
+        SELECT
+            {group_expr} AS group_value,
+            {extra_cols_sql}{',' if extra_cols else ''}
+            COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
+            COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
+            COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+            COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+            COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+            COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
+            SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
+            COUNT(*) AS record_count
+        FROM opencode_usage_records our
+        JOIN observed_models om ON om.id = our.model_id
+        {_RWC_SESSION_JOIN}
+        {_RWC_CONTEXT_JOIN}
+        {_RWC_PROJECT_JOIN}
+        WHERE {where_clause}
+        GROUP BY {group_expr}
+        ORDER BY group_value
+    """
+    rows = await conn.fetch(sql, *query_params)
+
+    return [
+        RecordWithContextGroupedRow(
+            group_value=str(r["group_value"]),
+            project_label=r.get("project_label"),
+            session_title=r.get("session_title"),
+            agent=r.get("agent"),
+            model_name=r.get("model_name"),
+            total_input_tokens=r["total_input_tokens"],
+            total_output_tokens=r["total_output_tokens"],
+            total_cached_tokens=r["total_cached_tokens"],
+            total_reasoning_tokens=r["total_reasoning_tokens"],
+            total_cache_read_tokens=r["total_cache_read_tokens"],
+            total_cache_write_tokens=r["total_cache_write_tokens"],
+            total_estimated_cost_usd=r["total_estimated_cost_usd"],
+            record_count=r["record_count"],
+        )
+        for r in rows
+    ]
+
+
+# ── Records-with-context endpoint ─────────────────────────────────────────
+
+
+@router.get("/records-with-context", response_model=Union[PaginatedResponse, list[RecordWithContextGroupedRow]])
+async def get_records_with_context(
+    request: Request,
+    start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
+    end_date: datetime = Query(..., description="ISO-8601 end date (inclusive)"),
+    project_id: str | None = Query(
+        default=None,
+        description="Filter by external project ID (exact match on sessions.project_id)",
+    ),
+    session_id: uuid.UUID | None = Query(default=None),
+    agent: str | None = Query(
+        default=None,
+        description="Filter by agent name (exact match on sessions.agent)",
+    ),
+    model: str | None = Query(
+        default=None,
+        description="Filter by model name (exact match on observed_models.model_name)",
+    ),
+    group_by: str | None = Query(
+        default=None,
+        description="Comma-separated group-by dimensions: "
+        "project,session,agent,model",
+    ),
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> PaginatedResponse | list[RecordWithContextGroupedRow]:
+    """Return usage records enriched with project label, session title, and agent.
+
+    **Raw mode** (no ``group_by``): returns paginated per-message rows with
+    context fields.  Supports ``limit`` and ``offset`` for pagination.
+
+    **Grouped mode** (with ``group_by``): returns aggregated subtotals for
+    the requested dimensions.  ``limit`` and ``offset`` are not applied.
+    """
+    _validate_date_range(start_date, end_date)
+    group_parts = _parse_records_with_context_group_by(group_by)
+    settings = get_settings()
+
+    if group_parts:
+        return await _fetch_records_with_context_grouped(
+            conn,
+            start_date,
+            end_date,
+            project_id,
+            session_id,
+            agent,
+            model,
+            group_parts,
+        )
+
+    return await _fetch_records_with_context(
+        conn,
+        start_date,
+        end_date,
+        project_id,
+        session_id,
+        agent,
+        model,
+        limit,
+        offset,
+        settings.grafana_base_url,
     )

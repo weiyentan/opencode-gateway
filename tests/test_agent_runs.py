@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -58,6 +59,7 @@ def _mk_session_row(
     cost: Decimal | None = Decimal("0.0100"),
     computed_status: str = "running",
     child_run_count: int = 0,
+    session_title: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions.
 
@@ -83,6 +85,7 @@ def _mk_session_row(
         "total_estimated_cost_usd": cost,
         "_status": computed_status,
         "child_run_count": child_run_count,
+        "session_title": session_title,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.get.side_effect = data.get
@@ -520,6 +523,62 @@ class TestAgentRunsList:
         assert item["code_changes_total"] == 0
 
 
+def _mk_ctx_row(
+    *,
+    code_change_count: int = 5,
+    code_change_additions: int = 120,
+    code_change_deletions: int = 30,
+    session_model: str | None = "claude-sonnet-4",
+    session_cost: Decimal | None = Decimal("0.0450"),
+    title: str | None = "Implement user auth",
+    source_directory: str | None = "/home/user/project/src",
+    source_path: str | None = "/home/user/project",
+    source_input_tokens: int = 8000,
+    source_output_tokens: int = 2000,
+    source_cached_tokens: int = 500,
+    source_reasoning_tokens: int = 0,
+) -> MagicMock:
+    """Return a MagicMock that looks like an asyncpg Record row for opencode_session_contexts."""
+    row = MagicMock()
+    data: dict[str, Any] = {
+        "code_change_count": code_change_count,
+        "code_change_additions": code_change_additions,
+        "code_change_deletions": code_change_deletions,
+        "session_model": session_model,
+        "session_cost": session_cost,
+        "title": title,
+        "source_directory": source_directory,
+        "source_path": source_path,
+        "source_input_tokens": source_input_tokens,
+        "source_output_tokens": source_output_tokens,
+        "source_cached_tokens": source_cached_tokens,
+        "source_reasoning_tokens": source_reasoning_tokens,
+    }
+    row.__getitem__.side_effect = data.__getitem__
+    row.get.side_effect = data.get
+    return row
+
+
+def _mk_todo_row(
+    *,
+    content: str = "Fix login bug",
+    status: str | None = "pending",
+    priority: str | None = "high",
+    position: int = 1,
+) -> MagicMock:
+    """Return a MagicMock that looks like an asyncpg Record row for opencode_session_todos."""
+    row = MagicMock()
+    data: dict[str, Any] = {
+        "content": content,
+        "status": status,
+        "priority": priority,
+        "position": position,
+    }
+    row.__getitem__.side_effect = data.__getitem__
+    row.get.side_effect = data.get
+    return row
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Detail endpoint tests
 # ══════════════════════════════════════════════════════════════════════════
@@ -822,6 +881,82 @@ class TestAgentRunsDetail:
         assert data["title"] is None
         assert data["todo_rows"] == []
         assert data["session_context"] is None
+
+    @pytest.mark.asyncio
+    async def test_detail_with_session_context(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Detail returns populated session_context when a context record exists."""
+        session_row = _mk_session_row(session_id=_SESSION_ID)
+        ctx_row = _mk_ctx_row(
+            title="Implement user auth",
+            session_model="claude-sonnet-4",
+            source_directory="/home/user/project/src",
+            code_change_additions=120,
+            code_change_deletions=30,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, ctx_row])
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        ctx = data["session_context"]
+        assert ctx is not None
+        assert ctx["title"] == "Implement user auth"
+        assert ctx["session_model"] == "claude-sonnet-4"
+        assert ctx["source_directory"] == "/home/user/project/src"
+        assert ctx["code_change_additions"] == 120
+        assert ctx["code_change_deletions"] == 30
+
+    @pytest.mark.asyncio
+    async def test_detail_with_todos(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Detail returns populated todo_rows (sorted by position) when todos exist."""
+        session_row = _mk_session_row(session_id=_SESSION_ID)
+        todo_rows = [
+            _mk_todo_row(content="Fix login bug", status="pending", priority="high", position=1),
+            _mk_todo_row(content="Write tests", status="completed", priority="medium", position=2),
+        ]
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetch = AsyncMock(side_effect=[[], todo_rows])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data["todo_rows"]) == 2
+        assert data["todo_rows"][0]["description"] == "Fix login bug"
+        assert data["todo_rows"][0]["status"] == "pending"
+        assert data["todo_rows"][0]["priority"] == "high"
+        assert data["todo_rows"][1]["description"] == "Write tests"
+        assert data["todo_rows"][1]["status"] == "completed"
+        assert data["todo_rows"][1]["priority"] == "medium"
+        assert data["todo_total"] == 2
+        assert data["todo_completed"] == 1
+        assert data["todo_blocked"] == 0
+
+    @pytest.mark.asyncio
+    async def test_detail_with_context_and_todos(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Detail returns both session_context and todo_rows when both exist."""
+        session_row = _mk_session_row(session_id=_SESSION_ID)
+        ctx_row = _mk_ctx_row(title="Refactor API", session_model="gpt-4o")
+        todo_rows = [
+            _mk_todo_row(content="Add endpoint", status="in_progress", priority="high", position=1),
+        ]
+        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, ctx_row])
+        mock_conn.fetch = AsyncMock(side_effect=[[], todo_rows])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["session_context"] is not None
+        assert data["session_context"]["title"] == "Refactor API"
+        assert len(data["todo_rows"]) == 1
+        assert data["todo_rows"][0]["description"] == "Add endpoint"
+        assert data["todo_total"] == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
