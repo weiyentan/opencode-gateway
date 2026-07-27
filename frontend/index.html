@@ -41,6 +41,14 @@
           </span>
           <span class="sidebar-label">Overview</span>
         </li>
+        <li class="sidebar-item" data-tab="sessions">
+          <span class="sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M4 6h16M4 12h16M4 18h12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"></path>
+            </svg>
+          </span>
+          <span class="sidebar-label">Sessions</span>
+        </li>
         <li class="sidebar-item" data-tab="agent-runs">
           <span class="sidebar-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
@@ -205,9 +213,20 @@
 
     </div><!-- .content-grid -->
 
-    <!-- Recent Sessions (full width) -->
+    <!-- Sessions Summary (full width) -->
     <section class="glass-panel panel-sessions">
-      <h2 class="panel-title">Recent Sessions</h2>
+      <h2 class="panel-title">Sessions</h2>
+      <p class="empty-state">Session details are available in the <strong>Sessions</strong> tab.</p>
+    </section>
+
+    </div><!-- #tab-overview -->
+
+    <!-- ── Tab: Sessions ──────────────────────────────────────────────── -->
+    <div class="tab-content" id="tab-sessions">
+
+    <!-- Sessions Table (full width) -->
+    <section class="glass-panel panel-sessions">
+      <h2 class="panel-title">All Sessions</h2>
       <div class="table-scroll">
         <table>
           <thead>
@@ -229,7 +248,7 @@
       </div>
     </section>
 
-    </div><!-- #tab-overview -->
+    </div><!-- #tab-sessions -->
 
     <!-- ── Tab: Agent Runs ─────────────────────────────────────────────── -->
     <div class="tab-content" id="tab-agent-runs">
