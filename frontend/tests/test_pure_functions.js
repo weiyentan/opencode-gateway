@@ -459,10 +459,12 @@ console.log('\u25B6 formatRangeLabel');
  */
 function resolveDateRange(state) {
   if (state.preset === 'custom' && state.customStartDate && state.customEndDate) {
-    return {
-      startDate: new Date(state.customStartDate + 'T00:00:00Z'),
-      endDate: new Date(state.customEndDate + 'T23:59:59Z')
-    };
+    var startDate = new Date(state.customStartDate + 'T00:00:00Z');
+    var endDate = new Date(state.customEndDate + 'T23:59:59Z');
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return computeDateRange('this-month');
+    }
+    return { startDate: startDate, endDate: endDate };
   }
   return computeDateRange(state.preset);
 }
