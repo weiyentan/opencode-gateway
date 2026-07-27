@@ -186,22 +186,22 @@ class AgentRunSummary(BaseModel):
     todo_total: int = Field(
         default=0,
         ge=0,
-        description="Total todo items (placeholder — 0 until todo snapshots exist)",
+        description="Total todo items (populated from opencode_session_todos queries)",
     )
     todo_completed: int = Field(
         default=0,
         ge=0,
-        description="Completed todo items (placeholder — 0 until todo snapshots exist)",
+        description="Completed todo items (populated from opencode_session_todos queries)",
     )
     todo_blocked: int = Field(
         default=0,
         ge=0,
-        description="Blocked todo items (placeholder — 0 until todo snapshots exist)",
+        description="Blocked todo items (populated from opencode_session_todos queries)",
     )
     code_changes_total: int = Field(
         default=0,
         ge=0,
-        description="Total code changes (placeholder — 0 until change tracking exists)",
+        description="Total code changes (populated from opencode_session_contexts queries)",
     )
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
@@ -222,7 +222,7 @@ class AgentRunDetail(BaseModel):
     """Full detail view for a single agent run, keyed by internal session UUID.
 
     Includes parent identifiers, child summaries, todo rows, project
-    details, Session Context (placeholder), and usage totals.
+    details, Session Context data, and usage totals.
     """
 
     id: uuid.UUID = Field(description="Internal Gateway session UUID")
@@ -258,15 +258,23 @@ class AgentRunDetail(BaseModel):
     )
     todo_rows: list[TodoRow] = Field(
         default_factory=list,
-        description="Todo items for this run (placeholder — empty until todo snapshots exist)",
+        description="Todo items for this run (populated from opencode_session_todos queries)",
     )
-    todo_total: int = Field(default=0, ge=0)
-    todo_completed: int = Field(default=0, ge=0)
-    todo_blocked: int = Field(default=0, ge=0)
-    code_changes_total: int = Field(default=0, ge=0)
+    todo_total: int = Field(
+        default=0, ge=0, description="Total todo items (populated from opencode_session_todos queries)"
+    )
+    todo_completed: int = Field(
+        default=0, ge=0, description="Completed todo items (populated from opencode_session_todos queries)"
+    )
+    todo_blocked: int = Field(
+        default=0, ge=0, description="Blocked todo items (populated from opencode_session_todos queries)"
+    )
+    code_changes_total: int = Field(
+        default=0, ge=0, description="Total code changes (populated from opencode_session_contexts queries)"
+    )
     session_context: dict[str, object] | None = Field(
         default=None,
-        description="Session Context data (placeholder — null until session_context table exists)",
+        description="Session Context data (populated from opencode_session_contexts queries)",
     )
     message_count: int = Field(default=0, ge=0)
     total_input_tokens: int = Field(default=0, ge=0)

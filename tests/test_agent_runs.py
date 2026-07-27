@@ -676,8 +676,8 @@ class TestAgentRunsDetail:
         assert data["child_summaries"] == []
 
     @pytest.mark.asyncio
-    async def test_detail_placeholder_fields(self, client: AsyncClient, mock_conn: AsyncMock):
-        """Placeholder fields (todo_rows, session_context, todo counts) return empty/null."""
+    async def test_detail_defaults_when_no_context_or_todos(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Defaults (todo_rows, session_context, todo counts) when no context/todos exist."""
         session_row = _mk_session_row(session_id=_SESSION_ID)
         mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
