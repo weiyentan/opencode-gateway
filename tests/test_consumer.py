@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -18,17 +19,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from aiokafka.structs import ConsumerRecord
+from aiokafka.structs import ConsumerRecord, TopicPartition
 
-from app.consumer.consumer import _MAX_RETRIES, KafkaConsumer
+from app.consumer.consumer import _MAX_RETRIES, ConsumerSettings, KafkaConsumer
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
 def _mk_settings(**overrides: str) -> Any:
-    """Build a Settings-like object with consumer fields set."""
-    from app.core.config import Settings
-
+    """Build consumer settings for tests."""
     kwargs: dict[str, str] = {
         "base_url": "http://gateway:8000",
         "collector_token": "test-collector-token",
@@ -38,11 +37,7 @@ def _mk_settings(**overrides: str) -> Any:
         "consumer_group_id": "opencode-gateway",
         **overrides,
     }
-    return Settings(
-        env="development",
-        api_key="",
-        **kwargs,
-    )
+    return ConsumerSettings(**kwargs)
 
 
 def _mk_consumer_record(
@@ -135,10 +130,14 @@ def _mk_5xx_response(status: int = 500) -> MagicMock:
 
 def test_consumer_config_defaults(monkeypatch):
     """Kafka consumer settings should have sensible defaults."""
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
-    from app.core.config import Settings
+    monkeypatch.delenv("GATEWAY_KAFKA_TOPIC", raising=False)
+    monkeypatch.delenv("GATEWAY_KAFKA_DLQ_TOPIC", raising=False)
+    monkeypatch.delenv("GATEWAY_CONSUMER_GROUP_ID", raising=False)
+    monkeypatch.delenv("GATEWAY_BASE_URL", raising=False)
+    monkeypatch.delenv("GATEWAY_COLLECTOR_TOKEN", raising=False)
+    monkeypatch.delenv("GATEWAY_KAFKA_BROKERS", raising=False)
 
-    settings = Settings()
+    settings = ConsumerSettings.from_env()
     assert settings.kafka_topic == "opencode-usage"
     assert settings.kafka_dlq_topic == "opencode-usage-dlq"
     assert settings.consumer_group_id == "opencode-gateway"
@@ -149,19 +148,20 @@ def test_consumer_config_defaults(monkeypatch):
 
 def test_consumer_config_env_override(monkeypatch):
     """GATEWAY_KAFKA_* env vars should override defaults."""
-    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
     monkeypatch.setenv("GATEWAY_KAFKA_TOPIC", "my-topic")
     monkeypatch.setenv("GATEWAY_KAFKA_DLQ_TOPIC", "my-dlq")
     monkeypatch.setenv("GATEWAY_CONSUMER_GROUP_ID", "my-group")
     monkeypatch.setenv("GATEWAY_BASE_URL", "http://gw:9000")
+    monkeypatch.setenv("GATEWAY_COLLECTOR_TOKEN", "collector-token")
+    monkeypatch.setenv("GATEWAY_KAFKA_BROKERS", "kafka:9092")
 
-    from app.core.config import Settings
-
-    settings = Settings()
+    settings = ConsumerSettings.from_env()
     assert settings.kafka_topic == "my-topic"
     assert settings.kafka_dlq_topic == "my-dlq"
     assert settings.consumer_group_id == "my-group"
     assert settings.base_url == "http://gw:9000"
+    assert settings.collector_token == "collector-token"
+    assert settings.kafka_brokers == "kafka:9092"
 
 
 # ── Process-message tests ──────────────────────────────────────────────────
@@ -190,8 +190,9 @@ async def test_process_message_2xx_commits(caplog):
     payload = _mk_ingest_payload()
     record = _mk_consumer_record(value=payload)
 
-    await consumer._process_message(record)
+    should_commit = await consumer._process_message(record)
 
+    assert should_commit is True
     http_client.post.assert_called_once()
     call_args = http_client.post.call_args
     assert call_args[0][0] == "/ingest"
@@ -221,8 +222,9 @@ async def test_process_message_4xx_sends_to_dlq(caplog):
     payload = _mk_ingest_payload()
     record = _mk_consumer_record(value=payload)
 
-    await consumer._process_message(record)
+    should_commit = await consumer._process_message(record)
 
+    assert should_commit is True
     # Should have POSTed to /ingest
     http_client.post.assert_called_once()
     # Should have sent to DLQ (model_dump'd payload, which adds defaults)
@@ -254,8 +256,9 @@ async def test_process_message_validation_failure_sends_to_dlq(caplog):
     bad_payload: dict[str, Any] = {"not": "valid"}
     record = _mk_consumer_record(value=bad_payload)
 
-    await consumer._process_message(record)
+    should_commit = await consumer._process_message(record)
 
+    assert should_commit is True
     # Should NOT have POSTed (validation failed before POST)
     http_client.post.assert_not_called()
     # Should have sent raw bad payload to DLQ
@@ -381,8 +384,9 @@ async def test_process_message_5xx_retries_exhausted(caplog):
     payload = _mk_ingest_payload()
     record = _mk_consumer_record(value=payload)
 
-    await consumer._process_message(record)
+    should_commit = await consumer._process_message(record)
 
+    assert should_commit is False
     # POST was called 3 times (retries)
     assert http_client.post.call_count == _MAX_RETRIES
     # DLQ should NOT have been called (5xx, not 4xx)
@@ -392,7 +396,92 @@ async def test_process_message_5xx_retries_exhausted(caplog):
     assert any("Max retries exhausted" in msg for msg in log_lines)
 
 
+# ── Offset commit tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_commits_when_message_processed():
+    """The poll loop should commit after a handled message."""
+    settings = _mk_settings()
+    consumer = KafkaConsumer(settings)
+    record = _mk_consumer_record(offset=42)
+    partition = TopicPartition(record.topic, record.partition)
+
+    mock_kafka_consumer = AsyncMock()
+    mock_kafka_consumer.getmany = AsyncMock(return_value={partition: [record]})
+    mock_kafka_consumer.commit = AsyncMock()
+    consumer._consumer = mock_kafka_consumer
+    consumer._http_client = AsyncMock(spec=httpx.AsyncClient)
+
+    async def process_and_stop(_record: ConsumerRecord) -> bool:
+        consumer._shutdown_event.set()
+        return True
+
+    consumer._process_message = AsyncMock(side_effect=process_and_stop)  # type: ignore[method-assign]
+
+    await consumer._poll_loop()
+
+    mock_kafka_consumer.commit.assert_called_once_with({partition: record.offset + 1})
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_does_not_commit_when_processing_fails():
+    """Retry exhaustion should leave the offset uncommitted for redelivery."""
+    settings = _mk_settings()
+    consumer = KafkaConsumer(settings)
+    record = _mk_consumer_record(offset=42)
+    partition = TopicPartition(record.topic, record.partition)
+
+    mock_kafka_consumer = AsyncMock()
+    mock_kafka_consumer.getmany = AsyncMock(return_value={partition: [record]})
+    mock_kafka_consumer.commit = AsyncMock()
+    consumer._consumer = mock_kafka_consumer
+    consumer._http_client = AsyncMock(spec=httpx.AsyncClient)
+
+    async def process_and_stop(_record: ConsumerRecord) -> bool:
+        consumer._shutdown_event.set()
+        return False
+
+    consumer._process_message = AsyncMock(side_effect=process_and_stop)  # type: ignore[method-assign]
+
+    await consumer._poll_loop()
+
+    mock_kafka_consumer.commit.assert_not_called()
+
+
 # ── Graceful shutdown tests ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_in_flight_poll_task():
+    """stop() should drain the poll task instead of cancelling it mid-flight."""
+    settings = _mk_settings()
+    consumer = KafkaConsumer(settings)
+    completed = False
+
+    async def in_flight_work() -> None:
+        nonlocal completed
+        await asyncio.sleep(0.01)
+        completed = True
+
+    consumer._poll_task = asyncio.create_task(in_flight_work())
+
+    mock_kafka_consumer = AsyncMock()
+    mock_kafka_consumer.stop = AsyncMock()
+    consumer._consumer = mock_kafka_consumer
+
+    mock_producer = AsyncMock()
+    mock_producer.stop = AsyncMock()
+    consumer._producer = mock_producer
+
+    http_client = AsyncMock(spec=httpx.AsyncClient)
+    http_client.aclose = AsyncMock()
+    consumer._http_client = http_client
+
+    await consumer.stop()
+
+    assert completed is True
+    assert consumer._poll_task.cancelled() is False
 
 
 @pytest.mark.asyncio
@@ -417,14 +506,14 @@ async def test_stop_idempotent():
     await consumer.stop()
     await consumer.stop()  # second call should be a no-op
 
-    # commit and stop should only be called once
-    assert mock_kafka_consumer.commit.call_count == 1
+    # stop should only be called once
+    mock_kafka_consumer.commit.assert_not_called()
     assert mock_kafka_consumer.stop.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_stop_closes_resources():
-    """stop() should commit offsets and close consumer, producer, and HTTP client."""
+    """stop() should close consumer, producer, and HTTP client."""
     settings = _mk_settings()
     consumer = KafkaConsumer(settings)
 
@@ -443,7 +532,7 @@ async def test_stop_closes_resources():
 
     await consumer.stop()
 
-    mock_kafka_consumer.commit.assert_called_once()
+    mock_kafka_consumer.commit.assert_not_called()
     mock_kafka_consumer.stop.assert_called_once()
     mock_producer.stop.assert_called_once()
     http_client.aclose.assert_called_once()
@@ -496,9 +585,33 @@ def test_main_missing_base_url(capsys, monkeypatch):
     """main() should exit with error when GATEWAY_BASE_URL is not set."""
     monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
     monkeypatch.setenv("GATEWAY_KAFKA_BROKERS", "kafka:9092")
+    monkeypatch.delenv("GATEWAY_BASE_URL", raising=False)
 
     from app.consumer.__main__ import main
 
     with pytest.raises(SystemExit) as exc_info:
         main()
     assert exc_info.value.code == 1
+
+
+def test_main_runs_consumer(monkeypatch):
+    """main() should run the consumer when required env vars are present."""
+    monkeypatch.setenv("GATEWAY_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("GATEWAY_KAFKA_BROKERS", "kafka:9092")
+
+    from app.consumer import __main__
+
+    run_mock = AsyncMock()
+
+    class FakeKafkaConsumer:
+        def __init__(self, settings: ConsumerSettings) -> None:
+            self.settings = settings
+
+        async def run(self) -> None:
+            await run_mock()
+
+    monkeypatch.setattr(__main__, "KafkaConsumer", FakeKafkaConsumer)
+
+    __main__.main()
+
+    run_mock.assert_awaited_once()

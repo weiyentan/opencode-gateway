@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 from asyncio import Task
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -34,13 +36,36 @@ from aiokafka.structs import ConsumerRecord, TopicPartition
 from pydantic import ValidationError
 
 from app.api.ingest import IngestRequest
-from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0
 _RETRY_BACKOFF = 2.0
+
+
+@dataclass(frozen=True)
+class ConsumerSettings:
+    """Settings owned by the Kafka consumer entry point."""
+
+    base_url: str = ""
+    collector_token: str = ""
+    kafka_brokers: str = ""
+    kafka_topic: str = "opencode-usage"
+    kafka_dlq_topic: str = "opencode-usage-dlq"
+    consumer_group_id: str = "opencode-gateway"
+
+    @classmethod
+    def from_env(cls) -> ConsumerSettings:
+        """Load consumer settings from GATEWAY_* environment variables."""
+        return cls(
+            base_url=os.getenv("GATEWAY_BASE_URL", ""),
+            collector_token=os.getenv("GATEWAY_COLLECTOR_TOKEN", ""),
+            kafka_brokers=os.getenv("GATEWAY_KAFKA_BROKERS", ""),
+            kafka_topic=os.getenv("GATEWAY_KAFKA_TOPIC", "opencode-usage"),
+            kafka_dlq_topic=os.getenv("GATEWAY_KAFKA_DLQ_TOPIC", "opencode-usage-dlq"),
+            consumer_group_id=os.getenv("GATEWAY_CONSUMER_GROUP_ID", "opencode-gateway"),
+        )
 
 
 class KafkaConsumer:
@@ -51,7 +76,7 @@ class KafkaConsumer:
     to initiate graceful shutdown.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: ConsumerSettings) -> None:
         self._settings = settings
         self._shutdown_event = asyncio.Event()
         self._consumer: AIOKafkaConsumer | None = None
@@ -86,6 +111,15 @@ class KafkaConsumer:
 
         self._poll_task = asyncio.create_task(self._poll_loop())
 
+    async def run(self) -> None:
+        """Run the consumer until shutdown, then close resources."""
+        await self.start()
+        try:
+            if self._poll_task is not None:
+                await self._poll_task
+        finally:
+            await self.stop()
+
     async def stop(self) -> None:
         """Initiate graceful shutdown.
 
@@ -98,18 +132,10 @@ class KafkaConsumer:
         logger.info("Kafka consumer shutting down...")
         self._shutdown_event.set()
 
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
+        if self._poll_task is not None and self._poll_task is not asyncio.current_task():
+            await self._poll_task
 
         if self._consumer is not None:
-            try:
-                await asyncio.wait_for(self._consumer.commit(), timeout=5.0)
-            except (TimeoutError, Exception):
-                logger.warning("Could not commit offsets during shutdown")
             await self._consumer.stop()
 
         if self._producer is not None:
@@ -124,7 +150,7 @@ class KafkaConsumer:
 
     def _signal_handler(self) -> None:
         logger.info("Received shutdown signal")
-        asyncio.ensure_future(self.stop())
+        self._shutdown_event.set()
 
     def _build_consumer(self) -> AIOKafkaConsumer:
         brokers = [b.strip() for b in self._settings.kafka_brokers.split(",") if b.strip()]
@@ -174,7 +200,19 @@ class KafkaConsumer:
                 for msg in messages:
                     if self._shutdown_event.is_set():
                         break
-                    await self._process_message(msg)
+                    try:
+                        should_commit = await self._process_message(msg)
+                    except Exception:
+                        logger.exception(
+                            "Failed to process message at %s:%s:%s; offset NOT committed",
+                            msg.topic,
+                            msg.partition,
+                            msg.offset,
+                        )
+                        continue
+
+                    if not should_commit:
+                        continue
 
                     # Commit after each successfully processed or DLQ'd message.
                     # Must extract TopicPartition from the record for explicit commit.
@@ -184,12 +222,10 @@ class KafkaConsumer:
                     except Exception:
                         logger.exception("Failed to commit offset for %s", tp)
 
-    async def _process_message(self, msg: ConsumerRecord) -> None:
+    async def _process_message(self, msg: ConsumerRecord) -> bool:
         """Deserialize, validate, and POST a single Kafka message.
 
-        On 4xx: sends the raw message to the DLQ topic before returning.
-        On 2xx or DLQ success: the caller commits the offset.
-        On failure (5xx / network / DLQ failure): the caller does NOT commit.
+        Returns True only when the caller may commit the Kafka offset.
         """
         raw_value = msg.value
         logger.debug("Processing message: topic=%s partition=%s offset=%s",
@@ -205,7 +241,7 @@ class KafkaConsumer:
                 exc.errors(),
             )
             await self._send_to_dlq(raw_value, msg)
-            return
+            return True
 
         # ── POST to Gateway with retry ─────────────────────────────────
         success = await self._post_with_retry(ingest_request)
@@ -216,6 +252,9 @@ class KafkaConsumer:
                 "offset NOT committed; Kafka will redeliver",
                 msg.offset,
             )
+            return False
+
+        return True
 
     async def _post_with_retry(self, ingest_request: IngestRequest) -> bool:
         """POST to ``/ingest`` with exponential-backoff retry.

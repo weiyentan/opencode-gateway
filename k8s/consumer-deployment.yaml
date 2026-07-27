@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: opencode-usage-consumer
-          image: ${REGISTRY}/opencode-gateway:${IMAGE_TAG}
+          image: ${REGISTRY}/opencode-gateway-consumer:${IMAGE_TAG}
           command: ["python", "-m", "app.consumer"]
           env:
             - name: GATEWAY_BASE_URL

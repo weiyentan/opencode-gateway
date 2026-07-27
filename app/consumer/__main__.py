@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.consumer.consumer import KafkaConsumer
-from app.core.config import Settings
+from app.consumer.consumer import ConsumerSettings, KafkaConsumer
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +17,7 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    settings = Settings()
+    settings = ConsumerSettings.from_env()
 
     if not settings.kafka_brokers:
         logger.error("GATEWAY_KAFKA_BROKERS is required but not set.")
@@ -31,7 +30,7 @@ def main() -> None:
     consumer = KafkaConsumer(settings)
 
     try:
-        asyncio.run(consumer.start())
+        asyncio.run(consumer.run())
     except KeyboardInterrupt:
         pass
 

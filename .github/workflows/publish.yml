@@ -1,19 +1,22 @@
-# ── Publish Gateway and Aurora Glass ──────────────────────────────────────────
-# Builds and publishes separate container images for the two modules that
+# ── Publish Gateway, Aurora Glass, and Consumer ───────────────────────────────
+# Builds and publishes separate container images for the modules that
 # together form the OpenCode Gateway observability platform:
 #
-#   Gateway      (root Dockerfile)           — Python/FastAPI REST API
-#   Aurora Glass (frontend/Dockerfile)       — browser-based telemetry dashboard
+#   Gateway      (root Dockerfile)             — Python/FastAPI REST API
+#   Aurora Glass (frontend/Dockerfile)          — browser-based telemetry dashboard
+#   Consumer     (Dockerfile.consumer)          — Kafka consumer for usage events
 #
-# Both images are built from the same repository revision and receive
+# All images are built from the same repository revision and receive
 # identical version tags (semver, SHA) so they are always deployed together.
 # On pull_request events the images are built but not pushed.
 #
 # Architecture: Gateway serves the observability API; Aurora Glass is a
 # separate frontend that consumes the Gateway API — see CONTEXT.md.
+# The Consumer runs independently, consuming Kafka messages and forwarding
+# them to the Gateway ingest endpoint.
 # ──────────────────────────────────────────────────────────────────────────────
 
-name: Publish Gateway and Aurora Glass
+name: Publish Gateway, Aurora Glass, and Consumer
 
 on:
   push:
@@ -37,6 +40,9 @@ jobs:
           - name: aurora-glass
             context: .
             dockerfile: frontend/Dockerfile
+          - name: consumer
+            context: .
+            dockerfile: Dockerfile.consumer
     steps:
       - uses: actions/checkout@v4
 
