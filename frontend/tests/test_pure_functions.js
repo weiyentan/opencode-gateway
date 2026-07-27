@@ -448,6 +448,81 @@ console.log('\u25B6 formatRangeLabel');
   assert(formatRangeLabel(undefined, undefined) === '--', 'undefined inputs → --');
 })();
 
+// ── Date-range helper: resolveDateRange ──────────────────────────────
+
+/**
+ * Resolve a date range from state, handling both preset and custom.
+ * This is a wrapper that either delegates to computeDateRange for named
+ * presets or constructs Date objects from custom date strings.
+ * @param {Object} state - { preset, customStartDate?, customEndDate? }
+ * @returns {{ startDate: Date, endDate: Date }}
+ */
+function resolveDateRange(state) {
+  if (state.preset === 'custom' && state.customStartDate && state.customEndDate) {
+    return {
+      startDate: new Date(state.customStartDate + 'T00:00:00Z'),
+      endDate: new Date(state.customEndDate + 'T23:59:59Z')
+    };
+  }
+  return computeDateRange(state.preset);
+}
+
+console.log('\u25B6 resolveDateRange');
+
+(function () {
+  // Preset delegation
+  var refDate = new Date(2026, 6, 27, 14, 30, 0, 0);
+  var origCompute = computeDateRange;
+
+  // Temporarily override Date.now for preset test
+  var state = { preset: 'last-7-days' };
+  var r = resolveDateRange(state);
+  assert(r.startDate instanceof Date, 'preset: startDate is a Date');
+  assert(r.endDate instanceof Date, 'preset: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'preset: startDate <= endDate');
+})();
+
+(function () {
+  // Custom date range
+  var state = {
+    preset: 'custom',
+    customStartDate: '2026-06-01',
+    customEndDate: '2026-06-30'
+  };
+  var r = resolveDateRange(state);
+  assert(r.startDate instanceof Date, 'custom: startDate is a Date');
+  assert(r.endDate instanceof Date, 'custom: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'custom: startDate <= endDate');
+  assert(r.startDate.getUTCFullYear() === 2026, 'custom: startDate year is 2026');
+  assert(r.startDate.getUTCMonth() === 5, 'custom: startDate month is June (5)');
+  assert(r.startDate.getUTCDate() === 1, 'custom: startDate day is 1');
+  assert(r.endDate.getUTCFullYear() === 2026, 'custom: endDate year is 2026');
+  assert(r.endDate.getUTCMonth() === 5, 'custom: endDate month is June (5)');
+  assert(r.endDate.getUTCDate() === 30, 'custom: endDate day is 30');
+  // Check UTC hours — T00:00:00Z for start, T23:59:59Z for end
+  assert(r.startDate.getUTCHours() === 0, 'custom: startDate UTC hours is 0');
+  assert(r.endDate.getUTCHours() === 23, 'custom: endDate UTC hours is 23');
+  assert(r.endDate.getUTCMinutes() === 59, 'custom: endDate UTC minutes is 59');
+  assert(r.endDate.getUTCSeconds() === 59, 'custom: endDate UTC seconds is 59');
+})();
+
+(function () {
+  // Custom with missing dates falls back to preset
+  var state = { preset: 'custom' };
+  var r = resolveDateRange(state);
+  // Should fall back to default (this-month) behavior
+  assert(r.startDate instanceof Date, 'custom no dates: startDate is a Date');
+  assert(r.endDate instanceof Date, 'custom no dates: endDate is a Date');
+})();
+
+(function () {
+  // Custom with only start date falls back to preset
+  var state = { preset: 'custom', customStartDate: '2026-06-01' };
+  var r = resolveDateRange(state);
+  assert(r.startDate instanceof Date, 'custom partial: startDate is a Date');
+  assert(r.endDate instanceof Date, 'custom partial: endDate is a Date');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 
 console.log('');

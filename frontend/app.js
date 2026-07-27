@@ -76,6 +76,12 @@
     sdDetailTitle:   $('sd-detail-title'),
     sdDetailBody:    $('sd-detail-body'),
     sdDetailClose:   $('sd-detail-close'),
+
+    // Date range bar
+    drPreset:       $('dr-preset'),
+    drCustomInputs: $('dr-custom-inputs'),
+    drStartDate:    $('dr-start-date'),
+    drEndDate:      $('dr-end-date'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -88,6 +94,23 @@
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
+  /**
+   * Resolve date range from state, handling both preset and custom.
+   * Delegates to computeDateRange for named presets; constructs Date
+   * objects from custom date strings when preset is 'custom'.
+   * @param {Object} state - { preset, customStartDate?, customEndDate? }
+   * @returns {{ startDate: Date, endDate: Date }}
+   */
+  function resolveDateRange(state) {
+    if (state.preset === 'custom' && state.customStartDate && state.customEndDate) {
+      return {
+        startDate: new Date(state.customStartDate + 'T00:00:00Z'),
+        endDate: new Date(state.customEndDate + 'T23:59:59Z')
+      };
+    }
+    return computeDateRange(state.preset);
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /** ISO-8601 date string for N days ago at midnight UTC */
@@ -319,7 +342,7 @@
   }
 
   async function fetchAll() {
-    var _dateRange = computeDateRange(dateRangeState.preset);
+    var _dateRange = resolveDateRange(dateRangeState);
     const aggStart = _dateRange.startDate.toISOString();
     const aggEnd = _dateRange.endDate.toISOString();
 
@@ -1326,9 +1349,66 @@
     });
   }
 
+  // ── Date Range Bar Handlers ─────────────────────────────────────────
+
+  function setupDateRangeHandlers() {
+    // Preset dropdown
+    if (els.drPreset) {
+      // Sync dropdown to current state on initial load
+      els.drPreset.value = dateRangeState.preset || 'this-month';
+      if (els.drPreset.value === 'custom') {
+        if (els.drCustomInputs) els.drCustomInputs.style.display = 'flex';
+        if (els.drStartDate && dateRangeState.customStartDate) els.drStartDate.value = dateRangeState.customStartDate;
+        if (els.drEndDate && dateRangeState.customEndDate) els.drEndDate.value = dateRangeState.customEndDate;
+      }
+
+      els.drPreset.addEventListener('change', function () {
+        var preset = els.drPreset.value;
+        dateRangeState.preset = preset;
+
+        if (preset === 'custom') {
+          // Show custom date inputs
+          if (els.drCustomInputs) els.drCustomInputs.style.display = 'flex';
+          // Don't refresh yet — wait for both date inputs
+        } else {
+          // Hide custom date inputs and clear custom state
+          if (els.drCustomInputs) els.drCustomInputs.style.display = 'none';
+          delete dateRangeState.customStartDate;
+          delete dateRangeState.customEndDate;
+          // Refresh with the selected preset immediately
+          refreshDashboard();
+        }
+      });
+    }
+
+    // Custom start date input
+    if (els.drStartDate) {
+      els.drStartDate.addEventListener('change', function () {
+        dateRangeState.customStartDate = els.drStartDate.value;
+        maybeApplyCustomRange();
+      });
+    }
+
+    // Custom end date input
+    if (els.drEndDate) {
+      els.drEndDate.addEventListener('change', function () {
+        dateRangeState.customEndDate = els.drEndDate.value;
+        maybeApplyCustomRange();
+      });
+    }
+  }
+
+  /** Trigger a dashboard refresh when both custom date inputs have values */
+  function maybeApplyCustomRange() {
+    if (dateRangeState.customStartDate && dateRangeState.customEndDate) {
+      refreshDashboard();
+    }
+  }
+
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
     setupTabNavigation();
+    setupDateRangeHandlers();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();
