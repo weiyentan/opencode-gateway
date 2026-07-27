@@ -687,6 +687,16 @@ td.clickable:hover {
   color: var(--accent-cyan);
 }
 
+/* Session row clickable (for session detail panel) */
+.session-row {
+  cursor: pointer;
+  transition: background var(--transition);
+}
+
+.session-row:hover td {
+  background: rgba(124, 140, 255, 0.06);
+}
+
 /* Status badges for agent runs */
 .badge-running   { background: rgba(94, 242, 255, 0.15); color: var(--accent-cyan); }
 .badge-completed { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
@@ -867,6 +877,12 @@ td.clickable:hover {
 
 .detail-todo-icon.in_progress {
   color: var(--accent-cyan);
+}
+
+.detail-todo-priority {
+  color: var(--text-muted);
+  font-size: 0.65rem;
+  margin-left: 4px;
 }
 
 .detail-loki-link {

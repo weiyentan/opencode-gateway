@@ -67,6 +67,12 @@
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
     arDetailClose:  $('ar-detail-close'),
+
+    // Session detail
+    sdDetailOverlay: $('sd-detail-overlay'),
+    sdDetailTitle:   $('sd-detail-title'),
+    sdDetailBody:    $('sd-detail-body'),
+    sdDetailClose:   $('sd-detail-close'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -636,7 +642,7 @@
       var duration = fmtDuration(s.first_message_at, s.last_message_at);
       var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
-      html += '<tr>' +
+      html += '<tr class="session-row" data-id="' + s.id + '">' +
         '<td>' + escHtml(clientName) + '</td>' +
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
         '<td>' + fmtDT(s.last_message_at) + '</td>' +
@@ -649,6 +655,15 @@
     });
 
     els.sessionsTbody.innerHTML = html;
+
+    // Attach click handlers for session detail view
+    var sessionRows = els.sessionsTbody.querySelectorAll('.session-row');
+    sessionRows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-id');
+        if (id) openSessionDetail(id);
+      });
+    });
   }
 
   /** Agent Runs Table */
@@ -837,6 +852,117 @@
     els.arDetailBody.innerHTML = html;
   }
 
+  /** Fetch and display session detail */
+  async function openSessionDetail(sessionId) {
+    els.sdDetailOverlay.classList.add('visible');
+    els.sdDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    els.sdDetailTitle.textContent = 'Session Detail';
+
+    try {
+      var data = await apiFetch('/api/v1/usage/agent-runs/' + encodeURIComponent(sessionId));
+      renderSessionDetail(data);
+    } catch (e) {
+      els.sdDetailBody.innerHTML = '<p class="empty-state">Failed to load detail: ' + escHtml(e.message) + '</p>';
+      console.error('Session detail fetch error:', e);
+    }
+  }
+
+  /** Close the session detail overlay */
+  function closeSessionDetail() {
+    els.sdDetailOverlay.classList.remove('visible');
+  }
+
+  /** Render Session Detail Panel */
+  function renderSessionDetail(d) {
+    if (!d) {
+      els.sdDetailBody.innerHTML = '<p class="empty-state">No detail data available</p>';
+      return;
+    }
+
+    els.sdDetailTitle.textContent = escHtml(d.title || 'Session Detail');
+
+    var duration = fmtDuration(d.first_message_at, d.last_message_at);
+    var projectStr = d.project_id || d.workspace_id || '--';
+    if (d.project_id && d.workspace_id && d.workspace_id !== d.project_id) {
+      projectStr = d.project_id + ' / ' + d.workspace_id;
+    }
+
+    // Extract session context fields
+    var ctx = d.session_context || {};
+    var model = ctx.session_model || '--';
+    var additions = ctx.code_change_additions != null ? Number(ctx.code_change_additions) : 0;
+    var deletions = ctx.code_change_deletions != null ? Number(ctx.code_change_deletions) : 0;
+    var netChange = additions - deletions;
+    var netLabel = netChange >= 0 ? '+' + fmtNum(netChange) : fmtNum(netChange);
+
+    var html = '';
+
+    // ── Project ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Project</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Project / Worktree', escHtml(projectStr)) +
+        fieldHtml('Source Directory', escHtml(ctx.source_directory || '--')) +
+      '</div></div>';
+
+    // ── Code Changes ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Code Changes</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Files Changed', fmtCodeChanges(d.code_changes_total)) +
+        fieldHtml('Additions', fmtNum(additions || 0)) +
+        fieldHtml('Deletions', fmtNum(deletions || 0)) +
+        fieldHtml('Net Change', netLabel) +
+      '</div></div>';
+
+    // ── Todos ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
+    if (d.todo_rows && d.todo_rows.length > 0) {
+      html += '<div class="detail-todo-list">';
+      d.todo_rows.forEach(function (t) {
+        var iconCls = t.status || 'pending';
+        var iconMap = { completed: '\u2713', blocked: '\u2717', in_progress: '\u25D4', pending: '\u25CB' };
+        var icon = iconMap[iconCls] || '\u25CB';
+        var priorityMark = t.priority
+          ? ' <span class="detail-todo-priority">[' + escHtml(t.priority) + ']</span>'
+          : '';
+        html += '<div class="detail-todo-item">' +
+          '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
+          '<span>' + escHtml(t.description) + priorityMark + '</span>' +
+          '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div class="detail-field-value" style="color:var(--text-muted)">No todos recorded</div>';
+    }
+    html += '</div>';
+
+    // ── Session Metadata ──
+    html += '<div class="detail-section">' +
+      '<div class="detail-section-title">Session Metadata</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Model', escHtml(model)) +
+        fieldHtml('Agent', escHtml(d.agent || '--')) +
+        fieldHtml('Duration', duration) +
+        fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
+        fieldHtml('First Message', fmtDT(d.first_message_at)) +
+        fieldHtml('Last Message', fmtDT(d.last_message_at)) +
+        fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
+        fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
+        fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
+      '</div></div>';
+
+    // ── Drill-down Link ──
+    if (d.loki_search_url) {
+      html += '<div class="detail-section">' +
+        '<a href="' + escHtml(d.loki_search_url) + '" target="_blank" rel="noopener" class="detail-loki-link">' +
+        '\u2197 Open in Grafana Explore</a></div>';
+    }
+
+    els.sdDetailBody.innerHTML = html;
+  }
+
   /** Helper: build a detail grid field row */
   function fieldHtml(label, value) {
     return '<div class="detail-field">' +
@@ -931,7 +1057,7 @@
       els.arFilterApply.addEventListener('click', applyFilters);
     }
 
-    // Detail close button
+    // Agent run detail close button
     if (els.arDetailClose) {
       els.arDetailClose.addEventListener('click', function () {
         els.arDetailOverlay.classList.remove('visible');
@@ -939,7 +1065,7 @@
       });
     }
 
-    // Overlay click to close
+    // Agent run detail overlay click to close
     if (els.arDetailOverlay) {
       els.arDetailOverlay.addEventListener('click', function (e) {
         if (e.target === els.arDetailOverlay) {
@@ -948,6 +1074,32 @@
         }
       });
     }
+
+    // Session detail close button
+    if (els.sdDetailClose) {
+      els.sdDetailClose.addEventListener('click', closeSessionDetail);
+    }
+
+    // Session detail overlay click to close
+    if (els.sdDetailOverlay) {
+      els.sdDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.sdDetailOverlay) {
+          closeSessionDetail();
+        }
+      });
+    }
+
+    // ESC key to close any open overlay
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') {
+        if (els.sdDetailOverlay && els.sdDetailOverlay.classList.contains('visible')) {
+          closeSessionDetail();
+        } else if (els.arDetailOverlay && els.arDetailOverlay.classList.contains('visible')) {
+          els.arDetailOverlay.classList.remove('visible');
+          agentRunDetail = null;
+        }
+      }
+    });
 
     // Enter key on agent filter triggers apply
     if (els.arFilterAgent) {
