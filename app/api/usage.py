@@ -929,6 +929,70 @@ async def _fetch_agent_run_detail(
         has_parent=session_row["parent_session_id"] is not None,
     )
 
+    # ── Query session context projection ────────────────────────────
+    ctx_row = await conn.fetchrow(
+        """SELECT
+            code_change_count,
+            code_change_additions,
+            code_change_deletions,
+            session_model,
+            session_cost,
+            title,
+            source_directory,
+            source_path,
+            source_input_tokens,
+            source_output_tokens,
+            source_cached_tokens,
+            source_reasoning_tokens
+        FROM opencode_session_contexts
+        WHERE source_database_id = $1 AND external_session_id = $2""",
+        session_row["source_database_id"],
+        session_row["external_session_id"],
+    )
+
+    # ── Query todo snapshots ──────────────────────────────────────
+    todo_rows_raw = await conn.fetch(
+        """SELECT content, status, priority, position
+        FROM opencode_session_todos
+        WHERE source_database_id = $1 AND external_session_id = $2
+        ORDER BY position""",
+        session_row["source_database_id"],
+        session_row["external_session_id"],
+    )
+
+    # ── Compute todo aggregates ────────────────────────────────────
+    todos: list[TodoRow] = [
+        TodoRow(
+            description=tr["content"],
+            status=tr["status"] or "pending",
+        )
+        for tr in todo_rows_raw
+    ]
+    todo_total = len(todos)
+    todo_completed = sum(
+        1 for tr in todo_rows_raw if tr["status"] == "completed"
+    )
+    todo_blocked = sum(
+        1 for tr in todo_rows_raw if tr["status"] == "blocked"
+    )
+
+    # ── Code change totals from session context ─────────────────────
+    code_changes_total: int = (
+        ctx_row["code_change_count"] if ctx_row else 0
+    ) or 0
+
+    # ── Build session context dict ──────────────────────────────────
+    session_context: dict[str, object] | None = None
+    if ctx_row:
+        session_context = {
+            "session_model": ctx_row["session_model"],
+            "title": ctx_row["title"],
+            "source_directory": ctx_row["source_directory"],
+            "source_path": ctx_row["source_path"],
+            "code_change_additions": ctx_row["code_change_additions"],
+            "code_change_deletions": ctx_row["code_change_deletions"],
+        }
+
     # ── Build detail ─────────────────────────────────────────────────
     return AgentRunDetail(
         id=session_row["id"],
@@ -945,12 +1009,12 @@ async def _fetch_agent_run_detail(
         parent_session_id=parent_external_id,
         parent_internal_id=parent_internal_id,
         child_summaries=child_summaries,
-        todo_rows=[],  # placeholder — no todo snapshots table yet
-        todo_total=0,
-        todo_completed=0,
-        todo_blocked=0,
-        code_changes_total=0,
-        session_context=None,  # placeholder — no session_context table yet
+        todo_rows=todos,
+        todo_total=todo_total,
+        todo_completed=todo_completed,
+        todo_blocked=todo_blocked,
+        code_changes_total=code_changes_total,
+        session_context=session_context,
         message_count=session_row["message_count"],
         total_input_tokens=session_row["total_input_tokens"],
         total_output_tokens=session_row["total_output_tokens"],
