@@ -165,8 +165,8 @@ async def _fetch_aggregates(
                 COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
                 SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
                 COUNT(*) AS record_count,
-                0 AS session_count,
-                0 AS model_count
+                COUNT(DISTINCT our.session_id) AS session_count,
+                COUNT(DISTINCT om.model_name) AS model_count
             FROM opencode_usage_records our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id

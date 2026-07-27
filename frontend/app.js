@@ -88,8 +88,6 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
-  let aggClientProject = null;    // client+project aggregate rows
-
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /** ISO-8601 date string for N days ago at midnight UTC */
@@ -827,8 +825,6 @@
       });
     });
 
-    // Store for later re-rendering
-    aggClientProject = data.aggClientProject;
   }
   async function openAgentRunDetail(sessionId) {
     // Show overlay
