@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 from typing import Any
 
@@ -19,7 +20,6 @@ from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from app.consumer.models import IngestRequest
-from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +81,7 @@ class Consumer:
 
     @classmethod
     def from_env(cls) -> Consumer:
-        """Create a Consumer from environment variables using the Settings class.
-
-        Uses :class:`Settings` from ``app.core.config`` as the single source
-        of truth for env-var mappings, defaults, and validation.
+        """Create a Consumer from environment variables.
 
         Required env vars:
             ``GATEWAY_KAFKA_BROKERS``, ``GATEWAY_BASE_URL``,
@@ -94,14 +91,16 @@ class Consumer:
             ``GATEWAY_KAFKA_TOPIC``, ``GATEWAY_KAFKA_DLQ_TOPIC``,
             ``GATEWAY_CONSUMER_GROUP_ID``
         """
-        settings = Settings()
+        kafka_brokers = os.getenv("GATEWAY_KAFKA_BROKERS", "")
+        base_url = os.getenv("GATEWAY_BASE_URL", "")
+        collector_token = os.getenv("GATEWAY_COLLECTOR_TOKEN", "")
 
         missing: list[str] = []
-        if not settings.kafka_brokers:
+        if not kafka_brokers:
             missing.append("GATEWAY_KAFKA_BROKERS")
-        if not settings.base_url:
+        if not base_url:
             missing.append("GATEWAY_BASE_URL")
-        if not settings.collector_token:
+        if not collector_token:
             missing.append("GATEWAY_COLLECTOR_TOKEN")
 
         if missing:
@@ -110,12 +109,12 @@ class Consumer:
             )
 
         return cls(
-            kafka_brokers=settings.kafka_brokers,
-            gateway_base_url=settings.base_url,
-            gateway_collector_token=settings.collector_token,
-            kafka_topic=settings.kafka_topic,
-            kafka_dlq_topic=settings.kafka_dlq_topic,
-            consumer_group_id=settings.consumer_group_id,
+            kafka_brokers=kafka_brokers,
+            gateway_base_url=base_url,
+            gateway_collector_token=collector_token,
+            kafka_topic=os.getenv("GATEWAY_KAFKA_TOPIC", _DEFAULT_KAFKA_TOPIC),
+            kafka_dlq_topic=os.getenv("GATEWAY_KAFKA_DLQ_TOPIC", _DEFAULT_KAFKA_DLQ_TOPIC),
+            consumer_group_id=os.getenv("GATEWAY_CONSUMER_GROUP_ID", _DEFAULT_CONSUMER_GROUP_ID),
         )
 
     # ── Lifecycle ──────────────────────────────────────────────────────
@@ -180,7 +179,7 @@ class Consumer:
                             iterator.__anext__(),
                             timeout=1.0,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         continue  # re-check _running
                     except StopAsyncIteration:
                         break

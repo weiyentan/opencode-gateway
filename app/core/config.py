@@ -95,19 +95,6 @@ class Settings(BaseSettings):
     # sensitive information embedded in field values.
     log_validation_detail: bool = False
 
-    # Kafka consumer — bridges usage records to the Gateway ingest API.
-    # The consumer runs as a separate container alongside the Gateway
-    # and reads from the ``opencode-usage`` topic.
-    kafka_brokers: str = "localhost:9092"
-    kafka_topic: str = "opencode-usage"
-    kafka_dlq_topic: str = "opencode-usage-dlq"
-    consumer_group_id: str = "opencode-gateway"
-
-    # Gateway URL and collector token for the Kafka consumer to POST to
-    # the Gateway's /ingest endpoint.
-    base_url: str = "http://localhost:8000"
-    collector_token: str = ""
-
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
