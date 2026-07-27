@@ -12,8 +12,6 @@
     document.querySelector('meta[name="refresh-interval"]')?.getAttribute('content'),
     10
   ) || 30000; // 30s default; override via <meta name="refresh-interval" content="...">
-  const AGG_WINDOW_DAYS = 30;        // window for aggregates (KPIs + model mix)
-  const SESSION_WINDOW_DAYS = 7;     // window for sessions
   const RECORD_LIMIT = 100;
   const SESSION_LIMIT = 20;
   const CLIENT_LIMIT = 100;
@@ -69,8 +67,9 @@
     arDetailClose:  $('ar-detail-close'),
 
     // Client/Project
-    cpTbody:        $('cp-tbody'),
-    cpWindowDays:   $('cp-window-days'),
+    cpTbody:         $('cp-tbody'),
+    cpWindowDays:    $('cp-window-days'),
+    cpPanelSubtitle: $('cp-panel-subtitle'),
 
     // Session detail
     sdDetailOverlay: $('sd-detail-overlay'),
@@ -88,6 +87,7 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
+  let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /** ISO-8601 date string for N days ago at midnight UTC */
@@ -142,6 +142,76 @@
     if (mins < 60) return mins + 'm ago';
     if (hrs < 24)  return hrs + 'h ago';
     return days + 'd ago';
+  }
+
+  // ── Date-range engine ──────────────────────────────────────────────────
+
+  /**
+   * Compute a start/end Date range from a named preset.
+   * @param {string} preset - 'this-month', 'last-month', 'last-30-days', 'last-7-days'
+   * @returns {{ startDate: Date, endDate: Date }}
+   */
+  function computeDateRange(preset) {
+    var now = new Date();
+    var startDate, endDate;
+
+    switch (preset) {
+      case 'this-month':
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        startDate.setHours(0, 0, 0, 0);
+        endDate = now;
+        break;
+      case 'last-month':
+        startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        startDate.setHours(0, 0, 0, 0);
+        endDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        endDate.setHours(0, 0, 0, 0);
+        break;
+      case 'last-30-days':
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        startDate.setHours(0, 0, 0, 0);
+        endDate = now;
+        break;
+      case 'last-7-days':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        startDate.setHours(0, 0, 0, 0);
+        endDate = now;
+        break;
+      default:
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        startDate.setHours(0, 0, 0, 0);
+        endDate = now;
+    }
+
+    return { startDate: startDate, endDate: endDate };
+  }
+
+  /**
+   * Format a date range as a human-readable label.
+   * @param {Date} startDate
+   * @param {Date} endDate
+   * @returns {string} e.g. "Jul 1\u201327, 2026"
+   */
+  function formatRangeLabel(startDate, endDate) {
+    if (!startDate || !endDate) return '--';
+    var monthDayOpts = { month: 'short', day: 'numeric' };
+    var fullOpts = { month: 'short', day: 'numeric', year: 'numeric' };
+    var startYear = startDate.getFullYear();
+    var endYear = endDate.getFullYear();
+    var startMonth = startDate.getMonth();
+    var endMonth = endDate.getMonth();
+
+    if (startYear === endYear && startMonth === endMonth) {
+      // Same month and year: "Jul 1\u201327, 2026"
+      var m = startDate.toLocaleDateString('en-US', { month: 'short' });
+      return m + ' ' + startDate.getDate() + '\u2013' + endDate.getDate() + ', ' + startYear;
+    } else if (startYear === endYear) {
+      // Different months, same year: "Jun 28\u2013Jul 27, 2026"
+      return startDate.toLocaleDateString('en-US', monthDayOpts) + '\u2013' + endDate.toLocaleDateString('en-US', monthDayOpts) + ', ' + startYear;
+    } else {
+      // Different years: "Dec 28, 2025\u2013Jan 27, 2026"
+      return startDate.toLocaleDateString('en-US', fullOpts) + '\u2013' + endDate.toLocaleDateString('en-US', fullOpts);
+    }
   }
 
   /** Format a short datetime */
@@ -249,10 +319,9 @@
   }
 
   async function fetchAll() {
-    const aggStart = daysAgo(AGG_WINDOW_DAYS);
-    const aggEnd = nowISO();
-    const sessStart = daysAgo(SESSION_WINDOW_DAYS);
-    const sessEnd = nowISO();
+    var _dateRange = computeDateRange(dateRangeState.preset);
+    const aggStart = _dateRange.startDate.toISOString();
+    const aggEnd = _dateRange.endDate.toISOString();
 
     const results = {};
     fetchErrors = {};  // Clear previous errors
@@ -267,7 +336,7 @@
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
-          apiFetch('/api/v1/usage/sessions?start_date=' + sessStart + '&end_date=' + sessEnd + '&limit=' + SESSION_LIMIT),
+          apiFetch('/api/v1/usage/sessions?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + SESSION_LIMIT),
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
           apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
           apiFetch(arUrl),
@@ -293,6 +362,9 @@
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
       fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
+
+      // Attach date range for downstream render functions
+      results._dateRange = _dateRange;
 
       // Build client lookup from admin/clients
       if (results.clients && results.clients.items) {
@@ -366,20 +438,30 @@
 
   /** KPI Row */
   function renderKPIs(data) {
+    // Compute range label once for all KPI subtitles
+    var rangeLabel = '--';
+    if (data._dateRange) {
+      rangeLabel = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
+    }
+
+    // Set all KPI subtitles to the formatted range label
+    els.kpiTokensDetail.textContent = rangeLabel;
+    els.kpiCostDetail.textContent = rangeLabel;
+    els.kpiSessionsDetail.textContent = rangeLabel;
+    els.kpiCollectorsDetail.textContent = rangeLabel;
+    els.kpiSourceDbsDetail.textContent = rangeLabel;
+
     // Total tokens from aggregates total row
     if (data.aggTotal && data.aggTotal.length > 0) {
       var t = data.aggTotal[0];
       var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
       els.kpiTokens.textContent = fmtNum(totalTokens);
-      els.kpiTokensDetail.textContent = 'input ' + fmtNum(t.total_input_tokens) + ' / output ' + fmtNum(t.total_output_tokens);
       els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
-      els.kpiCostDetail.textContent = t.record_count + ' records';
     }
 
     // Sessions from sessions API
     if (data.sessions) {
       els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
-      els.kpiSessionsDetail.textContent = 'last ' + SESSION_WINDOW_DAYS + ' days';
     }
 
     // Collectors & source DBs from health
@@ -388,9 +470,7 @@
       var srcDbs = data.health.source_databases || [];
       var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
       els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
-      els.kpiCollectorsDetail.textContent = 'total ' + collectors.length + ' registered';
       els.kpiSourceDbs.textContent = fmtNum(srcDbs.length);
-      els.kpiSourceDbsDetail.textContent = srcDbs.filter(function (d) { return d.health === 'healthy'; }).length + ' healthy';
     }
   }
 
@@ -636,7 +716,7 @@
   /** Recent Sessions */
   function renderSessionsTable(data) {
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
-      els.sessionsTbody.innerHTML = '<tr><td colspan="8" class="empty-state">No sessions in the last ' + SESSION_WINDOW_DAYS + ' days' + errorIndicator('sessions') + '</td></tr>';
+      els.sessionsTbody.innerHTML = '<tr><td colspan="8" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
       return;
     }
 
@@ -723,9 +803,9 @@
   function renderClientProjectBreakdown(data) {
     var rows = data && data.aggClientProject || [];
 
-    // Update window days display
-    if (els.cpWindowDays) {
-      els.cpWindowDays.textContent = AGG_WINDOW_DAYS;
+    // Update panel subtitle with formatted range label
+    if (els.cpPanelSubtitle && data._dateRange) {
+      els.cpPanelSubtitle.textContent = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
     }
 
     if (rows.length === 0) {

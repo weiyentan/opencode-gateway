@@ -97,6 +97,77 @@ function shortUUID(id) {
   return String(id).substring(0, 8);
 }
 
+// ── Date-range pure functions (duplicated from app.js for testability) ──
+
+/**
+ * Compute a start/end Date range from a named preset.
+ * @param {string} preset - 'this-month', 'last-month', 'last-30-days', 'last-7-days'
+ * @param {Date} [now] - reference date (for testing); defaults to new Date()
+ * @returns {{ startDate: Date, endDate: Date }}
+ */
+function computeDateRange(preset, now) {
+  now = now || new Date();
+  var startDate, endDate;
+
+  switch (preset) {
+    case 'this-month':
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = now;
+      break;
+    case 'last-month':
+      startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate.setHours(0, 0, 0, 0);
+      break;
+    case 'last-30-days':
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = now;
+      break;
+    case 'last-7-days':
+      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = now;
+      break;
+    default:
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = now;
+  }
+
+  return { startDate: startDate, endDate: endDate };
+}
+
+/**
+ * Format a date range as a human-readable label.
+ * @param {Date} startDate
+ * @param {Date} endDate
+ * @returns {string} e.g. "Jul 1–27, 2026"
+ */
+function formatRangeLabel(startDate, endDate) {
+  if (!startDate || !endDate) return '--';
+  var monthDayOpts = { month: 'short', day: 'numeric' };
+  var fullOpts = { month: 'short', day: 'numeric', year: 'numeric' };
+  var startYear = startDate.getFullYear();
+  var endYear = endDate.getFullYear();
+  var startMonth = startDate.getMonth();
+  var endMonth = endDate.getMonth();
+
+  if (startYear === endYear && startMonth === endMonth) {
+    // Same month and year: "Jul 1–27, 2026"
+    var m = startDate.toLocaleDateString('en-US', { month: 'short' });
+    return m + ' ' + startDate.getDate() + '\u2013' + endDate.getDate() + ', ' + startYear;
+  } else if (startYear === endYear) {
+    // Different months, same year: "Jun 28–Jul 27, 2026"
+    return startDate.toLocaleDateString('en-US', monthDayOpts) + '\u2013' + endDate.toLocaleDateString('en-US', monthDayOpts) + ', ' + startYear;
+  } else {
+    // Different years: "Dec 28, 2025–Jan 27, 2026"
+    return startDate.toLocaleDateString('en-US', fullOpts) + '\u2013' + endDate.toLocaleDateString('en-US', fullOpts);
+  }
+}
+
 // ── Simple test runner ──────────────────────────────────────────────────
 
 let passed = 0;
@@ -248,6 +319,134 @@ assert(shortUUID(undefined) === '--', 'undefined → --');
 assert(shortUUID('') === '--', 'empty → --');
 assert(shortUUID('550e8400-e29b-41d4-a716-446655440000') === '550e8400', 'UUID truncated to 8 chars');
 assert(shortUUID('abc') === 'abc', 'short string returned as-is');
+
+// ── Tests for computeDateRange ──────────────────────────────────────────
+
+console.log('\u25B6 computeDateRange');
+
+// Use fixed reference date: 2026-07-27 14:30:00 local
+var refDate = new Date(2026, 6, 27, 14, 30, 0, 0);
+
+(function () {
+  var r = computeDateRange('this-month', refDate);
+  assert(r.startDate instanceof Date, 'this-month: startDate is a Date');
+  assert(r.endDate instanceof Date, 'this-month: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'this-month: startDate <= endDate');
+  assert(r.startDate.getFullYear() === 2026, 'this-month: startDate year is 2026');
+  assert(r.startDate.getMonth() === 6, 'this-month: startDate month is July (6)');
+  assert(r.startDate.getDate() === 1, 'this-month: startDate day is 1');
+  assert(r.startDate.getHours() === 0, 'this-month: startDate hours is 0');
+  assert(r.startDate.getMinutes() === 0, 'this-month: startDate minutes is 0');
+  assert(r.endDate.getTime() === refDate.getTime(), 'this-month: endDate === refDate');
+})();
+
+(function () {
+  var r = computeDateRange('last-month', refDate);
+  assert(r.startDate instanceof Date, 'last-month: startDate is a Date');
+  assert(r.endDate instanceof Date, 'last-month: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'last-month: startDate <= endDate');
+  assert(r.startDate.getFullYear() === 2026, 'last-month: startDate year is 2026');
+  assert(r.startDate.getMonth() === 5, 'last-month: startDate month is June (5)');
+  assert(r.startDate.getDate() === 1, 'last-month: startDate day is 1');
+  assert(r.endDate.getFullYear() === 2026, 'last-month: endDate year is 2026');
+  assert(r.endDate.getMonth() === 6, 'last-month: endDate month is July (6)');
+  assert(r.endDate.getDate() === 1, 'last-month: endDate day is 1');
+  assert(r.endDate.getHours() === 0, 'last-month: endDate hours is 0');
+})();
+
+(function () {
+  var r = computeDateRange('last-30-days', refDate);
+  // 30 days before July 27 is June 27
+  assert(r.startDate instanceof Date, 'last-30-days: startDate is a Date');
+  assert(r.endDate instanceof Date, 'last-30-days: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'last-30-days: startDate <= endDate');
+  assert(r.startDate.getFullYear() === 2026, 'last-30-days: startDate year is 2026');
+  assert(r.startDate.getMonth() === 5, 'last-30-days: startDate month is June (5)');
+  assert(r.startDate.getDate() === 27, 'last-30-days: startDate day is 27');
+  assert(r.startDate.getHours() === 0, 'last-30-days: startDate hours is 0');
+  assert(r.startDate.getMinutes() === 0, 'last-30-days: startDate minutes is 0');
+  assert(r.endDate.getTime() === refDate.getTime(), 'last-30-days: endDate === refDate');
+})();
+
+(function () {
+  var r = computeDateRange('last-7-days', refDate);
+  // 7 days before July 27 is July 20
+  assert(r.startDate instanceof Date, 'last-7-days: startDate is a Date');
+  assert(r.endDate instanceof Date, 'last-7-days: endDate is a Date');
+  assert(r.startDate <= r.endDate, 'last-7-days: startDate <= endDate');
+  assert(r.startDate.getFullYear() === 2026, 'last-7-days: startDate year is 2026');
+  assert(r.startDate.getMonth() === 6, 'last-7-days: startDate month is July (6)');
+  assert(r.startDate.getDate() === 20, 'last-7-days: startDate day is 20');
+  assert(r.startDate.getHours() === 0, 'last-7-days: startDate hours is 0');
+  assert(r.startDate.getMinutes() === 0, 'last-7-days: startDate minutes is 0');
+  assert(r.endDate.getTime() === refDate.getTime(), 'last-7-days: endDate === refDate');
+})();
+
+(function () {
+  var r = computeDateRange('unknown-preset', refDate);
+  assert(r.startDate instanceof Date, 'unknown preset: startDate is a Date');
+  assert(r.endDate instanceof Date, 'unknown preset: endDate is a Date');
+  // Default should fall back to this-month behavior
+  assert(r.startDate.getDate() === 1, 'unknown preset: defaults to 1st of month');
+  assert(r.startDate.getMonth() === 6, 'unknown preset: defaults to July');
+})();
+
+(function () {
+  // January test for last-month crossing year boundary
+  var janRef = new Date(2026, 0, 15, 12, 0, 0, 0); // Jan 15, 2026
+  var r = computeDateRange('last-month', janRef);
+  assert(r.startDate.getFullYear() === 2025, 'last-month (Jan): startDate year is 2025');
+  assert(r.startDate.getMonth() === 11, 'last-month (Jan): startDate month is December (11)');
+  assert(r.startDate.getDate() === 1, 'last-month (Jan): startDate day is 1');
+  assert(r.endDate.getFullYear() === 2026, 'last-month (Jan): endDate year is 2026');
+  assert(r.endDate.getMonth() === 0, 'last-month (Jan): endDate month is January (0)');
+  assert(r.endDate.getDate() === 1, 'last-month (Jan): endDate day is 1');
+})();
+
+// ── Tests for formatRangeLabel ──────────────────────────────────────────
+
+console.log('\u25B6 formatRangeLabel');
+
+(function () {
+  // Same month and year: "Jul 1–27, 2026"
+  var start = new Date(2026, 6, 1);
+  var end = new Date(2026, 6, 27);
+  var label = formatRangeLabel(start, end);
+  assert(label.indexOf('Jul') !== -1, 'same month: contains month abbreviation');
+  assert(label.indexOf('1') !== -1, 'same month: contains start day');
+  assert(label.indexOf('27') !== -1, 'same month: contains end day');
+  assert(label.indexOf('2026') !== -1, 'same month: contains year');
+  assert(label.indexOf('\u2013') !== -1, 'same month: uses en-dash separator');
+})();
+
+(function () {
+  // Different months, same year: "Jun 28–Jul 27, 2026"
+  var start = new Date(2026, 5, 28);
+  var end = new Date(2026, 6, 27);
+  var label = formatRangeLabel(start, end);
+  assert(label.indexOf('Jun') !== -1, 'diff month same year: contains Jun');
+  assert(label.indexOf('Jul') !== -1, 'diff month same year: contains Jul');
+  assert(label.indexOf('2026') !== -1, 'diff month same year: contains year');
+  assert(label.indexOf('\u2013') !== -1, 'diff month same year: uses en-dash');
+})();
+
+(function () {
+  // Different years: "Dec 28, 2025–Jan 27, 2026"
+  var start = new Date(2025, 11, 28);
+  var end = new Date(2026, 0, 27);
+  var label = formatRangeLabel(start, end);
+  assert(label.indexOf('Dec') !== -1, 'diff year: contains Dec');
+  assert(label.indexOf('Jan') !== -1, 'diff year: contains Jan');
+  assert(label.indexOf('2025') !== -1, 'diff year: contains start year');
+  assert(label.indexOf('2026') !== -1, 'diff year: contains end year');
+  assert(label.indexOf('\u2013') !== -1, 'diff year: uses en-dash');
+})();
+
+(function () {
+  // Null/undefined protection
+  assert(formatRangeLabel(null, null) === '--', 'null inputs → --');
+  assert(formatRangeLabel(undefined, undefined) === '--', 'undefined inputs → --');
+})();
 
 // ── Summary ─────────────────────────────────────────────────────────────
 
