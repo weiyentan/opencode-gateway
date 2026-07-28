@@ -172,31 +172,16 @@ function fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, ca
   return html;
 }
 
-/** Format agent-run token cell (average cache read per call).
- *  Uses "uncached/output" label instead of "active".
- *  Omits average cache-read line when calls=0 or cacheRead=0.
+/** Format agent-run token cell using the shared compact Token Breakdown formatter.
+ *  Delegates to fmtTokenBreakdownCompact. Accepts cacheWriteTokens instead of callCount.
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
- *  @param {number|null} callCount
+ *  @param {number|null} cacheWriteTokens
  *  @returns {string} HTML for the cell content
  */
-function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, callCount) {
-  var input = inputTokens || 0;
-  var output = outputTokens || 0;
-  var calls = callCount || 0;
-
-  var uncachedOutput = input + output;
-  var averageCacheRead = calls > 0 ? (cacheReadTokens || 0) / calls : 0;
-
-  var html = fmtNum(uncachedOutput) + ' uncached/output' +
-    '<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
-
-  if (averageCacheRead > 0) {
-    html += '<br>avg cache read ' + fmtNum(averageCacheRead) + '/call';
-  }
-
-  return html;
+function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+  return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
 }
 
 // ── Date-range pure functions (duplicated from app.js for testability) ──
@@ -941,43 +926,55 @@ console.log('\u25B6 fmtTokenBreakdownCompact');
 
 console.log('\u25B6 fmtAgentRunTokens');
 
-// Normal averaging
+// Delegates to shared formatter — full cache hit with cache write
 (function () {
   var result = fmtAgentRunTokens(34900, 5100, 755500, 32);
-  assert(result === '40.0K uncached/output<br>in 34.9K \u00B7 out 5.1K<br>avg cache read 23.6K/call', 'normal averaging: 755500/32 = 23609.375 → 23.6K/call');
+  assert(result === '34.9K in / 5.1K out<br>cache hit 755.5K in / cache write 32 in', 'delegates to shared formatter: total cache hit + write');
 })();
 
-// Zero calls (no division by zero)
+// Cache hit without write (cacheWrite=0)
 (function () {
   var result = fmtAgentRunTokens(1000, 500, 50000, 0);
-  assert(result === '1.5K uncached/output<br>in 1.0K \u00B7 out 500', 'zero calls → no average line');
+  assert(result === '1.0K in / 500 out<br>cache hit 50.0K in', 'cache hit without write: no cache write line');
 })();
 
 // Null/missing values
 (function () {
   var result = fmtAgentRunTokens(null, null, null, null);
-  assert(result === '0 uncached/output<br>in 0 \u00B7 out 0', 'null values → no average line, all zeros');
+  assert(result === '0 in / 0 out', 'null values: zeros with no cache line');
 })();
 
-// Zero cache reads
+// Zero cache reads, non-zero cache write
 (function () {
   var result = fmtAgentRunTokens(10000, 5000, 0, 10);
-  assert(result === '15.0K uncached/output<br>in 10.0K \u00B7 out 5.0K', 'zero cache reads → no average line');
+  assert(result === '10.0K in / 5.0K out<br>cache hit 0 in / cache write 10 in', 'zero cache reads with write: cache line shown');
 })();
 
-// Contains 'uncached/output' label
-assert(fmtAgentRunTokens(100, 200, 300, 5).indexOf('uncached/output') !== -1, 'contains \"uncached/output\" label');
+// Forbidden labels must NOT appear
+(function () {
+  var result = fmtAgentRunTokens(100, 200, 300, 5);
+  assert(result.indexOf('uncached/output') === -1, 'no "uncached/output" label');
+  assert(result.indexOf('avg cache read') === -1, 'no "avg cache read" label');
+  assert(result.indexOf('/call') === -1, 'no "/call" suffix');
+})();
 
 // Large cache reads formatting
 (function () {
   var result = fmtAgentRunTokens(1000000, 500000, 50000000, 1000);
-  assert(result === '1.5M uncached/output<br>in 1.0M \u00B7 out 500.0K<br>avg cache read 50.0K/call', 'large cache reads: 50000000/1000 = 50000 → 50.0K/call');
+  assert(result === '1.0M in / 500.0K out<br>cache hit 50.0M in / cache write 1.0K in', 'large cache reads: proper fmtNum formatting');
 })();
 
-// Calls with fractional average
+// Small values with fractional cache write
 (function () {
   var result = fmtAgentRunTokens(100, 50, 150, 3);
-  assert(result === '150 uncached/output<br>in 100 \u00B7 out 50<br>avg cache read 50/call', 'fractional average: 150/3 = 50/call');
+  assert(result === '100 in / 50 out<br>cache hit 150 in / cache write 3 in', 'small values: cache hit + write displayed');
+})();
+
+// Output matches fmtTokenBreakdownCompact for same inputs
+(function () {
+  var direct = fmtTokenBreakdownCompact(34900, 5100, 755500, 32);
+  var viaAgent = fmtAgentRunTokens(34900, 5100, 755500, 32);
+  assert(direct === viaAgent, 'fmtAgentRunTokens delegates to fmtTokenBreakdownCompact: same output for (34900, 5100, 755500, 32)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
