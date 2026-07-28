@@ -452,6 +452,12 @@ assert(fmtProjectLabel({ project_label: '', project_id: 'abc123' }) === 'abc123'
  * Using window.resolveProjectLabel ensures tests always exercise
  * the single source of truth, preventing silent drift between
  * test expectations and production display logic.
+ *
+ * After the backend fix for issue #313, the group_value's pipe-delimited
+ * project part is the resolved Project Label (not raw external_project_id).
+ * This means both projectLabel (from API response) and projectId (from
+ * group_value split) contain friendly labels.  resolveProjectLabel() must
+ * still prefer the API's project_label field and fall back to projectId.
  */
 function resolveCPProjectLabel(row) {
   return window.resolveProjectLabel(row);
@@ -474,15 +480,41 @@ assert(resolveCPProjectLabel({ projectId: 'proj-abc' }) === 'proj-abc',
   'missing projectLabel falls back to projectId');
 
 // When both are missing, returns 'unknown'
-assert(resolveCPProjectLabel({}) === 'unknown', 'empty object → unknown');
+assert(resolveCPProjectLabel({}) === 'unknown', 'empty object \u2192 unknown');
 assert(resolveCPProjectLabel({ projectLabel: null, projectId: null }) === 'unknown',
-  'null projectLabel and null projectId → unknown');
+  'null projectLabel and null projectId \u2192 unknown');
 
 // Typical API responses
 assert(resolveCPProjectLabel({ projectLabel: 'Friendly Name', projectId: 'proj-abc' }) === 'Friendly Name',
   'API with resolved label uses it');
 assert(resolveCPProjectLabel({ projectLabel: 'unknown', projectId: 'unknown' }) === 'unknown',
   'API with unknown label uses unknown');
+
+// ── Post-issue-#313: group_value project part IS the project label ─────
+
+// When project_label from API is present and matches the group_value
+assert(resolveCPProjectLabel({ projectLabel: 'My App', projectId: 'My App' }) === 'My App',
+  'both fields contain same label \u2192 returns label');
+
+// When only projectId contains the resolved label (API project_label is null)
+assert(resolveCPProjectLabel({ projectLabel: null, projectId: 'My App' }) === 'My App',
+  'null projectLabel falls back to projectId which now contains the label');
+
+// When only projectId contains the resolved label (API project_label is empty)
+assert(resolveCPProjectLabel({ projectLabel: '', projectId: 'Database Backup Tool' }) === 'Database Backup Tool',
+  'empty projectLabel falls back to friendly label in projectId');
+
+// Verify no raw external project IDs appear in cells for this view
+// (projectLabel wins when available, projectId now holds the label)
+assert(resolveCPProjectLabel({ projectLabel: 'Friendly Name', projectId: 'raw-id-abc' }) === 'Friendly Name',
+  'raw ID in projectId is hidden when projectLabel is present');
+assert(resolveCPProjectLabel({ projectLabel: 'Friendly Name', projectId: 'Friendly Name' }) === 'Friendly Name',
+  'projectLabel used when both are the friendly label');
+
+// Edge case: project_label from API is 'unknown' (COALESCE fallback),
+// group_value project part is also 'unknown' — should display 'unknown'
+assert(resolveCPProjectLabel({ projectLabel: 'unknown', projectId: 'unknown' }) === 'unknown',
+  'unknown fallback displays as unknown');
 
 // ── Tests for truncate ──────────────────────────────────────────────────
 

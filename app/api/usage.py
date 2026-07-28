@@ -96,7 +96,7 @@ def _group_expression(parts: list[str]) -> str:
         elif part == "month":
             fragments.append("date_trunc('month', our.reported_at)::text")
         elif part == "project":
-            fragments.append("COALESCE(s.project_id, 'unknown')")
+            fragments.append(f"({_PROJECT_LABEL_SQL})")
 
     if len(fragments) == 1:
         return fragments[0]
