@@ -293,6 +293,7 @@
   /** Get a CSS status badge class for agent run status */
   function statusBadgeClass(status) {
     if (status === 'running') return 'badge-running';
+    if (status === 'stale') return 'badge-stale';
     if (status === 'completed') return 'badge-completed';
     if (status === 'blocked') return 'badge-blocked';
     return 'badge-unknown';
@@ -845,12 +846,12 @@
     runs.forEach(function (r) {
       var todoProgress = fmtTodoProgress(r.todo_completed, r.todo_total);
       var projectStr = fmtProjectLabel(r);
-      var statusCls = statusBadgeClass(r.status);
+      var statusCls = statusBadgeClass(r.currentStatus || r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
 
       html += '<tr class="ar-row" data-id="' + r.id + '">' +
         '<td class="clickable ar-title">' + escHtml(displayTitle) + '</td>' +
-        '<td>' + badge(r.status, statusCls).outerHTML + '</td>' +
+        '<td>' + badge(r.currentStatus || r.status, statusCls).outerHTML + '</td>' +
         '<td>' + escHtml(r.agent || '--') + '</td>' +
         '<td>' + escHtml(projectStr) + '</td>' +
         '<td>' + todoProgress + '</td>' +
@@ -1042,13 +1043,13 @@
     var tokens = (d.total_input_tokens || 0) + (d.total_output_tokens || 0);
     var duration = fmtDuration(d.first_message_at, d.last_message_at);
     var projectStr = fmtProjectLabel(d);
-    var statusCls = statusBadgeClass(d.status);
+    var statusCls = statusBadgeClass(d.currentStatus || d.status);
 
     // ── Session Metadata ──
     var html = '<div class="detail-section">' +
       '<div class="detail-section-title">Session Metadata</div>' +
       '<div class="detail-grid">' +
-        fieldHtml('Status', badge(d.status, statusCls).outerHTML) +
+        fieldHtml('Status', badge(d.currentStatus || d.status, statusCls).outerHTML) +
         fieldHtml('Title', escHtml(d.title || '--')) +
         fieldHtml('Internal ID', shortUUID(d.id)) +
         fieldHtml('External ID', escHtml(d.external_session_id || '--')) +
@@ -1086,10 +1087,10 @@
     if (d.child_summaries && d.child_summaries.length > 0) {
       html += '<div class="detail-child-list">';
       d.child_summaries.forEach(function (c) {
-        var cStatusCls = statusBadgeClass(c.status);
+        var cStatusCls = statusBadgeClass(c.currentStatus || c.status);
         html += '<div class="detail-child-item">' +
           '<span>' + shortUUID(c.id) + '</span>' +
-          '<span>' + badge(c.status, cStatusCls).outerHTML + '</span>' +
+          '<span>' + badge(c.currentStatus || c.status, cStatusCls).outerHTML + '</span>' +
           '<span style="color:var(--text-primary)">' + escHtml(c.agent || '--') + '</span>' +
           '<span style="color:var(--text-muted)">' + (c.message_count || 0) + ' msgs</span>' +
           '</div>';

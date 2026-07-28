@@ -76,6 +76,7 @@ function fmtTodoProgress(completed, total) {
 
 function statusBadgeClass(status) {
   if (status === 'running') return 'badge-running';
+  if (status === 'stale') return 'badge-stale';
   if (status === 'completed') return 'badge-completed';
   if (status === 'blocked') return 'badge-blocked';
   return 'badge-unknown';
@@ -319,12 +320,62 @@ assert(fmtTodoProgress(2, null) === '--', 'null total → --');
 console.log('\u25B6 statusBadgeClass');
 
 assert(statusBadgeClass('running') === 'badge-running', 'running → badge-running');
+assert(statusBadgeClass('stale') === 'badge-stale', 'stale → badge-stale');
 assert(statusBadgeClass('completed') === 'badge-completed', 'completed → badge-completed');
 assert(statusBadgeClass('blocked') === 'badge-blocked', 'blocked → badge-blocked');
 assert(statusBadgeClass('unknown') === 'badge-unknown', 'unknown → badge-unknown');
 assert(statusBadgeClass('anything-else') === 'badge-unknown', 'anything else → badge-unknown');
 assert(statusBadgeClass(null) === 'badge-unknown', 'null → badge-unknown');
 assert(statusBadgeClass('') === 'badge-unknown', 'empty → badge-unknown');
+
+// ── Tests for currentStatus badge fallback ────────────────────────────────
+
+console.log('\u25B6 currentStatus badge fallback');
+
+/**
+ * The two-field contract: render the status badge using currentStatus when
+ * available, falling back to status for backward compatibility.  This is
+ * used in renderAgentRunsTable, renderAgentRunDetail (parent), and child
+ * summaries within renderAgentRunDetail.
+ *
+ * @param {object} run - { currentStatus?: string, status?: string }
+ * @returns {string} CSS badge class from statusBadgeClass
+ */
+function resolveBadgeStatus(run) {
+  return statusBadgeClass(run && (run.currentStatus || run.status));
+}
+
+// When currentStatus is present, it takes precedence
+assert(resolveBadgeStatus({ currentStatus: 'running', status: 'completed' }) === 'badge-running',
+  'currentStatus running wins over status completed');
+assert(resolveBadgeStatus({ currentStatus: 'stale', status: 'running' }) === 'badge-stale',
+  'currentStatus stale wins over status running');
+assert(resolveBadgeStatus({ currentStatus: 'blocked', status: 'running' }) === 'badge-blocked',
+  'currentStatus blocked wins over status running');
+assert(resolveBadgeStatus({ currentStatus: 'completed', status: 'unknown' }) === 'badge-completed',
+  'currentStatus completed wins over status unknown');
+assert(resolveBadgeStatus({ currentStatus: 'unknown', status: 'running' }) === 'badge-unknown',
+  'currentStatus unknown wins over status running');
+
+// When currentStatus is absent, falls back to status
+assert(resolveBadgeStatus({ status: 'running' }) === 'badge-running',
+  'missing currentStatus falls back to status running');
+assert(resolveBadgeStatus({ status: 'stale' }) === 'badge-stale',
+  'missing currentStatus falls back to status stale');
+assert(resolveBadgeStatus({ status: 'blocked' }) === 'badge-blocked',
+  'missing currentStatus falls back to status blocked');
+
+// When both are absent, returns badge-unknown
+assert(resolveBadgeStatus({}) === 'badge-unknown',
+  'both missing → badge-unknown');
+assert(resolveBadgeStatus(null) === 'badge-unknown',
+  'null run → badge-unknown');
+assert(resolveBadgeStatus(undefined) === 'badge-unknown',
+  'undefined run → badge-unknown');
+
+// Same value for both fields
+assert(resolveBadgeStatus({ currentStatus: 'running', status: 'running' }) === 'badge-running',
+  'currentStatus == status → badge-running');
 
 // ── Tests for fmtCodeChanges ────────────────────────────────────────────
 

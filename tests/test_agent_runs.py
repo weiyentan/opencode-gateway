@@ -141,11 +141,50 @@ class TestComputeStatus:
         )
         assert result == "running"
 
-    def test_completed_when_inactive_no_parent(self):
-        """Session beyond quiet threshold, no parent → completed."""
+    def test_running_at_boundary_of_quiet_threshold(self):
+        """Session exactly at quiet threshold → running (inclusive)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(minutes=60)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "running"
+
+    def test_stale_when_beyond_quiet_no_parent(self):
+        """Session beyond quiet threshold, no parent, within stale window → stale."""
         from app.api.usage import _compute_status
 
         old = _NOW - timedelta(hours=2)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_stale_at_stale_threshold_boundary(self):
+        """Session exactly at stale threshold → stale (inclusive)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(hours=6)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_completed_when_beyond_stale_no_parent(self):
+        """Session beyond stale threshold, no parent → completed."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=10)
         result = _compute_status(
             last_message_at=old,
             message_count=10,
@@ -159,6 +198,19 @@ class TestComputeStatus:
         from app.api.usage import _compute_status
 
         old = _NOW - timedelta(hours=2)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "blocked"
+
+    def test_blocked_has_priority_over_stale(self):
+        """Session with parent is blocked even within stale window."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=4)
         result = _compute_status(
             last_message_at=old,
             message_count=10,
@@ -272,6 +324,11 @@ class TestAgentRunsList:
         assert data["limit"] == 50
         assert data["offset"] == 0
 
+        # currentStatus must be present alongside status (two-field contract)
+        item = data["items"][0]
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
+
     @pytest.mark.asyncio
     async def test_row_has_required_fields(self, client: AsyncClient, mock_conn: AsyncMock):
         """Each list row includes both internal and external IDs, computed status, etc."""
@@ -300,7 +357,9 @@ class TestAgentRunsList:
         assert item["external_session_id"] == _EXTERNAL_ID_A
 
         # Computed fields
-        assert item["status"] in ("running", "completed", "blocked", "unknown")
+        assert item["status"] in ("running", "stale", "completed", "blocked", "unknown")
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
         assert "child_run_count" in item
         assert isinstance(item["child_run_count"], int)
         assert item["child_run_count"] >= 0
@@ -350,6 +409,8 @@ class TestAgentRunsList:
         # Status from SQL computation uses now() which should be close
         # to real now; a 5-min-old session should be "running"
         assert item["status"] == "running"
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -617,6 +678,9 @@ class TestAgentRunsDetail:
         data = payload["data"]
         assert data["id"] == str(_SESSION_ID)
         assert data["external_session_id"] == _EXTERNAL_ID_A
+        # currentStatus must be present alongside status (two-field contract)
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_includes_loki_url(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -721,7 +785,9 @@ class TestAgentRunsDetail:
         child0 = data["child_summaries"][0]
         assert child0["id"] == str(child_id)
         assert child0["external_session_id"] == _EXTERNAL_ID_B
-        assert child0["status"] in ("running", "completed", "blocked", "unknown")
+        assert child0["status"] in ("running", "stale", "completed", "blocked", "unknown")
+        assert "currentStatus" in child0
+        assert child0["currentStatus"] == child0["status"]
         assert child0["agent"] == "code-editor-junior"
         assert child0["message_count"] == 3
 
@@ -839,6 +905,9 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["status"] == "running"
+        # currentStatus must be present alongside status (two-field contract)
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_blocked_status_with_parent(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -865,6 +934,8 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["status"] == "blocked"
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_missing_context_project_rows(self, client: AsyncClient, mock_conn: AsyncMock):
