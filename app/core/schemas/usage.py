@@ -222,6 +222,8 @@ class AgentRunSummary(BaseModel):
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
     last_updated_at: datetime = Field(
@@ -305,6 +307,8 @@ class AgentRunDetail(BaseModel):
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     first_message_at: datetime | None = Field(
         default=None, description="Timestamp of the first message"

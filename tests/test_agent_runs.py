@@ -52,6 +52,8 @@ def _mk_session_row(
     total_input_tokens: int = 500,
     total_output_tokens: int = 250,
     total_cached_tokens: int = 0,
+    total_cache_read_tokens: int = 0,
+    total_cache_write_tokens: int = 0,
     project_id: str | None = None,
     workspace_id: str | None = None,
     agent: str | None = None,
@@ -79,6 +81,8 @@ def _mk_session_row(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "total_cached_tokens": total_cached_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
         "project_id": project_id,
         "workspace_id": workspace_id,
         "agent": agent,
@@ -317,6 +321,8 @@ class TestAgentRunsList:
         assert "total_input_tokens" in item
         assert "total_output_tokens" in item
         assert "total_cached_tokens" in item
+        assert "total_cache_read_tokens" in item
+        assert "total_cache_write_tokens" in item
         assert "message_count" in item
 
         # Timestamp
@@ -788,6 +794,8 @@ class TestAgentRunsDetail:
         assert data["total_input_tokens"] == 1000
         assert data["total_output_tokens"] == 500
         assert data["total_cached_tokens"] == 100
+        assert data["total_cache_read_tokens"] == 0
+        assert data["total_cache_write_tokens"] == 0
         assert data["message_count"] == 20
         assert data["first_message_at"] is not None
         assert data["last_message_at"] is not None
