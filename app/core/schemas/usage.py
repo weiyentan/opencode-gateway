@@ -110,6 +110,11 @@ class SessionSummary(BaseModel):
     total_output_tokens: int
     total_cached_tokens: int
     project_id: str | None = None
+    project_label: str | None = Field(
+        default=None,
+        description="Resolved project label via COALESCE(display_name, name, "
+        "basename(worktree), project_id, 'unknown')",
+    )
     workspace_id: str | None = None
     agent: str | None = None
     parent_session_id: str | None = None
@@ -184,6 +189,11 @@ class AgentRunSummary(BaseModel):
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
+    project_label: str | None = Field(
+        default=None,
+        description="Resolved project label via COALESCE(display_name, name, "
+        "basename(worktree), project_id, 'unknown')",
+    )
     workspace_id: str | None = Field(
         default=None, description="Worktree/workspace identifier"
     )
@@ -249,6 +259,11 @@ class AgentRunDetail(BaseModel):
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
+    project_label: str | None = Field(
+        default=None,
+        description="Resolved project label via COALESCE(display_name, name, "
+        "basename(worktree), project_id, 'unknown')",
+    )
     workspace_id: str | None = Field(
         default=None, description="Worktree/workspace identifier"
     )

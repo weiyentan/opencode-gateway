@@ -60,11 +60,12 @@ def _mk_session_row(
     computed_status: str = "running",
     child_run_count: int = 0,
     session_title: str | None = None,
+    project_label: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions.
 
     Includes both stored session columns and computed columns (_status,
-    child_run_count) that the agent-runs SQL query produces.
+    child_run_count, project_label) that the agent-runs SQL query produces.
     """
     row = MagicMock()
     data = {
@@ -86,6 +87,7 @@ def _mk_session_row(
         "_status": computed_status,
         "child_run_count": child_run_count,
         "session_title": session_title,
+        "project_label": project_label if project_label is not None else project_id,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.get.side_effect = data.get

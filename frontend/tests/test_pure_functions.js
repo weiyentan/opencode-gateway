@@ -86,6 +86,21 @@ function fmtCodeChanges(n) {
   return fmtNum(n);
 }
 
+/** Format a project label for display.
+ *  Uses the resolved project_label field from the API when available;
+ *  falls back to project_id / workspace_id for backward compatibility. */
+function fmtProjectLabel(obj) {
+  if (obj && obj.project_label) return obj.project_label;
+  var pid = obj && obj.project_id;
+  var wid = obj && obj.workspace_id;
+  if (pid && wid && wid !== pid) {
+    return pid + ' / ' + wid;
+  }
+  if (pid) return pid;
+  if (wid) return wid;
+  return '--';
+}
+
 function truncate(str, maxLen) {
   if (!str) return '--';
   if (str.length <= maxLen) return escHtml(str);
@@ -298,6 +313,26 @@ assert(fmtCodeChanges(1) === '1', '1 → 1');
 assert(fmtCodeChanges(42) === '42', '42 → 42');
 assert(fmtCodeChanges(1000) === '1.0K', '1000 → 1.0K');
 assert(fmtCodeChanges(-1) === '--', '-1 → --');
+
+// ── Tests for fmtProjectLabel ───────────────────────────────────────
+
+console.log('\u25B6 fmtProjectLabel');
+
+assert(fmtProjectLabel(null) === '--', 'null → --');
+assert(fmtProjectLabel(undefined) === '--', 'undefined → --');
+assert(fmtProjectLabel({}) === '--', 'empty object → --');
+
+assert(fmtProjectLabel({ project_label: 'My Project' }) === 'My Project', 'project_label wins');
+assert(fmtProjectLabel({ project_label: 'My Project', project_id: 'abc123' }) === 'My Project', 'project_label wins over project_id');
+assert(fmtProjectLabel({ project_label: 'My Project', project_id: 'abc123', workspace_id: 'ws456' }) === 'My Project', 'project_label wins over both');
+
+assert(fmtProjectLabel({ project_id: 'abc123' }) === 'abc123', 'project_id alone → project_id');
+assert(fmtProjectLabel({ workspace_id: 'ws456' }) === 'ws456', 'workspace_id alone → workspace_id');
+assert(fmtProjectLabel({ project_id: 'abc123', workspace_id: 'abc123' }) === 'abc123', 'project_id equals workspace_id → just project_id');
+assert(fmtProjectLabel({ project_id: 'abc123', workspace_id: 'ws456' }) === 'abc123 / ws456', 'both present and different → joined');
+
+assert(fmtProjectLabel({ project_label: '' }) === '--', 'empty project_label falls through to default');
+assert(fmtProjectLabel({ project_label: '', project_id: 'abc123' }) === 'abc123', 'empty project_label falls through to project_id');
 
 // ── Tests for truncate ──────────────────────────────────────────────────
 

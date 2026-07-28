@@ -444,9 +444,13 @@ async def _fetch_sessions(
             s.agent,
             s.parent_session_id,
             s.total_estimated_cost_usd,
-            osc.title AS session_title
+            osc.title AS session_title,
+            {_PROJECT_LABEL_SQL} AS project_label
         FROM sessions s
         LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+        LEFT JOIN opencode_source_projects osp
+            ON osp.source_database_id = s.source_database_id
+            AND osp.external_project_id = s.project_id
         WHERE {where_clause}
         ORDER BY s.last_message_at DESC
         LIMIT ${len(query_params) + 1}
@@ -466,6 +470,7 @@ async def _fetch_sessions(
             total_output_tokens=r["total_output_tokens"],
             total_cached_tokens=r["total_cached_tokens"],
             project_id=r["project_id"],
+            project_label=r["project_label"],
             workspace_id=r["workspace_id"],
             agent=r["agent"],
             parent_session_id=r["parent_session_id"],
@@ -774,9 +779,13 @@ async def _fetch_agent_runs(
                     s.total_estimated_cost_usd,
                     s.last_message_at,
                     ({status_expr}) AS _status,
-                    osc.title AS session_title
+                    osc.title AS session_title,
+                    {_PROJECT_LABEL_SQL} AS project_label
                 FROM sessions s
                 LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+                LEFT JOIN opencode_source_projects osp
+                    ON osp.source_database_id = s.source_database_id
+                    AND osp.external_project_id = s.project_id
                 WHERE {where_clause}
             ) sub
             WHERE sub._status = ${len(params) + 1}
@@ -804,9 +813,13 @@ async def _fetch_agent_runs(
                 s.total_estimated_cost_usd,
                 s.last_message_at,
                 ({status_expr}) AS _status,
-                osc.title AS session_title
+                osc.title AS session_title,
+                {_PROJECT_LABEL_SQL} AS project_label
             FROM sessions s
             LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+            LEFT JOIN opencode_source_projects osp
+                ON osp.source_database_id = s.source_database_id
+                AND osp.external_project_id = s.project_id
             WHERE {where_clause}
         """
         count_from = f"FROM sessions s WHERE {where_clause}"
@@ -844,6 +857,7 @@ async def _fetch_agent_runs(
                 status=status_val,
                 agent=r["agent"],
                 project_id=r["project_id"],
+                project_label=r["project_label"],
                 workspace_id=r["workspace_id"],
                 todo_total=0,
                 todo_completed=0,
@@ -900,8 +914,12 @@ async def _fetch_agent_run_detail(
             s.project_id,
             s.workspace_id,
             s.agent,
-            s.parent_session_id
+            s.parent_session_id,
+            """ + _PROJECT_LABEL_SQL + """ AS project_label
         FROM sessions s
+        LEFT JOIN opencode_source_projects osp
+            ON osp.source_database_id = s.source_database_id
+            AND osp.external_project_id = s.project_id
         WHERE s.id = $1""",
         session_id,
     )
@@ -1034,6 +1052,7 @@ async def _fetch_agent_run_detail(
         status=computed_status,
         agent=session_row["agent"],
         project_id=session_row["project_id"],
+        project_label=session_row["project_label"],
         workspace_id=session_row["workspace_id"],
         parent_session_id=parent_external_id,
         parent_internal_id=parent_internal_id,
