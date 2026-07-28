@@ -34,6 +34,14 @@ Use inline resolution (option 2). At ingest time, `_resolve_session()`
 maps `(source_database_id, external_session_id)` to an internal
 `sessions.id` UUID via upsert. No separate mapping table is needed.
 
+The same ingest-time upsert also transforms per-message usage records
+into session-level aggregates. The collector sends token counts per
+OpenCode message/usage record; the Gateway owns the rollup into
+`sessions.message_count`, `sessions.total_input_tokens`,
+`sessions.total_output_tokens`, `sessions.total_cached_tokens`,
+`sessions.total_cache_read_tokens`, `sessions.total_cache_write_tokens`,
+and `sessions.total_estimated_cost_usd`.
+
 A unique index on `(source_database_id, external_session_id)` WHERE
 `external_session_id IS NOT NULL` enforces the invariant that each
 external session ID maps to exactly one internal UUID per source
@@ -49,6 +57,9 @@ database.
   same gateway session UUID, even across restarts or re-ingests.
 - **No sync problem**: because the mapping lives on the session row
   itself, there is no separate mapping table to get out of sync.
+- **Aggregation ownership**: collectors stay focused on read-only source
+  capture and do not compute session totals. The Gateway is the single
+  place that transforms per-record usage facts into session aggregates.
 - **Partial index avoids null noise**: usage records without an
   external session ID (e.g., anonymous telemetry) are not forced into
   the uniqueness constraint. The partial index only covers rows where
@@ -59,6 +70,8 @@ database.
 Positive:
 - Simpler schema — no extra mapping table or join
 - Resolution is a single upsert, not a two-step lookup-then-insert
+- Session token totals are updated atomically with session identity
+  resolution
 - Internal UUIDs are deterministic per (source DB, external ID) pair
 - The partial index allows nullable external session IDs without
   constraint violations
@@ -73,6 +86,10 @@ Negative:
 - `_resolve_session()` must use a transaction-safe upsert pattern;
   a naive read-then-write risks race conditions under concurrent
   ingestion
+- Aggregate columns added after historical ingest require explicit
+  backfill or re-ingest if old sessions should show those totals. Adding
+  a `DEFAULT 0` column only initializes the session aggregate row; it
+  does not recompute totals from `opencode_usage_records`.
 
 ## Schema Detail
 
@@ -90,10 +107,12 @@ handler) performs:
 INSERT INTO sessions (id, client_id, source_database_id, external_session_id,
                       first_message_at, last_message_at, message_count,
                       total_input_tokens, total_output_tokens, total_cached_tokens,
+                      total_cache_read_tokens, total_cache_write_tokens,
                       total_estimated_cost_usd)
 VALUES (:new_id, :client_id, :source_database_id, :external_session_id,
         :reported_at, :reported_at, 1,
         :input_tokens, :output_tokens, :cached_tokens,
+        :cache_read_tokens, :cache_write_tokens,
         :estimated_cost_usd)
 ON CONFLICT (source_database_id, external_session_id)
     WHERE external_session_id IS NOT NULL
@@ -103,6 +122,10 @@ DO UPDATE SET
     total_input_tokens = sessions.total_input_tokens + :input_tokens,
     total_output_tokens = sessions.total_output_tokens + :output_tokens,
     total_cached_tokens = sessions.total_cached_tokens + :cached_tokens,
+    total_cache_read_tokens =
+        sessions.total_cache_read_tokens + :cache_read_tokens,
+    total_cache_write_tokens =
+        sessions.total_cache_write_tokens + :cache_write_tokens,
     total_estimated_cost_usd =
         COALESCE(sessions.total_estimated_cost_usd, 0)
         + COALESCE(:estimated_cost_usd, 0)
@@ -110,6 +133,28 @@ RETURNING id;
 ```
 
 This pattern is idempotent and safe for concurrent callers.
+
+`total_cached_tokens` remains the backward-compatible combined cache
+counter. For v1.2 usage records, it is the sum of the split cache fields:
+
+```text
+cached_tokens = cache_read_tokens + cache_write_tokens
+```
+
+`total_cache_read_tokens` and `total_cache_write_tokens` preserve that
+split at session level for cache activity reporting. If a source record
+does not include the split fields, ingest treats them as zero for the
+session aggregate while still storing whatever per-record facts are
+available in `opencode_usage_records`.
+
+Historical note: migration `0014` added nullable per-record
+`opencode_usage_records.cache_read_tokens` and `cache_write_tokens`.
+Migration `0016` added non-null session aggregate columns with default
+zero. Migration `0016` intentionally defines storage shape only; it does
+not backfill existing `sessions` rows from historical
+`opencode_usage_records`. Operators who need historical session-level
+cache read/write totals must run a backfill or re-ingest/replay those
+records.
 
 ## Alternatives Considered
 
