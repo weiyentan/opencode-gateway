@@ -91,6 +91,7 @@ def _mk_session_row(
     total_output_tokens: int = 250,
     total_cached_tokens: int = 0,
     project_id: str | None = None,
+    project_label: str | None = None,
     workspace_id: str | None = None,
     agent: str | None = None,
     parent_session_id: str | None = None,
@@ -110,6 +111,7 @@ def _mk_session_row(
         "total_output_tokens": total_output_tokens,
         "total_cached_tokens": total_cached_tokens,
         "project_id": project_id,
+        "project_label": project_label,
         "workspace_id": workspace_id,
         "agent": agent,
         "parent_session_id": parent_session_id,
@@ -128,6 +130,7 @@ def _mk_agent_run_row(
     source_database_id: uuid.UUID = _SOURCE_DB_ID,
     external_session_id: str | None = None,
     project_id: str | None = None,
+    project_label: str | None = None,
     workspace_id: str | None = None,
     agent: str | None = None,
     parent_session_id: str | None = None,
@@ -150,6 +153,7 @@ def _mk_agent_run_row(
         "source_database_id": source_database_id,
         "external_session_id": _external_session_id,
         "project_id": project_id,
+        "project_label": project_label,
         "workspace_id": workspace_id,
         "agent": agent,
         "parent_session_id": parent_session_id,
@@ -877,6 +881,7 @@ class TestSessions:
         parent_id = str(uuid.uuid4())
         row = _mk_session_row(
             project_id="proj-123",
+            project_label="My Project",
             workspace_id="ws-456",
             agent="code-editor",
             parent_session_id=parent_id,
@@ -896,6 +901,7 @@ class TestSessions:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["project_id"] == "proj-123"
+        assert item["project_label"] == "My Project"
         assert item["workspace_id"] == "ws-456"
         assert item["agent"] == "code-editor"
         assert item["parent_session_id"] == parent_id
@@ -1015,7 +1021,10 @@ class TestSessionTitle:
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
         """Agent run summaries include session_title from opencode_session_contexts."""
-        row = _mk_agent_run_row(session_title="Agent Run Session")
+        row = _mk_agent_run_row(
+            session_title="Agent Run Session",
+            project_label="My Project",
+        )
         mock_conn.fetch = AsyncMock(return_value=[row])
         mock_conn.fetchval = AsyncMock(return_value=1)
 
@@ -1028,6 +1037,7 @@ class TestSessionTitle:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["session_title"] == "Agent Run Session"
+        assert item["project_label"] == "My Project"
 
     @pytest.mark.asyncio
     async def test_agent_runs_session_title_null_when_no_context(

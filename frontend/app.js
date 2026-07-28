@@ -303,6 +303,21 @@
     return String(id).substring(0, 8);
   }
 
+  /** Format a project label for display.
+   *  Uses the resolved project_label field from the API when available;
+   *  falls back to project_id / workspace_id for backward compatibility. */
+  function fmtProjectLabel(obj) {
+    if (obj && obj.project_label) return obj.project_label;
+    var pid = obj && obj.project_id;
+    var wid = obj && obj.workspace_id;
+    if (pid && wid && wid !== pid) {
+      return pid + ' / ' + wid;
+    }
+    if (pid) return pid;
+    if (wid) return wid;
+    return '--';
+  }
+
   // ── API Fetch (with envelope unwrapping) ──────────────────────────────
 
   async function apiFetch(path) {
@@ -793,10 +808,7 @@
     runs.forEach(function (r) {
       var todoProgress = fmtTodoProgress(r.todo_completed, r.todo_total);
       var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
-      var projectStr = r.project_id || r.workspace_id || '--';
-      if (r.project_id && r.workspace_id && r.workspace_id !== r.project_id) {
-        projectStr = r.project_id + ' / ' + r.workspace_id;
-      }
+      var projectStr = fmtProjectLabel(r);
       var statusCls = statusBadgeClass(r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
 
@@ -960,10 +972,7 @@
 
     var tokens = (d.total_input_tokens || 0) + (d.total_output_tokens || 0);
     var duration = fmtDuration(d.first_message_at, d.last_message_at);
-    var projectStr = d.project_id || d.workspace_id || '--';
-    if (d.project_id && d.workspace_id && d.workspace_id !== d.project_id) {
-      projectStr = d.project_id + ' / ' + d.workspace_id;
-    }
+    var projectStr = fmtProjectLabel(d);
     var statusCls = statusBadgeClass(d.status);
 
     // ── Session Metadata ──
@@ -1110,10 +1119,7 @@
     els.sdDetailTitle.textContent = escHtml(d.title || 'Session Detail');
 
     var duration = fmtDuration(d.first_message_at, d.last_message_at);
-    var projectStr = d.project_id || d.workspace_id || '--';
-    if (d.project_id && d.workspace_id && d.workspace_id !== d.project_id) {
-      projectStr = d.project_id + ' / ' + d.workspace_id;
-    }
+    var projectStr = fmtProjectLabel(d);
 
     // Extract session context fields
     var ctx = d.session_context || {};
