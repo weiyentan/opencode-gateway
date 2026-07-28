@@ -122,10 +122,10 @@ function shortUUID(id) {
   return String(id).substring(0, 8);
 }
 
-/** Format a compact three-line Token Breakdown HTML string.
- *  Line 1: active tokens (input + output)
- *  Line 2: input / output breakdown
- *  Line 3: cache read / write (hidden when both are zero/unavailable)
+/** Format a compact Token Breakdown HTML string.
+ *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
+ *  Line 1: {input} in / {output} out
+ *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
@@ -133,44 +133,45 @@ function shortUUID(id) {
  *  @returns {string} HTML for the cell content
  */
 function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+  return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+}
+
+/** Format a compact multi-line Token Breakdown HTML string.
+ *  Line 1: {input} in / {output} out
+ *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
+ *  Cache line is omitted when both cacheRead and cacheWrite are zero/null/undefined.
+ *  @param {number|null} inputTokens
+ *  @param {number|null} outputTokens
+ *  @param {number|null} cacheReadTokens
+ *  @param {number|null} cacheWriteTokens
+ *  @returns {string} HTML for the cell content
+ */
+function fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
   var input = inputTokens || 0;
   var output = outputTokens || 0;
-  var active = input + output;
   var cr = cacheReadTokens || 0;
   var cw = cacheWriteTokens || 0;
 
-  var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+  var html = fmtNum(input) + ' in / ' + fmtNum(output) + ' out';
   if (cr > 0 || cw > 0) {
-    html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
+    html += '<br>cache hit ' + fmtNum(cr) + ' in';
+    if (cw > 0) {
+      html += ' / cache write ' + fmtNum(cw) + ' in';
+    }
   }
   return html;
 }
 
-/** Format agent-run token cell (average cache read per call).
- *  Uses "uncached/output" label instead of "active".
- *  Omits average cache-read line when calls=0 or cacheRead=0.
+/** Format agent-run token cell using the shared compact Token Breakdown formatter.
+ *  Delegates to fmtTokenBreakdownCompact. Accepts cacheWriteTokens instead of callCount.
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
- *  @param {number|null} callCount
+ *  @param {number|null} cacheWriteTokens
  *  @returns {string} HTML for the cell content
  */
-function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, callCount) {
-  var input = inputTokens || 0;
-  var output = outputTokens || 0;
-  var calls = callCount || 0;
-
-  var uncachedOutput = input + output;
-  var averageCacheRead = calls > 0 ? (cacheReadTokens || 0) / calls : 0;
-
-  var html = fmtNum(uncachedOutput) + ' uncached/output' +
-    '<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
-
-  if (averageCacheRead > 0) {
-    html += '<br>avg cache read ' + fmtNum(averageCacheRead) + '/call';
-  }
-
-  return html;
+function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+  return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
 }
 
 // ── Date-range pure functions (duplicated from app.js for testability) ──
@@ -846,80 +847,149 @@ assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
 
 console.log('\u25B6 fmtTokenBreakdown');
 
-assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 active<br>in 0 \u00B7 out 0', 'all zeros, no cache line');
-assert(fmtTokenBreakdown(null, null, null, null) === '0 active<br>in 0 \u00B7 out 0', 'all nulls, no cache line');
-assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 active<br>in 0 \u00B7 out 0', 'all undefined, no cache line');
+// Delegates to fmtTokenBreakdownCompact; verify the compact format output
+assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 in / 0 out', 'all zeros, no cache line');
+assert(fmtTokenBreakdown(null, null, null, null) === '0 in / 0 out', 'all nulls, no cache line');
+assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 in / 0 out', 'all undefined, no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(60000, 36500, 120400, 8200);
-  assert(result.indexOf('96.5K active') !== -1, 'active = 96.5K for 60000+36500');
-  assert(result.indexOf('in 60.0K') !== -1, 'input 60000 → 60.0K');
-  assert(result.indexOf('out 36.5K') !== -1, 'output 36500 → 36.5K');
-  assert(result.indexOf('cache read 120.4K') !== -1, 'cache read 120400 → 120.4K');
-  assert(result.indexOf('write 8.2K') !== -1, 'cache write 8200 → 8.2K');
-  assert(result.indexOf('<br>') !== -1, 'contains br tags');
-  assert(result.indexOf('\u00B7') !== -1, 'contains middle dot separator');
+  assert(result === '60.0K in / 36.5K out<br>cache hit 120.4K in / cache write 8.2K in', 'full breakdown with cache read + write');
 })();
 
-assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache zero both → no cache line');
-assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache null both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '100.0K in / 50.0K out', 'cache zero both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, null, null) === '100.0K in / 50.0K out', 'cache null both → no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 3000, 0);
-  assert(result.indexOf('cache read 3.0K') !== -1, 'cache read non-zero → cache line shown');
-  assert(result.indexOf('write ') !== -1, 'cache write zero still shown in cache line');
+  assert(result === '1.0K in / 2.0K out<br>cache hit 3.0K in', 'cache read non-zero → cache line with hit only');
 })();
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 0, 3000);
-  assert(result.indexOf('cache read 0') !== -1, 'cache read zero still shown when write is non-zero');
-  assert(result.indexOf('write 3.0K') !== -1, 'cache write non-zero shown');
+  assert(result === '1.0K in / 2.0K out<br>cache hit 0 in / cache write 3.0K in', 'cache write non-zero shown, read zero displayed');
 })();
 
-assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') !== -1, 'contains \"active\" label');
-assert(fmtTokenBreakdown(0, 0, 500, 500).indexOf('cache read') !== -1, 'cache line present when cache values exist even if active is zero');
+assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') === -1, 'no \"active\" label in compact format');
+assert(fmtTokenBreakdown(0, 0, 500, 500) === '0 in / 0 out<br>cache hit 500 in / cache write 500 in', 'cache line present when cache values exist even if input/output are zero');
+
+// ── Tests for fmtTokenBreakdownCompact ────────────────────────────────────
+
+console.log('\u25B6 fmtTokenBreakdownCompact');
+
+// Normal case with cache hit
+(function () {
+  var result = fmtTokenBreakdownCompact(38800, 5200, 23400, 0);
+  assert(result === '38.8K in / 5.2K out<br>cache hit 23.4K in', 'normal cache hit: 38.8K in / 5.2K out / cache hit 23.4K in');
+})();
+
+// Case with both cache read and cache write
+(function () {
+  var result = fmtTokenBreakdownCompact(38800, 5200, 23400, 4200);
+  assert(result === '38.8K in / 5.2K out<br>cache hit 23.4K in / cache write 4.2K in', 'cache read + write: cache write appended');
+})();
+
+// Zero-cache case (no cache line)
+(function () {
+  var result = fmtTokenBreakdownCompact(38800, 5200, 0, 0);
+  assert(result === '38.8K in / 5.2K out', 'zero cache: no cache line');
+})();
+
+// All nulls — no cache line, zeros displayed
+(function () {
+  var result = fmtTokenBreakdownCompact(null, null, null, null);
+  assert(result === '0 in / 0 out', 'all nulls: zeros with no cache line');
+})();
+
+// All undefined — no cache line, zeros displayed
+(function () {
+  var result = fmtTokenBreakdownCompact(undefined, undefined, undefined, undefined);
+  assert(result === '0 in / 0 out', 'all undefined: zeros with no cache line');
+})();
+
+// Forbidden labels must NOT appear
+(function () {
+  var result = fmtTokenBreakdownCompact(1000, 500, 2000, 0);
+  assert(result.indexOf('active') === -1, 'no "active" label');
+  assert(result.indexOf('uncached/output') === -1, 'no "uncached/output" label');
+  assert(result.indexOf('avg cache read') === -1, 'no "avg cache read" label');
+  assert(result.indexOf('/call') === -1, 'no "/call" suffix');
+  assert(result.indexOf('write 0') === -1, 'no "write 0" (zero cache write omits entirely)');
+})();
+
+// Cache line omitted when both cache values are 0
+(function () {
+  var result = fmtTokenBreakdownCompact(50000, 25000, 0, 0);
+  assert(result.indexOf('<br>') === -1, 'no br when no cache activity');
+  assert(result.indexOf('cache hit') === -1, 'no "cache hit" when both cache values are zero');
+})();
+
+// Cache write only (no cache read)
+(function () {
+  var result = fmtTokenBreakdownCompact(10000, 5000, 0, 3000);
+  assert(result === '10.0K in / 5.0K out<br>cache hit 0 in / cache write 3.0K in', 'cache write only: cache line shown with 0 read');
+})();
+
+// Uses fmtNum for compact number formatting
+(function () {
+  var result = fmtTokenBreakdownCompact(1000000, 500000, 2000000, 100000);
+  assert(result.indexOf('1.0M') !== -1, 'uses fmtNum formatting for millions');
+  assert(result.indexOf('500.0K') !== -1, 'uses fmtNum formatting for thousands');
+})();
 
 // ── Tests for fmtAgentRunTokens ──────────────────────────────────────────
 
 console.log('\u25B6 fmtAgentRunTokens');
 
-// Normal averaging
+// Delegates to shared formatter — full cache hit with cache write
 (function () {
   var result = fmtAgentRunTokens(34900, 5100, 755500, 32);
-  assert(result === '40.0K uncached/output<br>in 34.9K \u00B7 out 5.1K<br>avg cache read 23.6K/call', 'normal averaging: 755500/32 = 23609.375 → 23.6K/call');
+  assert(result === '34.9K in / 5.1K out<br>cache hit 755.5K in / cache write 32 in', 'delegates to shared formatter: total cache hit + write');
 })();
 
-// Zero calls (no division by zero)
+// Cache hit without write (cacheWrite=0)
 (function () {
   var result = fmtAgentRunTokens(1000, 500, 50000, 0);
-  assert(result === '1.5K uncached/output<br>in 1.0K \u00B7 out 500', 'zero calls → no average line');
+  assert(result === '1.0K in / 500 out<br>cache hit 50.0K in', 'cache hit without write: no cache write line');
 })();
 
 // Null/missing values
 (function () {
   var result = fmtAgentRunTokens(null, null, null, null);
-  assert(result === '0 uncached/output<br>in 0 \u00B7 out 0', 'null values → no average line, all zeros');
+  assert(result === '0 in / 0 out', 'null values: zeros with no cache line');
 })();
 
-// Zero cache reads
+// Zero cache reads, non-zero cache write
 (function () {
   var result = fmtAgentRunTokens(10000, 5000, 0, 10);
-  assert(result === '15.0K uncached/output<br>in 10.0K \u00B7 out 5.0K', 'zero cache reads → no average line');
+  assert(result === '10.0K in / 5.0K out<br>cache hit 0 in / cache write 10 in', 'zero cache reads with write: cache line shown');
 })();
 
-// Contains 'uncached/output' label
-assert(fmtAgentRunTokens(100, 200, 300, 5).indexOf('uncached/output') !== -1, 'contains \"uncached/output\" label');
+// Forbidden labels must NOT appear
+(function () {
+  var result = fmtAgentRunTokens(100, 200, 300, 5);
+  assert(result.indexOf('uncached/output') === -1, 'no "uncached/output" label');
+  assert(result.indexOf('avg cache read') === -1, 'no "avg cache read" label');
+  assert(result.indexOf('/call') === -1, 'no "/call" suffix');
+})();
 
 // Large cache reads formatting
 (function () {
   var result = fmtAgentRunTokens(1000000, 500000, 50000000, 1000);
-  assert(result === '1.5M uncached/output<br>in 1.0M \u00B7 out 500.0K<br>avg cache read 50.0K/call', 'large cache reads: 50000000/1000 = 50000 → 50.0K/call');
+  assert(result === '1.0M in / 500.0K out<br>cache hit 50.0M in / cache write 1.0K in', 'large cache reads: proper fmtNum formatting');
 })();
 
-// Calls with fractional average
+// Small values with fractional cache write
 (function () {
   var result = fmtAgentRunTokens(100, 50, 150, 3);
-  assert(result === '150 uncached/output<br>in 100 \u00B7 out 50<br>avg cache read 50/call', 'fractional average: 150/3 = 50/call');
+  assert(result === '100 in / 50 out<br>cache hit 150 in / cache write 3 in', 'small values: cache hit + write displayed');
+})();
+
+// Output matches fmtTokenBreakdownCompact for same inputs
+(function () {
+  var direct = fmtTokenBreakdownCompact(34900, 5100, 755500, 32);
+  var viaAgent = fmtAgentRunTokens(34900, 5100, 755500, 32);
+  assert(direct === viaAgent, 'fmtAgentRunTokens delegates to fmtTokenBreakdownCompact: same output for (34900, 5100, 755500, 32)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

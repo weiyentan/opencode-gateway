@@ -318,10 +318,10 @@
     return String(id).substring(0, 8);
   }
 
-  /** Format a compact three-line Token Breakdown HTML string.
-   *  Line 1: active tokens (input + output)
-   *  Line 2: input / output breakdown
-   *  Line 3: cache read / write (hidden when both are zero/unavailable)
+  /** Format a compact Token Breakdown HTML string.
+   *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
+   *  Line 1: {input} in / {output} out
+   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
@@ -329,44 +329,45 @@
    *  @returns {string} HTML for the cell content
    */
   function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+    return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+  }
+
+  /** Format a compact multi-line Token Breakdown HTML string.
+   *  Line 1: {input} in / {output} out
+   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
+   *  Cache line is omitted when both cacheRead and cacheWrite are zero/null/undefined.
+   *  @param {number|null} inputTokens
+   *  @param {number|null} outputTokens
+   *  @param {number|null} cacheReadTokens
+   *  @param {number|null} cacheWriteTokens
+   *  @returns {string} HTML for the cell content
+   */
+  function fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
     var input = inputTokens || 0;
     var output = outputTokens || 0;
-    var active = input + output;
     var cr = cacheReadTokens || 0;
     var cw = cacheWriteTokens || 0;
 
-    var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+    var html = fmtNum(input) + ' in / ' + fmtNum(output) + ' out';
     if (cr > 0 || cw > 0) {
-      html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
+      html += '<br>cache hit ' + fmtNum(cr) + ' in';
+      if (cw > 0) {
+        html += ' / cache write ' + fmtNum(cw) + ' in';
+      }
     }
     return html;
   }
 
-  /** Format agent-run token cell (average cache read per call).
-   *  Uses "uncached/output" label instead of "active".
-   *  Omits average cache-read line when calls=0 or cacheRead=0.
+  /** Format agent-run token cell using the shared compact Token Breakdown formatter.
+   *  Delegates to fmtTokenBreakdownCompact. Accepts cacheWriteTokens instead of callCount.
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
-   *  @param {number|null} callCount
+   *  @param {number|null} cacheWriteTokens
    *  @returns {string} HTML for the cell content
    */
-  function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, callCount) {
-    var input = inputTokens || 0;
-    var output = outputTokens || 0;
-    var calls = callCount || 0;
-
-    var uncachedOutput = input + output;
-    var averageCacheRead = calls > 0 ? (cacheReadTokens || 0) / calls : 0;
-
-    var html = fmtNum(uncachedOutput) + ' uncached/output' +
-      '<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
-
-    if (averageCacheRead > 0) {
-      html += '<br>avg cache read ' + fmtNum(averageCacheRead) + '/call';
-    }
-
-    return html;
+  function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+    return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
   }
 
   /** Format a project label for display.
@@ -884,7 +885,7 @@
         '<td>' + todoProgress + '</td>' +
         '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
         '<td>' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
-        '<td>' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.message_count) + '</td>' +
+        '<td>' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
         '<td>' + fmtRelative(r.last_updated_at) + '</td>' +
         '<td>' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
