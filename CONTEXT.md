@@ -79,6 +79,20 @@ snapshots, parent/child session relationships, and usage aggregates. It is
 a summary view, not a replay of OpenCode events or message parts.
 _Avoid_: Event Timeline, transcript replay
 
+**Project Label**:
+The human-readable project value shown in Aurora Glass wherever usage is
+grouped by project. Resolved from source project metadata in this order:
+display name, name, workspace directory basename, external project ID, then
+`unknown`.
+_Avoid_: Project ID when referring to a display label
+
+**Drilldown State**:
+The user's current expanded/collapsed view within an Aurora Glass summary,
+such as which Client rows are expanded in the Client / Project Usage
+Breakdown. Auto-refresh may update values but should not discard Drilldown
+State while the query context remains the same.
+_Avoid_: Refresh state, table state
+
 **Admin API Key**:
 The `GATEWAY_API_KEY` environment variable. A master bearer token used by
 the `ApiKeyMiddleware` to protect ALL non-`/health` routes. Also serves
