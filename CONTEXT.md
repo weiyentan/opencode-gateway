@@ -75,9 +75,47 @@ and cancelled work items; they are not event timelines.
 **Agent Run Summary**:
 A Gateway API/view model that answers what happened during an OpenCode
 agent or subagent session using Session Context, Todo Snapshots, project
-snapshots, parent/child session relationships, and usage aggregates. It is
-a summary view, not a replay of OpenCode events or message parts.
+snapshots, parent/child session relationships, and usage aggregates. Date
+range filters include runs whose activity window overlaps the selected
+period, not only runs whose latest message falls inside it. The activity
+window runs from `first_message_at` through `last_message_at`; a missing
+`last_message_at` does not exclude a run that started before the selected
+period ends. Date-only range boundaries are calendar-day boundaries: the
+selected `To` date includes the full selected day. It is a summary view, not
+a replay of OpenCode events or message parts.
 _Avoid_: Event Timeline, transcript replay
+
+**Queued Agent Run**:
+An Agent Run that is known to the Gateway but has not yet produced its first
+observed message or usage activity. Before observed activity exists, date
+range filtering anchors the run on its creation or enqueue timestamp; once
+activity exists, normal Agent Run activity-window overlap applies.
+_Avoid_: Pending session, empty run
+
+**Token Category**:
+One of the distinct usage-token buckets reported by OpenCode: input tokens,
+output tokens, cache read tokens, and cache write tokens. Gateway summaries
+should preserve these categories instead of collapsing them into a single
+ambiguous token total.
+_Avoid_: Tokens when the category matters
+
+**Active Tokens**:
+The primary token total shown in Gateway summaries, calculated as input
+tokens plus output tokens. Active Tokens intentionally exclude cache read
+and cache write tokens so cache activity does not obscure new model work.
+_Avoid_: Total Tokens when cache categories are also visible
+
+**Cache Activity**:
+The token activity related to prompt caching, represented by cache read
+tokens and cache write tokens. Cache Activity should be displayed alongside
+Active Tokens, not merged into Active Tokens.
+_Avoid_: Cached Tokens when read/write direction matters
+
+**Token Breakdown**:
+A compact presentation of Active Tokens, input tokens, output tokens, and
+non-empty Cache Activity for a session or run. A Token Breakdown preserves
+category boundaries while keeping table rows scannable.
+_Avoid_: Single token total
 
 **Project Label**:
 The human-readable project value shown in Aurora Glass wherever usage is
@@ -164,6 +202,8 @@ manages.
 - **Session Context** is sent as a separate batch-level collection, not duplicated onto each **Usage Record**
 - A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
+- **Aurora Glass** applies the shared dashboard date range to **Agent Run Summary** views unless an Agent Runs-specific date boundary is explicitly selected; each Agent Runs-specific boundary takes precedence for that side of the range, while unset boundaries inherit from the shared dashboard range
+- **Aurora Glass** treats Agent Run status filters as additional narrowing filters on the effective date range; status filters do not define or alter the date range
 - The **Admin API Key** MAY also serve as a **Collector Credential** when its hash is registered in `collector_credentials`
 - The `ApiKeyMiddleware` runs before `require_collector_token` — a request must pass the **Admin API Key** check before **Collector Credential** lookup occurs
 - A **Usage Record Consumer** reads from the ``opencode-usage`` Kafka topic
