@@ -138,8 +138,7 @@ _Avoid_: Tokens when the category matters
 The primary token total shown in Gateway summaries (e.g. Sessions table
 and aggregate views), calculated as input tokens plus output tokens.
 Active Tokens intentionally exclude cache read and cache write tokens so
-cache activity does not obscure new model work. In the Agent Runs table,
-this same total is labelled **uncached/output** instead of active.
+cache activity does not obscure new model work.
 _Avoid_: Total Tokens when cache categories are also visible
 
 **Cache Activity**:
@@ -155,15 +154,14 @@ category boundaries while keeping table rows scannable.
 _Avoid_: Single token total
 
 **Agent Run Token Display**:
-The per-run token presentation in the Agent Runs table, distinct from the
-Token Breakdown used by Sessions and aggregate views. Shows input-plus-output
-tokens labelled as "uncached/output" (not "active"), an `in`/`out` breakdown,
-and average cache read tokens per message call (cache read tokens ÷ message
-count). Cache write tokens are omitted because per-run cache write totals
-are not meaningful in this context; the average cache-read-per-call metric
-better reflects cache efficiency. When the run has zero messages or zero
-cache read tokens, the average cache-read line is omitted entirely.
-_Avoid_: Token Breakdown when referring to Agent Runs
+The per-run token presentation in the Agent Runs table. Uses the same
+compact Token Breakdown format as Sessions and aggregate views — delegates
+to the shared `fmtTokenBreakdownCompact` formatter. Shows `{input} in / {output} out`
+on the first line with an optional second line for cache activity
+(`cache hit {cacheRead} in [ / cache write {cacheWrite} in ]`). The cache
+line is omitted when both cache read and cache write are zero or unavailable.
+No headline label (active/uncached/output), no per-call averaging.
+_Avoid_: "active" or "uncached/output" headline, per-call averaging
 
 **Project Label**:
 The human-readable project value shown in Aurora Glass wherever usage is
