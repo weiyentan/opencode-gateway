@@ -1982,9 +1982,9 @@ class TestSessionCacheTokensUpdate:
         # $8 = cached_tokens       = 15 (combined: 10 + 5)
         # $9 = cache_read_tokens   = 10
         # $10 = cache_write_tokens = 5
-        combined_cached = session_call[0][8]   # $9 → effective_cached_tokens
-        cache_read = session_call[0][9]         # $10 → cache_read_tokens
-        cache_write = session_call[0][10]        # $11 → cache_write_tokens
+        combined_cached = session_call[0][8]   # $8 → effective_cached_tokens
+        cache_read = session_call[0][9]         # $9 → cache_read_tokens
+        cache_write = session_call[0][10]        # $10 → cache_write_tokens
         assert combined_cached == 15, (
             f"Expected combined cached_tokens=15, got {combined_cached}"
         )
