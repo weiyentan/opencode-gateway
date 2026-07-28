@@ -342,6 +342,32 @@
     return html;
   }
 
+  /** Format a compact multi-line Token Breakdown HTML string.
+   *  Line 1: {input} in / {output} out
+   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
+   *  Cache line is omitted when both cacheRead and cacheWrite are zero/null/undefined.
+   *  @param {number|null} inputTokens
+   *  @param {number|null} outputTokens
+   *  @param {number|null} cacheReadTokens
+   *  @param {number|null} cacheWriteTokens
+   *  @returns {string} HTML for the cell content
+   */
+  function fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+    var input = inputTokens || 0;
+    var output = outputTokens || 0;
+    var cr = cacheReadTokens || 0;
+    var cw = cacheWriteTokens || 0;
+
+    var html = fmtNum(input) + ' in / ' + fmtNum(output) + ' out';
+    if (cr > 0 || cw > 0) {
+      html += '<br>cache hit ' + fmtNum(cr) + ' in';
+      if (cw > 0) {
+        html += ' / cache write ' + fmtNum(cw) + ' in';
+      }
+    }
+    return html;
+  }
+
   /** Format agent-run token cell (average cache read per call).
    *  Uses "uncached/output" label instead of "active".
    *  Omits average cache-read line when calls=0 or cacheRead=0.
