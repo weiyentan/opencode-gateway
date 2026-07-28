@@ -308,6 +308,8 @@ async def _resolve_session(
     workspace_id: str | None = None,
     agent: str | None = None,
     parent_session_id: str | None = None,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> uuid.UUID:
     """Map (source_database_id, external_session_id) to internal sessions.id UUID.
 
@@ -326,9 +328,10 @@ async def _resolve_session(
            (id, client_id, source_database_id, external_session_id,
             first_message_at, last_message_at, message_count,
             total_input_tokens, total_output_tokens, total_cached_tokens,
+            total_cache_read_tokens, total_cache_write_tokens,
             total_estimated_cost_usd,
             project_id, workspace_id, agent, parent_session_id)
-           VALUES ($1, $2, $3, $4, $5, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13)
+           VALUES ($1, $2, $3, $4, $5, $5, 1, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
            ON CONFLICT (source_database_id, external_session_id)
                WHERE external_session_id IS NOT NULL
            DO UPDATE SET
@@ -337,13 +340,15 @@ async def _resolve_session(
                total_input_tokens = sessions.total_input_tokens + $6,
                total_output_tokens = sessions.total_output_tokens + $7,
                total_cached_tokens = sessions.total_cached_tokens + $8,
+               total_cache_read_tokens = sessions.total_cache_read_tokens + $9,
+               total_cache_write_tokens = sessions.total_cache_write_tokens + $10,
                total_estimated_cost_usd =
                    COALESCE(sessions.total_estimated_cost_usd, 0)
-                   + COALESCE($9, 0),
-               project_id = COALESCE($10, sessions.project_id),
-               workspace_id = COALESCE($11, sessions.workspace_id),
-               agent = COALESCE($12, sessions.agent),
-               parent_session_id = COALESCE($13, sessions.parent_session_id)
+                   + COALESCE($11, 0),
+               project_id = COALESCE($12, sessions.project_id),
+               workspace_id = COALESCE($13, sessions.workspace_id),
+               agent = COALESCE($14, sessions.agent),
+               parent_session_id = COALESCE($15, sessions.parent_session_id)
            RETURNING id""",
         new_id,
         client_id,
@@ -353,6 +358,8 @@ async def _resolve_session(
         input_tokens,
         output_tokens,
         cached_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         estimated_cost_usd,
         project_id,
         workspace_id,
@@ -458,6 +465,8 @@ async def _process_one_record(
         workspace_id=record.workspace_id,
         agent=record.agent,
         parent_session_id=record.parent_session_id,
+        cache_read_tokens=record.cache_read_tokens or 0,
+        cache_write_tokens=record.cache_write_tokens or 0,
     )
 
     # ── 5. Insert usage record ───────────────────────────────────────

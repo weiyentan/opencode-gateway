@@ -113,6 +113,8 @@ class SessionSummary(BaseModel):
     total_input_tokens: int
     total_output_tokens: int
     total_cached_tokens: int
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
     project_id: str | None = None
     project_label: str | None = Field(
         default=None,
@@ -163,7 +165,11 @@ class ChildRunSummary(BaseModel):
         description="External OpenCode session identifier",
     )
     status: str = Field(
-        description="Computed status: running, completed, blocked, unknown"
+        description="Computed status: running, stale, completed, blocked, unknown"
+    )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
     )
     agent: str | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
@@ -189,7 +195,11 @@ class AgentRunSummary(BaseModel):
         description="Derived title from agent name and external session ID",
     )
     status: str = Field(
-        description="Computed status on read: running, completed, blocked, unknown"
+        description="Computed status on read: running, stale, completed, blocked, unknown"
+    )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
@@ -224,6 +234,8 @@ class AgentRunSummary(BaseModel):
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
     last_updated_at: datetime = Field(
@@ -259,7 +271,11 @@ class AgentRunDetail(BaseModel):
         description="Derived title from agent name and external session ID",
     )
     status: str = Field(
-        description="Computed status on read: running, completed, blocked, unknown"
+        description="Computed status on read: running, stale, completed, blocked, unknown"
+    )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
@@ -307,6 +323,8 @@ class AgentRunDetail(BaseModel):
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
+    total_cache_read_tokens: int = Field(default=0, ge=0)
+    total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     first_message_at: datetime | None = Field(
         default=None, description="Timestamp of the first message"
@@ -321,7 +339,7 @@ class AgentRunDetail(BaseModel):
 
 
 VALID_AGENT_RUN_STATUSES: frozenset[str] = frozenset(
-    {"running", "completed", "blocked", "unknown"}
+    {"running", "stale", "completed", "blocked", "unknown"}
 )
 
 

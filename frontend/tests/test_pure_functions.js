@@ -76,6 +76,7 @@ function fmtTodoProgress(completed, total) {
 
 function statusBadgeClass(status) {
   if (status === 'running') return 'badge-running';
+  if (status === 'stale') return 'badge-stale';
   if (status === 'completed') return 'badge-completed';
   if (status === 'blocked') return 'badge-blocked';
   return 'badge-unknown';
@@ -110,6 +111,30 @@ function truncate(str, maxLen) {
 function shortUUID(id) {
   if (!id) return '--';
   return String(id).substring(0, 8);
+}
+
+/** Format a compact three-line Token Breakdown HTML string.
+ *  Line 1: active tokens (input + output)
+ *  Line 2: input / output breakdown
+ *  Line 3: cache read / write (hidden when both are zero/unavailable)
+ *  @param {number|null} inputTokens
+ *  @param {number|null} outputTokens
+ *  @param {number|null} cacheReadTokens
+ *  @param {number|null} cacheWriteTokens
+ *  @returns {string} HTML for the cell content
+ */
+function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+  var input = inputTokens || 0;
+  var output = outputTokens || 0;
+  var active = input + output;
+  var cr = cacheReadTokens || 0;
+  var cw = cacheWriteTokens || 0;
+
+  var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+  if (cr > 0 || cw > 0) {
+    html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
+  }
+  return html;
 }
 
 // ── Date-range pure functions (duplicated from app.js for testability) ──
@@ -295,12 +320,62 @@ assert(fmtTodoProgress(2, null) === '--', 'null total → --');
 console.log('\u25B6 statusBadgeClass');
 
 assert(statusBadgeClass('running') === 'badge-running', 'running → badge-running');
+assert(statusBadgeClass('stale') === 'badge-stale', 'stale → badge-stale');
 assert(statusBadgeClass('completed') === 'badge-completed', 'completed → badge-completed');
 assert(statusBadgeClass('blocked') === 'badge-blocked', 'blocked → badge-blocked');
 assert(statusBadgeClass('unknown') === 'badge-unknown', 'unknown → badge-unknown');
 assert(statusBadgeClass('anything-else') === 'badge-unknown', 'anything else → badge-unknown');
 assert(statusBadgeClass(null) === 'badge-unknown', 'null → badge-unknown');
 assert(statusBadgeClass('') === 'badge-unknown', 'empty → badge-unknown');
+
+// ── Tests for currentStatus badge fallback ────────────────────────────────
+
+console.log('\u25B6 currentStatus badge fallback');
+
+/**
+ * The two-field contract: render the status badge using currentStatus when
+ * available, falling back to status for backward compatibility.  This is
+ * used in renderAgentRunsTable, renderAgentRunDetail (parent), and child
+ * summaries within renderAgentRunDetail.
+ *
+ * @param {object} run - { currentStatus?: string, status?: string }
+ * @returns {string} CSS badge class from statusBadgeClass
+ */
+function resolveBadgeStatus(run) {
+  return statusBadgeClass(run && (run.currentStatus || run.status));
+}
+
+// When currentStatus is present, it takes precedence
+assert(resolveBadgeStatus({ currentStatus: 'running', status: 'completed' }) === 'badge-running',
+  'currentStatus running wins over status completed');
+assert(resolveBadgeStatus({ currentStatus: 'stale', status: 'running' }) === 'badge-stale',
+  'currentStatus stale wins over status running');
+assert(resolveBadgeStatus({ currentStatus: 'blocked', status: 'running' }) === 'badge-blocked',
+  'currentStatus blocked wins over status running');
+assert(resolveBadgeStatus({ currentStatus: 'completed', status: 'unknown' }) === 'badge-completed',
+  'currentStatus completed wins over status unknown');
+assert(resolveBadgeStatus({ currentStatus: 'unknown', status: 'running' }) === 'badge-unknown',
+  'currentStatus unknown wins over status running');
+
+// When currentStatus is absent, falls back to status
+assert(resolveBadgeStatus({ status: 'running' }) === 'badge-running',
+  'missing currentStatus falls back to status running');
+assert(resolveBadgeStatus({ status: 'stale' }) === 'badge-stale',
+  'missing currentStatus falls back to status stale');
+assert(resolveBadgeStatus({ status: 'blocked' }) === 'badge-blocked',
+  'missing currentStatus falls back to status blocked');
+
+// When both are absent, returns badge-unknown
+assert(resolveBadgeStatus({}) === 'badge-unknown',
+  'both missing → badge-unknown');
+assert(resolveBadgeStatus(null) === 'badge-unknown',
+  'null run → badge-unknown');
+assert(resolveBadgeStatus(undefined) === 'badge-unknown',
+  'undefined run → badge-unknown');
+
+// Same value for both fields
+assert(resolveBadgeStatus({ currentStatus: 'running', status: 'running' }) === 'badge-running',
+  'currentStatus == status → badge-running');
 
 // ── Tests for fmtCodeChanges ────────────────────────────────────────────
 
@@ -698,6 +773,43 @@ assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
   var result = filterExpandedClients(prev, current);
   assert(result['Client A'] === true, 'Client A expanded despite duplicate name');
 })();
+
+// ── Tests for fmtTokenBreakdown ─────────────────────────────────────────
+
+console.log('\u25B6 fmtTokenBreakdown');
+
+assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 active<br>in 0 \u00B7 out 0', 'all zeros, no cache line');
+assert(fmtTokenBreakdown(null, null, null, null) === '0 active<br>in 0 \u00B7 out 0', 'all nulls, no cache line');
+assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 active<br>in 0 \u00B7 out 0', 'all undefined, no cache line');
+
+(function () {
+  var result = fmtTokenBreakdown(60000, 36500, 120400, 8200);
+  assert(result.indexOf('96.5K active') !== -1, 'active = 96.5K for 60000+36500');
+  assert(result.indexOf('in 60.0K') !== -1, 'input 60000 → 60.0K');
+  assert(result.indexOf('out 36.5K') !== -1, 'output 36500 → 36.5K');
+  assert(result.indexOf('cache read 120.4K') !== -1, 'cache read 120400 → 120.4K');
+  assert(result.indexOf('write 8.2K') !== -1, 'cache write 8200 → 8.2K');
+  assert(result.indexOf('<br>') !== -1, 'contains br tags');
+  assert(result.indexOf('\u00B7') !== -1, 'contains middle dot separator');
+})();
+
+assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache zero both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache null both → no cache line');
+
+(function () {
+  var result = fmtTokenBreakdown(1000, 2000, 3000, 0);
+  assert(result.indexOf('cache read 3.0K') !== -1, 'cache read non-zero → cache line shown');
+  assert(result.indexOf('write ') !== -1, 'cache write zero still shown in cache line');
+})();
+
+(function () {
+  var result = fmtTokenBreakdown(1000, 2000, 0, 3000);
+  assert(result.indexOf('cache read 0') !== -1, 'cache read zero still shown when write is non-zero');
+  assert(result.indexOf('write 3.0K') !== -1, 'cache write non-zero shown');
+})();
+
+assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') !== -1, 'contains \"active\" label');
+assert(fmtTokenBreakdown(0, 0, 500, 500).indexOf('cache read') !== -1, 'cache line present when cache values exist even if active is zero');
 
 // ── Summary ─────────────────────────────────────────────────────────────
 

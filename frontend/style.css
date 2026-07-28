@@ -906,6 +906,7 @@ td.clickable:hover {
 
 /* Status badges for agent runs */
 .badge-running   { background: rgba(94, 242, 255, 0.15); color: var(--accent-cyan); }
+.badge-stale     { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-completed { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-blocked   { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown   { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }

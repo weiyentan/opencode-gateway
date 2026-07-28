@@ -128,6 +128,12 @@ class Session(Base):
     total_cached_tokens: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False
     )
+    total_cache_read_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    total_cache_write_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     total_estimated_cost_usd: Mapped[Optional[Decimal]] = mapped_column(
         Numeric, nullable=True
     )
