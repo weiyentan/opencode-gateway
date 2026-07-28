@@ -7,11 +7,11 @@ Accepted
 ## Context
 
 The Gateway API returns an `AgentRunSummary` view model originally containing
-a single `status` field — a derived label such as `running`, `completed`,
-`blocked`, or `unknown`. This status is not stored in a database column; it
-is computed on read from session facts (message count, timestamps, parent
-relationship) using a heuristic with quiet-threshold and unknown-threshold
-constants.
+a single `status` field — a derived label such as `running`, `stale`,
+`completed`, `blocked`, or `unknown`. This status is not stored in a database
+column; it is computed on read from session facts (message count, timestamps,
+parent relationship) using a heuristic with quiet-threshold, stale-threshold,
+and unknown-threshold constants.
 
 At the time of this decision, the backend implements status derivation twice:
 
@@ -37,16 +37,21 @@ persisted status that consumers and operators relied on for debugging and
 backward-compatible filtering. The API contract was revised to introduce a
 separation of concerns:
 
-- **`status`** (unchanged): The raw value from the database column as
-  originally persisted. Preserved verbatim for backward compatibility,
-  debugging, and any consumer that depends on the stored value.
-- **`currentStatus`** (new): The derived/computed status produced by the
-  backend heuristics (`_compute_status` / `_status_case_expression`). This
-  is the canonical run-status label that the rest of the system should
+- **`status`**: The first-generation computed status, retained for backward
+  compatibility with existing API consumers.
+- **`currentStatus`**: The authoritative derived/computed status produced by
+  the backend heuristics (`_compute_status` / `_status_case_expression`).
+  This is the canonical run-status label that the rest of the system should
   consume.
 
-The UI badge rendering uses `currentStatus` exclusively; `status` is
-available in the payload only for troubleshooting and legacy consumers.
+**Note:** There is no raw persisted status column in the sessions table.
+Both `status` and `currentStatus` are computed on read from session facts.
+The two fields exist so consumers can migrate from the legacy `status` field
+to the canonical `currentStatus` without a breaking change.
+
+The UI badge rendering uses `currentStatus` (falling back to `status` for
+backward compatibility with older API responses that predate the two-field
+contract); `status` is available in the payload for legacy consumers.
 
 ## Decision
 
@@ -64,18 +69,17 @@ in the frontend.
 
 The API exposes **two distinct fields** to separate concerns:
 
-1. **`status`** — The raw, unmodified value from the database column.
-   Preserved unchanged for backward compatibility, operational debugging,
-   and consumers that read the persisted value directly. This field is
-   **not** recomputed by the backend.
-2. **`currentStatus`** — The derived/computed status produced by the
-   backend heuristics (`_compute_status` / `_status_case_expression`).
-   This is the canonical run-status label. All UI badge rendering MUST
-   use this field.
+1. **`status`** — The first-generation computed status, retained for
+   backward compatibility. May be deprecated in a future version.
+2. **`currentStatus`** — The authoritative derived/computed status produced
+   by the backend heuristics (`_compute_status` / `_status_case_expression`).
+   This is the canonical run-status label. All UI badge rendering SHOULD
+   use this field, falling back to `status` for responses that lack it.
 
-The frontend badge function (`statusBadgeClass`) uses `currentStatus`,
-not `status`. The `status` field remains in the payload strictly for
-debugging and legacy-consumer compatibility.
+Both fields contain the same derived value in the current implementation.
+The frontend badge function (`statusBadgeClass`) prefers `currentStatus`,
+falling back to `status` for backward compatibility. The `status` field
+remains in the payload strictly for legacy-consumer compatibility.
 
 ## Rationale
 
@@ -104,15 +108,15 @@ debugging and legacy-consumer compatibility.
 Positive:
 
 - Derivation logic remains consistent between list queries and detail views.
-- Threshold adjustments (quiet threshold, unknown threshold) are a single
-  backend change with no frontend deployment dependency.
+- Threshold adjustments (quiet threshold, stale threshold, unknown threshold)
+  are a single backend change with no frontend deployment dependency.
 - The frontend code stays simple: `statusBadgeClass` maps `currentStatus`
   to CSS, nothing more.
-- Raw persisted `status` is preserved for backward-compatible consumers,
-  operational queries, and debugging without interference from computed
-  overrides.
-- The two-field contract makes the distinction between persisted and derived
-  data explicit in the API schema, reducing confusion for API consumers.
+- The two-field contract provides a migration path from legacy `status` to
+  canonical `currentStatus` without a breaking change.
+- The `stale` status adds fidelity to the observability model: sessions with
+  a recent-but-inactive gap are distinguished from confidently-completed
+  sessions, reducing false "completed" classifications.
 
 Negative:
 
