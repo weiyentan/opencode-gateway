@@ -142,16 +142,33 @@ cache activity does not obscure new model work. In the Agent Runs table,
 this same total is labelled **uncached/output** instead of active.
 _Avoid_: Total Tokens when cache categories are also visible
 
+**Uncached/Output Tokens**:
+The preferred Aurora Glass label for the primary token total, calculated as
+input tokens plus output tokens. This is the display term for **Active Tokens**.
+_Avoid_: Active, Total Tokens
+
 **Cache Activity**:
 The token activity related to prompt caching, represented by cache read
 tokens and cache write tokens. Cache Activity should be displayed alongside
 Active Tokens, not merged into Active Tokens.
 _Avoid_: Cached Tokens when read/write direction matters
 
+**Average Cache Read Per Call**:
+Cache read tokens divided by the row's reliable call or message count. Used
+in Aurora Glass summary rows that aggregate multiple model calls.
+_Avoid_: Cache read total when a reliable denominator exists
+
+**Cumulative Cache Activity**:
+Raw cache read and cache write token totals. Used only when no reliable call
+or message denominator exists for the row.
+_Avoid_: Average cache read when the denominator is missing or ambiguous
+
 **Token Breakdown**:
-A compact presentation of Active Tokens, input tokens, output tokens, and
-non-empty Cache Activity for a session or run. A Token Breakdown preserves
-category boundaries while keeping table rows scannable.
+A compact presentation of **Uncached/Output Tokens**, input tokens, output
+tokens, and cache activity for a session or run. When a reliable call or
+message count exists, cache read should be shown as **Average Cache Read Per
+Call**; otherwise it should be shown as **Cumulative Cache Activity**. A Token
+Breakdown preserves category boundaries while keeping table rows scannable.
 _Avoid_: Single token total
 
 **Agent Run Token Display**:
@@ -250,6 +267,7 @@ manages.
 - **Session Context** is sent as a separate batch-level collection, not duplicated onto each **Usage Record**
 - A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
+- **Aurora Glass** uses the same **Token Breakdown** vocabulary for Sessions and **Agent Run Summary** rows when both have reliable call or message counts
 - **Aurora Glass** applies the shared dashboard date range to **Agent Run Summary** views unless an Agent Runs-specific date boundary is explicitly selected; each Agent Runs-specific boundary takes precedence for that side of the range, while unset boundaries inherit from the shared dashboard range
 - **Aurora Glass** treats Agent Run status filters as additional narrowing filters on the effective date range; status filters do not define or alter the date range
 - The **Admin API Key** MAY also serve as a **Collector Credential** when its hash is registered in `collector_credentials`
