@@ -122,10 +122,10 @@ function shortUUID(id) {
   return String(id).substring(0, 8);
 }
 
-/** Format a compact three-line Token Breakdown HTML string.
- *  Line 1: active tokens (input + output)
- *  Line 2: input / output breakdown
- *  Line 3: cache read / write (hidden when both are zero/unavailable)
+/** Format a compact Token Breakdown HTML string.
+ *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
+ *  Line 1: {input} in / {output} out
+ *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
@@ -133,17 +133,7 @@ function shortUUID(id) {
  *  @returns {string} HTML for the cell content
  */
 function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
-  var input = inputTokens || 0;
-  var output = outputTokens || 0;
-  var active = input + output;
-  var cr = cacheReadTokens || 0;
-  var cw = cacheWriteTokens || 0;
-
-  var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
-  if (cr > 0 || cw > 0) {
-    html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
-  }
-  return html;
+  return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
 }
 
 /** Format a compact multi-line Token Breakdown HTML string.
@@ -840,38 +830,31 @@ assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
 
 console.log('\u25B6 fmtTokenBreakdown');
 
-assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 active<br>in 0 \u00B7 out 0', 'all zeros, no cache line');
-assert(fmtTokenBreakdown(null, null, null, null) === '0 active<br>in 0 \u00B7 out 0', 'all nulls, no cache line');
-assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 active<br>in 0 \u00B7 out 0', 'all undefined, no cache line');
+// Delegates to fmtTokenBreakdownCompact; verify the compact format output
+assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 in / 0 out', 'all zeros, no cache line');
+assert(fmtTokenBreakdown(null, null, null, null) === '0 in / 0 out', 'all nulls, no cache line');
+assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 in / 0 out', 'all undefined, no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(60000, 36500, 120400, 8200);
-  assert(result.indexOf('96.5K active') !== -1, 'active = 96.5K for 60000+36500');
-  assert(result.indexOf('in 60.0K') !== -1, 'input 60000 → 60.0K');
-  assert(result.indexOf('out 36.5K') !== -1, 'output 36500 → 36.5K');
-  assert(result.indexOf('cache read 120.4K') !== -1, 'cache read 120400 → 120.4K');
-  assert(result.indexOf('write 8.2K') !== -1, 'cache write 8200 → 8.2K');
-  assert(result.indexOf('<br>') !== -1, 'contains br tags');
-  assert(result.indexOf('\u00B7') !== -1, 'contains middle dot separator');
+  assert(result === '60.0K in / 36.5K out<br>cache hit 120.4K in / cache write 8.2K in', 'full breakdown with cache read + write');
 })();
 
-assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache zero both → no cache line');
-assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K active<br>in 100.0K \u00B7 out 50.0K', 'cache null both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '100.0K in / 50.0K out', 'cache zero both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, null, null) === '100.0K in / 50.0K out', 'cache null both → no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 3000, 0);
-  assert(result.indexOf('cache read 3.0K') !== -1, 'cache read non-zero → cache line shown');
-  assert(result.indexOf('write ') !== -1, 'cache write zero still shown in cache line');
+  assert(result === '1.0K in / 2.0K out<br>cache hit 3.0K in', 'cache read non-zero → cache line with hit only');
 })();
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 0, 3000);
-  assert(result.indexOf('cache read 0') !== -1, 'cache read zero still shown when write is non-zero');
-  assert(result.indexOf('write 3.0K') !== -1, 'cache write non-zero shown');
+  assert(result === '1.0K in / 2.0K out<br>cache hit 0 in / cache write 3.0K in', 'cache write non-zero shown, read zero displayed');
 })();
 
-assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') !== -1, 'contains \"active\" label');
-assert(fmtTokenBreakdown(0, 0, 500, 500).indexOf('cache read') !== -1, 'cache line present when cache values exist even if active is zero');
+assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') === -1, 'no \"active\" label in compact format');
+assert(fmtTokenBreakdown(0, 0, 500, 500) === '0 in / 0 out<br>cache hit 500 in / cache write 500 in', 'cache line present when cache values exist even if input/output are zero');
 
 // ── Tests for fmtTokenBreakdownCompact ────────────────────────────────────
 

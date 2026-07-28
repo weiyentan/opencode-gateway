@@ -318,10 +318,10 @@
     return String(id).substring(0, 8);
   }
 
-  /** Format a compact three-line Token Breakdown HTML string.
-   *  Line 1: active tokens (input + output)
-   *  Line 2: input / output breakdown
-   *  Line 3: cache read / write (hidden when both are zero/unavailable)
+  /** Format a compact Token Breakdown HTML string.
+   *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
+   *  Line 1: {input} in / {output} out
+   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
@@ -329,17 +329,7 @@
    *  @returns {string} HTML for the cell content
    */
   function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
-    var input = inputTokens || 0;
-    var output = outputTokens || 0;
-    var active = input + output;
-    var cr = cacheReadTokens || 0;
-    var cw = cacheWriteTokens || 0;
-
-    var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
-    if (cr > 0 || cw > 0) {
-      html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
-    }
-    return html;
+    return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
   }
 
   /** Format a compact multi-line Token Breakdown HTML string.
