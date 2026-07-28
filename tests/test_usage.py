@@ -659,7 +659,7 @@ class TestClientProjectAggregates:
         assert data[0]["project_label"] is None
 
     @pytest.mark.asyncio
-    async def test_project_label_null_for_unknown_project(
+    async def test_project_label_unknown_for_unmatched_project(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
         """project_label is 'unknown' when source_projects has no matching row."""

@@ -94,6 +94,19 @@
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
+  let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+  /**
+   * Resolve the display label for a project row in the Client/Project
+   * Usage Breakdown.  Single source of truth — used by both the render
+   * function and tests.
+   *
+   * Priority: projectLabel → projectId → 'unknown'
+   * @param {object|null|undefined} p - projectRow shaped object
+   * @returns {string}
+   */
+  function resolveProjectLabel(p) {
+    return (p && p.projectLabel) || (p && p.projectId) || 'unknown';
+  }
   /**
    * Resolve date range from state, handling both preset and custom.
    * Delegates to computeDateRange for named presets; constructs Date
@@ -916,7 +929,7 @@
       // Project sub-rows (hidden by default)
       c.projectRows.forEach(function (p) {
         html += '<tr class="cp-project-row" data-cp-parent="' + cid + '" style="display:none">' +
-          '<td>' + escHtml(p.projectLabel || p.projectId || 'unknown') + '</td>' +
+          '<td>' + escHtml(resolveProjectLabel(p)) + '</td>' +
           '<td>' + fmtNum(p.tokens) + '</td>' +
           '<td>' + fmtCost(p.cost) + '</td>' +
           '<td>' + fmtNum(p.sessions) + '</td>' +
@@ -924,6 +937,13 @@
           '</tr>';
       });
     });
+
+    // Reset drilldown state if the date range context changed
+    var currentDateRangeKey = JSON.stringify(dateRangeState);
+    if (currentDateRangeKey !== _lastDateRangeKey) {
+      expandedClientNames = {};
+      _lastDateRangeKey = currentDateRangeKey;
+    }
 
     // Capture expanded state before re-render (keyed by client name, not row position)
     var expandedIcons = els.cpTbody.querySelectorAll('.cp-expand-icon.expanded');
@@ -1472,5 +1492,8 @@
   } else {
     startAutoRefresh();
   }
+
+  // Expose for tests
+  window.resolveProjectLabel = resolveProjectLabel;
 
 })();

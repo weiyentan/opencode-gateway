@@ -337,15 +337,13 @@ assert(fmtProjectLabel({ project_label: '', project_id: 'abc123' }) === 'abc123'
 // ── Tests for Client/Project Breakdown project label display ─────────────
 
 /**
- * Resolve the display label for a project row in the Client/Project
- * Usage Breakdown.  Mirrors the logic in renderClientProjectBreakdown():
- *   p.projectLabel || p.projectId || 'unknown'
- *
- * @param {object} row - projectRow shaped object with projectLabel, projectId
- * @returns {string}
+ * Delegates to the production resolveProjectLabel() from app.js.
+ * Using window.resolveProjectLabel ensures tests always exercise
+ * the single source of truth, preventing silent drift between
+ * test expectations and production display logic.
  */
 function resolveCPProjectLabel(row) {
-  return (row && row.projectLabel) || (row && row.projectId) || 'unknown';
+  return window.resolveProjectLabel(row);
 }
 
 console.log('\u25B6 resolveCPProjectLabel');
