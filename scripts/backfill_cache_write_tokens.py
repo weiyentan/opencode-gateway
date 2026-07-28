@@ -21,12 +21,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 import asyncpg
 
-# Allow running from the repo root
-sys.path.insert(0, ".")
+# Allow running from any location by resolving the repo root relative to this script
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.config import get_settings  # noqa: E402
 
