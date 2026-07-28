@@ -92,6 +92,41 @@ range filtering anchors the run on its creation or enqueue timestamp; once
 activity exists, normal Agent Run activity-window overlap applies.
 _Avoid_: Pending session, empty run
 
+**Run Status — Completed**:
+A best-effort terminal status derived by the gateway from available
+quiet/activity heuristics. Because OpenCode exposes no authoritative
+terminal success signal, "completed" is not an upstream-proven success
+proof — it means the session has fallen quiet beyond the threshold, has
+no parent dependency, and has recorded messages (see
+``_compute_status``). Inactivity alone must never be confused with
+upstream-proven success; it is a heuristic. Distinct from Blocked
+(intentional wait), Stale (lost liveness), Timed Out (expired budget), and
+terminal failures like Failed or Cancelled.
+
+**Run Status — Running**:
+A run that is actively executing with trusted, recent liveness evidence —
+heartbeats, output, or other forward-progress signals.
+
+**Run Status — Blocked**:
+A run that is intentionally paused awaiting an external condition
+(dependency, human input, resource). The inactivity is deliberate and
+tracked, not presumed. A Blocked run may return to Running when the
+condition resolves.
+
+**Run Status — Stale**:
+A run whose liveness is no longer trusted without any terminal signal
+(success, error, cancellation, or timeout). The process or response stream
+has gone silent, or its heartbeats cannot be verified. Stale is a valid
+direct user-facing status label in observability contexts. It represents
+a gap in observability, not a known termination reason. Distinct from
+Blocked (intentional tracked wait) and Timed Out (expired budget).
+
+**Run Status — Timed Out**:
+A terminal unsuccessful status. The run exceeded its configured maximum
+duration, regardless of whether it was making progress or blocked.
+Distinct from Stale (non-terminal, observability gap) and Blocked
+(intentional tracked wait).
+
 **Token Category**:
 One of the distinct usage-token buckets reported by OpenCode: input tokens,
 output tokens, cache read tokens, and cache write tokens. Gateway summaries
