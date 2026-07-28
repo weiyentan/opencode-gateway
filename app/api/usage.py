@@ -888,6 +888,7 @@ async def _fetch_agent_runs(
                 source_database_id=r["source_database_id"],
                 title=_derive_title(r["agent"], r["external_session_id"]),
                 status=status_val,
+                currentStatus=status_val,
                 agent=r["agent"],
                 project_id=r["project_id"],
                 project_label=r["project_label"],
@@ -997,6 +998,7 @@ async def _fetch_agent_run_detail(
                 id=cr["id"],
                 external_session_id=cr["external_session_id"],
                 status=child_status,
+                currentStatus=child_status,
                 agent=cr["agent"],
                 message_count=cr["message_count"],
             )
@@ -1083,6 +1085,7 @@ async def _fetch_agent_run_detail(
             session_row["agent"], session_row["external_session_id"]
         ),
         status=computed_status,
+        currentStatus=computed_status,
         agent=session_row["agent"],
         project_id=session_row["project_id"],
         project_label=session_row["project_label"],

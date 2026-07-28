@@ -320,6 +320,11 @@ class TestAgentRunsList:
         assert data["limit"] == 50
         assert data["offset"] == 0
 
+        # currentStatus must be present alongside status (two-field contract)
+        item = data["items"][0]
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
+
     @pytest.mark.asyncio
     async def test_row_has_required_fields(self, client: AsyncClient, mock_conn: AsyncMock):
         """Each list row includes both internal and external IDs, computed status, etc."""
@@ -349,6 +354,8 @@ class TestAgentRunsList:
 
         # Computed fields
         assert item["status"] in ("running", "stale", "completed", "blocked", "unknown")
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
         assert "child_run_count" in item
         assert isinstance(item["child_run_count"], int)
         assert item["child_run_count"] >= 0
@@ -396,6 +403,8 @@ class TestAgentRunsList:
         # Status from SQL computation uses now() which should be close
         # to real now; a 5-min-old session should be "running"
         assert item["status"] == "running"
+        assert "currentStatus" in item
+        assert item["currentStatus"] == item["status"]
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -663,6 +672,9 @@ class TestAgentRunsDetail:
         data = payload["data"]
         assert data["id"] == str(_SESSION_ID)
         assert data["external_session_id"] == _EXTERNAL_ID_A
+        # currentStatus must be present alongside status (two-field contract)
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_includes_loki_url(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -768,6 +780,8 @@ class TestAgentRunsDetail:
         assert child0["id"] == str(child_id)
         assert child0["external_session_id"] == _EXTERNAL_ID_B
         assert child0["status"] in ("running", "stale", "completed", "blocked", "unknown")
+        assert "currentStatus" in child0
+        assert child0["currentStatus"] == child0["status"]
         assert child0["agent"] == "code-editor-junior"
         assert child0["message_count"] == 3
 
@@ -883,6 +897,9 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["status"] == "running"
+        # currentStatus must be present alongside status (two-field contract)
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_blocked_status_with_parent(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -909,6 +926,8 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["status"] == "blocked"
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
 
     @pytest.mark.asyncio
     async def test_detail_missing_context_project_rows(self, client: AsyncClient, mock_conn: AsyncMock):

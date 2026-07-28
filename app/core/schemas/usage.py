@@ -165,6 +165,10 @@ class ChildRunSummary(BaseModel):
     status: str = Field(
         description="Computed status: running, stale, completed, blocked, unknown"
     )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
+    )
     agent: str | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
 
@@ -190,6 +194,10 @@ class AgentRunSummary(BaseModel):
     )
     status: str = Field(
         description="Computed status on read: running, stale, completed, blocked, unknown"
+    )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
@@ -260,6 +268,10 @@ class AgentRunDetail(BaseModel):
     )
     status: str = Field(
         description="Computed status on read: running, stale, completed, blocked, unknown"
+    )
+    currentStatus: str = Field(
+        description="Current computed status (same derivation as status). "
+        "Preferred field for UI badge rendering per ADR 0010."
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
