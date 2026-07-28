@@ -215,6 +215,11 @@ async def _fetch_aggregates(
         if has_project
         else ""
     )
+    group_project_suffix = (
+        f",\n            ({_PROJECT_LABEL_SQL})"
+        if has_project
+        else ""
+    )
 
     sql = f"""
         SELECT
@@ -235,7 +240,7 @@ async def _fetch_aggregates(
         {sessions_join}
         {project_join}
         WHERE {where_clause}
-        GROUP BY {group_expr}
+        GROUP BY {group_expr}{group_project_suffix}
         ORDER BY group_value
     """
     rows = await conn.fetch(sql, *query_params)

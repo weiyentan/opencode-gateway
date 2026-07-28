@@ -754,6 +754,44 @@ class TestClientProjectAggregates:
         assert data[0]["session_count"] == 4
         assert data[0]["model_count"] == 3
 
+    @pytest.mark.asyncio
+    async def test_group_by_client_project_sql_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The GROUP BY clause includes the standalone _PROJECT_LABEL_SQL expression
+        when group_by includes 'project', so PostgreSQL accepts the query."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+
+        # Capture the SQL sent to conn.fetch (the grouped path)
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        sql = call_args[0][0]
+
+        # The GROUP BY must include both the concatenated expression
+        # AND the standalone project-label expression (parenthesized).
+        assert "GROUP BY" in sql.upper()
+        assert "COALESCE(" in sql  # _PROJECT_LABEL_SQL contains COALESCE
+        # The parenthesised form should appear after GROUP BY
+        group_by_clause = sql.split("GROUP BY")[1].split("ORDER BY")[0]
+        # Should contain both the pipe-delimited expression and the standalone
+        assert "||" in group_by_clause or "oc.name" in group_by_clause
+        # The standalone project label expression appears after a comma
+        assert "COALESCE(" in group_by_clause
+        assert group_by_clause.count("COALESCE(") >= 1
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
