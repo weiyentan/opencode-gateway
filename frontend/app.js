@@ -303,6 +303,30 @@
     return String(id).substring(0, 8);
   }
 
+  /** Format a compact three-line Token Breakdown HTML string.
+   *  Line 1: active tokens (input + output)
+   *  Line 2: input / output breakdown
+   *  Line 3: cache read / write (hidden when both are zero/unavailable)
+   *  @param {number|null} inputTokens
+   *  @param {number|null} outputTokens
+   *  @param {number|null} cacheReadTokens
+   *  @param {number|null} cacheWriteTokens
+   *  @returns {string} HTML for the cell content
+   */
+  function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
+    var input = inputTokens || 0;
+    var output = outputTokens || 0;
+    var active = input + output;
+    var cr = cacheReadTokens || 0;
+    var cw = cacheWriteTokens || 0;
+
+    var html = fmtNum(active) + ' active<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+    if (cr > 0 || cw > 0) {
+      html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
+    }
+    return html;
+  }
+
   /** Format a project label for display.
    *  Uses the resolved project_label field from the API when available;
    *  falls back to project_id / workspace_id for backward compatibility. */
@@ -762,7 +786,6 @@
     var html = '';
     data.sessions.items.forEach(function (s) {
       var clientName = clientMap[s.client_id] || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
-      var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
       var cost = s.total_estimated_cost_usd;
       var duration = fmtDuration(s.first_message_at, s.last_message_at);
       var title = s.session_title || '--';
@@ -775,7 +798,7 @@
         '<td>' + fmtDT(s.last_message_at) + '</td>' +
         '<td>' + duration + '</td>' +
         '<td>' + (s.message_count || 0) + '</td>' +
-        '<td>' + fmtNum(tokens) + '</td>' +
+        '<td>' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</td>' +
         '<td>' + fmtCost(cost) + '</td>' +
         '<td>' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
         '</tr>';
@@ -807,7 +830,6 @@
     var html = '';
     runs.forEach(function (r) {
       var todoProgress = fmtTodoProgress(r.todo_completed, r.todo_total);
-      var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
       var projectStr = fmtProjectLabel(r);
       var statusCls = statusBadgeClass(r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
@@ -820,7 +842,7 @@
         '<td>' + todoProgress + '</td>' +
         '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
         '<td>' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
-        '<td>' + fmtNum(tokens) + '</td>' +
+        '<td>' + fmtTokenBreakdown(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
         '<td>' + fmtRelative(r.last_updated_at) + '</td>' +
         '<td>' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
@@ -1060,8 +1082,9 @@
       '<div class="detail-grid">' +
         fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
         fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
-        fieldHtml('Cached Tokens', fmtNum(d.total_cached_tokens)) +
-        fieldHtml('Total Tokens', fmtNum(tokens)) +
+        fieldHtml('Cache Read Tokens', fmtNum(d.total_cache_read_tokens)) +
+        fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
+        fieldHtml('Active Tokens', fmtNum(tokens)) +
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
         fieldHtml('Code Changes', fmtCodeChanges(d.code_changes_total)) +
       '</div></div>';
@@ -1184,6 +1207,8 @@
         fieldHtml('Last Message', fmtDT(d.last_message_at)) +
         fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
         fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
+        fieldHtml('Cache Read Tokens', fmtNum(d.total_cache_read_tokens)) +
+        fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
       '</div></div>';
 
