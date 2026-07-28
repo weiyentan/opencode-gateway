@@ -2244,3 +2244,100 @@ class TestRecordsWithContextEnvelope:
         payload = response.json()
         assert payload["status"] == "ok"
         assert "data" in payload
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #317 — Backfill cache-write token verification
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestBackfillCacheWriteTokens:
+    """Tests for the backfill script's verification and update logic.
+
+    These tests verify the SQL queries and argument parsing used by
+    ``scripts/backfill_cache_write_tokens.py``.  The actual database
+    execution is tested via integration tests.
+    """
+
+    def test_verification_query_is_defined(self):
+        """The VERIFICATION_QUERY constant is a non-empty string."""
+        from scripts.backfill_cache_write_tokens import VERIFICATION_QUERY
+        assert VERIFICATION_QUERY
+        assert "HAVING" in VERIFICATION_QUERY.upper()
+        assert "session_cache_write" in VERIFICATION_QUERY.lower()
+
+    def test_backfill_update_sql_is_defined(self):
+        """The BACKFILL_UPDATE_SQL constant is a non-empty UPDATE statement."""
+        from scripts.backfill_cache_write_tokens import BACKFILL_UPDATE_SQL
+        assert BACKFILL_UPDATE_SQL
+        assert BACKFILL_UPDATE_SQL.strip().upper().startswith("UPDATE")
+
+    def test_mismatch_count_sql_is_defined(self):
+        """The MISMATCH_COUNT_SQL constant is a non-empty COUNT query."""
+        from scripts.backfill_cache_write_tokens import MISMATCH_COUNT_SQL
+        assert MISMATCH_COUNT_SQL
+        assert "COUNT" in MISMATCH_COUNT_SQL.upper()
+
+    def test_dry_run_default_false(self):
+        """The --dry-run flag defaults to False."""
+        from scripts.backfill_cache_write_tokens import _parse_args
+        args = _parse_args([])
+        assert args.dry_run is False
+
+    def test_dry_run_flag_true(self):
+        """Passing --dry-run sets dry_run=True."""
+        from scripts.backfill_cache_write_tokens import _parse_args
+        args = _parse_args(["--dry-run"])
+        assert args.dry_run is True
+
+    @pytest.mark.asyncio
+    async def test_count_mismatches_returns_int(self):
+        """_count_mismatches returns an integer from the database."""
+        from scripts.backfill_cache_write_tokens import _count_mismatches
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value={"cnt": 5})
+        result = await _count_mismatches(mock_conn)
+        assert result == 5
+        # Verify the MISMATCH_COUNT_SQL was sent
+        call_sql = mock_conn.fetchrow.call_args[0][0]
+        assert "COUNT" in call_sql
+
+    @pytest.mark.asyncio
+    async def test_count_mismatches_none_returns_zero(self):
+        """_count_mismatches returns 0 when fetchrow returns None."""
+        from scripts.backfill_cache_write_tokens import _count_mismatches
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        result = await _count_mismatches(mock_conn)
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_run_verification_returns_list(self):
+        """_run_verification returns a list of mismatched rows."""
+        from scripts.backfill_cache_write_tokens import _run_verification
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[
+            {"id": "sid-1", "session_cache_write": 0, "raw_cache_write_sum": 5},
+        ])
+        result = await _run_verification(mock_conn)
+        assert len(result) == 1
+        assert result[0]["session_cache_write"] == 0
+        assert result[0]["raw_cache_write_sum"] == 5
+
+    @pytest.mark.asyncio
+    async def test_run_backfill_returns_updated_count(self):
+        """_run_backfill returns the number of rows updated."""
+        from scripts.backfill_cache_write_tokens import _run_backfill
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="UPDATE 7")
+        result = await _run_backfill(mock_conn)
+        assert result == 7
+
+    @pytest.mark.asyncio
+    async def test_run_backfill_zero_updated(self):
+        """_run_backfill returns 0 when no rows matched."""
+        from scripts.backfill_cache_write_tokens import _run_backfill
+        mock_conn = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="UPDATE 0")
+        result = await _run_backfill(mock_conn)
+        assert result == 0
