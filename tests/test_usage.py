@@ -90,6 +90,8 @@ def _mk_session_row(
     total_input_tokens: int = 500,
     total_output_tokens: int = 250,
     total_cached_tokens: int = 0,
+    total_cache_read_tokens: int = 0,
+    total_cache_write_tokens: int = 0,
     project_id: str | None = None,
     project_label: str | None = None,
     workspace_id: str | None = None,
@@ -110,6 +112,8 @@ def _mk_session_row(
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "total_cached_tokens": total_cached_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
         "project_id": project_id,
         "project_label": project_label,
         "workspace_id": workspace_id,
@@ -905,6 +909,51 @@ class TestSessions:
         assert item["workspace_id"] == "ws-456"
         assert item["agent"] == "code-editor"
         assert item["parent_session_id"] == parent_id
+
+    @pytest.mark.asyncio
+    async def test_sessions_include_cache_read_write_tokens(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Session summaries include total_cache_read_tokens and total_cache_write_tokens."""
+        row = _mk_session_row(
+            total_cache_read_tokens=42,
+            total_cache_write_tokens=7,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["total_cache_read_tokens"] == 42
+        assert item["total_cache_write_tokens"] == 7
+
+    @pytest.mark.asyncio
+    async def test_sessions_cache_read_write_default_to_zero(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Session summaries default cache read/write to 0 when not explicitly set."""
+        row = _mk_session_row()  # defaults total_cache_read_tokens=0, total_cache_write_tokens=0
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["total_cache_read_tokens"] == 0
+        assert item["total_cache_write_tokens"] == 0
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):
