@@ -2052,6 +2052,328 @@ class TestSessionCacheTokensUpdate:
         assert cache_read == 0, f"Expected cache_read=0, got {cache_read}"
         assert cache_write == 0, f"Expected cache_write=0, got {cache_write}"
 
+    @pytest.mark.asyncio
+    async def test_multiple_records_accumulate_cache_tokens(self, monkeypatch):
+        """Two v1.2 records for the same session accumulate cache tokens
+        in the session upsert — each call increments by its own values."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        shared_session_id = uuid.uuid4()
+
+        # Helper: create a session row mock returning the same UUID each time
+        def _session_row(_id: uuid.UUID = shared_session_id):
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": _id}.__getitem__
+            return r
+
+        mock_conn.fetchrow.side_effect = [
+            auth,                    # 0. auth
+            None,                    # 1. source_database check (new)
+            None,                    # 2. dedup rec-001 (new)
+            None,                    # 3. model gpt-4 (new)
+            _session_row(),          # 4. session upsert rec-001 → returns shared id
+            None,                    # 5. dedup rec-002 (new)
+            None,                    # 6. model claude-3 (new)
+            _session_row(),          # 7. session upsert rec-002 → returns shared id
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(shared_session_id),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+                {
+                    "source_record_id": "rec-002",
+                    "session_id": str(shared_session_id),
+                    "model": "claude-3",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 20,
+                    "cache_write_tokens": 8,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["rejected_count"] == 0
+
+        # Collect all session upsert calls
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 2
+
+        # First record: cache_read=10, cache_write=5, combined=15
+        first_call = session_calls[0]
+        assert first_call[0][8] == 15, (
+            f"First record: expected combined=15, got {first_call[0][8]}"
+        )
+        assert first_call[0][9] == 10, (
+            f"First record: expected cache_read=10, got {first_call[0][9]}"
+        )
+        assert first_call[0][10] == 5, (
+            f"First record: expected cache_write=5, got {first_call[0][10]}"
+        )
+
+        # Second record: cache_read=20, cache_write=8, combined=28
+        second_call = session_calls[1]
+        assert second_call[0][8] == 28, (
+            f"Second record: expected combined=28, got {second_call[0][8]}"
+        )
+        assert second_call[0][9] == 20, (
+            f"Second record: expected cache_read=20, got {second_call[0][9]}"
+        )
+        assert second_call[0][10] == 8, (
+            f"Second record: expected cache_write=8, got {second_call[0][10]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_v10_and_v12_same_session(self, monkeypatch):
+        """A v1.0 and v1.2 record for the same session both contribute
+        to the session upsert.  The v1.0 record passes wire cached_tokens
+        as $8 and 0 for $9/$10; the v1.2 record passes cache_read/write
+        separately."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        shared_session_id = uuid.uuid4()
+
+        def _session_row(_id: uuid.UUID = shared_session_id):
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": _id}.__getitem__
+            return r
+
+        mock_conn.fetchrow.side_effect = [
+            auth,                    # 0. auth
+            None,                    # 1. source_database check (new)
+            None,                    # 2. dedup rec-v10 (new)
+            None,                    # 3. model gpt-4 (new)
+            _session_row(),          # 4. session upsert rec-v10 → shared id
+            None,                    # 5. dedup rec-v12 (new)
+            None,                    # 6. model claude-3 (new)
+            _session_row(),          # 7. session upsert rec-v12 → shared id
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Batch schema_version must match the first record's era — we use
+        # "1.2" because the batch-level version only controls the schema
+        # gate, individual records can be minimal v1.0 style.
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                # v1.0-style record (no enrichment fields)
+                {
+                    "source_record_id": "rec-v10",
+                    "session_id": str(shared_session_id),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 42,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                # v1.2-style record with cache_read/cache_write
+                {
+                    "source_record_id": "rec-v12",
+                    "session_id": str(shared_session_id),
+                    "model": "claude-3",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 15,
+                    "cache_write_tokens": 7,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["rejected_count"] == 0
+
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 2
+
+        # v1.0 record: uses wire cached_tokens=42, no cache_read/write
+        v10_call = session_calls[0]
+        assert v10_call[0][8] == 42, (
+            f"v1.0: expected combined=42, got {v10_call[0][8]}"
+        )
+        assert v10_call[0][9] == 0, (
+            f"v1.0: expected cache_read=0, got {v10_call[0][9]}"
+        )
+        assert v10_call[0][10] == 0, (
+            f"v1.0: expected cache_write=0, got {v10_call[0][10]}"
+        )
+
+        # v1.2 record: cache_read=15, cache_write=7, combined=22
+        v12_call = session_calls[1]
+        assert v12_call[0][8] == 22, (
+            f"v1.2: expected combined=22, got {v12_call[0][8]}"
+        )
+        assert v12_call[0][9] == 15, (
+            f"v1.2: expected cache_read=15, got {v12_call[0][9]}"
+        )
+        assert v12_call[0][10] == 7, (
+            f"v1.2: expected cache_write=7, got {v12_call[0][10]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_v12_zero_cache_write_tokens(self, monkeypatch):
+        """A v1.2 record with explicitly zero cache_write_tokens passes 0."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-zero-cw",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 0,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+        session_call = next(
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        )
+        # cache_read=10 + cache_write=0 → combined=10
+        assert session_call[0][8] == 10, (
+            f"Expected combined=10, got {session_call[0][8]}"
+        )
+        assert session_call[0][9] == 10, (
+            f"Expected cache_read=10, got {session_call[0][9]}"
+        )
+        assert session_call[0][10] == 0, (
+            f"Expected cache_write=0, got {session_call[0][10]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_v12_missing_cache_write_tokens_defaults_zero(self, monkeypatch):
+        """A v1.2 record with None cache_write_tokens passes 0 for cache_write.
+        Since cache_read is also None, effective_cached_tokens = wire value."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-no-cw",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 30,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    # intentionally omit cache_read_tokens and cache_write_tokens
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["accepted_count"] == 1
+
+        session_call = next(
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        )
+        # Both cache_read and cache_write are None → use wire cached_tokens=30
+        # cache_read/cache_write default to 0 in the upsert
+        assert session_call[0][8] == 30, (
+            f"Expected combined=30, got {session_call[0][8]}"
+        )
+        assert session_call[0][9] == 0, (
+            f"Expected cache_read=0, got {session_call[0][9]}"
+        )
+        assert session_call[0][10] == 0, (
+            f"Expected cache_write=0, got {session_call[0][10]}"
+        )
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Issue #252 — Projection payload ingestion
