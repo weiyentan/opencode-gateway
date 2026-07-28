@@ -33,6 +33,10 @@ class AggregateRow(BaseModel):
     record_count: int = Field(default=0, ge=0)
     session_count: int = Field(default=0, ge=0)
     model_count: int = Field(default=0, ge=0)
+    project_label: str | None = Field(
+        default=None,
+        description="Resolved project label (present when group includes 'project')",
+    )
 
 
 class AggregateQuery(BaseModel):

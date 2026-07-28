@@ -874,6 +874,7 @@
       var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
       var projectRow = {
         projectId: projectId,
+        projectLabel: r.project_label || null,
         tokens: tokens,
         cost: r.total_estimated_cost_usd,
         sessions: r.session_count || 0,
@@ -914,7 +915,7 @@
       // Project sub-rows (hidden by default)
       c.projectRows.forEach(function (p) {
         html += '<tr class="cp-project-row" data-cp-parent="' + cid + '" style="display:none">' +
-          '<td>' + escHtml(p.projectId) + '</td>' +
+          '<td>' + escHtml(p.projectLabel || p.projectId || 'unknown') + '</td>' +
           '<td>' + fmtNum(p.tokens) + '</td>' +
           '<td>' + fmtCost(p.cost) + '</td>' +
           '<td>' + fmtNum(p.sessions) + '</td>' +

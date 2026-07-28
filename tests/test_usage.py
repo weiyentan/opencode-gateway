@@ -185,6 +185,7 @@ def _mk_aggregate_row(
     record_count: int = 3,
     session_count: int = 2,
     model_count: int = 1,
+    project_label: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock for an aggregate query result row."""
     row = MagicMock()
@@ -200,6 +201,7 @@ def _mk_aggregate_row(
         "record_count": record_count,
         "session_count": session_count,
         "model_count": model_count,
+        "project_label": project_label,
     }
     row.__getitem__.side_effect = data.__getitem__
     return row
@@ -580,6 +582,114 @@ class TestClientProjectAggregates:
         data = response.json()["data"]
         assert len(data) == 1
         assert data[0]["group_value"] == "Acme Corp|proj-abc"
+
+    @pytest.mark.asyncio
+    async def test_project_label_in_client_project_aggregate(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """project_label is returned in the response when group_by includes project."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="Acme Corp|proj-abc",
+                record_count=10,
+                session_count=3,
+                model_count=2,
+                project_label="Friendly Project Name",
+            ),
+            _mk_aggregate_row(
+                group_value="Acme Corp|proj-xyz",
+                record_count=5,
+                session_count=1,
+                model_count=1,
+                project_label="Another Project",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        # First row should have the resolved project label
+        assert data[0]["project_label"] == "Friendly Project Name"
+        assert data[0]["group_value"] == "Acme Corp|proj-abc"
+        # Second row should have its own project label
+        assert data[1]["project_label"] == "Another Project"
+
+    @pytest.mark.asyncio
+    async def test_project_label_null_when_not_grouped_by_project(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """project_label is null when group_by does NOT include 'project'."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="gpt-4",
+                record_count=5,
+                session_count=2,
+                model_count=1,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        # project_label should be null because "project" is not in group_by
+        assert data[0]["project_label"] is None
+
+    @pytest.mark.asyncio
+    async def test_project_label_null_for_unknown_project(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """project_label is 'unknown' when source_projects has no matching row."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="Beta Inc|unknown",
+                record_count=2,
+                session_count=1,
+                model_count=1,
+                project_label="unknown",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["project_label"] == "unknown"
+        assert data[0]["group_value"] == "Beta Inc|unknown"
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -334,6 +334,47 @@ assert(fmtProjectLabel({ project_id: 'abc123', workspace_id: 'ws456' }) === 'abc
 assert(fmtProjectLabel({ project_label: '' }) === '--', 'empty project_label falls through to default');
 assert(fmtProjectLabel({ project_label: '', project_id: 'abc123' }) === 'abc123', 'empty project_label falls through to project_id');
 
+// ── Tests for Client/Project Breakdown project label display ─────────────
+
+/**
+ * Resolve the display label for a project row in the Client/Project
+ * Usage Breakdown.  Mirrors the logic in renderClientProjectBreakdown():
+ *   p.projectLabel || p.projectId || 'unknown'
+ *
+ * @param {object} row - projectRow shaped object with projectLabel, projectId
+ * @returns {string}
+ */
+function resolveCPProjectLabel(row) {
+  return (row && row.projectLabel) || (row && row.projectId) || 'unknown';
+}
+
+console.log('\u25B6 resolveCPProjectLabel');
+
+// When project_label is available from the API, it takes precedence
+assert(resolveCPProjectLabel({ projectLabel: 'My Web App', projectId: 'proj-abc' }) === 'My Web App',
+  'projectLabel wins over projectId');
+
+// When project_label is null/empty, falls back to projectId
+assert(resolveCPProjectLabel({ projectLabel: null, projectId: 'proj-abc' }) === 'proj-abc',
+  'null projectLabel falls back to projectId');
+assert(resolveCPProjectLabel({ projectLabel: '', projectId: 'proj-xyz' }) === 'proj-xyz',
+  'empty string projectLabel falls back to projectId');
+
+// When project_label is undefined (missing), falls back to projectId
+assert(resolveCPProjectLabel({ projectId: 'proj-abc' }) === 'proj-abc',
+  'missing projectLabel falls back to projectId');
+
+// When both are missing, returns 'unknown'
+assert(resolveCPProjectLabel({}) === 'unknown', 'empty object → unknown');
+assert(resolveCPProjectLabel({ projectLabel: null, projectId: null }) === 'unknown',
+  'null projectLabel and null projectId → unknown');
+
+// Typical API responses
+assert(resolveCPProjectLabel({ projectLabel: 'Friendly Name', projectId: 'proj-abc' }) === 'Friendly Name',
+  'API with resolved label uses it');
+assert(resolveCPProjectLabel({ projectLabel: 'unknown', projectId: 'unknown' }) === 'unknown',
+  'API with unknown label uses unknown');
+
 // ── Tests for truncate ──────────────────────────────────────────────────
 
 console.log('\u25B6 truncate');
