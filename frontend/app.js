@@ -923,7 +923,7 @@
     rows.forEach(function (r) {
       var parts = (r.group_value || '').split('|');
       var clientName = parts[0] || 'Unknown';
-      var projectId = parts[1] || 'unknown';
+      var projectLabel = parts[1] || 'unknown';
 
       if (!clientMap[clientName]) {
         clientMap[clientName] = {
@@ -937,8 +937,8 @@
 
       var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
       var projectRow = {
-        projectId: projectId,
-        projectLabel: r.project_label || null,
+        projectId: projectLabel,
+        projectLabel: r.project_label || projectLabel,
         tokens: tokens,
         cost: r.total_estimated_cost_usd,
         sessions: r.session_count || 0,

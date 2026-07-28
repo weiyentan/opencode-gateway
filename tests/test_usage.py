@@ -496,22 +496,25 @@ class TestClientProjectAggregates:
         """group_by=client,project returns pipe-delimited group_value per client+project."""
         rows = [
             _mk_aggregate_row(
-                group_value="Acme Corp|proj-abc",
+                group_value="Acme Corp|Friendly Project Name",
                 record_count=10,
                 session_count=3,
                 model_count=2,
+                project_label="Friendly Project Name",
             ),
             _mk_aggregate_row(
-                group_value="Acme Corp|proj-xyz",
+                group_value="Acme Corp|Another Project",
                 record_count=5,
                 session_count=1,
                 model_count=1,
+                project_label="Another Project",
             ),
             _mk_aggregate_row(
                 group_value="Beta Inc|unknown",
                 record_count=2,
                 session_count=1,
                 model_count=1,
+                project_label="unknown",
             ),
         ]
         mock_conn.fetch = AsyncMock(return_value=rows)
@@ -530,14 +533,16 @@ class TestClientProjectAggregates:
         assert response.status_code == 200
         data = response.json()["data"]
         assert len(data) == 3
-        # First row: Acme Corp|proj-abc
-        assert data[0]["group_value"] == "Acme Corp|proj-abc"
+        # First row: Acme Corp|Friendly Project Name
+        assert data[0]["group_value"] == "Acme Corp|Friendly Project Name"
         assert data[0]["record_count"] == 10
         assert data[0]["session_count"] == 3
         assert data[0]["model_count"] == 2
-        # Third row: Beta Inc|unknown (NULL project_id → COALESCE)
+        assert data[0]["project_label"] == "Friendly Project Name"
+        # Third row: Beta Inc|unknown (NULL source_projects → 'unknown')
         assert data[2]["group_value"] == "Beta Inc|unknown"
         assert data[2]["session_count"] == 1
+        assert data[2]["project_label"] == "unknown"
 
     @pytest.mark.asyncio
     async def test_group_by_client_project_empty(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -566,10 +571,11 @@ class TestClientProjectAggregates:
         """client,project group_by works when combined with other filters."""
         rows = [
             _mk_aggregate_row(
-                group_value="Acme Corp|proj-abc",
+                group_value="Acme Corp|My Project Label",
                 record_count=3,
                 session_count=1,
                 model_count=1,
+                project_label="My Project Label",
             ),
         ]
         mock_conn.fetch = AsyncMock(return_value=rows)
@@ -589,23 +595,28 @@ class TestClientProjectAggregates:
         assert response.status_code == 200
         data = response.json()["data"]
         assert len(data) == 1
-        assert data[0]["group_value"] == "Acme Corp|proj-abc"
+        assert data[0]["group_value"] == "Acme Corp|My Project Label"
+        assert data[0]["project_label"] == "My Project Label"
 
     @pytest.mark.asyncio
     async def test_project_label_in_client_project_aggregate(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
-        """project_label is returned in the response when group_by includes project."""
+        """project_label is returned in the response when group_by includes project.
+        
+        The group_value now uses the resolved project label (via _PROJECT_LABEL_SQL),
+        so the pipe-delimited part after the client name IS the project label.
+        """
         rows = [
             _mk_aggregate_row(
-                group_value="Acme Corp|proj-abc",
+                group_value="Acme Corp|Friendly Project Name",
                 record_count=10,
                 session_count=3,
                 model_count=2,
                 project_label="Friendly Project Name",
             ),
             _mk_aggregate_row(
-                group_value="Acme Corp|proj-xyz",
+                group_value="Acme Corp|Another Project",
                 record_count=5,
                 session_count=1,
                 model_count=1,
@@ -628,11 +639,12 @@ class TestClientProjectAggregates:
         assert response.status_code == 200
         data = response.json()["data"]
         assert len(data) == 2
-        # First row should have the resolved project label
+        # First row should have the resolved project label in both fields
         assert data[0]["project_label"] == "Friendly Project Name"
-        assert data[0]["group_value"] == "Acme Corp|proj-abc"
+        assert data[0]["group_value"] == "Acme Corp|Friendly Project Name"
         # Second row should have its own project label
         assert data[1]["project_label"] == "Another Project"
+        assert data[1]["group_value"] == "Acme Corp|Another Project"
 
     @pytest.mark.asyncio
     async def test_project_label_null_when_not_grouped_by_project(
@@ -698,6 +710,49 @@ class TestClientProjectAggregates:
         assert len(data) == 1
         assert data[0]["project_label"] == "unknown"
         assert data[0]["group_value"] == "Beta Inc|unknown"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_project_labels_merged_by_backend(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """When two different external_project_ids resolve to the same Project Label
+        under the same client, the backend GROUP BY merges them into one row."""
+        # Simulate: two raw project IDs ("proj-abc", "proj-xyz") both resolve
+        # to the same friendly label "My Project" via source_projects table.
+        # The GROUP BY on (_PROJECT_LABEL_SQL) produces a single merged row.
+        rows = [
+            _mk_aggregate_row(
+                group_value="Acme Corp|My Project",
+                record_count=15,  # 10 + 5 merged
+                session_count=4,   # 3 + 1 merged
+                model_count=3,     # 2 + 1 merged
+                project_label="My Project",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1, (
+            "Expected exactly 1 row after merging duplicate labels, "
+            f"got {len(data)}"
+        )
+        assert data[0]["group_value"] == "Acme Corp|My Project"
+        assert data[0]["project_label"] == "My Project"
+        assert data[0]["record_count"] == 15
+        assert data[0]["session_count"] == 4
+        assert data[0]["model_count"] == 3
 
 
 # ══════════════════════════════════════════════════════════════════════════
