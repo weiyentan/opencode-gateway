@@ -754,6 +754,53 @@ class TestClientProjectAggregates:
         assert data[0]["session_count"] == 4
         assert data[0]["model_count"] == 3
 
+    @pytest.mark.asyncio
+    async def test_group_by_client_project_sql_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Verify the generated SQL includes the standalone _PROJECT_LABEL_SQL expression
+        in the GROUP BY clause, not just within the concatenated group_expr."""
+        mock_conn.fetch = AsyncMock(return_value=[
+            _mk_aggregate_row(
+                group_value="Acme Corp|Friendly Project Name",
+                record_count=10, session_count=3, model_count=2,
+                project_label="Friendly Project Name",
+            )
+        ])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+        assert response.status_code == 200
+
+        # Capture the SQL sent to conn.fetch
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        sql = call_args[0][0]
+
+        # The GROUP BY clause must contain both the concatenated expression
+        # AND the standalone _PROJECT_LABEL_SQL
+        assert "GROUP BY" in sql.upper(), "SQL must contain GROUP BY"
+
+        # Extract the GROUP BY clause (everything between GROUP BY and ORDER BY)
+        group_by_match = sql.upper().split("GROUP BY")[1].split("ORDER BY")[0].strip()
+
+        # There should be a comma in the GROUP BY clause indicating two entries:
+        # the concatenated group_expr and the standalone _PROJECT_LABEL_SQL
+        assert "," in group_by_match, (
+            "Expected GROUP BY to have multiple entries (concatenated expr + standalone label), "
+            f"got: {group_by_match}"
+        )
+        assert "COALESCE" in group_by_match, (
+            "Expected GROUP BY to contain COALESCE expression for project_label, "
+            f"got: {group_by_match}"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
