@@ -93,6 +93,20 @@
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
+  let expandedClientNames = {}; // drilldown: client names with expanded project rows
+  let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+  /**
+   * Resolve the display label for a project row in the Client/Project
+   * Usage Breakdown.  Single source of truth — used by both the render
+   * function and tests.
+   *
+   * Priority: projectLabel → projectId → 'unknown'
+   * @param {object|null|undefined} p - projectRow shaped object
+   * @returns {string}
+   */
+  function resolveProjectLabel(p) {
+    return (p && p.projectLabel) || (p && p.projectId) || 'unknown';
+  }
   /**
    * Resolve date range from state, handling both preset and custom.
    * Delegates to computeDateRange for named presets; constructs Date
@@ -874,6 +888,7 @@
       var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
       var projectRow = {
         projectId: projectId,
+        projectLabel: r.project_label || null,
         tokens: tokens,
         cost: r.total_estimated_cost_usd,
         sessions: r.session_count || 0,
@@ -914,13 +929,34 @@
       // Project sub-rows (hidden by default)
       c.projectRows.forEach(function (p) {
         html += '<tr class="cp-project-row" data-cp-parent="' + cid + '" style="display:none">' +
-          '<td>' + escHtml(p.projectId) + '</td>' +
+          '<td>' + escHtml(resolveProjectLabel(p)) + '</td>' +
           '<td>' + fmtNum(p.tokens) + '</td>' +
           '<td>' + fmtCost(p.cost) + '</td>' +
           '<td>' + fmtNum(p.sessions) + '</td>' +
           '<td>' + fmtNum(p.models) + '</td>' +
           '</tr>';
       });
+    });
+
+    // Reset drilldown state if the date range context changed
+    var currentDateRangeKey = JSON.stringify(dateRangeState);
+    if (currentDateRangeKey !== _lastDateRangeKey) {
+      expandedClientNames = {};
+      _lastDateRangeKey = currentDateRangeKey;
+    }
+
+    // Capture expanded state before re-render (keyed by client name, not row position)
+    var expandedIcons = els.cpTbody.querySelectorAll('.cp-expand-icon.expanded');
+    expandedClientNames = {};
+    expandedIcons.forEach(function (icon) {
+      var row = icon.closest('.cp-client-row');
+      if (row) {
+        var nameTd = row.querySelector('td');
+        if (nameTd) {
+          var clientName = nameTd.textContent.replace('\u25B6', '').replace('\u25BC', '').trim();
+          if (clientName) expandedClientNames[clientName] = true;
+        }
+      }
     });
 
     els.cpTbody.innerHTML = html;
@@ -944,6 +980,17 @@
       });
     });
 
+    // Restore expanded clients after re-render
+    var allClientRows = els.cpTbody.querySelectorAll('.cp-client-row');
+    allClientRows.forEach(function (row) {
+      var nameTd = row.querySelector('td');
+      if (nameTd) {
+        var clientName = nameTd.textContent.replace('\u25B6', '').replace('\u25BC', '').trim();
+        if (expandedClientNames[clientName]) {
+          row.click();
+        }
+      }
+    });
   }
   async function openAgentRunDetail(sessionId) {
     // Show overlay
@@ -1445,5 +1492,8 @@
   } else {
     startAutoRefresh();
   }
+
+  // Expose for tests
+  window.resolveProjectLabel = resolveProjectLabel;
 
 })();

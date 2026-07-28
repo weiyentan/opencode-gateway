@@ -194,17 +194,31 @@ async def _fetch_aggregates(
         ]
 
     group_expr = _group_expression(group_parts)
+    has_project = "project" in group_parts
 
-    # Conditionally join sessions when the project dimension is in use
+    # Conditionally join sessions and source_projects when the
+    # project dimension is in use
     sessions_join = (
         "LEFT JOIN sessions s ON s.id = our.session_id"
-        if "project" in group_parts
+        if has_project
+        else ""
+    )
+    project_join = (
+        "LEFT JOIN opencode_source_projects osp "
+        "  ON osp.source_database_id = our.source_database_id "
+        "  AND osp.external_project_id = s.project_id"
+        if has_project
+        else ""
+    )
+    project_label_col = (
+        f",\n            {_PROJECT_LABEL_SQL} AS project_label"
+        if has_project
         else ""
     )
 
     sql = f"""
         SELECT
-            {group_expr} AS group_value,
+            {group_expr} AS group_value{project_label_col},
             COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
             COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
             COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
@@ -219,6 +233,7 @@ async def _fetch_aggregates(
         JOIN observed_models om ON om.id = our.model_id
         LEFT JOIN opencode_clients oc ON oc.id = our.client_id
         {sessions_join}
+        {project_join}
         WHERE {where_clause}
         GROUP BY {group_expr}
         ORDER BY group_value
@@ -237,6 +252,7 @@ async def _fetch_aggregates(
             record_count=r["record_count"],
             session_count=r["session_count"],
             model_count=r["model_count"],
+            project_label=r["project_label"] if has_project else None,
         )
         for r in rows
     ]

@@ -334,6 +334,45 @@ assert(fmtProjectLabel({ project_id: 'abc123', workspace_id: 'ws456' }) === 'abc
 assert(fmtProjectLabel({ project_label: '' }) === '--', 'empty project_label falls through to default');
 assert(fmtProjectLabel({ project_label: '', project_id: 'abc123' }) === 'abc123', 'empty project_label falls through to project_id');
 
+// ── Tests for Client/Project Breakdown project label display ─────────────
+
+/**
+ * Delegates to the production resolveProjectLabel() from app.js.
+ * Using window.resolveProjectLabel ensures tests always exercise
+ * the single source of truth, preventing silent drift between
+ * test expectations and production display logic.
+ */
+function resolveCPProjectLabel(row) {
+  return window.resolveProjectLabel(row);
+}
+
+console.log('\u25B6 resolveCPProjectLabel');
+
+// When project_label is available from the API, it takes precedence
+assert(resolveCPProjectLabel({ projectLabel: 'My Web App', projectId: 'proj-abc' }) === 'My Web App',
+  'projectLabel wins over projectId');
+
+// When project_label is null/empty, falls back to projectId
+assert(resolveCPProjectLabel({ projectLabel: null, projectId: 'proj-abc' }) === 'proj-abc',
+  'null projectLabel falls back to projectId');
+assert(resolveCPProjectLabel({ projectLabel: '', projectId: 'proj-xyz' }) === 'proj-xyz',
+  'empty string projectLabel falls back to projectId');
+
+// When project_label is undefined (missing), falls back to projectId
+assert(resolveCPProjectLabel({ projectId: 'proj-abc' }) === 'proj-abc',
+  'missing projectLabel falls back to projectId');
+
+// When both are missing, returns 'unknown'
+assert(resolveCPProjectLabel({}) === 'unknown', 'empty object → unknown');
+assert(resolveCPProjectLabel({ projectLabel: null, projectId: null }) === 'unknown',
+  'null projectLabel and null projectId → unknown');
+
+// Typical API responses
+assert(resolveCPProjectLabel({ projectLabel: 'Friendly Name', projectId: 'proj-abc' }) === 'Friendly Name',
+  'API with resolved label uses it');
+assert(resolveCPProjectLabel({ projectLabel: 'unknown', projectId: 'unknown' }) === 'unknown',
+  'API with unknown label uses unknown');
+
 // ── Tests for truncate ──────────────────────────────────────────────────
 
 console.log('\u25B6 truncate');
@@ -558,6 +597,106 @@ console.log('\u25B6 resolveDateRange');
   var r = resolveDateRange(state);
   assert(r.startDate instanceof Date, 'custom partial: startDate is a Date');
   assert(r.endDate instanceof Date, 'custom partial: endDate is a Date');
+})();
+
+// ── Drilldown State: helpers for client expansion preservation ──────────
+
+/**
+ * Strip expand/collapse icon characters from a client name cell text.
+ * The expand icon (▶ or ▼) is rendered as the first child of the <td>,
+ * so textContent includes it. This helper extracts just the client name.
+ * @param {string} text - textContent from the first <td> of a client row
+ * @returns {string} cleaned client name
+ */
+function stripExpandIcon(text) {
+  if (!text) return '';
+  return text.replace('\u25B6', '').replace('\u25BC', '').trim();
+}
+
+/**
+ * Compute the set of client names that should remain expanded,
+ * given the previously expanded names and the current list of client names.
+ * Names that no longer exist in the current data are dropped.
+ * This simulates the restoration logic used by renderClientProjectBreakdown.
+ * @param {Object} prevExpanded - { clientName: true, ... }
+ * @param {string[]} currentNames - list of client names in the current render
+ * @returns {Object} { clientName: true, ... } — subset that still exists
+ */
+function filterExpandedClients(prevExpanded, currentNames) {
+  var result = {};
+  currentNames.forEach(function (name) {
+    if (prevExpanded[name]) result[name] = true;
+  });
+  return result;
+}
+
+console.log('\u25B6 drilldown state helpers');
+
+// ── Tests for stripExpandIcon ───────────────────────────────────────────
+
+assert(stripExpandIcon(null) === '', 'null → empty');
+assert(stripExpandIcon('') === '', 'empty → empty');
+assert(stripExpandIcon('Client A') === 'Client A', 'plain name unchanged');
+assert(stripExpandIcon('▶Client A') === 'Client A', 'leading play icon stripped');
+assert(stripExpandIcon('▼Client A') === 'Client A', 'leading down-arrow stripped');
+assert(stripExpandIcon('  ▶Client A  ') === 'Client A', 'whitespace trimmed');
+assert(stripExpandIcon('▶  Client A') === 'Client A', 'extra whitespace after icon');
+assert(stripExpandIcon('A Client Named ▶') === 'A Client Named', 'icon stripped anywhere in text');
+assert(stripExpandIcon('Client A▶') === 'Client A', 'trailing icon stripped');
+assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
+
+// ── Tests for filterExpandedClients ──────────────────────────────────────
+
+(function () {
+  // Basic: one expanded client, still exists
+  var prev = { 'Client A': true };
+  var current = ['Client A', 'Client B'];
+  var result = filterExpandedClients(prev, current);
+  assert(result['Client A'] === true, 'Client A remains expanded');
+  assert(result['Client B'] === undefined, 'Client B was not previously expanded');
+})();
+
+(function () {
+  // Expanded client no longer in current data
+  var prev = { 'Client A': true, 'Client B': true };
+  var current = ['Client B'];
+  var result = filterExpandedClients(prev, current);
+  assert(result['Client A'] === undefined, 'Client A dropped (no longer in data)');
+  assert(result['Client B'] === true, 'Client B remains expanded');
+})();
+
+(function () {
+  // Empty previous state
+  var prev = {};
+  var current = ['Client A', 'Client B'];
+  var result = filterExpandedClients(prev, current);
+  assert(Object.keys(result).length === 0, 'empty previous → no expanded clients');
+})();
+
+(function () {
+  // Unknown client in prevExpanded — does not appear in current
+  var prev = { 'Ghost Client': true };
+  var current = ['Client A'];
+  var result = filterExpandedClients(prev, current);
+  assert(result['Ghost Client'] === undefined, 'unknown client not in current data');
+  assert(Object.keys(result).length === 0, 'no match → empty result');
+})();
+
+(function () {
+  // Stability: keyed by name, not position. If names shift order, expansion follows name.
+  var prev = { 'Client B': true, 'Client A': true };
+  var current = ['Client A', 'Client B'];
+  var result = filterExpandedClients(prev, current);
+  assert(result['Client A'] === true, 'Client A expanded regardless of position');
+  assert(result['Client B'] === true, 'Client B expanded regardless of position');
+})();
+
+(function () {
+  // Duplicate names in current list — last occurrence wins (same behavior as the render loop)
+  var prev = { 'Client A': true };
+  var current = ['Client B', 'Client A', 'Client A'];
+  var result = filterExpandedClients(prev, current);
+  assert(result['Client A'] === true, 'Client A expanded despite duplicate name');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
