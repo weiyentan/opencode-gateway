@@ -93,6 +93,7 @@
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
+  let expandedClientNames = {}; // drilldown: client names with expanded project rows
   /**
    * Resolve date range from state, handling both preset and custom.
    * Delegates to computeDateRange for named presets; constructs Date
@@ -924,6 +925,20 @@
       });
     });
 
+    // Capture expanded state before re-render (keyed by client name, not row position)
+    var expandedIcons = els.cpTbody.querySelectorAll('.cp-expand-icon.expanded');
+    expandedClientNames = {};
+    expandedIcons.forEach(function (icon) {
+      var row = icon.closest('.cp-client-row');
+      if (row) {
+        var nameTd = row.querySelector('td');
+        if (nameTd) {
+          var clientName = nameTd.textContent.replace('\u25B6', '').replace('\u25BC', '').trim();
+          if (clientName) expandedClientNames[clientName] = true;
+        }
+      }
+    });
+
     els.cpTbody.innerHTML = html;
 
     // Attach expand/collapse handlers
@@ -945,6 +960,17 @@
       });
     });
 
+    // Restore expanded clients after re-render
+    var allClientRows = els.cpTbody.querySelectorAll('.cp-client-row');
+    allClientRows.forEach(function (row) {
+      var nameTd = row.querySelector('td');
+      if (nameTd) {
+        var clientName = nameTd.textContent.replace('\u25B6', '').replace('\u25BC', '').trim();
+        if (expandedClientNames[clientName]) {
+          row.click();
+        }
+      }
+    });
   }
   async function openAgentRunDetail(sessionId) {
     // Show overlay
