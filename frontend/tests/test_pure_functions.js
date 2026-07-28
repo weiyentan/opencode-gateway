@@ -7,6 +7,15 @@
  * that is extracted from frontend/app.js into testable pure functions.
  */
 
+// Minimal window polyfill for Node.js test environment
+if (typeof window === 'undefined') {
+  var window = {
+    resolveProjectLabel: function(p) {
+      return (p && p.projectLabel) || (p && p.projectId) || 'unknown';
+    }
+  };
+}
+
 // ── Pure functions (duplicated from app.js for testability) ──────────────
 
 function fmtNum(n) {
@@ -134,6 +143,33 @@ function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWrit
   if (cr > 0 || cw > 0) {
     html += '<br>cache read ' + fmtNum(cr) + ' \u00B7 write ' + fmtNum(cw);
   }
+  return html;
+}
+
+/** Format agent-run token cell (average cache read per call).
+ *  Uses "uncached/output" label instead of "active".
+ *  Omits average cache-read line when calls=0 or cacheRead=0.
+ *  @param {number|null} inputTokens
+ *  @param {number|null} outputTokens
+ *  @param {number|null} cacheReadTokens
+ *  @param {number|null} callCount
+ *  @returns {string} HTML for the cell content
+ */
+function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, callCount) {
+  var input = inputTokens || 0;
+  var output = outputTokens || 0;
+  var calls = callCount || 0;
+
+  var uncachedOutput = input + output;
+  var averageCacheRead = calls > 0 ? (cacheReadTokens || 0) / calls : 0;
+
+  var html = fmtNum(uncachedOutput) + ' uncached/output' +
+    '<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+
+  if (averageCacheRead > 0) {
+    html += '<br>avg cache read ' + fmtNum(averageCacheRead) + '/call';
+  }
+
   return html;
 }
 
@@ -810,6 +846,49 @@ assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K active<br>in 100
 
 assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') !== -1, 'contains \"active\" label');
 assert(fmtTokenBreakdown(0, 0, 500, 500).indexOf('cache read') !== -1, 'cache line present when cache values exist even if active is zero');
+
+// ── Tests for fmtAgentRunTokens ──────────────────────────────────────────
+
+console.log('\u25B6 fmtAgentRunTokens');
+
+// Normal averaging
+(function () {
+  var result = fmtAgentRunTokens(34900, 5100, 755500, 32);
+  assert(result === '40.0K uncached/output<br>in 34.9K \u00B7 out 5.1K<br>avg cache read 23.6K/call', 'normal averaging: 755500/32 = 23609.375 → 23.6K/call');
+})();
+
+// Zero calls (no division by zero)
+(function () {
+  var result = fmtAgentRunTokens(1000, 500, 50000, 0);
+  assert(result === '1.5K uncached/output<br>in 1.0K \u00B7 out 500', 'zero calls → no average line');
+})();
+
+// Null/missing values
+(function () {
+  var result = fmtAgentRunTokens(null, null, null, null);
+  assert(result === '0 uncached/output<br>in 0 \u00B7 out 0', 'null values → no average line, all zeros');
+})();
+
+// Zero cache reads
+(function () {
+  var result = fmtAgentRunTokens(10000, 5000, 0, 10);
+  assert(result === '15.0K uncached/output<br>in 10.0K \u00B7 out 5.0K', 'zero cache reads → no average line');
+})();
+
+// Contains 'uncached/output' label
+assert(fmtAgentRunTokens(100, 200, 300, 5).indexOf('uncached/output') !== -1, 'contains \"uncached/output\" label');
+
+// Large cache reads formatting
+(function () {
+  var result = fmtAgentRunTokens(1000000, 500000, 50000000, 1000);
+  assert(result === '1.5M uncached/output<br>in 1.0M \u00B7 out 500.0K<br>avg cache read 50.0K/call', 'large cache reads: 50000000/1000 = 50000 → 50.0K/call');
+})();
+
+// Calls with fractional average
+(function () {
+  var result = fmtAgentRunTokens(100, 50, 150, 3);
+  assert(result === '150 uncached/output<br>in 100 \u00B7 out 50<br>avg cache read 50/call', 'fractional average: 150/3 = 50/call');
+})();
 
 // ── Summary ─────────────────────────────────────────────────────────────
 

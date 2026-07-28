@@ -342,6 +342,33 @@
     return html;
   }
 
+  /** Format agent-run token cell (average cache read per call).
+   *  Uses "uncached/output" label instead of "active".
+   *  Omits average cache-read line when calls=0 or cacheRead=0.
+   *  @param {number|null} inputTokens
+   *  @param {number|null} outputTokens
+   *  @param {number|null} cacheReadTokens
+   *  @param {number|null} callCount
+   *  @returns {string} HTML for the cell content
+   */
+  function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, callCount) {
+    var input = inputTokens || 0;
+    var output = outputTokens || 0;
+    var calls = callCount || 0;
+
+    var uncachedOutput = input + output;
+    var averageCacheRead = calls > 0 ? (cacheReadTokens || 0) / calls : 0;
+
+    var html = fmtNum(uncachedOutput) + ' uncached/output' +
+      '<br>in ' + fmtNum(input) + ' \u00B7 out ' + fmtNum(output);
+
+    if (averageCacheRead > 0) {
+      html += '<br>avg cache read ' + fmtNum(averageCacheRead) + '/call';
+    }
+
+    return html;
+  }
+
   /** Format a project label for display.
    *  Uses the resolved project_label field from the API when available;
    *  falls back to project_id / workspace_id for backward compatibility. */
@@ -857,7 +884,7 @@
         '<td>' + todoProgress + '</td>' +
         '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
         '<td>' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
-        '<td>' + fmtTokenBreakdown(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
+        '<td>' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.message_count) + '</td>' +
         '<td>' + fmtRelative(r.last_updated_at) + '</td>' +
         '<td>' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
