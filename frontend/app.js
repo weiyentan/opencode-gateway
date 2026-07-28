@@ -293,6 +293,7 @@
   /** Get a CSS status badge class for agent run status */
   function statusBadgeClass(status) {
     if (status === 'running') return 'badge-running';
+    if (status === 'stale') return 'badge-stale';
     if (status === 'completed') return 'badge-completed';
     if (status === 'blocked') return 'badge-blocked';
     return 'badge-unknown';

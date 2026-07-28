@@ -163,7 +163,7 @@ class ChildRunSummary(BaseModel):
         description="External OpenCode session identifier",
     )
     status: str = Field(
-        description="Computed status: running, completed, blocked, unknown"
+        description="Computed status: running, stale, completed, blocked, unknown"
     )
     agent: str | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
@@ -189,7 +189,7 @@ class AgentRunSummary(BaseModel):
         description="Derived title from agent name and external session ID",
     )
     status: str = Field(
-        description="Computed status on read: running, completed, blocked, unknown"
+        description="Computed status on read: running, stale, completed, blocked, unknown"
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
@@ -259,7 +259,7 @@ class AgentRunDetail(BaseModel):
         description="Derived title from agent name and external session ID",
     )
     status: str = Field(
-        description="Computed status on read: running, completed, blocked, unknown"
+        description="Computed status on read: running, stale, completed, blocked, unknown"
     )
     agent: str | None = Field(default=None, description="Agent name")
     project_id: str | None = Field(default=None, description="Project identifier")
@@ -321,7 +321,7 @@ class AgentRunDetail(BaseModel):
 
 
 VALID_AGENT_RUN_STATUSES: frozenset[str] = frozenset(
-    {"running", "completed", "blocked", "unknown"}
+    {"running", "stale", "completed", "blocked", "unknown"}
 )
 
 

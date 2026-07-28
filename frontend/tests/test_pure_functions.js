@@ -76,6 +76,7 @@ function fmtTodoProgress(completed, total) {
 
 function statusBadgeClass(status) {
   if (status === 'running') return 'badge-running';
+  if (status === 'stale') return 'badge-stale';
   if (status === 'completed') return 'badge-completed';
   if (status === 'blocked') return 'badge-blocked';
   return 'badge-unknown';
@@ -295,6 +296,7 @@ assert(fmtTodoProgress(2, null) === '--', 'null total → --');
 console.log('\u25B6 statusBadgeClass');
 
 assert(statusBadgeClass('running') === 'badge-running', 'running → badge-running');
+assert(statusBadgeClass('stale') === 'badge-stale', 'stale → badge-stale');
 assert(statusBadgeClass('completed') === 'badge-completed', 'completed → badge-completed');
 assert(statusBadgeClass('blocked') === 'badge-blocked', 'blocked → badge-blocked');
 assert(statusBadgeClass('unknown') === 'badge-unknown', 'unknown → badge-unknown');

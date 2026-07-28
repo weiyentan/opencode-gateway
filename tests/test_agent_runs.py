@@ -137,11 +137,50 @@ class TestComputeStatus:
         )
         assert result == "running"
 
-    def test_completed_when_inactive_no_parent(self):
-        """Session beyond quiet threshold, no parent → completed."""
+    def test_running_at_boundary_of_quiet_threshold(self):
+        """Session exactly at quiet threshold → running (inclusive)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(minutes=60)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "running"
+
+    def test_stale_when_beyond_quiet_no_parent(self):
+        """Session beyond quiet threshold, no parent, within stale window → stale."""
         from app.api.usage import _compute_status
 
         old = _NOW - timedelta(hours=2)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_stale_at_stale_threshold_boundary(self):
+        """Session exactly at stale threshold → stale (inclusive)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(hours=6)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_completed_when_beyond_stale_no_parent(self):
+        """Session beyond stale threshold, no parent → completed."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=10)
         result = _compute_status(
             last_message_at=old,
             message_count=10,
@@ -155,6 +194,19 @@ class TestComputeStatus:
         from app.api.usage import _compute_status
 
         old = _NOW - timedelta(hours=2)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "blocked"
+
+    def test_blocked_has_priority_over_stale(self):
+        """Session with parent is blocked even within stale window."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=4)
         result = _compute_status(
             last_message_at=old,
             message_count=10,
@@ -296,7 +348,7 @@ class TestAgentRunsList:
         assert item["external_session_id"] == _EXTERNAL_ID_A
 
         # Computed fields
-        assert item["status"] in ("running", "completed", "blocked", "unknown")
+        assert item["status"] in ("running", "stale", "completed", "blocked", "unknown")
         assert "child_run_count" in item
         assert isinstance(item["child_run_count"], int)
         assert item["child_run_count"] >= 0
@@ -715,7 +767,7 @@ class TestAgentRunsDetail:
         child0 = data["child_summaries"][0]
         assert child0["id"] == str(child_id)
         assert child0["external_session_id"] == _EXTERNAL_ID_B
-        assert child0["status"] in ("running", "completed", "blocked", "unknown")
+        assert child0["status"] in ("running", "stale", "completed", "blocked", "unknown")
         assert child0["agent"] == "code-editor-junior"
         assert child0["message_count"] == 3
 
