@@ -337,7 +337,7 @@
    *    {output} out + {cacheWrite} cache write
    *
    *  Where:
-   *    total = input + output + cacheWrite
+   *    total = input + output + cacheRead + cacheWrite
    *    uncached = input - cacheRead (the portion of input NOT served from cache)
    *    cached = cacheRead (the portion of input served from cache)
    *
@@ -355,7 +355,7 @@
     var cw = cacheWriteTokens || 0;
 
     var uncached = Math.max(0, input - cr);
-    var total = input + output + cw;
+    var total = input + output + cr + cw;
 
     return fmtNum(total) + ' total<br>'
       + fmtNum(input) + ' in = ' + fmtNum(uncached) + ' uncached + ' + fmtNum(cr) + ' cached<br>'
