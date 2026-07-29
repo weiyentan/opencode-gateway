@@ -33,7 +33,7 @@ def upgrade() -> None:
         sa.text(
             """
             UPDATE opencode_source_projects
-            SET name = regexp_replace(worktree, '^.*/', '')
+            SET name = regexp_replace(worktree, '^.*[\\/]', '')
             WHERE name IS NULL
               AND worktree IS NOT NULL
               AND worktree != ''
@@ -56,7 +56,7 @@ def downgrade() -> None:
               AND worktree IS NOT NULL
               AND worktree != ''
               AND worktree != '/'
-              AND name = regexp_replace(worktree, '^.*/', '')
+              AND name = regexp_replace(worktree, '^.*[\\/]', '')
             """
         )
     )
