@@ -320,8 +320,6 @@
 
   /** Format a compact Token Breakdown HTML string.
    *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
-   *  Line 1: {input} in / {output} out
-   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
@@ -333,9 +331,17 @@
   }
 
   /** Format a compact multi-line Token Breakdown HTML string.
-   *  Line 1: {input} in / {output} out
-   *  Line 2 (optional): cache hit {cacheRead} in [ / cache write {cacheWrite} in ]
-   *  Cache line is omitted when both cacheRead and cacheWrite are zero/null/undefined.
+   *  Three-line math-style format:
+   *    {total} total
+   *    {input} in = {uncached} uncached + {cached} cached
+   *    {output} out + {cacheWrite} cache write
+   *
+   *  Where:
+   *    total = input + output + cacheWrite
+   *    uncached = input - cacheRead (the portion of input NOT served from cache)
+   *    cached = cacheRead (the portion of input served from cache)
+   *
+   *  All three lines are always shown, even when values are zero.
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
@@ -348,18 +354,16 @@
     var cr = cacheReadTokens || 0;
     var cw = cacheWriteTokens || 0;
 
-    var html = fmtNum(input) + ' in / ' + fmtNum(output) + ' out';
-    if (cr > 0 || cw > 0) {
-      html += '<br>cache hit ' + fmtNum(cr) + ' in';
-      if (cw > 0) {
-        html += ' / cache write ' + fmtNum(cw) + ' in';
-      }
-    }
-    return html;
+    var uncached = Math.max(0, input - cr);
+    var total = input + output + cw;
+
+    return fmtNum(total) + ' total<br>'
+      + fmtNum(input) + ' in = ' + fmtNum(uncached) + ' uncached + ' + fmtNum(cr) + ' cached<br>'
+      + fmtNum(output) + ' out + ' + fmtNum(cw) + ' cache write';
   }
 
   /** Format agent-run token cell using the shared compact Token Breakdown formatter.
-   *  Delegates to fmtTokenBreakdownCompact. Accepts cacheWriteTokens instead of callCount.
+   *  Delegates to fmtTokenBreakdownCompact for the shared three-line math-style format.
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens

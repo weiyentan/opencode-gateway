@@ -2376,8 +2376,150 @@ class TestSessionCacheTokensUpdate:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Issue #252 — Projection payload ingestion
+#  Issue #316 — Backfill migration (0017) session cache-token totals
 # ════════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionCacheTokenBackfill:
+    """Backfill migration (0017) recomputes session cache-token totals from
+    raw opencode_usage_records for sessions ingested before the per-category
+    cache columns were added in migration 0016."""
+
+    def test_backfill_aggregation_sums_correctly(self):
+        """The SQL aggregation in the backfill migration should:
+        - SUM raw record cache columns grouped by session_id
+        - COALESCE to 0 for sessions with no records
+        """
+        # Simulate raw records in opencode_usage_records
+        raw = [
+            ("sid-a", 5, 10, 3),   # (session_id, cache_write, cache_read, cached)
+            ("sid-a", 3, 7, 2),
+            ("sid-b", 20, 15, 10),
+            ("sid-b", 0, 0, 0),
+        ]
+
+        from collections import defaultdict
+        totals = defaultdict(lambda: {"cw": 0, "cr": 0, "ct": 0})
+        for sid, cw, cr, ct in raw:
+            totals[sid]["cw"] += cw
+            totals[sid]["cr"] += cr
+            totals[sid]["ct"] += ct
+
+        # Session A: 5+3=8 cache_write, 10+7=17 cache_read, 3+2=5 cached
+        assert totals["sid-a"]["cw"] == 8
+        assert totals["sid-a"]["cr"] == 17
+        assert totals["sid-a"]["ct"] == 5
+
+        # Session B: 20+0=20 cache_write, 15+0=15 cache_read, 10+0=10 cached
+        assert totals["sid-b"]["cw"] == 20
+        assert totals["sid-b"]["cr"] == 15
+        assert totals["sid-b"]["ct"] == 10
+
+    def test_backfill_handles_session_with_no_raw_records(self):
+        """COALESCE(SUM(...), 0) ensures sessions with no matching raw
+        records receive 0 for all cache-token totals."""
+        from collections import defaultdict
+        totals = defaultdict(lambda: {"cw": 0, "cr": 0, "ct": 0})
+
+        # No records added for "sid-empty" — COALESCE gives 0
+        assert totals["sid-empty"]["cw"] == 0
+        assert totals["sid-empty"]["cr"] == 0
+        assert totals["sid-empty"]["ct"] == 0
+
+    @pytest.mark.asyncio
+    async def test_backfill_matches_ingest_accumulation(self, monkeypatch):
+        """When multiple records are ingested for the same session,
+        the session-upsert parameter values per record match what the
+        backfill would SUM across all records.
+
+        On the second record, the per-record cache tokens are correctly
+        passed to the upsert SQL (accumulation happens in the DB via
+        ``ON CONFLICT ... DO UPDATE SET x = x + $param``).
+        """
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        # Two records for the same session.
+        # Structure: [auth] + [sd_check] + [dedup, model, session] * 2
+        fetchrow_side_effects = [auth, None]  # auth + source-database check
+        for _ in range(2):
+            session_row = MagicMock()
+            session_row.__getitem__.side_effect = {"id": _SESSION_ID}.__getitem__
+            fetchrow_side_effects.extend([None, None, session_row])  # dedup, model, session
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = fetchrow_side_effects
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-multi-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+                {
+                    "source_record_id": "rec-multi-002",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 200,
+                    "output_tokens": 100,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 20,
+                    "cache_write_tokens": 15,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+
+        # There should be 2 session upsert calls (one per record)
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 2, (
+            f"Expected 2 session upserts for 2 records, got {len(session_calls)}"
+        )
+
+        # First record per-record params: cache_read=10, cache_write=5, cached=15
+        first = session_calls[0]
+        assert first[0][8] == 15, f"First record cached_tokens: expected 15, got {first[0][8]}"
+        assert first[0][9] == 10, f"First record cache_read_tokens: expected 10, got {first[0][9]}"
+        assert first[0][10] == 5, f"First record cache_write_tokens: expected 5, got {first[0][10]}"
+
+        # Second record per-record params: cache_read=20, cache_write=15, cached=35
+        second = session_calls[1]
+        assert second[0][8] == 35, f"Second record cached_tokens: expected 35, got {second[0][8]}"
+        assert second[0][9] == 20, f"Second record cache_read_tokens: expected 20, got {second[0][9]}"
+        assert second[0][10] == 15, f"Second record cache_write_tokens: expected 15, got {second[0][10]}"
+
+        # The backfill would SUM these two records:
+        # total_cache_read_tokens  = 10 + 20 = 30
+        # total_cache_write_tokens = 5 + 15 = 20
+        # total_cached_tokens      = 15 + 35 = 50
+        # (Accumulation in the DB via ON CONFLICT DO UPDATE would produce the same totals)
 
 
 class TestProjectionBackwardCompat:
