@@ -331,17 +331,19 @@
   }
 
   /** Format a compact multi-line Token Breakdown HTML string.
-   *  Three-line math-style format:
+   *  Flat two-line breakdown with optional cache line:
    *    {total} total
-   *    {input} in = {uncached} uncached + {cached} cached
-   *    {output} out + {cacheWrite} cache write
+   *    {input} in | {output} out
+   *    {cr} cache read [+ {cw} cache write]   (optional)
    *
    *  Where:
    *    total = input + output + cacheRead + cacheWrite
-   *    uncached = input - cacheRead (the portion of input NOT served from cache)
-   *    cached = cacheRead (the portion of input served from cache)
    *
-   *  All three lines are always shown, even when values are zero.
+   *  Cache line is omitted when both cache_read and cache_write are zero.
+   *  When only cache_read > 0:  "{cr} cache read"
+   *  When only cache_write > 0: "{cw} cache write"
+   *  When both > 0:             "{cr} cache read + {cw} cache write"
+   *
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens
@@ -354,16 +356,24 @@
     var cr = cacheReadTokens || 0;
     var cw = cacheWriteTokens || 0;
 
-    var uncached = Math.max(0, input - cr);
     var total = input + output + cr + cw;
 
-    return fmtNum(total) + ' total<br>'
-      + fmtNum(input) + ' in = ' + fmtNum(uncached) + ' uncached + ' + fmtNum(cr) + ' cached<br>'
-      + fmtNum(output) + ' out + ' + fmtNum(cw) + ' cache write';
+    var result = fmtNum(total) + ' total<br>'
+      + fmtNum(input) + ' in | ' + fmtNum(output) + ' out';
+
+    if (cr > 0 && cw > 0) {
+      result += '<br>' + fmtNum(cr) + ' cache read + ' + fmtNum(cw) + ' cache write';
+    } else if (cr > 0) {
+      result += '<br>' + fmtNum(cr) + ' cache read';
+    } else if (cw > 0) {
+      result += '<br>' + fmtNum(cw) + ' cache write';
+    }
+
+    return result;
   }
 
   /** Format agent-run token cell using the shared compact Token Breakdown formatter.
-   *  Delegates to fmtTokenBreakdownCompact for the shared three-line math-style format.
+   *  Delegates to fmtTokenBreakdownCompact for the shared two-line + optional cache line format.
    *  @param {number|null} inputTokens
    *  @param {number|null} outputTokens
    *  @param {number|null} cacheReadTokens

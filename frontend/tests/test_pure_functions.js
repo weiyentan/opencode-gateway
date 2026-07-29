@@ -135,17 +135,19 @@ function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWrit
 }
 
 /** Format a compact multi-line Token Breakdown HTML string.
- *  Three-line math-style format:
+ *  Flat two-line breakdown with optional cache line:
  *    {total} total
- *    {input} in = {uncached} uncached + {cached} cached
- *    {output} out + {cacheWrite} cache write
+ *    {input} in | {output} out
+ *    {cr} cache read [+ {cw} cache write]   (optional)
  *
  *  Where:
  *    total = input + output + cacheRead + cacheWrite
- *    uncached = input - cacheRead (the portion of input NOT served from cache)
- *    cached = cacheRead (the portion of input served from cache)
  *
- *  All three lines are always shown, even when values are zero.
+ *  Cache line is omitted when both cache_read and cache_write are zero.
+ *  When only cache_read > 0:  "{cr} cache read"
+ *  When only cache_write > 0: "{cw} cache write"
+ *  When both > 0:             "{cr} cache read + {cw} cache write"
+ *
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
@@ -158,16 +160,24 @@ function fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, ca
   var cr = cacheReadTokens || 0;
   var cw = cacheWriteTokens || 0;
 
-  var uncached = Math.max(0, input - cr);
   var total = input + output + cr + cw;
 
-  return fmtNum(total) + ' total<br>'
-    + fmtNum(input) + ' in = ' + fmtNum(uncached) + ' uncached + ' + fmtNum(cr) + ' cached<br>'
-    + fmtNum(output) + ' out + ' + fmtNum(cw) + ' cache write';
+  var result = fmtNum(total) + ' total<br>'
+    + fmtNum(input) + ' in | ' + fmtNum(output) + ' out';
+
+  if (cr > 0 && cw > 0) {
+    result += '<br>' + fmtNum(cr) + ' cache read + ' + fmtNum(cw) + ' cache write';
+  } else if (cr > 0) {
+    result += '<br>' + fmtNum(cr) + ' cache read';
+  } else if (cw > 0) {
+    result += '<br>' + fmtNum(cw) + ' cache write';
+  }
+
+  return result;
 }
 
 /** Format agent-run token cell using the shared compact Token Breakdown formatter.
- *  Delegates to fmtTokenBreakdownCompact for the shared three-line math-style format.
+ *  Delegates to fmtTokenBreakdownCompact for the shared two-line + optional cache line format.
  *  @param {number|null} inputTokens
  *  @param {number|null} outputTokens
  *  @param {number|null} cacheReadTokens
@@ -851,102 +861,102 @@ assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
 
 console.log('\u25B6 fmtTokenBreakdown');
 
-// Delegates to fmtTokenBreakdownCompact; verify the three-line math-style format output
-assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'all zeros, all three lines shown');
-assert(fmtTokenBreakdown(null, null, null, null) === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'all nulls, all three lines shown');
-assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'all undefined, all three lines shown');
+// Delegates to fmtTokenBreakdownCompact; verify the flat two-line + optional cache line format
+assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 total<br>0 in | 0 out', 'all zeros, no cache line');
+assert(fmtTokenBreakdown(null, null, null, null) === '0 total<br>0 in | 0 out', 'all nulls, no cache line');
+assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 total<br>0 in | 0 out', 'all undefined, no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(60000, 36500, 120400, 8200);
-  // total=225.1K (input + output + cacheRead + cacheWrite), uncached=max(0,60000-120400)=0
-  assert(result === '225.1K total<br>60.0K in = 0 uncached + 120.4K cached<br>36.5K out + 8.2K cache write', 'full breakdown with cache read + write — three-line math format');
+  // total=225.1K (input + output + cacheRead + cacheWrite)
+  assert(result === '225.1K total<br>60.0K in | 36.5K out<br>120.4K cache read + 8.2K cache write', 'full breakdown with cache read + write — flat two-line + cache line');
 })();
 
-assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K total<br>100.0K in = 100.0K uncached + 0 cached<br>50.0K out + 0 cache write', 'cache zero both → still shows all three lines');
-assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K total<br>100.0K in = 100.0K uncached + 0 cached<br>50.0K out + 0 cache write', 'cache null both → still shows all three lines');
+assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K total<br>100.0K in | 50.0K out', 'cache zero both → no cache line');
+assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K total<br>100.0K in | 50.0K out', 'cache null both → no cache line');
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 3000, 0);
-  // total=6.0K (input + output + cacheRead + cacheWrite), uncached=max(0,1000-3000)=0
-  assert(result === '6.0K total<br>1.0K in = 0 uncached + 3.0K cached<br>2.0K out + 0 cache write', 'cache read non-zero → three-line format with uncached=0');
+  // total=6.0K (input + output + cacheRead + cacheWrite)
+  assert(result === '6.0K total<br>1.0K in | 2.0K out<br>3.0K cache read', 'cache read non-zero → cache read line only');
 })();
 
 (function () {
   var result = fmtTokenBreakdown(1000, 2000, 0, 3000);
-  // total=6.0K, uncached=max(0,1000-0)=1000
-  assert(result === '6.0K total<br>1.0K in = 1.0K uncached + 0 cached<br>2.0K out + 3.0K cache write', 'cache write non-zero shown, read zero displayed — three-line format');
+  // total=6.0K
+  assert(result === '6.0K total<br>1.0K in | 2.0K out<br>3.0K cache write', 'cache write non-zero → cache write line only');
 })();
 
-assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') === -1, 'no \"active\" label in compact format');
-assert(fmtTokenBreakdown(0, 0, 500, 500) === '1.0K total<br>0 in = 0 uncached + 500 cached<br>0 out + 500 cache write', 'cache line present when cache values exist even if input/output are zero');
+assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') === -1, 'no "active" label in compact format');
+assert(fmtTokenBreakdown(0, 0, 500, 500) === '1.0K total<br>0 in | 0 out<br>500 cache read + 500 cache write', 'cache line present when cache values exist even if input/output are zero');
 
 // ── Tests for fmtTokenBreakdownCompact ────────────────────────────────────
 
 console.log('\u25B6 fmtTokenBreakdownCompact');
 
-// Normal case with cache hit — three-line math format
+// Normal case with cache hit — flat two-line + cache read line
 (function () {
   var result = fmtTokenBreakdownCompact(38800, 5200, 23400, 0);
-  // total=67.4K (input + output + cacheRead + cacheWrite), uncached=max(0,38800-23400)=15.4K
-  assert(result === '67.4K total<br>38.8K in = 15.4K uncached + 23.4K cached<br>5.2K out + 0 cache write', 'normal cache hit: three-line math-style breakdown');
+  // total=67.4K (input + output + cacheRead + cacheWrite)
+  assert(result === '67.4K total<br>38.8K in | 5.2K out<br>23.4K cache read', 'normal cache hit: flat two-line + cache read line');
 })();
 
 // Case with both cache read and cache write
 (function () {
   var result = fmtTokenBreakdownCompact(38800, 5200, 23400, 4200);
-  // total=71.6K (input + output + cacheRead + cacheWrite), uncached=max(0,38800-23400)=15.4K
-  assert(result === '71.6K total<br>38.8K in = 15.4K uncached + 23.4K cached<br>5.2K out + 4.2K cache write', 'cache read + write: all three lines shown');
+  // total=71.6K (input + output + cacheRead + cacheWrite)
+  assert(result === '71.6K total<br>38.8K in | 5.2K out<br>23.4K cache read + 4.2K cache write', 'cache read + write: both on cache line');
 })();
 
-// Zero-cache case — still shows all three lines
+// Zero-cache case — no cache line
 (function () {
   var result = fmtTokenBreakdownCompact(38800, 5200, 0, 0);
-  // total=44.0K, uncached=max(0,38800-0)=38.8K
-  assert(result === '44.0K total<br>38.8K in = 38.8K uncached + 0 cached<br>5.2K out + 0 cache write', 'zero cache: still shows all three lines');
+  // total=44.0K
+  assert(result === '44.0K total<br>38.8K in | 5.2K out', 'zero cache: no cache line');
 })();
 
-// All nulls — all three lines with zeros
+// All nulls — no cache line
 (function () {
   var result = fmtTokenBreakdownCompact(null, null, null, null);
-  assert(result === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'all nulls: all three lines with zeros');
+  assert(result === '0 total<br>0 in | 0 out', 'all nulls: no cache line');
 })();
 
-// All undefined — all three lines with zeros
+// All undefined — no cache line
 (function () {
   var result = fmtTokenBreakdownCompact(undefined, undefined, undefined, undefined);
-  assert(result === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'all undefined: all three lines with zeros');
+  assert(result === '0 total<br>0 in | 0 out', 'all undefined: no cache line');
 })();
 
 // Forbidden labels must NOT appear (\"uncached/output\" as a combined phrase, \"avg cache read\", \"/call\" suffix)
 (function () {
   var result = fmtTokenBreakdownCompact(1000, 500, 2000, 0);
-  // total=3.5K (input + output + cacheRead + cacheWrite), uncached=max(0,1000-2000)=0
-  assert(result === '3.5K total<br>1.0K in = 0 uncached + 2.0K cached<br>500 out + 0 cache write', 'expected three-line format for (1000,500,2000,0)');
+  // total=3.5K (input + output + cacheRead + cacheWrite)
+  assert(result === '3.5K total<br>1.0K in | 500 out<br>2.0K cache read', 'expected flat format for (1000,500,2000,0)');
   assert(result.indexOf('active') === -1, 'no "active" label');
   assert(result.indexOf('uncached/output') === -1, 'no "uncached/output" label');
   assert(result.indexOf('avg cache read') === -1, 'no "avg cache read" label');
   assert(result.indexOf('/call') === -1, 'no "/call" suffix');
 })();
 
-// All three lines always present, even when cache values are zero
+// Cache line omitted when both cache values are zero
 (function () {
   var result = fmtTokenBreakdownCompact(50000, 25000, 0, 0);
-  assert(result === '75.0K total<br>50.0K in = 50.0K uncached + 0 cached<br>25.0K out + 0 cache write', 'shows all three lines even with zero cache');
+  assert(result === '75.0K total<br>50.0K in | 25.0K out', 'no cache line when both cache values zero');
   assert(result.indexOf('cache hit') === -1, 'no "cache hit" phrase in new format');
 })();
 
-// Cache write only (no cache read) — uncached equals full input
+// Cache write only (no cache read)
 (function () {
   var result = fmtTokenBreakdownCompact(10000, 5000, 0, 3000);
-  // total=18.0K, uncached=max(0,10000-0)=10.0K
-  assert(result === '18.0K total<br>10.0K in = 10.0K uncached + 0 cached<br>5.0K out + 3.0K cache write', 'cache write only: uncached = full input, cached = 0');
+  // total=18.0K
+  assert(result === '18.0K total<br>10.0K in | 5.0K out<br>3.0K cache write', 'cache write only: cache write line only');
 })();
 
 // Uses fmtNum for compact number formatting
 (function () {
   var result = fmtTokenBreakdownCompact(1000000, 500000, 2000000, 100000);
-  // total=3.6M (input + output + cacheRead + cacheWrite), uncached=max(0,1000000-2000000)=0
-  assert(result === '3.6M total<br>1.0M in = 0 uncached + 2.0M cached<br>500.0K out + 100.0K cache write', 'expected three-line format for millions');
+  // total=3.6M (input + output + cacheRead + cacheWrite)
+  assert(result === '3.6M total<br>1.0M in | 500.0K out<br>2.0M cache read + 100.0K cache write', 'expected flat format for millions');
   assert(result.indexOf('1.0M') !== -1, 'uses fmtNum formatting for millions');
   assert(result.indexOf('500.0K') !== -1, 'uses fmtNum formatting for thousands');
 })();
@@ -955,55 +965,55 @@ console.log('\u25B6 fmtTokenBreakdownCompact');
 
 console.log('\u25B6 fmtAgentRunTokens');
 
-// Delegates to shared formatter — full cache hit with cache write, three-line math format
+// Delegates to shared formatter — full cache hit with cache write
 (function () {
   var result = fmtAgentRunTokens(34900, 5100, 755500, 32);
-  // total=795.5K (input + output + cacheRead + cacheWrite), uncached=max(0,34900-755500)=0
-  assert(result === '795.5K total<br>34.9K in = 0 uncached + 755.5K cached<br>5.1K out + 32 cache write', 'delegates to shared formatter: three-line math-style format');
+  // total=795.5K (input + output + cacheRead + cacheWrite)
+  assert(result === '795.5K total<br>34.9K in | 5.1K out<br>755.5K cache read + 32 cache write', 'delegates to shared formatter: flat two-line + cache line');
 })();
 
 // Cache hit without write (cacheWrite=0)
 (function () {
   var result = fmtAgentRunTokens(1000, 500, 50000, 0);
-  // total=51.5K (input + output + cacheRead + cacheWrite), uncached=max(0,1000-50000)=0
-  assert(result === '51.5K total<br>1.0K in = 0 uncached + 50.0K cached<br>500 out + 0 cache write', 'cache hit without write: three-line with cache write 0');
+  // total=51.5K (input + output + cacheRead + cacheWrite)
+  assert(result === '51.5K total<br>1.0K in | 500 out<br>50.0K cache read', 'cache hit without write: cache read line only');
 })();
 
-// Null/missing values — all three lines with zeros
+// Null/missing values — no cache line
 (function () {
   var result = fmtAgentRunTokens(null, null, null, null);
-  assert(result === '0 total<br>0 in = 0 uncached + 0 cached<br>0 out + 0 cache write', 'null values: all three lines with zeros');
+  assert(result === '0 total<br>0 in | 0 out', 'null values: no cache line');
 })();
 
 // Zero cache reads, non-zero cache write
 (function () {
   var result = fmtAgentRunTokens(10000, 5000, 0, 10);
-  // total=15.0K, uncached=max(0,10000-0)=10.0K
-  assert(result === '15.0K total<br>10.0K in = 10.0K uncached + 0 cached<br>5.0K out + 10 cache write', 'zero cache reads with write: three-line format');
+  // total=15.0K (input + output + cacheRead + cacheWrite)
+  assert(result === '15.0K total<br>10.0K in | 5.0K out<br>10 cache write', 'zero cache reads with write: cache write line only');
 })();
 
 // Forbidden labels must NOT appear as combined phrases
 (function () {
   var result = fmtAgentRunTokens(100, 200, 300, 5);
-  // total=605 (input + output + cacheRead + cacheWrite), uncached=max(0,100-300)=0
-  assert(result === '605 total<br>100 in = 0 uncached + 300 cached<br>200 out + 5 cache write', 'expected three-line format for (100,200,300,5)');
+  // total=605 (input + output + cacheRead + cacheWrite)
+  assert(result === '605 total<br>100 in | 200 out<br>300 cache read + 5 cache write', 'expected flat format for (100,200,300,5)');
   assert(result.indexOf('uncached/output') === -1, 'no "uncached/output" label');
   assert(result.indexOf('avg cache read') === -1, 'no "avg cache read" label');
   assert(result.indexOf('/call') === -1, 'no "/call" suffix');
 })();
 
-// Large cache reads formatting — three-line math format
+// Large cache reads formatting
 (function () {
   var result = fmtAgentRunTokens(1000000, 500000, 50000000, 1000);
-  // total=51.5M (input + output + cacheRead + cacheWrite), uncached=max(0,1000000-50000000)=0
-  assert(result === '51.5M total<br>1.0M in = 0 uncached + 50.0M cached<br>500.0K out + 1.0K cache write', 'large cache reads: proper fmtNum formatting in three-line format');
+  // total=51.5M (input + output + cacheRead + cacheWrite)
+  assert(result === '51.5M total<br>1.0M in | 500.0K out<br>50.0M cache read + 1.0K cache write', 'large cache reads: proper fmtNum formatting');
 })();
 
-// Small values with fractional cache write — three-line format
+// Small values with both cache read and write
 (function () {
   var result = fmtAgentRunTokens(100, 50, 150, 3);
-  // total=303 (input + output + cacheRead + cacheWrite), uncached=max(0,100-150)=0
-  assert(result === '303 total<br>100 in = 0 uncached + 150 cached<br>50 out + 3 cache write', 'small values: three-line format displayed');
+  // total=303 (input + output + cacheRead + cacheWrite)
+  assert(result === '303 total<br>100 in | 50 out<br>150 cache read + 3 cache write', 'small values: flat format displayed');
 })();
 
 // Output matches fmtTokenBreakdownCompact for same inputs
