@@ -143,9 +143,12 @@ _Avoid_: Total Tokens when cache categories are also visible
 
 **Uncached/Output Tokens**:
 The fresh model input and output tokens shown for one Aurora Glass summary
-row. Aurora Glass displays these directly as `{input} in / {output} out`
-rather than as a summed headline.
-_Avoid_: Active, Total Tokens, uncached/output headline
+row. Aurora Glass displays these as `{input} in | {output} out` on a single
+line, separated by a pipe.
+
+Input and output are independent provider-reported counters. "Uncached" is
+no longer displayed as a derived value — use the raw input token count.
+_Avoid_: Active, Total Tokens, "uncached" derived value in display
 
 **Cache Activity**:
 The token activity related to prompt caching, represented by cache read
@@ -161,15 +164,16 @@ _Avoid_: Cache read total when a reliable denominator exists
 
 **Cache-Hit Input**:
 The cached prompt/input tokens reused by the model, derived from cache read
-tokens. Aurora Glass displays this as `cache hit {cache_read} in`. Cache-Hit
-Input is input-side reuse, not a separate output category.
-_Avoid_: Cached output, cache hit output
+tokens. Aurora Glass displays this as `{cr} cache read` on the optional
+third breakdown line. Cache-Hit Input is displayed alongside (not inside)
+input/output.
+_Avoid_: Cached output, cache hit output, nesting cache read inside input
 
 **Cache-Write Input**:
 The prompt/input tokens written into the provider cache, derived from cache
-write tokens. Aurora Glass omits Cache-Write Input when it is zero and appends
-it to the cache line when non-zero.
-_Avoid_: Cache write output, write 0
+write tokens. Aurora Glass displays Cache-Write Input on the optional third
+breakdown line, omitted when zero, appended to cache read when both present.
+_Avoid_: Cache write output, write 0, showing cache line when both are zero
 
 **Cumulative Cache Activity**:
 Raw cache read and cache write token totals for a row. Compact Token
@@ -179,36 +183,43 @@ _Avoid_: Average cache read in compact row displays
 
 **Token Breakdown**:
 A compact per-title presentation of usage tokens for a session or run.
-Aurora Glass summary rows display a three-line math-style breakdown:
+Aurora Glass summary rows display a flat two-line breakdown with an
+optional cache line:
 
 {total} total
-{input} in = {uncached} uncached + {cached} cached
-{output} out + {cache_write} cache write
+{input} in | {output} out
+{cache_hit} cache read + {cache_write} cache write
+
+The cache line is shown only when at least one of cache_read or cache_write
+is non-zero:
+- Both zero → cache line omitted entirely
+- Only cache_read > 0 → `{cr} cache read`
+- Only cache_write > 0 → `{cw} cache write`
+- Both > 0 → `{cr} cache read + {cw} cache write`
 
 Where:
 - `total = input + output + cache_read + cache_write`
-- `uncached = input - cache_read` (the portion of input NOT served from cache)
-- `cached = cache_read` (the portion of input served from cache, i.e. Cache-Hit Input)
+- The four counters are independent provider-reported values, not a nested breakdown of input
+- Cache values are siblings of input/output under total, not subsets of input
 
-All three lines are always shown, even when numbers are zero.
 Token numbers use Aurora Glass compact number formatting (e.g. 66.1K, 1.0M).
 
-_Avoid_: Single token total, one-line format, per-call averaging
+_Avoid_: "in = uncached + cached" line, derived "uncached" value,
+  three-line-always format, per-call averaging
 
 **Agent Run Token Display**:
 The per-run token presentation in the Agent Runs table. Uses the same
-three-line math-style Token Breakdown format as Sessions and aggregate
-views — delegates to the shared `fmtTokenBreakdownCompact` formatter.
-Displays:
+Token Breakdown format as Sessions — delegates to the shared
+`fmtTokenBreakdownCompact` formatter. Displays:
 
 {total} total
-{input} in = {uncached} uncached + {cached} cached
-{output} out + {cache_write} cache write
+{input} in | {output} out
+{cache_hit} cache read + {cache_write} cache write
 
-All three lines are always shown, even when numbers are zero. No headline
-label (active/uncached/output), no per-call averaging.
+Cache line follows the same conditional visibility rules as Token Breakdown.
+No headline label (active/uncached/output), no per-call averaging.
 _Avoid_: "active" or "uncached/output" headline, per-call averaging,
-  one-line format
+  one-line format, always-show-cache line
 
 **Project Label**:
 The human-readable project value shown in Aurora Glass wherever usage is
