@@ -1258,7 +1258,11 @@ _PROJECT_LABEL_SQL = """
                   OR osp.worktree = '/' THEN NULL
             ELSE substring(osp.worktree, '([^/]+)$')
         END,
-        s.project_id,
+        CASE
+            WHEN s.project_id IS NULL THEN NULL
+            WHEN length(s.project_id) > 12 THEN substring(s.project_id, 1, 12) || '…'
+            ELSE s.project_id
+        END,
         'unknown'
     )
 """
