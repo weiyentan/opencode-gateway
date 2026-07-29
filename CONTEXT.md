@@ -186,7 +186,7 @@ Aurora Glass summary rows display a three-line math-style breakdown:
 {output} out + {cache_write} cache write
 
 Where:
-- `total = input + output + cache_write`
+- `total = input + output + cache_read + cache_write`
 - `uncached = input - cache_read` (the portion of input NOT served from cache)
 - `cached = cache_read` (the portion of input served from cache, i.e. Cache-Hit Input)
 
