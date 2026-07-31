@@ -610,26 +610,11 @@ class TestAgentRunsList:
         assert item["model"] == "claude-sonnet-4-20250514"
 
     @pytest.mark.asyncio
-    async def test_model_null_when_session_has_no_context(
+    async def test_model_null_when_no_session_model(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
-        """List rows have null model when no Session Context row exists (LEFT JOIN miss)."""
-        row = _mk_session_row(session_model=None)
-        mock_conn.fetch = AsyncMock(return_value=[row])
-        mock_conn.fetchval = AsyncMock(return_value=1)
-
-        async with client as c:
-            response = await c.get("/api/v1/usage/agent-runs")
-
-        assert response.status_code == 200
-        item = response.json()["data"]["items"][0]
-        assert item["model"] is None
-
-    @pytest.mark.asyncio
-    async def test_model_null_when_context_model_is_null(
-        self, client: AsyncClient, mock_conn: AsyncMock
-    ):
-        """List rows have null model when the Session Context row has a null session_model."""
+        """List rows have null model when Session Context has no model
+        (JOIN miss or NULL column)."""
         row = _mk_session_row(session_model=None)
         mock_conn.fetch = AsyncMock(return_value=[row])
         mock_conn.fetchval = AsyncMock(return_value=1)
