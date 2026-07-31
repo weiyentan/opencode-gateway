@@ -66,6 +66,12 @@ summary counts. Session Context explains what a session was doing;
 usage records explain what model usage it consumed.
 _Avoid_: Usage Record, Session aggregate
 
+**Session Model**:
+The LLM model identifier (e.g., `claude-sonnet-4-20250514`) recorded in a
+Session Context row. Set by OpenCode at session start. Surfaces in the
+agent-runs list Model column and the Session Context section of the detail
+overlay. When absent, the column renders as `—`.
+
 **Todo Snapshot**:
 The latest observed set of OpenCode `todo` rows for an external session,
 read from the source SQLite database and stored by the Gateway for agent

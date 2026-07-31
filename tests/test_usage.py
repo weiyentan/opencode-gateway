@@ -149,6 +149,7 @@ def _mk_agent_run_row(
     status: str = "completed",
     child_run_count: int = 0,
     session_title: str | None = None,
+    session_model: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for agent runs."""
     row = MagicMock()
@@ -174,6 +175,7 @@ def _mk_agent_run_row(
         "_status": status,
         "child_run_count": child_run_count,
         "session_title": session_title,
+        "session_model": session_model,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.__iter__ = MagicMock(return_value=iter(data.keys()))

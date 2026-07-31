@@ -823,6 +823,7 @@ async def _fetch_agent_runs(
                     s.last_message_at,
                     ({status_expr}) AS _status,
                     osc.title AS session_title,
+                    osc.session_model AS session_model,
                     {_PROJECT_LABEL_SQL} AS project_label
                 FROM sessions s
                 LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
@@ -859,6 +860,7 @@ async def _fetch_agent_runs(
                 s.last_message_at,
                 ({status_expr}) AS _status,
                 osc.title AS session_title,
+                osc.session_model AS session_model,
                 {_PROJECT_LABEL_SQL} AS project_label
             FROM sessions s
             LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
@@ -919,6 +921,7 @@ async def _fetch_agent_runs(
                 last_updated_at=r["last_message_at"],
                 child_run_count=r["child_run_count"],
                 session_title=r["session_title"],
+                model=r["session_model"],
             )
         )
 

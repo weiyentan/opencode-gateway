@@ -62,6 +62,7 @@ def _mk_session_row(
     computed_status: str = "running",
     child_run_count: int = 0,
     session_title: str | None = None,
+    session_model: str | None = None,
     project_label: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions.
@@ -91,6 +92,7 @@ def _mk_session_row(
         "_status": computed_status,
         "child_run_count": child_run_count,
         "session_title": session_title,
+        "session_model": session_model,
         "project_label": project_label if project_label is not None else project_id,
     }
     row.__getitem__.side_effect = data.__getitem__
@@ -590,6 +592,39 @@ class TestAgentRunsList:
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["code_changes_total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_model_present_when_session_has_model(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows include model from opencode_session_contexts.session_model."""
+        row = _mk_session_row(session_model="claude-sonnet-4-20250514")
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["model"] == "claude-sonnet-4-20250514"
+
+    @pytest.mark.asyncio
+    async def test_model_null_when_no_session_model(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows have null model when Session Context has no model
+        (JOIN miss or NULL column)."""
+        row = _mk_session_row(session_model=None)
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["model"] is None
 
 
 def _mk_ctx_row(
