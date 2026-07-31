@@ -250,6 +250,10 @@ class AgentRunSummary(BaseModel):
         default=None,
         description="Session title from opencode_session_contexts (null if no context)",
     )
+    model: str | None = Field(
+        default=None,
+        description="LLM model identifier from opencode_session_contexts (null if no context)",
+    )
 
 
 class AgentRunDetail(BaseModel):
