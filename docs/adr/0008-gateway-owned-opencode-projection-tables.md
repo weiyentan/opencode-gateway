@@ -214,6 +214,7 @@ The summary API/view model may derive fields such as:
 title
 status
 agent
+model
 project/worktree
 parent run
 child run count
