@@ -31,6 +31,14 @@ function fmtCost(n) {
   return '$' + num.toFixed(num < 0.01 ? 4 : 2);
 }
 
+/** Format a session model identifier for display.
+ *  Renders an em dash (\u2014) when the model is null/absent, mirroring
+ *  the Cost column fallback pattern. HTML-escapes the model string. */
+function fmtModel(model) {
+  if (model == null || model === '') return '\u2014';
+  return escHtml(String(model));
+}
+
 function fmtDuration(start, end) {
   if (!start || !end) return '--';
   const ms = new Date(end) - new Date(start);
@@ -301,6 +309,16 @@ assert(fmtCost(0.005) === '$0.0050', '0.005 \u2192 $0.0050 (4 decimal places)');
 assert(fmtCost(0.01) === '$0.01', '0.01 \u2192 $0.01 (2 decimal places)');
 assert(fmtCost(123.456) === '$123.46', '123.456 \u2192 $123.46');
 assert(fmtCost(0.00123) === '$0.0012', '0.00123 \u2192 $0.0012');
+
+// ── Tests for fmtModel ──────────────────────────────────────────────────
+
+console.log('\u25B6 fmtModel');
+
+assert(fmtModel(null) === '\u2014', 'null \u2192 em dash');
+assert(fmtModel(undefined) === '\u2014', 'undefined \u2192 em dash');
+assert(fmtModel('') === '\u2014', 'empty string \u2192 em dash');
+assert(fmtModel('claude-sonnet-4-20250514') === 'claude-sonnet-4-20250514', 'model string unchanged');
+assert(fmtModel('<script>') === '&lt;script&gt;', 'HTML escaped');
 
 // ── Tests for fmtDuration ───────────────────────────────────────────────
 

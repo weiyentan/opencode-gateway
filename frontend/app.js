@@ -156,6 +156,14 @@
     return '$' + num.toFixed(num < 0.01 ? 4 : 2);
   }
 
+  /** Format a session model identifier for display.
+   *  Renders an em dash (\u2014) when the model is null/absent, mirroring
+   *  the Cost column fallback pattern. HTML-escapes the model string. */
+  function fmtModel(model) {
+    if (model == null || model === '') return '\u2014';
+    return escHtml(String(model));
+  }
+
   /** Format a duration between two ISO timestamps */
   function fmtDuration(start, end) {
     if (!start || !end) return '--';
@@ -880,7 +888,7 @@
       var errSuffix = agentRunsFetchError
         ? ' <span class="fetch-error" title="' + escHtml(agentRunsFetchError) + '">\u26A0 Fetch error</span>'
         : '';
-      els.arTbody.innerHTML = '<tr><td colspan="10" class="empty-state">No agent runs' + errSuffix + '</td></tr>';
+      els.arTbody.innerHTML = '<tr><td colspan="11" class="empty-state">No agent runs' + errSuffix + '</td></tr>';
       return;
     }
 
@@ -895,6 +903,7 @@
         '<td class="clickable ar-title">' + escHtml(displayTitle) + '</td>' +
         '<td>' + badge(r.currentStatus || r.status, statusCls).outerHTML + '</td>' +
         '<td>' + escHtml(r.agent || '--') + '</td>' +
+        '<td>' + fmtModel(r.model) + '</td>' +
         '<td>' + escHtml(projectStr) + '</td>' +
         '<td>' + todoProgress + '</td>' +
         '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
