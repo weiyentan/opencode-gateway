@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from app.core.auth import require_collector_token
 from app.db.session import get_session
@@ -76,7 +76,11 @@ class SessionContextPayload(BaseModel):
     title: str | None = Field(default=None, description="Session title")
     slug: str | None = Field(default=None, description="Session slug")
     version: str | None = Field(default=None, description="Session version")
-    session_model: str | None = Field(default=None, description="Model used for the session")
+    session_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("model", "session_model"),
+        description="Model used for the session",
+    )
     session_cost: Decimal | None = Field(default=None, description="Session cost in USD")
     source_input_tokens: int | None = Field(default=None, description="Source-reported input tokens")
     source_output_tokens: int | None = Field(default=None, description="Source-reported output tokens")
