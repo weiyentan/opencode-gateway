@@ -597,7 +597,25 @@ class TestAgentRunsList:
     async def test_model_present_when_session_has_model(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
-        """List rows include model from opencode_session_contexts.session_model."""
+        """List rows include formatted model from opencode_session_contexts.session_model."""
+        row = _mk_session_row(
+            session_model='{"providerID": "opencode-go", "id": "deepseek-v4-flash"}'
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["model"] == "opencode-go / deepseek-v4-flash"
+
+    @pytest.mark.asyncio
+    async def test_model_plain_string_passes_through(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows pass through a plain (non-JSON) session_model unchanged."""
         row = _mk_session_row(session_model="claude-sonnet-4-20250514")
         mock_conn.fetch = AsyncMock(return_value=[row])
         mock_conn.fetchval = AsyncMock(return_value=1)

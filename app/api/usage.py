@@ -17,6 +17,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.core.config import get_settings
+from app.core.formatting import format_model_output
 from app.core.loki import build_loki_search_url
 from app.core.schemas.usage import (
     AgentRunDetail,
@@ -921,7 +922,7 @@ async def _fetch_agent_runs(
                 last_updated_at=r["last_message_at"],
                 child_run_count=r["child_run_count"],
                 session_title=r["session_title"],
-                model=r["session_model"],
+                model=format_model_output(r["session_model"]),
             )
         )
 
