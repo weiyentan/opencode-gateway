@@ -171,7 +171,7 @@ def _mk_session_context_payload(
     *,
     external_session_id: str = "ses_ctx_test",
     title: str = "Test Session",
-    session_model: str = "gpt-4",
+    session_model: str | None = "gpt-4",
     external_project_id: str | None = None,
     parent_external_session_id: str | None = None,
     **kwargs,
@@ -179,11 +179,12 @@ def _mk_session_context_payload(
     defaults: dict = {
         "external_session_id": external_session_id,
         "title": title,
-        "session_model": session_model,
         "source_input_tokens": 1000,
         "source_output_tokens": 500,
         "source_payload": {"summary": "test session context"},
     }
+    if session_model is not None:
+        defaults["session_model"] = session_model
     if external_project_id is not None:
         defaults["external_project_id"] = external_project_id
     if parent_external_session_id is not None:
@@ -2662,6 +2663,91 @@ class TestSessionContextUpsert:
         ]
         assert len(sc_inserts) == 1
         assert "ON CONFLICT" in str(sc_inserts[0])
+
+    @pytest.mark.asyncio
+    async def test_session_context_model_key_maps_to_session_model(self, monkeypatch):
+        """The collector's `model` key (pre-#46) populates session_model on ingest."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,  # 1. auth
+            None,  # 2. sd check
+            None,  # 3. resolve session_id for ctx
+            None,  # 4. resolve source_project_id for ctx
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[
+                _mk_session_context_payload(
+                    session_model=None,
+                    model="claude-sonnet-4-20250514",
+                ),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["projection_accepted_count"] == 1
+
+        # The model value must reach the upsert as the session_model parameter
+        sc_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_contexts" in str(call)
+        ]
+        assert len(sc_inserts) == 1
+        assert "claude-sonnet-4-20250514" in str(sc_inserts[0])
+
+    @pytest.mark.asyncio
+    async def test_session_context_session_model_key_maps_to_session_model(self, monkeypatch):
+        """The corrected collector's `session_model` key also maps to session_model."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,  # 1. auth
+            None,  # 2. sd check
+            None,  # 3. resolve session_id for ctx
+            None,  # 4. resolve source_project_id for ctx
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            session_contexts=[
+                _mk_session_context_payload(session_model="claude-sonnet-4-20250514"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["projection_accepted_count"] == 1
+
+        # The session_model value must reach the upsert as the session_model parameter
+        sc_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_session_contexts" in str(call)
+        ]
+        assert len(sc_inserts) == 1
+        assert "claude-sonnet-4-20250514" in str(sc_inserts[0])
 
     @pytest.mark.asyncio
     async def test_session_context_preserves_first_seen_on_upsert(self, monkeypatch):
