@@ -1087,7 +1087,7 @@ async def _fetch_agent_run_detail(
     session_context: dict[str, object] | None = None
     if ctx_row:
         session_context = {
-            "session_model": ctx_row["session_model"],
+            "session_model": format_model_output(ctx_row["session_model"]),
             "title": ctx_row["title"],
             "source_directory": ctx_row["source_directory"],
             "source_path": ctx_row["source_path"],

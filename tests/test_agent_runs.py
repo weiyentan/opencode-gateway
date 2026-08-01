@@ -1022,7 +1022,7 @@ class TestAgentRunsDetail:
         session_row = _mk_session_row(session_id=_SESSION_ID)
         ctx_row = _mk_ctx_row(
             title="Implement user auth",
-            session_model="claude-sonnet-4",
+            session_model='{"providerID": "opencode-go", "id": "deepseek-v4-flash"}',
             source_directory="/home/user/project/src",
             code_change_additions=120,
             code_change_deletions=30,
@@ -1038,7 +1038,7 @@ class TestAgentRunsDetail:
         ctx = data["session_context"]
         assert ctx is not None
         assert ctx["title"] == "Implement user auth"
-        assert ctx["session_model"] == "claude-sonnet-4"
+        assert ctx["session_model"] == "opencode-go / deepseek-v4-flash"
         assert ctx["source_directory"] == "/home/user/project/src"
         assert ctx["code_change_additions"] == 120
         assert ctx["code_change_deletions"] == 30
@@ -1088,6 +1088,7 @@ class TestAgentRunsDetail:
         data = response.json()["data"]
         assert data["session_context"] is not None
         assert data["session_context"]["title"] == "Refactor API"
+        assert data["session_context"]["session_model"] == "gpt-4o"
         assert len(data["todo_rows"]) == 1
         assert data["todo_rows"][0]["description"] == "Add endpoint"
         assert data["todo_total"] == 1
