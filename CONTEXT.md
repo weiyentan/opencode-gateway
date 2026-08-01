@@ -72,6 +72,14 @@ Session Context row. Set by OpenCode at session start. Surfaces in the
 agent-runs list Model column and the Session Context section of the detail
 overlay. When absent, the column renders as `—`.
 
+The Session Context row is the **canonical source** for "which model did a
+session use". The `sessions` aggregate table deliberately carries no model
+column — a second denormalized copy would drift from this source of truth.
+The sessions endpoint (`SessionSummary`) therefore has no model field; if
+one is ever needed it must be derived via LEFT JOIN to the Session Context
+row, the same way the agent-runs list derives it.
+_Avoid_: Session Model on the sessions aggregate, Session Model on a Usage Record
+
 **Todo Snapshot**:
 The latest observed set of OpenCode `todo` rows for an external session,
 read from the source SQLite database and stored by the Gateway for agent
