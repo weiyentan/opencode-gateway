@@ -856,7 +856,7 @@
       var title = s.session_title || '--';
       var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
-      html += '<tr class="session-row" data-id="' + s.id + '">' +
+      html += '<tr class="session-row" data-id="' + s.id + '" tabindex="0"' + (isActive ? ' data-active="true"' : '') + '>' +
         '<td>' + escHtml(clientName) + '</td>' +
         '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
@@ -877,6 +877,14 @@
       row.addEventListener('click', function () {
         var id = row.getAttribute('data-id');
         if (id) openSessionDetail(id);
+      });
+      // Keyboard activation: Enter or Space on a focused row opens the detail overlay
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var id = row.getAttribute('data-id');
+          if (id) openSessionDetail(id);
+        }
       });
     });
   }

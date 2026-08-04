@@ -23,8 +23,12 @@
   --glass-hover:  rgba(255, 255, 255, 0.12);
   --glass-border: rgba(255, 255, 255, 0.10);
   --text-primary: #e8ecf4;
-  --text-secondary: #8b93b0;
-  --text-muted:   #556080;
+  /* WCAG AA (S4): lightened from #8b93b0 → 6.35:1 on glass, 7.70:1 on bg-deep,
+     and keeps a clear ~1.4× luminance step above --text-muted (hierarchy) */
+  --text-secondary: #9ca5bf;
+  /* WCAG AA (S4): lightened from #556080 → 4.55:1 on glass (#1c2431), 5.51:1 on
+     bg-deep. Old value failed: 2.50:1 on glass, 3.04:1 on bg-deep (needs 4.5:1) */
+  --text-muted:   #808aa8;
   --accent-indigo: #7c8cff;
   --accent-cyan:   #5ef2ff;
   --accent-pink:   #ff75b5;
@@ -900,8 +904,42 @@ td.clickable:hover {
   transition: background var(--transition);
 }
 
+/* Keyboard focus: visible outline when tabbing to a session row */
+.session-row:focus-visible {
+  outline: 2px solid var(--accent-indigo);
+  outline-offset: -2px;
+}
+
 .session-row:hover td {
   background: rgba(124, 140, 255, 0.06);
+}
+
+/* Active session rows — non-color cues supplementing the status color
+   (S4 a11y): 1) left border accent (3px transparent placeholder on the
+   base rule avoids layout shift), 2) glow ring bleeding right of the
+   accent, 3) radial background wash across the row. */
+.session-row td:first-child {
+  border-left: 3px solid transparent;
+}
+
+.session-row[data-active="true"] td:first-child {
+  border-left-color: var(--status-healthy);
+  box-shadow: 8px 0 16px -8px rgba(74, 222, 128, 0.45);
+}
+
+.session-row[data-active="true"] {
+  background-image: radial-gradient(ellipse 70% 100% at 0% 50%, rgba(74, 222, 128, 0.10), transparent 70%);
+}
+
+/* Badge pulse — additional non-color cue for active/running sessions */
+.badge-active,
+.badge-running {
+  animation: badge-pulse 2s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
 }
 
 /* Status badges for agent runs */
@@ -1367,5 +1405,36 @@ td.clickable:hover {
 
   .dr-custom-inputs {
     gap: 8px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ACCESSIBILITY: reduced motion (S4)
+   Respects the OS/browser prefers-reduced-motion setting: collapses all
+   animation/transition motion. Static non-color cues (left border accent,
+   background wash) are intentionally retained so active sessions stay
+   distinguishable without motion.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Disable badge pulse (sessions active + agent runs running) */
+  .badge-active,
+  .badge-running {
+    animation: none !important;
+  }
+
+  /* Disable the active-row glow ring; the border accent and background
+     wash remain (they are static, non-animated cues) */
+  .session-row[data-active="true"] td:first-child {
+    box-shadow: none !important;
   }
 }
