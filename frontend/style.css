@@ -38,6 +38,32 @@
   --font:           'Inter', system-ui, -apple-system, sans-serif;
   --transition:     0.25s ease;
   --max-width:      1400px;
+
+  /* === Layered Glass Surfaces === */
+  --glass-bg-wash:          rgba(255,255,255,0.03);   /* Background wash layer */
+  --glass-mid-tint:         rgba(255,255,255,0.06);   /* Mid-layer tint */
+  --glass-fg-surface:       rgba(255,255,255,0.10);   /* Foreground card surface */
+  --glass-fg-surface-hover: rgba(255,255,255,0.14);   /* Hover surface lift */
+
+  /* === Accent Palette === */
+  --accent-cyan-light:      #7ef7ff;   /* Lighter cyan for highlights */
+  --accent-purple:          #a78bfa;   /* Purple accent for interactive elements */
+  --accent-indigo-deep:     #6366f1;   /* Deep indigo for borders/glows */
+
+  /* === Shadows & Glows === */
+  --shadow-subtle:          0 1px 3px rgba(0,0,0,0.3);
+  --shadow-elevated:        0 4px 12px rgba(0,0,0,0.4);
+  --glow-active-ring:       0 0 0 2px rgba(94,242,255,0.25);   /* Active session ring */
+  --glow-active-inner:      0 0 8px rgba(94,242,255,0.15);   /* Active session inner glow */
+  --glow-error-tint:        0 0 0 1px rgba(248,113,113,0.2);   /* Error border tint */
+
+  /* === Typography === */
+  --font-mono:              'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+  /* === Transitions === */
+  --transition-fast:        0.15s ease;
+  --transition-normal:      0.25s ease;
+  --transition-slow:        0.4s ease;
 }
 
 html {
