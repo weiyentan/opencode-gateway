@@ -856,7 +856,7 @@
       var title = s.session_title || '--';
       var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
 
-      html += '<tr class="session-row" data-id="' + s.id + '">' +
+      html += '<tr class="session-row" data-id="' + s.id + '" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + (isActive ? 'active' : 'idle') + '">' +
         '<td>' + escHtml(clientName) + '</td>' +
         '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
