@@ -1049,16 +1049,6 @@ td.clickable:hover {
     var(--glass);
 }
 
-/* Active badge pulses slowly (~3s); idle/completed badges stay flat */
-.session-row[data-active='true'] .badge-active {
-  animation: badge-pulse 3s ease-in-out infinite;
-}
-
-@keyframes badge-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.75; }
-}
-
 /* Active session rows — non-color cues supplementing the status color
    (S4 a11y): 1) left border accent (3px transparent placeholder on the
    base rule avoids layout shift), 2) glow ring bleeding right of the
