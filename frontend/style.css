@@ -22,6 +22,7 @@
   --glass:        rgba(255, 255, 255, 0.08);
   --glass-hover:  rgba(255, 255, 255, 0.12);
   --glass-border: rgba(255, 255, 255, 0.10);
+  --glass-border-strong: rgba(255, 255, 255, 0.16); /* Brighter border for thead separators */
   --text-primary: #e8ecf4;
   --text-secondary: #8b93b0;
   --text-muted:   #556080;
@@ -531,11 +532,15 @@ body {
 .panel-title {
   font-size: 0.95rem;
   font-weight: 600;
-  color: var(--accent-purple);
+  color: var(--text-primary);
   margin-bottom: 14px;
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.panel-sessions .panel-title {
+  color: var(--accent-purple);
 }
 
 .event-badge {
@@ -718,7 +723,7 @@ thead th {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+  border-bottom: 1px solid var(--glass-border-strong);
   white-space: nowrap;
 }
 
