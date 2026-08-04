@@ -9,12 +9,60 @@
 
 // Minimal window polyfill for Node.js test environment
 if (typeof window === 'undefined') {
-  var window = {
-    resolveProjectLabel: function(p) {
-      return (p && p.projectLabel) || (p && p.projectId) || 'unknown';
+  var window = {};
+}
+
+// Load the REAL production functions from frontend/app.js.
+// app.js runs as an IIFE that exposes resolveProjectLabel and
+// buildSessionRowHtml on window.  Evaluating it inside a Node vm sandbox
+// (with a minimal DOM stub) means these tests exercise the production code
+// itself — not a copy-pasted duplicate — so the rendered session-row markup
+// is guaranteed to match what the real dashboard renders.
+var fs = require('fs');
+var vm = require('vm');
+var path = require('path');
+
+(function loadRealAppJs() {
+  var appJsPath = path.join(__dirname, '..', 'app.js');
+  var source = fs.readFileSync(appJsPath, 'utf8');
+
+  var documentStub = {
+    readyState: 'loading',
+    querySelector: function () { return null; },
+    getElementById: function () { return null; },
+    querySelectorAll: function () { return []; },
+    addEventListener: function () {},
+    createElement: function (tag) {
+      var el = { className: '', textContent: '', style: {} };
+      Object.defineProperty(el, 'outerHTML', {
+        get: function () {
+          return '<' + tag + ' class="' + el.className + '">' + el.textContent + '</' + tag + '>';
+        }
+      });
+      return el;
     }
   };
-}
+
+  var sandboxWindow = {};
+  var sandbox = {
+    window: sandboxWindow,
+    document: documentStub,
+    console: console,
+    setTimeout: setTimeout,
+    setInterval: setInterval,
+    clearInterval: clearInterval,
+    clearTimeout: clearTimeout,
+    fetch: function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); },
+    location: { href: '' },
+    navigator: {}
+  };
+  sandbox.window = sandboxWindow;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox, { filename: 'app.js' });
+
+  window.resolveProjectLabel = sandboxWindow.resolveProjectLabel;
+  window.buildSessionRowHtml = sandboxWindow.buildSessionRowHtml;
+})();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
 
@@ -1039,6 +1087,151 @@ console.log('\u25B6 fmtAgentRunTokens');
   var direct = fmtTokenBreakdownCompact(34900, 5100, 755500, 32);
   var viaAgent = fmtAgentRunTokens(34900, 5100, 755500, 32);
   assert(direct === viaAgent, 'fmtAgentRunTokens delegates to fmtTokenBreakdownCompact: same output for (34900, 5100, 755500, 32)');
+})();
+
+// ── buildSessionRowHtml (production function loaded from app.js) ────────
+// The REAL implementation lives in frontend/app.js (exposed on
+// window.buildSessionRowHtml by the vm sandbox loader above).  This thin
+// wrapper delegates so tests always exercise the production markup contract
+// — class="session-row", data-id, data-active, data-status, and exactly
+// three .num cells — never a copy-pasted duplicate.
+
+function buildSessionRowHtml(s, clientName, now) {
+  return window.buildSessionRowHtml(s, clientName, now);
+}
+
+// ── Tests for buildSessionRowHtml ──────────────────────────────────────
+
+console.log('\u25B6 buildSessionRowHtml');
+
+// Reference timestamp for deterministic tests: 2026-08-04 12:00:00 UTC
+var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
+
+(function () {
+  // Active session: last_message_at within SESSION_ACTIVE_WINDOW_MS
+  var recentTime = new Date(testNow - 600000).toISOString(); // 10 min ago
+  var session = {
+    id: 'ses-abc-123',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 15,
+    total_input_tokens: 1000,
+    total_output_tokens: 500,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.05,
+    session_title: 'Test Session'
+  };
+  var html = buildSessionRowHtml(session, 'TestClient', testNow);
+  assert(html.indexOf('data-active="true"') !== -1, 'active session: data-active="true"');
+  assert(html.indexOf('data-status="active"') !== -1, 'active session: data-status="active"');
+  assert(html.indexOf('data-id="ses-abc-123"') !== -1, 'active session: data-id matches session id');
+})();
+
+(function () {
+  // Idle session: last_message_at outside SESSION_ACTIVE_WINDOW_MS
+  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
+  var session = {
+    id: 'ses-idle-456',
+    first_message_at: oldTime,
+    last_message_at: oldTime,
+    message_count: 3,
+    total_input_tokens: 200,
+    total_output_tokens: 100,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: null
+  };
+  var html = buildSessionRowHtml(session, 'IdleClient', testNow);
+  assert(html.indexOf('data-active="false"') !== -1, 'idle session: data-active="false"');
+  assert(html.indexOf('data-status="idle"') !== -1, 'idle session: data-status="idle"');
+  assert(html.indexOf('data-id="ses-idle-456"') !== -1, 'idle session: data-id matches session id');
+})();
+
+(function () {
+  // Defensive: the sessions API exposes no error signal today — SessionSummary
+  // has no `error` field and the sessions query selects no error column — so a
+  // session object carrying an unexpected extra `error` key must still render a
+  // plain active/idle status. The row markup must never emit data-status="error".
+  var recentTime = new Date(testNow - 300000).toISOString(); // 5 min ago
+  var session = {
+    id: 'ses-def-789',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 1,
+    total_input_tokens: 50,
+    total_output_tokens: 10,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.001,
+    session_title: 'Defensive Session',
+    error: 'unexpected extra field (not part of SessionSummary)'
+  };
+  var html = buildSessionRowHtml(session, 'DefClient', testNow);
+  assert(html.indexOf('data-status="active"') !== -1, 'extra error key ignored: data-status="active" while active');
+  assert(html.indexOf('data-status="error"') === -1, 'row markup never emits data-status="error" (no error signal in API)');
+})();
+
+(function () {
+  // Idle variant: extra error key must not flip an idle session to an error state.
+  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
+  var session = {
+    id: 'ses-def-idle',
+    first_message_at: oldTime,
+    last_message_at: oldTime,
+    message_count: 3,
+    total_input_tokens: 200,
+    total_output_tokens: 100,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: null,
+    error: 'ignored'
+  };
+  var html = buildSessionRowHtml(session, 'DefClient2', testNow);
+  assert(html.indexOf('data-status="idle"') !== -1, 'extra error key ignored: data-status="idle" for idle session');
+  assert(html.indexOf('data-status="error"') === -1, 'idle row never emits data-status="error"');
+})();
+
+(function () {
+  // Verify three .num cells in the row markup
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var session = {
+    id: 'ses-num-test',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 42,
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.5,
+    session_title: 'Numeric Test'
+  };
+  var html = buildSessionRowHtml(session, 'NumClient', testNow);
+  var numMatches = html.match(/class="num"/g);
+  var numCount = numMatches ? numMatches.length : 0;
+  assert(numCount === 3, 'session row: exactly three .num cells (' + numCount + ' found)');
+})();
+
+(function () {
+  // class="session-row" is present
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var session = {
+    id: 'ses-cls-test',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 1,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0,
+    session_title: null
+  };
+  var html = buildSessionRowHtml(session, 'ClsClient', testNow);
+  assert(html.indexOf('class="session-row"') !== -1, 'session row: has class="session-row"');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

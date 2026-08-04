@@ -841,6 +841,33 @@
     els.agentsTbody.innerHTML = html;
   }
 
+  /** Build a single session row <tr> HTML string (extracted for testability).
+   *  @param {object} s - session summary object from the API
+   *  @param {string} clientName - resolved client display name
+   *  @param {number} [now] - reference timestamp (defaults to Date.now()); exposed for deterministic tests
+   *  @returns {string} <tr> HTML with data-active, data-status, class="session-row", data-id, and three .num cells
+   */
+  function buildSessionRowHtml(s, clientName, now) {
+    var cost = s.total_estimated_cost_usd;
+    var duration = fmtDuration(s.first_message_at, s.last_message_at);
+    var title = s.session_title || '--';
+    var ts = now != null ? now : Date.now();
+    var isActive = s.last_message_at && (ts - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
+    var rowStatus = isActive ? 'active' : 'idle';
+
+    return '<tr class="session-row" data-id="' + s.id + '" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + rowStatus + '">' +
+      '<td>' + escHtml(clientName) + '</td>' +
+      '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
+      '<td>' + fmtDT(s.first_message_at) + '</td>' +
+      '<td>' + fmtDT(s.last_message_at) + '</td>' +
+      '<td>' + duration + '</td>' +
+      '<td><span class="num">' + (s.message_count || 0) + '</span></td>' +
+      '<td><span class="num">' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</span></td>' +
+      '<td><span class="num">' + fmtCost(cost) + '</span></td>' +
+      '<td>' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
+      '</tr>';
+  }
+
   /** Recent Sessions */
   function renderSessionsTable(data) {
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
@@ -851,22 +878,7 @@
     var html = '';
     data.sessions.items.forEach(function (s) {
       var clientName = clientMap[s.client_id] || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
-      var cost = s.total_estimated_cost_usd;
-      var duration = fmtDuration(s.first_message_at, s.last_message_at);
-      var title = s.session_title || '--';
-      var isActive = s.last_message_at && (Date.now() - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
-
-      html += '<tr class="session-row" data-id="' + s.id + '">' +
-        '<td>' + escHtml(clientName) + '</td>' +
-        '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
-        '<td>' + fmtDT(s.first_message_at) + '</td>' +
-        '<td>' + fmtDT(s.last_message_at) + '</td>' +
-        '<td>' + duration + '</td>' +
-        '<td>' + (s.message_count || 0) + '</td>' +
-        '<td>' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</td>' +
-        '<td>' + fmtCost(cost) + '</td>' +
-        '<td>' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
-        '</tr>';
+      html += buildSessionRowHtml(s, clientName);
     });
 
     els.sessionsTbody.innerHTML = html;
@@ -1572,5 +1584,6 @@
 
   // Expose for tests
   window.resolveProjectLabel = resolveProjectLabel;
+  window.buildSessionRowHtml = buildSessionRowHtml;
 
 })();
