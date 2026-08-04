@@ -5,6 +5,59 @@
    indigo #7c8cff, cyan #5ef2ff, pink #ff75b5, gold #ffd86f
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   REUSABLE VISUAL PATTERNS (S1–S5, Aurora Glass-inspired reskin)
+   Reference for future work — e.g. the detail panel (#sd-detail-overlay).
+   Comment-only documentation of the patterns established in S1–S4; no
+   style rules live in this block.
+
+   1. Layer composition — stack translucent backgrounds, outermost wash first:
+        background:
+          radial-gradient(ellipse at left center, rgba(cyan,0.06) 0%, transparent 70%),
+          linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
+          var(--glass);
+      Order matters: each layer paints over the previous one; the LAST layer is
+      the foreground surface. Precedents in this file: .aurora-bg (radial
+      gradient stack) and .logo (linear-gradient(135deg, var(--accent-cyan),
+      var(--accent-indigo))).
+
+   2. State-driven styling via data-* attributes (state lives in markup, not
+      modifier classes):
+        .session-row[data-active="true"]  { …active row glow/ring… }
+        .session-row[data-status="error"] { …error tinting… }
+      Current base fallback: .session-row:hover td { background: rgba(124,140,255,0.06); }
+      S1–S4 extend this with [data-*] attribute selectors so app.js renders
+      state once and CSS drives the visuals.
+
+   3. Token usage checklist — token → visual effect → example selector:
+        --glass          translucent panel fill  → .kpi-card, .date-range-bar
+        --glass-hover    elevated fill on hover  → .kpi-card:hover
+        --glass-border   hairline panel border   → .header, .kpi-card
+        --accent-indigo  #7c8cff brand/primary   → .kpi-sessions .kpi-value
+        --accent-cyan    #5ef2ff brand/active    → .kpi-tokens .kpi-value, .logo, .badge-running
+        --accent-pink    #ff75b5 brand/accent    → .kpi-source-dbs .kpi-value
+        --accent-gold    #ffd86f brand/accent    → .kpi-cost .kpi-value
+        --status-healthy success/green           → .badge-active, .badge-completed, .live-indicator
+        --status-stale   warning/amber           → .badge-stale, .badge-blocked, .live-indicator.stale
+        --status-unknown neutral/grey            → .badge-unknown, .badge-inactive
+        --status-error   error/red               → .live-indicator.error
+      S1–S4 forward-reference tokens (arrive with the reskin slices; verify
+      they exist before use): --glow-active-ring, --glow-active-inner,
+      --glow-error-tint, --glass-bg-wash, --glass-fg-surface-hover,
+      --accent-cyan-light, --accent-purple, --font-mono.
+
+   4. Reduced motion — S4 adds a @media (prefers-reduced-motion: reduce) block
+      that disables decorative animation (aurora-drift, live-pulse) and
+      transitions while keeping state/color changes instant. Any new animation
+      MUST be gated behind this media query.
+
+   5. Badge enhancement pattern — semantic meaning lives in the color pair
+      (tinted background + matching text token):
+        .badge-running { background: rgba(94,242,255,0.15); color: var(--accent-cyan); }
+      Enhancements (ring/glow/tint) may augment the badge WITHOUT changing that
+      semantic color pair, so badge meaning survives any reskin.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 /* ── Reset & Base ─────────────────────────────────────────────────────── */
 
 *,
@@ -24,8 +77,12 @@
   --glass-border: rgba(255, 255, 255, 0.10);
   --glass-border-strong: rgba(255, 255, 255, 0.16); /* Brighter border for thead separators */
   --text-primary: #e8ecf4;
-  --text-secondary: #8b93b0;
-  --text-muted:   #556080;
+  /* WCAG AA (S4): lightened from #8b93b0 → 6.35:1 on glass, 7.70:1 on bg-deep,
+     and keeps a clear ~1.4× luminance step above --text-muted (hierarchy) */
+  --text-secondary: #9ca5bf;
+  /* WCAG AA (S4): lightened from #556080 → 4.55:1 on glass (#1c2431), 5.51:1 on
+     bg-deep. Old value failed: 2.50:1 on glass, 3.04:1 on bg-deep (needs 4.5:1) */
+  --text-muted:   #808aa8;
   --accent-indigo: #7c8cff;
   --accent-cyan:   #5ef2ff;
   --accent-pink:   #ff75b5;
@@ -959,6 +1016,14 @@ td.clickable:hover {
   border-left: 2px solid transparent; /* Reserved for active-state accent */
 }
 
+/* Keyboard focus: visible ring when tabbing to a session row.
+   Uses an inset box-shadow on the cells rather than outline on the <tr>,
+   because Firefox does not render outlines on table-row elements
+   (Bugzilla 893137); inset shadows render reliably in Chrome/Edge/Safari/Firefox. */
+.session-row:focus-visible td {
+  box-shadow: inset 0 0 0 2px var(--accent-indigo);
+}
+
 .session-row td {
   transition: background var(--transition);
 }
@@ -984,14 +1049,38 @@ td.clickable:hover {
     var(--glass);
 }
 
-/* Active badge pulses slowly (~3s); idle/completed badges stay flat */
-.session-row[data-active='true'] .badge-active {
-  animation: badge-pulse 3s ease-in-out infinite;
+/* Active session rows — non-color cues supplementing the status color
+   (S4 a11y): 1) left border accent (3px transparent placeholder on the
+   base rule avoids layout shift), 2) glow ring bleeding right of the
+   accent, 3) radial background wash across the row. */
+.session-row td:first-child {
+  border-left: 3px solid transparent;
 }
 
-@keyframes badge-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.75; }
+.session-row[data-active="true"] td:first-child {
+  border-left-color: var(--status-healthy);
+  box-shadow: 8px 0 16px -8px rgba(74, 222, 128, 0.45);
+}
+
+.session-row[data-active="true"] {
+  background-image: radial-gradient(ellipse 70% 100% at 0% 50%, rgba(74, 222, 128, 0.10), transparent 70%);
+}
+
+/* Badge pulse — additional non-color cue for active/running sessions.
+   Pulses ONLY the tinted background layer (not the whole badge) so badge
+   text stays at full opacity and the semantic color pair + text contrast
+   remain WCAG AA-compliant throughout the animation. */
+.badge-active  { animation: badge-pulse-active 2s ease-in-out infinite; }
+.badge-running { animation: badge-pulse-running 2s ease-in-out infinite; }
+
+@keyframes badge-pulse-active {
+  0%, 100% { background-color: rgba(74, 222, 128, 0.22); }
+  50%      { background-color: rgba(74, 222, 128, 0.10); }
+}
+
+@keyframes badge-pulse-running {
+  0%, 100% { background-color: rgba(94, 242, 255, 0.22); }
+  50%      { background-color: rgba(94, 242, 255, 0.10); }
 }
 
 /* Status badges for agent runs */
@@ -1457,5 +1546,43 @@ td.clickable:hover {
 
   .dr-custom-inputs {
     gap: 8px;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ACCESSIBILITY: reduced motion (S4)
+   Respects the OS/browser prefers-reduced-motion setting: collapses all
+   animation/transition motion. Static non-color cues (left border accent,
+   background wash) are intentionally retained so active sessions stay
+   distinguishable without motion.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Disable badge pulse (sessions active + agent runs running) */
+  .badge-active,
+  .badge-running {
+    animation: none !important;
+  }
+
+  /* Disable the active-row glow ring; the border accent and background
+     wash remain (they are static, non-animated cues) */
+  .session-row[data-active="true"] td:first-child {
+    box-shadow: none !important;
+  }
+
+  /* Focus indicators are not motion — keep the keyboard focus ring visible
+     even when animations are disabled (overrides the glow-ring removal above). */
+  .session-row[data-active="true"]:focus-visible td:first-child,
+  .session-row:focus-visible td {
+    box-shadow: inset 0 0 0 2px var(--accent-indigo) !important;
   }
 }
