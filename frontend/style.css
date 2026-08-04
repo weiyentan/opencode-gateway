@@ -5,6 +5,59 @@
    indigo #7c8cff, cyan #5ef2ff, pink #ff75b5, gold #ffd86f
    ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   REUSABLE VISUAL PATTERNS (S1–S5, Aurora Glass-inspired reskin)
+   Reference for future work — e.g. the detail panel (#sd-detail-overlay).
+   Comment-only documentation of the patterns established in S1–S4; no
+   style rules live in this block.
+
+   1. Layer composition — stack translucent backgrounds, outermost wash first:
+        background:
+          radial-gradient(ellipse at left center, rgba(cyan,0.06) 0%, transparent 70%),
+          linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
+          var(--glass);
+      Order matters: each layer paints over the previous one; the LAST layer is
+      the foreground surface. Precedents in this file: .aurora-bg (radial
+      gradient stack) and .logo (linear-gradient(135deg, var(--accent-cyan),
+      var(--accent-indigo))).
+
+   2. State-driven styling via data-* attributes (state lives in markup, not
+      modifier classes):
+        .session-row[data-active="true"]  { …active row glow/ring… }
+        .session-row[data-status="error"] { …error tinting… }
+      Current base fallback: .session-row:hover td { background: rgba(124,140,255,0.06); }
+      S1–S4 extend this with [data-*] attribute selectors so app.js renders
+      state once and CSS drives the visuals.
+
+   3. Token usage checklist — token → visual effect → example selector:
+        --glass          translucent panel fill  → .kpi-card, .date-range-bar
+        --glass-hover    elevated fill on hover  → .kpi-card:hover
+        --glass-border   hairline panel border   → .header, .kpi-card
+        --accent-indigo  #7c8cff brand/primary   → .kpi-sessions .kpi-value
+        --accent-cyan    #5ef2ff brand/active    → .kpi-tokens .kpi-value, .logo, .badge-running
+        --accent-pink    #ff75b5 brand/accent    → .kpi-source-dbs .kpi-value
+        --accent-gold    #ffd86f brand/accent    → .kpi-cost .kpi-value
+        --status-healthy success/green           → .badge-active, .badge-completed, .live-indicator
+        --status-stale   warning/amber           → .badge-stale, .badge-blocked, .live-indicator.stale
+        --status-unknown neutral/grey            → .badge-unknown, .badge-inactive
+        --status-error   error/red               → .live-indicator.error
+      S1–S4 forward-reference tokens (arrive with the reskin slices; verify
+      they exist before use): --glow-active-ring, --glow-active-inner,
+      --glow-error-tint, --glass-bg-wash, --glass-fg-surface-hover,
+      --accent-cyan-light, --accent-purple, --font-mono.
+
+   4. Reduced motion — S4 adds a @media (prefers-reduced-motion: reduce) block
+      that disables decorative animation (aurora-drift, live-pulse) and
+      transitions while keeping state/color changes instant. Any new animation
+      MUST be gated behind this media query.
+
+   5. Badge enhancement pattern — semantic meaning lives in the color pair
+      (tinted background + matching text token):
+        .badge-running { background: rgba(94,242,255,0.15); color: var(--accent-cyan); }
+      Enhancements (ring/glow/tint) may augment the badge WITHOUT changing that
+      semantic color pair, so badge meaning survives any reskin.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 /* ── Reset & Base ─────────────────────────────────────────────────────── */
 
 *,
