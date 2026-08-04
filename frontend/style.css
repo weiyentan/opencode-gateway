@@ -75,6 +75,7 @@
   --glass:        rgba(255, 255, 255, 0.08);
   --glass-hover:  rgba(255, 255, 255, 0.12);
   --glass-border: rgba(255, 255, 255, 0.10);
+  --glass-border-strong: rgba(255, 255, 255, 0.16); /* Brighter border for thead separators */
   --text-primary: #e8ecf4;
   /* WCAG AA (S4): lightened from #8b93b0 → 6.35:1 on glass, 7.70:1 on bg-deep,
      and keeps a clear ~1.4× luminance step above --text-muted (hierarchy) */
@@ -95,6 +96,31 @@
   --font:           'Inter', system-ui, -apple-system, sans-serif;
   --transition:     0.25s ease;
   --max-width:      1400px;
+
+  /* === Layered Glass Surfaces === */
+  --glass-bg-wash:          rgba(255,255,255,0.03);   /* Background wash layer */
+  --glass-mid-tint:         rgba(255,255,255,0.06);   /* Mid-layer tint */
+  --glass-fg-surface:       rgba(255,255,255,0.10);   /* Foreground card surface */
+  --glass-fg-surface-hover: rgba(255,255,255,0.14);   /* Hover surface lift */
+
+  /* === Accent Palette === */
+  --accent-cyan-light:      #7ef7ff;   /* Lighter cyan for highlights */
+  --accent-purple:          #a78bfa;   /* Purple accent for interactive elements */
+  --accent-indigo-deep:     #6366f1;   /* Deep indigo for borders/glows */
+
+  /* === Shadows & Glows === */
+  --shadow-subtle:          0 1px 3px rgba(0,0,0,0.3);
+  --shadow-elevated:        0 4px 12px rgba(0,0,0,0.4);
+  --glow-active-ring:       0 0 0 2px rgba(94,242,255,0.25);   /* Active session ring */
+  --glow-active-inner:      0 0 8px rgba(94,242,255,0.15);   /* Active session inner glow */
+
+  /* === Typography === */
+  --font-mono:              'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+  /* === Transitions === */
+  --transition-fast:        0.15s ease;
+  --transition-normal:      0.25s ease;
+  --transition-slow:        0.4s ease;
 }
 
 html {
@@ -569,6 +595,10 @@ body {
   gap: 10px;
 }
 
+.panel-sessions .panel-title {
+  color: var(--accent-purple);
+}
+
 .event-badge {
   font-size: 0.68rem;
   font-weight: 600;
@@ -749,12 +779,17 @@ thead th {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
-  border-bottom: 1px solid var(--glass-border);
+  border-bottom: 1px solid var(--glass-border-strong);
   white-space: nowrap;
 }
 
+/* Mid-layer tint separates the table body from the header */
+tbody {
+  background: var(--glass-mid-tint);
+}
+
 tbody td {
-  padding: 9px 10px;
+  padding: 6px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
@@ -762,11 +797,18 @@ tbody td {
 }
 
 tbody tr:hover td {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--glass-fg-surface);
 }
 
 .table-scroll {
   overflow-x: auto;
+}
+
+/* Monospace numeric cells — messages count, token breakdown, cost */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; /* Align digit widths */
+  letter-spacing: -0.02em;
 }
 
 .empty-state {
@@ -790,8 +832,20 @@ tbody tr:hover td {
 .badge-healthy  { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-stale    { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
-.badge-active   { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
-.badge-inactive { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
+/* Sessions status pills — semantic colors kept, left-edge accent added */
+.badge-active {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--status-healthy);
+  border-left: 2px solid var(--status-healthy);
+  padding: 2px 10px 2px 8px; /* offset for the 2px accent border */
+}
+
+.badge-inactive {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--status-unknown);
+  border-left: 2px solid var(--status-unknown);
+  padding: 2px 10px 2px 8px;
+}
 
 /* Fetch error indicator — shown inline in empty states when an endpoint failed */
 .fetch-error {
@@ -955,6 +1009,11 @@ td.clickable:hover {
 .session-row {
   cursor: pointer;
   transition: background var(--transition);
+  /* Layered glass stack: gradient wash over the base glass surface */
+  background:
+    linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
+    var(--glass);
+  border-left: 2px solid transparent; /* Reserved for active-state accent */
 }
 
 /* Keyboard focus: visible ring when tabbing to a session row.
@@ -965,8 +1024,39 @@ td.clickable:hover {
   box-shadow: inset 0 0 0 2px var(--accent-indigo);
 }
 
+.session-row td {
+  transition: background var(--transition);
+}
+
+/* Brighter surface shift with a restrained cyan accent wash + border */
 .session-row:hover td {
-  background: rgba(124, 140, 255, 0.06);
+  background:
+    linear-gradient(135deg, rgba(126, 247, 255, 0.08) 0%, transparent 100%),
+    var(--glass-fg-surface-hover);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/* Active session (last message within SESSION_ACTIVE_WINDOW_MS):
+   cyan left border accent + outer/inner glow ring + radial background
+   wash emanating from the left edge. Emphasis comes from color, glow,
+   and border only — row height stays identical to idle rows. */
+.session-row[data-active='true'] {
+  border-left: 2px solid var(--accent-cyan-light);
+  box-shadow: var(--glow-active-ring), var(--glow-active-inner);
+  background:
+    radial-gradient(ellipse at left center, rgba(94, 242, 255, 0.06) 0%, transparent 70%),
+    linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
+    var(--glass);
+}
+
+/* Active badge pulses slowly (~3s); idle/completed badges stay flat */
+.session-row[data-active='true'] .badge-active {
+  animation: badge-pulse 3s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.75; }
 }
 
 /* Active session rows — non-color cues supplementing the status color
