@@ -1150,10 +1150,13 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
 })();
 
 (function () {
-  // Error session: last_message_at within window + s.error truthy
+  // Defensive: the sessions API exposes no error signal today — SessionSummary
+  // has no `error` field and the sessions query selects no error column — so a
+  // session object carrying an unexpected extra `error` key must still render a
+  // plain active/idle status. The row markup must never emit data-status="error".
   var recentTime = new Date(testNow - 300000).toISOString(); // 5 min ago
   var session = {
-    id: 'ses-err-789',
+    id: 'ses-def-789',
     first_message_at: recentTime,
     last_message_at: recentTime,
     message_count: 1,
@@ -1162,12 +1165,33 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
     total_cache_read_tokens: 0,
     total_cache_write_tokens: 0,
     total_estimated_cost_usd: 0.001,
-    session_title: 'Error Session',
-    error: 'something went wrong'
+    session_title: 'Defensive Session',
+    error: 'unexpected extra field (not part of SessionSummary)'
   };
-  var html = buildSessionRowHtml(session, 'ErrClient', testNow);
-  assert(html.indexOf('data-status="error"') !== -1, 'error session: data-status="error" with error field');
-  assert(html.indexOf('data-id="ses-err-789"') !== -1, 'error session: data-id matches session id');
+  var html = buildSessionRowHtml(session, 'DefClient', testNow);
+  assert(html.indexOf('data-status="active"') !== -1, 'extra error key ignored: data-status="active" while active');
+  assert(html.indexOf('data-status="error"') === -1, 'row markup never emits data-status="error" (no error signal in API)');
+})();
+
+(function () {
+  // Idle variant: extra error key must not flip an idle session to an error state.
+  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
+  var session = {
+    id: 'ses-def-idle',
+    first_message_at: oldTime,
+    last_message_at: oldTime,
+    message_count: 3,
+    total_input_tokens: 200,
+    total_output_tokens: 100,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: null,
+    error: 'ignored'
+  };
+  var html = buildSessionRowHtml(session, 'DefClient2', testNow);
+  assert(html.indexOf('data-status="idle"') !== -1, 'extra error key ignored: data-status="idle" for idle session');
+  assert(html.indexOf('data-status="error"') === -1, 'idle row never emits data-status="error"');
 })();
 
 (function () {

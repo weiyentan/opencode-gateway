@@ -853,7 +853,7 @@
     var title = s.session_title || '--';
     var ts = now != null ? now : Date.now();
     var isActive = s.last_message_at && (ts - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
-    var rowStatus = (s.last_message_at && s.error) ? 'error' : (isActive ? 'active' : 'idle');
+    var rowStatus = isActive ? 'active' : 'idle';
 
     return '<tr class="session-row" data-id="' + s.id + '" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + rowStatus + '">' +
       '<td>' + escHtml(clientName) + '</td>' +

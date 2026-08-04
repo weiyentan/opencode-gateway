@@ -56,7 +56,6 @@
   --shadow-elevated:        0 4px 12px rgba(0,0,0,0.4);
   --glow-active-ring:       0 0 0 2px rgba(94,242,255,0.25);   /* Active session ring */
   --glow-active-inner:      0 0 8px rgba(94,242,255,0.15);   /* Active session inner glow */
-  --glow-error-tint:        0 0 0 1px rgba(248,113,113,0.2);   /* Error border tint */
 
   /* === Typography === */
   --font-mono:              'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
@@ -983,12 +982,6 @@ td.clickable:hover {
     radial-gradient(ellipse at left center, rgba(94, 242, 255, 0.06) 0%, transparent 70%),
     linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
     var(--glass);
-}
-
-/* Error/failure rows: subtle red border tint; badge carries the color */
-.session-row[data-status='error'] {
-  border-left: 2px solid var(--status-error);
-  box-shadow: var(--glow-error-tint);
 }
 
 /* Active badge pulses slowly (~3s); idle/completed badges stay flat */
