@@ -959,11 +959,41 @@ td.clickable:hover {
   transition: background var(--transition);
 }
 
-/* Brighter surface shift with a restrained cyan accent wash */
+/* Brighter surface shift with a restrained cyan accent wash + border */
 .session-row:hover td {
   background:
     linear-gradient(135deg, rgba(126, 247, 255, 0.08) 0%, transparent 100%),
     var(--glass-fg-surface-hover);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/* Active session (last message within SESSION_ACTIVE_WINDOW_MS):
+   cyan left border accent + outer/inner glow ring + radial background
+   wash emanating from the left edge. Emphasis comes from color, glow,
+   and border only — row height stays identical to idle rows. */
+.session-row[data-active='true'] {
+  border-left: 2px solid var(--accent-cyan-light);
+  box-shadow: var(--glow-active-ring), var(--glow-active-inner);
+  background:
+    radial-gradient(ellipse at left center, rgba(94, 242, 255, 0.06) 0%, transparent 70%),
+    linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
+    var(--glass);
+}
+
+/* Error/failure rows: subtle red border tint; badge carries the color */
+.session-row[data-status='error'] {
+  border-left: 2px solid var(--status-error);
+  box-shadow: var(--glow-error-tint);
+}
+
+/* Active badge pulses slowly (~3s); idle/completed badges stay flat */
+.session-row[data-active='true'] .badge-active {
+  animation: badge-pulse 3s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.75; }
 }
 
 /* Status badges for agent runs */
