@@ -957,10 +957,12 @@ td.clickable:hover {
   transition: background var(--transition);
 }
 
-/* Keyboard focus: visible outline when tabbing to a session row */
-.session-row:focus-visible {
-  outline: 2px solid var(--accent-indigo);
-  outline-offset: -2px;
+/* Keyboard focus: visible ring when tabbing to a session row.
+   Uses an inset box-shadow on the cells rather than outline on the <tr>,
+   because Firefox does not render outlines on table-row elements
+   (Bugzilla 893137); inset shadows render reliably in Chrome/Edge/Safari/Firefox. */
+.session-row:focus-visible td {
+  box-shadow: inset 0 0 0 2px var(--accent-indigo);
 }
 
 .session-row:hover td {
@@ -984,15 +986,21 @@ td.clickable:hover {
   background-image: radial-gradient(ellipse 70% 100% at 0% 50%, rgba(74, 222, 128, 0.10), transparent 70%);
 }
 
-/* Badge pulse — additional non-color cue for active/running sessions */
-.badge-active,
-.badge-running {
-  animation: badge-pulse 2s ease-in-out infinite;
+/* Badge pulse — additional non-color cue for active/running sessions.
+   Pulses ONLY the tinted background layer (not the whole badge) so badge
+   text stays at full opacity and the semantic color pair + text contrast
+   remain WCAG AA-compliant throughout the animation. */
+.badge-active  { animation: badge-pulse-active 2s ease-in-out infinite; }
+.badge-running { animation: badge-pulse-running 2s ease-in-out infinite; }
+
+@keyframes badge-pulse-active {
+  0%, 100% { background-color: rgba(74, 222, 128, 0.22); }
+  50%      { background-color: rgba(74, 222, 128, 0.10); }
 }
 
-@keyframes badge-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.55; }
+@keyframes badge-pulse-running {
+  0%, 100% { background-color: rgba(94, 242, 255, 0.22); }
+  50%      { background-color: rgba(94, 242, 255, 0.10); }
 }
 
 /* Status badges for agent runs */
@@ -1489,5 +1497,12 @@ td.clickable:hover {
      wash remain (they are static, non-animated cues) */
   .session-row[data-active="true"] td:first-child {
     box-shadow: none !important;
+  }
+
+  /* Focus indicators are not motion — keep the keyboard focus ring visible
+     even when animations are disabled (overrides the glow-ring removal above). */
+  .session-row[data-active="true"]:focus-visible td:first-child,
+  .session-row:focus-visible td {
+    box-shadow: inset 0 0 0 2px var(--accent-indigo) !important;
   }
 }
