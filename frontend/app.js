@@ -862,9 +862,9 @@
         '<td>' + fmtDT(s.first_message_at) + '</td>' +
         '<td>' + fmtDT(s.last_message_at) + '</td>' +
         '<td>' + duration + '</td>' +
-        '<td>' + (s.message_count || 0) + '</td>' +
-        '<td>' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</td>' +
-        '<td>' + fmtCost(cost) + '</td>' +
+        '<td><span class="num">' + (s.message_count || 0) + '</span></td>' +
+        '<td><span class="num">' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</span></td>' +
+        '<td><span class="num">' + fmtCost(cost) + '</span></td>' +
         '<td>' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
         '</tr>';
     });
