@@ -47,9 +47,8 @@
         --status-unknown neutral/grey            → .badge-unknown, .badge-inactive
         --status-error   error/red               → .live-indicator.error
       S1–S4 forward-reference tokens (arrive with the reskin slices; verify
-      they exist before use): --glow-active-ring, --glow-active-inner,
-      --glow-error-tint, --glass-bg-wash, --glass-fg-surface-hover,
-      --accent-cyan-light, --accent-purple, --font-mono.
+      they exist before use): --glow-error-tint, --glass-bg-wash,
+      --glass-fg-surface-hover, --accent-cyan-light, --accent-purple.
 
    4. Reduced motion — S4 adds a @media (prefers-reduced-motion: reduce) block
       that disables decorative animation (aurora-drift, live-pulse) and
@@ -116,11 +115,6 @@
   /* === Shadows & Glows === */
   --shadow-subtle:          0 1px 3px rgba(0,0,0,0.3);
   --shadow-elevated:        0 4px 12px rgba(0,0,0,0.4);
-  --glow-active-ring:       0 0 0 2px rgba(94,242,255,0.25);   /* Active session ring */
-  --glow-active-inner:      0 0 8px rgba(94,242,255,0.15);   /* Active session inner glow */
-
-  /* === Typography === */
-  --font-mono:              'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
 
   /* === Transitions === */
   --transition-fast:        0.15s ease;
@@ -1563,14 +1557,17 @@ td.clickable:hover {
 
   /* Stacked rows are block-level now, so the keyboard focus ring moves to
      an outline on the card (Firefox renders outlines on block elements) and
-     the per-cell inset shadow from the desktop rule is suppressed. */
+     the per-cell inset shadow from the desktop rule is suppressed. The
+     !important wins the cascade over the reduced-motion inset ring rule
+     (which is !important too), preserving the single card outline under
+     prefers-reduced-motion. */
   #sessions-table tr.session-row:focus-visible {
     outline: 2px solid var(--accent-indigo);
     outline-offset: 2px;
   }
 
   #sessions-table tr.session-row:focus-visible td {
-    box-shadow: none;
+    box-shadow: none !important;
   }
 }
 

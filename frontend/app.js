@@ -313,13 +313,6 @@
     return fmtNum(n);
   }
 
-  /** Truncate a string with ellipsis if longer than maxLen */
-  function truncate(str, maxLen) {
-    if (!str) return '--';
-    if (str.length <= maxLen) return escHtml(str);
-    return escHtml(str.substring(0, maxLen)) + '&hellip;';
-  }
-
   /** Format a short UUID for display */
   function shortUUID(id) {
     if (!id) return '--';
