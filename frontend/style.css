@@ -91,9 +91,9 @@
   --status-stale:   #fbbf24;
   --status-unknown: #94a3b8;
   --status-error:   #f87171;
-  --radius-panel:   22px;
+  --radius-panel:   12px;
   --radius-pill:    999px;
-  --font:           'Inter', system-ui, -apple-system, sans-serif;
+  --font:           system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   --transition:     0.25s ease;
   --max-width:      1400px;
 
@@ -275,79 +275,82 @@ body {
   color: var(--status-error);
 }
 
-/* ── App Layout (sidebar + main) ─────────────────────────────────────── */
+/* ── App Layout (top-nav + main) ────────────────────────────────────── */
 
 .app-layout {
   display: flex;
+  flex-direction: column;
   min-height: calc(100vh - 56px); /* header height */
   position: relative;
   z-index: 1;
 }
 
-/* ── Sidebar Navigation ─────────────────────────────────────────────── */
+/* ── Top Navigation ──────────────────────────────────────────────────── */
 
-.sidebar {
-  width: 200px;
+.top-nav {
   flex-shrink: 0;
   background: rgba(13, 19, 38, 0.75);
   backdrop-filter: blur(20px) saturate(120%);
   -webkit-backdrop-filter: blur(20px) saturate(120%);
-  border-right: 1px solid var(--glass-border);
-  padding: 20px 0;
+  border-bottom: 1px solid var(--glass-border);
+  padding: 0;
   display: flex;
-  flex-direction: column;
-  gap: 4px;
 }
 
-.sidebar-nav {
+.top-nav-list {
   list-style: none;
   margin: 0;
   padding: 0;
+  display: flex;
+  flex-direction: row;
+  gap: 2px;
+  width: 100%;
 }
 
-.sidebar-item {
+.top-nav-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   padding: 12px 20px;
   cursor: pointer;
-  transition: background var(--transition), color var(--transition);
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
   color: var(--text-secondary);
-  font-size: 0.94rem;
+  font-size: 0.9rem;
   font-weight: 500;
-  border-left: 3px solid transparent;
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
 }
 
-.sidebar-item:hover {
+.top-nav-item:hover {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-primary);
 }
 
-.sidebar-item.active {
-  background: rgba(124, 140, 255, 0.10);
-  color: var(--accent-cyan);
-  border-left-color: var(--accent-cyan);
+.top-nav-item.active {
+  background: rgba(124, 140, 255, 0.08);
+  color: var(--accent-indigo);
+  border-bottom-color: var(--accent-indigo);
 }
 
-.sidebar-icon {
-  width: 20px;
-  height: 20px;
+.top-nav-icon {
+  width: 18px;
+  height: 18px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
   color: var(--accent-indigo);
-  transition: color var(--transition), filter var(--transition);
+  transition: color var(--transition);
 }
 
-.sidebar-icon svg {
-  width: 20px;
-  height: 20px;
+.top-nav-icon svg {
+  width: 18px;
+  height: 18px;
   display: block;
   fill: currentColor;
 }
 
-.sidebar-icon path {
+.top-nav-icon path {
   stroke: currentColor;
   stroke-width: 1.8;
   stroke-linecap: round;
@@ -355,22 +358,21 @@ body {
   fill: none;
 }
 
-.sidebar-icon path:first-child,
-.sidebar-icon svg path:only-child {
+.top-nav-icon path:first-child,
+.top-nav-icon svg path:only-child {
   fill: currentColor;
   stroke: none;
 }
 
-.sidebar-item:hover .sidebar-icon {
-  color: var(--accent-cyan);
+.top-nav-item:hover .top-nav-icon {
+  color: var(--accent-indigo);
 }
 
-.sidebar-item.active .sidebar-icon {
-  color: var(--accent-cyan);
-  filter: drop-shadow(0 0 6px rgba(94, 242, 255, 0.35));
+.top-nav-item.active .top-nav-icon {
+  color: var(--accent-indigo);
 }
 
-.sidebar-label {
+.top-nav-label {
   white-space: nowrap;
 }
 
@@ -391,8 +393,9 @@ body {
   position: relative;
   z-index: 1;
   max-width: var(--max-width);
-  margin: 0;
+  margin: 0 auto;
   padding: 24px 24px 40px;
+  width: 100%;
 }
 
 /* Refresh indicator — subtle opacity change during data fetch */
@@ -783,11 +786,6 @@ thead th {
   white-space: nowrap;
 }
 
-/* Mid-layer tint separates the table body from the header */
-tbody {
-  background: var(--glass-mid-tint);
-}
-
 tbody td {
   padding: 6px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
@@ -806,7 +804,6 @@ tbody tr:hover td {
 
 /* Monospace numeric cells — messages count, token breakdown, cost */
 .num {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; /* Align digit widths */
   letter-spacing: -0.02em;
 }
@@ -1359,16 +1356,6 @@ td.clickable:hover {
   .kpi-row {
     grid-template-columns: repeat(3, 1fr);
   }
-
-  .sidebar {
-    width: 160px;
-    padding: 14px 0;
-  }
-
-  .sidebar-item {
-    padding: 10px 14px;
-    font-size: 0.76rem;
-  }
 }
 
 /* ≤760px — single-column layout */
@@ -1486,37 +1473,13 @@ td.clickable:hover {
     flex-direction: column;
   }
 
-  .sidebar {
-    width: 100%;
-    flex-direction: row;
-    padding: 8px 0;
-    border-right: none;
-    border-bottom: 1px solid var(--glass-border);
-    overflow-x: auto;
-  }
-
-  .sidebar-nav {
-    display: flex;
-    flex-direction: row;
-    gap: 4px;
-    padding: 0 12px;
-  }
-
-  .sidebar-item {
+  .top-nav-item {
     padding: 8px 14px;
     font-size: 0.74rem;
-    border-left: none;
-    border-bottom: 2px solid transparent;
-    border-radius: 8px 8px 0 0;
     flex-shrink: 0;
   }
 
-  .sidebar-item.active {
-    border-left-color: transparent;
-    border-bottom-color: var(--accent-cyan);
-  }
-
-  .sidebar-label {
+  .top-nav-label {
     font-size: 0.72rem;
   }
 

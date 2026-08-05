@@ -1489,22 +1489,22 @@
   }
 
   function setupTabNavigation() {
-    var sidebarItems = document.querySelectorAll('.sidebar-item');
+    var navItems = document.querySelectorAll('.top-nav-item');
     var tabContents = document.querySelectorAll('.tab-content');
 
     function activateTab(tabName) {
       // Deactivate all
-      sidebarItems.forEach(function (item) { item.classList.remove('active'); });
+      navItems.forEach(function (item) { item.classList.remove('active'); });
       tabContents.forEach(function (tab) { tab.classList.remove('active'); });
 
       // Activate target
-      var targetItem = document.querySelector('.sidebar-item[data-tab="' + tabName + '"]');
+      var targetItem = document.querySelector('.top-nav-item[data-tab="' + tabName + '"]');
       var targetTab = document.getElementById('tab-' + tabName);
       if (targetItem) targetItem.classList.add('active');
       if (targetTab) targetTab.classList.add('active');
     }
 
-    sidebarItems.forEach(function (item) {
+    navItems.forEach(function (item) {
       item.addEventListener('click', function () {
         var tabName = item.getAttribute('data-tab');
         if (tabName) activateTab(tabName);
