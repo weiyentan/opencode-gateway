@@ -861,15 +861,15 @@
     var rowStatus = isActive ? 'active' : 'idle';
 
     return '<tr class="session-row" data-id="' + s.id + '" tabindex="0" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + rowStatus + '">' +
-      '<td>' + escHtml(clientName) + '</td>' +
-      '<td class="session-title-col" title="' + escHtml(title) + '"><span class="session-title">' + escHtml(title) + '</span></td>' +
-      '<td>' + fmtDT(s.first_message_at) + '</td>' +
-      '<td>' + fmtDT(s.last_message_at) + '</td>' +
-      '<td>' + duration + '</td>' +
-      '<td><span class="num">' + (s.message_count || 0) + '</span></td>' +
-      '<td><span class="num">' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</span></td>' +
-      '<td><span class="num">' + fmtCost(cost) + '</span></td>' +
-      '<td>' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
+      '<td data-label="Client">' + escHtml(clientName) + '</td>' +
+      '<td class="session-title-col" data-label="Session Title" title="' + escHtml(title) + '"><span class="session-title">' + escHtml(title) + '</span></td>' +
+      '<td class="sess-col-low" data-label="First Message">' + fmtDT(s.first_message_at) + '</td>' +
+      '<td data-label="Last Message">' + fmtDT(s.last_message_at) + '</td>' +
+      '<td class="sess-col-low" data-label="Duration">' + duration + '</td>' +
+      '<td class="sess-col-low" data-label="Messages"><span class="num">' + (s.message_count || 0) + '</span></td>' +
+      '<td class="sess-col-low" data-label="Tokens"><span class="num">' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</span></td>' +
+      '<td data-label="Cost"><span class="num">' + fmtCost(cost) + '</span></td>' +
+      '<td data-label="Status">' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
       '</tr>';
   }
 
@@ -1513,6 +1513,15 @@
       item.addEventListener('click', function () {
         var tabName = item.getAttribute('data-tab');
         if (tabName) activateTab(tabName);
+      });
+      // Keyboard activation: Enter or Space on a focused nav item switches
+      // tabs (nav items are focusable via tabindex="0" in index.html)
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var tabName = item.getAttribute('data-tab');
+          if (tabName) activateTab(tabName);
+        }
       });
     });
   }
