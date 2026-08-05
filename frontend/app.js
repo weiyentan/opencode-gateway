@@ -842,6 +842,11 @@
   }
 
   /** Build a single session row <tr> HTML string (extracted for testability).
+   *  Balanced Quiet Rows: activity is communicated through the compact
+   *  outlined badge in the Status column (Badge Only) — the row itself carries
+   *  no status-driven visual treatment. Titles render in full inside a
+   *  .session-title span so CSS can ellipsis-clip them in the flexible title
+   *  column; the hard 40-char JS truncation is gone.
    *  @param {object} s - session summary object from the API
    *  @param {string} clientName - resolved client display name
    *  @param {number} [now] - reference timestamp (defaults to Date.now()); exposed for deterministic tests
@@ -857,7 +862,7 @@
 
     return '<tr class="session-row" data-id="' + s.id + '" tabindex="0" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + rowStatus + '">' +
       '<td>' + escHtml(clientName) + '</td>' +
-      '<td class="session-title-col" title="' + escHtml(title) + '">' + truncate(title, 40) + '</td>' +
+      '<td class="session-title-col" title="' + escHtml(title) + '"><span class="session-title">' + escHtml(title) + '</span></td>' +
       '<td>' + fmtDT(s.first_message_at) + '</td>' +
       '<td>' + fmtDT(s.last_message_at) + '</td>' +
       '<td>' + duration + '</td>' +

@@ -1234,6 +1234,76 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
   assert(html.indexOf('class="session-row"') !== -1, 'session row: has class="session-row"');
 })();
 
+(function () {
+  // Balanced Quiet Rows — readable titles: the flexible title column renders
+  // the FULL session title (overflow is handled by CSS ellipsis on the
+  // .session-title span), never a hard 40-char JS truncation. The tooltip
+  // attribute and title column class are preserved.
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var longTitle = 'A deliberately long session title that exceeds forty characters to verify full-title rendering';
+  var session = {
+    id: 'ses-long-title',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 1,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0,
+    session_title: longTitle
+  };
+  var html = buildSessionRowHtml(session, 'LongClient', testNow);
+  assert(html.indexOf(longTitle) !== -1, 'title cell renders the full session title (no hard truncation)');
+  assert(html.indexOf('&hellip;') === -1, 'title cell does not insert a JS ellipsis (CSS overflow handles clipping)');
+  assert(html.indexOf('<span class="session-title">') !== -1, 'title cell wraps text in .session-title span (flexible column ellipsis hook)');
+  assert(html.indexOf('class="session-title-col"') !== -1, 'title cell keeps session-title-col class');
+})();
+
+(function () {
+  // Balanced Quiet Rows — Badge Only status treatment: activity is
+  // communicated exclusively through the compact outlined badge in the
+  // Status column. Active sessions render badge-active with "active" text;
+  // idle sessions render badge-inactive with "ended" text.
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var activeSession = {
+    id: 'ses-badge-active',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 5,
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: 'Badge Active'
+  };
+  var activeHtml = buildSessionRowHtml(activeSession, 'BadgeClient', testNow);
+  assert(activeHtml.indexOf('<span class="badge badge-active">active</span>') !== -1,
+    'active session: status cell is the badge-active span with "active" text');
+  assert(activeHtml.indexOf('<span class="badge badge-inactive">') === -1,
+    'active session: no inactive badge emitted');
+
+  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
+  var idleSession = {
+    id: 'ses-badge-idle',
+    first_message_at: oldTime,
+    last_message_at: oldTime,
+    message_count: 3,
+    total_input_tokens: 200,
+    total_output_tokens: 100,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: null
+  };
+  var idleHtml = buildSessionRowHtml(idleSession, 'BadgeClient2', testNow);
+  assert(idleHtml.indexOf('<span class="badge badge-inactive">ended</span>') !== -1,
+    'idle session: status cell is the badge-inactive span with "ended" text');
+  assert(idleHtml.indexOf('<span class="badge badge-active">') === -1,
+    'idle session: no active badge emitted');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 
 console.log('');
