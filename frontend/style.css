@@ -1473,6 +1473,10 @@ td.clickable:hover {
     flex-direction: column;
   }
 
+  .top-nav {
+    overflow-x: auto;
+  }
+
   .top-nav-item {
     padding: 8px 14px;
     font-size: 0.74rem;
