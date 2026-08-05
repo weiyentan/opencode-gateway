@@ -1234,6 +1234,229 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
   assert(html.indexOf('class="session-row"') !== -1, 'session row: has class="session-row"');
 })();
 
+(function () {
+  // Balanced Quiet Rows — readable titles: the flexible title column renders
+  // the FULL session title (overflow is handled by CSS ellipsis on the
+  // .session-title span), never a hard 40-char JS truncation. The tooltip
+  // attribute and title column class are preserved.
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var longTitle = 'A deliberately long session title that exceeds forty characters to verify full-title rendering';
+  var session = {
+    id: 'ses-long-title',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 1,
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0,
+    session_title: longTitle
+  };
+  var html = buildSessionRowHtml(session, 'LongClient', testNow);
+  assert(html.indexOf(longTitle) !== -1, 'title cell renders the full session title (no hard truncation)');
+  assert(html.indexOf('&hellip;') === -1, 'title cell does not insert a JS ellipsis (CSS overflow handles clipping)');
+  assert(html.indexOf('<span class="session-title">') !== -1, 'title cell wraps text in .session-title span (flexible column ellipsis hook)');
+  assert(html.indexOf('class="session-title-col"') !== -1, 'title cell keeps session-title-col class');
+})();
+
+(function () {
+  // Balanced Quiet Rows — Badge Only status treatment: activity is
+  // communicated exclusively through the compact outlined badge in the
+  // Status column. Active sessions render badge-active with "active" text;
+  // idle sessions render badge-inactive with "ended" text.
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var activeSession = {
+    id: 'ses-badge-active',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 5,
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: 'Badge Active'
+  };
+  var activeHtml = buildSessionRowHtml(activeSession, 'BadgeClient', testNow);
+  assert(activeHtml.indexOf('<span class="badge badge-active">active</span>') !== -1,
+    'active session: status cell is the badge-active span with "active" text');
+  assert(activeHtml.indexOf('<span class="badge badge-inactive">') === -1,
+    'active session: no inactive badge emitted');
+
+  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
+  var idleSession = {
+    id: 'ses-badge-idle',
+    first_message_at: oldTime,
+    last_message_at: oldTime,
+    message_count: 3,
+    total_input_tokens: 200,
+    total_output_tokens: 100,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.01,
+    session_title: null
+  };
+  var idleHtml = buildSessionRowHtml(idleSession, 'BadgeClient2', testNow);
+  assert(idleHtml.indexOf('<span class="badge badge-inactive">ended</span>') !== -1,
+    'idle session: status cell is the badge-inactive span with "ended" text');
+  assert(idleHtml.indexOf('<span class="badge badge-active">') === -1,
+    'idle session: no active badge emitted');
+})();
+
+(function () {
+  // Responsive Hybrid — stacked-row markup hooks: every cell carries a
+  // data-label attribute (the ≤760px stacked-row CSS renders it as the
+  // label on each label/value line) and the four low-priority cells carry
+  // the sess-col-low class (hidden at 761–1024px tablet widths). Client,
+  // Session Title, Last Message, Cost, and Status must remain unmarked.
+  var recentTime = new Date(testNow - 600000).toISOString();
+  var session = {
+    id: 'ses-resp-hooks',
+    first_message_at: recentTime,
+    last_message_at: recentTime,
+    message_count: 7,
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    total_cache_read_tokens: 0,
+    total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 0.02,
+    session_title: 'Responsive Hooks'
+  };
+  var html = buildSessionRowHtml(session, 'RespClient', testNow);
+
+  // All nine labels present, in table column order
+  var labels = ['Client', 'Session Title', 'First Message', 'Last Message', 'Duration', 'Messages', 'Tokens', 'Cost', 'Status'];
+  var labelPos = -1;
+  labels.forEach(function (label) {
+    var idx = html.indexOf('data-label="' + label + '"');
+    assert(idx !== -1, 'session row: cell carries data-label="' + label + '"');
+    assert(idx > labelPos, 'session row: data-label="' + label + '" appears after the previous column label (column order preserved)');
+    labelPos = idx;
+  });
+
+  // Low-priority cells carry sess-col-low; retained columns do not
+  var low = ['First Message', 'Duration', 'Messages', 'Tokens'];
+  var kept = ['Client', 'Session Title', 'Last Message', 'Cost', 'Status'];
+  low.forEach(function (label) {
+    assert(html.indexOf('class="sess-col-low" data-label="' + label + '"') !== -1,
+      'session row: low-priority cell "' + label + '" carries class="sess-col-low"');
+  });
+  kept.forEach(function (label) {
+    assert(html.indexOf('class="sess-col-low" data-label="' + label + '"') === -1,
+      'session row: retained column "' + label + '" is not marked sess-col-low');
+  });
+
+  // Focus attribute on the row (keyboard reachability)
+  assert(html.indexOf('tabindex="0"') !== -1, 'session row: tabindex="0" keeps the row keyboard-focusable');
+})();
+
+// ── Static markup smoke check (frontend/index.html) ─────────────────────
+// The repo has no browser test harness, so the "browser-level or equivalent
+// smoke check" acceptance criterion maps to static assertions on the real
+// index.html markup: the four top-nav tabs exist and are keyboard-focusable
+// (tabindex="0"), each has a matching tab-content panel, and the sessions
+// table carries the responsive hooks (#sessions-table + sess-col-low header
+// cells) that the breakpoint CSS targets.
+
+console.log('\u25B6 index.html markup (smoke check)');
+
+(function () {
+  var indexPath = path.join(__dirname, '..', 'index.html');
+  var html = fs.readFileSync(indexPath, 'utf8');
+
+  // Four tabs: top-nav item + matching content panel
+  var tabs = ['overview', 'sessions', 'agent-runs', 'clients-projects'];
+  tabs.forEach(function (tab) {
+    assert(html.indexOf('data-tab="' + tab + '"') !== -1, 'top nav: item for tab "' + tab + '" exists');
+    assert(html.indexOf('id="tab-' + tab + '"') !== -1, 'top nav: tab-content panel #tab-' + tab + ' exists');
+  });
+
+  // Keyboard reachability: every top-nav item is focusable (tabindex="0"),
+  // so tabbing enters Overview → Sessions → Agent Runs → Clients / Projects.
+  var navItemCount = (html.match(/class="top-nav-item/g) || []).length;
+  assert(navItemCount === 4, 'top nav: exactly four top-nav-item elements (' + navItemCount + ' found)');
+  tabs.forEach(function (tab) {
+    assert(html.indexOf('data-tab="' + tab + '" tabindex="0"') !== -1,
+      'top nav: tab "' + tab + '" is keyboard-focusable (tabindex="0")');
+  });
+
+  // Responsive hooks: the sessions table is addressable by id and its four
+  // low-priority header cells carry sess-col-low (hidden at 761–1024px).
+  assert(html.indexOf('<table id="sessions-table">') !== -1, 'sessions table carries id="sessions-table"');
+  ['First Message', 'Duration', 'Messages', 'Tokens'].forEach(function (label) {
+    assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') !== -1,
+      'sessions header: "' + label + '" marked sess-col-low');
+  });
+  ['Client', 'Session Title', 'Last Message', 'Cost', 'Status'].forEach(function (label) {
+    assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') === -1,
+      'sessions header: retained column "' + label + '" is not marked sess-col-low');
+  });
+})();
+
+// ── Static CSS verification (frontend/style.css) ────────────────────────
+// No browser is available in the repository test environment, so the
+// responsive and reduced-motion acceptance criteria are verified statically
+// against the real stylesheet: the three viewport bands (>1024px full table,
+// 761–1024px condensed, ≤760px stacked), the reduced-motion animation kills,
+// focus-visible rules, and the Balanced Quiet Rows regression guards (no
+// green active-row cast, no cyan row stripe in live rules).
+
+console.log('\u25B6 style.css responsive + reduced-motion (static verification)');
+
+(function () {
+  var cssPath = path.join(__dirname, '..', 'style.css');
+  var css = fs.readFileSync(cssPath, 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: guards assert on real rules only
+
+  // The three viewport bands
+  assert(css.indexOf('@media (max-width: 1024px)') !== -1, 'style.css: tablet breakpoint @media (max-width: 1024px) exists');
+  assert(css.indexOf('@media (max-width: 760px)') !== -1, 'style.css: phone breakpoint @media (max-width: 760px) exists');
+
+  // 761–1024px tablet band: low-priority sessions columns hidden via sess-col-low
+  var tabletBlock = css.slice(css.indexOf('@media (max-width: 1024px)'), css.indexOf('@media (max-width: 760px)'));
+  assert(tabletBlock.indexOf('#sessions-table .sess-col-low') !== -1 && tabletBlock.indexOf('display: none') !== -1,
+    'tablet block hides #sessions-table .sess-col-low (First Message, Duration, Messages, Tokens)');
+
+  // ≤760px phone band: stacked session rows — header removed, rows become
+  // block cards, cells render label/value lines via attr(data-label)
+  // (lastIndexOf: the file-header comment also mentions the reduced-motion
+  // media query, so anchor on the real block after the 760px one)
+  var rmStart = css.lastIndexOf('@media (prefers-reduced-motion: reduce)');
+  var phoneBlock = css.slice(css.indexOf('@media (max-width: 760px)'), rmStart);
+  assert(phoneBlock.indexOf('#sessions-table thead') !== -1 && phoneBlock.indexOf('display: none') !== -1,
+    'phone block removes the sessions table header (stacked rows carry their own labels)');
+  assert(phoneBlock.indexOf('tr.session-row') !== -1 && phoneBlock.indexOf('display: block') !== -1,
+    'phone block turns session rows into stacked block cards');
+  assert(phoneBlock.indexOf('attr(data-label)') !== -1,
+    'phone block labels stacked cells via attr(data-label)');
+
+  // Reduced motion: aurora drift, live pulse, badge pulse disabled; status
+  // badges (static border/text cues) untouched; focus ring retained
+  var rmBlock = css.slice(rmStart);
+  assert(rmBlock.indexOf('.aurora-bg') !== -1 && rmBlock.indexOf('animation: none') !== -1,
+    'reduced motion: aurora drift disabled (.aurora-bg animation: none)');
+  assert(rmBlock.indexOf('.live-indicator::before') !== -1 && rmBlock.indexOf('animation: none') !== -1,
+    'reduced motion: live pulse disabled (.live-indicator::before animation: none)');
+  assert(rmBlock.indexOf('.badge-running') !== -1 && rmBlock.indexOf('animation: none') !== -1,
+    'reduced motion: badge pulse disabled (.badge-running animation: none)');
+  assert(rmBlock.indexOf('.badge-active') === -1,
+    'reduced motion: session status badge styling untouched (static border/text cues retained)');
+  assert(rmBlock.indexOf('.session-row:focus-visible td') !== -1,
+    'reduced motion: keyboard focus ring retained (focus is not motion)');
+
+  // Focus visibility at base
+  assert(css.indexOf('.session-row:focus-visible td') !== -1, 'style.css: session-row focus ring rule exists');
+  assert(css.indexOf('.top-nav-item:focus-visible') !== -1, 'style.css: top-nav-item focus ring rule exists');
+
+  // Balanced Quiet Rows regression guards — no green active-row cast and no
+  // cyan row stripe in live rules (status visuals live in the badge only)
+  assert(live.indexOf('[data-active') === -1,
+    'no status-driven [data-active] row selector in live CSS (no green active-row cast)');
+  assert(!/\.session-row[^{]*\{[^}]*border-left[^}]*\}/.test(live),
+    'no .session-row rule paints a left rail/stripe in live CSS');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 
 console.log('');

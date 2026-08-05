@@ -28,6 +28,11 @@
       Current base fallback: .session-row:hover td { background: rgba(124,140,255,0.06); }
       S1–S4 extend this with [data-*] attribute selectors so app.js renders
       state once and CSS drives the visuals.
+      #350 (Balanced Quiet Rows) SUPERSEDES the row-level state styling for
+      the SESSIONS table: rows keep the data-active/data-status attributes as
+      data hooks, but status visuals live in the compact outlined badge only
+      (Badge Only) — no active-row background, rail, shadow, glow, or pulse.
+      The [data-*] pattern remains available for other surfaces.
 
    3. Token usage checklist — token → visual effect → example selector:
         --glass          translucent panel fill  → .kpi-card, .date-range-bar
@@ -42,9 +47,8 @@
         --status-unknown neutral/grey            → .badge-unknown, .badge-inactive
         --status-error   error/red               → .live-indicator.error
       S1–S4 forward-reference tokens (arrive with the reskin slices; verify
-      they exist before use): --glow-active-ring, --glow-active-inner,
-      --glow-error-tint, --glass-bg-wash, --glass-fg-surface-hover,
-      --accent-cyan-light, --accent-purple, --font-mono.
+      they exist before use): --glow-error-tint, --glass-bg-wash,
+      --glass-fg-surface-hover, --accent-cyan-light, --accent-purple.
 
    4. Reduced motion — S4 adds a @media (prefers-reduced-motion: reduce) block
       that disables decorative animation (aurora-drift, live-pulse) and
@@ -91,9 +95,9 @@
   --status-stale:   #fbbf24;
   --status-unknown: #94a3b8;
   --status-error:   #f87171;
-  --radius-panel:   22px;
+  --radius-panel:   12px;
   --radius-pill:    999px;
-  --font:           'Inter', system-ui, -apple-system, sans-serif;
+  --font:           system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   --transition:     0.25s ease;
   --max-width:      1400px;
 
@@ -111,11 +115,6 @@
   /* === Shadows & Glows === */
   --shadow-subtle:          0 1px 3px rgba(0,0,0,0.3);
   --shadow-elevated:        0 4px 12px rgba(0,0,0,0.4);
-  --glow-active-ring:       0 0 0 2px rgba(94,242,255,0.25);   /* Active session ring */
-  --glow-active-inner:      0 0 8px rgba(94,242,255,0.15);   /* Active session inner glow */
-
-  /* === Typography === */
-  --font-mono:              'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
 
   /* === Transitions === */
   --transition-fast:        0.15s ease;
@@ -275,79 +274,82 @@ body {
   color: var(--status-error);
 }
 
-/* ── App Layout (sidebar + main) ─────────────────────────────────────── */
+/* ── App Layout (top-nav + main) ────────────────────────────────────── */
 
 .app-layout {
   display: flex;
+  flex-direction: column;
   min-height: calc(100vh - 56px); /* header height */
   position: relative;
   z-index: 1;
 }
 
-/* ── Sidebar Navigation ─────────────────────────────────────────────── */
+/* ── Top Navigation ──────────────────────────────────────────────────── */
 
-.sidebar {
-  width: 200px;
+.top-nav {
   flex-shrink: 0;
   background: rgba(13, 19, 38, 0.75);
   backdrop-filter: blur(20px) saturate(120%);
   -webkit-backdrop-filter: blur(20px) saturate(120%);
-  border-right: 1px solid var(--glass-border);
-  padding: 20px 0;
+  border-bottom: 1px solid var(--glass-border);
+  padding: 0;
   display: flex;
-  flex-direction: column;
-  gap: 4px;
 }
 
-.sidebar-nav {
+.top-nav-list {
   list-style: none;
   margin: 0;
   padding: 0;
+  display: flex;
+  flex-direction: row;
+  gap: 2px;
+  width: 100%;
 }
 
-.sidebar-item {
+.top-nav-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   padding: 12px 20px;
   cursor: pointer;
-  transition: background var(--transition), color var(--transition);
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
   color: var(--text-secondary);
-  font-size: 0.94rem;
+  font-size: 0.9rem;
   font-weight: 500;
-  border-left: 3px solid transparent;
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
 }
 
-.sidebar-item:hover {
+.top-nav-item:hover {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text-primary);
 }
 
-.sidebar-item.active {
-  background: rgba(124, 140, 255, 0.10);
-  color: var(--accent-cyan);
-  border-left-color: var(--accent-cyan);
+.top-nav-item.active {
+  background: rgba(124, 140, 255, 0.08);
+  color: var(--accent-indigo);
+  border-bottom-color: var(--accent-indigo);
 }
 
-.sidebar-icon {
-  width: 20px;
-  height: 20px;
+.top-nav-icon {
+  width: 18px;
+  height: 18px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
   color: var(--accent-indigo);
-  transition: color var(--transition), filter var(--transition);
+  transition: color var(--transition);
 }
 
-.sidebar-icon svg {
-  width: 20px;
-  height: 20px;
+.top-nav-icon svg {
+  width: 18px;
+  height: 18px;
   display: block;
   fill: currentColor;
 }
 
-.sidebar-icon path {
+.top-nav-icon path {
   stroke: currentColor;
   stroke-width: 1.8;
   stroke-linecap: round;
@@ -355,23 +357,30 @@ body {
   fill: none;
 }
 
-.sidebar-icon path:first-child,
-.sidebar-icon svg path:only-child {
+.top-nav-icon path:first-child,
+.top-nav-icon svg path:only-child {
   fill: currentColor;
   stroke: none;
 }
 
-.sidebar-item:hover .sidebar-icon {
-  color: var(--accent-cyan);
+.top-nav-item:hover .top-nav-icon {
+  color: var(--accent-indigo);
 }
 
-.sidebar-item.active .sidebar-icon {
-  color: var(--accent-cyan);
-  filter: drop-shadow(0 0 6px rgba(94, 242, 255, 0.35));
+.top-nav-item.active .top-nav-icon {
+  color: var(--accent-indigo);
 }
 
-.sidebar-label {
+.top-nav-label {
   white-space: nowrap;
+}
+
+/* Keyboard focus on nav items — visible ring with a sensible tab order
+   (nav items are focusable via tabindex="0", so tabbing enters
+   Overview → Sessions → Agent Runs → Clients / Projects). */
+.top-nav-item:focus-visible {
+  outline: 2px solid var(--accent-indigo);
+  outline-offset: -2px;
 }
 
 /* ── Tab Content ─────────────────────────────────────────────────────── */
@@ -391,8 +400,9 @@ body {
   position: relative;
   z-index: 1;
   max-width: var(--max-width);
-  margin: 0;
+  margin: 0 auto;
   padding: 24px 24px 40px;
+  width: 100%;
 }
 
 /* Refresh indicator — subtle opacity change during data fetch */
@@ -773,7 +783,7 @@ table {
 
 thead th {
   text-align: left;
-  padding: 8px 10px;
+  padding: 10px 12px; /* Balanced Quiet Rows: balanced cell spacing */
   font-weight: 600;
   font-size: 0.7rem;
   text-transform: uppercase;
@@ -783,13 +793,8 @@ thead th {
   white-space: nowrap;
 }
 
-/* Mid-layer tint separates the table body from the header */
-tbody {
-  background: var(--glass-mid-tint);
-}
-
 tbody td {
-  padding: 6px 10px;
+  padding: 10px 12px; /* Balanced Quiet Rows: balanced cell spacing */
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
@@ -806,7 +811,6 @@ tbody tr:hover td {
 
 /* Monospace numeric cells — messages count, token breakdown, cost */
 .num {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; /* Align digit widths */
   letter-spacing: -0.02em;
 }
@@ -832,19 +836,22 @@ tbody tr:hover td {
 .badge-healthy  { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-stale    { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
-/* Sessions status pills — semantic colors kept, left-edge accent added */
+/* Sessions status badges — Balanced Quiet Rows: compact OUTLINED treatment
+   (Badge Only). Transparent fill, 1px border, full-opacity semantic text.
+   Status is communicated by the badge alone — the row itself carries no
+   background wash, left rail, shadow, glow, or pulse. */
 .badge-active {
-  background: rgba(74, 222, 128, 0.15);
   color: var(--status-healthy);
-  border-left: 2px solid var(--status-healthy);
-  padding: 2px 10px 2px 8px; /* offset for the 2px accent border */
+  border: 1px solid rgba(74, 222, 128, 0.5);
+  background: transparent;
+  padding: 1px 8px;
 }
 
 .badge-inactive {
-  background: rgba(148, 163, 184, 0.15);
   color: var(--status-unknown);
-  border-left: 2px solid var(--status-unknown);
-  padding: 2px 10px 2px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  background: transparent;
+  padding: 1px 8px;
 }
 
 /* Fetch error indicator — shown inline in empty states when an endpoint failed */
@@ -1005,15 +1012,14 @@ td.clickable:hover {
   color: var(--accent-cyan);
 }
 
-/* Session row clickable (for session detail panel) */
+/* Session row clickable (for session detail panel) — Balanced Quiet Rows.
+   No status-driven row background: activity is communicated by the compact
+   outlined badge in the Status column (Badge Only), so no green background
+   wash, green left rail, green box shadow, glow ring, animated pulse, or
+   bright cyan stripe is applied to the row. */
 .session-row {
   cursor: pointer;
   transition: background var(--transition);
-  /* Layered glass stack: gradient wash over the base glass surface */
-  background:
-    linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
-    var(--glass);
-  border-left: 2px solid transparent; /* Reserved for active-state accent */
 }
 
 /* Keyboard focus: visible ring when tabbing to a session row.
@@ -1028,55 +1034,37 @@ td.clickable:hover {
   transition: background var(--transition);
 }
 
-/* Brighter surface shift with a restrained cyan accent wash + border */
+/* Hover feedback is a subtle NEUTRAL surface change only — it must not
+   imitate a status state (no cyan/green tint, no accent border). */
 .session-row:hover td {
-  background:
-    linear-gradient(135deg, rgba(126, 247, 255, 0.08) 0%, transparent 100%),
-    var(--glass-fg-surface-hover);
-  border-color: rgba(255, 255, 255, 0.18);
+  background: var(--glass-fg-surface-hover);
 }
 
-/* Active session (last message within SESSION_ACTIVE_WINDOW_MS):
-   cyan left border accent + outer/inner glow ring + radial background
-   wash emanating from the left edge. Emphasis comes from color, glow,
-   and border only — row height stays identical to idle rows. */
-.session-row[data-active='true'] {
-  border-left: 2px solid var(--accent-cyan-light);
-  box-shadow: var(--glow-active-ring), var(--glow-active-inner);
-  background:
-    radial-gradient(ellipse at left center, rgba(94, 242, 255, 0.06) 0%, transparent 70%),
-    linear-gradient(135deg, var(--glass-bg-wash) 0%, transparent 100%),
-    var(--glass);
+/* Flexible title column: absorbs the remaining table width so titles stay
+   readable; overflow is clipped with a CSS ellipsis on the .session-title
+   span (full title remains available in the tooltip). */
+.session-title-col {
+  width: 100%;
 }
 
-/* Active session rows — non-color cues supplementing the status color
-   (S4 a11y): 1) left border accent (3px transparent placeholder on the
-   base rule avoids layout shift), 2) glow ring bleeding right of the
-   accent, 3) radial background wash across the row. */
-.session-row td:first-child {
-  border-left: 3px solid transparent;
+.session-title-col .session-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary); /* readable title over muted metadata */
 }
 
-.session-row[data-active="true"] td:first-child {
-  border-left-color: var(--status-healthy);
-  box-shadow: 8px 0 16px -8px rgba(74, 222, 128, 0.45);
+/* Numeric cells (messages, tokens, cost) — tabular numerals (inherited from
+   tbody td and .num) plus right alignment for stable column alignment. */
+.session-row td:has(.num) {
+  text-align: right;
 }
 
-.session-row[data-active="true"] {
-  background-image: radial-gradient(ellipse 70% 100% at 0% 50%, rgba(74, 222, 128, 0.10), transparent 70%);
-}
-
-/* Badge pulse — additional non-color cue for active/running sessions.
-   Pulses ONLY the tinted background layer (not the whole badge) so badge
-   text stays at full opacity and the semantic color pair + text contrast
-   remain WCAG AA-compliant throughout the animation. */
-.badge-active  { animation: badge-pulse-active 2s ease-in-out infinite; }
+/* Badge pulse — additional non-color cue for RUNNING agent runs only.
+   Session badges are static compact outlined badges (Balanced Quiet Rows);
+   active session rows no longer pulse. */
 .badge-running { animation: badge-pulse-running 2s ease-in-out infinite; }
-
-@keyframes badge-pulse-active {
-  0%, 100% { background-color: rgba(74, 222, 128, 0.22); }
-  50%      { background-color: rgba(74, 222, 128, 0.10); }
-}
 
 @keyframes badge-pulse-running {
   0%, 100% { background-color: rgba(94, 242, 255, 0.22); }
@@ -1360,14 +1348,13 @@ td.clickable:hover {
     grid-template-columns: repeat(3, 1fr);
   }
 
-  .sidebar {
-    width: 160px;
-    padding: 14px 0;
-  }
-
-  .sidebar-item {
-    padding: 10px 14px;
-    font-size: 0.76rem;
+  /* Responsive Hybrid — tablet band (761–1024px): hide the low-priority
+     sessions columns (First Message, Duration, Messages, Tokens, marked
+     .sess-col-low in index.html/app.js) so client, title, recent activity,
+     cost, and status stay readable without horizontal scrolling. Above
+     1024px the complete Balanced Quiet Rows table is untouched. */
+  #sessions-table .sess-col-low {
+    display: none;
   }
 }
 
@@ -1486,37 +1473,17 @@ td.clickable:hover {
     flex-direction: column;
   }
 
-  .sidebar {
-    width: 100%;
-    flex-direction: row;
-    padding: 8px 0;
-    border-right: none;
-    border-bottom: 1px solid var(--glass-border);
+  .top-nav {
     overflow-x: auto;
   }
 
-  .sidebar-nav {
-    display: flex;
-    flex-direction: row;
-    gap: 4px;
-    padding: 0 12px;
-  }
-
-  .sidebar-item {
+  .top-nav-item {
     padding: 8px 14px;
     font-size: 0.74rem;
-    border-left: none;
-    border-bottom: 2px solid transparent;
-    border-radius: 8px 8px 0 0;
     flex-shrink: 0;
   }
 
-  .sidebar-item.active {
-    border-left-color: transparent;
-    border-bottom-color: var(--accent-cyan);
-  }
-
-  .sidebar-label {
+  .top-nav-label {
     font-size: 0.72rem;
   }
 
@@ -1547,14 +1514,69 @@ td.clickable:hover {
   .dr-custom-inputs {
     gap: 8px;
   }
+
+  /* Responsive Hybrid — phone band (≤760px): the sessions table becomes a
+     stacked card list so rows stay readable without horizontal desktop-table
+     scrolling. The header row is removed; each session row renders as a card
+     whose cells become label/value lines (label from the data-label hook
+     emitted by buildSessionRowHtml). Low-priority cells stay hidden from the
+     1024px rule above. */
+  #sessions-table thead {
+    display: none;
+  }
+
+  #sessions-table tr.session-row {
+    display: block;
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  #sessions-table tr.session-row td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    padding: 5px 0;
+    border: none;
+    white-space: normal;
+  }
+
+  #sessions-table tr.session-row td::before {
+    content: attr(data-label);
+    font-size: 0.62rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  /* Stacked rows are block-level now, so the keyboard focus ring moves to
+     an outline on the card (Firefox renders outlines on block elements) and
+     the per-cell inset shadow from the desktop rule is suppressed. The
+     !important wins the cascade over the reduced-motion inset ring rule
+     (which is !important too), preserving the single card outline under
+     prefers-reduced-motion. */
+  #sessions-table tr.session-row:focus-visible {
+    outline: 2px solid var(--accent-indigo);
+    outline-offset: 2px;
+  }
+
+  #sessions-table tr.session-row:focus-visible td {
+    box-shadow: none !important;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    ACCESSIBILITY: reduced motion (S4)
    Respects the OS/browser prefers-reduced-motion setting: collapses all
-   animation/transition motion. Static non-color cues (left border accent,
-   background wash) are intentionally retained so active sessions stay
-   distinguishable without motion.
+   animation/transition motion. Session rows (Balanced Quiet Rows) carry no
+   animated treatments — the badge is static, so only the agent-runs pulse
+   and the keyboard focus ring need handling here.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1567,21 +1589,25 @@ td.clickable:hover {
     scroll-behavior: auto !important;
   }
 
-  /* Disable badge pulse (sessions active + agent runs running) */
-  .badge-active,
+  /* Disable badge pulse (agent runs running) — session badges are static
+     compact outlined badges (Balanced Quiet Rows), no pulse to disable */
   .badge-running {
     animation: none !important;
   }
 
-  /* Disable the active-row glow ring; the border accent and background
-     wash remain (they are static, non-animated cues) */
-  .session-row[data-active="true"] td:first-child {
-    box-shadow: none !important;
+  /* Aurora drift — the gradient stays fully static under reduced motion */
+  .aurora-bg {
+    animation: none !important;
+  }
+
+  /* Live pulse — the status dot renders solid; state distinction is
+     retained by the dot color and the LIVE/STALE/ERROR label text */
+  .live-indicator::before {
+    animation: none !important;
   }
 
   /* Focus indicators are not motion — keep the keyboard focus ring visible
-     even when animations are disabled (overrides the glow-ring removal above). */
-  .session-row[data-active="true"]:focus-visible td:first-child,
+     even when animations are disabled. */
   .session-row:focus-visible td {
     box-shadow: inset 0 0 0 2px var(--accent-indigo) !important;
   }

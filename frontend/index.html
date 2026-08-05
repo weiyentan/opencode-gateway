@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="refresh-interval" content="30000">
   <title>Aurora Glass &mdash; OpenCode Gateway</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css?v=20260727-cache-control">
 </head>
 <body>
@@ -27,11 +24,11 @@
   </header>
 
   <div class="app-layout">
-    <!-- Sidebar Navigation -->
-    <nav class="sidebar" id="sidebar">
-      <ul class="sidebar-nav">
-        <li class="sidebar-item active" data-tab="overview">
-          <span class="sidebar-icon" aria-hidden="true">
+    <!-- Top Navigation -->
+    <nav class="top-nav" id="top-nav">
+      <ul class="top-nav-list">
+        <li class="top-nav-item active" data-tab="overview" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
               <rect x="4" y="4" width="6" height="6" rx="1.5"></rect>
               <rect x="14" y="4" width="6" height="6" rx="1.5"></rect>
@@ -39,26 +36,26 @@
               <rect x="14" y="14" width="6" height="6" rx="1.5"></rect>
             </svg>
           </span>
-          <span class="sidebar-label">Overview</span>
+          <span class="top-nav-label">Overview</span>
         </li>
-        <li class="sidebar-item" data-tab="sessions">
-          <span class="sidebar-icon" aria-hidden="true">
+        <li class="top-nav-item" data-tab="sessions" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
               <path d="M4 6h16M4 12h16M4 18h12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"></path>
             </svg>
           </span>
-          <span class="sidebar-label">Sessions</span>
+          <span class="top-nav-label">Sessions</span>
         </li>
-        <li class="sidebar-item" data-tab="agent-runs">
-          <span class="sidebar-icon" aria-hidden="true">
+        <li class="top-nav-item" data-tab="agent-runs" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
               <path d="M8 5.5v13l10-6.5z"></path>
             </svg>
           </span>
-          <span class="sidebar-label">Agent Runs</span>
+          <span class="top-nav-label">Agent Runs</span>
         </li>
-        <li class="sidebar-item" data-tab="clients-projects">
-          <span class="sidebar-icon" aria-hidden="true">
+        <li class="top-nav-item" data-tab="clients-projects" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
               <circle cx="7" cy="12" r="2.5"></circle>
               <circle cx="17" cy="7" r="2.5"></circle>
@@ -66,7 +63,7 @@
               <path d="M9.2 10.8 14.8 8.2M9.2 13.2l5.6 2.6"></path>
             </svg>
           </span>
-          <span class="sidebar-label">Clients / Projects</span>
+          <span class="top-nav-label">Clients / Projects</span>
         </li>
       </ul>
     </nav>
@@ -228,16 +225,16 @@
     <section class="glass-panel panel-sessions">
       <h2 class="panel-title">All Sessions</h2>
       <div class="table-scroll">
-        <table>
+        <table id="sessions-table">
           <thead>
             <tr>
               <th>Client</th>
-              <th>Session Title</th>
-              <th>First Message</th>
+              <th class="session-title-col">Session Title</th>
+              <th class="sess-col-low">First Message</th>
               <th>Last Message</th>
-              <th>Duration</th>
-              <th>Messages</th>
-              <th>Tokens</th>
+              <th class="sess-col-low">Duration</th>
+              <th class="sess-col-low">Messages</th>
+              <th class="sess-col-low">Tokens</th>
               <th>Cost</th>
               <th>Status</th>
             </tr>
