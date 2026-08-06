@@ -228,7 +228,7 @@ async def _fetch_aggregates(
         """
         async with timed_operation("db.query.aggregates.total", "db"):
             async with _db_timeout(
-                "db.query.usage.aggregates.total", db_timeout_seconds
+                "db.query.aggregates.total", db_timeout_seconds
             ):
                 row = await conn.fetchrow(sql, *query_params)
         return [
@@ -300,7 +300,7 @@ async def _fetch_aggregates(
     """
     async with timed_operation("db.query.aggregates.grouped", "db"):
         async with _db_timeout(
-            "db.query.usage.aggregates.grouped", db_timeout_seconds
+            "db.query.aggregates.grouped", db_timeout_seconds
         ):
             rows = await conn.fetch(sql, *query_params)
     return [
@@ -400,10 +400,11 @@ async def _fetch_records(
         JOIN observed_models om ON om.id = our.model_id
         WHERE {where_clause}
     """
-    async with _db_timeout(
-        "db.query.usage.records.count", db_timeout_seconds
-    ):
-        total = await conn.fetchval(count_sql, *query_params)
+    async with timed_operation("db.query.records.count", "db"):
+        async with _db_timeout(
+            "db.query.records.count", db_timeout_seconds
+        ):
+            total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
     order_col = "our.reported_at" if sort_by == "reported_at" else "our.ingested_at"
@@ -433,10 +434,11 @@ async def _fetch_records(
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
-    async with _db_timeout(
-        "db.query.usage.records.data", db_timeout_seconds
-    ):
-        rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with timed_operation("db.query.records.data", "db"):
+        async with _db_timeout(
+            "db.query.records.data", db_timeout_seconds
+        ):
+            rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         RecordRow(
@@ -522,7 +524,7 @@ async def _fetch_sessions(
     count_sql = f"SELECT COUNT(*) FROM sessions s WHERE {where_clause}"
     async with timed_operation("db.query.sessions.count", "db"):
         async with _db_timeout(
-            "db.query.usage.sessions.count", db_timeout_seconds
+            "db.query.sessions.count", db_timeout_seconds
         ):
             total = await conn.fetchval(count_sql, *query_params)
 
@@ -559,7 +561,7 @@ async def _fetch_sessions(
     """
     async with timed_operation("db.query.sessions.data", "db"):
         async with _db_timeout(
-            "db.query.usage.sessions.data", db_timeout_seconds
+            "db.query.sessions.data", db_timeout_seconds
         ):
             rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
@@ -1022,7 +1024,7 @@ async def _fetch_agent_runs(
     count_sql = f"SELECT COUNT(*) {count_from}"
     async with timed_operation("db.query.agent_runs.count", "db"):
         async with _db_timeout(
-            "db.query.usage.agent_runs.count", db_timeout_seconds
+            "db.query.agent_runs.count", db_timeout_seconds
         ):
             total = await conn.fetchval(count_sql, *params)
 
@@ -1044,7 +1046,7 @@ async def _fetch_agent_runs(
     """
     async with timed_operation("db.query.agent_runs.data", "db"):
         async with _db_timeout(
-            "db.query.usage.agent_runs.data", db_timeout_seconds
+            "db.query.agent_runs.data", db_timeout_seconds
         ):
             rows = await conn.fetch(data_sql, *params, limit, offset)
 
@@ -1129,7 +1131,7 @@ async def _fetch_agent_run_detail(
     # ── Fetch session + context + parent_internal_id (merged) ───────
     async with timed_operation("db.query.agent_run_detail.session", "db"):
         async with _db_timeout(
-            "db.query.usage.agent_run_detail.session", db_timeout_seconds
+            "db.query.agent_run_detail.session", db_timeout_seconds
         ):
             session_row = await conn.fetchrow(
                 """SELECT
@@ -1187,7 +1189,7 @@ async def _fetch_agent_run_detail(
     # ── Fetch child sessions ─────────────────────────────────────────
     async with timed_operation("db.query.agent_run_detail.children", "db"):
         async with _db_timeout(
-            "db.query.usage.agent_run_detail.children", db_timeout_seconds
+            "db.query.agent_run_detail.children", db_timeout_seconds
         ):
             child_rows = await conn.fetch(
                 """SELECT
@@ -1231,7 +1233,7 @@ async def _fetch_agent_run_detail(
     # ── Fetch todo snapshots ──────────────────────────────────────
     async with timed_operation("db.query.agent_run_detail.todos", "db"):
         async with _db_timeout(
-            "db.query.usage.agent_run_detail.todos", db_timeout_seconds
+            "db.query.agent_run_detail.todos", db_timeout_seconds
         ):
             todo_rows_raw = await conn.fetch(
                 """SELECT content, status, priority, position
@@ -1561,10 +1563,11 @@ async def _fetch_records_with_context(
         {_RWC_SESSION_JOIN}
         WHERE {where_clause}
     """
-    async with _db_timeout(
-        "db.query.usage.records_with_context.count", db_timeout_seconds
-    ):
-        total = await conn.fetchval(count_sql, *query_params)
+    async with timed_operation("db.query.records_with_context.count", "db"):
+        async with _db_timeout(
+            "db.query.records_with_context.count", db_timeout_seconds
+        ):
+            total = await conn.fetchval(count_sql, *query_params)
 
     # ── Data query ──────────────────────────────────────────────────
     data_sql = f"""
@@ -1599,10 +1602,11 @@ async def _fetch_records_with_context(
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
-    async with _db_timeout(
-        "db.query.usage.records_with_context.data", db_timeout_seconds
-    ):
-        rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with timed_operation("db.query.records_with_context.data", "db"):
+        async with _db_timeout(
+            "db.query.records_with_context.data", db_timeout_seconds
+        ):
+            rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         RecordWithContextRow(
@@ -1730,10 +1734,11 @@ async def _fetch_records_with_context_grouped(
         GROUP BY {group_expr}
         ORDER BY group_value
     """
-    async with _db_timeout(
-        "db.query.usage.records_with_context.grouped", db_timeout_seconds
-    ):
-        rows = await conn.fetch(sql, *query_params)
+    async with timed_operation("db.query.records_with_context.grouped", "db"):
+        async with _db_timeout(
+            "db.query.records_with_context.grouped", db_timeout_seconds
+        ):
+            rows = await conn.fetch(sql, *query_params)
 
     return [
         RecordWithContextGroupedRow(

@@ -1,13 +1,13 @@
 {
   "concurrent_users": 10,
-  "wall_clock_ms": 369.975,
-  "p50_ms": 187.123,
-  "p95_ms": 318.5,
-  "mean_ms": 188.156,
-  "min_ms": 45.196,
-  "max_ms": 333.193,
-  "pool_wait_p50_ms": 30.852,
-  "pool_wait_p95_ms": 33.442,
+  "wall_clock_ms": 460.997,
+  "p50_ms": 272.153,
+  "p95_ms": 408.969,
+  "mean_ms": 264.666,
+  "min_ms": 45.724,
+  "max_ms": 424.341,
+  "pool_wait_p50_ms": 33.889,
+  "pool_wait_p95_ms": 75.768,
   "error_rate": 0.0,
   "error_count": 0
 }

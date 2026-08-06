@@ -118,6 +118,7 @@ def create_app(
 
     from app.core.envelope import (
         http_exception_handler,
+        timeout_exception_handler,
         validation_exception_handler,
     )
 
@@ -127,6 +128,17 @@ def create_app(
     # more-specific handler must come first.
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
+
+    # ── Timeout handler ──────────────────────────────────────────────
+    # _request_timeout / _db_timeout raise TimeoutError on expiry.  On
+    # Python >= 3.11 the built-in TimeoutError and asyncio.TimeoutError
+    # are the same class, so only one registration is needed.  On 3.9 /
+    # 3.10 the backport raises the built-in TimeoutError; the
+    # asyncio.TimeoutError registration is a no-op guard in case
+    # anything else raises it.
+    import asyncio
+    app.add_exception_handler(TimeoutError, timeout_exception_handler)
+    app.add_exception_handler(asyncio.TimeoutError, timeout_exception_handler)
 
     from app.api.admin_clients import router as admin_clients_router
     from app.api.cursor import router as cursor_router

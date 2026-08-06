@@ -293,3 +293,84 @@ class TestMiddlewareRegistration:
         assert record.endpoint == "/health"
         assert record.status_code == 200
         assert record.correlation_id == response.headers["X-Correlation-ID"]
+
+
+class TestTimeoutExceptionHandler:
+    """Validate that request timeout expiry returns 504 (not 500)."""
+
+    @staticmethod
+    def _build_app_with_timeout_route() -> Any:
+        from fastapi import FastAPI
+
+        from app.core.envelope import timeout_exception_handler
+
+        app = FastAPI()
+        app.add_exception_handler(TimeoutError, timeout_exception_handler)
+
+        @app.get("/timeout")
+        async def timeout_endpoint() -> None:
+            raise TimeoutError()
+
+        @app.get("/healthz")
+        async def healthz() -> dict[str, str]:
+            return {"status": "ok"}
+
+        app.add_middleware(RequestTimingMiddleware)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_504_with_json_body(self, caplog) -> None:
+        """TimeoutError propagated from an endpoint returns 504 Gateway Timeout."""
+        caplog.set_level(logging.INFO, logger=_TELEMETRY_LOGGER)
+
+        app = self._build_app_with_timeout_route()
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/timeout")
+
+        assert response.status_code == 504
+        body = response.json()
+        assert body["status"] == "error"
+        assert body["error"]["code"] == "GATEWAY_TIMEOUT"
+        assert "time budget" in body["error"]["message"]
+
+        # The request.completed log should still be emitted (by the middleware)
+        # and the operation.timeout log is already emitted by the timeout
+        # machinery before the exception propagates — we verify the
+        # middleware still fires.
+        request_logs = [r for r in _records(caplog) if r.getMessage() == EVENT_REQUEST_COMPLETED]
+        assert len(request_logs) == 1
+        assert request_logs[0].status_code == 504
+        assert request_logs[0].endpoint == "/timeout"
+
+    @pytest.mark.asyncio
+    async def test_health_endpoint_unaffected(self, caplog) -> None:
+        """The timeout handler does NOT affect the health endpoint."""
+        caplog.set_level(logging.INFO, logger=_TELEMETRY_LOGGER)
+
+        app = self._build_app_with_timeout_route()
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/healthz")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_swallow_operation_timeout_log(self, caplog) -> None:
+        """The handler returns 504; the telemetry log is still emitted (tested
+        via the request.completed log from the middleware, which fires after
+        the exception handler returns)."""
+        caplog.set_level(logging.INFO, logger=_TELEMETRY_LOGGER)
+
+        app = self._build_app_with_timeout_route()
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/timeout")
+
+        assert response.status_code == 504
+        # Middleware's request.completed log confirms the exception path
+        # didn't skip the logging pipeline.
+        request_logs = [r for r in _records(caplog) if r.getMessage() == EVENT_REQUEST_COMPLETED]
+        assert len(request_logs) >= 1
+        assert request_logs[0].status_code == 504

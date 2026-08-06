@@ -192,6 +192,15 @@ class _TelemetryCapture:
                 total += getattr(rec, "duration_ms", 0.0)
         return round(total, 3)
 
+    def count_by_prefix(self, prefix: str) -> int:
+        """Count events whose ``event_name`` starts with *prefix*."""
+        return sum(
+            1
+            for rec in self._records
+            if isinstance(getattr(rec, "event_name", ""), str)
+            and getattr(rec, "event_name", "").startswith(prefix)
+        )
+
     @property
     def event_count(self) -> int:
         return len(self._records)
@@ -603,6 +612,57 @@ class TestSyntheticSingleSession:
                 assert r["query_count"] > 0, f"{label}: zero queries"
 
     @pytest.mark.asyncio
+    async def test_db_operations_emit_exactly_one_completed_event_per_query(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Each DB query wrapped in timed_operation emits exactly one event.
+
+        The ``operation.completed`` event is emitted once per query by
+        ``timed_operation``, and the nested ``timeout_operation`` wrapper
+        emits nothing on success.  The measured ``duration_ms`` includes
+        sub-millisecond ``timeout_operation`` wrapper overhead.
+        Single-counting is guaranteed by design — there is one
+        ``timed_operation`` context manager per query, and it emits its
+        event exactly once in its ``finally`` block.
+        """
+        from collections import Counter
+
+        # Representative endpoint: records (2 queries: count + data)
+        label = "records"
+        method, path, params = ("GET", "/api/v1/usage/records",
+                                {"start_date": "2025-07-01T00:00:00Z",
+                                 "end_date": "2025-07-31T23:59:59Z",
+                                 "limit": "10"})
+
+        with _TelemetryCapture() as telemetry:
+            async with client as c:
+                await _measure_endpoint(
+                    c, mock_conn, method, path, label, params, telemetry=telemetry,
+                )
+
+        # Filter to only db.* events
+        db_event_names = [
+            getattr(r, "event_name", "")
+            for r in telemetry._records
+            if isinstance(getattr(r, "event_name", ""), str)
+            and getattr(r, "event_name", "").startswith("db.")
+        ]
+
+        # Each distinct event name must appear exactly once
+        name_counts = Counter(db_event_names)
+        duplicates = [n for n, c in name_counts.items() if c > 1]
+        assert not duplicates, (
+            f"Duplicate operation.completed events detected: {duplicates}. "
+            f"All names: {db_event_names}"
+        )
+
+        # Must have at least db.query.records.count and db.query.records.data
+        assert len(db_event_names) >= 2, (
+            f"Expected >=2 db.* operation.completed events, got {len(db_event_names)}: "
+            f"{db_event_names}"
+        )
+
+    @pytest.mark.asyncio
     async def test_synthetic_concurrent_users(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
@@ -670,9 +730,36 @@ class TestSyntheticSingleSession:
             "error_rate": round(error_rate, 4),
             "error_count": len(errors),
         }
-        _load_or_commit_baseline(
+        baseline = _load_or_commit_baseline(
             _BASELINE_DIR / "concurrent_baseline.json", concurrent_data
         )
+
+        # If baseline exists, assert no regression
+        if baseline is not None:
+            regressions = []
+            wall_clock_threshold = baseline["wall_clock_ms"] * _REGRESSION_FACTOR
+            if wall_clock_ms > wall_clock_threshold:
+                regressions.append(
+                    f"  wall_clock: {round(wall_clock_ms, 3)}ms > "
+                    f"{round(wall_clock_threshold, 3)}ms "
+                    f"(baseline {baseline['wall_clock_ms']}ms × {_REGRESSION_FACTOR})"
+                )
+            current_p95 = _p95(durations)
+            p95_threshold = baseline["p95_ms"] * _REGRESSION_FACTOR
+            if current_p95 > p95_threshold:
+                regressions.append(
+                    f"  p95: {round(current_p95, 3)}ms > "
+                    f"{round(p95_threshold, 3)}ms "
+                    f"(baseline {baseline['p95_ms']}ms × {_REGRESSION_FACTOR})"
+                )
+            if regressions:
+                msg = (
+                    "Performance regression detected in concurrent-user scenario:\n"
+                    + "\n".join(regressions)
+                    + "\n\nCurrent results:\n"
+                    + json.dumps(concurrent_data, indent=2)
+                )
+                pytest.fail(msg)
 
     @pytest.mark.asyncio
     async def test_synthetic_dashboard_wall_clock(
@@ -727,9 +814,35 @@ class TestSyntheticSingleSession:
             "refresh_error_count": len(refresh_errors),
             "endpoints": [r["endpoint"] for r in initial_results],
         }
-        _load_or_commit_baseline(
+        baseline = _load_or_commit_baseline(
             _BASELINE_DIR / "dashboard_wall_clock_baseline.json", dashboard_data
         )
+
+        # If baseline exists, assert no regression
+        if baseline is not None:
+            regressions = []
+            initial_threshold = baseline["initial_load_ms"] * _REGRESSION_FACTOR
+            if initial_wall_clock_ms > initial_threshold:
+                regressions.append(
+                    f"  initial_load: {round(initial_wall_clock_ms, 3)}ms > "
+                    f"{round(initial_threshold, 3)}ms "
+                    f"(baseline {baseline['initial_load_ms']}ms × {_REGRESSION_FACTOR})"
+                )
+            refresh_threshold = baseline["refresh_load_ms"] * _REGRESSION_FACTOR
+            if refresh_wall_clock_ms > refresh_threshold:
+                regressions.append(
+                    f"  refresh_load: {round(refresh_wall_clock_ms, 3)}ms > "
+                    f"{round(refresh_threshold, 3)}ms "
+                    f"(baseline {baseline['refresh_load_ms']}ms × {_REGRESSION_FACTOR})"
+                )
+            if regressions:
+                msg = (
+                    "Performance regression detected in dashboard wall-clock scenario:\n"
+                    + "\n".join(regressions)
+                    + "\n\nCurrent results:\n"
+                    + json.dumps(dashboard_data, indent=2)
+                )
+                pytest.fail(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
