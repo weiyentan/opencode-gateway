@@ -38,6 +38,7 @@
     dashboard:      document.querySelector('.dashboard'),
     liveIndicator:  $('live-indicator'),
     timestamp:      $('timestamp'),
+    lastRefreshed:  $('last-refreshed'),
     dbStatus:       $('db-status'),
     versionFooter:  $('footer-version'),
 
@@ -102,6 +103,36 @@
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+
+  // ── Panel freshness state (issue #357) ────────────────────────────────
+  // Per-panel freshness map: panelId → { status: 'ok'|'refreshing'|'stale',
+  // updatedAt }.  Maintained by refreshDashboard() (and applyFilters() for
+  // the agent-runs panel) and consumed by each panel render through the
+  // pure helpers below (computePanelFreshness / shouldRenderPanel).  A panel
+  // whose fetch failed resolves to 'stale' and its render function skips the
+  // re-render, so the previous successful data stays on screen.
+  //
+  // lastRefreshedAt records the time of the last COMPLETED refresh cycle.
+  // It is module-level and exposed via getLastRefreshedAt() so follow-up
+  // work (issue #358 — KPI label clarification) can reuse it; the header
+  // "Last refreshed HH:MM:SS" clock consumes it via updateLastRefreshed().
+  let panelStates = {};
+  let lastRefreshedAt = null;
+
+  // Which fetch endpoint keys feed each panel — used to resolve a panel to
+  // 'stale' when any of its endpoints failed in the current refresh cycle.
+  // 'agentRuns' maps to the agentRunsFetchError channel (fetched separately).
+  const PANEL_ENDPOINTS = {
+    kpi:             ['health', 'aggTotal', 'sessions'],
+    'model-mix':     ['aggByModel'],
+    events:          ['health', 'sessions'],
+    'collector-dist': ['health'],
+    collectors:      ['health'],
+    agents:          ['aggByModel', 'health'],
+    sessions:        ['sessions'],
+    'agent-runs':    ['agentRuns'],
+    'client-project': ['aggClientProject'],
+  };
 
   // ── Client metadata cache ─────────────────────────────────────────────
   // The client_id → name map changes rarely but costs one HTTP round trip
@@ -512,6 +543,91 @@
     return '--';
   }
 
+  // ── Panel freshness (pure helpers — no DOM) ───────────────────────────
+  // Freshness state model (issue #357): refreshDashboard() maintains a
+  // per-panel state map (panelStates: panelId → { status, updatedAt }) and
+  // each panel render consumes it through these helpers.  status is one of
+  //   'refreshing' — a refresh cycle is in flight for this panel
+  //   'ok'         — last fetch succeeded; updatedAt = completion time
+  //   'stale'      — last fetch failed; the panel keeps showing previous data
+  // These functions are pure so the Node test harness can exercise the full
+  // refreshing/updated/stale lifecycle through the vm-sandbox exports.
+
+  /** Format "Updated Xm ago" text from a panel's last successful update time.
+   *  @param {number|null} updatedAtMs  epoch ms of the last successful update
+   *  @param {number}      nowMs        epoch ms reference time
+   *  @returns {string|null} "just now" (<60s), "Nm ago" (<60m), "Nh ago" (<24h),
+   *                         "Nd ago", or null when updatedAtMs is absent
+   *                         (panel never updated).  Future timestamps clamp to
+   *                         "just now" instead of rendering a negative age. */
+  function formatUpdatedAgo(updatedAtMs, nowMs) {
+    if (updatedAtMs == null) return null;
+    var diffMs = Math.max(0, nowMs - updatedAtMs);
+    var mins = Math.floor(diffMs / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + 'm ago';
+    var hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    return Math.floor(hrs / 24) + 'd ago';
+  }
+
+  /** Compute a panel's freshness descriptor from the per-panel state map.
+   *  @param {Object}   panelStates panelId → { status, updatedAt }
+   *  @param {string}   panelId     e.g. 'model-mix'
+   *  @param {number}   nowMs       epoch ms reference time
+   *  @returns {{status: string, label: string, cssClass: string}|null}
+   *    refreshing → { label: 'Refreshing…', cssClass: 'freshness-refreshing' }
+   *    stale      → { label: 'Showing previous data', cssClass: 'freshness-stale' }
+   *    ok         → { label: 'Updated ' + formatUpdatedAgo(...) }
+   *    unknown/idle panel → null (render nothing) */
+  function computePanelFreshness(panelStates, panelId, nowMs) {
+    var st = panelStates && panelStates[panelId];
+    if (!st) return null;
+    if (st.status === 'refreshing') {
+      return { status: 'refreshing', label: 'Refreshing\u2026', cssClass: 'freshness-refreshing' };
+    }
+    if (st.status === 'stale') {
+      return { status: 'stale', label: 'Showing previous data', cssClass: 'freshness-stale' };
+    }
+    return {
+      status: 'ok',
+      label: 'Updated ' + (formatUpdatedAgo(st.updatedAt, nowMs) || '--'),
+      cssClass: ''
+    };
+  }
+
+  /** Whether a panel render should repaint its content.
+   *  A 'stale' panel (failed fetch) returns false so the render function
+   *  keeps the previous successful data on screen and only the freshness
+   *  label ("Showing previous data") is swapped in. */
+  function shouldRenderPanel(panelStates, panelId) {
+    var st = panelStates && panelStates[panelId];
+    return !(st && st.status === 'stale');
+  }
+
+  /** Resolve every panel's post-fetch status from the current endpoint errors.
+   *  @param {Object} endpointErrors fetch-error map keyed by endpoint key
+   *                                 ('agentRuns' for the agent-runs channel)
+   *  @returns {Object} panelId → 'ok' | 'stale' */
+  function resolvePanelStatuses(endpointErrors) {
+    var out = {};
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var failed = PANEL_ENDPOINTS[panelId].some(function (key) {
+        return !!endpointErrors[key];
+      });
+      out[panelId] = failed ? 'stale' : 'ok';
+    });
+    return out;
+  }
+
+  /** Format a Date as a compact HH:MM:SS clock for the header
+   *  "Last refreshed" timestamp (matches the dashboard's 24h header style). */
+  function formatClockTime(d) {
+    return d.toLocaleString('en-US', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+  }
+
   // ── API Fetch (with envelope unwrapping) ──────────────────────────────
 
   async function apiFetch(path) {
@@ -678,6 +794,9 @@
 
   /** KPI Row */
   function renderKPIs(data) {
+    applyPanelFreshness('kpi');
+    if (!shouldRenderPanel(panelStates, 'kpi')) return; // failed fetch → keep previous values
+
     // Compute range label once for all KPI subtitles
     var rangeLabel = '--';
     if (data._dateRange) {
@@ -716,6 +835,9 @@
 
   /** Model Mix — horizontal bar chart */
   function renderModelMix(data) {
+    applyPanelFreshness('model-mix');
+    if (!shouldRenderPanel(panelStates, 'model-mix')) return; // failed fetch → keep previous chart
+
     var models = data.aggByModel || [];
     if (models.length === 0) {
       els.modelMixChart.innerHTML = '<p class="empty-state">No model data available' + errorIndicator('aggByModel') + '</p>';
@@ -753,6 +875,9 @@
 
   /** Operational Events Feed */
   function renderLiveEvents(data) {
+    applyPanelFreshness('events');
+    if (!shouldRenderPanel(panelStates, 'events')) return; // failed fetch → keep previous events
+
     var events = [];
     var now = new Date().toISOString();
 
@@ -866,6 +991,9 @@
 
   /** Collector Distribution — health bar per collector */
   function renderCollectorDistribution(data) {
+    applyPanelFreshness('collector-dist');
+    if (!shouldRenderPanel(panelStates, 'collector-dist')) return; // failed fetch → keep previous bars
+
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
       els.collectorDist.innerHTML = '<p class="empty-state">No collectors registered' + errorIndicator('health') + '</p>';
       return;
@@ -897,6 +1025,9 @@
 
   /** Collectors Table */
   function renderCollectorsTable(data) {
+    applyPanelFreshness('collectors');
+    if (!shouldRenderPanel(panelStates, 'collectors')) return; // failed fetch → keep previous rows
+
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
       els.collectorsTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No collectors' + errorIndicator('health') + '</td></tr>';
       return;
@@ -918,6 +1049,9 @@
 
   /** Agents & LLMs In Use */
   function renderAgentsTable(data) {
+    applyPanelFreshness('agents');
+    if (!shouldRenderPanel(panelStates, 'agents')) return; // failed fetch → keep previous rows
+
     if (!data.aggByModel || data.aggByModel.length === 0) {
       els.agentsTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No agent data' + errorIndicator('aggByModel') + '</td></tr>';
       return;
@@ -987,6 +1121,9 @@
 
   /** Recent Sessions */
   function renderSessionsTable(data) {
+    applyPanelFreshness('sessions');
+    if (!shouldRenderPanel(panelStates, 'sessions')) return; // failed fetch → keep previous rows
+
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
       els.sessionsTbody.innerHTML = '<tr><td colspan="9" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
       return;
@@ -1020,6 +1157,9 @@
 
   /** Agent Runs Table */
   function renderAgentRunsTable(data) {
+    applyPanelFreshness('agent-runs');
+    if (!shouldRenderPanel(panelStates, 'agent-runs')) return; // failed fetch → keep previous rows
+
     var runs = data && data.items;
     if (!runs || runs.length === 0) {
       var errSuffix = agentRunsFetchError
@@ -1065,6 +1205,9 @@
 
   /** Render Client/Project Usage Breakdown two-level expandable table */
   function renderClientProjectBreakdown(data) {
+    applyPanelFreshness('client-project');
+    if (!shouldRenderPanel(panelStates, 'client-project')) return; // failed fetch → keep previous rows
+
     var rows = data && data.aggClientProject || [];
 
     // Update panel subtitle with formatted range label
@@ -1489,12 +1632,72 @@
     return '';
   }
 
+  // ── Panel freshness (DOM wiring) ──────────────────────────────────────
+  // Each instrumented panel carries a <span class="panel-freshness"
+  // id="freshness-<panelId>"> in its title row (index.html).  The label is
+  // small muted text rendered in the title's existing flex row, so it never
+  // changes panel layout — no spinners, no overlays, no reflow.
+
+  /** Render a panel's freshness label into its header span. */
+  function applyPanelFreshness(panelId) {
+    var el = document.getElementById('freshness-' + panelId);
+    if (!el) return;
+    var f = computePanelFreshness(panelStates, panelId, Date.now());
+    if (!f) {
+      el.textContent = '';
+      el.className = 'panel-freshness';
+      return;
+    }
+    el.textContent = f.label;
+    el.className = 'panel-freshness ' + f.cssClass;
+  }
+
+  /** Record a panel state and repaint its freshness label. */
+  function setPanelState(panelId, status, updatedAt) {
+    panelStates[panelId] = { status: status, updatedAt: updatedAt };
+    applyPanelFreshness(panelId);
+  }
+
+  /** Mark every panel 'refreshing' at the start of a refresh cycle. */
+  function markAllPanelsRefreshing() {
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var prev = panelStates[panelId];
+      setPanelState(panelId, 'refreshing', prev ? prev.updatedAt : null);
+    });
+  }
+
+  /** Resolve every panel to 'ok'/'stale' from the cycle's fetch errors.
+   *  A failed panel keeps its previous updatedAt (data on screen is the
+   *  previous successful render); a successful one records the cycle time. */
+  function resolvePanelStatesAfterFetch() {
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError });
+    var statuses = resolvePanelStatuses(errors);
+    var nowMs = Date.now();
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var prev = panelStates[panelId];
+      if (statuses[panelId] === 'stale') {
+        setPanelState(panelId, 'stale', prev ? prev.updatedAt : null);
+      } else {
+        setPanelState(panelId, 'ok', nowMs);
+      }
+    });
+  }
+
+  /** Repaint the header "Last refreshed HH:MM:SS" clock. */
+  function updateLastRefreshed() {
+    if (!els.lastRefreshed) return;
+    els.lastRefreshed.textContent =
+      'Last refreshed ' + (lastRefreshedAt ? formatClockTime(lastRefreshedAt) : '--');
+  }
+
   // ── Orchestration ─────────────────────────────────────────────────────
 
   async function refreshDashboard() {
     try {
       if (els.dashboard) els.dashboard.classList.add('refreshing');
+      markAllPanelsRefreshing(); // "Refreshing…" on every panel while the cycle is in flight
       var data = await fetchAll();
+      resolvePanelStatesAfterFetch(); // per-panel ok/stale from this cycle's fetch errors
       renderHeader(data);
       renderKPIs(data);
       renderModelMix(data);
@@ -1510,6 +1713,11 @@
       showError('Dashboard refresh error: ' + e.message);
     } finally {
       if (els.dashboard) els.dashboard.classList.remove('refreshing');
+      // The cycle completed (successfully or not) — record its completion
+      // time for the header clock.  lastRefreshedAt is exposed via
+      // getLastRefreshedAt() for reuse by follow-up work (issue #358).
+      lastRefreshedAt = new Date();
+      updateLastRefreshed();
     }
   }
 
@@ -1534,15 +1742,21 @@
 
   function applyFilters() {
     agentRunFilters = readFiltersFromUI();
+    // Track the agent-runs panel freshness for this independent fetch
+    var prev = panelStates['agent-runs'];
+    setPanelState('agent-runs', 'refreshing', prev ? prev.updatedAt : null);
     // Re-fetch agent runs with new filters, update table
     var url = buildAgentRunsUrl();
     apiFetch(url).then(function (data) {
       agentRunsData = data;
       agentRunsFetchError = null;
+      setPanelState('agent-runs', 'ok', Date.now());
       renderAgentRunsTable(data);
     }).catch(function (e) {
       agentRunsFetchError = e.message || 'Agent runs query failed';
-      renderAgentRunsTable(null);
+      var prevState = panelStates['agent-runs'];
+      setPanelState('agent-runs', 'stale', prevState ? prevState.updatedAt : null);
+      renderAgentRunsTable(null); // keeps previous rows; label shows "Showing previous data"
       console.error('Agent runs filter fetch error:', e);
     });
   }
@@ -1723,5 +1937,13 @@
   window.ensureClientName = ensureClientName;
   window.refreshClientCache = refreshClientCache;
   window.invalidateClientCache = invalidateClientCache;
+  window.formatUpdatedAgo = formatUpdatedAgo;
+  window.computePanelFreshness = computePanelFreshness;
+  window.shouldRenderPanel = shouldRenderPanel;
+  window.resolvePanelStatuses = resolvePanelStatuses;
+  window.formatClockTime = formatClockTime;
+  // Read-only accessor for the last COMPLETED refresh cycle time — reusable
+  // by follow-up work (issue #358) without reaching into module state.
+  window.getLastRefreshedAt = function () { return lastRefreshedAt; };
 
 })();

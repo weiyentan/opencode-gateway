@@ -257,6 +257,14 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Header "Last refreshed HH:MM:SS" clock — time of the last completed
+   refresh cycle, updated by refreshDashboard (issue #357) */
+.last-refreshed {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .db-status {
   font-size: 0.72rem;
   padding: 3px 10px;
@@ -418,6 +426,7 @@ body {
   grid-template-columns: repeat(5, 1fr);
   gap: 16px;
   margin-bottom: 24px;
+  position: relative; /* anchor for the row's freshness label */
 }
 
 .kpi-card {
@@ -621,6 +630,43 @@ body {
 .event-badge.empty {
   background: rgba(148, 163, 184, 0.12);
   color: var(--text-muted);
+}
+
+/* ── Panel freshness indicators (issue #357) ────────────────────────────
+   Subtle per-panel labels (Refreshing… / Updated Xm ago / Showing previous
+   data) rendered in the panel title row.  The span sits inside the title's
+   existing flex row and is pushed to the right edge with margin-left:auto,
+   so the label never changes the panel's layout — no spinners, no overlays,
+   no reflow.  Empty labels are display:none. */
+.panel-freshness {
+  margin-left: auto;
+  font-size: 0.68rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.panel-freshness:empty {
+  display: none;
+}
+
+.panel-freshness.freshness-refreshing {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.panel-freshness.freshness-stale {
+  color: var(--status-stale);
+}
+
+/* The KPI row has no title row, so its label is pinned to the top-right
+   corner of the row (absolute → takes no space, zero layout shift). */
+.kpi-row .panel-freshness {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  margin-left: 0;
 }
 
 /* ── Model Mix Chart ──────────────────────────────────────────────────── */

@@ -72,6 +72,12 @@ var appJsSandbox = null;
   window.ensureClientName = sandboxWindow.ensureClientName;
   window.refreshClientCache = sandboxWindow.refreshClientCache;
   window.invalidateClientCache = sandboxWindow.invalidateClientCache;
+  window.formatUpdatedAgo = sandboxWindow.formatUpdatedAgo;
+  window.computePanelFreshness = sandboxWindow.computePanelFreshness;
+  window.shouldRenderPanel = sandboxWindow.shouldRenderPanel;
+  window.resolvePanelStatuses = sandboxWindow.resolvePanelStatuses;
+  window.formatClockTime = sandboxWindow.formatClockTime;
+  window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1478,6 +1484,120 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
   }, 10);
 })();
 
+// ── Panel freshness states (issue #357) ─────────────────────────────────
+// The freshness logic lives in pure helpers in app.js (formatUpdatedAgo,
+// computePanelFreshness, shouldRenderPanel, resolvePanelStatuses) that are
+// exercised here through the vm-sandbox exports — the same production code
+// the dashboard runs.  refreshDashboard maintains the per-panel state map
+// (panelId → { status: 'ok'|'refreshing'|'stale', updatedAt }) and each
+// panel render consumes it via these helpers.
+
+console.log('\u25B6 formatUpdatedAgo');
+
+(function () {
+  var now = 1000000;
+  assert(window.formatUpdatedAgo(now, now) === 'just now', 'zero elapsed \u2192 just now');
+  assert(window.formatUpdatedAgo(now, now + 59000) === 'just now', '59s elapsed \u2192 just now');
+  assert(window.formatUpdatedAgo(now, now + 60000) === '1m ago', '60s elapsed \u2192 1m ago');
+  assert(window.formatUpdatedAgo(now, now + 120000) === '2m ago', '2m elapsed \u2192 2m ago');
+  assert(window.formatUpdatedAgo(now, now + 59 * 60000) === '59m ago', '59m elapsed \u2192 59m ago');
+  assert(window.formatUpdatedAgo(now, now + 60 * 60000) === '1h ago', '1h elapsed \u2192 1h ago');
+  assert(window.formatUpdatedAgo(now, now + 23 * 3600000) === '23h ago', '23h elapsed \u2192 23h ago');
+  assert(window.formatUpdatedAgo(now, now + 24 * 3600000) === '1d ago', '24h elapsed \u2192 1d ago');
+  assert(window.formatUpdatedAgo(now, now + 3 * 24 * 3600000) === '3d ago', '3d elapsed \u2192 3d ago');
+  assert(window.formatUpdatedAgo(null, now) === null, 'null timestamp \u2192 null (never updated)');
+  assert(window.formatUpdatedAgo(undefined, now) === null, 'undefined timestamp \u2192 null (never updated)');
+  // Future timestamps clamp to "just now" rather than rendering a negative age
+  assert(window.formatUpdatedAgo(now + 5000, now) === 'just now', 'future timestamp clamps to just now');
+})();
+
+console.log('\u25B6 computePanelFreshness');
+
+(function () {
+  var now = 1000000;
+  assert(window.computePanelFreshness({}, 'kpi', now) === null, 'unknown panel \u2192 null (nothing rendered)');
+  assert(window.computePanelFreshness(null, 'kpi', now) === null, 'missing state map \u2192 null');
+
+  var f = window.computePanelFreshness({ 'model-mix': { status: 'refreshing', updatedAt: 500000 } }, 'model-mix', now);
+  assert(f && f.status === 'refreshing' && f.label === 'Refreshing\u2026',
+    'refreshing state shows "Refreshing\u2026" while the panel update is in flight');
+
+  var g = window.computePanelFreshness({ kpi: { status: 'stale', updatedAt: 500000 } }, 'kpi', now);
+  assert(g && g.status === 'stale' && g.label === 'Showing previous data',
+    'stale state shows "Showing previous data" warning');
+
+  var h = window.computePanelFreshness({ events: { status: 'ok', updatedAt: now - 120000 } }, 'events', now);
+  assert(h && h.status === 'ok' && h.label === 'Updated 2m ago', 'ok state renders "Updated 2m ago"');
+
+  var i = window.computePanelFreshness({ sessions: { status: 'ok', updatedAt: now } }, 'sessions', now);
+  assert(i && i.label === 'Updated just now', 'ok state renders "Updated just now" for a fresh update');
+
+  var j = window.computePanelFreshness({ kpi: { status: 'ok', updatedAt: null } }, 'kpi', now);
+  assert(j && j.label === 'Updated --', 'ok state without a timestamp falls back to "Updated --"');
+})();
+
+console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)');
+
+(function () {
+  // No endpoint errors → every panel resolves to 'ok'
+  var allOk = window.resolvePanelStatuses({});
+  ['kpi', 'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'sessions', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
+    });
+
+  // A failed endpoint stales exactly the panels that consume it
+  var modelMixFailed = window.resolvePanelStatuses({ aggByModel: 'boom' });
+  assert(modelMixFailed['model-mix'] === 'stale' && modelMixFailed.agents === 'stale',
+    'aggByModel failure: model-mix and agents go stale');
+  assert(modelMixFailed.kpi === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed.sessions === 'ok',
+    'aggByModel failure: unrelated panels stay ok');
+
+  var healthFailed = window.resolvePanelStatuses({ health: 'down' });
+  assert(healthFailed.kpi === 'stale' && healthFailed.events === 'stale' &&
+         healthFailed['collector-dist'] === 'stale' && healthFailed.collectors === 'stale' &&
+         healthFailed.agents === 'stale',
+    'health failure: every health-fed panel goes stale');
+  assert(healthFailed.sessions === 'ok', 'health failure: sessions panel stays ok');
+
+  var agentRunsFailed = window.resolvePanelStatuses({ agentRuns: 'boom' });
+  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed.kpi === 'ok',
+    'agentRuns failure: only the agent-runs panel goes stale');
+
+  // Failed panel retains its previous data: the state map keeps the old
+  // updatedAt, shouldRenderPanel refuses the re-render, and the label flips
+  // to the "Showing previous data" warning.
+  var states = { 'model-mix': { status: 'ok', updatedAt: 500000 } };
+  states['model-mix'] = {
+    status: window.resolvePanelStatuses({ aggByModel: 'boom' })['model-mix'],
+    updatedAt: states['model-mix'].updatedAt // previous successful update time survives the failure
+  };
+  assert(window.shouldRenderPanel(states, 'model-mix') === false,
+    'failed panel skips re-render \u2192 previous successful data is retained');
+  assert(window.computePanelFreshness(states, 'model-mix', 1000000).label === 'Showing previous data',
+    'failed panel swaps in the "Showing previous data" freshness label');
+
+  // Healthy panels keep rendering and show the updated timestamp
+  assert(window.shouldRenderPanel({ kpi: { status: 'ok', updatedAt: 500000 } }, 'kpi') === true,
+    'ok panel still renders');
+  assert(window.shouldRenderPanel({ kpi: { status: 'refreshing', updatedAt: 500000 } }, 'kpi') === true,
+    'refreshing panel still renders (label shows while updating)');
+  assert(window.shouldRenderPanel({}, 'kpi') === true,
+    'panel with no recorded state still renders (initial load)');
+})();
+
+console.log('\u25B6 header last-refreshed clock (issue #357)');
+
+(function () {
+  // Exposed module-level timestamp: null until the first refresh completes
+  assert(window.getLastRefreshedAt() === null, 'lastRefreshedAt starts null (no refresh cycle completed yet)');
+
+  var d = new Date(2026, 0, 2, 3, 4, 5);
+  assert(window.formatClockTime(d) === '03:04:05', 'formatClockTime renders HH:MM:SS (03:04:05)');
+  var e = new Date(2026, 6, 6, 23, 59, 59);
+  assert(window.formatClockTime(e) === '23:59:59', 'formatClockTime renders HH:MM:SS (23:59:59)');
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
@@ -1536,6 +1656,19 @@ console.log('\u25B6 index.html markup (smoke check)');
   assert(html.indexOf('<th>Active Tokens</th>') !== -1,
     'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
   assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
+
+  // Freshness indicators (issue #357): the header carries a labeled
+  // "Last refreshed" clock, and each instrumented panel carries a
+  // .panel-freshness span in its title row (KPI row, Model Mix,
+  // Operational Events, Sessions, plus the remaining data panels).
+  assert(html.indexOf('id="last-refreshed"') !== -1 && html.indexOf('Last refreshed') !== -1,
+    'header: #last-refreshed element with "Last refreshed" label exists');
+  ['kpi', 'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'sessions', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(html.indexOf('id="freshness-' + panelId + '"') !== -1,
+        'panel: freshness span #freshness-' + panelId + ' exists in the markup');
+    });
+  assert(html.indexOf('class="panel-freshness"') !== -1, 'panel: freshness spans use class="panel-freshness"');
 })();
 
 // ── Static CSS verification (frontend/style.css) ────────────────────────
@@ -1599,6 +1732,14 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
     'no status-driven [data-active] row selector in live CSS (no green active-row cast)');
   assert(!/\.session-row[^{]*\{[^}]*border-left[^}]*\}/.test(live),
     'no .session-row rule paints a left rail/stripe in live CSS');
+
+  // Freshness styles (issue #357): subtle muted labels in panel titles —
+  // inline in the title's existing flex row (no layout shifts) — plus the
+  // "Last refreshed" header clock and the stale/refreshing state variants.
+  assert(live.indexOf('.panel-freshness') !== -1, 'style.css: .panel-freshness base rule exists');
+  assert(live.indexOf('.freshness-refreshing') !== -1, 'style.css: .freshness-refreshing state rule exists');
+  assert(live.indexOf('.freshness-stale') !== -1, 'style.css: .freshness-stale state rule exists');
+  assert(live.indexOf('.last-refreshed') !== -1, 'style.css: .last-refreshed header clock rule exists');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
