@@ -15,6 +15,14 @@
   const RECORD_LIMIT = 100;
   const SESSION_LIMIT = 20;
   const CLIENT_LIMIT = 100;
+  /**
+   * Client metadata cache expiry policy: the client_id → name map is fetched
+   * from /admin/clients at most once per 10-minute window.  Within the TTL
+   * refresh cycles reuse the cached map; after expiry the next cycle
+   * refetches.  Unknown client ids additionally trigger a non-blocking
+   * background refresh at any time (see ensureClientName).
+   */
+  const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
   /** Session is considered "active" if last_message_at is within this window.
    *  This is a heuristic — long-running but infrequent sessions may be
    *  incorrectly marked as "ended", and very recent sessions that have
@@ -85,7 +93,6 @@
 
   // ── State ──────────────────────────────────────────────────────────────
 
-  let clientMap = {};      // client_id → name
   let refreshTimer = null;
   let fetchErrors = {};    // endpoint_key → error_message, per-fetch-cycle tracking
   let agentRunsData = null;       // latest agent runs response
@@ -95,6 +102,111 @@
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+
+  // ── Client metadata cache ─────────────────────────────────────────────
+  // The client_id → name map changes rarely but costs one HTTP round trip
+  // per fetch, so it is cached in memory with a 10-minute expiry
+  // (CLIENT_CACHE_TTL_MS).  Within the TTL window refresh cycles reuse the
+  // cached map; after expiry the next cycle refetches.  Lookup misses
+  // (unknown client ids in rendered data) trigger a non-blocking background
+  // refresh, and a failed refresh never clears the map — last-known names
+  // stay available (stale-while-failure).
+
+  /**
+   * Create an in-memory cache for the client_id → name lookup map.
+   * Pure factory — no DOM or fetch access — so the Node test harness can
+   * exercise hit/miss/expiry/invalidation with an injected clock.
+   *
+   * Expiry policy: the cache is stale once `ttlMs` (default
+   * CLIENT_CACHE_TTL_MS, 10 minutes) elapses since the last successful
+   * refresh.  Entries never expire individually — get() keeps returning
+   * last-known names even after expiry (stale-while-revalidate); callers
+   * decide when to refetch via isExpired().
+   *
+   * @param {Object} [opts] - { ttlMs, now }; now() injects the clock (tests)
+   * @returns {Object} cache handle: get/set/has/isExpired/refresh/invalidate/snapshot
+   */
+  function createClientCache(opts) {
+    var ttlMs = (opts && opts.ttlMs != null) ? opts.ttlMs : CLIENT_CACHE_TTL_MS;
+    var nowFn = (opts && typeof opts.now === 'function') ? opts.now : Date.now;
+    var map = {};        // client_id → name (last known; survives refresh failures)
+    var loadedAt = null; // ms timestamp of last successful refresh; null = never loaded
+
+    function isExpired() {
+      return loadedAt === null || (nowFn() - loadedAt) >= ttlMs;
+    }
+
+    return {
+      /** Look up a client name; undefined when the id is unknown (miss). */
+      get: function (id) { return map[id]; },
+      /** True when the id has a cached name. */
+      has: function (id) { return Object.prototype.hasOwnProperty.call(map, id); },
+      /** True when never loaded or the TTL window has elapsed. */
+      isExpired: isExpired,
+      /** Record a single client entry (client_id → name). */
+      set: function (id, name) { map[id] = name; },
+      /**
+       * Replace the whole map with a freshly fetched client list.  Call only
+       * on success — on failure leave the map untouched so last-known names
+       * remain available (stale-while-failure).  Resets the TTL window.
+       */
+      refresh: function (entries) {
+        var next = {};
+        (entries || []).forEach(function (c) {
+          next[c.id] = c.name || c.id;
+        });
+        map = next;
+        loadedAt = nowFn();
+      },
+      /**
+       * Manual invalidation for use after client administration changes:
+       * marks the cache stale so the next refresh cycle refetches, but keeps
+       * last-known names so labels survive a subsequent fetch failure.
+       */
+      invalidate: function () {
+        loadedAt = null;
+      },
+      /** Copy of the current map (introspection/tests). */
+      snapshot: function () { return Object.assign({}, map); }
+    };
+  }
+
+  /** The live client metadata cache used by the dashboard (10-min TTL). */
+  var clientCache = createClientCache({ ttlMs: CLIENT_CACHE_TTL_MS });
+
+  /** Refetch client metadata and replace the cached map on success.
+   *  Never clears the map: on failure last-known names are retained. */
+  function refreshClientCache() {
+    return apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
+      .then(function (data) {
+        if (data && data.items) {
+          clientCache.refresh(data.items);
+        }
+        return data;
+      })
+      .catch(function (e) {
+        // Stale-while-failure: keep the last-known client names.
+        console.error('Client metadata refresh failed:', e);
+      });
+  }
+
+  /**
+   * Resolve a client's display name from the cache.  A lookup miss (unknown
+   * client id) triggers a non-blocking background refresh of the cache and
+   * returns undefined, letting callers fall back to the raw id.
+   */
+  function ensureClientName(clientId) {
+    var name = clientCache.get(clientId);
+    if (name === undefined) {
+      refreshClientCache(); // background refresh — fire and forget
+    }
+    return name;
+  }
+
+  /** Expose cache invalidation for client administration changes. */
+  function invalidateClientCache() {
+    clientCache.invalidate();
+  }
   /**
    * Resolve the display label for a project row in the Client/Project
    * Usage Breakdown.  Single source of truth — used by both the render
@@ -451,6 +563,13 @@
       // Build agent runs URL with current filters
       var arUrl = buildAgentRunsUrl();
 
+      // Client metadata is cached for 10 minutes (CLIENT_CACHE_TTL_MS):
+      // only fetch /admin/clients when the cache is stale — within the TTL
+      // window refresh cycles reuse the cached map instead of refetching.
+      var clientsPromise = clientCache.isExpired()
+        ? apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
+        : Promise.resolve(null);
+
       // Parallel fetches
       const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns, aggClientProjectResult] =
         await Promise.allSettled([
@@ -459,7 +578,7 @@
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
           apiFetch('/api/v1/usage/sessions?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + SESSION_LIMIT),
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
-          apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
+          clientsPromise,
           apiFetch(arUrl),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
         ]);
@@ -487,11 +606,11 @@
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
 
-      // Build client lookup from admin/clients
+      // Populate the client lookup cache from admin/clients.  Runs only on
+      // a successful fetch — on failure the cache keeps its last-known
+      // names (stale-while-failure), never clearing the map.
       if (results.clients && results.clients.items) {
-        results.clients.items.forEach(function (c) {
-          clientMap[c.id] = c.name || c.id;
-        });
+        clientCache.refresh(results.clients.items);
       }
     } catch (e) {
       console.error('Dashboard fetch error:', e);
@@ -704,7 +823,7 @@
       data.sessions.items.slice(0, 5).forEach(function (s) {
         var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
         if (tokens > 100000) {
-          var label = clientMap[s.client_id] || s.client_id;
+          var label = ensureClientName(s.client_id) || s.client_id;
           events.push({
             type: 'info',
             icon: '\uD83D\uDCCA',  // 📊
@@ -875,7 +994,7 @@
 
     var html = '';
     data.sessions.items.forEach(function (s) {
-      var clientName = clientMap[s.client_id] || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
+      var clientName = ensureClientName(s.client_id) || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
       html += buildSessionRowHtml(s, clientName);
     });
 
@@ -1600,5 +1719,9 @@
   // Expose for tests
   window.resolveProjectLabel = resolveProjectLabel;
   window.buildSessionRowHtml = buildSessionRowHtml;
+  window.createClientCache = createClientCache;
+  window.ensureClientName = ensureClientName;
+  window.refreshClientCache = refreshClientCache;
+  window.invalidateClientCache = invalidateClientCache;
 
 })();
