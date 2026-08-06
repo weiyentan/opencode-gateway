@@ -430,6 +430,7 @@ body {
 }
 
 .kpi-card {
+  position: relative; /* anchor for the per-card freshness label */
   background: var(--glass);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
@@ -660,9 +661,9 @@ body {
   color: var(--status-stale);
 }
 
-/* The KPI row has no title row, so its label is pinned to the top-right
-   corner of the row (absolute → takes no space, zero layout shift). */
-.kpi-row .panel-freshness {
+/* Each KPI card pins its own freshness label to the card's top-right
+   corner (absolute → takes no space, zero layout shift). */
+.kpi-card .panel-freshness {
   position: absolute;
   top: 6px;
   right: 8px;

@@ -27,6 +27,12 @@ var path = require('path');
 // tests) — the sandbox object is the vm context's global object.
 var appJsSandbox = null;
 
+// Async-block completion counter for deterministic summary polling (issue N3).
+// MUST be initialized at the top of the file before any test block that
+// increments it — otherwise var hoisting leaves it undefined during the
+// ++ calls and the = 0 assignment later clobbers the counter.
+var pendingAsyncBlocks = 0;
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -1459,6 +1465,7 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
     'unknown id: background refresh fetches /admin/clients once');
 
   // Let the fire-and-forget refresh land, then verify the cache was rebuilt
+  pendingAsyncBlocks++;
   setTimeout(function () {
     var hitCalls = calls.length;
     assert(window.ensureClientName('c1') === 'Alpha',
@@ -1476,14 +1483,84 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
       return Promise.resolve({ ok: false, status: 500 });
     };
     window.ensureClientName('unknown-2'); // miss → background refresh → fetch fails
+    pendingAsyncBlocks++;
     setTimeout(function () {
       assert(window.ensureClientName('c1') === 'Alpha',
         'stale-while-failure: labels survive a failed background refresh');
       assert(calls.length === 2,
         'one fetch per miss: hits never fetch, a failed refresh never clears the map');
+      pendingAsyncBlocks--;
     }, 10);
+    pendingAsyncBlocks--;
   }, 10);
 })();
+
+// F2 — in-flight deduplication: multiple concurrent cache misses fire at
+// most one /admin/clients fetch (single-flight fan-out protection).
+// Wrapped in a setTimeout so the previous test's in-flight refresh has
+// fully drained (clientsRefreshInFlight is null) before we start.
+console.log('\u25B6 client metadata cache — in-flight deduplication (issue F2)');
+
+pendingAsyncBlocks++;
+setTimeout(function () {
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return new Promise(function (resolve) {
+      // Simulate a slow fetch so concurrent callers pile up before it resolves
+      setTimeout(function () {
+        resolve({
+          ok: true,
+          json: function () {
+            return Promise.resolve({
+              items: [
+                { id: 'x1', name: 'X-One' },
+                { id: 'x2', name: 'X-Two' },
+                { id: 'x3', name: 'X-Three' }
+              ]
+            });
+          }
+        });
+      }, 20);
+    });
+  };
+
+  // Start from a stale cache (previous test's refresh populated it)
+  window.invalidateClientCache();
+  var callsBefore = calls.length;
+
+  // Three synchronous misses — all should share one in-flight promise
+  var r1 = window.ensureClientName('x1');
+  var r2 = window.ensureClientName('x2');
+  var r3 = window.ensureClientName('x3');
+  // All three return undefined (cache miss) synchronously
+  assert(r1 === undefined, 'miss 1: returns undefined (caller falls back to raw id)');
+  assert(r2 === undefined, 'miss 2: returns undefined');
+  assert(r3 === undefined, 'miss 3: returns undefined');
+
+  // Assert exactly ONE fetch was triggered (not three)
+  var fetchCountBeforeResolve = calls.length - callsBefore;
+  assert(fetchCountBeforeResolve === 1,
+    'concurrent misses: exactly one /admin/clients fetch triggered, not ' + fetchCountBeforeResolve);
+
+  // After the fetch resolves, the cache has all three names
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    assert(window.ensureClientName('x1') === 'X-One',
+      'post-dedupe: x1 resolves from the cache after single shared fetch');
+    assert(window.ensureClientName('x2') === 'X-Two',
+      'post-dedupe: x2 resolves from the cache');
+    assert(window.ensureClientName('x3') === 'X-Three',
+      'post-dedupe: x3 resolves from the cache');
+    // Subsequent hits trigger zero additional fetches
+    var callsAfterResolve = calls.length;
+    window.ensureClientName('x1');
+    assert(calls.length === callsAfterResolve,
+      'post-dedupe: known ids trigger no additional fetches');
+    pendingAsyncBlocks--;
+  }, 30);
+  pendingAsyncBlocks--;
+}, 15);
 
 // ── Panel freshness states (issue #357) ─────────────────────────────────
 // The freshness logic lives in pure helpers in app.js (formatUpdatedAgo,
@@ -1542,7 +1619,8 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
 (function () {
   // No endpoint errors → every panel resolves to 'ok'
   var allOk = window.resolvePanelStatuses({});
-  ['kpi', 'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'sessions', 'agent-runs', 'client-project']
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'sessions', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
     });
@@ -1551,18 +1629,23 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
   var modelMixFailed = window.resolvePanelStatuses({ aggByModel: 'boom' });
   assert(modelMixFailed['model-mix'] === 'stale' && modelMixFailed.agents === 'stale',
     'aggByModel failure: model-mix and agents go stale');
-  assert(modelMixFailed.kpi === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed.sessions === 'ok',
-    'aggByModel failure: unrelated panels stay ok');
+  assert(modelMixFailed['kpi-tokens'] === 'ok' && modelMixFailed['kpi-cost'] === 'ok' &&
+         modelMixFailed['kpi-sessions'] === 'ok' && modelMixFailed['kpi-collectors'] === 'ok' &&
+         modelMixFailed['kpi-source-dbs'] === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed.sessions === 'ok',
+    'aggByModel failure: unrelated panels (KPI cards, events, sessions) stay ok');
 
   var healthFailed = window.resolvePanelStatuses({ health: 'down' });
-  assert(healthFailed.kpi === 'stale' && healthFailed.events === 'stale' &&
+  assert(healthFailed['kpi-collectors'] === 'stale' && healthFailed['kpi-source-dbs'] === 'stale' &&
+         healthFailed.events === 'stale' &&
          healthFailed['collector-dist'] === 'stale' && healthFailed.collectors === 'stale' &&
          healthFailed.agents === 'stale',
-    'health failure: every health-fed panel goes stale');
-  assert(healthFailed.sessions === 'ok', 'health failure: sessions panel stays ok');
+    'health failure: every health-fed panel (kpi-collectors, kpi-source-dbs, events, collector-dist, collectors, agents) goes stale');
+  assert(healthFailed['kpi-tokens'] === 'ok' && healthFailed['kpi-cost'] === 'ok' &&
+         healthFailed['kpi-sessions'] === 'ok' && healthFailed.sessions === 'ok',
+    'health failure: sessions panel and non-health KPI cards stay ok');
 
   var agentRunsFailed = window.resolvePanelStatuses({ agentRuns: 'boom' });
-  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed.kpi === 'ok',
+  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed['kpi-tokens'] === 'ok',
     'agentRuns failure: only the agent-runs panel goes stale');
 
   // Failed panel retains its previous data: the state map keeps the old
@@ -1585,6 +1668,28 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
     'refreshing panel still renders (label shows while updating)');
   assert(window.shouldRenderPanel({}, 'kpi') === true,
     'panel with no recorded state still renders (initial load)');
+})();
+
+// N1 — never-rendered stale panel: no previous data to retain → render proceeds
+console.log('\u25B6 shouldRenderPanel + computePanelFreshness (stale + never-updated, issue N1)');
+
+(function () {
+  // Stale panel that has NEVER rendered (updatedAt null): render should
+  // proceed so the empty/error state is shown instead of "Loading..."
+  assert(window.shouldRenderPanel({ p: { status: 'stale', updatedAt: null } }, 'p') === true,
+    'stale + null updatedAt: render proceeds (no previous data to retain)');
+  // Stale panel WITH previous data: render is suppressed to keep last-known values
+  assert(window.shouldRenderPanel({ p: { status: 'stale', updatedAt: 1000 } }, 'p') === false,
+    'stale + non-null updatedAt: render skipped (retains previous data)');
+
+  var now = 2000;
+  // Stale + never-updated → no freshness label (no "Showing previous data" on placeholders)
+  assert(window.computePanelFreshness({ p: { status: 'stale', updatedAt: null } }, 'p', now) === null,
+    'stale + null updatedAt: computePanelFreshness returns null (no label)');
+  // Stale + has previous data → "Showing previous data" label
+  var fresh = window.computePanelFreshness({ p: { status: 'stale', updatedAt: 1000 } }, 'p', now);
+  assert(fresh !== null && fresh.status === 'stale' && fresh.label === 'Showing previous data',
+    'stale + non-null updatedAt: computePanelFreshness returns stale descriptor');
 })();
 
 console.log('\u25B6 header last-refreshed clock (issue #357)');
@@ -1651,6 +1756,42 @@ console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
     'kpi-collectors: subtitle never carries the date-range label');
   assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t).indexOf(rangeLabel) === -1,
     'kpi-source-dbs: subtitle never carries the date-range label');
+})();
+
+// N2 — per-card KPI staleness: each KPI card resolves independently, so a
+// single failing endpoint (e.g. sessions) never freezes the tokens/cost cards
+console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)');
+
+(function () {
+  // Only sessions fails → only kpi-sessions goes stale
+  var sessionFail = window.resolvePanelStatuses({ sessions: 'boom' });
+  assert(sessionFail['kpi-tokens'] === 'ok', 'sessions fail: kpi-tokens stays ok (aggTotal is fine)');
+  assert(sessionFail['kpi-cost'] === 'ok', 'sessions fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(sessionFail['kpi-sessions'] === 'stale', 'sessions fail: kpi-sessions goes stale');
+  assert(sessionFail['kpi-collectors'] === 'ok', 'sessions fail: kpi-collectors stays ok (health is fine)');
+  assert(sessionFail['kpi-source-dbs'] === 'ok', 'sessions fail: kpi-source-dbs stays ok (health is fine)');
+
+  // Only health fails → only kpi-collectors and kpi-source-dbs go stale
+  var healthFail = window.resolvePanelStatuses({ health: 'down' });
+  assert(healthFail['kpi-tokens'] === 'ok', 'health fail: kpi-tokens stays ok (aggTotal is fine)');
+  assert(healthFail['kpi-cost'] === 'ok', 'health fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(healthFail['kpi-sessions'] === 'ok', 'health fail: kpi-sessions stays ok (sessions is fine)');
+  assert(healthFail['kpi-collectors'] === 'stale', 'health fail: kpi-collectors goes stale');
+  assert(healthFail['kpi-source-dbs'] === 'stale', 'health fail: kpi-source-dbs goes stale');
+
+  // aggTotal fails → kpi-tokens and kpi-cost go stale, rest stay ok
+  var aggFail = window.resolvePanelStatuses({ aggTotal: 'boom' });
+  assert(aggFail['kpi-tokens'] === 'stale', 'aggTotal fail: kpi-tokens goes stale');
+  assert(aggFail['kpi-cost'] === 'stale', 'aggTotal fail: kpi-cost goes stale');
+  assert(aggFail['kpi-sessions'] === 'ok', 'aggTotal fail: kpi-sessions stays ok');
+  assert(aggFail['kpi-collectors'] === 'ok', 'aggTotal fail: kpi-collectors stays ok');
+
+  // No errors → all KPI cards ok
+  var allOk = window.resolvePanelStatuses({});
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs']
+    .forEach(function (kpiId) {
+      assert(allOk[kpiId] === 'ok', 'no errors: KPI card "' + kpiId + '" resolves to ok');
+    });
 })();
 
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
@@ -1727,7 +1868,8 @@ console.log('\u25B6 index.html markup (smoke check)');
   // Operational Events, Sessions, plus the remaining data panels).
   assert(html.indexOf('id="last-refreshed"') !== -1 && html.indexOf('Last refreshed') !== -1,
     'header: #last-refreshed element with "Last refreshed" label exists');
-  ['kpi', 'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'sessions', 'agent-runs', 'client-project']
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'sessions', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(html.indexOf('id="freshness-' + panelId + '"') !== -1,
         'panel: freshness span #freshness-' + panelId + ' exists in the markup');
@@ -1807,15 +1949,42 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
-// The summary is deferred ~50ms so the async background-refresh assertions
-// (which await the production refreshClientCache promise chain through the
-// fetch stub) land before the process exits.
+// The summary is deferred until ALL pending async test callbacks have
+// completed (deterministic, not a fixed timer).  A safety cap at 5 s
+// prevents a genuinely hung test from holding the process open forever.
 
-setTimeout(function () {
+function printSummary() {
   console.log('');
   console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
   console.log('  Passed:', passed, ' / Failed:', failed);
   console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+}
 
+var _summaryScheduled = false;
+var _summaryStart = Date.now();
+var _MAX_SUMMARY_WAIT_MS = 5000; // safety cap: hung test still reports
+
+function finishWhenIdle() {
+  if (pendingAsyncBlocks > 0) {
+    if (Date.now() - _summaryStart > _MAX_SUMMARY_WAIT_MS) {
+      console.error('  WARNING: async blocks still pending after ' + _MAX_SUMMARY_WAIT_MS + 'ms — printing summary anyway');
+      printSummary();
+      process.exit(failed > 0 ? 1 : 0);
+      return;
+    }
+    setTimeout(finishWhenIdle, 10);
+    return;
+  }
+  printSummary();
   process.exit(failed > 0 ? 1 : 0);
-}, 50);
+}
+
+// Schedule the finish poll once at the end of the synchronous test run.
+// Each async test block increments pendingAsyncBlocks before scheduling
+// its callback and decrements at the end, guaranteeing the summary only
+// prints after all pending async work lands.
+if (!_summaryScheduled) {
+  _summaryScheduled = true;
+  _summaryStart = Date.now();
+  setTimeout(finishWhenIdle, 10);
+}

@@ -123,7 +123,11 @@
   // 'stale' when any of its endpoints failed in the current refresh cycle.
   // 'agentRuns' maps to the agentRunsFetchError channel (fetched separately).
   const PANEL_ENDPOINTS = {
-    kpi:             ['health', 'aggTotal', 'sessions'],
+    'kpi-tokens':     ['aggTotal'],
+    'kpi-cost':       ['aggTotal'],
+    'kpi-sessions':   ['sessions'],
+    'kpi-collectors': ['health'],
+    'kpi-source-dbs': ['health'],
     'model-mix':     ['aggByModel'],
     events:          ['health', 'sessions'],
     'collector-dist': ['health'],
@@ -205,10 +209,18 @@
   /** The live client metadata cache used by the dashboard (10-min TTL). */
   var clientCache = createClientCache({ ttlMs: CLIENT_CACHE_TTL_MS });
 
+  /** Shared in-flight promise: deduplicates concurrent background refreshes
+   *  so that a single render pass (up to ~25 cache misses) fires at most one
+   *  /admin/clients request.  Null while no refresh is in flight. */
+  var clientsRefreshInFlight = null;
+
   /** Refetch client metadata and replace the cached map on success.
-   *  Never clears the map: on failure last-known names are retained. */
+   *  Never clears the map: on failure last-known names are retained.
+   *  Deduplicates in-flight requests through a shared promise — concurrent
+   *  callers all await the same single fetch. */
   function refreshClientCache() {
-    return apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
+    if (clientsRefreshInFlight) return clientsRefreshInFlight;
+    clientsRefreshInFlight = apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
       .then(function (data) {
         if (data && data.items) {
           clientCache.refresh(data.items);
@@ -218,7 +230,11 @@
       .catch(function (e) {
         // Stale-while-failure: keep the last-known client names.
         console.error('Client metadata refresh failed:', e);
+      })
+      .finally(function () {
+        clientsRefreshInFlight = null;
       });
+    return clientsRefreshInFlight;
   }
 
   /**
@@ -577,7 +593,8 @@
    *  @param {number}   nowMs       epoch ms reference time
    *  @returns {{status: string, label: string, cssClass: string}|null}
    *    refreshing → { label: 'Refreshing…', cssClass: 'freshness-refreshing' }
-   *    stale      → { label: 'Showing previous data', cssClass: 'freshness-stale' }
+   *    stale + previously updated → { label: 'Showing previous data', cssClass: 'freshness-stale' }
+   *    stale + never updated       → null (no previous data to reference)
    *    ok         → { label: 'Updated ' + formatUpdatedAgo(...) }
    *    unknown/idle panel → null (render nothing) */
   function computePanelFreshness(panelStates, panelId, nowMs) {
@@ -587,6 +604,9 @@
       return { status: 'refreshing', label: 'Refreshing\u2026', cssClass: 'freshness-refreshing' };
     }
     if (st.status === 'stale') {
+      // Never rendered: no previous data exists, so no "Showing previous
+      // data" label — the panel render shows its empty/error state instead.
+      if (st.updatedAt == null) return null;
       return { status: 'stale', label: 'Showing previous data', cssClass: 'freshness-stale' };
     }
     return {
@@ -599,10 +619,14 @@
   /** Whether a panel render should repaint its content.
    *  A 'stale' panel (failed fetch) returns false so the render function
    *  keeps the previous successful data on screen and only the freshness
-   *  label ("Showing previous data") is swapped in. */
+   *  label ("Showing previous data") is swapped in.
+   *  A stale panel with no previous render (updatedAt null) has no data to
+   *  retain — let the render run so it shows its empty/error state. */
   function shouldRenderPanel(panelStates, panelId) {
     var st = panelStates && panelStates[panelId];
-    return !(st && st.status === 'stale');
+    // A stale panel with no previous render (updatedAt null) has no data to
+    // retain — let the render run so it shows its empty/error state.
+    return !(st && st.status === 'stale' && st.updatedAt != null);
   }
 
   /** Resolve every panel's post-fetch status from the current endpoint errors.
@@ -720,8 +744,10 @@
       // Client metadata is cached for 10 minutes (CLIENT_CACHE_TTL_MS):
       // only fetch /admin/clients when the cache is stale — within the TTL
       // window refresh cycles reuse the cached map instead of refetching.
+      // Routed through refreshClientCache() so the scheduled path shares the
+      // same single-flight deduplication as the background-refresh path.
       var clientsPromise = clientCache.isExpired()
-        ? apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
+        ? refreshClientCache()
         : Promise.resolve(null);
 
       // Parallel fetches
@@ -760,12 +786,10 @@
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
 
-      // Populate the client lookup cache from admin/clients.  Runs only on
-      // a successful fetch — on failure the cache keeps its last-known
-      // names (stale-while-failure), never clearing the map.
-      if (results.clients && results.clients.items) {
-        clientCache.refresh(results.clients.items);
-      }
+      // Client cache is already refreshed by refreshClientCache() above
+      // (single-flight deduped); the results.clients field is retained on
+      // the results object for diagnostic visibility but the cache itself
+      // is already populated — no secondary refresh needed.
     } catch (e) {
       console.error('Dashboard fetch error:', e);
       showError('Failed to fetch dashboard data: ' + e.message);
@@ -830,10 +854,15 @@
     }
   }
 
-  /** KPI Row */
+  /** KPI Row — per-card freshness so a single failing endpoint (e.g. sessions)
+   *  never freezes the entire row (issue N2). */
   function renderKPIs(data) {
-    applyPanelFreshness('kpi');
-    if (!shouldRenderPanel(panelStates, 'kpi')) return; // failed fetch → keep previous values
+    // Apply per-card freshness labels (replaces the old row-level label)
+    applyPanelFreshness('kpi-tokens');
+    applyPanelFreshness('kpi-cost');
+    applyPanelFreshness('kpi-sessions');
+    applyPanelFreshness('kpi-collectors');
+    applyPanelFreshness('kpi-source-dbs');
 
     // Compute range label once for all KPI subtitles
     var rangeLabel = '--';
@@ -852,26 +881,39 @@
     els.kpiCollectorsDetail.textContent = kpiSubtitle('kpi-collectors', rangeLabel, lastRefreshedAt);
     els.kpiSourceDbsDetail.textContent = kpiSubtitle('kpi-source-dbs', rangeLabel, lastRefreshedAt);
 
-    // Total tokens from aggregates total row
-    if (data.aggTotal && data.aggTotal.length > 0) {
-      var t = data.aggTotal[0];
-      var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
-      els.kpiTokens.textContent = fmtNum(totalTokens);
-      els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
+    // Total tokens from aggregates total row — gated on kpi-tokens (and
+    // kpi-cost, which shares the aggTotal endpoint).
+    if (shouldRenderPanel(panelStates, 'kpi-tokens')) {
+      if (data.aggTotal && data.aggTotal.length > 0) {
+        var t = data.aggTotal[0];
+        var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
+        els.kpiTokens.textContent = fmtNum(totalTokens);
+        els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
+      }
     }
 
-    // Sessions from sessions API
-    if (data.sessions) {
-      els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
+    // Sessions from sessions API — gated on kpi-sessions card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-sessions')) {
+      if (data.sessions) {
+        els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
+      }
     }
 
-    // Collectors & source DBs from health
-    if (data.health) {
-      var collectors = data.health.collectors || [];
-      var srcDbs = data.health.source_databases || [];
-      var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
-      els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
-      els.kpiSourceDbs.textContent = fmtNum(srcDbs.length);
+    // Collectors from health — gated on kpi-collectors card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-collectors')) {
+      if (data.health) {
+        var collectors = data.health.collectors || [];
+        var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
+        els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
+      }
+    }
+
+    // Source DBs from health — gated on kpi-source-dbs card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-source-dbs')) {
+      if (data.health) {
+        var srcDbs = data.health.source_databases || [];
+        els.kpiSourceDbs.textContent = fmtNum(srcDbs.length);
+      }
     }
   }
 
@@ -1740,6 +1782,10 @@
       markAllPanelsRefreshing(); // "Refreshing…" on every panel while the cycle is in flight
       var data = await fetchAll();
       resolvePanelStatesAfterFetch(); // per-panel ok/stale from this cycle's fetch errors
+      // Record the cycle timestamp BEFORE rendering so the KPI "As of"
+      // subtitle and any other render-time consumers see the CURRENT
+      // cycle's time, not the previous one (fixes one-cycle lag).
+      lastRefreshedAt = new Date();    // data on screen is from this cycle
       renderHeader(data);
       renderKPIs(data);
       renderModelMix(data);
@@ -1755,10 +1801,8 @@
       showError('Dashboard refresh error: ' + e.message);
     } finally {
       if (els.dashboard) els.dashboard.classList.remove('refreshing');
-      // The cycle completed (successfully or not) — record its completion
-      // time for the header clock.  lastRefreshedAt is exposed via
-      // getLastRefreshedAt() for reuse by follow-up work (issue #358).
-      lastRefreshedAt = new Date();
+      // Repaint the header clock — lastRefreshedAt was set before the
+      // render pass above so the header displays the current cycle time.
       updateLastRefreshed();
     }
   }
