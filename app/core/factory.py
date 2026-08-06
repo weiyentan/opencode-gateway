@@ -106,9 +106,11 @@ def create_app(
     # ── Middleware (applied in registration order — last added runs first) ──
     from app.core.auth import ApiKeyMiddleware
     from app.core.envelope import ResponseEnvelopeMiddleware
+    from app.core.telemetry import RequestTimingMiddleware
 
     app.add_middleware(ApiKeyMiddleware)
     app.add_middleware(ResponseEnvelopeMiddleware)
+    app.add_middleware(RequestTimingMiddleware)
 
     # ── Exception handlers ──────────────────────────────────────────────
     from fastapi.exceptions import RequestValidationError
