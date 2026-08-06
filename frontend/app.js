@@ -632,7 +632,7 @@
     els.modelMixChart.innerHTML = html;
   }
 
-  /** Live Events Feed */
+  /** Operational Events Feed */
   function renderLiveEvents(data) {
     var events = [];
     var now = new Date().toISOString();

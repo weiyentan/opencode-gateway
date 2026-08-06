@@ -236,7 +236,7 @@ The dashboard polls the Gateway REST API every 30 seconds and renders:
 |---------|-------------|-------------|
 | **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Total tokens, estimated cost, session count, healthy collectors, source databases |
 | **Model Mix** | `/api/v1/usage/aggregates?group_by=model` | Token/cost breakdown by LLM model |
-| **Live Events** | Recent usage records | Real-time feed of incoming telemetry events |
+| **Operational Events** | Recent usage records | Real-time feed of incoming telemetry events |
 | **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
 | **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |

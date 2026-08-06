@@ -1392,6 +1392,14 @@ console.log('\u25B6 index.html markup (smoke check)');
     assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') === -1,
       'sessions header: retained column "' + label + '" is not marked sess-col-low');
   });
+
+  // Events panel title (issue #355): the "Live Events" panel was renamed to
+  // "Operational Events" — a label-only change. The event badge and the
+  // empty-state text must remain untouched.
+  assert(html.indexOf('Operational Events') !== -1, 'events panel: title reads "Operational Events"');
+  assert(html.indexOf('Live Events') === -1, 'events panel: "Live Events" no longer appears in the markup');
+  assert(html.indexOf('id="event-badge"') !== -1, 'events panel: #event-badge element still present');
+  assert(html.indexOf('Waiting for events&hellip;') !== -1, 'events panel: empty-state text unchanged');
 })();
 
 // ── Static CSS verification (frontend/style.css) ────────────────────────
