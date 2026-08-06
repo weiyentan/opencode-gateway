@@ -24,7 +24,7 @@ Design rules:
 
 Usage::
 
-    async with timed_operation("db.query.usage", "db"):
+    async with timed_operation("db.query.records.count", "db"):
         rows = await conn.fetch(...)
 
     async with timeout_operation("status.compute", "compute"):
@@ -120,7 +120,7 @@ async def timed_operation(
 
     Args:
         event_name: Specific event name for this operation (e.g.
-            ``"db.query.usage"``).
+            ``"db.query.records.count"``).
         operation_type: Coarse operation category (e.g. ``"db"``,
             ``"compute"``, ``"external"``).
         correlation_id: Explicit correlation ID; defaults to the one
@@ -277,7 +277,7 @@ async def timeout_operation(
 
     Args:
         event_name: Specific event name for this operation (e.g.
-            ``"db.query.usage"``).
+            ``"db.query.records.count"``).
         operation_type: Coarse operation category (e.g. ``"db"``,
             ``"compute"``, ``"external"``).
         budget_ms: Timeout budget in milliseconds.  Defaults to the

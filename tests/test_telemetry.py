@@ -53,7 +53,7 @@ class TestTimedOperation:
         caplog.set_level(logging.INFO, logger=_TELEMETRY_LOGGER)
 
         start = time.perf_counter()
-        async with timed_operation("db.query.usage", "db", correlation_id="cid-1"):
+        async with timed_operation("db.query.records.count", "db", correlation_id="cid-1"):
             await asyncio.sleep(0.01)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -61,7 +61,7 @@ class TestTimedOperation:
         assert len(records) == 1
         record = records[0]
         assert record.getMessage() == EVENT_OPERATION_COMPLETED
-        assert record.event_name == "db.query.usage"
+        assert record.event_name == "db.query.records.count"
         assert record.operation_type == "db"
         assert record.success is True
         assert record.correlation_id == "cid-1"

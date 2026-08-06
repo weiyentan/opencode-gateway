@@ -2372,7 +2372,7 @@ class TestTimeoutBudgets:
         with pytest.raises(TimeoutError):
             # budget_ms=50 is far smaller than the 10s sleep
             async with timeout_operation(
-                "db.query.usage", "db", budget_ms=50,
+                "db.query.records.count", "db", budget_ms=50,
             ):
                 await asyncio.sleep(10)
 
@@ -2383,7 +2383,7 @@ class TestTimeoutBudgets:
         assert len(telemetry_records) == 1
         record = telemetry_records[0]
         assert record.getMessage() == EVENT_OPERATION_TIMEOUT
-        assert record.event_name == "db.query.usage"
+        assert record.event_name == "db.query.records.count"
         assert record.operation_type == "db"
         assert record.budget_ms == 50
 
