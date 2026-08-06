@@ -623,6 +623,33 @@ async def get_sessions(
 #  Agent Run helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Canonical agent run status thresholds — SINGLE AUTHORITATIVE SOURCE
+# ────────────────────────────────────────────────────────────────────────────
+#  Both :func:`_compute_status` (Python) and :func:`_status_case_expression`
+#  (SQL) implement exactly the table below. The SQL function renders its
+#  interval literals from the constants beneath this block, so a threshold
+#  change is made here — and only here — and both implementations pick it
+#  up automatically. If you edit either function's branch logic, update
+#  this table to match. Tests in tests/test_agent_runs.py pin both
+#  implementations to this table.
+#
+#  Branch priority (first match wins):
+#    1. unknown    — message_count == 0 OR last_message_at IS NULL
+#    2. running    — last_message_at >= now() - 60 minutes
+#    3. unknown    — last_message_at < now() - 24 hours
+#    4. blocked    — parent_session_id IS NOT NULL AND beyond quiet
+#                    (reached only when branches 2 and 3 missed, so the
+#                    "beyond quiet" part is implied by branch order)
+#    5. stale      — last_message_at >= now() - 6 hours AND no parent
+#    6. completed  — fallback (beyond stale, no parent, has messages)
+#
+#  Boundary inclusivity is identical in both implementations:
+#     * exactly 60 minutes old → running  (inclusive: ``<=`` / ``>=``)
+#     * exactly 24 hours old   → NOT unknown (strict: ``>`` / ``<``)
+#     * exactly 6 hours old    → stale    (inclusive: ``<=`` / ``>=``)
+# ────────────────────────────────────────────────────────────────────────────
+
 # Default quiet threshold in minutes — a session whose last message is
 # within this window is considered "running" rather than "completed".
 # Exposed as a module-level constant so tests can reference it.
@@ -673,6 +700,11 @@ def _compute_status(
     (``_QUIET_THRESHOLD_MINUTES``, ``_STALE_THRESHOLD_HOURS``,
     ``_UNKNOWN_THRESHOLD_HOURS``) that can be adjusted as the system's
     behaviour is tuned.
+
+    The canonical status table (branch priority, threshold values, boundary
+    inclusivity) is documented once above the constants block; this function
+    and the SQL CASE expression in :func:`_status_case_expression` must
+    implement it identically.
     """
     if now is None:
         now = _utcnow()
@@ -756,11 +788,16 @@ def _build_agent_run_filters(
 def _status_case_expression() -> str:
     """Return a SQL CASE expression that computes status from session columns.
 
-    Mirrors the logic in :func:`_compute_status` but expressed in SQL
-    so the database can filter rows by computed status.
+    Implements the canonical status table documented above the
+    ``_QUIET_THRESHOLD_MINUTES`` constants block — the single authoritative
+    source for thresholds, branch priority, and boundary inclusivity.
 
-    Uses ``now()`` as the reference time and the same threshold constants
-    as the Python implementation.
+    Mirrors the logic in :func:`_compute_status` but expressed in SQL
+    so the database can filter rows by computed status. Uses ``now()`` as
+    the reference time and renders its intervals from the same module-level
+    constants as the Python implementation, keeping the same branch order
+    (unknown → running → unknown → blocked → stale → completed) and the
+    same boundary inclusivity (running/stale inclusive, unknown-old strict).
     """
     quiet_interval = f"interval '{_QUIET_THRESHOLD_MINUTES} minutes'"
     stale_interval = f"interval '{_STALE_THRESHOLD_HOURS} hours'"

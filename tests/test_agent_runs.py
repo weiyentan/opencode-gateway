@@ -259,6 +259,150 @@ class TestComputeStatus:
         assert result == "unknown"
 
 
+def _sql_status(
+    *,
+    now: datetime,
+    last_message_at: datetime | None,
+    message_count: int,
+    parent_session_id: object | None,
+) -> str:
+    """Evaluate the semantics of _status_case_expression() for a single row.
+
+    Literal transliteration of the rendered SQL CASE expression (branch
+    order, operators, and constants) so tests can compare the SQL status
+    path with the Python path without a live database. Written against the
+    canonical status table, not against _compute_status(), so it catches
+    real drift. If _status_case_expression() changes, mirror it here.
+    """
+    from app.api import usage as usage_module
+
+    if message_count == 0 or last_message_at is None:
+        return "unknown"
+    quiet = timedelta(minutes=usage_module._QUIET_THRESHOLD_MINUTES)
+    unknown = timedelta(hours=usage_module._UNKNOWN_THRESHOLD_HOURS)
+    stale = timedelta(hours=usage_module._STALE_THRESHOLD_HOURS)
+    if last_message_at >= now - quiet:
+        return "running"
+    if last_message_at < now - unknown:
+        return "unknown"
+    if parent_session_id is not None:
+        return "blocked"
+    if last_message_at >= now - stale:
+        return "stale"
+    return "completed"
+
+
+class TestStatusCaseExpression:
+    """Alignment tests: _status_case_expression() (SQL) vs _compute_status() (Python).
+
+    The SQL CASE expression is generated from the same module-level constants
+    and must keep the same branch order and boundary inclusivity as the
+    Python implementation. These tests pin both to the canonical status table
+    documented in app/api/usage.py above _QUIET_THRESHOLD_MINUTES, so any
+    future drift between the two implementations is caught.
+    """
+
+    def test_sql_case_expression_matches_canonical_table(self):
+        """Rendered SQL CASE must match the canonical table exactly: same
+        branch order, operators, labels, and constant-derived intervals."""
+        from app.api import usage as usage_module
+
+        expected = f"""
+        CASE
+            WHEN s.message_count = 0 OR s.last_message_at IS NULL THEN 'unknown'
+            WHEN s.last_message_at >= now() - interval
+                '{usage_module._QUIET_THRESHOLD_MINUTES} minutes' THEN 'running'
+            WHEN s.last_message_at < now() - interval
+                '{usage_module._UNKNOWN_THRESHOLD_HOURS} hours' THEN 'unknown'
+            WHEN s.parent_session_id IS NOT NULL THEN 'blocked'
+            WHEN s.last_message_at >= now() - interval
+                '{usage_module._STALE_THRESHOLD_HOURS} hours' THEN 'stale'
+            ELSE 'completed'
+        END
+        """
+
+        def _norm(text: str) -> str:
+            return " ".join(text.split())
+
+        assert _norm(usage_module._status_case_expression()) == _norm(expected)
+
+    def test_sql_case_expression_intervals_come_from_module_constants(self):
+        """Every interval literal in the rendered SQL must be derived from the
+        shared module-level constants — no hardcoded thresholds."""
+        from app.api import usage as usage_module
+
+        sql = usage_module._status_case_expression()
+        assert (
+            f"interval '{usage_module._QUIET_THRESHOLD_MINUTES} minutes'"
+            in sql
+        )
+        assert (
+            f"interval '{usage_module._STALE_THRESHOLD_HOURS} hours'" in sql
+        )
+        assert (
+            f"interval '{usage_module._UNKNOWN_THRESHOLD_HOURS} hours'" in sql
+        )
+
+    @pytest.mark.parametrize(
+        ("age_minutes", "message_count", "has_parent", "expected"),
+        [
+            # Branch 1 — unknown: no messages or missing last_message_at
+            (5, 0, False, "unknown"),
+            (5, 0, True, "unknown"),
+            (None, 3, False, "unknown"),  # last_message_at IS NULL
+            # Branch 2 — running: inclusive at exactly 60 minutes
+            (0, 1, False, "running"),
+            (59, 1, False, "running"),
+            (60, 1, False, "running"),
+            (60, 1, True, "running"),
+            # Branch 3 — unknown-old: strict at exactly 24 hours
+            (24 * 60 + 1, 1, False, "unknown"),
+            (48 * 60, 1, True, "unknown"),
+            # Branch 4 — blocked: beyond quiet with a parent
+            (61, 1, True, "blocked"),
+            (6 * 60, 1, True, "blocked"),
+            (24 * 60, 1, True, "blocked"),
+            # Branch 5 — stale: inclusive at exactly 6 hours, no parent
+            (61, 1, False, "stale"),
+            (6 * 60, 1, False, "stale"),
+            # Branch 6 — completed: fallback
+            (6 * 60 + 1, 1, False, "completed"),
+            (24 * 60, 1, False, "completed"),
+        ],
+    )
+    def test_python_and_sql_agree_on_status(
+        self, age_minutes, message_count, has_parent, expected
+    ):
+        """For identical inputs, the Python implementation, the SQL-path
+        transliteration, and the canonical expectation must all agree."""
+        from app.api.usage import _compute_status
+
+        last_message_at = (
+            None if age_minutes is None else _NOW - timedelta(minutes=age_minutes)
+        )
+        parent_session_id = "ses_parent" if has_parent else None
+
+        py_status = _compute_status(
+            last_message_at=last_message_at,
+            message_count=message_count,
+            has_parent=has_parent,
+            now=_NOW,
+        )
+        sql_status = _sql_status(
+            now=_NOW,
+            last_message_at=last_message_at,
+            message_count=message_count,
+            parent_session_id=parent_session_id,
+        )
+
+        assert sql_status == expected, (
+            f"SQL path deviates from canonical table: {sql_status!r} != {expected!r}"
+        )
+        assert py_status == expected, (
+            f"Python path deviates from canonical table: {py_status!r} != {expected!r}"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Title derivation tests (unit)
 # ══════════════════════════════════════════════════════════════════════════
