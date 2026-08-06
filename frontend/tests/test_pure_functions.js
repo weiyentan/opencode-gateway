@@ -22,6 +22,11 @@ var fs = require('fs');
 var vm = require('vm');
 var path = require('path');
 
+// The vm sandbox that runs app.js.  Kept in scope so tests can swap the
+// fetch stub (e.g. to count /admin/clients calls in the background-refresh
+// tests) — the sandbox object is the vm context's global object.
+var appJsSandbox = null;
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -57,11 +62,16 @@ var path = require('path');
     navigator: {}
   };
   sandbox.window = sandboxWindow;
+  appJsSandbox = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'app.js' });
 
   window.resolveProjectLabel = sandboxWindow.resolveProjectLabel;
   window.buildSessionRowHtml = sandboxWindow.buildSessionRowHtml;
+  window.createClientCache = sandboxWindow.createClientCache;
+  window.ensureClientName = sandboxWindow.ensureClientName;
+  window.refreshClientCache = sandboxWindow.refreshClientCache;
+  window.invalidateClientCache = sandboxWindow.invalidateClientCache;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1351,6 +1361,123 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
   assert(html.indexOf('tabindex="0"') !== -1, 'session row: tabindex="0" keeps the row keyboard-focusable');
 })();
 
+// ── Client metadata cache (production code loaded from app.js) ───────────
+// The REAL implementation lives in frontend/app.js: createClientCache is a
+// pure factory (no DOM/fetch access) exposed on window by the vm sandbox
+// loader, so the first block exercises the production 10-minute expiry
+// policy directly with an injected clock.  The second block drives the
+// production wiring (ensureClientName → refreshClientCache → /admin/clients)
+// through a fetch-counting stub: hits never fetch, misses trigger a
+// non-blocking background refresh, and a failed refresh never clears the
+// last-known names.
+
+function createClientCache(opts) {
+  return window.createClientCache(opts);
+}
+
+console.log('\u25B6 client metadata cache — pure factory (10-minute TTL)');
+
+(function () {
+  var t = 1000000; // fake clock, ms
+  var cache = createClientCache({ ttlMs: 600000, now: function () { return t; } });
+
+  // Empty cache is stale → first read must fetch
+  assert(cache.isExpired() === true, 'never-loaded cache is expired (stale)');
+
+  cache.refresh([
+    { id: 'c1', name: 'Alpha' },
+    { id: 'c2', name: null },
+    { id: 'c3', name: '' }
+  ]);
+
+  // Cache hit
+  assert(cache.get('c1') === 'Alpha', 'hit: cached name returned for known id');
+  assert(cache.get('c2') === 'c2', 'hit: id with no name falls back to the id');
+  assert(cache.get('c3') === 'c3', 'hit: empty name falls back to the id');
+  assert(cache.has('c1') === true, 'has: known id → true');
+  assert(cache.isExpired() === false, 'freshly refreshed cache is not expired');
+
+  // Cache miss
+  assert(cache.get('unknown') === undefined, 'miss: unknown id returns undefined');
+  assert(cache.has('unknown') === false, 'has: unknown id → false');
+
+  // TTL expiry (10 minutes = 600000 ms)
+  t += 599999;
+  assert(cache.isExpired() === false, 'not expired just before the 10-minute TTL elapses');
+  t += 2; // 600001 ms since refresh
+  assert(cache.isExpired() === true, 'expired once the 10-minute TTL elapses');
+  assert(cache.get('c1') === 'Alpha', 'stale-while-revalidate: last-known names remain readable after expiry');
+
+  // A fresh refresh resets the TTL window and replaces the map
+  t += 600000;
+  cache.refresh([{ id: 'c2', name: 'Beta' }]);
+  assert(cache.isExpired() === false, 'refresh resets the TTL window');
+  assert(cache.get('c2') === 'Beta', 'refresh: renamed id returns the new name');
+  assert(cache.get('c1') === undefined, 'refresh: ids absent from the fresh list drop out');
+
+  // Manual invalidation (post-admin-change hook): marks stale, keeps names
+  cache.invalidate();
+  assert(cache.isExpired() === true, 'invalidate marks the cache stale (forces refetch)');
+  assert(cache.get('c2') === 'Beta', 'invalidate keeps last-known names (stale-while-failure)');
+})();
+
+console.log('\u25B6 client metadata cache — background refresh wiring');
+
+(function () {
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({
+          items: [
+            { id: 'c1', name: 'Alpha' },
+            { id: 'c2', name: null },
+            { id: 'zzz', name: 'Zed' }
+          ]
+        });
+      }
+    });
+  };
+
+  // Start from a stale cache (as after first load or an admin change)
+  window.invalidateClientCache();
+  assert(calls.length === 0, 'invalidateClientCache() does not fetch by itself');
+
+  // Lookup miss → non-blocking background refresh of /admin/clients
+  var label = window.ensureClientName('unknown-id');
+  assert(label === undefined, 'unknown id: ensureClientName returns undefined (caller falls back to the raw id)');
+  assert(calls.length === 1 && calls[0] === '/admin/clients?limit=100',
+    'unknown id: background refresh fetches /admin/clients once');
+
+  // Let the fire-and-forget refresh land, then verify the cache was rebuilt
+  setTimeout(function () {
+    var hitCalls = calls.length;
+    assert(window.ensureClientName('c1') === 'Alpha',
+      'background refresh: refreshed cache resolves the previously unknown id');
+    assert(calls.length === hitCalls,
+      'cache hit: a known id does not trigger another fetch');
+    assert(window.ensureClientName('zzz') === 'Zed',
+      'background refresh: previously unknown id now resolves from the cache');
+    assert(window.ensureClientName('c2') === 'c2',
+      'background refresh: id without a name falls back to the id');
+
+    // Stale-while-failure: a failing background refresh keeps last-known names
+    appJsSandbox.fetch = function (url) {
+      calls.push(url);
+      return Promise.resolve({ ok: false, status: 500 });
+    };
+    window.ensureClientName('unknown-2'); // miss → background refresh → fetch fails
+    setTimeout(function () {
+      assert(window.ensureClientName('c1') === 'Alpha',
+        'stale-while-failure: labels survive a failed background refresh');
+      assert(calls.length === 2,
+        'one fetch per miss: hits never fetch, a failed refresh never clears the map');
+    }, 10);
+  }, 10);
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
@@ -1458,10 +1585,15 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
+// The summary is deferred ~50ms so the async background-refresh assertions
+// (which await the production refreshClientCache promise chain through the
+// fetch stub) land before the process exits.
 
-console.log('');
-console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
-console.log('  Passed:', passed, ' / Failed:', failed);
-console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+setTimeout(function () {
+  console.log('');
+  console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+  console.log('  Passed:', passed, ' / Failed:', failed);
+  console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
 
-process.exit(failed > 0 ? 1 : 0);
+  process.exit(failed > 0 ? 1 : 0);
+}, 50);
