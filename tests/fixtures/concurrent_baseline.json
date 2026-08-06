@@ -1,0 +1,13 @@
+{
+  "concurrent_users": 10,
+  "wall_clock_ms": 369.975,
+  "p50_ms": 187.123,
+  "p95_ms": 318.5,
+  "mean_ms": 188.156,
+  "min_ms": 45.196,
+  "max_ms": 333.193,
+  "pool_wait_p50_ms": 30.852,
+  "pool_wait_p95_ms": 33.442,
+  "error_rate": 0.0,
+  "error_count": 0
+}

@@ -64,11 +64,28 @@ def _mk_session_row(
     session_title: str | None = None,
     session_model: str | None = None,
     project_label: str | None = None,
+    # Merged context columns (from LEFT JOIN with opencode_session_contexts)
+    ctx_present: int | None = None,  # non-null PK → row-presence signal
+    parent_internal_id: uuid.UUID | None = None,
+    code_change_count: int | None = None,
+    code_change_additions: int | None = None,
+    code_change_deletions: int | None = None,
+    ctx_session_model: str | None = None,
+    ctx_session_cost: Decimal | None = None,
+    ctx_title: str | None = None,
+    ctx_source_directory: str | None = None,
+    ctx_source_path: str | None = None,
+    ctx_source_input_tokens: int | None = None,
+    ctx_source_output_tokens: int | None = None,
+    ctx_source_cached_tokens: int | None = None,
+    ctx_source_reasoning_tokens: int | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions.
 
     Includes both stored session columns and computed columns (_status,
-    child_run_count, project_label) that the agent-runs SQL query produces.
+    child_run_count, project_label) that the agent-runs SQL query produces,
+    plus merged context columns from the LEFT JOIN with
+    opencode_session_contexts.
     """
     row = MagicMock()
     data = {
@@ -94,6 +111,21 @@ def _mk_session_row(
         "session_title": session_title,
         "session_model": session_model,
         "project_label": project_label if project_label is not None else project_id,
+        # Merged context columns
+        "ctx_present": ctx_present,  # non-null PK → row-presence signal
+        "parent_internal_id": parent_internal_id,
+        "code_change_count": code_change_count,
+        "code_change_additions": code_change_additions,
+        "code_change_deletions": code_change_deletions,
+        "ctx_session_model": ctx_session_model,
+        "ctx_session_cost": ctx_session_cost,
+        "ctx_title": ctx_title,
+        "ctx_source_directory": ctx_source_directory,
+        "ctx_source_path": ctx_source_path,
+        "ctx_source_input_tokens": ctx_source_input_tokens,
+        "ctx_source_output_tokens": ctx_source_output_tokens,
+        "ctx_source_cached_tokens": ctx_source_cached_tokens,
+        "ctx_source_reasoning_tokens": ctx_source_reasoning_tokens,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.get.side_effect = data.get
@@ -789,42 +821,6 @@ class TestAgentRunsList:
         assert item["model"] is None
 
 
-def _mk_ctx_row(
-    *,
-    code_change_count: int = 5,
-    code_change_additions: int = 120,
-    code_change_deletions: int = 30,
-    session_model: str | None = "claude-sonnet-4",
-    session_cost: Decimal | None = Decimal("0.0450"),
-    title: str | None = "Implement user auth",
-    source_directory: str | None = "/home/user/project/src",
-    source_path: str | None = "/home/user/project",
-    source_input_tokens: int = 8000,
-    source_output_tokens: int = 2000,
-    source_cached_tokens: int = 500,
-    source_reasoning_tokens: int = 0,
-) -> MagicMock:
-    """Return a MagicMock that looks like an asyncpg Record row for opencode_session_contexts."""
-    row = MagicMock()
-    data: dict[str, Any] = {
-        "code_change_count": code_change_count,
-        "code_change_additions": code_change_additions,
-        "code_change_deletions": code_change_deletions,
-        "session_model": session_model,
-        "session_cost": session_cost,
-        "title": title,
-        "source_directory": source_directory,
-        "source_path": source_path,
-        "source_input_tokens": source_input_tokens,
-        "source_output_tokens": source_output_tokens,
-        "source_cached_tokens": source_cached_tokens,
-        "source_reasoning_tokens": source_reasoning_tokens,
-    }
-    row.__getitem__.side_effect = data.__getitem__
-    row.get.side_effect = data.get
-    return row
-
-
 def _mk_todo_row(
     *,
     content: str = "Fix login bug",
@@ -862,8 +858,8 @@ class TestAgentRunsDetail:
             agent="code-editor",
             project_id="proj-1",
         )
-        # fetchrow: session → context (not found) → parent (not called — no parent)
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        # Combined row: session + context (LEFT JOIN) + parent_internal_id
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])  # children, todos
 
         async with client as c:
@@ -883,7 +879,7 @@ class TestAgentRunsDetail:
     async def test_detail_includes_loki_url(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail includes a loki_search_url."""
         session_row = _mk_session_row(session_id=_SESSION_ID)
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -904,15 +900,10 @@ class TestAgentRunsDetail:
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             parent_session_id=parent_external,
+            parent_internal_id=parent_internal_id,
         )
 
-        # First fetchrow: session row
-        # Second fetchrow: parent resolution
-        # Third fetchrow: session context
-        parent_row = MagicMock()
-        parent_row.__getitem__.side_effect = {"id": parent_internal_id}.__getitem__
-
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, parent_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -930,7 +921,7 @@ class TestAgentRunsDetail:
             session_id=_SESSION_ID,
             parent_session_id=None,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -969,7 +960,7 @@ class TestAgentRunsDetail:
             ),
         ]
 
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[child_rows, []])
 
         async with client as c:
@@ -995,7 +986,7 @@ class TestAgentRunsDetail:
             session_id=_SESSION_ID,
             external_session_id=_EXTERNAL_ID_A,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1009,7 +1000,7 @@ class TestAgentRunsDetail:
     async def test_detail_defaults_when_no_context_or_todos(self, client: AsyncClient, mock_conn: AsyncMock):
         """Defaults (todo_rows, session_context, todo counts) when no context/todos exist."""
         session_row = _mk_session_row(session_id=_SESSION_ID)
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1046,7 +1037,7 @@ class TestAgentRunsDetail:
             cost=Decimal("0.0250"),
             message_count=20,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1071,7 +1062,7 @@ class TestAgentRunsDetail:
             agent="code-editor",
             external_session_id="ses_abc123def456",
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1093,7 +1084,7 @@ class TestAgentRunsDetail:
             last_message_at=recent,
             message_count=10,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1117,12 +1108,10 @@ class TestAgentRunsDetail:
             last_message_at=old,
             message_count=5,
             parent_session_id="ses_parent_001",
+            parent_internal_id=None,
         )
 
-        # First fetchrow: session row
-        # Second fetchrow: parent resolution (not found)
-        # Third fetchrow: session context (not found)
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1144,7 +1133,7 @@ class TestAgentRunsDetail:
             agent=None,
             external_session_id=None,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1163,15 +1152,16 @@ class TestAgentRunsDetail:
     @pytest.mark.asyncio
     async def test_detail_with_session_context(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail returns populated session_context when a context record exists."""
-        session_row = _mk_session_row(session_id=_SESSION_ID)
-        ctx_row = _mk_ctx_row(
-            title="Implement user auth",
-            session_model='{"providerID": "opencode-go", "id": "deepseek-v4-flash"}',
-            source_directory="/home/user/project/src",
+        session_row = _mk_session_row(
+            session_id=_SESSION_ID,
+            ctx_present=1,
+            ctx_title="Implement user auth",
+            ctx_session_model='{"providerID": "opencode-go", "id": "deepseek-v4-flash"}',
+            ctx_source_directory="/home/user/project/src",
             code_change_additions=120,
             code_change_deletions=30,
         )
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, ctx_row])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], []])
 
         async with client as c:
@@ -1195,7 +1185,7 @@ class TestAgentRunsDetail:
             _mk_todo_row(content="Fix login bug", status="pending", priority="high", position=1),
             _mk_todo_row(content="Write tests", status="completed", priority="medium", position=2),
         ]
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, None])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], todo_rows])
 
         async with client as c:
@@ -1217,12 +1207,16 @@ class TestAgentRunsDetail:
     @pytest.mark.asyncio
     async def test_detail_with_context_and_todos(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail returns both session_context and todo_rows when both exist."""
-        session_row = _mk_session_row(session_id=_SESSION_ID)
-        ctx_row = _mk_ctx_row(title="Refactor API", session_model="gpt-4o")
+        session_row = _mk_session_row(
+            session_id=_SESSION_ID,
+            ctx_present=1,
+            ctx_title="Refactor API",
+            ctx_session_model="gpt-4o",
+        )
         todo_rows = [
             _mk_todo_row(content="Add endpoint", status="in_progress", priority="high", position=1),
         ]
-        mock_conn.fetchrow = AsyncMock(side_effect=[session_row, ctx_row])
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
         mock_conn.fetch = AsyncMock(side_effect=[[], todo_rows])
 
         async with client as c:
@@ -1236,6 +1230,49 @@ class TestAgentRunsDetail:
         assert len(data["todo_rows"]) == 1
         assert data["todo_rows"][0]["description"] == "Add endpoint"
         assert data["todo_total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_detail_context_with_null_session_model(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Context row exists but session_model is NULL — session_context
+        MUST be populated with null model and code_changes_total MUST be correct.
+
+        Regession test for #362: has_context must detect row PRESENCE, not model
+        non-null.  ``opencode_session_contexts.session_model`` is nullable,
+        and sessions with no model assigned are a valid production state.
+        """
+        session_row = _mk_session_row(
+            session_id=_SESSION_ID,
+            ctx_present=1,
+            ctx_title="Bug fix session",
+            ctx_session_model=None,  # NULL model — valid production state
+            ctx_source_directory="/home/user/project/src",
+            code_change_count=42,
+            code_change_additions=200,
+            code_change_deletions=50,
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # session_context must exist even when model is null
+        assert data["session_context"] is not None, (
+            "session_context should be populated when context row exists, "
+            "even with NULL session_model"
+        )
+        assert data["session_context"]["title"] == "Bug fix session"
+        assert data["session_context"]["session_model"] is None
+        assert data["session_context"]["code_change_additions"] == 200
+        assert data["session_context"]["code_change_deletions"] == 50
+        # code_changes_total must reflect the context row
+        assert data["code_changes_total"] == 42, (
+            f"Expected code_changes_total=42, got {data['code_changes_total']}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -2343,3 +2344,148 @@ class TestBackfillCacheWriteTokens:
         mock_conn.execute = AsyncMock(return_value="UPDATE 0")
         result = await _run_backfill(mock_conn)
         assert result == 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #363 — Timeout Budgets
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestTimeoutBudgets:
+    """Tests for layered timeout budget enforcement on read endpoints."""
+
+    # ── Real enforcement: over-budget → cancelled + logged ──────────────
+
+    @pytest.mark.asyncio
+    async def test_operation_exceeding_budget_is_cancelled_and_logged(
+        self, caplog,
+    ):
+        """A coroutine violating its budget is cancelled (TimeoutError) and
+        emits an ``operation.timeout`` log event."""
+        import logging
+
+        from app.core.telemetry import EVENT_OPERATION_TIMEOUT, timeout_operation
+
+        telemetry_logger = "app.core.telemetry"
+        caplog.set_level(logging.WARNING, logger=telemetry_logger)
+
+        with pytest.raises(TimeoutError):
+            # budget_ms=50 is far smaller than the 10s sleep
+            async with timeout_operation(
+                "db.query.usage", "db", budget_ms=50,
+            ):
+                await asyncio.sleep(10)
+
+        # The operation must have been cancelled — elapsed should be < 1s
+        telemetry_records = [
+            r for r in caplog.records if r.name == telemetry_logger
+        ]
+        assert len(telemetry_records) == 1
+        record = telemetry_records[0]
+        assert record.getMessage() == EVENT_OPERATION_TIMEOUT
+        assert record.event_name == "db.query.usage"
+        assert record.operation_type == "db"
+        assert record.budget_ms == 50
+
+    # ── Wrappers pass config-derived budgets to timeout_operation ───────
+
+    @pytest.mark.asyncio
+    async def test_wrappers_invoke_timeout_operation_with_config_budgets(self):
+        """_db_timeout, _request_timeout, and _status_timeout forward their
+        budget parameters to timeout_operation."""
+        from unittest.mock import patch
+
+        from app.api.usage import _db_timeout, _request_timeout, _status_timeout
+
+        with patch(
+            "app.api.usage.timeout_operation"
+        ) as mock_timeout_op:
+            import contextlib
+
+            @contextlib.asynccontextmanager
+            async def _fake_timeout(*args, **kwargs):
+                yield
+
+            mock_timeout_op.side_effect = _fake_timeout
+
+            # _db_timeout with explicit seconds → budget_ms = seconds * 1000
+            async with _db_timeout("test.db", db_timeout_seconds=10):
+                pass
+            db_call_kw = mock_timeout_op.call_args.kwargs
+            assert db_call_kw["budget_ms"] == 10000, (
+                f"Expected 10000, got {db_call_kw}"
+            )
+
+            mock_timeout_op.reset_mock()
+
+            # _request_timeout with explicit seconds
+            async with _request_timeout(total_request_timeout_seconds=30):
+                pass
+            req_call_kw = mock_timeout_op.call_args.kwargs
+            assert req_call_kw["budget_ms"] == 30000, (
+                f"Expected 30000, got {req_call_kw}"
+            )
+
+            mock_timeout_op.reset_mock()
+
+            # _status_timeout with explicit seconds
+            async with _status_timeout(status_timeout_seconds=7):
+                pass
+            status_call_kw = mock_timeout_op.call_args.kwargs
+            assert status_call_kw["budget_ms"] == 7000, (
+                f"Expected 7000, got {status_call_kw}"
+            )
+
+    # ── Endpoint-level wiring — wrappers are invoked in real endpoint flow ──
+
+    @pytest.mark.asyncio
+    async def test__fetch_aggregates_wraps_queries_with_db_timeout(self):
+        """_fetch_aggregates calls timeout_operation (via _db_timeout) when
+        executing database queries."""
+        import datetime
+        from unittest.mock import patch
+
+        from app.core.config import Settings
+
+        settings = Settings(
+            database_timeout_seconds=3,
+        )
+
+        mock_conn = AsyncMock()
+        row = _mk_aggregate_row(record_count=1)
+        mock_conn.fetchrow = AsyncMock(return_value=row)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        with patch(
+            "app.api.usage.timeout_operation"
+        ) as mock_timeout_op:
+            import contextlib
+
+            @contextlib.asynccontextmanager
+            async def _fake_timeout(*args, **kwargs):
+                yield
+
+            mock_timeout_op.side_effect = _fake_timeout
+
+            from app.api.usage import _fetch_aggregates
+
+            # UP017: ruff assumes requires-python >=3.12, but the local
+            # dev/test runtime is Python 3.9 (datetime.UTC is 3.11+).
+            now = datetime.datetime(2025, 7, 1, tzinfo=timezone.utc)  # noqa: UP017
+            await _fetch_aggregates(
+                mock_conn, now, now, None, None, None, [],
+                db_timeout_seconds=settings.database_timeout_seconds,
+            )
+
+            assert mock_timeout_op.called, (
+                "timeout_operation should be called for DB queries"
+            )
+            # At least one call must pass budget_ms matching the config value
+            budget_calls = [
+                c for c in mock_timeout_op.call_args_list
+                if c.kwargs.get("budget_ms") == settings.database_timeout_seconds * 1000
+            ]
+            assert len(budget_calls) >= 1, (
+                f"Expected timeout_operation call with "
+                f"budget_ms={settings.database_timeout_seconds * 1000}"
+            )

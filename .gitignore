@@ -22,6 +22,9 @@ env/
 .coverage
 htmlcov/
 
+# Profiling output (machine-specific timings, not for version control)
+tests/fixtures/profiling-output/
+
 # Mypy
 .mypy_cache/
 

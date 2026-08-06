@@ -1,0 +1,17 @@
+{
+  "initial_load_ms": 224.758,
+  "refresh_load_ms": 217.005,
+  "initial_endpoints": 8,
+  "initial_error_count": 0,
+  "refresh_error_count": 0,
+  "endpoints": [
+    "aggregates",
+    "records",
+    "sessions",
+    "agent-runs",
+    "agent-run-detail",
+    "records-with-context",
+    "health",
+    "cursor"
+  ]
+}
