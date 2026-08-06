@@ -1392,6 +1392,15 @@ console.log('\u25B6 index.html markup (smoke check)');
     assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') === -1,
       'sessions header: retained column "' + label + '" is not marked sess-col-low');
   });
+
+  // Token vocabulary (issue #354): the KPI card label and the Client / Project
+  // Usage Breakdown tokens column header read "Active Tokens"; the legacy
+  // "Total Tokens" label is gone from the markup entirely.
+  assert(html.indexOf('<span class="kpi-label">Active Tokens</span>') !== -1,
+    'KPI card: label reads "Active Tokens"');
+  assert(html.indexOf('<th>Active Tokens</th>') !== -1,
+    'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
+  assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
 })();
 
 // ── Static CSS verification (frontend/style.css) ────────────────────────
