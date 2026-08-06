@@ -1,0 +1,274 @@
+{
+  "aggregates": {
+    "endpoint": "aggregates",
+    "p50_ms": 5.929,
+    "p95_ms": 7.611,
+    "min_ms": 5.596,
+    "max_ms": 8.094,
+    "mean_ms": 6.218,
+    "durations": [
+      7.02,
+      8.094,
+      6.331,
+      5.988,
+      5.799,
+      6.006,
+      5.733,
+      5.87,
+      5.596,
+      5.741
+    ],
+    "db_time_ms": 0.093,
+    "status_computation_time_ms": 0.0,
+    "query_count": 1,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 0,
+      "fetchrow": 1,
+      "fetchval": 0
+    }
+  },
+  "records": {
+    "endpoint": "records",
+    "p50_ms": 63.619,
+    "p95_ms": 131.441,
+    "min_ms": 49.289,
+    "max_ms": 140.018,
+    "mean_ms": 83.461,
+    "durations": [
+      58.167,
+      119.086,
+      49.289,
+      115.324,
+      55.806,
+      53.482,
+      120.959,
+      53.41,
+      69.071,
+      140.018
+    ],
+    "db_time_ms": 33.852,
+    "status_computation_time_ms": 0.0,
+    "query_count": 2,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 1,
+      "fetchrow": 0,
+      "fetchval": 1
+    }
+  },
+  "sessions": {
+    "endpoint": "sessions",
+    "p50_ms": 16.418,
+    "p95_ms": 48.065,
+    "min_ms": 14.938,
+    "max_ms": 73.729,
+    "mean_ms": 21.892,
+    "durations": [
+      16.484,
+      16.29,
+      16.478,
+      14.938,
+      16.379,
+      16.699,
+      15.991,
+      73.729,
+      15.47,
+      16.457
+    ],
+    "db_time_ms": 6.87,
+    "status_computation_time_ms": 0.0,
+    "query_count": 2,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 1,
+      "fetchrow": 0,
+      "fetchval": 1
+    }
+  },
+  "agent-runs": {
+    "endpoint": "agent-runs",
+    "p50_ms": 15.647,
+    "p95_ms": 46.728,
+    "min_ms": 14.578,
+    "max_ms": 71.799,
+    "mean_ms": 21.214,
+    "durations": [
+      16.043,
+      15.67,
+      14.578,
+      16.03,
+      15.42,
+      15.475,
+      15.418,
+      15.624,
+      16.085,
+      71.799
+    ],
+    "db_time_ms": 6.342,
+    "status_computation_time_ms": 0.0,
+    "query_count": 2,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 1,
+      "fetchrow": 0,
+      "fetchval": 1
+    }
+  },
+  "agent-run-detail": {
+    "endpoint": "agent-run-detail",
+    "p50_ms": 11.314,
+    "p95_ms": 13.602,
+    "min_ms": 10.184,
+    "max_ms": 14.771,
+    "mean_ms": 11.495,
+    "durations": [
+      11.128,
+      14.771,
+      11.095,
+      10.477,
+      11.599,
+      11.745,
+      11.499,
+      10.184,
+      10.284,
+      12.173
+    ],
+    "db_time_ms": 3.628,
+    "status_computation_time_ms": 0.248,
+    "query_count": 3,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 2,
+      "fetchrow": 1,
+      "fetchval": 0
+    }
+  },
+  "records-with-context": {
+    "endpoint": "records-with-context",
+    "p50_ms": 61.522,
+    "p95_ms": 161.993,
+    "min_ms": 52.575,
+    "max_ms": 168.507,
+    "mean_ms": 94.288,
+    "durations": [
+      52.776,
+      57.5,
+      128.258,
+      57.312,
+      168.507,
+      62.896,
+      52.575,
+      154.031,
+      60.147,
+      148.883
+    ],
+    "db_time_ms": 36.016,
+    "status_computation_time_ms": 0.0,
+    "query_count": 2,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 1,
+      "fetchrow": 0,
+      "fetchval": 1
+    }
+  },
+  "health": {
+    "endpoint": "health",
+    "p50_ms": 7.577,
+    "p95_ms": 8.908,
+    "min_ms": 6.735,
+    "max_ms": 9.035,
+    "mean_ms": 7.671,
+    "durations": [
+      8.388,
+      8.752,
+      7.806,
+      6.735,
+      7.08,
+      9.035,
+      7.348,
+      8.014,
+      6.781,
+      6.776
+    ],
+    "db_time_ms": 0.092,
+    "status_computation_time_ms": 0.0,
+    "query_count": 0,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 0,
+      "fetchrow": 0,
+      "fetchval": 0
+    }
+  },
+  "cursor": {
+    "endpoint": "cursor",
+    "p50_ms": 6.201,
+    "p95_ms": 7.9,
+    "min_ms": 5.788,
+    "max_ms": 7.907,
+    "mean_ms": 6.63,
+    "durations": [
+      5.855,
+      6.365,
+      7.487,
+      7.134,
+      7.891,
+      7.907,
+      6.037,
+      5.788,
+      5.854,
+      5.98
+    ],
+    "db_time_ms": 0.0,
+    "status_computation_time_ms": 0.0,
+    "query_count": 2,
+    "status_codes": [
+      200
+    ],
+    "error_count": 0,
+    "error_rate": 0.0,
+    "iterations": 10,
+    "db_queries": {
+      "fetch": 0,
+      "fetchrow": 2,
+      "fetchval": 0
+    }
+  }
+}

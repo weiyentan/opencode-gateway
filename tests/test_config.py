@@ -240,3 +240,61 @@ def test_settings_no_execution_era_fields(monkeypatch):
         assert not hasattr(settings, removed_field), (
             f"Execution-era field '{removed_field}' should not exist on Settings"
         )
+
+
+# ── Issue #363: Asyncpg Pool Tuning & Timeout Budgets ────────────────────
+
+
+def test_pool_tuning_setting_defaults(monkeypatch):
+    """database_max_inactive_connection_lifetime defaults to 1800."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.database_max_inactive_connection_lifetime == 1800
+
+
+def test_pool_tuning_setting_override_from_env(monkeypatch):
+    """GATEWAY_DATABASE_MAX_INACTIVE_CONNECTION_LIFETIME overrides the default."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_DATABASE_MAX_INACTIVE_CONNECTION_LIFETIME", "900")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.database_max_inactive_connection_lifetime == 900
+
+
+def test_timeout_budget_defaults(monkeypatch):
+    """Timeout budget settings have correct defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.database_timeout_seconds == 5
+    assert settings.status_computation_timeout_seconds == 2
+    assert settings.total_request_timeout_seconds == 20
+
+
+def test_timeout_budget_overrides_from_env(monkeypatch):
+    """GATEWAY_*_TIMEOUT_SECONDS env vars override timeout budget defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_DATABASE_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("GATEWAY_STATUS_COMPUTATION_TIMEOUT_SECONDS", "4")
+    monkeypatch.setenv("GATEWAY_TOTAL_REQUEST_TIMEOUT_SECONDS", "30")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.database_timeout_seconds == 10
+    assert settings.status_computation_timeout_seconds == 4
+    assert settings.total_request_timeout_seconds == 30
+
+
+def test_existing_pool_settings_unchanged(monkeypatch):
+    """Issue #363 must not change existing pool setting defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.database_min_connections == 2
+    assert settings.database_max_connections == 10
+    assert settings.database_connection_timeout == 30

@@ -11,8 +11,10 @@ exclude = ["alembic*", "frontend*", "tests*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = ["-m", "not profiling"]
 markers = [
     "integration: tests that require Docker or a real PostgreSQL instance",
+    "profiling: performance profiling benchmarks (measurement only, excluded from default CI runs)",
 ]
 
 [tool.ruff]

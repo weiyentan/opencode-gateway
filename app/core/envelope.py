@@ -37,6 +37,7 @@ _STATUS_TO_ERROR_CODE: dict[int, str] = {
     424: "FAILED_DEPENDENCY",
     500: "INTERNAL_ERROR",
     503: "SERVICE_UNAVAILABLE",
+    504: "GATEWAY_TIMEOUT",
 }
 
 
@@ -210,6 +211,29 @@ async def validation_exception_handler(
             "error": {
                 "code": "VALIDATION_ERROR",
                 "message": "Request validation failed",
+            },
+        },
+    )
+
+
+async def timeout_exception_handler(
+    request: Request, exc: TimeoutError
+) -> JSONResponse:
+    """Map request timeout expiry to HTTP 504 Gateway Timeout.
+
+    The telemetry layer (:func:`~app.core.telemetry.timeout_operation`)
+    emits a structured ``operation.timeout`` log event *before* raising
+    the exception — this handler only converts the exception into a
+    meaningful HTTP response for dashboard clients.  It does NOT swallow
+    or suppress any telemetry events.
+    """
+    return JSONResponse(
+        status_code=504,
+        content={
+            "status": "error",
+            "error": {
+                "code": "GATEWAY_TIMEOUT",
+                "message": "The request exceeded its configured time budget",
             },
         },
     )
