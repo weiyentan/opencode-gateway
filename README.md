@@ -91,6 +91,10 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MIN_CONNECTIONS` | `2` | asyncpg pool minimum size |
 | `GATEWAY_DATABASE_MAX_CONNECTIONS` | `10` | asyncpg pool maximum size |
 | `GATEWAY_DATABASE_CONNECTION_TIMEOUT` | `30` | Connection timeout in seconds |
+| `GATEWAY_DATABASE_MAX_INACTIVE_CONNECTION_LIFETIME` | `1800` | Max lifetime (seconds) of an inactive connection before asyncpg closes it |
+| `GATEWAY_DATABASE_TIMEOUT_SECONDS` | `5` | Per-query timeout budget in seconds |
+| `GATEWAY_STATUS_COMPUTATION_TIMEOUT_SECONDS` | `2` | `_compute_status` timeout budget in seconds |
+| `GATEWAY_TOTAL_REQUEST_TIMEOUT_SECONDS` | `20` | Endpoint total request timeout budget in seconds |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
 | `GATEWAY_KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap brokers (comma-separated) — used by the consumer bridge |
 | `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |

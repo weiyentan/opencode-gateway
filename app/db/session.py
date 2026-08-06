@@ -36,6 +36,9 @@ class DatabasePool:
             min_size=self._settings.database_min_connections,
             max_size=self._settings.database_max_connections,
             timeout=self._settings.database_connection_timeout,
+            max_inactive_connection_lifetime=(
+                self._settings.database_max_inactive_connection_lifetime
+            ),
         )
         if self._settings.database_ssl:
             pool_kwargs["ssl"] = self._settings.database_ssl

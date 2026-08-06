@@ -76,7 +76,16 @@ class Settings(BaseSettings):
     database_min_connections: int = 2
     database_max_connections: int = 10
     database_connection_timeout: int = 30
+    database_max_inactive_connection_lifetime: int = 1800
     database_ssl: str | None = None
+
+    # Timeout budgets (seconds) for layered request processing
+    #   database: per-query timeout via asyncio.timeout
+    #   status_computation: _compute_status timeout
+    #   total_request: endpoint-level total budget
+    database_timeout_seconds: int = 5
+    status_computation_timeout_seconds: int = 2
+    total_request_timeout_seconds: int = 20
 
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"
