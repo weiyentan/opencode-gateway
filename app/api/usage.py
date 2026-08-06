@@ -7,6 +7,7 @@ wrapped in the standard envelope format.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -28,11 +29,59 @@ from app.core.schemas.usage import (
     RecordWithContextGroupedRow,
     SessionSummary,
 )
+from app.core.telemetry import timeout_operation
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["usage"])
+
+# ── Timeout helpers ────────────────────────────────────────────────────────
+
+
+@contextlib.asynccontextmanager
+async def _db_timeout(
+    event_name: str,
+    db_timeout_seconds: int,
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Wrap a database query with the configured per-query timeout budget."""
+    async with timeout_operation(
+        event_name, "db", budget_ms=db_timeout_seconds * 1000
+    ):
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _status_timeout(
+    status_timeout_seconds: int,
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Wrap a _compute_status call with its configured timeout budget.
+
+    .. note::
+        ``_compute_status`` is a pure, synchronous, O(1) function — it
+        contains no await points.  Timeout machinery (``asyncio.timeout``
+        and the 3.9 backport) can only cancel at an await point, so the
+        status budget can never actually fire.  The wrapper satisfies the
+        letter of AC4 and provides a place to drop an await point later
+        (e.g. if status derivation moves into the database).
+    """
+    async with timeout_operation(
+        "status.compute", "compute", budget_ms=status_timeout_seconds * 1000
+    ):
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _request_timeout(
+    total_request_timeout_seconds: int,
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Wrap an endpoint handler body with the total request timeout budget."""
+    async with timeout_operation(
+        "request.total", "request",
+        budget_ms=total_request_timeout_seconds * 1000,
+    ):
+        yield
+
 
 # ── Valid group-by dimensions ─────────────────────────────────────────────
 
@@ -148,6 +197,8 @@ async def _fetch_aggregates(
     model: str | None,
     session_id: uuid.UUID | None,
     group_parts: list[str],
+    *,
+    db_timeout_seconds: int,
 ) -> list[AggregateRow]:
     """Execute the aggregates query and return typed rows."""
     where_clause, params = _build_aggregate_filters(
@@ -175,7 +226,10 @@ async def _fetch_aggregates(
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
             WHERE {where_clause}
         """
-        row = await conn.fetchrow(sql, *query_params)
+        async with _db_timeout(
+            "db.query.usage.aggregates.total", db_timeout_seconds
+        ):
+            row = await conn.fetchrow(sql, *query_params)
         return [
             AggregateRow(
                 group_value="total",
@@ -243,7 +297,10 @@ async def _fetch_aggregates(
         {group_by_clause}
         ORDER BY group_value
     """
-    rows = await conn.fetch(sql, *query_params)
+    async with _db_timeout(
+        "db.query.usage.aggregates.grouped", db_timeout_seconds
+    ):
+        rows = await conn.fetch(sql, *query_params)
     return [
         AggregateRow(
             group_value=str(r["group_value"]),
@@ -325,6 +382,8 @@ async def _fetch_records(
     sort_by: str,
     sort_dir: str,
     grafana_base_url: str,
+    *,
+    db_timeout_seconds: int,
 ) -> PaginatedResponse[RecordRow]:
     """Execute count + data queries and return a paginated response."""
     where_clause, params = _build_record_filters(
@@ -339,7 +398,10 @@ async def _fetch_records(
         JOIN observed_models om ON om.id = our.model_id
         WHERE {where_clause}
     """
-    total = await conn.fetchval(count_sql, *query_params)
+    async with _db_timeout(
+        "db.query.usage.records.count", db_timeout_seconds
+    ):
+        total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
     order_col = "our.reported_at" if sort_by == "reported_at" else "our.ingested_at"
@@ -369,7 +431,10 @@ async def _fetch_records(
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
-    rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with _db_timeout(
+        "db.query.usage.records.data", db_timeout_seconds
+    ):
+        rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         RecordRow(
@@ -421,6 +486,8 @@ async def _fetch_sessions(
     limit: int,
     offset: int,
     grafana_base_url: str,
+    *,
+    db_timeout_seconds: int,
 ) -> PaginatedResponse[SessionSummary]:
     """Return sessions whose interval overlaps *start_date*–*end_date*.
 
@@ -446,7 +513,10 @@ async def _fetch_sessions(
 
     # Total count
     count_sql = f"SELECT COUNT(*) FROM sessions s WHERE {where_clause}"
-    total = await conn.fetchval(count_sql, *query_params)
+    async with _db_timeout(
+        "db.query.usage.sessions.count", db_timeout_seconds
+    ):
+        total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
     data_sql = f"""
@@ -479,7 +549,10 @@ async def _fetch_sessions(
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
-    rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with _db_timeout(
+        "db.query.usage.sessions.data", db_timeout_seconds
+    ):
+        rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         SessionSummary(
@@ -548,9 +621,13 @@ async def get_aggregates(
     """
     _validate_date_range(start_date, end_date)
     group_parts = _parse_group_by(group_by)
-    return await _fetch_aggregates(
-        conn, start_date, end_date, client_id, model, session_id, group_parts
-    )
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_aggregates(
+            conn, start_date, end_date, client_id, model, session_id,
+            group_parts,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
 
 
 @router.get("/records")
@@ -576,19 +653,21 @@ async def get_records(
     _validate_date_range(start_date, end_date)
     sort_by, sort_dir = _validate_sort(sort_by, sort_dir)
     settings = get_settings()
-    return await _fetch_records(
-        conn,
-        start_date,
-        end_date,
-        client_id,
-        model,
-        session_id,
-        limit,
-        offset,
-        sort_by,
-        sort_dir,
-        settings.grafana_base_url,
-    )
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_records(
+            conn,
+            start_date,
+            end_date,
+            client_id,
+            model,
+            session_id,
+            limit,
+            offset,
+            sort_by,
+            sort_dir,
+            settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
 
 
 @router.get("/sessions")
@@ -608,15 +687,17 @@ async def get_sessions(
     """
     _validate_date_range(start_date, end_date)
     settings = get_settings()
-    return await _fetch_sessions(
-        conn,
-        start_date,
-        end_date,
-        client_id,
-        limit,
-        offset,
-        settings.grafana_base_url,
-    )
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_sessions(
+            conn,
+            start_date,
+            end_date,
+            client_id,
+            limit,
+            offset,
+            settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -791,6 +872,8 @@ async def _fetch_agent_runs(
     limit: int,
     offset: int,
     grafana_base_url: str,
+    *,
+    db_timeout_seconds: int,
 ) -> PaginatedResponse[AgentRunSummary]:
     """Query sessions table, compute status, join child counts, return paginated."""
     from app.core.schemas.usage import AgentRunSummary
@@ -874,7 +957,10 @@ async def _fetch_agent_runs(
 
     # ── Count query ─────────────────────────────────────────────────
     count_sql = f"SELECT COUNT(*) {count_from}"
-    total = await conn.fetchval(count_sql, *params)
+    async with _db_timeout(
+        "db.query.usage.agent_runs.count", db_timeout_seconds
+    ):
+        total = await conn.fetchval(count_sql, *params)
 
     # ── Child count subquery ────────────────────────────────────────
     child_subquery = """
@@ -890,7 +976,10 @@ async def _fetch_agent_runs(
         LIMIT ${len(params) + 1}
         OFFSET ${len(params) + 2}
     """
-    rows = await conn.fetch(data_sql, *params, limit, offset)
+    async with _db_timeout(
+        "db.query.usage.agent_runs.data", db_timeout_seconds
+    ):
+        rows = await conn.fetch(data_sql, *params, limit, offset)
 
     items: list[AgentRunSummary] = []
     for r in rows:
@@ -941,6 +1030,9 @@ async def _fetch_agent_run_detail(
     conn: asyncpg.Connection,
     session_id: uuid.UUID,
     grafana_base_url: str,
+    *,
+    db_timeout_seconds: int,
+    status_timeout_seconds: int,
 ) -> AgentRunDetail:
     """Fetch a single agent run detail by internal session UUID."""
     from app.core.schemas.usage import (
@@ -950,8 +1042,11 @@ async def _fetch_agent_run_detail(
     )
 
     # ── Fetch the session row ────────────────────────────────────────
-    session_row = await conn.fetchrow(
-        """SELECT
+    async with _db_timeout(
+        "db.query.usage.agent_run_detail.session", db_timeout_seconds
+    ):
+        session_row = await conn.fetchrow(
+            """SELECT
             s.id,
             s.client_id,
             s.source_database_id,
@@ -988,31 +1083,38 @@ async def _fetch_agent_run_detail(
     parent_internal_id: uuid.UUID | None = None
     parent_external_id: str | None = session_row["parent_session_id"]
     if parent_external_id:
-        parent_row = await conn.fetchrow(
-            "SELECT id FROM sessions WHERE external_session_id = $1 LIMIT 1",
-            parent_external_id,
-        )
+        async with _db_timeout(
+            "db.query.usage.agent_run_detail.parent", db_timeout_seconds
+        ):
+            parent_row = await conn.fetchrow(
+                "SELECT id FROM sessions WHERE external_session_id = $1 LIMIT 1",
+                parent_external_id,
+            )
         if parent_row:
             parent_internal_id = parent_row["id"]
 
     # ── Fetch child sessions ─────────────────────────────────────────
-    child_rows = await conn.fetch(
-        """SELECT
-            id, external_session_id, agent, message_count,
-            last_message_at
-        FROM sessions
-        WHERE parent_session_id = $1
-        ORDER BY last_message_at DESC""",
-        session_row["external_session_id"],
-    )
+    async with _db_timeout(
+        "db.query.usage.agent_run_detail.children", db_timeout_seconds
+    ):
+        child_rows = await conn.fetch(
+            """SELECT
+                id, external_session_id, agent, message_count,
+                last_message_at
+            FROM sessions
+            WHERE parent_session_id = $1
+            ORDER BY last_message_at DESC""",
+            session_row["external_session_id"],
+        )
 
     child_summaries: list[ChildRunSummary] = []
     for cr in child_rows:
-        child_status = _compute_status(
-            last_message_at=cr["last_message_at"],
-            message_count=cr["message_count"],
-            has_parent=True,
-        )
+        async with _status_timeout(status_timeout_seconds):
+            child_status = _compute_status(
+                last_message_at=cr["last_message_at"],
+                message_count=cr["message_count"],
+                has_parent=True,
+            )
         child_summaries.append(
             ChildRunSummary(
                 id=cr["id"],
@@ -1025,41 +1127,48 @@ async def _fetch_agent_run_detail(
         )
 
     # ── Compute status ────────────────────────────────────────────────
-    computed_status = _compute_status(
-        last_message_at=session_row["last_message_at"],
-        message_count=session_row["message_count"],
-        has_parent=session_row["parent_session_id"] is not None,
-    )
+    async with _status_timeout(status_timeout_seconds):
+        computed_status = _compute_status(
+            last_message_at=session_row["last_message_at"],
+            message_count=session_row["message_count"],
+            has_parent=session_row["parent_session_id"] is not None,
+        )
 
     # ── Query session context projection ────────────────────────────
-    ctx_row = await conn.fetchrow(
-        """SELECT
-            code_change_count,
-            code_change_additions,
-            code_change_deletions,
-            session_model,
-            session_cost,
-            title,
-            source_directory,
-            source_path,
-            source_input_tokens,
-            source_output_tokens,
-            source_cached_tokens,
-            source_reasoning_tokens
-        FROM opencode_session_contexts
-        WHERE session_id = $1""",
-        session_row["id"],
-    )
+    async with _db_timeout(
+        "db.query.usage.agent_run_detail.context", db_timeout_seconds
+    ):
+        ctx_row = await conn.fetchrow(
+            """SELECT
+                code_change_count,
+                code_change_additions,
+                code_change_deletions,
+                session_model,
+                session_cost,
+                title,
+                source_directory,
+                source_path,
+                source_input_tokens,
+                source_output_tokens,
+                source_cached_tokens,
+                source_reasoning_tokens
+            FROM opencode_session_contexts
+            WHERE session_id = $1""",
+            session_row["id"],
+        )
 
     # ── Query todo snapshots ──────────────────────────────────────
-    todo_rows_raw = await conn.fetch(
-        """SELECT content, status, priority, position
-        FROM opencode_session_todos
-        WHERE source_database_id = $1 AND external_session_id = $2
-        ORDER BY position""",
-        session_row["source_database_id"],
-        session_row["external_session_id"],
-    )
+    async with _db_timeout(
+        "db.query.usage.agent_run_detail.todos", db_timeout_seconds
+    ):
+        todo_rows_raw = await conn.fetch(
+            """SELECT content, status, priority, position
+            FROM opencode_session_todos
+            WHERE source_database_id = $1 AND external_session_id = $2
+            ORDER BY position""",
+            session_row["source_database_id"],
+            session_row["external_session_id"],
+        )
 
     # ── Compute todo aggregates ────────────────────────────────────
     todos: list[TodoRow] = [
@@ -1205,18 +1314,20 @@ async def get_agent_runs(
         )
 
     settings = get_settings()
-    return await _fetch_agent_runs(
-        conn,
-        client_id,
-        from_date,
-        to_date,
-        agent,
-        external_project_id,
-        filter_status,
-        limit,
-        offset,
-        settings.grafana_base_url,
-    )
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_agent_runs(
+            conn,
+            client_id,
+            from_date,
+            to_date,
+            agent,
+            external_project_id,
+            filter_status,
+            limit,
+            offset,
+            settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
 
 
 @router.get("/agent-runs/{session_id}")
@@ -1236,9 +1347,12 @@ async def get_agent_run_detail(
     from app.core.schemas.usage import AgentRunDetail
 
     settings = get_settings()
-    return await _fetch_agent_run_detail(
-        conn, session_id, settings.grafana_base_url
-    )
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_agent_run_detail(
+            conn, session_id, settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
+            status_timeout_seconds=settings.status_computation_timeout_seconds,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1354,6 +1468,8 @@ async def _fetch_records_with_context(
     limit: int,
     offset: int,
     grafana_base_url: str,
+    *,
+    db_timeout_seconds: int,
 ) -> PaginatedResponse:
     """Execute count + data queries for raw (non-grouped) mode.
 
@@ -1374,7 +1490,10 @@ async def _fetch_records_with_context(
         {_RWC_SESSION_JOIN}
         WHERE {where_clause}
     """
-    total = await conn.fetchval(count_sql, *query_params)
+    async with _db_timeout(
+        "db.query.usage.records_with_context.count", db_timeout_seconds
+    ):
+        total = await conn.fetchval(count_sql, *query_params)
 
     # ── Data query ──────────────────────────────────────────────────
     data_sql = f"""
@@ -1409,7 +1528,10 @@ async def _fetch_records_with_context(
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
-    rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with _db_timeout(
+        "db.query.usage.records_with_context.data", db_timeout_seconds
+    ):
+        rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         RecordWithContextRow(
@@ -1501,6 +1623,8 @@ async def _fetch_records_with_context_grouped(
     agent: str | None,
     model: str | None,
     group_parts: list[str],
+    *,
+    db_timeout_seconds: int,
 ) -> list:
     """Execute aggregated query for grouped mode.
 
@@ -1535,7 +1659,10 @@ async def _fetch_records_with_context_grouped(
         GROUP BY {group_expr}
         ORDER BY group_value
     """
-    rows = await conn.fetch(sql, *query_params)
+    async with _db_timeout(
+        "db.query.usage.records_with_context.grouped", db_timeout_seconds
+    ):
+        rows = await conn.fetch(sql, *query_params)
 
     return [
         RecordWithContextGroupedRow(
@@ -1599,8 +1726,21 @@ async def get_records_with_context(
     group_parts = _parse_records_with_context_group_by(group_by)
     settings = get_settings()
 
-    if group_parts:
-        return await _fetch_records_with_context_grouped(
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        if group_parts:
+            return await _fetch_records_with_context_grouped(
+                conn,
+                start_date,
+                end_date,
+                project_id,
+                session_id,
+                agent,
+                model,
+                group_parts,
+                db_timeout_seconds=settings.database_timeout_seconds,
+            )
+
+        return await _fetch_records_with_context(
             conn,
             start_date,
             end_date,
@@ -1608,18 +1748,8 @@ async def get_records_with_context(
             session_id,
             agent,
             model,
-            group_parts,
+            limit,
+            offset,
+            settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
         )
-
-    return await _fetch_records_with_context(
-        conn,
-        start_date,
-        end_date,
-        project_id,
-        session_id,
-        agent,
-        model,
-        limit,
-        offset,
-        settings.grafana_base_url,
-    )

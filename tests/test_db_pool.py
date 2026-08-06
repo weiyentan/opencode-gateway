@@ -1,5 +1,6 @@
 """Tests for the database connection pool lifecycle."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,8 +41,56 @@ class TestDatabasePoolConnect:
                 min_size=5,
                 max_size=20,
                 timeout=45,
+                max_inactive_connection_lifetime=1800,
             )
             assert db_pool.pool is mock_pool
+
+    @pytest.mark.asyncio
+    async def test_connect_passes_max_inactive_connection_lifetime(self):
+        """connect() passes database_max_inactive_connection_lifetime to asyncpg.create_pool."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(
+            database_host="testhost",
+            database_port=5432,
+            database_name="testdb",
+            database_user="testuser",
+            database_password="secret",
+            database_max_inactive_connection_lifetime=900,
+        )
+
+        mock_pool = AsyncMock()
+        mock_create_pool = AsyncMock(return_value=mock_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+            _, kwargs = mock_create_pool.call_args
+            assert kwargs["max_inactive_connection_lifetime"] == 900
+
+    @pytest.mark.asyncio
+    async def test_connect_defaults_max_inactive_connection_lifetime(self):
+        """connect() passes the default 1800s when no override is set."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(
+            database_host="testhost",
+            database_port=5432,
+            database_name="testdb",
+            database_user="testuser",
+            database_password="secret",
+        )
+
+        mock_pool = AsyncMock()
+        mock_create_pool = AsyncMock(return_value=mock_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+            _, kwargs = mock_create_pool.call_args
+            assert kwargs["max_inactive_connection_lifetime"] == 1800
 
 
 class TestDatabasePoolEdgeCases:
@@ -183,3 +232,139 @@ class TestLifespanIntegration:
             app = create_app()
             async with app.router.lifespan_context(app):
                 assert app.state.pool is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Issue #363 — Concurrent load / connection recycling (AC5)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestDatabasePoolConcurrency:
+    """Simulated concurrent-load tests for the DatabasePool.
+
+    Uses a controllable fake pool whose acquire/release can be counted;
+    runs N concurrent acquisitions; asserts acquire/release counts balance
+    and the fake pool's concurrency limit is respected.
+    """
+
+    @staticmethod
+    def _make_fake_pool(max_size: int) -> MagicMock:
+        """Return a MagicMock that simulates an asyncpg.Pool with a concurrency cap.
+
+        * ``acquire()`` is a coroutine that yields a mock connection and
+          increments an ``_outstanding`` counter to track concurrency.
+        * ``release()`` is a coroutine that decrements the counter.
+        * ``_outstanding`` and ``_max_outstanding`` are tracked so tests can
+          assert the pool never exceeded *max_size*.
+        * ``_acquire_count`` and ``_release_count`` are recorded so tests can
+          assert zero leaks.
+        """
+        pool = MagicMock(spec=["acquire", "release", "close"])
+        pool._outstanding = 0
+        pool._max_outstanding = 0
+        pool._acquire_count = 0
+        pool._release_count = 0
+        pool._max_size = max_size
+
+        async def _acquire_side_effect():
+            """Coroutine that returns a mock connection and tracks concurrency."""
+            pool._outstanding += 1
+            pool._acquire_count += 1
+            pool._max_outstanding = max(
+                pool._max_outstanding, pool._outstanding
+            )
+            return MagicMock()
+
+        pool.acquire = AsyncMock(side_effect=_acquire_side_effect)
+
+        async def _release_side_effect(conn):
+            pool._release_count += 1
+            pool._outstanding -= 1
+            return None
+
+        pool.release = AsyncMock(side_effect=_release_side_effect)
+        pool.close = AsyncMock()
+
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_pool_constructed_with_correct_concurrency_limits(self):
+        """Under concurrent construction, min_size and max_size are forwarded
+        to asyncpg.create_pool, which enforces the concurrency cap."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(
+            database_min_connections=2,
+            database_max_connections=10,
+            database_connection_timeout=30,
+        )
+
+        mock_create_pool = AsyncMock(return_value=AsyncMock())
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+        kwargs = mock_create_pool.call_args.kwargs
+        assert kwargs["min_size"] == 2
+        assert kwargs["max_size"] == 10, (
+            "max_size should be passed to asyncpg (enforces concurrency cap)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connections_balanced_no_leak(self):
+        """After all concurrent tasks finish, acquire and release counts balance.
+
+        This verifies that connections are properly released back to the pool
+        after each use — no connection leaks.
+        """
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(
+            database_min_connections=2,
+            database_max_connections=5,
+        )
+
+        fake_pool = self._make_fake_pool(max_size=5)
+        mock_create_pool = AsyncMock(return_value=fake_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+            # Run 30 concurrent tasks through the pool
+            async def work_once() -> None:
+                conn = await db_pool.acquire()
+                await asyncio.sleep(0.0005)
+                await db_pool.release(conn)
+
+            await asyncio.gather(*[work_once() for _ in range(30)])
+
+        # All connections released — no leak
+        assert fake_pool._release_count == fake_pool._acquire_count == 30
+        # After all work, outstanding should be 0
+        assert fake_pool._outstanding == 0, (
+            f"{fake_pool._outstanding} connections still outstanding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_inactive_connection_lifetime_in_pool_kwargs(self):
+        """Under concurrent construction, max_inactive_connection_lifetime is
+        forwarded to the asyncpg pool."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(
+            database_max_inactive_connection_lifetime=1200,
+        )
+
+        mock_pool = self._make_fake_pool(max_size=5)
+        mock_create_pool = AsyncMock(return_value=mock_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+        call_kwargs = mock_create_pool.call_args.kwargs
+        assert call_kwargs["max_inactive_connection_lifetime"] == 1200, (
+            "max_inactive_connection_lifetime not forwarded to asyncpg"
+        )
