@@ -78,6 +78,7 @@ var appJsSandbox = null;
   window.resolvePanelStatuses = sandboxWindow.resolvePanelStatuses;
   window.formatClockTime = sandboxWindow.formatClockTime;
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
+  window.kpiSubtitle = sandboxWindow.kpiSubtitle;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1598,6 +1599,60 @@ console.log('\u25B6 header last-refreshed clock (issue #357)');
   assert(window.formatClockTime(e) === '23:59:59', 'formatClockTime renders HH:MM:SS (23:59:59)');
 })();
 
+// ── KPI subtitle split (issue #358) ─────────────────────────────────────
+// Historical KPIs (Active Tokens, Est. Cost, Sessions) keep the selected
+// date range as their subtitle — they are date-range aggregates.  Current-
+// health KPIs (Healthy Collectors, Source Databases) are live snapshots:
+// they show "As of HH:MM:SS" from the last completed refresh (issue #357's
+// lastRefreshedAt) or "Current" before any refresh completes.  Exercised
+// through the vm-sandbox export of the production kpiSubtitle helper.
+
+console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
+
+(function () {
+  var rangeLabel = 'Jul 1\u201327, 2026';
+
+  // Historical KPIs keep the date-range subtitle — with and without a
+  // completed refresh (their aggregates are range-scoped either way).
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions'].forEach(function (kpiId) {
+    assert(window.kpiSubtitle(kpiId, rangeLabel, null) === rangeLabel,
+      kpiId + ': historical KPI keeps the date-range subtitle (no refresh yet)');
+    assert(window.kpiSubtitle(kpiId, rangeLabel, new Date(2026, 6, 6, 23, 59, 59)) === rangeLabel,
+      kpiId + ': historical KPI keeps the date-range subtitle after a refresh');
+  });
+
+  // Current-health KPIs show the As-of timestamp once a refresh completed
+  var t = new Date(2026, 6, 6, 23, 59, 59);
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, t) === 'As of 23:59:59',
+    'kpi-collectors: current-health KPI shows "As of 23:59:59"');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t) === 'As of 23:59:59',
+    'kpi-source-dbs: current-health KPI shows "As of 23:59:59"');
+
+  // The As-of timestamp reuses the header clock formatting (formatClockTime)
+  var m = new Date(2026, 0, 2, 3, 4, 5);
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, m) === 'As of ' + window.formatClockTime(m),
+    'kpi-collectors: As-of timestamp matches formatClockTime (shared with the header clock)');
+
+  // Label shape is exactly "As of HH:MM:SS"
+  assert(/^As of \d{2}:\d{2}:\d{2}$/.test(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t)),
+    'kpi-source-dbs: current-health label matches the "As of HH:MM:SS" format');
+
+  // Before the first refresh completes (no lastRefreshedAt) → "Current"
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, null) === 'Current',
+    'kpi-collectors: no refresh yet \u2192 "Current" fallback');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, undefined) === 'Current',
+    'kpi-source-dbs: no refresh yet \u2192 "Current" fallback');
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, 'not-a-date') === 'Current',
+    'kpi-collectors: invalid refresh value \u2192 "Current" fallback');
+
+  // The UI must not imply collector health is aggregated historically:
+  // the current-health subtitle never carries the date-range label.
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, t).indexOf(rangeLabel) === -1,
+    'kpi-collectors: subtitle never carries the date-range label');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t).indexOf(rangeLabel) === -1,
+    'kpi-source-dbs: subtitle never carries the date-range label');
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
@@ -1656,6 +1711,15 @@ console.log('\u25B6 index.html markup (smoke check)');
   assert(html.indexOf('<th>Active Tokens</th>') !== -1,
     'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
   assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
+
+  // KPI subtitle spans (issue #358): all five KPI cards carry a .kpi-sub
+  // detail span (historical cards keep the date range; current-health
+  // cards show the As-of timestamp — renderKPIs targets these elements).
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs']
+    .forEach(function (kpiId) {
+      assert(html.indexOf('id="' + kpiId + '-detail"') !== -1,
+        'KPI card: subtitle span #' + kpiId + '-detail exists in the markup');
+    });
 
   // Freshness indicators (issue #357): the header carries a labeled
   // "Last refreshed" clock, and each instrumented panel carries a

@@ -628,6 +628,44 @@
     });
   }
 
+  // ── KPI card classification (issue #358) ───────────────────────────────
+  // Historical KPIs aggregate usage over the selected date range, so their
+  // subtitles keep the range label.  Current-health KPIs (Healthy
+  // Collectors, Source Databases) are live snapshots from /health — they
+  // must not be presented as historical aggregates, so their subtitles
+  // show "As of HH:MM:SS" instead of the date range.
+  const KPI_TYPES = {
+    'kpi-tokens':     'historical', // Active Tokens — date-range aggregate
+    'kpi-cost':       'historical', // Est. Cost (USD) — date-range aggregate
+    'kpi-sessions':   'historical', // Sessions — date-range aggregate
+    'kpi-collectors': 'current',    // Healthy Collectors — live health snapshot
+    'kpi-source-dbs': 'current',    // Source Databases — live health snapshot
+  };
+
+  /** Resolve a KPI card subtitle.
+   *  Historical KPIs return the formatted date-range label unchanged.
+   *  Current-health KPIs return "As of HH:MM:SS" from the last completed
+   *  refresh cycle (issue #357's lastRefreshedAt, shared with the header
+   *  clock), falling back to "Current" before the first refresh completes.
+   *  Pure — no DOM access — so the Node test harness can exercise it
+   *  through the vm-sandbox exports.
+   *  @param {string} kpiId          e.g. 'kpi-tokens' | 'kpi-collectors'
+   *  @param {string} dateRangeLabel formatted range label (e.g. "Jul 1–27, 2026")
+   *  @param {*}      lastRefreshedAt Date of the last completed refresh
+   *                                 cycle, or null before the first one
+   *  @returns {string} subtitle text */
+  function kpiSubtitle(kpiId, dateRangeLabel, lastRefreshedAt) {
+    if (KPI_TYPES[kpiId] !== 'current') return dateRangeLabel;
+    // Duck-type the timestamp instead of instanceof Date so Dates created
+    // in another realm (e.g. the Node test harness) validate correctly.
+    if (lastRefreshedAt == null ||
+        typeof lastRefreshedAt.getTime !== 'function' ||
+        isNaN(lastRefreshedAt.getTime())) {
+      return 'Current';
+    }
+    return 'As of ' + formatClockTime(lastRefreshedAt);
+  }
+
   // ── API Fetch (with envelope unwrapping) ──────────────────────────────
 
   async function apiFetch(path) {
@@ -803,12 +841,16 @@
       rangeLabel = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
     }
 
-    // Set all KPI subtitles to the formatted range label
-    els.kpiTokensDetail.textContent = rangeLabel;
-    els.kpiCostDetail.textContent = rangeLabel;
-    els.kpiSessionsDetail.textContent = rangeLabel;
-    els.kpiCollectorsDetail.textContent = rangeLabel;
-    els.kpiSourceDbsDetail.textContent = rangeLabel;
+    // Set KPI subtitles: historical KPIs (Active Tokens, Est. Cost,
+    // Sessions) show the selected date range; current-health KPIs
+    // (Healthy Collectors, Source Databases) show "As of HH:MM:SS" from
+    // the last completed refresh (or "Current" before any refresh) — a
+    // live snapshot, never a historical aggregate (issue #358).
+    els.kpiTokensDetail.textContent = kpiSubtitle('kpi-tokens', rangeLabel, lastRefreshedAt);
+    els.kpiCostDetail.textContent = kpiSubtitle('kpi-cost', rangeLabel, lastRefreshedAt);
+    els.kpiSessionsDetail.textContent = kpiSubtitle('kpi-sessions', rangeLabel, lastRefreshedAt);
+    els.kpiCollectorsDetail.textContent = kpiSubtitle('kpi-collectors', rangeLabel, lastRefreshedAt);
+    els.kpiSourceDbsDetail.textContent = kpiSubtitle('kpi-source-dbs', rangeLabel, lastRefreshedAt);
 
     // Total tokens from aggregates total row
     if (data.aggTotal && data.aggTotal.length > 0) {
@@ -1942,6 +1984,7 @@
   window.shouldRenderPanel = shouldRenderPanel;
   window.resolvePanelStatuses = resolvePanelStatuses;
   window.formatClockTime = formatClockTime;
+  window.kpiSubtitle = kpiSubtitle;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };
