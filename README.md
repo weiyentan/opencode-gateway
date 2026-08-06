@@ -95,6 +95,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_TIMEOUT_SECONDS` | `5` | Per-query timeout budget in seconds |
 | `GATEWAY_STATUS_COMPUTATION_TIMEOUT_SECONDS` | `2` | `_compute_status` timeout budget in seconds |
 | `GATEWAY_TOTAL_REQUEST_TIMEOUT_SECONDS` | `20` | Endpoint total request timeout budget in seconds |
+| `GATEWAY_OPERATION_TIMEOUT_MS` | `30000` | Default per-operation timeout budget in milliseconds. Read directly by the telemetry module (`app/core/telemetry.py`) and applied when an operation specifies no explicit budget |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
 | `GATEWAY_KAFKA_BROKERS` | `localhost:9092` | Kafka bootstrap brokers (comma-separated) — used by the consumer bridge |
 | `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |
@@ -104,6 +105,8 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
+
+> **Observability:** The Gateway emits structured timing log events — `request.completed` (per-request wall-clock duration, status code, endpoint, correlation ID), `operation.completed` (per-database-query/operation duration and success), and `operation.timeout` (deadline expiry, with the budget). Event data lives in structured `extra` fields, never in interpolated log strings, and contains no raw SQL or sensitive payload data. Each request receives a correlation ID propagated via the `X-Correlation-ID` request/response header; operation events within the request inherit it, which helps correlate latency in log aggregation tools.
 
 ### Run
 
@@ -124,6 +127,8 @@ uvicorn app.main:app
 ```bash
 pytest tests/ -v
 ```
+
+Performance profiling benchmarks (`tests/test_read_path_perf.py`) are marked `profiling` and excluded from the default run (`-m not profiling`). Run them explicitly with `pytest tests/test_read_path_perf.py -m profiling`. Baseline JSONs in `tests/fixtures/` are committed; set `REGENERATE_BASELINES=1` to force regeneration, and note profiling output is written to a gitignored `tests/fixtures/profiling-output/` directory.
 
 ### Verify
 
@@ -300,6 +305,7 @@ opencode-gateway/
 │   │   ├── loki.py               # Grafana Explore URL builder
 │   │   ├── logging.py            # RedactingFormatter
 │   │   ├── secrets.py            # Secret detection utilities
+│   │   ├── telemetry.py          # Request timing middleware, operation/timeout helpers, structured timing log events
 │   │   └── schemas/
 │   │       ├── __init__.py
 │   │       ├── identity.py       # Pydantic schemas for clients & tokens
