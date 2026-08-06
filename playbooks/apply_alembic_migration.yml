@@ -1,0 +1,76 @@
+---
+# Run Alembic migration on opencode-gateway production database.
+# Executes `alembic upgrade head` inside the gateway pod which has
+# alembic pre-installed, then verifies indexes were created.
+#
+# Requires:
+#   - Kubernetes credential with access to the opencode-gateway namespace
+#   - Kubectl available on the controller node
+#
+# Usage (AWX extra_vars):
+#   migration_file: "0019_add_performance_indexes.py"  # optional, defaults to head
+
+- name: Apply Alembic migration to opencode-gateway database
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Get gateway pod name (latest rollout)
+      ansible.builtin.shell: |
+        kubectl get pods -n opencode-gateway \
+          -l component=gateway \
+          -o jsonpath='{.items[0].metadata.name}'
+      register: gateway_pod_name
+      changed_when: false
+
+    - name: Set gateway pod fact
+      ansible.builtin.set_fact:
+        gw_pod: "{{ gateway_pod_name.stdout }}"
+
+    - name: Display target pod
+      ansible.builtin.debug:
+        msg: "Targeting gateway pod: {{ gw_pod }} in namespace: opencode-gateway"
+
+    - name: Verify migration file exists in pod source
+      ansible.builtin.shell: |
+        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
+          test -f /app/alembic/versions/{{ migration_file | default('0019_add_performance_indexes.py') }}
+      register: migration_check
+      changed_when: false
+      failed_when: migration_check.rc != 0
+
+    - name: Run alembic upgrade head
+      ansible.builtin.shell: |
+        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
+          alembic upgrade head
+      register: alembic_output
+      changed_when: "'already at' not in alembic_output.stdout"
+
+    - name: Display alembic output
+      ansible.builtin.debug:
+        var: alembic_output.stdout_lines
+
+    - name: Check alembic migration status
+      ansible.builtin.shell: |
+        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
+          alembic current
+      register: alembic_current
+      changed_when: false
+
+    - name: Display current migration revision
+      ansible.builtin.debug:
+        var: alembic_current.stdout_lines
+
+    - name: Verify performance indexes exist via psql
+      ansible.builtin.shell: |
+        kubectl exec -n opencode-gateway \
+          $(kubectl get pods -n opencode-gateway \
+            -l cluster-name=opencode-gateway-db \
+            -o jsonpath='{.items[0].metadata.name}') -- \
+          psql -U opencode -d opencode_gateway \
+            -c "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_our_%' OR indexname LIKE 'idx_sessions_%' ORDER BY indexname;"
+      register: indexes_check
+      changed_when: false
+
+    - name: Display verified indexes
+      ansible.builtin.debug:
+        var: indexes_check.stdout_lines
