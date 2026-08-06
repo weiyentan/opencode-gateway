@@ -1,47 +1,86 @@
 ---
 # Run Alembic migration on opencode-gateway production database.
-# Executes `alembic upgrade head` inside the gateway pod which has
-# alembic pre-installed, then verifies indexes were created.
+# Connects directly to the CloudNative PG primary instance via its
+# service endpoint using psql, then verifies indexes were created.
 #
 # Requires:
-#   - Kubernetes credential with access to the opencode-gateway namespace
-#   - Kubectl available on the controller node
+#   - Database connection details via extra_vars or env vars
+#     DB_HOST (default: opencode-gateway-db-primary.opencode-gateway.svc.cluster.local)
+#     DB_PORT (default: 5432)
+#     DB_NAME (default: opencode_gateway)
+#     DB_USER (default: opencode)
+#     DB_PASSWORD (must be provided via vault or secure launch)
 #
 # Usage (AWX extra_vars):
-#   migration_file: "0019_add_performance_indexes.py"  # optional, defaults to head
+#   db_password: "your-secret-password"  # required
 
 - name: Apply Alembic migration to opencode-gateway database
   hosts: localhost
   gather_facts: false
+  vars:
+    db_host: "{{ lookup('env', 'DB_HOST') | default('opencode-gateway-db-primary.opencode-gateway.svc.cluster.local', true) }}"
+    db_port: "{{ lookup('env', 'DB_PORT') | default('5432', true) }}"
+    db_name: "{{ lookup('env', 'DB_NAME') | default('opencode_gateway', true) }}"
+    db_user: "{{ lookup('env', 'DB_USER') | default('opencode', true) }}"
+    db_password: "{{ db_password | default('', true) }}"
+    migration_file: "0019_add_performance_indexes.py"
+
   tasks:
-    - name: Get gateway pod name (latest rollout)
-      ansible.builtin.shell: |
-        kubectl get pods -n opencode-gateway \
-          -l component=gateway \
-          -o jsonpath='{.items[0].metadata.name}'
-      register: gateway_pod_name
+    - name: Validate database password is provided
+      ansible.builtin.fail:
+        msg: "db_password must be provided via extra_vars or Vault for security"
+      when: db_password == ''
+
+    - name: Check if migration file exists in project
+      ansible.builtin.stat:
+        path: "/var/lib/awx/projects/{{ item }}/alembic/versions/{{ migration_file }}"
+      loop: "{{ ansible_playbook_names | default(['opencode-gateway']) }}"
+      register: migration_file_check
       changed_when: false
 
-    - name: Set gateway pod fact
-      ansible.builtin.set_fact:
-        gw_pod: "{{ gateway_pod_name.stdout }}"
+    - name: Verify alembic.ini exists
+      ansible.builtin.stat:
+        path: /var/lib/awx/projects/opencode-gateway/alembic.ini
+      register: alembic_ini_check
+      changed_when: false
 
-    - name: Display target pod
+    - name: Display alembic.ini status
       ansible.builtin.debug:
-        msg: "Targeting gateway pod: {{ gw_pod }} in namespace: opencode-gateway"
+        var: alembic_ini_check
 
-    - name: Verify migration file exists in pod source
+    - name: Run alembic upgrade head via direct psql connection
       ansible.builtin.shell: |
-        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
-          test -f /app/alembic/versions/{{ migration_file | default('0019_add_performance_indexes.py') }}
-      register: migration_check
+        export PGPASSWORD="{{ db_password }}"
+        psql -h "{{ db_host }}" -p "{{ db_port }}" -U "{{ db_user }}" -d "{{ db_name }}" \
+          -c "SELECT version();"
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      register: db_version
       changed_when: false
-      failed_when: migration_check.rc != 0
+
+    - name: Display database version
+      ansible.builtin.debug:
+        var: db_version.stdout_lines
+
+    - name: Check current alembic revision
+      ansible.builtin.shell: |
+        cd /var/lib/awx/projects/opencode-gateway && \
+        alembic current
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      register: alembic_current_before
+      changed_when: false
+
+    - name: Display current alembic revision before migration
+      ansible.builtin.debug:
+        var: alembic_current_before.stdout_lines
 
     - name: Run alembic upgrade head
       ansible.builtin.shell: |
-        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
-          alembic upgrade head
+        cd /var/lib/awx/projects/opencode-gateway && \
+        alembic upgrade head
+      environment:
+        PGPASSWORD: "{{ db_password }}"
       register: alembic_output
       changed_when: "'already at' not in alembic_output.stdout"
 
@@ -49,25 +88,26 @@
       ansible.builtin.debug:
         var: alembic_output.stdout_lines
 
-    - name: Check alembic migration status
+    - name: Check alembic migration status after upgrade
       ansible.builtin.shell: |
-        kubectl exec -n opencode-gateway {{ gw_pod }} -- \
-          alembic current
-      register: alembic_current
+        cd /var/lib/awx/projects/opencode-gateway && \
+        alembic current
+      environment:
+        PGPASSWORD: "{{ db_password }}"
+      register: alembic_current_after
       changed_when: false
 
-    - name: Display current migration revision
+    - name: Display current alembic revision after migration
       ansible.builtin.debug:
-        var: alembic_current.stdout_lines
+        var: alembic_current_after.stdout_lines
 
-    - name: Verify performance indexes exist via psql
+    - name: Verify performance indexes exist
       ansible.builtin.shell: |
-        kubectl exec -n opencode-gateway \
-          $(kubectl get pods -n opencode-gateway \
-            -l cluster-name=opencode-gateway-db \
-            -o jsonpath='{.items[0].metadata.name}') -- \
-          psql -U opencode -d opencode_gateway \
-            -c "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname LIKE 'idx_our_%' OR indexname LIKE 'idx_sessions_%' ORDER BY indexname;"
+        export PGPASSWORD="{{ db_password }}"
+        psql -h "{{ db_host }}" -p "{{ db_port }}" -U "{{ db_user }}" -d "{{ db_name }}" \
+          -c "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND (indexname LIKE 'idx_our_%' OR indexname LIKE 'idx_sessions_%') ORDER BY indexname;"
+      environment:
+        PGPASSWORD: "{{ db_password }}"
       register: indexes_check
       changed_when: false
 
