@@ -22,6 +22,17 @@ var fs = require('fs');
 var vm = require('vm');
 var path = require('path');
 
+// The vm sandbox that runs app.js.  Kept in scope so tests can swap the
+// fetch stub (e.g. to count /admin/clients calls in the background-refresh
+// tests) — the sandbox object is the vm context's global object.
+var appJsSandbox = null;
+
+// Async-block completion counter for deterministic summary polling (issue N3).
+// MUST be initialized at the top of the file before any test block that
+// increments it — otherwise var hoisting leaves it undefined during the
+// ++ calls and the = 0 assignment later clobbers the counter.
+var pendingAsyncBlocks = 0;
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -57,11 +68,23 @@ var path = require('path');
     navigator: {}
   };
   sandbox.window = sandboxWindow;
+  appJsSandbox = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'app.js' });
 
   window.resolveProjectLabel = sandboxWindow.resolveProjectLabel;
   window.buildSessionRowHtml = sandboxWindow.buildSessionRowHtml;
+  window.createClientCache = sandboxWindow.createClientCache;
+  window.ensureClientName = sandboxWindow.ensureClientName;
+  window.refreshClientCache = sandboxWindow.refreshClientCache;
+  window.invalidateClientCache = sandboxWindow.invalidateClientCache;
+  window.formatUpdatedAgo = sandboxWindow.formatUpdatedAgo;
+  window.computePanelFreshness = sandboxWindow.computePanelFreshness;
+  window.shouldRenderPanel = sandboxWindow.shouldRenderPanel;
+  window.resolvePanelStatuses = sandboxWindow.resolvePanelStatuses;
+  window.formatClockTime = sandboxWindow.formatClockTime;
+  window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
+  window.kpiSubtitle = sandboxWindow.kpiSubtitle;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1351,6 +1374,426 @@ var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
   assert(html.indexOf('tabindex="0"') !== -1, 'session row: tabindex="0" keeps the row keyboard-focusable');
 })();
 
+// ── Client metadata cache (production code loaded from app.js) ───────────
+// The REAL implementation lives in frontend/app.js: createClientCache is a
+// pure factory (no DOM/fetch access) exposed on window by the vm sandbox
+// loader, so the first block exercises the production 10-minute expiry
+// policy directly with an injected clock.  The second block drives the
+// production wiring (ensureClientName → refreshClientCache → /admin/clients)
+// through a fetch-counting stub: hits never fetch, misses trigger a
+// non-blocking background refresh, and a failed refresh never clears the
+// last-known names.
+
+function createClientCache(opts) {
+  return window.createClientCache(opts);
+}
+
+console.log('\u25B6 client metadata cache — pure factory (10-minute TTL)');
+
+(function () {
+  var t = 1000000; // fake clock, ms
+  var cache = createClientCache({ ttlMs: 600000, now: function () { return t; } });
+
+  // Empty cache is stale → first read must fetch
+  assert(cache.isExpired() === true, 'never-loaded cache is expired (stale)');
+
+  cache.refresh([
+    { id: 'c1', name: 'Alpha' },
+    { id: 'c2', name: null },
+    { id: 'c3', name: '' }
+  ]);
+
+  // Cache hit
+  assert(cache.get('c1') === 'Alpha', 'hit: cached name returned for known id');
+  assert(cache.get('c2') === 'c2', 'hit: id with no name falls back to the id');
+  assert(cache.get('c3') === 'c3', 'hit: empty name falls back to the id');
+  assert(cache.has('c1') === true, 'has: known id → true');
+  assert(cache.isExpired() === false, 'freshly refreshed cache is not expired');
+
+  // Cache miss
+  assert(cache.get('unknown') === undefined, 'miss: unknown id returns undefined');
+  assert(cache.has('unknown') === false, 'has: unknown id → false');
+
+  // TTL expiry (10 minutes = 600000 ms)
+  t += 599999;
+  assert(cache.isExpired() === false, 'not expired just before the 10-minute TTL elapses');
+  t += 2; // 600001 ms since refresh
+  assert(cache.isExpired() === true, 'expired once the 10-minute TTL elapses');
+  assert(cache.get('c1') === 'Alpha', 'stale-while-revalidate: last-known names remain readable after expiry');
+
+  // A fresh refresh resets the TTL window and replaces the map
+  t += 600000;
+  cache.refresh([{ id: 'c2', name: 'Beta' }]);
+  assert(cache.isExpired() === false, 'refresh resets the TTL window');
+  assert(cache.get('c2') === 'Beta', 'refresh: renamed id returns the new name');
+  assert(cache.get('c1') === undefined, 'refresh: ids absent from the fresh list drop out');
+
+  // Manual invalidation (post-admin-change hook): marks stale, keeps names
+  cache.invalidate();
+  assert(cache.isExpired() === true, 'invalidate marks the cache stale (forces refetch)');
+  assert(cache.get('c2') === 'Beta', 'invalidate keeps last-known names (stale-while-failure)');
+})();
+
+console.log('\u25B6 client metadata cache — background refresh wiring');
+
+(function () {
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({
+          items: [
+            { id: 'c1', name: 'Alpha' },
+            { id: 'c2', name: null },
+            { id: 'zzz', name: 'Zed' }
+          ]
+        });
+      }
+    });
+  };
+
+  // Start from a stale cache (as after first load or an admin change)
+  window.invalidateClientCache();
+  assert(calls.length === 0, 'invalidateClientCache() does not fetch by itself');
+
+  // Lookup miss → non-blocking background refresh of /admin/clients
+  var label = window.ensureClientName('unknown-id');
+  assert(label === undefined, 'unknown id: ensureClientName returns undefined (caller falls back to the raw id)');
+  assert(calls.length === 1 && calls[0] === '/admin/clients?limit=100',
+    'unknown id: background refresh fetches /admin/clients once');
+
+  // Let the fire-and-forget refresh land, then verify the cache was rebuilt
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    var hitCalls = calls.length;
+    assert(window.ensureClientName('c1') === 'Alpha',
+      'background refresh: refreshed cache resolves the previously unknown id');
+    assert(calls.length === hitCalls,
+      'cache hit: a known id does not trigger another fetch');
+    assert(window.ensureClientName('zzz') === 'Zed',
+      'background refresh: previously unknown id now resolves from the cache');
+    assert(window.ensureClientName('c2') === 'c2',
+      'background refresh: id without a name falls back to the id');
+
+    // Stale-while-failure: a failing background refresh keeps last-known names
+    appJsSandbox.fetch = function (url) {
+      calls.push(url);
+      return Promise.resolve({ ok: false, status: 500 });
+    };
+    window.ensureClientName('unknown-2'); // miss → background refresh → fetch fails
+    pendingAsyncBlocks++;
+    setTimeout(function () {
+      assert(window.ensureClientName('c1') === 'Alpha',
+        'stale-while-failure: labels survive a failed background refresh');
+      assert(calls.length === 2,
+        'one fetch per miss: hits never fetch, a failed refresh never clears the map');
+      pendingAsyncBlocks--;
+    }, 10);
+    pendingAsyncBlocks--;
+  }, 10);
+})();
+
+// F2 — in-flight deduplication: multiple concurrent cache misses fire at
+// most one /admin/clients fetch (single-flight fan-out protection).
+// Wrapped in a setTimeout so the previous test's in-flight refresh has
+// fully drained (clientsRefreshInFlight is null) before we start.
+console.log('\u25B6 client metadata cache — in-flight deduplication (issue F2)');
+
+pendingAsyncBlocks++;
+setTimeout(function () {
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return new Promise(function (resolve) {
+      // Simulate a slow fetch so concurrent callers pile up before it resolves
+      setTimeout(function () {
+        resolve({
+          ok: true,
+          json: function () {
+            return Promise.resolve({
+              items: [
+                { id: 'x1', name: 'X-One' },
+                { id: 'x2', name: 'X-Two' },
+                { id: 'x3', name: 'X-Three' }
+              ]
+            });
+          }
+        });
+      }, 20);
+    });
+  };
+
+  // Start from a stale cache (previous test's refresh populated it)
+  window.invalidateClientCache();
+  var callsBefore = calls.length;
+
+  // Three synchronous misses — all should share one in-flight promise
+  var r1 = window.ensureClientName('x1');
+  var r2 = window.ensureClientName('x2');
+  var r3 = window.ensureClientName('x3');
+  // All three return undefined (cache miss) synchronously
+  assert(r1 === undefined, 'miss 1: returns undefined (caller falls back to raw id)');
+  assert(r2 === undefined, 'miss 2: returns undefined');
+  assert(r3 === undefined, 'miss 3: returns undefined');
+
+  // Assert exactly ONE fetch was triggered (not three)
+  var fetchCountBeforeResolve = calls.length - callsBefore;
+  assert(fetchCountBeforeResolve === 1,
+    'concurrent misses: exactly one /admin/clients fetch triggered, not ' + fetchCountBeforeResolve);
+
+  // After the fetch resolves, the cache has all three names
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    assert(window.ensureClientName('x1') === 'X-One',
+      'post-dedupe: x1 resolves from the cache after single shared fetch');
+    assert(window.ensureClientName('x2') === 'X-Two',
+      'post-dedupe: x2 resolves from the cache');
+    assert(window.ensureClientName('x3') === 'X-Three',
+      'post-dedupe: x3 resolves from the cache');
+    // Subsequent hits trigger zero additional fetches
+    var callsAfterResolve = calls.length;
+    window.ensureClientName('x1');
+    assert(calls.length === callsAfterResolve,
+      'post-dedupe: known ids trigger no additional fetches');
+    pendingAsyncBlocks--;
+  }, 30);
+  pendingAsyncBlocks--;
+}, 15);
+
+// ── Panel freshness states (issue #357) ─────────────────────────────────
+// The freshness logic lives in pure helpers in app.js (formatUpdatedAgo,
+// computePanelFreshness, shouldRenderPanel, resolvePanelStatuses) that are
+// exercised here through the vm-sandbox exports — the same production code
+// the dashboard runs.  refreshDashboard maintains the per-panel state map
+// (panelId → { status: 'ok'|'refreshing'|'stale', updatedAt }) and each
+// panel render consumes it via these helpers.
+
+console.log('\u25B6 formatUpdatedAgo');
+
+(function () {
+  var now = 1000000;
+  assert(window.formatUpdatedAgo(now, now) === 'just now', 'zero elapsed \u2192 just now');
+  assert(window.formatUpdatedAgo(now, now + 59000) === 'just now', '59s elapsed \u2192 just now');
+  assert(window.formatUpdatedAgo(now, now + 60000) === '1m ago', '60s elapsed \u2192 1m ago');
+  assert(window.formatUpdatedAgo(now, now + 120000) === '2m ago', '2m elapsed \u2192 2m ago');
+  assert(window.formatUpdatedAgo(now, now + 59 * 60000) === '59m ago', '59m elapsed \u2192 59m ago');
+  assert(window.formatUpdatedAgo(now, now + 60 * 60000) === '1h ago', '1h elapsed \u2192 1h ago');
+  assert(window.formatUpdatedAgo(now, now + 23 * 3600000) === '23h ago', '23h elapsed \u2192 23h ago');
+  assert(window.formatUpdatedAgo(now, now + 24 * 3600000) === '1d ago', '24h elapsed \u2192 1d ago');
+  assert(window.formatUpdatedAgo(now, now + 3 * 24 * 3600000) === '3d ago', '3d elapsed \u2192 3d ago');
+  assert(window.formatUpdatedAgo(null, now) === null, 'null timestamp \u2192 null (never updated)');
+  assert(window.formatUpdatedAgo(undefined, now) === null, 'undefined timestamp \u2192 null (never updated)');
+  // Future timestamps clamp to "just now" rather than rendering a negative age
+  assert(window.formatUpdatedAgo(now + 5000, now) === 'just now', 'future timestamp clamps to just now');
+})();
+
+console.log('\u25B6 computePanelFreshness');
+
+(function () {
+  var now = 1000000;
+  assert(window.computePanelFreshness({}, 'kpi', now) === null, 'unknown panel \u2192 null (nothing rendered)');
+  assert(window.computePanelFreshness(null, 'kpi', now) === null, 'missing state map \u2192 null');
+
+  var f = window.computePanelFreshness({ 'model-mix': { status: 'refreshing', updatedAt: 500000 } }, 'model-mix', now);
+  assert(f && f.status === 'refreshing' && f.label === 'Refreshing\u2026',
+    'refreshing state shows "Refreshing\u2026" while the panel update is in flight');
+
+  var g = window.computePanelFreshness({ kpi: { status: 'stale', updatedAt: 500000 } }, 'kpi', now);
+  assert(g && g.status === 'stale' && g.label === 'Showing previous data',
+    'stale state shows "Showing previous data" warning');
+
+  var h = window.computePanelFreshness({ events: { status: 'ok', updatedAt: now - 120000 } }, 'events', now);
+  assert(h && h.status === 'ok' && h.label === 'Updated 2m ago', 'ok state renders "Updated 2m ago"');
+
+  var i = window.computePanelFreshness({ sessions: { status: 'ok', updatedAt: now } }, 'sessions', now);
+  assert(i && i.label === 'Updated just now', 'ok state renders "Updated just now" for a fresh update');
+
+  var j = window.computePanelFreshness({ kpi: { status: 'ok', updatedAt: null } }, 'kpi', now);
+  assert(j && j.label === 'Updated --', 'ok state without a timestamp falls back to "Updated --"');
+})();
+
+console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)');
+
+(function () {
+  // No endpoint errors → every panel resolves to 'ok'
+  var allOk = window.resolvePanelStatuses({});
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'sessions', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
+    });
+
+  // A failed endpoint stales exactly the panels that consume it
+  var modelMixFailed = window.resolvePanelStatuses({ aggByModel: 'boom' });
+  assert(modelMixFailed['model-mix'] === 'stale' && modelMixFailed.agents === 'stale',
+    'aggByModel failure: model-mix and agents go stale');
+  assert(modelMixFailed['kpi-tokens'] === 'ok' && modelMixFailed['kpi-cost'] === 'ok' &&
+         modelMixFailed['kpi-sessions'] === 'ok' && modelMixFailed['kpi-collectors'] === 'ok' &&
+         modelMixFailed['kpi-source-dbs'] === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed.sessions === 'ok',
+    'aggByModel failure: unrelated panels (KPI cards, events, sessions) stay ok');
+
+  var healthFailed = window.resolvePanelStatuses({ health: 'down' });
+  assert(healthFailed['kpi-collectors'] === 'stale' && healthFailed['kpi-source-dbs'] === 'stale' &&
+         healthFailed.events === 'stale' &&
+         healthFailed['collector-dist'] === 'stale' && healthFailed.collectors === 'stale' &&
+         healthFailed.agents === 'stale',
+    'health failure: every health-fed panel (kpi-collectors, kpi-source-dbs, events, collector-dist, collectors, agents) goes stale');
+  assert(healthFailed['kpi-tokens'] === 'ok' && healthFailed['kpi-cost'] === 'ok' &&
+         healthFailed['kpi-sessions'] === 'ok' && healthFailed.sessions === 'ok',
+    'health failure: sessions panel and non-health KPI cards stay ok');
+
+  var agentRunsFailed = window.resolvePanelStatuses({ agentRuns: 'boom' });
+  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed['kpi-tokens'] === 'ok',
+    'agentRuns failure: only the agent-runs panel goes stale');
+
+  // Failed panel retains its previous data: the state map keeps the old
+  // updatedAt, shouldRenderPanel refuses the re-render, and the label flips
+  // to the "Showing previous data" warning.
+  var states = { 'model-mix': { status: 'ok', updatedAt: 500000 } };
+  states['model-mix'] = {
+    status: window.resolvePanelStatuses({ aggByModel: 'boom' })['model-mix'],
+    updatedAt: states['model-mix'].updatedAt // previous successful update time survives the failure
+  };
+  assert(window.shouldRenderPanel(states, 'model-mix') === false,
+    'failed panel skips re-render \u2192 previous successful data is retained');
+  assert(window.computePanelFreshness(states, 'model-mix', 1000000).label === 'Showing previous data',
+    'failed panel swaps in the "Showing previous data" freshness label');
+
+  // Healthy panels keep rendering and show the updated timestamp
+  assert(window.shouldRenderPanel({ kpi: { status: 'ok', updatedAt: 500000 } }, 'kpi') === true,
+    'ok panel still renders');
+  assert(window.shouldRenderPanel({ kpi: { status: 'refreshing', updatedAt: 500000 } }, 'kpi') === true,
+    'refreshing panel still renders (label shows while updating)');
+  assert(window.shouldRenderPanel({}, 'kpi') === true,
+    'panel with no recorded state still renders (initial load)');
+})();
+
+// N1 — never-rendered stale panel: no previous data to retain → render proceeds
+console.log('\u25B6 shouldRenderPanel + computePanelFreshness (stale + never-updated, issue N1)');
+
+(function () {
+  // Stale panel that has NEVER rendered (updatedAt null): render should
+  // proceed so the empty/error state is shown instead of "Loading..."
+  assert(window.shouldRenderPanel({ p: { status: 'stale', updatedAt: null } }, 'p') === true,
+    'stale + null updatedAt: render proceeds (no previous data to retain)');
+  // Stale panel WITH previous data: render is suppressed to keep last-known values
+  assert(window.shouldRenderPanel({ p: { status: 'stale', updatedAt: 1000 } }, 'p') === false,
+    'stale + non-null updatedAt: render skipped (retains previous data)');
+
+  var now = 2000;
+  // Stale + never-updated → no freshness label (no "Showing previous data" on placeholders)
+  assert(window.computePanelFreshness({ p: { status: 'stale', updatedAt: null } }, 'p', now) === null,
+    'stale + null updatedAt: computePanelFreshness returns null (no label)');
+  // Stale + has previous data → "Showing previous data" label
+  var fresh = window.computePanelFreshness({ p: { status: 'stale', updatedAt: 1000 } }, 'p', now);
+  assert(fresh !== null && fresh.status === 'stale' && fresh.label === 'Showing previous data',
+    'stale + non-null updatedAt: computePanelFreshness returns stale descriptor');
+})();
+
+console.log('\u25B6 header last-refreshed clock (issue #357)');
+
+(function () {
+  // Exposed module-level timestamp: null until the first refresh completes
+  assert(window.getLastRefreshedAt() === null, 'lastRefreshedAt starts null (no refresh cycle completed yet)');
+
+  var d = new Date(2026, 0, 2, 3, 4, 5);
+  assert(window.formatClockTime(d) === '03:04:05', 'formatClockTime renders HH:MM:SS (03:04:05)');
+  var e = new Date(2026, 6, 6, 23, 59, 59);
+  assert(window.formatClockTime(e) === '23:59:59', 'formatClockTime renders HH:MM:SS (23:59:59)');
+})();
+
+// ── KPI subtitle split (issue #358) ─────────────────────────────────────
+// Historical KPIs (Active Tokens, Est. Cost, Sessions) keep the selected
+// date range as their subtitle — they are date-range aggregates.  Current-
+// health KPIs (Healthy Collectors, Source Databases) are live snapshots:
+// they show "As of HH:MM:SS" from the last completed refresh (issue #357's
+// lastRefreshedAt) or "Current" before any refresh completes.  Exercised
+// through the vm-sandbox export of the production kpiSubtitle helper.
+
+console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
+
+(function () {
+  var rangeLabel = 'Jul 1\u201327, 2026';
+
+  // Historical KPIs keep the date-range subtitle — with and without a
+  // completed refresh (their aggregates are range-scoped either way).
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions'].forEach(function (kpiId) {
+    assert(window.kpiSubtitle(kpiId, rangeLabel, null) === rangeLabel,
+      kpiId + ': historical KPI keeps the date-range subtitle (no refresh yet)');
+    assert(window.kpiSubtitle(kpiId, rangeLabel, new Date(2026, 6, 6, 23, 59, 59)) === rangeLabel,
+      kpiId + ': historical KPI keeps the date-range subtitle after a refresh');
+  });
+
+  // Current-health KPIs show the As-of timestamp once a refresh completed
+  var t = new Date(2026, 6, 6, 23, 59, 59);
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, t) === 'As of 23:59:59',
+    'kpi-collectors: current-health KPI shows "As of 23:59:59"');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t) === 'As of 23:59:59',
+    'kpi-source-dbs: current-health KPI shows "As of 23:59:59"');
+
+  // The As-of timestamp reuses the header clock formatting (formatClockTime)
+  var m = new Date(2026, 0, 2, 3, 4, 5);
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, m) === 'As of ' + window.formatClockTime(m),
+    'kpi-collectors: As-of timestamp matches formatClockTime (shared with the header clock)');
+
+  // Label shape is exactly "As of HH:MM:SS"
+  assert(/^As of \d{2}:\d{2}:\d{2}$/.test(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t)),
+    'kpi-source-dbs: current-health label matches the "As of HH:MM:SS" format');
+
+  // Before the first refresh completes (no lastRefreshedAt) → "Current"
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, null) === 'Current',
+    'kpi-collectors: no refresh yet \u2192 "Current" fallback');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, undefined) === 'Current',
+    'kpi-source-dbs: no refresh yet \u2192 "Current" fallback');
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, 'not-a-date') === 'Current',
+    'kpi-collectors: invalid refresh value \u2192 "Current" fallback');
+
+  // The UI must not imply collector health is aggregated historically:
+  // the current-health subtitle never carries the date-range label.
+  assert(window.kpiSubtitle('kpi-collectors', rangeLabel, t).indexOf(rangeLabel) === -1,
+    'kpi-collectors: subtitle never carries the date-range label');
+  assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t).indexOf(rangeLabel) === -1,
+    'kpi-source-dbs: subtitle never carries the date-range label');
+})();
+
+// N2 — per-card KPI staleness: each KPI card resolves independently, so a
+// single failing endpoint (e.g. sessions) never freezes the tokens/cost cards
+console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)');
+
+(function () {
+  // Only sessions fails → only kpi-sessions goes stale
+  var sessionFail = window.resolvePanelStatuses({ sessions: 'boom' });
+  assert(sessionFail['kpi-tokens'] === 'ok', 'sessions fail: kpi-tokens stays ok (aggTotal is fine)');
+  assert(sessionFail['kpi-cost'] === 'ok', 'sessions fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(sessionFail['kpi-sessions'] === 'stale', 'sessions fail: kpi-sessions goes stale');
+  assert(sessionFail['kpi-collectors'] === 'ok', 'sessions fail: kpi-collectors stays ok (health is fine)');
+  assert(sessionFail['kpi-source-dbs'] === 'ok', 'sessions fail: kpi-source-dbs stays ok (health is fine)');
+
+  // Only health fails → only kpi-collectors and kpi-source-dbs go stale
+  var healthFail = window.resolvePanelStatuses({ health: 'down' });
+  assert(healthFail['kpi-tokens'] === 'ok', 'health fail: kpi-tokens stays ok (aggTotal is fine)');
+  assert(healthFail['kpi-cost'] === 'ok', 'health fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(healthFail['kpi-sessions'] === 'ok', 'health fail: kpi-sessions stays ok (sessions is fine)');
+  assert(healthFail['kpi-collectors'] === 'stale', 'health fail: kpi-collectors goes stale');
+  assert(healthFail['kpi-source-dbs'] === 'stale', 'health fail: kpi-source-dbs goes stale');
+
+  // aggTotal fails → kpi-tokens and kpi-cost go stale, rest stay ok
+  var aggFail = window.resolvePanelStatuses({ aggTotal: 'boom' });
+  assert(aggFail['kpi-tokens'] === 'stale', 'aggTotal fail: kpi-tokens goes stale');
+  assert(aggFail['kpi-cost'] === 'stale', 'aggTotal fail: kpi-cost goes stale');
+  assert(aggFail['kpi-sessions'] === 'ok', 'aggTotal fail: kpi-sessions stays ok');
+  assert(aggFail['kpi-collectors'] === 'ok', 'aggTotal fail: kpi-collectors stays ok');
+
+  // No errors → all KPI cards ok
+  var allOk = window.resolvePanelStatuses({});
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs']
+    .forEach(function (kpiId) {
+      assert(allOk[kpiId] === 'ok', 'no errors: KPI card "' + kpiId + '" resolves to ok');
+    });
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
@@ -1392,6 +1835,46 @@ console.log('\u25B6 index.html markup (smoke check)');
     assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') === -1,
       'sessions header: retained column "' + label + '" is not marked sess-col-low');
   });
+
+  // Events panel title (issue #355): the "Live Events" panel was renamed to
+  // "Operational Events" — a label-only change. The event badge and the
+  // empty-state text must remain untouched.
+  assert(html.indexOf('Operational Events') !== -1, 'events panel: title reads "Operational Events"');
+  assert(html.indexOf('Live Events') === -1, 'events panel: "Live Events" no longer appears in the markup');
+  assert(html.indexOf('id="event-badge"') !== -1, 'events panel: #event-badge element still present');
+  assert(html.indexOf('Waiting for events&hellip;') !== -1, 'events panel: empty-state text unchanged');
+
+  // Token vocabulary (issue #354): the KPI card label and the Client / Project
+  // Usage Breakdown tokens column header read "Active Tokens"; the legacy
+  // "Total Tokens" label is gone from the markup entirely.
+  assert(html.indexOf('<span class="kpi-label">Active Tokens</span>') !== -1,
+    'KPI card: label reads "Active Tokens"');
+  assert(html.indexOf('<th>Active Tokens</th>') !== -1,
+    'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
+  assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
+
+  // KPI subtitle spans (issue #358): all five KPI cards carry a .kpi-sub
+  // detail span (historical cards keep the date range; current-health
+  // cards show the As-of timestamp — renderKPIs targets these elements).
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs']
+    .forEach(function (kpiId) {
+      assert(html.indexOf('id="' + kpiId + '-detail"') !== -1,
+        'KPI card: subtitle span #' + kpiId + '-detail exists in the markup');
+    });
+
+  // Freshness indicators (issue #357): the header carries a labeled
+  // "Last refreshed" clock, and each instrumented panel carries a
+  // .panel-freshness span in its title row (KPI row, Model Mix,
+  // Operational Events, Sessions, plus the remaining data panels).
+  assert(html.indexOf('id="last-refreshed"') !== -1 && html.indexOf('Last refreshed') !== -1,
+    'header: #last-refreshed element with "Last refreshed" label exists');
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'sessions', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(html.indexOf('id="freshness-' + panelId + '"') !== -1,
+        'panel: freshness span #freshness-' + panelId + ' exists in the markup');
+    });
+  assert(html.indexOf('class="panel-freshness"') !== -1, 'panel: freshness spans use class="panel-freshness"');
 })();
 
 // ── Static CSS verification (frontend/style.css) ────────────────────────
@@ -1455,13 +1938,53 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
     'no status-driven [data-active] row selector in live CSS (no green active-row cast)');
   assert(!/\.session-row[^{]*\{[^}]*border-left[^}]*\}/.test(live),
     'no .session-row rule paints a left rail/stripe in live CSS');
+
+  // Freshness styles (issue #357): subtle muted labels in panel titles —
+  // inline in the title's existing flex row (no layout shifts) — plus the
+  // "Last refreshed" header clock and the stale/refreshing state variants.
+  assert(live.indexOf('.panel-freshness') !== -1, 'style.css: .panel-freshness base rule exists');
+  assert(live.indexOf('.freshness-refreshing') !== -1, 'style.css: .freshness-refreshing state rule exists');
+  assert(live.indexOf('.freshness-stale') !== -1, 'style.css: .freshness-stale state rule exists');
+  assert(live.indexOf('.last-refreshed') !== -1, 'style.css: .last-refreshed header clock rule exists');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
+// The summary is deferred until ALL pending async test callbacks have
+// completed (deterministic, not a fixed timer).  A safety cap at 5 s
+// prevents a genuinely hung test from holding the process open forever.
 
-console.log('');
-console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
-console.log('  Passed:', passed, ' / Failed:', failed);
-console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+function printSummary() {
+  console.log('');
+  console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+  console.log('  Passed:', passed, ' / Failed:', failed);
+  console.log('\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550');
+}
 
-process.exit(failed > 0 ? 1 : 0);
+var _summaryScheduled = false;
+var _summaryStart = Date.now();
+var _MAX_SUMMARY_WAIT_MS = 5000; // safety cap: hung test still reports
+
+function finishWhenIdle() {
+  if (pendingAsyncBlocks > 0) {
+    if (Date.now() - _summaryStart > _MAX_SUMMARY_WAIT_MS) {
+      console.error('  WARNING: async blocks still pending after ' + _MAX_SUMMARY_WAIT_MS + 'ms — printing summary anyway');
+      printSummary();
+      process.exit(failed > 0 ? 1 : 0);
+      return;
+    }
+    setTimeout(finishWhenIdle, 10);
+    return;
+  }
+  printSummary();
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+// Schedule the finish poll once at the end of the synchronous test run.
+// Each async test block increments pendingAsyncBlocks before scheduling
+// its callback and decrements at the end, guaranteeing the summary only
+// prints after all pending async work lands.
+if (!_summaryScheduled) {
+  _summaryScheduled = true;
+  _summaryStart = Date.now();
+  setTimeout(finishWhenIdle, 10);
+}

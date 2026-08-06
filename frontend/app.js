@@ -15,6 +15,14 @@
   const RECORD_LIMIT = 100;
   const SESSION_LIMIT = 20;
   const CLIENT_LIMIT = 100;
+  /**
+   * Client metadata cache expiry policy: the client_id → name map is fetched
+   * from /admin/clients at most once per 10-minute window.  Within the TTL
+   * refresh cycles reuse the cached map; after expiry the next cycle
+   * refetches.  Unknown client ids additionally trigger a non-blocking
+   * background refresh at any time (see ensureClientName).
+   */
+  const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
   /** Session is considered "active" if last_message_at is within this window.
    *  This is a heuristic — long-running but infrequent sessions may be
    *  incorrectly marked as "ended", and very recent sessions that have
@@ -30,6 +38,7 @@
     dashboard:      document.querySelector('.dashboard'),
     liveIndicator:  $('live-indicator'),
     timestamp:      $('timestamp'),
+    lastRefreshed:  $('last-refreshed'),
     dbStatus:       $('db-status'),
     versionFooter:  $('footer-version'),
 
@@ -85,7 +94,6 @@
 
   // ── State ──────────────────────────────────────────────────────────────
 
-  let clientMap = {};      // client_id → name
   let refreshTimer = null;
   let fetchErrors = {};    // endpoint_key → error_message, per-fetch-cycle tracking
   let agentRunsData = null;       // latest agent runs response
@@ -95,6 +103,157 @@
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+
+  // ── Panel freshness state (issue #357) ────────────────────────────────
+  // Per-panel freshness map: panelId → { status: 'ok'|'refreshing'|'stale',
+  // updatedAt }.  Maintained by refreshDashboard() (and applyFilters() for
+  // the agent-runs panel) and consumed by each panel render through the
+  // pure helpers below (computePanelFreshness / shouldRenderPanel).  A panel
+  // whose fetch failed resolves to 'stale' and its render function skips the
+  // re-render, so the previous successful data stays on screen.
+  //
+  // lastRefreshedAt records the time of the last COMPLETED refresh cycle.
+  // It is module-level and exposed via getLastRefreshedAt() so follow-up
+  // work (issue #358 — KPI label clarification) can reuse it; the header
+  // "Last refreshed HH:MM:SS" clock consumes it via updateLastRefreshed().
+  let panelStates = {};
+  let lastRefreshedAt = null;
+
+  // Which fetch endpoint keys feed each panel — used to resolve a panel to
+  // 'stale' when any of its endpoints failed in the current refresh cycle.
+  // 'agentRuns' maps to the agentRunsFetchError channel (fetched separately).
+  const PANEL_ENDPOINTS = {
+    'kpi-tokens':     ['aggTotal'],
+    'kpi-cost':       ['aggTotal'],
+    'kpi-sessions':   ['sessions'],
+    'kpi-collectors': ['health'],
+    'kpi-source-dbs': ['health'],
+    'model-mix':     ['aggByModel'],
+    events:          ['health', 'sessions'],
+    'collector-dist': ['health'],
+    collectors:      ['health'],
+    agents:          ['aggByModel', 'health'],
+    sessions:        ['sessions'],
+    'agent-runs':    ['agentRuns'],
+    'client-project': ['aggClientProject'],
+  };
+
+  // ── Client metadata cache ─────────────────────────────────────────────
+  // The client_id → name map changes rarely but costs one HTTP round trip
+  // per fetch, so it is cached in memory with a 10-minute expiry
+  // (CLIENT_CACHE_TTL_MS).  Within the TTL window refresh cycles reuse the
+  // cached map; after expiry the next cycle refetches.  Lookup misses
+  // (unknown client ids in rendered data) trigger a non-blocking background
+  // refresh, and a failed refresh never clears the map — last-known names
+  // stay available (stale-while-failure).
+
+  /**
+   * Create an in-memory cache for the client_id → name lookup map.
+   * Pure factory — no DOM or fetch access — so the Node test harness can
+   * exercise hit/miss/expiry/invalidation with an injected clock.
+   *
+   * Expiry policy: the cache is stale once `ttlMs` (default
+   * CLIENT_CACHE_TTL_MS, 10 minutes) elapses since the last successful
+   * refresh.  Entries never expire individually — get() keeps returning
+   * last-known names even after expiry (stale-while-revalidate); callers
+   * decide when to refetch via isExpired().
+   *
+   * @param {Object} [opts] - { ttlMs, now }; now() injects the clock (tests)
+   * @returns {Object} cache handle: get/set/has/isExpired/refresh/invalidate/snapshot
+   */
+  function createClientCache(opts) {
+    var ttlMs = (opts && opts.ttlMs != null) ? opts.ttlMs : CLIENT_CACHE_TTL_MS;
+    var nowFn = (opts && typeof opts.now === 'function') ? opts.now : Date.now;
+    var map = {};        // client_id → name (last known; survives refresh failures)
+    var loadedAt = null; // ms timestamp of last successful refresh; null = never loaded
+
+    function isExpired() {
+      return loadedAt === null || (nowFn() - loadedAt) >= ttlMs;
+    }
+
+    return {
+      /** Look up a client name; undefined when the id is unknown (miss). */
+      get: function (id) { return map[id]; },
+      /** True when the id has a cached name. */
+      has: function (id) { return Object.prototype.hasOwnProperty.call(map, id); },
+      /** True when never loaded or the TTL window has elapsed. */
+      isExpired: isExpired,
+      /** Record a single client entry (client_id → name). */
+      set: function (id, name) { map[id] = name; },
+      /**
+       * Replace the whole map with a freshly fetched client list.  Call only
+       * on success — on failure leave the map untouched so last-known names
+       * remain available (stale-while-failure).  Resets the TTL window.
+       */
+      refresh: function (entries) {
+        var next = {};
+        (entries || []).forEach(function (c) {
+          next[c.id] = c.name || c.id;
+        });
+        map = next;
+        loadedAt = nowFn();
+      },
+      /**
+       * Manual invalidation for use after client administration changes:
+       * marks the cache stale so the next refresh cycle refetches, but keeps
+       * last-known names so labels survive a subsequent fetch failure.
+       */
+      invalidate: function () {
+        loadedAt = null;
+      },
+      /** Copy of the current map (introspection/tests). */
+      snapshot: function () { return Object.assign({}, map); }
+    };
+  }
+
+  /** The live client metadata cache used by the dashboard (10-min TTL). */
+  var clientCache = createClientCache({ ttlMs: CLIENT_CACHE_TTL_MS });
+
+  /** Shared in-flight promise: deduplicates concurrent background refreshes
+   *  so that a single render pass (up to ~25 cache misses) fires at most one
+   *  /admin/clients request.  Null while no refresh is in flight. */
+  var clientsRefreshInFlight = null;
+
+  /** Refetch client metadata and replace the cached map on success.
+   *  Never clears the map: on failure last-known names are retained.
+   *  Deduplicates in-flight requests through a shared promise — concurrent
+   *  callers all await the same single fetch. */
+  function refreshClientCache() {
+    if (clientsRefreshInFlight) return clientsRefreshInFlight;
+    clientsRefreshInFlight = apiFetch('/admin/clients?limit=' + CLIENT_LIMIT)
+      .then(function (data) {
+        if (data && data.items) {
+          clientCache.refresh(data.items);
+        }
+        return data;
+      })
+      .catch(function (e) {
+        // Stale-while-failure: keep the last-known client names.
+        console.error('Client metadata refresh failed:', e);
+      })
+      .finally(function () {
+        clientsRefreshInFlight = null;
+      });
+    return clientsRefreshInFlight;
+  }
+
+  /**
+   * Resolve a client's display name from the cache.  A lookup miss (unknown
+   * client id) triggers a non-blocking background refresh of the cache and
+   * returns undefined, letting callers fall back to the raw id.
+   */
+  function ensureClientName(clientId) {
+    var name = clientCache.get(clientId);
+    if (name === undefined) {
+      refreshClientCache(); // background refresh — fire and forget
+    }
+    return name;
+  }
+
+  /** Expose cache invalidation for client administration changes. */
+  function invalidateClientCache() {
+    clientCache.invalidate();
+  }
   /**
    * Resolve the display label for a project row in the Client/Project
    * Usage Breakdown.  Single source of truth — used by both the render
@@ -400,6 +559,137 @@
     return '--';
   }
 
+  // ── Panel freshness (pure helpers — no DOM) ───────────────────────────
+  // Freshness state model (issue #357): refreshDashboard() maintains a
+  // per-panel state map (panelStates: panelId → { status, updatedAt }) and
+  // each panel render consumes it through these helpers.  status is one of
+  //   'refreshing' — a refresh cycle is in flight for this panel
+  //   'ok'         — last fetch succeeded; updatedAt = completion time
+  //   'stale'      — last fetch failed; the panel keeps showing previous data
+  // These functions are pure so the Node test harness can exercise the full
+  // refreshing/updated/stale lifecycle through the vm-sandbox exports.
+
+  /** Format "Updated Xm ago" text from a panel's last successful update time.
+   *  @param {number|null} updatedAtMs  epoch ms of the last successful update
+   *  @param {number}      nowMs        epoch ms reference time
+   *  @returns {string|null} "just now" (<60s), "Nm ago" (<60m), "Nh ago" (<24h),
+   *                         "Nd ago", or null when updatedAtMs is absent
+   *                         (panel never updated).  Future timestamps clamp to
+   *                         "just now" instead of rendering a negative age. */
+  function formatUpdatedAgo(updatedAtMs, nowMs) {
+    if (updatedAtMs == null) return null;
+    var diffMs = Math.max(0, nowMs - updatedAtMs);
+    var mins = Math.floor(diffMs / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + 'm ago';
+    var hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    return Math.floor(hrs / 24) + 'd ago';
+  }
+
+  /** Compute a panel's freshness descriptor from the per-panel state map.
+   *  @param {Object}   panelStates panelId → { status, updatedAt }
+   *  @param {string}   panelId     e.g. 'model-mix'
+   *  @param {number}   nowMs       epoch ms reference time
+   *  @returns {{status: string, label: string, cssClass: string}|null}
+   *    refreshing → { label: 'Refreshing…', cssClass: 'freshness-refreshing' }
+   *    stale + previously updated → { label: 'Showing previous data', cssClass: 'freshness-stale' }
+   *    stale + never updated       → null (no previous data to reference)
+   *    ok         → { label: 'Updated ' + formatUpdatedAgo(...) }
+   *    unknown/idle panel → null (render nothing) */
+  function computePanelFreshness(panelStates, panelId, nowMs) {
+    var st = panelStates && panelStates[panelId];
+    if (!st) return null;
+    if (st.status === 'refreshing') {
+      return { status: 'refreshing', label: 'Refreshing\u2026', cssClass: 'freshness-refreshing' };
+    }
+    if (st.status === 'stale') {
+      // Never rendered: no previous data exists, so no "Showing previous
+      // data" label — the panel render shows its empty/error state instead.
+      if (st.updatedAt == null) return null;
+      return { status: 'stale', label: 'Showing previous data', cssClass: 'freshness-stale' };
+    }
+    return {
+      status: 'ok',
+      label: 'Updated ' + (formatUpdatedAgo(st.updatedAt, nowMs) || '--'),
+      cssClass: ''
+    };
+  }
+
+  /** Whether a panel render should repaint its content.
+   *  A 'stale' panel (failed fetch) returns false so the render function
+   *  keeps the previous successful data on screen and only the freshness
+   *  label ("Showing previous data") is swapped in.
+   *  A stale panel with no previous render (updatedAt null) has no data to
+   *  retain — let the render run so it shows its empty/error state. */
+  function shouldRenderPanel(panelStates, panelId) {
+    var st = panelStates && panelStates[panelId];
+    // A stale panel with no previous render (updatedAt null) has no data to
+    // retain — let the render run so it shows its empty/error state.
+    return !(st && st.status === 'stale' && st.updatedAt != null);
+  }
+
+  /** Resolve every panel's post-fetch status from the current endpoint errors.
+   *  @param {Object} endpointErrors fetch-error map keyed by endpoint key
+   *                                 ('agentRuns' for the agent-runs channel)
+   *  @returns {Object} panelId → 'ok' | 'stale' */
+  function resolvePanelStatuses(endpointErrors) {
+    var out = {};
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var failed = PANEL_ENDPOINTS[panelId].some(function (key) {
+        return !!endpointErrors[key];
+      });
+      out[panelId] = failed ? 'stale' : 'ok';
+    });
+    return out;
+  }
+
+  /** Format a Date as a compact HH:MM:SS clock for the header
+   *  "Last refreshed" timestamp (matches the dashboard's 24h header style). */
+  function formatClockTime(d) {
+    return d.toLocaleString('en-US', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+  }
+
+  // ── KPI card classification (issue #358) ───────────────────────────────
+  // Historical KPIs aggregate usage over the selected date range, so their
+  // subtitles keep the range label.  Current-health KPIs (Healthy
+  // Collectors, Source Databases) are live snapshots from /health — they
+  // must not be presented as historical aggregates, so their subtitles
+  // show "As of HH:MM:SS" instead of the date range.
+  const KPI_TYPES = {
+    'kpi-tokens':     'historical', // Active Tokens — date-range aggregate
+    'kpi-cost':       'historical', // Est. Cost (USD) — date-range aggregate
+    'kpi-sessions':   'historical', // Sessions — date-range aggregate
+    'kpi-collectors': 'current',    // Healthy Collectors — live health snapshot
+    'kpi-source-dbs': 'current',    // Source Databases — live health snapshot
+  };
+
+  /** Resolve a KPI card subtitle.
+   *  Historical KPIs return the formatted date-range label unchanged.
+   *  Current-health KPIs return "As of HH:MM:SS" from the last completed
+   *  refresh cycle (issue #357's lastRefreshedAt, shared with the header
+   *  clock), falling back to "Current" before the first refresh completes.
+   *  Pure — no DOM access — so the Node test harness can exercise it
+   *  through the vm-sandbox exports.
+   *  @param {string} kpiId          e.g. 'kpi-tokens' | 'kpi-collectors'
+   *  @param {string} dateRangeLabel formatted range label (e.g. "Jul 1–27, 2026")
+   *  @param {*}      lastRefreshedAt Date of the last completed refresh
+   *                                 cycle, or null before the first one
+   *  @returns {string} subtitle text */
+  function kpiSubtitle(kpiId, dateRangeLabel, lastRefreshedAt) {
+    if (KPI_TYPES[kpiId] !== 'current') return dateRangeLabel;
+    // Duck-type the timestamp instead of instanceof Date so Dates created
+    // in another realm (e.g. the Node test harness) validate correctly.
+    if (lastRefreshedAt == null ||
+        typeof lastRefreshedAt.getTime !== 'function' ||
+        isNaN(lastRefreshedAt.getTime())) {
+      return 'Current';
+    }
+    return 'As of ' + formatClockTime(lastRefreshedAt);
+  }
+
   // ── API Fetch (with envelope unwrapping) ──────────────────────────────
 
   async function apiFetch(path) {
@@ -451,6 +741,15 @@
       // Build agent runs URL with current filters
       var arUrl = buildAgentRunsUrl();
 
+      // Client metadata is cached for 10 minutes (CLIENT_CACHE_TTL_MS):
+      // only fetch /admin/clients when the cache is stale — within the TTL
+      // window refresh cycles reuse the cached map instead of refetching.
+      // Routed through refreshClientCache() so the scheduled path shares the
+      // same single-flight deduplication as the background-refresh path.
+      var clientsPromise = clientCache.isExpired()
+        ? refreshClientCache()
+        : Promise.resolve(null);
+
       // Parallel fetches
       const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns, aggClientProjectResult] =
         await Promise.allSettled([
@@ -459,7 +758,7 @@
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
           apiFetch('/api/v1/usage/sessions?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + SESSION_LIMIT),
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
-          apiFetch('/admin/clients?limit=' + CLIENT_LIMIT),
+          clientsPromise,
           apiFetch(arUrl),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
         ]);
@@ -487,12 +786,10 @@
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
 
-      // Build client lookup from admin/clients
-      if (results.clients && results.clients.items) {
-        results.clients.items.forEach(function (c) {
-          clientMap[c.id] = c.name || c.id;
-        });
-      }
+      // Client cache is already refreshed by refreshClientCache() above
+      // (single-flight deduped); the results.clients field is retained on
+      // the results object for diagnostic visibility but the cache itself
+      // is already populated — no secondary refresh needed.
     } catch (e) {
       console.error('Dashboard fetch error:', e);
       showError('Failed to fetch dashboard data: ' + e.message);
@@ -557,46 +854,74 @@
     }
   }
 
-  /** KPI Row */
+  /** KPI Row — per-card freshness so a single failing endpoint (e.g. sessions)
+   *  never freezes the entire row (issue N2). */
   function renderKPIs(data) {
+    // Apply per-card freshness labels (replaces the old row-level label)
+    applyPanelFreshness('kpi-tokens');
+    applyPanelFreshness('kpi-cost');
+    applyPanelFreshness('kpi-sessions');
+    applyPanelFreshness('kpi-collectors');
+    applyPanelFreshness('kpi-source-dbs');
+
     // Compute range label once for all KPI subtitles
     var rangeLabel = '--';
     if (data._dateRange) {
       rangeLabel = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
     }
 
-    // Set all KPI subtitles to the formatted range label
-    els.kpiTokensDetail.textContent = rangeLabel;
-    els.kpiCostDetail.textContent = rangeLabel;
-    els.kpiSessionsDetail.textContent = rangeLabel;
-    els.kpiCollectorsDetail.textContent = rangeLabel;
-    els.kpiSourceDbsDetail.textContent = rangeLabel;
+    // Set KPI subtitles: historical KPIs (Active Tokens, Est. Cost,
+    // Sessions) show the selected date range; current-health KPIs
+    // (Healthy Collectors, Source Databases) show "As of HH:MM:SS" from
+    // the last completed refresh (or "Current" before any refresh) — a
+    // live snapshot, never a historical aggregate (issue #358).
+    els.kpiTokensDetail.textContent = kpiSubtitle('kpi-tokens', rangeLabel, lastRefreshedAt);
+    els.kpiCostDetail.textContent = kpiSubtitle('kpi-cost', rangeLabel, lastRefreshedAt);
+    els.kpiSessionsDetail.textContent = kpiSubtitle('kpi-sessions', rangeLabel, lastRefreshedAt);
+    els.kpiCollectorsDetail.textContent = kpiSubtitle('kpi-collectors', rangeLabel, lastRefreshedAt);
+    els.kpiSourceDbsDetail.textContent = kpiSubtitle('kpi-source-dbs', rangeLabel, lastRefreshedAt);
 
-    // Total tokens from aggregates total row
-    if (data.aggTotal && data.aggTotal.length > 0) {
-      var t = data.aggTotal[0];
-      var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
-      els.kpiTokens.textContent = fmtNum(totalTokens);
-      els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
+    // Total tokens from aggregates total row — gated on kpi-tokens (and
+    // kpi-cost, which shares the aggTotal endpoint).
+    if (shouldRenderPanel(panelStates, 'kpi-tokens')) {
+      if (data.aggTotal && data.aggTotal.length > 0) {
+        var t = data.aggTotal[0];
+        var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
+        els.kpiTokens.textContent = fmtNum(totalTokens);
+        els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
+      }
     }
 
-    // Sessions from sessions API
-    if (data.sessions) {
-      els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
+    // Sessions from sessions API — gated on kpi-sessions card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-sessions')) {
+      if (data.sessions) {
+        els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
+      }
     }
 
-    // Collectors & source DBs from health
-    if (data.health) {
-      var collectors = data.health.collectors || [];
-      var srcDbs = data.health.source_databases || [];
-      var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
-      els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
-      els.kpiSourceDbs.textContent = fmtNum(srcDbs.length);
+    // Collectors from health — gated on kpi-collectors card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-collectors')) {
+      if (data.health) {
+        var collectors = data.health.collectors || [];
+        var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
+        els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
+      }
+    }
+
+    // Source DBs from health — gated on kpi-source-dbs card freshness
+    if (shouldRenderPanel(panelStates, 'kpi-source-dbs')) {
+      if (data.health) {
+        var srcDbs = data.health.source_databases || [];
+        els.kpiSourceDbs.textContent = fmtNum(srcDbs.length);
+      }
     }
   }
 
   /** Model Mix — horizontal bar chart */
   function renderModelMix(data) {
+    applyPanelFreshness('model-mix');
+    if (!shouldRenderPanel(panelStates, 'model-mix')) return; // failed fetch → keep previous chart
+
     var models = data.aggByModel || [];
     if (models.length === 0) {
       els.modelMixChart.innerHTML = '<p class="empty-state">No model data available' + errorIndicator('aggByModel') + '</p>';
@@ -632,8 +957,11 @@
     els.modelMixChart.innerHTML = html;
   }
 
-  /** Live Events Feed */
+  /** Operational Events Feed */
   function renderLiveEvents(data) {
+    applyPanelFreshness('events');
+    if (!shouldRenderPanel(panelStates, 'events')) return; // failed fetch → keep previous events
+
     var events = [];
     var now = new Date().toISOString();
 
@@ -704,7 +1032,7 @@
       data.sessions.items.slice(0, 5).forEach(function (s) {
         var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
         if (tokens > 100000) {
-          var label = clientMap[s.client_id] || s.client_id;
+          var label = ensureClientName(s.client_id) || s.client_id;
           events.push({
             type: 'info',
             icon: '\uD83D\uDCCA',  // 📊
@@ -747,6 +1075,9 @@
 
   /** Collector Distribution — health bar per collector */
   function renderCollectorDistribution(data) {
+    applyPanelFreshness('collector-dist');
+    if (!shouldRenderPanel(panelStates, 'collector-dist')) return; // failed fetch → keep previous bars
+
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
       els.collectorDist.innerHTML = '<p class="empty-state">No collectors registered' + errorIndicator('health') + '</p>';
       return;
@@ -778,6 +1109,9 @@
 
   /** Collectors Table */
   function renderCollectorsTable(data) {
+    applyPanelFreshness('collectors');
+    if (!shouldRenderPanel(panelStates, 'collectors')) return; // failed fetch → keep previous rows
+
     if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
       els.collectorsTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No collectors' + errorIndicator('health') + '</td></tr>';
       return;
@@ -799,6 +1133,9 @@
 
   /** Agents & LLMs In Use */
   function renderAgentsTable(data) {
+    applyPanelFreshness('agents');
+    if (!shouldRenderPanel(panelStates, 'agents')) return; // failed fetch → keep previous rows
+
     if (!data.aggByModel || data.aggByModel.length === 0) {
       els.agentsTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No agent data' + errorIndicator('aggByModel') + '</td></tr>';
       return;
@@ -868,6 +1205,9 @@
 
   /** Recent Sessions */
   function renderSessionsTable(data) {
+    applyPanelFreshness('sessions');
+    if (!shouldRenderPanel(panelStates, 'sessions')) return; // failed fetch → keep previous rows
+
     if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
       els.sessionsTbody.innerHTML = '<tr><td colspan="9" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
       return;
@@ -875,7 +1215,7 @@
 
     var html = '';
     data.sessions.items.forEach(function (s) {
-      var clientName = clientMap[s.client_id] || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
+      var clientName = ensureClientName(s.client_id) || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
       html += buildSessionRowHtml(s, clientName);
     });
 
@@ -901,6 +1241,9 @@
 
   /** Agent Runs Table */
   function renderAgentRunsTable(data) {
+    applyPanelFreshness('agent-runs');
+    if (!shouldRenderPanel(panelStates, 'agent-runs')) return; // failed fetch → keep previous rows
+
     var runs = data && data.items;
     if (!runs || runs.length === 0) {
       var errSuffix = agentRunsFetchError
@@ -946,6 +1289,9 @@
 
   /** Render Client/Project Usage Breakdown two-level expandable table */
   function renderClientProjectBreakdown(data) {
+    applyPanelFreshness('client-project');
+    if (!shouldRenderPanel(panelStates, 'client-project')) return; // failed fetch → keep previous rows
+
     var rows = data && data.aggClientProject || [];
 
     // Update panel subtitle with formatted range label
@@ -1370,12 +1716,76 @@
     return '';
   }
 
+  // ── Panel freshness (DOM wiring) ──────────────────────────────────────
+  // Each instrumented panel carries a <span class="panel-freshness"
+  // id="freshness-<panelId>"> in its title row (index.html).  The label is
+  // small muted text rendered in the title's existing flex row, so it never
+  // changes panel layout — no spinners, no overlays, no reflow.
+
+  /** Render a panel's freshness label into its header span. */
+  function applyPanelFreshness(panelId) {
+    var el = document.getElementById('freshness-' + panelId);
+    if (!el) return;
+    var f = computePanelFreshness(panelStates, panelId, Date.now());
+    if (!f) {
+      el.textContent = '';
+      el.className = 'panel-freshness';
+      return;
+    }
+    el.textContent = f.label;
+    el.className = 'panel-freshness ' + f.cssClass;
+  }
+
+  /** Record a panel state and repaint its freshness label. */
+  function setPanelState(panelId, status, updatedAt) {
+    panelStates[panelId] = { status: status, updatedAt: updatedAt };
+    applyPanelFreshness(panelId);
+  }
+
+  /** Mark every panel 'refreshing' at the start of a refresh cycle. */
+  function markAllPanelsRefreshing() {
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var prev = panelStates[panelId];
+      setPanelState(panelId, 'refreshing', prev ? prev.updatedAt : null);
+    });
+  }
+
+  /** Resolve every panel to 'ok'/'stale' from the cycle's fetch errors.
+   *  A failed panel keeps its previous updatedAt (data on screen is the
+   *  previous successful render); a successful one records the cycle time. */
+  function resolvePanelStatesAfterFetch() {
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError });
+    var statuses = resolvePanelStatuses(errors);
+    var nowMs = Date.now();
+    Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
+      var prev = panelStates[panelId];
+      if (statuses[panelId] === 'stale') {
+        setPanelState(panelId, 'stale', prev ? prev.updatedAt : null);
+      } else {
+        setPanelState(panelId, 'ok', nowMs);
+      }
+    });
+  }
+
+  /** Repaint the header "Last refreshed HH:MM:SS" clock. */
+  function updateLastRefreshed() {
+    if (!els.lastRefreshed) return;
+    els.lastRefreshed.textContent =
+      'Last refreshed ' + (lastRefreshedAt ? formatClockTime(lastRefreshedAt) : '--');
+  }
+
   // ── Orchestration ─────────────────────────────────────────────────────
 
   async function refreshDashboard() {
     try {
       if (els.dashboard) els.dashboard.classList.add('refreshing');
+      markAllPanelsRefreshing(); // "Refreshing…" on every panel while the cycle is in flight
       var data = await fetchAll();
+      resolvePanelStatesAfterFetch(); // per-panel ok/stale from this cycle's fetch errors
+      // Record the cycle timestamp BEFORE rendering so the KPI "As of"
+      // subtitle and any other render-time consumers see the CURRENT
+      // cycle's time, not the previous one (fixes one-cycle lag).
+      lastRefreshedAt = new Date();    // data on screen is from this cycle
       renderHeader(data);
       renderKPIs(data);
       renderModelMix(data);
@@ -1391,6 +1801,9 @@
       showError('Dashboard refresh error: ' + e.message);
     } finally {
       if (els.dashboard) els.dashboard.classList.remove('refreshing');
+      // Repaint the header clock — lastRefreshedAt was set before the
+      // render pass above so the header displays the current cycle time.
+      updateLastRefreshed();
     }
   }
 
@@ -1415,15 +1828,21 @@
 
   function applyFilters() {
     agentRunFilters = readFiltersFromUI();
+    // Track the agent-runs panel freshness for this independent fetch
+    var prev = panelStates['agent-runs'];
+    setPanelState('agent-runs', 'refreshing', prev ? prev.updatedAt : null);
     // Re-fetch agent runs with new filters, update table
     var url = buildAgentRunsUrl();
     apiFetch(url).then(function (data) {
       agentRunsData = data;
       agentRunsFetchError = null;
+      setPanelState('agent-runs', 'ok', Date.now());
       renderAgentRunsTable(data);
     }).catch(function (e) {
       agentRunsFetchError = e.message || 'Agent runs query failed';
-      renderAgentRunsTable(null);
+      var prevState = panelStates['agent-runs'];
+      setPanelState('agent-runs', 'stale', prevState ? prevState.updatedAt : null);
+      renderAgentRunsTable(null); // keeps previous rows; label shows "Showing previous data"
       console.error('Agent runs filter fetch error:', e);
     });
   }
@@ -1600,5 +2019,18 @@
   // Expose for tests
   window.resolveProjectLabel = resolveProjectLabel;
   window.buildSessionRowHtml = buildSessionRowHtml;
+  window.createClientCache = createClientCache;
+  window.ensureClientName = ensureClientName;
+  window.refreshClientCache = refreshClientCache;
+  window.invalidateClientCache = invalidateClientCache;
+  window.formatUpdatedAgo = formatUpdatedAgo;
+  window.computePanelFreshness = computePanelFreshness;
+  window.shouldRenderPanel = shouldRenderPanel;
+  window.resolvePanelStatuses = resolvePanelStatuses;
+  window.formatClockTime = formatClockTime;
+  window.kpiSubtitle = kpiSubtitle;
+  // Read-only accessor for the last COMPLETED refresh cycle time — reusable
+  // by follow-up work (issue #358) without reaching into module state.
+  window.getLastRefreshedAt = function () { return lastRefreshedAt; };
 
 })();

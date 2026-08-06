@@ -19,6 +19,7 @@
     <div class="header-right">
       <span class="live-indicator" id="live-indicator">LIVE</span>
       <span class="timestamp" id="timestamp">--</span>
+      <span class="last-refreshed" id="last-refreshed">Last refreshed --</span>
       <span class="db-status" id="db-status">--</span>
     </div>
   </header>
@@ -100,26 +101,31 @@
     <!-- KPI Row -->
     <section class="kpi-row" id="kpi-row">
       <div class="kpi-card kpi-tokens">
-        <span class="kpi-label">Total Tokens</span>
+        <span class="panel-freshness" id="freshness-kpi-tokens"></span>
+        <span class="kpi-label">Active Tokens</span>
         <span class="kpi-value" id="kpi-tokens">--</span>
         <span class="kpi-sub" id="kpi-tokens-detail">--</span>
       </div>
       <div class="kpi-card kpi-cost">
+        <span class="panel-freshness" id="freshness-kpi-cost"></span>
         <span class="kpi-label">Est. Cost (USD)</span>
         <span class="kpi-value" id="kpi-cost">--</span>
         <span class="kpi-sub" id="kpi-cost-detail">--</span>
       </div>
       <div class="kpi-card kpi-sessions">
+        <span class="panel-freshness" id="freshness-kpi-sessions"></span>
         <span class="kpi-label">Sessions</span>
         <span class="kpi-value" id="kpi-sessions">--</span>
         <span class="kpi-sub" id="kpi-sessions-detail">--</span>
       </div>
       <div class="kpi-card kpi-collectors">
+        <span class="panel-freshness" id="freshness-kpi-collectors"></span>
         <span class="kpi-label">Healthy Collectors</span>
         <span class="kpi-value" id="kpi-collectors">--</span>
         <span class="kpi-sub" id="kpi-collectors-detail">--</span>
       </div>
       <div class="kpi-card kpi-source-dbs">
+        <span class="panel-freshness" id="freshness-kpi-source-dbs"></span>
         <span class="kpi-label">Source Databases</span>
         <span class="kpi-value" id="kpi-source-dbs">--</span>
         <span class="kpi-sub" id="kpi-source-dbs-detail">--</span>
@@ -134,7 +140,7 @@
 
         <!-- Model Mix -->
         <section class="glass-panel panel-model-mix">
-          <h2 class="panel-title">Model Mix</h2>
+          <h2 class="panel-title">Model Mix<span class="panel-freshness" id="freshness-model-mix"></span></h2>
           <div class="chart-container" id="model-mix-chart">
             <p class="empty-state">Loading model distribution&hellip;</p>
           </div>
@@ -142,7 +148,7 @@
 
         <!-- Collectors Table -->
         <section class="glass-panel panel-collectors">
-          <h2 class="panel-title">Collectors</h2>
+          <h2 class="panel-title">Collectors<span class="panel-freshness" id="freshness-collectors"></span></h2>
           <div class="table-scroll">
             <table>
               <thead>
@@ -165,11 +171,12 @@
       <!-- Right Column -->
       <div class="col-right">
 
-        <!-- Live Events -->
+        <!-- Operational Events -->
         <section class="glass-panel panel-events">
           <h2 class="panel-title">
-            Live Events
+            Operational Events
             <span class="event-badge" id="event-badge"></span>
+            <span class="panel-freshness" id="freshness-events"></span>
           </h2>
           <div class="events-feed" id="events-feed">
             <p class="empty-state">Waiting for events&hellip;</p>
@@ -178,7 +185,7 @@
 
         <!-- Collector Distribution -->
         <section class="glass-panel panel-collector-dist">
-          <h2 class="panel-title">Collector Distribution</h2>
+          <h2 class="panel-title">Collector Distribution<span class="panel-freshness" id="freshness-collector-dist"></span></h2>
           <div id="collector-dist-chart">
             <p class="empty-state">Loading&hellip;</p>
           </div>
@@ -186,7 +193,7 @@
 
         <!-- Agents & LLMs In Use -->
         <section class="glass-panel panel-agents">
-          <h2 class="panel-title">Agents &amp; LLMs In Use</h2>
+          <h2 class="panel-title">Agents &amp; LLMs In Use<span class="panel-freshness" id="freshness-agents"></span></h2>
           <div class="table-scroll">
             <table>
               <thead>
@@ -223,7 +230,7 @@
 
     <!-- Sessions Table (full width) -->
     <section class="glass-panel panel-sessions">
-      <h2 class="panel-title">All Sessions</h2>
+      <h2 class="panel-title">All Sessions<span class="panel-freshness" id="freshness-sessions"></span></h2>
       <div class="table-scroll">
         <table id="sessions-table">
           <thead>
@@ -253,7 +260,7 @@
 
     <!-- Agent Runs (full width) -->
     <section class="glass-panel panel-agent-runs">
-      <h2 class="panel-title">Agent Runs</h2>
+      <h2 class="panel-title">Agent Runs<span class="panel-freshness" id="freshness-agent-runs"></span></h2>
       <div class="agent-runs-filters" id="agent-runs-filters">
         <div class="filter-group">
           <label for="ar-filter-from">From</label>
@@ -309,14 +316,14 @@
     <div class="tab-content" id="tab-clients-projects">
 
     <section class="glass-panel panel-client-project">
-      <h2 class="panel-title">Client / Project Usage Breakdown</h2>
+      <h2 class="panel-title">Client / Project Usage Breakdown<span class="panel-freshness" id="freshness-client-project"></span></h2>
       <p class="panel-subtitle" id="cp-panel-subtitle">--</p>
       <div class="table-scroll">
         <table class="cp-table" id="cp-table">
           <thead>
             <tr>
               <th>Client / Project</th>
-              <th>Total Tokens</th>
+              <th>Active Tokens</th>
               <th>Est. Cost</th>
               <th>Sessions</th>
               <th>Models</th>

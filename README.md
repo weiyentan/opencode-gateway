@@ -135,7 +135,7 @@ Expected response (example):
 {"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
 ```
 
-**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, live events, collector health, agent/LLM usage, and recent sessions — all auto-refreshing every 30 seconds. The frontend is served by a separate nginx container that proxies API requests to the Gateway.
+**Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, operational events, collector health, agent/LLM usage, and recent sessions — auto-refreshing every 30 seconds (client metadata is cached for 10 minutes). The frontend is served by a separate nginx container that proxies API requests to the Gateway.
 
 ---
 
@@ -230,13 +230,13 @@ The frontend is the sole browser entrypoint — the Gateway runs internally and 
 
 ### Dashboard Sections
 
-The dashboard polls the Gateway REST API every 30 seconds and renders:
+The dashboard polls the Gateway REST API every 30 seconds (client metadata is cached for 10 minutes) and renders:
 
 | Section | Data Source | Description |
 |---------|-------------|-------------|
-| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Total tokens, estimated cost, session count, healthy collectors, source databases |
+| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Active tokens, estimated cost, session count, healthy collectors, source databases |
 | **Model Mix** | `/api/v1/usage/aggregates?group_by=model` | Token/cost breakdown by LLM model |
-| **Live Events** | Recent usage records | Real-time feed of incoming telemetry events |
+| **Operational Events** | Recent usage records | Real-time feed of incoming telemetry events |
 | **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
 | **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
