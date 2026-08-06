@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.core.telemetry import timed_operation
 from app.db.session import DatabasePool
 
 logger = logging.getLogger(__name__)
@@ -106,25 +107,26 @@ async def _collector_health_summary(
     try:
         conn = await db_pool.acquire()
         try:
-            rows = await conn.fetch("""
-                SELECT
-                    cc.id AS credential_id,
-                    c.name  AS client_name,
-                    (
-                        SELECT MAX(ib.ingested_at)
-                        FROM ingest_batches ib
-                        WHERE ib.collector_credential_id = cc.id
-                    ) AS last_heartbeat,
-                    COALESCE((
-                        SELECT SUM(ib.record_count)
-                        FROM ingest_batches ib
-                        WHERE ib.collector_credential_id = cc.id
-                    ), 0) AS total_records_ingested
-                FROM collector_credentials cc
-                JOIN opencode_clients c ON c.id = cc.client_id
-                WHERE cc.revoked_at IS NULL
-                ORDER BY cc.id
-            """)
+            async with timed_operation("db.query.health.collectors", "db"):
+                rows = await conn.fetch("""
+                    SELECT
+                        cc.id AS credential_id,
+                        c.name  AS client_name,
+                        (
+                            SELECT MAX(ib.ingested_at)
+                            FROM ingest_batches ib
+                            WHERE ib.collector_credential_id = cc.id
+                        ) AS last_heartbeat,
+                        COALESCE((
+                            SELECT SUM(ib.record_count)
+                            FROM ingest_batches ib
+                            WHERE ib.collector_credential_id = cc.id
+                        ), 0) AS total_records_ingested
+                    FROM collector_credentials cc
+                    JOIN opencode_clients c ON c.id = cc.client_id
+                    WHERE cc.revoked_at IS NULL
+                    ORDER BY cc.id
+                """)
         finally:
             await db_pool.release(conn)
     except Exception:
@@ -153,17 +155,18 @@ async def _source_db_health_summary(
     try:
         conn = await db_pool.acquire()
         try:
-            rows = await conn.fetch("""
-                SELECT
-                    sd.id            AS source_database_id,
-                    c.name           AS client_name,
-                    sd.last_seen_at  AS last_push,
-                    sd.record_count  AS record_count
-                FROM source_databases sd
-                JOIN opencode_clients c ON c.id = sd.client_id
-                WHERE sd.is_active = true
-                ORDER BY sd.id
-            """)
+            async with timed_operation("db.query.health.source_databases", "db"):
+                rows = await conn.fetch("""
+                    SELECT
+                        sd.id            AS source_database_id,
+                        c.name           AS client_name,
+                        sd.last_seen_at  AS last_push,
+                        sd.record_count  AS record_count
+                    FROM source_databases sd
+                    JOIN opencode_clients c ON c.id = sd.client_id
+                    WHERE sd.is_active = true
+                    ORDER BY sd.id
+                """)
         finally:
             await db_pool.release(conn)
     except Exception:
@@ -187,9 +190,10 @@ async def _last_ingest_timestamp(db_pool: DatabasePool) -> datetime | None:
     try:
         conn = await db_pool.acquire()
         try:
-            row = await conn.fetchrow(
-                "SELECT MAX(ingested_at) AS last_ts FROM ingest_batches"
-            )
+            async with timed_operation("db.query.health.last_ingest", "db"):
+                row = await conn.fetchrow(
+                    "SELECT MAX(ingested_at) AS last_ts FROM ingest_batches"
+                )
         finally:
             await db_pool.release(conn)
         return row["last_ts"] if row else None

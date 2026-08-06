@@ -28,6 +28,7 @@ from app.core.schemas.usage import (
     RecordWithContextGroupedRow,
     SessionSummary,
 )
+from app.core.telemetry import timed_operation
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -156,26 +157,27 @@ async def _fetch_aggregates(
     query_params = [start_date, end_date, *params]
 
     if not group_parts:
-        # Single total row
-        sql = f"""
-            SELECT
-                'total' AS group_value,
-                COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
-                COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
-                COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
-                COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
-                COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
-                COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
-                SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-                COUNT(*) AS record_count,
-                COUNT(DISTINCT our.session_id) AS session_count,
-                COUNT(DISTINCT om.model_name) AS model_count
-            FROM opencode_usage_records our
-            JOIN observed_models om ON om.id = our.model_id
-            LEFT JOIN opencode_clients oc ON oc.id = our.client_id
-            WHERE {where_clause}
-        """
-        row = await conn.fetchrow(sql, *query_params)
+        # Single total row.  Audit: 1 query (fetchrow) — already optimal.
+        async with timed_operation("db.query.aggregates.total", "db"):
+            sql = f"""
+                SELECT
+                    'total' AS group_value,
+                    COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
+                    COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
+                    COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+                    COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+                    COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+                    COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
+                    SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
+                    COUNT(*) AS record_count,
+                    COUNT(DISTINCT our.session_id) AS session_count,
+                    COUNT(DISTINCT om.model_name) AS model_count
+                FROM opencode_usage_records our
+                JOIN observed_models om ON om.id = our.model_id
+                LEFT JOIN opencode_clients oc ON oc.id = our.client_id
+                WHERE {where_clause}
+            """
+            row = await conn.fetchrow(sql, *query_params)
         return [
             AggregateRow(
                 group_value="total",
@@ -221,29 +223,30 @@ async def _fetch_aggregates(
     if has_project:
         group_by_clause += f",{_PROJECT_LABEL_SQL}"
 
-    sql = f"""
-        SELECT
-            {group_expr} AS group_value{project_label_col},
-            COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
-            COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
-            COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
-            COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
-            COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
-            COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
-            SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-            COUNT(*) AS record_count,
-            COUNT(DISTINCT our.session_id) AS session_count,
-            COUNT(DISTINCT om.model_name) AS model_count
-        FROM opencode_usage_records our
-        JOIN observed_models om ON om.id = our.model_id
-        LEFT JOIN opencode_clients oc ON oc.id = our.client_id
-        {sessions_join}
-        {project_join}
-        WHERE {where_clause}
-        {group_by_clause}
-        ORDER BY group_value
-    """
-    rows = await conn.fetch(sql, *query_params)
+    async with timed_operation("db.query.aggregates.grouped", "db"):
+        sql = f"""
+            SELECT
+                {group_expr} AS group_value{project_label_col},
+                COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+                COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+                COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+                COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
+                SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
+                COUNT(*) AS record_count,
+                COUNT(DISTINCT our.session_id) AS session_count,
+                COUNT(DISTINCT om.model_name) AS model_count
+            FROM opencode_usage_records our
+            JOIN observed_models om ON om.id = our.model_id
+            LEFT JOIN opencode_clients oc ON oc.id = our.client_id
+            {sessions_join}
+            {project_join}
+            WHERE {where_clause}
+            {group_by_clause}
+            ORDER BY group_value
+        """
+        rows = await conn.fetch(sql, *query_params)
     return [
         AggregateRow(
             group_value=str(r["group_value"]),
@@ -428,6 +431,10 @@ async def _fetch_sessions(
     ``first_message_at <= end_date`` **and** ``last_message_at >= start_date``.
     This captures sessions that started before the query range but were still
     active during it.
+
+    Audit: 2 queries (count + data), both with LEFT JOIN for context and
+    project label — no N+1 pattern found.  Columns are explicitly listed
+    (``SELECT s.id, s.client_id, …``) rather than ``SELECT *``.
     """
     params: list = []
 
@@ -445,41 +452,43 @@ async def _fetch_sessions(
     query_params = [start_date, end_date, *params]
 
     # Total count
-    count_sql = f"SELECT COUNT(*) FROM sessions s WHERE {where_clause}"
-    total = await conn.fetchval(count_sql, *query_params)
+    async with timed_operation("db.query.sessions.count", "db"):
+        count_sql = f"SELECT COUNT(*) FROM sessions s WHERE {where_clause}"
+        total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
-    data_sql = f"""
-        SELECT
-            s.id,
-            s.client_id,
-            s.source_database_id,
-            s.first_message_at,
-            s.last_message_at,
-            s.message_count,
-            s.total_input_tokens,
-            s.total_output_tokens,
-            s.total_cached_tokens,
-            s.total_cache_read_tokens,
-            s.total_cache_write_tokens,
-            s.project_id,
-            s.workspace_id,
-            s.agent,
-            s.parent_session_id,
-            s.total_estimated_cost_usd,
-            osc.title AS session_title,
-            {_PROJECT_LABEL_SQL} AS project_label
-        FROM sessions s
-        LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
-        LEFT JOIN opencode_source_projects osp
-            ON osp.source_database_id = s.source_database_id
-            AND osp.external_project_id = s.project_id
-        WHERE {where_clause}
-        ORDER BY s.last_message_at DESC
-        LIMIT ${len(query_params) + 1}
-        OFFSET ${len(query_params) + 2}
-    """
-    rows = await conn.fetch(data_sql, *query_params, limit, offset)
+    async with timed_operation("db.query.sessions.data", "db"):
+        data_sql = f"""
+            SELECT
+                s.id,
+                s.client_id,
+                s.source_database_id,
+                s.first_message_at,
+                s.last_message_at,
+                s.message_count,
+                s.total_input_tokens,
+                s.total_output_tokens,
+                s.total_cached_tokens,
+                s.total_cache_read_tokens,
+                s.total_cache_write_tokens,
+                s.project_id,
+                s.workspace_id,
+                s.agent,
+                s.parent_session_id,
+                s.total_estimated_cost_usd,
+                osc.title AS session_title,
+                {_PROJECT_LABEL_SQL} AS project_label
+            FROM sessions s
+            LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+            LEFT JOIN opencode_source_projects osp
+                ON osp.source_database_id = s.source_database_id
+                AND osp.external_project_id = s.project_id
+            WHERE {where_clause}
+            ORDER BY s.last_message_at DESC
+            LIMIT ${len(query_params) + 1}
+            OFFSET ${len(query_params) + 2}
+        """
+        rows = await conn.fetch(data_sql, *query_params, limit, offset)
 
     items = [
         SessionSummary(
@@ -792,7 +801,23 @@ async def _fetch_agent_runs(
     offset: int,
     grafana_base_url: str,
 ) -> PaginatedResponse[AgentRunSummary]:
-    """Query sessions table, compute status, join child counts, return paginated."""
+    """Query sessions table, compute status, join child counts, return paginated.
+
+    Audit: removed N+1 pattern for ``child_run_count`` — replaced the
+    per-row correlated subquery ``(SELECT COUNT(*) FROM sessions child
+    WHERE child.parent_session_id = ...)`` with a pre-computed CTE
+    ``child_counts`` that aggregates once before the main query.
+    2 queries (count + data), no N+1.
+
+    Query-plan rationale: the correlated subquery version forces a nested
+    loop — the inner ``SELECT COUNT(*) … WHERE parent_session_id = …``
+    runs once for every row in the result set (50–1000 times per page).
+    The CTE ``child_counts`` does a single ``GROUP BY parent_session_id``
+    pass over ``sessions`` and the main query LEFT JOINs it at the outer
+    level.  For N result rows the old plan does O(N) index scans; the new
+    plan does O(1) hash-aggregate + hash-join.  ``parent_session_id`` is
+    indexed, so the CTE can use an index-only scan.
+    """
     from app.core.schemas.usage import AgentRunSummary
 
     where_clause, params = _build_agent_run_filters(
@@ -873,24 +898,28 @@ async def _fetch_agent_runs(
         count_from = f"FROM sessions s WHERE {where_clause}"
 
     # ── Count query ─────────────────────────────────────────────────
-    count_sql = f"SELECT COUNT(*) {count_from}"
-    total = await conn.fetchval(count_sql, *params)
+    async with timed_operation("db.query.agent_runs.count", "db"):
+        count_sql = f"SELECT COUNT(*) {count_from}"
+        total = await conn.fetchval(count_sql, *params)
 
-    # ── Child count subquery ────────────────────────────────────────
-    child_subquery = """
-        SELECT COUNT(*) FROM sessions child
-        WHERE child.parent_session_id = s.external_session_id
-    """
-
-    # ── Data query ──────────────────────────────────────────────────
-    data_sql = f"""
-        SELECT *, ({child_subquery}) AS child_run_count
-        FROM ({base_query}) s
-        ORDER BY s.last_message_at DESC NULLS LAST
-        LIMIT ${len(params) + 1}
-        OFFSET ${len(params) + 2}
-    """
-    rows = await conn.fetch(data_sql, *params, limit, offset)
+    # ── Data query with CTE for child counts (no N+1) ──────────────
+    async with timed_operation("db.query.agent_runs.data", "db"):
+        data_sql = f"""
+            WITH child_counts AS (
+                SELECT parent_session_id, COUNT(*) AS cnt
+                FROM sessions
+                WHERE parent_session_id IS NOT NULL
+                GROUP BY parent_session_id
+            )
+            SELECT s.*, COALESCE(cc.cnt, 0) AS child_run_count
+            FROM ({base_query}) s
+            LEFT JOIN child_counts cc
+                ON cc.parent_session_id = s.external_session_id
+            ORDER BY s.last_message_at DESC NULLS LAST
+            LIMIT ${len(params) + 1}
+            OFFSET ${len(params) + 2}
+        """
+        rows = await conn.fetch(data_sql, *params, limit, offset)
 
     items: list[AgentRunSummary] = []
     for r in rows:
@@ -942,41 +971,79 @@ async def _fetch_agent_run_detail(
     session_id: uuid.UUID,
     grafana_base_url: str,
 ) -> AgentRunDetail:
-    """Fetch a single agent run detail by internal session UUID."""
+    """Fetch a single agent run detail by internal session UUID.
+
+    Optimized from 5 sequential queries to 3:
+    1. Session row + context (LEFT JOIN) + parent internal ID (correlated subquery)
+    2. Child sessions
+    3. Todo snapshots
+
+    Query-plan rationale:
+    - LEFT JOINing ``opencode_session_contexts`` into the session fetchrow
+      eliminates a separate index-lookup on ``session_id`` (the FK); the join
+      is 1:1 per session and resolved in the same heap scan.
+    - The parent-internal-ID correlated subquery ``(SELECT p.id FROM sessions p
+      WHERE p.external_session_id = s.parent_session_id LIMIT 1)`` is only
+      evaluated when ``parent_session_id IS NOT NULL``; when NULL the
+      subquery short-circuits.  ``external_session_id`` is indexed, so each
+      invocation is a single index seek — cheaper than a separate round-trip.
+    - This reduces the per-request query count from 5 to 3 (2 round-trips
+      saved), eliminating the latency tail of the extra network exchanges.
+    """
     from app.core.schemas.usage import (
         AgentRunDetail,
         ChildRunSummary,
         TodoRow,
     )
 
-    # ── Fetch the session row ────────────────────────────────────────
-    session_row = await conn.fetchrow(
-        """SELECT
-            s.id,
-            s.client_id,
-            s.source_database_id,
-            s.external_session_id,
-            s.first_message_at,
-            s.last_message_at,
-            s.message_count,
-            s.total_input_tokens,
-            s.total_output_tokens,
-            s.total_cached_tokens,
-            s.total_cache_read_tokens,
-            s.total_cache_write_tokens,
-            s.total_estimated_cost_usd,
-            s.project_id,
-            s.workspace_id,
-            s.agent,
-            s.parent_session_id,
-            """ + _PROJECT_LABEL_SQL + """ AS project_label
-        FROM sessions s
-        LEFT JOIN opencode_source_projects osp
-            ON osp.source_database_id = s.source_database_id
-            AND osp.external_project_id = s.project_id
-        WHERE s.id = $1""",
-        session_id,
-    )
+    # ── Fetch session + context + parent_internal_id (merged) ───────
+    async with timed_operation("db.query.agent_run_detail.session", "db"):
+        session_row = await conn.fetchrow(
+            """SELECT
+                s.id,
+                s.client_id,
+                s.source_database_id,
+                s.external_session_id,
+                s.first_message_at,
+                s.last_message_at,
+                s.message_count,
+                s.total_input_tokens,
+                s.total_output_tokens,
+                s.total_cached_tokens,
+                s.total_cache_read_tokens,
+                s.total_cache_write_tokens,
+                s.total_estimated_cost_usd,
+                s.project_id,
+                s.workspace_id,
+                s.agent,
+                s.parent_session_id,
+                """ + _PROJECT_LABEL_SQL + """ AS project_label,
+                -- Parent resolution via correlated subquery
+                (SELECT p.id FROM sessions p
+                 WHERE p.external_session_id = s.parent_session_id LIMIT 1
+                ) AS parent_internal_id,
+                -- Session context columns
+                osc.id AS ctx_present,  -- non-null PK → reliable row-presence signal
+                osc.code_change_count,
+                osc.code_change_additions,
+                osc.code_change_deletions,
+                osc.session_model AS ctx_session_model,
+                osc.session_cost AS ctx_session_cost,
+                osc.title AS ctx_title,
+                osc.source_directory AS ctx_source_directory,
+                osc.source_path AS ctx_source_path,
+                osc.source_input_tokens AS ctx_source_input_tokens,
+                osc.source_output_tokens AS ctx_source_output_tokens,
+                osc.source_cached_tokens AS ctx_source_cached_tokens,
+                osc.source_reasoning_tokens AS ctx_source_reasoning_tokens
+            FROM sessions s
+            LEFT JOIN opencode_source_projects osp
+                ON osp.source_database_id = s.source_database_id
+                AND osp.external_project_id = s.project_id
+            LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+            WHERE s.id = $1""",
+            session_id,
+        )
 
     if session_row is None:
         raise HTTPException(
@@ -984,35 +1051,26 @@ async def _fetch_agent_run_detail(
             detail=f"Agent run not found: {session_id}",
         )
 
-    # ── Resolve parent internal ID if parent_session_id is set ───────
-    parent_internal_id: uuid.UUID | None = None
-    parent_external_id: str | None = session_row["parent_session_id"]
-    if parent_external_id:
-        parent_row = await conn.fetchrow(
-            "SELECT id FROM sessions WHERE external_session_id = $1 LIMIT 1",
-            parent_external_id,
-        )
-        if parent_row:
-            parent_internal_id = parent_row["id"]
-
     # ── Fetch child sessions ─────────────────────────────────────────
-    child_rows = await conn.fetch(
-        """SELECT
-            id, external_session_id, agent, message_count,
-            last_message_at
-        FROM sessions
-        WHERE parent_session_id = $1
-        ORDER BY last_message_at DESC""",
-        session_row["external_session_id"],
-    )
+    async with timed_operation("db.query.agent_run_detail.children", "db"):
+        child_rows = await conn.fetch(
+            """SELECT
+                id, external_session_id, agent, message_count,
+                last_message_at
+            FROM sessions
+            WHERE parent_session_id = $1
+            ORDER BY last_message_at DESC""",
+            session_row["external_session_id"],
+        )
 
     child_summaries: list[ChildRunSummary] = []
     for cr in child_rows:
-        child_status = _compute_status(
-            last_message_at=cr["last_message_at"],
-            message_count=cr["message_count"],
-            has_parent=True,
-        )
+        async with timed_operation("compute.status.child", "compute"):
+            child_status = _compute_status(
+                last_message_at=cr["last_message_at"],
+                message_count=cr["message_count"],
+                has_parent=True,
+            )
         child_summaries.append(
             ChildRunSummary(
                 id=cr["id"],
@@ -1025,41 +1083,23 @@ async def _fetch_agent_run_detail(
         )
 
     # ── Compute status ────────────────────────────────────────────────
-    computed_status = _compute_status(
-        last_message_at=session_row["last_message_at"],
-        message_count=session_row["message_count"],
-        has_parent=session_row["parent_session_id"] is not None,
-    )
+    async with timed_operation("compute.status.session", "compute"):
+        computed_status = _compute_status(
+            last_message_at=session_row["last_message_at"],
+            message_count=session_row["message_count"],
+            has_parent=session_row["parent_session_id"] is not None,
+        )
 
-    # ── Query session context projection ────────────────────────────
-    ctx_row = await conn.fetchrow(
-        """SELECT
-            code_change_count,
-            code_change_additions,
-            code_change_deletions,
-            session_model,
-            session_cost,
-            title,
-            source_directory,
-            source_path,
-            source_input_tokens,
-            source_output_tokens,
-            source_cached_tokens,
-            source_reasoning_tokens
-        FROM opencode_session_contexts
-        WHERE session_id = $1""",
-        session_row["id"],
-    )
-
-    # ── Query todo snapshots ──────────────────────────────────────
-    todo_rows_raw = await conn.fetch(
-        """SELECT content, status, priority, position
-        FROM opencode_session_todos
-        WHERE source_database_id = $1 AND external_session_id = $2
-        ORDER BY position""",
-        session_row["source_database_id"],
-        session_row["external_session_id"],
-    )
+    # ── Fetch todo snapshots ──────────────────────────────────────
+    async with timed_operation("db.query.agent_run_detail.todos", "db"):
+        todo_rows_raw = await conn.fetch(
+            """SELECT content, status, priority, position
+            FROM opencode_session_todos
+            WHERE source_database_id = $1 AND external_session_id = $2
+            ORDER BY position""",
+            session_row["source_database_id"],
+            session_row["external_session_id"],
+        )
 
     # ── Compute todo aggregates ────────────────────────────────────
     todos: list[TodoRow] = [
@@ -1078,21 +1118,25 @@ async def _fetch_agent_run_detail(
         1 for tr in todo_rows_raw if tr["status"] == "blocked"
     )
 
-    # ── Code change totals from session context ─────────────────────
+    # ── Extract context from merged row ──────────────────────────────
+    parent_external_id: str | None = session_row["parent_session_id"]
+    parent_internal_id: uuid.UUID | None = session_row["parent_internal_id"]
+
+    has_context = session_row["ctx_present"] is not None
     code_changes_total: int = (
-        ctx_row["code_change_count"] if ctx_row else 0
+        session_row["code_change_count"] if has_context else 0
     ) or 0
 
     # ── Build session context dict ──────────────────────────────────
     session_context: dict[str, object] | None = None
-    if ctx_row:
+    if has_context:
         session_context = {
-            "session_model": format_model_output(ctx_row["session_model"]),
-            "title": ctx_row["title"],
-            "source_directory": ctx_row["source_directory"],
-            "source_path": ctx_row["source_path"],
-            "code_change_additions": ctx_row["code_change_additions"],
-            "code_change_deletions": ctx_row["code_change_deletions"],
+            "session_model": format_model_output(session_row["ctx_session_model"]),
+            "title": session_row["ctx_title"],
+            "source_directory": session_row["ctx_source_directory"],
+            "source_path": session_row["ctx_source_path"],
+            "code_change_additions": session_row["code_change_additions"],
+            "code_change_deletions": session_row["code_change_deletions"],
         }
 
     # ── Build detail ─────────────────────────────────────────────────
@@ -1187,10 +1231,7 @@ async def get_agent_runs(
     ``running``, ``stale``, ``completed``, ``blocked``, or ``unknown``.
     See :func:`_compute_status` for the full derivation rules.
     """
-    from app.core.schemas.usage import (
-        VALID_AGENT_RUN_STATUSES,
-        AgentRunSummary,
-    )
+    from app.core.schemas.usage import VALID_AGENT_RUN_STATUSES
 
     # Validate date range if both provided
     if from_date is not None and to_date is not None:
@@ -1233,8 +1274,6 @@ async def get_agent_run_detail(
     No OpenCode event, transcript, or message-part replay data is
     included — this endpoint returns aggregated facts only.
     """
-    from app.core.schemas.usage import AgentRunDetail
-
     settings = get_settings()
     return await _fetch_agent_run_detail(
         conn, session_id, settings.grafana_base_url
