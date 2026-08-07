@@ -29,23 +29,29 @@ env:
   REGISTRY: docker.io
 
 jobs:
+  # Single source of truth for the image build matrix. The `build` job derives
+  # its matrix from this output and the `promote` job iterates the same image
+  # names, so the two lists can never silently diverge. Add or remove an image
+  # here only — no other place in this workflow hardcodes the image list.
+  images:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.define.outputs.matrix }}
+    steps:
+      - name: Define image matrix
+        id: define
+        run: |
+          echo 'matrix=[{"name":"gateway","context":".","dockerfile":"Dockerfile"},{"name":"aurora-glass","context":".","dockerfile":"frontend/Dockerfile"},{"name":"consumer","context":".","dockerfile":"Dockerfile.consumer"}]' >> "$GITHUB_OUTPUT"
+
   build:
+    needs: images
     runs-on: ubuntu-latest
     strategy:
       # A failed build must not prevent the other candidates from completing;
       # promotion is gated on the whole matrix succeeding below.
       fail-fast: false
       matrix:
-        image:
-          - name: gateway
-            context: .
-            dockerfile: Dockerfile
-          - name: aurora-glass
-            context: .
-            dockerfile: frontend/Dockerfile
-          - name: consumer
-            context: .
-            dockerfile: Dockerfile.consumer
+        image: ${{ fromJSON(needs.images.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +81,7 @@ jobs:
 
   promote:
     if: github.event_name != 'pull_request' && needs.build.result == 'success'
-    needs: build
+    needs: [images, build]
     runs-on: ubuntu-latest
     steps:
       - name: Log in to DockerHub
@@ -90,12 +96,27 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           REF_NAME: ${{ github.ref_name }}
           REGISTRY: ${{ env.REGISTRY }}
+          IMAGES_JSON: ${{ needs.images.outputs.matrix }}
         run: |
           set -euo pipefail
 
-          for image in gateway aurora-glass consumer; do
+          # Pre-flight: every candidate image must exist before any release tag
+          # is promoted, otherwise a missing candidate would still leave the
+          # three images on different published revisions. With `set -e`, a
+          # failed inspect aborts before the first promote tag is written.
+          for image in $(echo "${IMAGES_JSON}" | jq -r '.[].name'); do
+            docker buildx imagetools inspect \
+              "${REGISTRY}/${IMAGE_NAME}-${image}:${COMMIT_SHA}-candidate" >/dev/null
+          done
+
+          # Promote only after the whole candidate set is confirmed present.
+          # The promoted SHA tag is the 12-character short SHA, matching the
+          # previous docker/metadata-action `type=sha,prefix=` behaviour; the
+          # full SHA remains unique to the candidate tag.
+          sha_tag="${COMMIT_SHA:0:12}"
+          for image in $(echo "${IMAGES_JSON}" | jq -r '.[].name'); do
             source_image="${REGISTRY}/${IMAGE_NAME}-${image}:${COMMIT_SHA}-candidate"
-            tags=("${REGISTRY}/${IMAGE_NAME}-${image}:${COMMIT_SHA}")
+            tags=("${REGISTRY}/${IMAGE_NAME}-${image}:${sha_tag}")
 
             if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
               version="${REF_NAME#v}"
