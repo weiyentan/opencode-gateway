@@ -42,6 +42,7 @@ import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -386,3 +387,296 @@ async def apply_replay_merge(
                 )
 
     return IngestOutcome.UPDATED
+
+
+# ---------------------------------------------------------------------------
+# Advisory lock key — per-endpoint serialisation for reconciliation
+# ---------------------------------------------------------------------------
+
+RECONCILE_LOCK_CLASS = 47_004
+"""High 32 bits of the two-arg reconciliation serialisation lock.
+
+Follows the ``app/db/lock.py`` convention (``PORT_LOCK_KEY`` = 47_001,
+``CLEANUP_LOCK_CLASS`` = 47_002, ``REPLAY_LOCK_CLASS`` = 47_003).
+The low 32 bits are derived from ``client_id.int & 0xFFFFFFFF`` to
+serialise concurrent reconciliation runs per client.
+"""
+
+
+def _reconcile_lock_key(client_id: uuid.UUID) -> tuple[int, int]:
+    """Derive the two-arg advisory lock key for a reconciliation client."""
+    return (RECONCILE_LOCK_CLASS, client_id.int & 0xFFFFFFFF)
+
+
+# ---------------------------------------------------------------------------
+# Historical usage reconciliation — duplicate scan, canonical selection,
+# session aggregate rebuild
+# ---------------------------------------------------------------------------
+
+
+def _select_canonical(
+    group: list[asyncpg.Record],
+) -> tuple[asyncpg.Record, list[asyncpg.Record]]:
+    """Select the canonical row from a duplicate group.
+
+    Canonical = earliest ``first_ingested_at``, lowest ``id`` as tiebreaker.
+    Returns ``(canonical, non_canonicals)``.
+    """
+    # Sort by first_ingested_at ASC, then id ASC
+    sorted_group = sorted(
+        group, key=lambda r: (r["first_ingested_at"], r["id"])
+    )
+    return sorted_group[0], sorted_group[1:]
+
+
+@dataclass
+class ReconcilePreview:
+    """Summary of a reconciliation scan — what would change.
+
+    Attributes:
+        events_to_merge: Number of non-canonical duplicate events to remove.
+        aggregates_affected: Number of distinct sessions that would be rebuilt.
+        token_adjustment: Net token change (sum of ``input_tokens + output_tokens``
+            from non-canonical rows, negative — those tokens are removed).
+        cost_adjustment: Net cost change (sum of ``estimated_cost_usd`` from
+            non-canonical rows, negative — that cost is removed).
+    """
+
+    events_to_merge: int = 0
+    aggregates_affected: int = 0
+    token_adjustment: int = 0
+    cost_adjustment: Decimal = Decimal("0")
+
+    def to_response(self, dry_run: bool) -> dict[str, object]:
+        return {
+            "dry_run": dry_run,
+            "events_to_merge": self.events_to_merge,
+            "aggregates_affected": self.aggregates_affected,
+            "token_adjustment": self.token_adjustment,
+            "cost_adjustment_usd": str(self.cost_adjustment),
+        }
+
+
+async def scan_duplicate_groups(
+    conn: asyncpg.Connection,
+    *,
+    client_id: uuid.UUID | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> list[list[asyncpg.Record]]:
+    """Scan usage_events for duplicate source_record_id groups.
+
+    Returns a list of groups — each group is a list of ``usage_events``
+    rows sharing the same ``source_record_id`` within the filter window.
+    Only groups with >1 row are returned.
+
+    Filtering:
+    - ``client_id``: optional — when provided, scans only that client's events.
+    - ``date_from`` / ``date_to``: optional — filter on ``reported_at``.
+    """
+    conditions: list[str] = []
+    params: list[object] = []
+    idx = 1
+
+    if client_id is not None:
+        conditions.append(f"ue.client_id = ${idx}")
+        params.append(client_id)
+        idx += 1
+
+    if date_from is not None:
+        conditions.append(f"ue.reported_at >= ${idx}")
+        params.append(date_from)
+        idx += 1
+
+    if date_to is not None:
+        # Include the full day — date_to is a date, so add one day
+        conditions.append(f"ue.reported_at < ${idx}")
+        params.append(date_to)
+        idx += 1
+
+    where_clause = " AND ".join(conditions) if conditions else "TRUE"
+
+    rows = await conn.fetch(
+        f"""
+        SELECT ue.*
+        FROM usage_events ue
+        JOIN (
+            SELECT source_record_id
+            FROM usage_events ue2
+            WHERE {where_clause.replace('ue.', 'ue2.')}
+            GROUP BY source_record_id
+            HAVING COUNT(*) > 1
+        ) dup ON ue.source_record_id = dup.source_record_id
+        WHERE {where_clause}
+        ORDER BY ue.source_record_id, ue.first_ingested_at, ue.id
+        """,
+        *params,
+    )
+
+    # Group rows by source_record_id
+    groups: dict[str, list[asyncpg.Record]] = {}
+    for row in rows:
+        groups.setdefault(row["source_record_id"], []).append(row)
+
+    return list(groups.values())
+
+
+def compute_reconcile_preview(
+    groups: list[list[asyncpg.Record]],
+) -> ReconcilePreview:
+    """Compute a dry-run preview from duplicate groups.
+
+    For each group, selects the canonical row (earliest ``first_ingested_at``,
+    lowest ``id`` as tiebreaker), then sums token and cost adjustments from
+    the non-canonical rows.
+    """
+    preview = ReconcilePreview()
+    affected_sessions: set[uuid.UUID] = set()
+
+    for group in groups:
+        canonical, non_canonicals = _select_canonical(group)
+        if not non_canonicals:
+            continue
+
+        for nc in non_canonicals:
+            preview.events_to_merge += 1
+            # Token adjustment: input + output tokens from non-canonical
+            preview.token_adjustment -= int(nc["input_tokens"] or 0)
+            preview.token_adjustment -= int(nc["output_tokens"] or 0)
+            # Cost adjustment
+            nc_cost = nc["estimated_cost_usd"]
+            if nc_cost is not None:
+                if isinstance(nc_cost, Decimal):
+                    preview.cost_adjustment -= nc_cost
+                else:
+                    preview.cost_adjustment -= Decimal(str(nc_cost))
+
+            if nc["session_id"] is not None:
+                affected_sessions.add(nc["session_id"])
+
+    preview.aggregates_affected = len(affected_sessions)
+    return preview
+
+
+async def perform_reconciliation(
+    conn: asyncpg.Connection,
+    groups: list[list[asyncpg.Record]],
+) -> ReconcilePreview:
+    """Execute reconciliation and rebuild affected session aggregates.
+
+    Assumes the caller has already acquired the advisory lock and opened
+    a transaction.  For each duplicate group:
+    1. Selects the canonical row.
+    2. NULLs out ``usage_event_id`` on referencing ``usage_ingest_attempts``.
+    3. Deletes non-canonical ``usage_events`` rows.
+    4. Rebuilds the session aggregate from remaining canonical events.
+
+    Returns a :class:`ReconcilePreview` with the actual counts.
+    """
+    preview = ReconcilePreview()
+    affected_sessions: set[uuid.UUID] = set()
+    non_canonical_ids: list[uuid.UUID] = []
+
+    for group in groups:
+        canonical, non_canonicals = _select_canonical(group)
+        if not non_canonicals:
+            continue
+
+        for nc in non_canonicals:
+            nc_id: uuid.UUID = nc["id"]
+            non_canonical_ids.append(nc_id)
+            preview.events_to_merge += 1
+            preview.token_adjustment -= int(nc["input_tokens"] or 0)
+            preview.token_adjustment -= int(nc["output_tokens"] or 0)
+            nc_cost = nc["estimated_cost_usd"]
+            if nc_cost is not None:
+                if isinstance(nc_cost, Decimal):
+                    preview.cost_adjustment -= nc_cost
+                else:
+                    preview.cost_adjustment -= Decimal(str(nc_cost))
+            if nc["session_id"] is not None:
+                affected_sessions.add(nc["session_id"])
+
+    preview.aggregates_affected = len(affected_sessions)
+
+    if not non_canonical_ids:
+        return preview
+
+    # ── 1. NULL out usage_event_id on referencing ingest attempts ─────
+    await conn.execute(
+        """
+        UPDATE usage_ingest_attempts
+        SET usage_event_id = NULL
+        WHERE usage_event_id = ANY($1)
+        """,
+        non_canonical_ids,
+    )
+
+    # ── 2. Delete non-canonical usage_events ──────────────────────────
+    await conn.execute(
+        "DELETE FROM usage_events WHERE id = ANY($1)",
+        non_canonical_ids,
+    )
+
+    # ── 3. Rebuild session aggregates from remaining canonical events ─
+    if affected_sessions:
+        session_list = list(affected_sessions)
+        await _rebuild_session_aggregates(conn, session_list)
+
+    return preview
+
+
+async def _rebuild_session_aggregates(
+    conn: asyncpg.Connection,
+    session_ids: list[uuid.UUID],
+) -> None:
+    """Rebuild session aggregate totals from remaining canonical usage_events.
+
+    Recomputes ``total_input_tokens``, ``total_output_tokens``,
+    ``total_cached_tokens``, ``total_cache_read_tokens``,
+    ``total_cache_write_tokens``, and ``total_estimated_cost_usd`` for
+    each affected session directly from the canonical event rows that
+    remain in ``usage_events``.
+    """
+    if not session_ids:
+        return
+
+    # Recompute from canonical events
+    rows = await conn.fetch(
+        """
+        SELECT
+            session_id,
+            COALESCE(SUM(input_tokens), 0)::int AS total_input_tokens,
+            COALESCE(SUM(output_tokens), 0)::int AS total_output_tokens,
+            COALESCE(SUM(cached_tokens), 0)::int AS total_cached_tokens,
+            COALESCE(SUM(cache_read_tokens), 0)::int AS total_cache_read_tokens,
+            COALESCE(SUM(cache_write_tokens), 0)::int AS total_cache_write_tokens,
+            SUM(estimated_cost_usd) AS total_estimated_cost_usd
+        FROM usage_events
+        WHERE session_id = ANY($1)
+        GROUP BY session_id
+        """,
+        session_ids,
+    )
+
+    for row in rows:
+        sid: uuid.UUID = row["session_id"]
+        await conn.execute(
+            """
+            UPDATE sessions
+            SET total_input_tokens = $2,
+                total_output_tokens = $3,
+                total_cached_tokens = $4,
+                total_cache_read_tokens = $5,
+                total_cache_write_tokens = $6,
+                total_estimated_cost_usd = $7
+            WHERE id = $1
+            """,
+            sid,
+            row["total_input_tokens"],
+            row["total_output_tokens"],
+            row["total_cached_tokens"],
+            row["total_cache_read_tokens"],
+            row["total_cache_write_tokens"],
+            row["total_estimated_cost_usd"],
+        )

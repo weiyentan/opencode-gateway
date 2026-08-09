@@ -145,6 +145,7 @@ def create_app(
     from app.api.admin_resolve_source_identity import (
         router as admin_resolve_source_identity_router,
     )
+    from app.api.admin_reconcile import router as admin_reconcile_router
     from app.api.cursor import router as cursor_router
     from app.api.health import router as health_router
     from app.api.ingest import router as ingest_router
@@ -154,6 +155,7 @@ def create_app(
     app.include_router(admin_clients_router)
     app.include_router(admin_quarantines_router)
     app.include_router(admin_resolve_source_identity_router)
+    app.include_router(admin_reconcile_router)
     app.include_router(cursor_router)
     app.include_router(ingest_router)
     app.include_router(usage_router, prefix="/api/v1/usage")
