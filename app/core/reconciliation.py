@@ -108,8 +108,18 @@ event UUID (``event_id.int & 0xFFFFFFFF``).
 
 
 def _replay_lock_key(event_id: uuid.UUID) -> tuple[int, int]:
-    """Derive the two-arg advisory lock key for a canonical event id."""
-    return (REPLAY_LOCK_CLASS, event_id.int & 0xFFFFFFFF)
+    """Derive the two-arg advisory lock key for a canonical event id.
+
+    The low 32 bits of ``event_id.int`` are interpreted as a SIGNED int32
+    so the key always binds to the ``int4`` arguments of
+    ``pg_advisory_xact_lock(int, int)`` — an unsigned interpretation can
+    exceed ``INT32_MAX`` and asyncpg raises ``OverflowError: value out of
+    int32 range`` at bind time.  This is the same fix applied to
+    :func:`_canonical_event_lock_key` in issue #395.
+    """
+    unsigned = event_id.int & 0xFFFFFFFF
+    key = unsigned if unsigned <= 0x7FFFFFFF else unsigned - 0x100000000
+    return (REPLAY_LOCK_CLASS, key)
 
 
 # ---------------------------------------------------------------------------
