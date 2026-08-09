@@ -3120,6 +3120,124 @@ class TestProjectDirectoryReplace:
         ]
         assert len(insert_calls) == 3
 
+    @pytest.mark.asyncio
+    async def test_duplicate_directories_collapsed(self, monkeypatch):
+        """Duplicate directory paths in one snapshot produce one row each."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="/tmp/b"),
+                _mk_directory_payload(directory="/tmp/a"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 2
+        assert data["projection_rejected_count"] == 0
+
+        # One DELETE, then exactly one INSERT per distinct directory
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 2
+
+        inserted_dirs = sorted(call.args[4] for call in insert_calls)
+        assert inserted_dirs == ["/tmp/a", "/tmp/b"]
+
+    @pytest.mark.asyncio
+    async def test_blank_directories_filtered(self, monkeypatch):
+        """Blank and whitespace-only directory paths never reach INSERT."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="   "),
+                _mk_directory_payload(directory="\t\n"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 1
+        assert insert_calls[0].args[4] == "/tmp/a"
+
+    @pytest.mark.asyncio
+    async def test_empty_directory_rejected_at_validation(self, monkeypatch):
+        """An empty directory string fails schema validation with 422."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory=""),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        # Pydantic min_length=1 rejects empty directory at validation → 422
+        assert response.status_code == 422
+
 
 class TestSessionTodoReplace:
     """Session todos are replaced per external session within the batch."""
