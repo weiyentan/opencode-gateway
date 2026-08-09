@@ -124,7 +124,7 @@ class ProjectPayload(BaseModel):
 class ProjectDirectoryPayload(BaseModel):
     """A project directory projection from an OpenCode collector."""
 
-    directory: str = Field(description="Directory path")
+    directory: str = Field(min_length=1, description="Directory path")
     directory_type: str | None = Field(default=None, description="Directory type")
     strategy: str | None = Field(default=None, description="Directory strategy")
     source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
@@ -834,8 +834,24 @@ async def _process_project_directories(
     to ``(client_id, source_database_id)``, then inserts the provided
     batch.  All operations run within the caller's transaction.
 
+    The incoming batch is normalised before insertion: blank, empty, or
+    whitespace-only directory paths are filtered out, and duplicate
+    paths within the batch are collapsed to a single entry.  Replaying
+    a snapshot therefore cannot produce duplicate or empty rows.
+
     Returns the number of inserted rows.
     """
+    # ── Normalise batch: drop blank paths, collapse duplicates ───────
+    seen: set[str] = set()
+    batch: list[ProjectDirectoryPayload] = []
+    for entry in directories:
+        if not entry.directory.strip():
+            continue
+        if entry.directory in seen:
+            continue
+        seen.add(entry.directory)
+        batch.append(entry)
+
     # ── Delete existing directories for this scope ───────────────────
     await conn.execute(
         "DELETE FROM opencode_project_directories WHERE client_id = $1 AND source_database_id = $2",
@@ -845,7 +861,7 @@ async def _process_project_directories(
 
     # ── Insert new batch ─────────────────────────────────────────────
     count = 0
-    for entry in directories:
+    for entry in batch:
         source_created_at_tz = (
             entry.source_created_at_tz
             if entry.source_created_at_tz is not None
