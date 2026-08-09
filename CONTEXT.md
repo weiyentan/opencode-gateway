@@ -288,6 +288,29 @@ validation failure) or requests that received a 4xx response from the
 Gateway ingest endpoint. DLQ messages include the original payload and a
 reason string describing the failure.
 
+**Replay Merge**:
+The non-erasing rule applied at ingest when a losing duplicate Usage Record
+passes the dedup identity check (identical ``input_tokens``, ``output_tokens``,
+``cached_tokens``, ``estimated_cost_usd``): the stored Usage Record remains
+authoritative, and the replay fills only currently-NULL nullable enrichment
+fields — ``provider``, ``mode``, ``finish_reason``, ``reasoning_tokens``,
+``cache_read_tokens``, ``cache_write_tokens``. Populated values are never
+erased by a replay (each SET clause is ``COALESCE(col, $n)`` in a single atomic
+UPDATE). ``estimated_cost_usd`` is excluded as a fill candidate because it is
+part of the dedup identity comparison — a stored-NULL + populated-incoming cost
+goes to conflict instead of being filled. Null and whitespace-only optional
+text is treated as "missing" (fillable); numeric zero is a valid observed value
+and is never treated as missing. When Replay Merge backfills cache token
+columns, the session aggregate's derived enrichment totals
+(``total_cache_read_tokens``, ``total_cache_write_tokens``) are repaired exactly
+once inside an explicit transaction with ``SELECT ... FOR UPDATE``, while base
+totals (``total_input_tokens``, ``total_output_tokens``, ``total_cached_tokens``,
+``message_count``) are never incremented by a replay delivery. The same
+non-erasing principle applies to Session Context and Project projections while
+preserving their snapshot semantics.
+_Avoid_: Overwrite-on-replay, replay append (double-counting), uncached/derived
+merge on base totals
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
@@ -330,6 +353,10 @@ manages.
 - A **Usage Record Consumer** reads from the ``opencode-usage`` Kafka topic
 - A **Usage Record Consumer** POSTs to the Gateway's ``/ingest`` endpoint using a **Collector Credential**
 - Unprocessable messages are sent to the **Dead Letter Queue (DLQ)** topic ``opencode-usage-dlq``
+- A **Replay Merge** applies only to a duplicate **Usage Record** that passed the dedup identity check; a divergent duplicate goes to conflict instead
+- A **Replay Merge** fills only currently-NULL nullable enrichment fields on the stored **Usage Record** and never erases populated values
+- A **Replay Merge** that backfills ``cache_read_tokens``/``cache_write_tokens`` triggers a one-time repair of the owning session aggregate's derived enrichment totals (``total_cache_read_tokens``/``total_cache_write_tokens``), never its base totals
+- The **Replay Merge** non-erasing fill-absent principle also applies to **Session Context** and Project projections while preserving their snapshot semantics
 
 ## Flagged Ambiguities
 
