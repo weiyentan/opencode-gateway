@@ -95,6 +95,19 @@ def _auth_row(
     return row
 
 
+def _add_transaction_support(mock_conn: AsyncMock) -> None:
+    """Set up ``mock_conn.transaction()`` to return an async context manager
+    matching the shape of ``asyncpg.Connection.transaction()``.
+
+    Needed by tests that exercise ``_apply_replay_merge``, which wraps
+    its SELECT FOR UPDATE + COALESCE UPDATE + aggregate repair inside
+    ``async with conn.transaction():``."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=None)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    mock_conn.transaction = MagicMock(return_value=ctx)
+
+
 def _build_ingest_app(
     mock_conn: AsyncMock,
     *,
@@ -394,6 +407,7 @@ class TestDuplicateBatchIdempotent:
     async def test_v12_duplicate_uses_effective_cached_tokens(self, monkeypatch):
         """v1.2 duplicates compare against stored cache_read + cache_write tokens."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_dedup = MagicMock()
         existing_dedup.__getitem__.side_effect = {
@@ -406,6 +420,13 @@ class TestDuplicateBatchIdempotent:
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,
@@ -413,7 +434,7 @@ class TestDuplicateBatchIdempotent:
             existing_model,  # model upsert
             None,            # atomic INSERT → conflict
             existing_dedup,  # dedup query → identical
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            lock_row,        # _apply_replay_merge: SELECT FOR UPDATE
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3875,6 +3896,7 @@ class TestReplayMergeFillAbsent:
         """A replay with identical required values and a new provider fills
         provider on the stored record without touching other fields."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
@@ -3888,6 +3910,13 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,             # 1. auth
@@ -3895,7 +3924,7 @@ class TestReplayMergeFillAbsent:
             existing_model,   # 3. model upsert
             None,             # 4. atomic INSERT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3945,6 +3974,7 @@ class TestReplayMergeFillAbsent:
         """A replay with identical required values fills absent numeric
         enrichment fields (reasoning_tokens, cache_read_tokens, etc.)."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
@@ -3958,10 +3988,16 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup,
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            auth, None, existing_model, None, existing_dedup, lock_row,
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4017,6 +4053,7 @@ class TestReplayMergeFillAbsent:
         filled with 0 from the replay, and a stored 0 is NOT treated
         as missing."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
@@ -4030,10 +4067,16 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup,
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            auth, None, existing_model, None, existing_dedup, lock_row,
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4085,6 +4128,7 @@ class TestReplayMergeFillAbsent:
         column and Postgres row-level locking serialises the two UPDATEs, so
         no populated value is erased."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
 
         existing_model = MagicMock()
@@ -4099,6 +4143,19 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row_a = MagicMock()
+        lock_row_a.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        lock_row_b = MagicMock()
+        lock_row_b.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,             # 1. auth
@@ -4106,12 +4163,12 @@ class TestReplayMergeFillAbsent:
             existing_model,   # 3. model upsert (record A)
             None,             # 4. atomic INSERT → conflict (record A, loser)
             existing_dedup,   # 5. dedup query → identical match
-            # _apply_replay_merge for record A: COALESCE-based UPDATE
+            lock_row_a,       # 6. _apply_replay_merge FOR UPDATE (record A)
             # Record B:
-            existing_model,   # 6. model upsert (record B)
-            None,             # 7. atomic INSERT → conflict (record B, loser)
-            existing_dedup,   # 8. dedup query → identical match
-            # _apply_replay_merge for record B: COALESCE-based UPDATE
+            existing_model,   # 7. model upsert (record B)
+            None,             # 8. atomic INSERT → conflict (record B, loser)
+            existing_dedup,   # 9. dedup query → identical match
+            lock_row_b,       # 10. _apply_replay_merge FOR UPDATE (record B)
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4210,6 +4267,7 @@ class TestReplayMergeNoOverwrite:
         """When the stored record already has a provider, a replay with a
         different provider does NOT overwrite it."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
@@ -4223,10 +4281,16 @@ class TestReplayMergeNoOverwrite:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup,
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            auth, None, existing_model, None, existing_dedup, lock_row,
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4289,6 +4353,7 @@ class TestReplayMergeNoOverwrite:
         """A replay fills an absent 'mode' field while leaving an already-populated
         'provider' untouched — only the absent field is updated."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         existing_model = MagicMock()
         existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
@@ -4302,10 +4367,16 @@ class TestReplayMergeNoOverwrite:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup,
-            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
+            auth, None, existing_model, None, existing_dedup, lock_row,
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4615,3 +4686,494 @@ class TestReplayMergeWhitespaceNormalization:
         # newline-only → stripped to empty → treated as missing
         assert "enrichment applied" not in (data["results"][0]["reason"] or "")
         assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #380 — Replay enrichment: aggregate repair without double-counting
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestReplayEnrichmentSessionAggregateRepair:
+    """When replay merge fills cache_read_tokens / cache_write_tokens on a
+    usage record, the session aggregate's derived totals are repaired
+    without inflating base totals or message_count."""
+
+    @pytest.mark.asyncio
+    async def test_replay_enrichment_updates_session_cache_totals(self, monkeypatch):
+        """A replay that fills cache_read_tokens=10 and cache_write_tokens=5
+        on a previously-stored record updates the session's total_cache_read_tokens
+        and total_cache_write_tokens via atomic aggregate repair UPDATEs."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,  # 10 + 5 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        # FOR UPDATE returns: cache_read_tokens=NULL, cache_write_tokens=NULL
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert
+            None,             # 4. atomic INSERT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # ── Verify session aggregate repair UPDATEs were issued ─────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+
+        # cache_read_tokens repair
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Expected 1 session total_cache_read_tokens repair UPDATE, "
+            f"got {len(cr_repairs)}"
+        )
+        assert "+ $1" in cr_repairs[0] or "total_cache_read_tokens +" in cr_repairs[0], (
+            "Repair UPDATE must add (not overwrite) the delta"
+        )
+
+        # cache_write_tokens repair
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cw_repairs) == 1, (
+            f"Expected 1 session total_cache_write_tokens repair UPDATE, "
+            f"got {len(cw_repairs)}"
+        )
+        assert "+ $1" in cw_repairs[0] or "total_cache_write_tokens +" in cw_repairs[0], (
+            "Repair UPDATE must add (not overwrite) the delta"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_enrichment_does_not_inflate_base_totals(self, monkeypatch):
+        """A replay delivery that fills cache tokens must NOT increment
+        total_input_tokens, total_output_tokens, total_cached_tokens,
+        or message_count on the session aggregate.  The session resolution
+        path (winner) is never reached for a dedup loser."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 28,  # 20 + 8 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,             # source_database check
+            existing_model,   # model upsert
+            None,             # atomic INSERT → conflict
+            existing_dedup,   # dedup query → identical
+            lock_row,         # _apply_replay_merge: SELECT FOR UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 20,
+                    "cache_write_tokens": 8,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+
+        # ── Verify NO session resolution was triggered ──────────────────
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 0, (
+            "Replay delivery (loser path) must NOT call _resolve_session — "
+            "base totals must not be incremented"
+        )
+
+        # ── Verify NO base-total or message_count UPDATEs ───────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        base_total_fields = [
+            "total_input_tokens", "total_output_tokens",
+            "total_cached_tokens", "message_count",
+        ]
+        for field in base_total_fields:
+            bad_updates = [
+                call for call in all_execute_calls if field in call
+            ]
+            assert len(bad_updates) == 0, (
+                f"Replay delivery must NOT update {field} on session aggregate. "
+                f"Found: {bad_updates}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_delivery_does_not_double_count(self, monkeypatch):
+        """A second identical replay delivery must NOT double-count any
+        session aggregate.  The FOR UPDATE sees already-filled cache token
+        columns and produces a zero delta, so no repair UPDATE is issued."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,  # 10 + 5 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+
+        # First record: cache tokens are NULL → deltas will be applied
+        lock_row_first = MagicMock()
+        lock_row_first.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        # Second record (duplicate): cache tokens are already filled → deltas = 0
+        lock_row_second = MagicMock()
+        lock_row_second.__getitem__.side_effect = {
+            "cache_read_tokens": 10,   # already filled by first replay
+            "cache_write_tokens": 5,   # already filled by first replay
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                   # 1. auth
+            None,                   # 2. source_database check
+            existing_model,         # 3. model upsert (record 1)
+            None,                   # 4. atomic INSERT → conflict (record 1)
+            existing_dedup,         # 5. dedup query → identical (record 1)
+            lock_row_first,         # 6. _apply_replay_merge FOR UPDATE (record 1)
+            existing_model,         # 7. model upsert (record 2, duplicate)
+            None,                   # 8. atomic INSERT → conflict (record 2)
+            existing_dedup,         # 9. dedup query → identical (record 2)
+            lock_row_second,        # 10. _apply_replay_merge FOR UPDATE (record 2)
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        base_record = {
+            "source_record_id": "rec-001",
+            "session_id": str(_SESSION_ID),
+            "model": "gpt-4",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": "0.0035",
+            "reported_at": _mk_ts().isoformat(),
+            "cache_read_tokens": 10,
+            "cache_write_tokens": 5,
+        }
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[dict(base_record), dict(base_record)],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # ── Verify exactly ONE set of session repair UPDATEs ────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Duplicate delivery must NOT double-count cache_read_tokens. "
+            f"Found {len(cr_repairs)} repair UPDATEs: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 1, (
+            f"Duplicate delivery must NOT double-count cache_write_tokens. "
+            f"Found {len(cw_repairs)} repair UPDATEs: {cw_repairs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_with_zero_cache_tokens_zero_delta(self, monkeypatch):
+        """A replay with cache_read_tokens=0, cache_write_tokens=0 fills
+        the stored fields but produces a delta of 0, so no session aggregate
+        repair is issued (adding 0 is a no-op)."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        # ── Verify NO session repair UPDATEs for zero deltas ────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 0, (
+            f"Zero delta must not issue cache_read repair UPDATE. "
+            f"Found: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 0, (
+            f"Zero delta must not issue cache_write repair UPDATE. "
+            f"Found: {cw_repairs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_only_cache_read_fills_only_that_total(self, monkeypatch):
+        """A replay with only cache_read_tokens (cache_write_tokens omitted)
+        updates only total_cache_read_tokens, not total_cache_write_tokens."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # cache_read_tokens provided, cache_write_tokens NOT in payload
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Expected cache_read repair when cache_read_tokens=10. "
+            f"Found: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 0, (
+            f"Expected NO cache_write repair when cache_write_tokens is absent. "
+            f"Found: {cw_repairs}"
+        )

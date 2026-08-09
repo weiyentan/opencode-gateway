@@ -249,12 +249,26 @@ async def _apply_replay_merge(
     differing enrichment values.  Each SET clause reads ``col =
     COALESCE(col, $n)`` — if the column is already populated the
     COALESCE keeps the stored value; if NULL the incoming value is
-    written.  Postgres row-level locking serialises concurrent UPDATEs,
-    so interleaved replays cannot overwrite each other's fills.
+    written.
 
     Whitespace-only text values are treated as missing (normalised to
     None before the SET clause is built, so COALESCE is a no-op and the
     column is simply not included in the UPDATE).
+
+    The entire read+repair sequence — ``SELECT ... FOR UPDATE``, the
+    enrichment COALESCE UPDATE, and the session aggregate repair
+    UPDATEs — runs inside an explicit ``async with conn.transaction()``
+    block.  Under auto-commit mode the FOR UPDATE lock is released at
+    the end of a single statement, so without a transaction two
+    concurrent replays can both read NULL, both compute a delta, and
+    both apply it (double-count).  The explicit transaction holds the
+    row lock across all statements so exactly one replay fills the
+    column and applies the session-aggregate delta.
+
+    A ``session_id`` that is NULL in the locked record row (winner has
+    not backfilled yet) is resolved via ``_resolve_internal_session_id``
+    within the same transaction so the aggregate repair is not silently
+    skipped.
 
     Returns ``True`` if an enrichment UPDATE was issued.
     """
@@ -297,15 +311,90 @@ async def _apply_replay_merge(
     if not set_clauses:
         return False
 
-    params.extend([client_id, source_db_id, record.source_record_id])
-    await conn.execute(
-        f"""UPDATE opencode_usage_records
-            SET {', '.join(set_clauses)}
-            WHERE client_id = ${param_idx}
-              AND source_database_id = ${param_idx + 1}
-              AND source_record_id = ${param_idx + 2}""",
-        *params,
-    )
+    incoming_cr = getattr(record, "cache_read_tokens", None)
+    incoming_cw = getattr(record, "cache_write_tokens", None)
+
+    # ── Enclose in an explicit transaction ────────────────────────────
+    # Under auto-commit, FOR UPDATE releases the lock at statement end,
+    # so the enrichment UPDATE and the aggregate repair UPDATEs would
+    # run without the lock held — two concurrent replays could both read
+    # NULL and both apply the delta.  An explicit transaction holds the
+    # row lock across all statements, serialising concurrent replays.
+    async with conn.transaction():
+        # Lock the record row and read pre-enrichment cache token state
+        current = await conn.fetchrow(
+            """SELECT cache_read_tokens, cache_write_tokens, session_id
+               FROM opencode_usage_records
+               WHERE client_id = $1
+                 AND source_database_id = $2
+                 AND source_record_id = $3
+               FOR UPDATE""",
+            client_id,
+            source_db_id,
+            record.source_record_id,
+        )
+
+        # The record must exist at this point (the caller verified it via
+        # the dedup query); treat a missing row as a no-op.
+        if current is None:
+            return False
+
+        before_cr = current["cache_read_tokens"]
+        before_cw = current["cache_write_tokens"]
+        resolved_session_id = current["session_id"]
+
+        # Handle session_id race: the winning request may not have
+        # backfilled session_id on the usage record yet (backfill is a
+        # separate statement after _resolve_session).  Resolve from the
+        # sessions table within the same transaction so the aggregate
+        # repair is not silently lost.
+        if resolved_session_id is None:
+            resolved_session_id = await _resolve_internal_session_id(
+                conn, source_db_id, record.session_id,
+            )
+
+        params.extend([client_id, source_db_id, record.source_record_id])
+        await conn.execute(
+            f"""UPDATE opencode_usage_records
+                SET {', '.join(set_clauses)}
+                WHERE client_id = ${param_idx}
+                  AND source_database_id = ${param_idx + 1}
+                  AND source_record_id = ${param_idx + 2}""",
+            *params,
+        )
+
+        # ── Repair session aggregate enrichment totals ────────────────
+        # Compute the delta for cache token fields that were backfilled
+        # (previously NULL, now non-NULL).  A non-NULL before value means
+        # the column was already populated by the original write or a
+        # prior replay — no delta is needed because that population was
+        # already counted (either by the original _resolve_session call
+        # or by a prior aggregate repair).
+        cr_delta: int = 0
+        cw_delta: int = 0
+        if before_cr is None and incoming_cr is not None:
+            cr_delta = incoming_cr
+        if before_cw is None and incoming_cw is not None:
+            cw_delta = incoming_cw
+
+        # Apply session aggregate repair — only for non-zero deltas and
+        # only when session_id is resolved.
+        if resolved_session_id is not None:
+            if cr_delta > 0:
+                await conn.execute(
+                    "UPDATE sessions SET total_cache_read_tokens = "
+                    "total_cache_read_tokens + $1 WHERE id = $2",
+                    cr_delta,
+                    resolved_session_id,
+                )
+            if cw_delta > 0:
+                await conn.execute(
+                    "UPDATE sessions SET total_cache_write_tokens = "
+                    "total_cache_write_tokens + $1 WHERE id = $2",
+                    cw_delta,
+                    resolved_session_id,
+                )
+
     return True
 
 
