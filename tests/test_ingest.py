@@ -6279,3 +6279,686 @@ class TestIngestBatchFKOrdering:
                 f"ingest_batches INSERT at position {batch_insert_pos} — "
                 f"otherwise the FK constraint would fail on a real database"
             )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Issue #388 — Ingest duplicate detection + replay merge on canonical events
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCanonicalDuplicateDetection:
+    """Duplicate detection on the canonical event layer (issue #388).
+
+    When ``_record_canonical_event`` finds an existing canonical event
+    for ``(canonical_source_identity_id, source_record_id)``, the incoming
+    record is compared against the stored event: identical → ``"duplicate"``
+    (no event modification); differing → ``"updated"`` (replay merge).
+    """
+
+    # ── Shared helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _existing_canonical_mock(event_id: uuid.UUID) -> MagicMock:
+        """Return a findrow row signalling an existing canonical event."""
+        row = MagicMock()
+        row.__getitem__.side_effect = {"id": event_id}.__getitem__
+        return row
+
+    @staticmethod
+    def _full_event_mock(*, input_tokens: int = 100, output_tokens: int = 50,
+                         cached_tokens: int = 0, reasoning_tokens: int = 0,
+                         cache_read_tokens: int = 0, cache_write_tokens: int = 0,
+                         estimated_cost_usd: Decimal | None = Decimal("0.0035"),
+                         provider: str | None = None, mode: str | None = None,
+                         finish_reason: str | None = None) -> MagicMock:
+        """Return a fetchrow row with full canonical event field values."""
+        values: dict = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "estimated_cost_usd": estimated_cost_usd,
+            "provider": provider,
+            "mode": mode,
+            "finish_reason": finish_reason,
+        }
+        row = MagicMock()
+        row.__getitem__.side_effect = values.__getitem__
+        return row
+
+    @staticmethod
+    def _enrichment_read_mock() -> MagicMock:
+        """Return a fetchrow row for the text enrichment FOR UPDATE read."""
+        row = MagicMock()
+        row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+        }.__getitem__
+        return row
+
+    def _build_existing_canonical_side_effect(
+        self,
+        *,
+        event_id: uuid.UUID,
+        stored_event: MagicMock,
+        extra_fetchrow: list | None = None,
+    ) -> list:
+        """Build a fetchrow side-effect list for a single new record that
+        maps to an EXISTING canonical event.
+
+        The legacy _process_one_record layer sees the record as a winner
+        (new → atomic INSERT returns a row).  The _record_canonical_event
+        layer then finds an existing canonical event and reads its full
+        fields for comparison.
+
+        extra_fetchrow: additional fetchrow responses needed after the
+            full event read (e.g. for enrichment FOR UPDATE during merge).
+        """
+        auth = _auth_row()
+        items: list = [auth, None]  # auth + sd_check
+
+        # _process_one_record: model, atomic INSERT(winner), session upsert
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        items.extend([None, insert_row, session_row])
+
+        # resolve_canonical_identity: SELECT → None, INSERT RETURNING
+        identity_row = MagicMock()
+        identity_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(), "canonical_parent_id": None,
+        }.__getitem__
+        items.extend([None, identity_row])
+
+        # model lookup, session lookup
+        model_row = MagicMock()
+        model_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        items.extend([model_row, session_lookup_row])
+
+        # event lookup → returns existing event id
+        items.append(self._existing_canonical_mock(event_id))
+
+        # full event read for comparison
+        items.append(stored_event)
+
+        if extra_fetchrow:
+            items.extend(extra_fetchrow)
+
+        return items
+
+    # ── Tests ───────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_identical_replay_returns_duplicate_no_event_change(self, monkeypatch):
+        """An identical replay returns status ``"duplicate"`` with no
+        modification to the canonical event.  The attempt is recorded
+        with outcome ``"duplicate"``."""
+        mock_conn = AsyncMock()
+        stored_event = self._full_event_mock()
+        event_id = uuid.uuid4()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+            )
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-identical-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        result = data["results"][0]
+        assert result["status"] == "duplicate", (
+            f"Expected 'duplicate' for identical replay, got '{result['status']}'"
+        )
+        assert result["event_id"] is not None
+        assert result["attempt_id"] is not None
+
+        # Verify no change to the event — no UPDATE on usage_events
+        update_events = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE usage_events" in str(c)
+        ]
+        assert len(update_events) == 0, (
+            f"Expected 0 UPDATES to usage_events for identical replay, got {len(update_events)}"
+        )
+
+        # Verify attempt was recorded with "duplicate" outcome
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "duplicate" in str(attempt_inserts[0].args), (
+            "Ingest Attempt outcome must be 'duplicate'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_token_field_change_returns_updated(self, monkeypatch):
+        """A replay with a single differing token field triggers replay
+        merge and returns status ``"updated"``."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        # Stored event: input_tokens=100, incoming: input_tokens=200
+        stored_event = self._full_event_mock(input_tokens=100, output_tokens=50)
+        mock_conn.fetchrow = AsyncMock()
+
+        # Extra fetchrow: enrichment FOR UPDATE read (all NULL → no fill)
+        enrichment_read = self._enrichment_read_mock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+                extra_fetchrow=[enrichment_read],
+            )
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)  # advisory lock
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        # Mock apply_replay_merge to return UPDATED
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-diff-input-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 200,   # differs from stored (100)
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        result = data["results"][0]
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for differing replay, got '{result['status']}'"
+        )
+        assert result["event_id"] is not None
+        assert result["attempt_id"] is not None
+
+        # Verify apply_replay_merge was called with correct new_values
+        apply_call = _recon.apply_replay_merge.call_args
+        assert apply_call is not None, "apply_replay_merge should have been called"
+        new_values_arg = apply_call[0][2]  # (conn, event_id, new_values)
+        assert new_values_arg["input_tokens"] == 200
+        assert new_values_arg["output_tokens"] == 50
+
+        # Verify attempt recorded with "updated" outcome
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "updated" in str(attempt_inserts[0].args), (
+            "Ingest Attempt outcome must be 'updated'"
+        )
+
+        # Verify last_ingested_at was updated
+        last_ingested_updates = [
+            c for c in mock_conn.execute.call_args_list
+            if "SET last_ingested_at" in str(c)
+        ]
+        assert len(last_ingested_updates) == 1
+
+    @pytest.mark.asyncio
+    async def test_multi_field_change_triggers_replay_merge(self, monkeypatch):
+        """A replay with multiple differing fields (input_tokens, output_tokens,
+        cached_tokens) triggers replay merge and returns ``"updated"``."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        stored_event = self._full_event_mock(
+            input_tokens=100, output_tokens=50, cached_tokens=0,
+        )
+        enrichment_read = self._enrichment_read_mock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+                extra_fetchrow=[enrichment_read],
+            )
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-multi-diff-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 300,    # stored: 100
+                "output_tokens": 150,   # stored: 50
+                "cached_tokens": 50,    # stored: 0
+                "estimated_cost_usd": "0.0150",  # stored: 0.0035
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "updated"
+
+        # verify the merge was triggered
+        assert _recon.apply_replay_merge.called
+
+    @pytest.mark.asyncio
+    async def test_text_enrichment_change_returns_updated_with_coalesce_fill(
+        self, monkeypatch,
+    ):
+        """A replay whose token/cost fields are identical but whose text
+        enrichment fields differ triggers a COALESCE fill and returns
+        ``"updated"``."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+
+        # Stored event: no enrichment; incoming: provider="openai", mode="chat"
+        stored_event = self._full_event_mock(
+            provider=None, mode=None, finish_reason=None,
+        )
+        # enrichment FOR UPDATE read: stored values are all NULL
+        enrichment_read = self._enrichment_read_mock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+                extra_fetchrow=[enrichment_read],
+            )
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        # apply_replay_merge returns DUPLICATE (zero delta on token/cost)
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.DUPLICATE),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-enrich-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+                "provider": "openai",       # stored: NULL
+                "mode": "chat",             # stored: NULL
+                "finish_reason": "stop",    # stored: NULL
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        # Enrichment was filled → outcome is "updated"
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for enrichment fill, got '{result['status']}'"
+        )
+
+        # Verify COALESCE UPDATE was issued for text enrichment
+        coalesce_updates = [
+            c for c in mock_conn.execute.call_args_list
+            if "COALESCE" in str(c)
+        ]
+        assert len(coalesce_updates) == 1, (
+            f"Expected 1 COALESCE UPDATE for text enrichment, got {len(coalesce_updates)}"
+        )
+
+        # Verify attempt recorded with "updated"
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "updated" in str(attempt_inserts[0].args)
+
+    @pytest.mark.asyncio
+    async def test_incoming_null_enrichment_does_not_erase_populated_value(
+        self, monkeypatch,
+    ):
+        """When the incoming record has ``provider=None`` but the stored
+        canonical event already has ``provider="openai"``, the populated
+        value is NOT erased.  The comparison treats them as identical
+        (stored non-None, incoming None → match passes), so the replay
+        is classified as ``"duplicate"``.
+
+        This tests the null-handling / non-erasing semantic of ADR 0011:
+        null/omitted collector values never erase populated stored values.
+        """
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+
+        # Stored event has provider="openai", incoming has provider=None
+        stored_event = self._full_event_mock(provider="openai")
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+            )
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Incoming: provider=None (omitted), same token values
+        record = {
+            "source_record_id": "rec-null-enrich-001",
+            "session_id": str(_SESSION_ID),
+            "model": "gpt-4",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": "0.0035",
+            "reported_at": _mk_ts().isoformat(),
+            # provider deliberately omitted (None)
+        }
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(records=[record]),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        # stored provider="openai" vs incoming None → should be "duplicate"
+        assert result["status"] == "duplicate", (
+            f"Expected 'duplicate' (null incoming does not erase), got '{result['status']}'"
+        )
+
+        # No UPDATE on usage_events (no erasure)
+        update_events = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE usage_events" in str(c)
+        ]
+        assert len(update_events) == 0, (
+            "Expected 0 UPDATES — null incoming must not erase"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_accepted_duplicate_updated_independent(
+        self, monkeypatch,
+    ):
+        """A replay batch containing a mix of accepted, duplicate, and updated
+        records processes each record independently."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+
+        # new → accepted (event id unused; only fetchrow ordering matters)
+        event_id_2 = uuid.uuid4()  # identical → duplicate
+        event_id_3 = uuid.uuid4()  # different → updated
+
+        # ── Build fetchrow side effects for 3 records ─────────────────
+        auth = _auth_row()
+        fetchrow_responses: list = [auth, None]  # auth + sd_check
+
+        # Record 1: NEW — _process_one_record winner → _record_canonical_event NEW
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row_1 = MagicMock()
+        session_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([None, insert_row_1, session_row_1])
+        fetchrow_responses.extend(_canonical_event_side_effect_items())
+
+        # Record 2: winner → EXISTING canonical → identical
+        insert_row_2 = MagicMock()
+        insert_row_2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row_2 = MagicMock()
+        session_row_2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([None, insert_row_2, session_row_2])
+        identity_row_2 = MagicMock()
+        identity_row_2.__getitem__.side_effect = {
+            "id": uuid.uuid4(), "canonical_parent_id": None,
+        }.__getitem__
+        fetchrow_responses.extend([None, identity_row_2])
+        model_r2 = MagicMock()
+        model_r2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        sess_r2 = MagicMock()
+        sess_r2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([model_r2, sess_r2])
+        fetchrow_responses.append(self._existing_canonical_mock(event_id_2))
+        fetchrow_responses.append(self._full_event_mock())  # identical to record 2
+
+        # Record 3: winner → EXISTING canonical → different
+        insert_row_3 = MagicMock()
+        insert_row_3.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row_3 = MagicMock()
+        session_row_3.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([None, insert_row_3, session_row_3])
+        identity_row_3 = MagicMock()
+        identity_row_3.__getitem__.side_effect = {
+            "id": uuid.uuid4(), "canonical_parent_id": None,
+        }.__getitem__
+        fetchrow_responses.extend([None, identity_row_3])
+        model_r3 = MagicMock()
+        model_r3.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        sess_r3 = MagicMock()
+        sess_r3.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([model_r3, sess_r3])
+        fetchrow_responses.append(self._existing_canonical_mock(event_id_3))
+        # Stored: input_tokens=100, incoming will be 200
+        fetchrow_responses.append(self._full_event_mock(input_tokens=100))
+        # Enrichment FOR UPDATE read
+        enrichment_read = self._enrichment_read_mock()
+        fetchrow_responses.append(enrichment_read)
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = fetchrow_responses
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        # Mock apply_replay_merge for record 3
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {  # Record 0: new (accepted)
+                    "source_record_id": "rec-mix-new",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {  # Record 1: identical (duplicate)
+                    "source_record_id": "rec-mix-dup",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {  # Record 2: different (updated)
+                    "source_record_id": "rec-mix-upd",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": 200,       # differs from stored (100)
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        results = data["results"]
+        assert len(results) == 3
+
+        assert results[0]["status"] == "accepted", (
+            f"Record 0 should be accepted, got '{results[0]['status']}'"
+        )
+        assert results[1]["status"] == "duplicate", (
+            f"Record 1 should be duplicate, got '{results[1]['status']}'"
+        )
+        assert results[2]["status"] == "updated", (
+            f"Record 2 should be updated, got '{results[2]['status']}'"
+        )
+
+        # All three should have event_id and attempt_id
+        for i, result in enumerate(results):
+            assert result["event_id"] is not None, (
+                f"Record {i}: event_id should not be None for status '{result['status']}'"
+            )
+            assert result["attempt_id"] is not None, (
+                f"Record {i}: attempt_id should not be None for status '{result['status']}'"
+            )
+
+        # Verify attempt outcomes: one accepted, one duplicate, one updated
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 3
+        outcomes = [str(c.args) for c in attempt_inserts]
+        assert any("accepted" in o for o in outcomes), "Missing 'accepted' attempt"
+        assert any("duplicate" in o for o in outcomes), "Missing 'duplicate' attempt"
+        assert any("updated" in o for o in outcomes), "Missing 'updated' attempt"
+
+    @pytest.mark.asyncio
+    async def test_cache_tokens_field_change_triggers_delta(self, monkeypatch):
+        """A replay with differing cache_read_tokens and cache_write_tokens
+        triggers replay merge with those fields in the new_values."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        stored_event = self._full_event_mock(
+            cache_read_tokens=0, cache_write_tokens=0,
+        )
+        enrichment_read = self._enrichment_read_mock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+                extra_fetchrow=[enrichment_read],
+            )
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[{
+                "source_record_id": "rec-cache-diff-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+                "cache_read_tokens": 30,      # stored: 0
+                "cache_write_tokens": 15,     # stored: 0
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "updated"
+
+        # Verify cache token fields are passed to apply_replay_merge
+        apply_call = _recon.apply_replay_merge.call_args
+        new_values = apply_call[0][2]
+        assert new_values["cache_read_tokens"] == 30
+        assert new_values["cache_write_tokens"] == 15

@@ -1217,6 +1217,136 @@ async def _process_session_todos(
     return total_inserted
 
 
+# ── Canonical event helpers (issue #388) ────────────────────────────────────
+
+
+def _canonical_fields_identical(
+    stored: asyncpg.Record, record: IngestRecord, effective_cached_tokens: int,
+) -> bool:
+    """Compare all observable collector fields against the stored canonical event.
+
+    Returns ``True`` when every compared field of the stored event matches
+    the incoming record — the replay is an identical delivery.  Returns
+    ``False`` when any field differs (including when the incoming value is
+    non-null and authoritative).
+
+    Compared fields (executor design decision for issue #388):
+    - Token/cost fields: ``input_tokens``, ``output_tokens``,
+      ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
+      ``cache_write_tokens``, ``estimated_cost_usd``.
+    - Text enrichment: ``provider``, ``mode``, ``finish_reason``.
+
+    ``reported_at`` is deliberately excluded — replays may carry slightly
+    different timestamps for the same logical record, so timestamp drift
+    must not force a spurious update.
+    """
+    if stored["input_tokens"] != record.input_tokens:
+        return False
+    if stored["output_tokens"] != record.output_tokens:
+        return False
+    if stored["cached_tokens"] != effective_cached_tokens:
+        return False
+    # Nullable numeric fields: when the incoming value is None, the field
+    # was omitted from the replay — treat as identical (ADR 0011: null
+    # produces zero delta, never erases).  Only a non-None incoming that
+    # differs from the stored value is a difference.  Numeric zero is a
+    # valid observed value and is never treated as missing.
+    if record.reasoning_tokens is not None and (
+        stored["reasoning_tokens"] or 0
+    ) != record.reasoning_tokens:
+        return False
+    if record.cache_read_tokens is not None and (
+        stored["cache_read_tokens"] or 0
+    ) != record.cache_read_tokens:
+        return False
+    if record.cache_write_tokens is not None and (
+        stored["cache_write_tokens"] or 0
+    ) != record.cache_write_tokens:
+        return False
+    # estimated_cost_usd: only compare when incoming is non-None
+    if record.estimated_cost_usd is not None and not _decimal_equal(
+        stored["estimated_cost_usd"], record.estimated_cost_usd,
+    ):
+        return False
+
+    # Text enrichment — normalised comparison (whitespace-only → None).
+    # **Non-erasing semantics (ADR 0011)**: a None/omitted incoming value
+    # can never erase a populated stored value, so those are treated as
+    # identical.  Only a non-None incoming that differs from the stored
+    # value is considered a difference.
+    stored_provider = _normalise_optional_text(stored["provider"])
+    incoming_provider = _normalise_optional_text(record.provider)
+    if incoming_provider is not None and incoming_provider != stored_provider:
+        return False
+    stored_mode = _normalise_optional_text(stored["mode"])
+    incoming_mode = _normalise_optional_text(record.mode)
+    if incoming_mode is not None and incoming_mode != stored_mode:
+        return False
+    stored_fr = _normalise_optional_text(stored["finish_reason"])
+    incoming_fr = _normalise_optional_text(record.finish_reason)
+    if incoming_fr is not None and incoming_fr != stored_fr:
+        return False
+
+    return True
+
+
+async def _fill_canonical_text_enrichment(
+    conn: asyncpg.Connection,
+    event_id: uuid.UUID,
+    record: IngestRecord,
+) -> bool:
+    """COALESCE-fill text enrichment fields on a canonical event (non-erasing).
+
+    For each of ``provider``, ``mode``, ``finish_reason``: when the stored
+    value is NULL and the incoming value is non-NULL (after whitespace
+    normalisation), the column is filled via ``COALESCE(col, $n)`` —
+    populated stored values are never erased.  Numeric zero semantics do
+    not apply to text fields.
+
+    Returns ``True`` when at least one enrichment column was filled.
+    """
+    enrichment: dict[str, str] = {}
+    for field_name in ("provider", "mode", "finish_reason"):
+        incoming = _normalise_optional_text(getattr(record, field_name, None))
+        if incoming is not None:
+            enrichment[field_name] = incoming
+
+    if not enrichment:
+        return False
+
+    # Read stored values under FOR UPDATE (caller owns the transaction)
+    current = await conn.fetchrow(
+        "SELECT provider, mode, finish_reason FROM usage_events WHERE id = $1 FOR UPDATE",
+        event_id,
+    )
+    if current is None:
+        return False
+
+    fillable: dict[str, str] = {}
+    for field_name, incoming in enrichment.items():
+        stored = current[field_name]
+        if stored is None:
+            fillable[field_name] = incoming
+
+    if not fillable:
+        return False
+
+    set_clauses: list[str] = []
+    params: list[object] = []
+    param_idx = 1
+    for field_name, value in fillable.items():
+        set_clauses.append(f"{field_name} = COALESCE({field_name}, ${param_idx})")
+        params.append(value)
+        param_idx += 1
+    params.append(event_id)
+
+    await conn.execute(
+        f"UPDATE usage_events SET {', '.join(set_clauses)} WHERE id = ${param_idx}",
+        *params,
+    )
+    return True
+
+
 # ── Canonical event recording (issue #387) ──────────────────────────────────
 
 
@@ -1240,10 +1370,35 @@ async def _record_canonical_event(
     (these were just upserted by ``_process_one_record``), so the
     canonical event has the same model and session references.
 
-    Returns a dict with ``event_id`` and ``attempt_id`` for the caller
+    **Replay Merge (issue #388):** When a canonical event already exists
+    for ``(canonical_source_identity_id, source_record_id)``, the incoming
+    record's observable fields are compared against the stored event:
+
+    * All compared fields identical → outcome ``"duplicate"`` — no event
+      modification; the attempt is recorded with the ``"duplicate"``
+      outcome.
+    * Any differing non-null collector field → the replay merge path:
+      ``apply_replay_merge()`` (from ``app.core.reconciliation``) computes
+      per-field deltas and adjusts session aggregates;
+      ``_fill_canonical_text_enrichment()`` COALESCE-fills text
+      enrichment fields (provider, mode, finish_reason) without erasing;
+      ``last_ingested_at`` is bumped; outcome is ``"updated"``.
+
+    **Compared field set**: ``input_tokens``, ``output_tokens``,
+    ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
+    ``cache_write_tokens``, ``estimated_cost_usd``, ``provider``,
+    ``mode``, ``finish_reason``.  These are the collector-furnished
+    fields observable on a canonical event and represent the full set
+    of collector data captured in the event row.  ``reported_at`` is
+    deliberately excluded — replays may carry slightly different
+    timestamps for the same logical record.
+
+    Returns a dict with ``event_id``, ``attempt_id``, and ``status``
+    (``"accepted"``, ``"duplicate"``, or ``"updated"``) for the caller
     to attach to the :class:`IngestRecordResult`.
     """
     from app.core.identity import resolve_canonical_identity
+    from app.core.reconciliation import IngestOutcome, apply_replay_merge
 
     # ── 1. Resolve canonical source identity ──────────────────────
     collector_source_id = str(source_db_id)
@@ -1283,9 +1438,12 @@ async def _record_canonical_event(
     else:
         effective_cached_tokens = int(record.cached_tokens)
 
-    event_id: uuid.UUID | None = None
+    event_id: uuid.UUID
+    outcome_str: str
+    reason: str | None = None
+
     if existing is None:
-        # ── 4. Insert new canonical event ─────────────────────────
+        # ── 4a. NEW — insert canonical event ──────────────────────
         event_id = uuid.uuid4()
         await conn.execute(
             """INSERT INTO usage_events
@@ -1328,8 +1486,62 @@ async def _record_canonical_event(
             record.parent_session_id,
             now,
         )
+        outcome_str = "accepted"
     else:
+        # ── 4b. EXISTING canonical event — compare for duplicate vs update ─
         event_id = existing["id"]
+
+        # Read full canonical event for comparison
+        stored = await conn.fetchrow(
+            """SELECT input_tokens, output_tokens, cached_tokens,
+                      reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                      estimated_cost_usd, provider, mode, finish_reason
+               FROM usage_events WHERE id = $1""",
+            event_id,
+        )
+
+        if _canonical_fields_identical(stored, record, effective_cached_tokens):
+            # All compared fields identical → duplicate
+            outcome_str = "duplicate"
+        else:
+            # Any differing non-null collector field → apply replay merge
+            # The entire merge sequence runs inside an explicit transaction
+            # so the advisory lock on the event row spans the read-compute-
+            # write across apply_replay_merge and the enrichment fill.
+            async with conn.transaction():
+                # Build new_values mapping for apply_replay_merge
+                # (delta-computable fields from the collector)
+                new_values: dict[str, object] = {
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "cached_tokens": effective_cached_tokens,
+                    "cache_read_tokens": record.cache_read_tokens,
+                    "cache_write_tokens": record.cache_write_tokens,
+                    "reasoning_tokens": record.reasoning_tokens,
+                    "estimated_cost_usd": record.estimated_cost_usd,
+                }
+                merge_outcome = await apply_replay_merge(conn, event_id, new_values)
+
+                # COALESCE-fill text enrichment fields (non-erasing)
+                enrichment_filled = await _fill_canonical_text_enrichment(
+                    conn, event_id, record,
+                )
+
+                # Update last_ingested_at to reflect this replay delivery
+                await conn.execute(
+                    "UPDATE usage_events SET last_ingested_at = $1 WHERE id = $2",
+                    now,
+                    event_id,
+                )
+
+                # Outcome: "updated" if either token/cost or enrichment changed
+                if merge_outcome == IngestOutcome.UPDATED or enrichment_filled:
+                    outcome_str = "updated"
+                else:
+                    # Rare: pre-check saw a difference but under the lock
+                    # nothing actually changed (concurrent merge already
+                    # applied the same correction).  Treat as duplicate.
+                    outcome_str = "duplicate"
 
     # ── 5. Record Ingest Attempt ──────────────────────────────────
     # Redact the record for JSONB storage: model_dump(mode='json')
@@ -1349,12 +1561,19 @@ async def _record_canonical_event(
         record.source_record_id,
         record_jsonb,
         batch_id,
-        "accepted",
+        outcome_str,
         replay_id,
         now,
     )
 
-    return {"event_id": event_id, "attempt_id": attempt_id}
+    result: dict[str, uuid.UUID | None] = {
+        "event_id": event_id,
+        "attempt_id": attempt_id,
+        "status": outcome_str,
+    }
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 # ── POST /ingest ──────────────────────────────────────────────────────────
@@ -1437,7 +1656,6 @@ async def ingest_usage(
             )
         results.append(result)
         if result.status == "accepted":
-            accepted += 1
             # ── Canonical event layer: record a canonical event for
             # genuinely new records (not idempotent duplicates from replay).
             is_new = result.reason is None or not result.reason.startswith("Duplicate")
@@ -1449,10 +1667,30 @@ async def ingest_usage(
                     )
                     result.event_id = canonical["event_id"]
                     result.attempt_id = canonical["attempt_id"]
+                    # Propagate the canonical-level status when it differs
+                    # from "accepted" (e.g. duplicate / updated on replay).
+                    canonical_status = canonical.get("status")
+                    if canonical_status and canonical_status != "accepted":
+                        result.status = canonical_status
+                        if canonical.get("reason"):
+                            result.reason = canonical["reason"]
                 except Exception as exc:
                     logger.error(
                         "Record %s canonical event recording failed: %s", idx, exc,
                     )
+
+        # ── Counting — records with status "accepted", "duplicate", or
+        # "updated" all represent successful processing (the record was
+        # either new, idempotent, or reconciled).  Only records with
+        # status "quarantined", "conflict", or "rejected" increment the
+        # rejected count.
+        if result.status in ("accepted",):
+            accepted += 1
+        elif result.status in ("duplicate", "updated"):
+            # Successfully processed — no event creation, no error.
+            # Neither accepted nor rejected; per-record result carries the
+            # canonical outcome.
+            pass
         else:
             rejected += 1
 
