@@ -563,6 +563,21 @@ class TestConcurrentSameEventDelivery:
                 return mock_row({"id": model_id})
             if "SELECT id FROM sessions" in sql:
                 return mock_row({"id": session_id})
+            if "SELECT input_tokens, output_tokens" in sql and "FROM usage_events" in sql:
+                # Full canonical event field read for duplicate/replay-merge
+                # Return values matching the record → identical → "duplicate"
+                return mock_row({
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": None,
+                    "cache_write_tokens": None,
+                    "estimated_cost_usd": None,
+                    "provider": None,
+                    "mode": None,
+                    "finish_reason": None,
+                })
             if "SELECT id FROM usage_events" in sql:
                 key = (str(identity_id), "rec-001")
                 row = fake_usage_events.get(key)
@@ -598,10 +613,12 @@ class TestConcurrentSameEventDelivery:
             result1 = await _record_canonical_event(
                 mock_conn, record, client_id, source_db_id,
                 batch_id, None, now,
+                canonical_identity_id=identity_id,
             )
             result2 = await _record_canonical_event(
                 mock_conn, record, client_id, source_db_id,
                 batch_id, None, now,
+                canonical_identity_id=identity_id,
             )
 
         # ── Assertions ─────────────────────────────────────────────
@@ -675,16 +692,28 @@ class TestLockSerializationLatency:
         event_id = uuid.uuid4()
 
         # ── Build fresh mock per call ──────────────────────────────
-        # Because _record_canonical_event calls fetchrow 3 times per
-        # delivery (model, session, event SELECT), 10 deliveries need
-        # 30 side-effect entries.
+        # Because _record_canonical_event calls fetchrow 4 times per
+        # delivery (model, session, FOR UPDATE event SELECT, full field
+        # read for duplicate comparison), 10 deliveries need 40 entries.
         def _build_fetchrow_side_effect(existing_event_id: uuid.UUID):
             entries = []
             for _ in range(10):
                 entries.extend([
                     mock_row({"id": model_id}),           # model lookup
                     mock_row({"id": session_id}),         # session lookup
-                    mock_row({"id": existing_event_id}),  # event already exists
+                    mock_row({"id": existing_event_id}),  # FOR UPDATE: event exists
+                    mock_row({                            # full field read: identical → duplicate
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cached_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "cache_read_tokens": None,
+                        "cache_write_tokens": None,
+                        "estimated_cost_usd": None,
+                        "provider": None,
+                        "mode": None,
+                        "finish_reason": None,
+                    }),
                 ])
             return entries
 
@@ -702,6 +731,7 @@ class TestLockSerializationLatency:
             return _record_canonical_event(
                 mock_conn, record, client_id, source_db_id,
                 batch_id, None, now,
+                canonical_identity_id=identity_id,
             )
 
         # ── 1. 10 sequential deliveries (baseline) ─────────────────

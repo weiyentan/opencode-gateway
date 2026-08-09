@@ -113,26 +113,25 @@ def _add_transaction_support(mock_conn: AsyncMock) -> None:
 def _winner_fetchrow_items() -> list:
     """fetchrow side-effect items for ONE winning first-delivery record.
 
-    Order: [sd_check] + [model_upsert, atomic_insert, session_upsert,
-    identity_select, identity_insert, model_lookup, session_lookup,
+    Order: [sd_check] + [cross_identity_check] + [model_upsert,
+    atomic_insert, session_upsert] + [model_lookup, session_lookup,
     event_lookup] — the canonical-event recording path (#387).
+
+    ``resolve_canonical_identity`` is monkeypatched in ``_build_two_layer_app``
+    (per #389 restructure) so no identity resolution fetchrow slots needed.
     """
     insert_row = MagicMock()
     insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
     session_row = MagicMock()
     session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-    identity_insert_row = MagicMock()
-    identity_insert_row.__getitem__.side_effect = {
-        "id": uuid.uuid4(), "canonical_parent_id": None,
-    }.__getitem__
     model_lookup_row = MagicMock()
     model_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
     session_lookup_row = MagicMock()
     session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
     return [
         None,                                  # sd check (new)
+        None,                                  # handler: cross-identity conflict check
         None, insert_row, session_row,         # _process_one_record
-        None, identity_insert_row,             # resolve_canonical_identity
         model_lookup_row,                      # model lookup
         session_lookup_row,                    # session lookup
         None,                                  # event lookup (no existing)
@@ -160,6 +159,27 @@ def _build_two_layer_app(
     import app.core.config as _cfg
 
     importlib.reload(_cfg)
+
+    # Issue #389 restructure: patch identity/quarantine resolution so
+    # tests don't need real DB queries for identity routing. Same as
+    # _build_ingest_app in test_ingest.py.
+    import app.core.identity as _identity_mod
+    _fixed_canonical_id = uuid.uuid4()
+    monkeypatch.setattr(
+        _identity_mod,
+        "resolve_canonical_identity",
+        AsyncMock(return_value=_fixed_canonical_id),
+    )
+    monkeypatch.setattr(
+        _identity_mod,
+        "is_quarantined",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        _identity_mod,
+        "check_quarantine_overlap",
+        AsyncMock(return_value=[]),
+    )
 
     app = create_app(configure_logging=False)
 
@@ -262,6 +282,7 @@ class TestLegacyIngestPayloads:
             # ── Delivery 2: identical loser path ──
             _auth_row(),
             None,              # sd check (exists)
+            None,              # handler: cross-identity conflict check
             existing_model,    # model upsert (exists)
             None,              # atomic INSERT → ON CONFLICT (loser)
             existing_dedup,    # dedup query → identical match

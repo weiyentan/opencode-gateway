@@ -1407,8 +1407,11 @@ async def _record_canonical_event(
     (``"accepted"``, ``"duplicate"``, or ``"updated"``) for the caller
     to attach to the :class:`IngestRecordResult`.
     """
-    from app.core.identity import resolve_canonical_identity
-    from app.core.reconciliation import IngestOutcome, acquire_canonical_event_lock, apply_replay_merge
+    from app.core.reconciliation import (
+        IngestOutcome,
+        acquire_canonical_event_lock,
+        apply_replay_merge,
+    )
     from app.core.telemetry import EVENT_LOCK_ACQUIRED, timed_operation
 
     # ── 1. Resolve model and session (already upserted by _process_one_record) ──
