@@ -122,9 +122,20 @@ class ProjectPayload(BaseModel):
 
 
 class ProjectDirectoryPayload(BaseModel):
-    """A project directory projection from an OpenCode collector."""
+    """A project directory projection from an OpenCode collector.
 
-    directory: str = Field(description="Directory path")
+    **Validation vs filtering asymmetry**: ``directory=""`` (empty string)
+    fails Pydantic ``min_length=1`` validation → HTTP 422, which rejects
+    the *entire* /ingest batch (all records lost to DLQ). In contrast,
+    ``directory="  "`` (whitespace-only) passes Pydantic validation and is
+    silently filtered at processing time in ``_process_project_directories``
+    without affecting other records in the batch.  Both satisfy the
+    ``#376`` contract AC1 ("rejected or filtered"), but the blast radius
+    differs: empty strings kill the whole batch; whitespace-only paths
+    are dropped per-row.
+    """
+
+    directory: str = Field(min_length=1, description="Directory path")
     directory_type: str | None = Field(default=None, description="Directory type")
     strategy: str | None = Field(default=None, description="Directory strategy")
     source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
@@ -223,6 +234,184 @@ def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
         return abs(a - b) < Decimal('0.0001')
     except (ValueError, TypeError, InvalidOperation):
         return False
+
+
+def _normalise_optional_text(value: str | None) -> str | None:
+    """Normalise an optional text value for Replay Merge.
+    
+    Whitespace-only strings are treated as missing and become ``None``.
+    Non-empty strings and ``None`` pass through unchanged.
+    """
+    if value is not None and isinstance(value, str) and value.strip() == "":
+        return None
+    return value
+
+
+async def _apply_replay_merge(
+    conn: asyncpg.Connection,
+    record: IngestRecord,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+) -> bool:
+    """Apply Replay Merge: fill absent enrichment fields on the stored record.
+
+    Reads the stored enrichment columns under ``SELECT ... FOR UPDATE``
+    within an explicit transaction, determines which columns are actually
+    fillable (stored NULL + incoming non-NULL), and issues a COALESCE
+    UPDATE only for those columns.  Returns ``True`` if at least one
+    column was filled (i.e. an enrichment UPDATE was issued).
+
+    The FOR UPDATE lock makes the stored-state read race-free — no
+    concurrent writer can change the row between read and write.
+    Whitespace-only text values are treated as missing (normalised to
+    None before comparison).  Numeric zero is a valid observed value and
+    is never treated as missing.
+
+    The entire read+repair sequence — ``SELECT ... FOR UPDATE``, the
+    fillable-only COALESCE UPDATE, and the session aggregate repair
+    UPDATEs — runs inside an explicit ``async with conn.transaction()``
+    block.  Under auto-commit mode the FOR UPDATE lock is released at
+    the end of a single statement, so without a transaction two
+    concurrent replays can both read NULL, both compute a delta, and
+    both apply it (double-count).  The explicit transaction holds the
+    row lock across all statements so exactly one replay fills the
+    column and applies the session-aggregate delta.
+
+    A ``session_id`` that is NULL in the locked record row (winner has
+    not backfilled yet) is resolved via ``_resolve_internal_session_id``
+    within the same transaction so the aggregate repair is not silently
+    skipped.
+    """
+
+    # ── Build incoming enrichment map ─────────────────────────────────
+    _incoming: dict[str, object] = {}
+
+    _TEXT_ENRICHMENT: list[str] = ["provider", "mode", "finish_reason"]
+    for field_name in _TEXT_ENRICHMENT:
+        raw = getattr(record, field_name, None)
+        _incoming[field_name] = _normalise_optional_text(raw)
+
+    _NUMERIC_ENRICHMENT: list[str] = [
+        "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
+    ]
+    for field_name in _NUMERIC_ENRICHMENT:
+        _incoming[field_name] = getattr(record, field_name, None)
+
+    # estimated_cost_usd is excluded from enrichment: it is part of the
+    # dedup identity (compared via _decimal_equal at the merge gate).
+    # At this point the stored value is either non-NULL (populated — no
+    # fill needed) or both stored and incoming are NULL (nothing to
+    # fill).  A stored-NULL + incoming-populated cost fails the identity
+    # check and goes to conflict (preserving TestDivergentDuplicate), so
+    # including it in the SET clauses would be unreachable dead code.
+
+    # ── Enclose in an explicit transaction ────────────────────────────
+    # Under auto-commit, FOR UPDATE releases the lock at statement end,
+    # so the enrichment UPDATE and the aggregate repair UPDATEs would
+    # run without the lock held — two concurrent replays could both read
+    # NULL and both apply the delta.  An explicit transaction holds the
+    # row lock across all statements, serialising concurrent replays.
+    async with conn.transaction():
+        # Lock the record row and read stored enrichment columns
+        current = await conn.fetchrow(
+            """SELECT provider, mode, finish_reason,
+                      reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                      session_id
+               FROM opencode_usage_records
+               WHERE client_id = $1
+                 AND source_database_id = $2
+                 AND source_record_id = $3
+               FOR UPDATE""",
+            client_id,
+            source_db_id,
+            record.source_record_id,
+        )
+
+        # The record must exist at this point (the caller verified it via
+        # the dedup query); treat a missing row as a no-op.
+        if current is None:
+            return False
+
+        # ── Determine actually fillable columns ────────────────────────
+        # A column is fillable when the stored value is NULL AND the
+        # incoming value is non-NULL (for text: already normalised via
+        # _normalise_optional_text; for numerics: incoming is not None —
+        # zero is valid).  A stored non-NULL value (including whitespace-
+        # only text that was stored verbatim) is NOT fillable because
+        # COALESCE would preserve it.
+        fillable_columns: dict[str, object] = {}
+        for field_name, incoming in _incoming.items():
+            stored = current[field_name]
+            if stored is None and incoming is not None:
+                fillable_columns[field_name] = incoming
+
+        if not fillable_columns:
+            return False  # nothing to fill — race-free accurate reason
+
+        # ── Build COALESCE SET clauses for fillable columns ───────────
+        set_clauses: list[str] = []
+        params: list = []
+        param_idx = 1
+        for field_name, incoming in fillable_columns.items():
+            set_clauses.append(f"{field_name} = COALESCE({field_name}, ${param_idx})")
+            params.append(incoming)
+            param_idx += 1
+
+        resolved_session_id = current["session_id"]
+
+        # Handle session_id race: the winning request may not have
+        # backfilled session_id on the usage record yet (backfill is a
+        # separate statement after _resolve_session).  Resolve from the
+        # sessions table within the same transaction so the aggregate
+        # repair is not silently lost.
+        if resolved_session_id is None:
+            resolved_session_id = await _resolve_internal_session_id(
+                conn, source_db_id, record.session_id,
+            )
+
+        params.extend([client_id, source_db_id, record.source_record_id])
+        await conn.execute(
+            f"""UPDATE opencode_usage_records
+                SET {', '.join(set_clauses)}
+                WHERE client_id = ${param_idx}
+                  AND source_database_id = ${param_idx + 1}
+                  AND source_record_id = ${param_idx + 2}""",
+            *params,
+        )
+
+        # ── Repair session aggregate enrichment totals ────────────────
+        # Compute the delta for cache token fields that were backfilled
+        # (previously NULL, now non-NULL).  A non-NULL before value means
+        # the column was already populated by the original write or a
+        # prior replay — no delta is needed because that population was
+        # already counted (either by the original _resolve_session call
+        # or by a prior aggregate repair).
+        cr_delta: int = 0
+        cw_delta: int = 0
+        if "cache_read_tokens" in fillable_columns:
+            cr_delta = int(fillable_columns["cache_read_tokens"])  # type: ignore[arg-type]
+        if "cache_write_tokens" in fillable_columns:
+            cw_delta = int(fillable_columns["cache_write_tokens"])  # type: ignore[arg-type]
+
+        # Apply session aggregate repair — only for positive deltas and
+        # only when session_id is resolved.
+        if resolved_session_id is not None:
+            if cr_delta > 0:
+                await conn.execute(
+                    "UPDATE sessions SET total_cache_read_tokens = "
+                    "total_cache_read_tokens + $1 WHERE id = $2",
+                    cr_delta,
+                    resolved_session_id,
+                )
+            if cw_delta > 0:
+                await conn.execute(
+                    "UPDATE sessions SET total_cache_write_tokens = "
+                    "total_cache_write_tokens + $1 WHERE id = $2",
+                    cw_delta,
+                    resolved_session_id,
+                )
+
+    return True
 
 
 async def _upsert_source_database(
@@ -384,7 +573,18 @@ async def _process_one_record(
     source_db_id: uuid.UUID,
     now: datetime,
 ) -> IngestRecordResult:
-    """Process a single ingest record — idempotency, validation, upsert.
+    """Process a single ingest record — validate, deduplicate, upsert.
+
+    Uses an atomic ``INSERT … ON CONFLICT … DO NOTHING RETURNING id``
+    on ``(client_id, source_database_id, source_record_id)`` inside an
+    explicit ``async with conn.transaction()`` block to determine the
+    winner under concurrent replay.  The winning request runs all
+    first-time side effects (session resolution with aggregate
+    increment, source-database record count bump) within the same
+    transaction so a crash between statements cannot permanently
+    under-count.  A losing identical duplicate returns ``accepted``
+    (with optional Replay Merge); a losing divergent duplicate returns
+    ``conflict``.
 
     Returns an :class:`IngestRecordResult` regardless of outcome so the
     caller can implement partial-success semantics.
@@ -427,7 +627,74 @@ async def _process_one_record(
     else:
         effective_cached_tokens = cached_tokens
 
-    # ── 2. Idempotency check ─────────────────────────────────────────
+    # ── 2. Upsert observed model (idempotent — harmless for losers) ──
+    model_id = await _upsert_model(conn, record.model, now)
+
+    # ── 3. Atomic dedup INSERT + winner side effects in ONE transaction ──
+    # Under concurrent replay, two requests can both pass a SELECT check
+    # before either commits.  The atomic INSERT ... ON CONFLICT ... DO
+    # NOTHING determines the winner in a single statement with no race
+    # window.  All winner first-time side effects run inside an explicit
+    # transaction so the INSERT is atomic with session resolution and
+    # aggregate increment — a crash between statements cannot permanently
+    # under-count (if the transaction rolls back the INSERT is also
+    # rolled back and a retried replay re-enters as winner).
+    record_uuid = uuid.uuid4()
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            """INSERT INTO opencode_usage_records
+               (id, client_id, source_database_id, source_record_id, session_id,
+                model_id, input_tokens, output_tokens, cached_tokens,
+                estimated_cost_usd, reported_at, ingested_at,
+                provider, mode, finish_reason, reasoning_tokens,
+                cache_read_tokens, cache_write_tokens)
+               VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11,
+                       $12, $13, $14, $15, $16, $17)
+               ON CONFLICT (client_id, source_database_id, source_record_id)
+               DO NOTHING
+               RETURNING id""",
+            record_uuid,
+            client_id,
+            source_db_id,
+            record.source_record_id,
+            model_id,
+            input_tokens,
+            output_tokens,
+            effective_cached_tokens,
+            record.estimated_cost_usd,
+            record.reported_at,
+            now,
+            record.provider,
+            record.mode,
+            record.finish_reason,
+            record.reasoning_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+        )
+
+        if row is not None:
+            # WINNER — first writer, run first-time side effects
+            internal_session_id = await _resolve_session(
+                conn, source_db_id, client_id, record.session_id,
+                input_tokens, output_tokens, effective_cached_tokens,
+                record.estimated_cost_usd, now,
+                project_id=record.project_id,
+                workspace_id=record.workspace_id,
+                agent=record.agent,
+                parent_session_id=record.parent_session_id,
+                cache_read_tokens=record.cache_read_tokens or 0,
+                cache_write_tokens=record.cache_write_tokens or 0,
+            )
+            await conn.execute(
+                "UPDATE opencode_usage_records SET session_id = $1 WHERE id = $2",
+                internal_session_id, record_uuid,
+            )
+            await _increment_source_database_record_count(conn, source_db_id, now)
+
+    if row is not None:
+        return IngestRecordResult(index=index, status="accepted")
+
+    # ── LOSER — dedup match, discriminate identical vs divergent ──────
     existing = await conn.fetchrow(
         """SELECT id, input_tokens, output_tokens, cached_tokens, estimated_cost_usd
            FROM opencode_usage_records
@@ -445,10 +712,17 @@ async def _process_one_record(
             and existing["cached_tokens"] == effective_cached_tokens
             and _decimal_equal(existing["estimated_cost_usd"], record.estimated_cost_usd)
         ):
+            # ── Replay Merge: fill absent enrichment fields ──────────
+            enrichment_applied = await _apply_replay_merge(
+                conn, record, client_id, source_db_id,
+            )
+            reason = "Duplicate (idempotent)"
+            if enrichment_applied:
+                reason += " — enrichment applied"
             return IngestRecordResult(
                 index=index,
                 status="accepted",
-                reason="Duplicate (idempotent)",
+                reason=reason,
             )
         # Different values → conflict
         return IngestRecordResult(
@@ -457,57 +731,12 @@ async def _process_one_record(
             reason="Divergent duplicate: same dedup key but different values",
         )
 
-    # ── 3. Upsert observed model ─────────────────────────────────────
-    model_id = await _upsert_model(conn, record.model, now)
-
-    # ── 4. Resolve session (upsert + increment aggregates) ───────────
-    internal_session_id = await _resolve_session(
-        conn, source_db_id, client_id, record.session_id,
-        input_tokens, output_tokens, effective_cached_tokens,
-        record.estimated_cost_usd, now,
-        project_id=record.project_id,
-        workspace_id=record.workspace_id,
-        agent=record.agent,
-        parent_session_id=record.parent_session_id,
-        cache_read_tokens=record.cache_read_tokens or 0,
-        cache_write_tokens=record.cache_write_tokens or 0,
+    # Should not reach here: if ON CONFLICT fired, the row must exist.
+    return IngestRecordResult(
+        index=index,
+        status="rejected",
+        reason="Unexpected dedup state: conflict detected but row not found",
     )
-
-    # ── 5. Insert usage record ───────────────────────────────────────
-    record_uuid = uuid.uuid4()
-    await conn.execute(
-        """INSERT INTO opencode_usage_records
-           (id, client_id, source_database_id, source_record_id, session_id,
-            model_id, input_tokens, output_tokens, cached_tokens,
-            estimated_cost_usd, reported_at, ingested_at,
-            provider, mode, finish_reason, reasoning_tokens,
-            cache_read_tokens, cache_write_tokens)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                   $13, $14, $15, $16, $17, $18)""",
-        record_uuid,
-        client_id,
-        source_db_id,
-        record.source_record_id,
-        internal_session_id,
-        model_id,
-        input_tokens,
-        output_tokens,
-        effective_cached_tokens,
-        record.estimated_cost_usd,
-        record.reported_at,
-        now,
-        record.provider,
-        record.mode,
-        record.finish_reason,
-        record.reasoning_tokens,
-        record.cache_read_tokens,
-        record.cache_write_tokens,
-    )
-
-    # ── 6. Bump source database record count ─────────────────────────
-    await _increment_source_database_record_count(conn, source_db_id, now)
-
-    return IngestRecordResult(index=index, status="accepted")
 
 
 # ── Projection processing helpers ─────────────────────────────────────────
@@ -675,16 +904,16 @@ async def _process_session_context(
         source_db_id,
         ctx.external_session_id,
         resolved_session_id,
-        ctx.parent_external_session_id,
+        _normalise_optional_text(ctx.parent_external_session_id),
         resolved_parent_session_id,
-        ctx.external_project_id,
+        _normalise_optional_text(ctx.external_project_id),
         resolved_source_project_id,
-        ctx.source_directory,
-        ctx.source_path,
-        ctx.title,
-        ctx.slug,
-        ctx.version,
-        ctx.session_model,
+        _normalise_optional_text(ctx.source_directory),
+        _normalise_optional_text(ctx.source_path),
+        _normalise_optional_text(ctx.title),
+        _normalise_optional_text(ctx.slug),
+        _normalise_optional_text(ctx.version),
+        _normalise_optional_text(ctx.session_model),
         ctx.session_cost,
         ctx.source_input_tokens,
         ctx.source_output_tokens,
@@ -770,14 +999,14 @@ async def _process_project(
         source_db_id,
         proj.external_project_id,
         proj.source_project_id,
-        proj.worktree,
-        proj.vcs,
+        _normalise_optional_text(proj.worktree),
+        _normalise_optional_text(proj.vcs),
         proj.sandboxes,
-        proj.name,
-        proj.display_name,
-        proj.icon,
-        proj.icon_color,
-        proj.raw_commands,
+        _normalise_optional_text(proj.name),
+        _normalise_optional_text(proj.display_name),
+        _normalise_optional_text(proj.icon),
+        _normalise_optional_text(proj.icon_color),
+        _normalise_optional_text(proj.raw_commands),
         proj.parsed_commands,
         proj.source_created_at,
         proj.source_updated_at,
@@ -802,8 +1031,26 @@ async def _process_project_directories(
     to ``(client_id, source_database_id)``, then inserts the provided
     batch.  All operations run within the caller's transaction.
 
-    Returns the number of inserted rows.
+    Each path is whitespace-trimmed before processing and storage.
+    The incoming batch is normalised before insertion: blank, empty, or
+    whitespace-only directory paths are filtered out, and duplicate
+    paths (after trimming) within the batch are collapsed to a single
+    entry stored with the canonical stripped form.  Replaying a snapshot
+    therefore cannot produce duplicate or empty rows.
     """
+    # ── Normalise batch: trim, drop blank paths, collapse duplicates ──
+    seen: set[str] = set()
+    batch: list[ProjectDirectoryPayload] = []
+    for entry in directories:
+        path = entry.directory.strip()
+        if not path:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        entry.directory = path
+        batch.append(entry)
+
     # ── Delete existing directories for this scope ───────────────────
     await conn.execute(
         "DELETE FROM opencode_project_directories WHERE client_id = $1 AND source_database_id = $2",
@@ -813,7 +1060,7 @@ async def _process_project_directories(
 
     # ── Insert new batch ─────────────────────────────────────────────
     count = 0
-    for entry in directories:
+    for entry in batch:
         source_created_at_tz = (
             entry.source_created_at_tz
             if entry.source_created_at_tz is not None
@@ -993,7 +1240,13 @@ async def ingest_usage(
     rejected = 0
 
     for idx, record in enumerate(body.records):
-        result = await _process_one_record(conn, record, idx, client_id, source_db_id, now)
+        try:
+            result = await _process_one_record(conn, record, idx, client_id, source_db_id, now)
+        except Exception as exc:
+            logger.warning("Record %s failed processing: %s", idx, exc)
+            result = IngestRecordResult(
+                index=idx, status="rejected", reason="Processing error — record skipped",
+            )
         results.append(result)
         if result.status == "accepted":
             accepted += 1

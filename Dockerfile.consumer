@@ -36,7 +36,12 @@ USER gateway
 # Verify the consumer can be imported at build time.
 RUN python -c "import app.consumer; print('Consumer module ready')"
 
+# Health check: procps (pgrep) is not installed in python:3.12-slim, so
+# use a Python probe that verifies PID 1 is alive and is the consumer
+# process (exec-form CMD makes the consumer PID 1 by construction).
+# The probe command must stay identical to the k8s livenessProbe exec
+# command in k8s/consumer-deployment.yaml.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD pgrep -f "python -m app.consumer" || exit 1
+    CMD ["python", "-c", "import os,sys; os.kill(1,0); sys.exit(0 if b'app.consumer' in open('/proc/1/cmdline','rb').read() else 1)"]
 
 CMD ["python", "-m", "app.consumer"]

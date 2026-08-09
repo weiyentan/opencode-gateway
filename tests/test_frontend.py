@@ -95,6 +95,69 @@ class TestNginxProxyConfiguration:
             "nginx.conf must proxy /docs through GATEWAY_UPSTREAM"
         )
 
+    # ── IPv4 upstream policy (issue #378) ─────────────────────────────
+    # The Gateway uvicorn listens on IPv4 127.0.0.1:8000. A proxy_pass
+    # targeting `localhost` can resolve to IPv6 [::1]:8000 and fail with
+    # Connection Refused — the hot-patch regression this suite locks in.
+
+    def test_no_localhost_in_nginx_config(self):
+        """nginx.conf must not reference localhost anywhere.
+
+        `localhost` may resolve to [::1] while uvicorn listens only on
+        127.0.0.1 — proxying to it causes Connection Refused errors.
+        """
+        assert "localhost" not in self.config, (
+            "nginx.conf must not reference localhost — it can resolve to "
+            "[::1]:8000 while the Gateway listens on 127.0.0.1:8000 "
+            "(Connection Refused)"
+        )
+
+    def test_all_proxy_pass_directives_use_upstream_template(self):
+        """Every proxy_pass must use the ${GATEWAY_UPSTREAM} env-var template.
+
+        No proxy_pass may hard-code a hostname: the upstream host is set at
+        container start by docker-entrypoint.sh from an IPv4-safe default.
+        """
+        import re
+        proxy_passes = re.findall(r"proxy_pass\s+([^;]+);", self.config)
+        assert proxy_passes, "nginx.conf must contain proxy_pass directives"
+        for directive in proxy_passes:
+            assert "${GATEWAY_UPSTREAM}" in directive, (
+                "proxy_pass must use ${GATEWAY_UPSTREAM} template variable, "
+                f"got {directive.strip()!r}"
+            )
+            assert "localhost" not in directive, (
+                f"proxy_pass must not reference localhost, got {directive.strip()!r}"
+            )
+
+    def test_substituted_config_upstream_is_ipv4_safe(self):
+        """Substituting the entrypoint default upstream must yield IPv4 targets.
+
+        Simulates the envsubst step from docker-entrypoint.sh so the baked
+        template and the runtime default are verified together: the rendered
+        config must contain no localhost upstream.
+        """
+        import re
+        entrypoint = (FRONTEND_DIR / "docker-entrypoint.sh").read_text()
+        default_match = re.search(r'DEFAULT_UPSTREAM="([^"]+)"', entrypoint)
+        assert default_match, (
+            "docker-entrypoint.sh must define DEFAULT_UPSTREAM"
+        )
+        default = default_match.group(1)
+        assert "localhost" not in default, (
+            f"DEFAULT_UPSTREAM must be IPv4-safe, got {default!r}"
+        )
+        assert default.startswith("http://"), (
+            f"DEFAULT_UPSTREAM must be an http:// URL, got {default!r}"
+        )
+
+        substituted = self.config.replace("${GATEWAY_UPSTREAM}", default)
+        for directive in re.findall(r"proxy_pass\s+([^;]+);", substituted):
+            assert "localhost" not in directive, (
+                "Rendered proxy_pass must not reference localhost, got "
+                f"{directive.strip()!r}"
+            )
+
     # ── Static file serving ────────────────────────────────────────────
 
     def test_serves_static_files_at_root(self):
@@ -128,6 +191,113 @@ class TestNginxProxyConfiguration:
             re.DOTALL,
         )
         return bool(pattern.search(self.config))
+
+
+class TestFrontendEntrypointIPv4Upstream:
+    """docker-entrypoint.sh must default GATEWAY_UPSTREAM to an IPv4-safe host.
+
+    The entrypoint substitutes GATEWAY_UPSTREAM into the nginx template at
+    container start. Its default is the last line of defense against a
+    localhost upstream (issue #378 Connection Refused regression).
+    """
+
+    ENTRYPOINT = FRONTEND_DIR / "docker-entrypoint.sh"
+
+    @pytest.fixture(autouse=True)
+    def _load_entrypoint(self):
+        self.content = self.ENTRYPOINT.read_text()
+
+    def test_entrypoint_default_upstream_is_ipv4_safe(self):
+        """DEFAULT_UPSTREAM must resolve to IPv4 (gateway DNS or 127.0.0.1)."""
+        assert 'DEFAULT_UPSTREAM="http://gateway:8000"' in self.content or \
+            'DEFAULT_UPSTREAM="http://127.0.0.1:8000"' in self.content, (
+            "DEFAULT_UPSTREAM must resolve to an IPv4 host "
+            "(http://gateway:8000 or http://127.0.0.1:8000)"
+        )
+
+    def test_entrypoint_has_no_localhost_reference(self):
+        """The entrypoint must not reference localhost as an upstream."""
+        assert "localhost" not in self.content, (
+            "docker-entrypoint.sh must not default the upstream to localhost"
+        )
+
+    def test_entrypoint_substitutes_gateway_upstream(self):
+        """The entrypoint must envsubst GATEWAY_UPSTREAM into the nginx config."""
+        assert "envsubst" in self.content, (
+            "docker-entrypoint.sh must run envsubst to render nginx.conf"
+        )
+        assert "GATEWAY_UPSTREAM" in self.content, (
+            "docker-entrypoint.sh must substitute GATEWAY_UPSTREAM"
+        )
+
+
+class TestFrontendDockerfileBakesNginxConfig:
+    """The nginx config must be baked into the image, not runtime-patched.
+
+    The issue #378 hot-fix (kubectl exec + sed) was lost on pod restart.
+    The fix is permanent only because the Dockerfile copies the IPv4-safe
+    template and the envsubst entrypoint into the image at build time.
+    """
+
+    DOCKERFILE = FRONTEND_DIR / "Dockerfile"
+
+    @pytest.fixture(autouse=True)
+    def _load_dockerfile(self):
+        self.content = self.DOCKERFILE.read_text()
+
+    def test_dockerfile_bakes_nginx_config_template(self):
+        """The Dockerfile must COPY frontend/nginx.conf as the nginx config."""
+        assert "./frontend/nginx.conf" in self.content, (
+            "frontend/Dockerfile must COPY ./frontend/nginx.conf into the image"
+        )
+        assert "/etc/nginx/conf.d/default.conf" in self.content, (
+            "frontend/Dockerfile must install nginx.conf as the default vhost"
+        )
+
+    def test_dockerfile_installs_envsubst_entrypoint(self):
+        """The Dockerfile must install the entrypoint that renders the config."""
+        assert "./frontend/docker-entrypoint.sh" in self.content, (
+            "frontend/Dockerfile must COPY ./frontend/docker-entrypoint.sh"
+        )
+        assert 'ENTRYPOINT ["/docker-entrypoint.sh"]' in self.content, (
+            "frontend/Dockerfile must set the envsubst entrypoint"
+        )
+
+    def test_dockerfile_localhost_is_healthcheck_self_check_not_upstream(self):
+        """The only localhost reference must be the HEALTHCHECK self-check.
+
+        ``localhost`` in the frontend Dockerfile is the frontend's OWN nginx:
+        the HEALTHCHECK runs ``curl -f http://localhost/`` inside the
+        container, hitting the frontend nginx on port 80. It is NOT a gateway
+        upstream, so it does not violate the no-localhost-upstream policy of
+        issue #378 (the IPv6 [::1] Connection Refused regression). Any
+        localhost reference outside the HEALTHCHECK command — or a HEALTHCHECK
+        that targets the gateway upstream on port 8000 — must fail this test.
+        """
+        lines = self.content.splitlines()
+
+        healthcheck_lines = [
+            line for line in lines if line.lstrip().startswith("HEALTHCHECK")
+        ]
+        assert healthcheck_lines, "frontend/Dockerfile must define a HEALTHCHECK"
+
+        localhost_lines = [line for line in lines if "localhost" in line]
+        assert localhost_lines, (
+            "frontend/Dockerfile must reference localhost in its HEALTHCHECK"
+        )
+        for line in localhost_lines:
+            assert "curl -f http://localhost/" in line, (
+                "the only localhost reference must be the HEALTHCHECK "
+                f"self-check command, got: {line!r}"
+            )
+            assert "8000" not in line, (
+                "HEALTHCHECK must self-check the frontend's own nginx, not "
+                f"the gateway upstream on port 8000, got: {line!r}"
+            )
+            assert "proxy_pass" not in line and "GATEWAY_UPSTREAM" not in line, (
+                "HEALTHCHECK must not target a gateway upstream, "
+                f"got: {line!r}"
+            )
 
 
 class TestDockerComposeSameOriginStack:
@@ -198,5 +368,22 @@ class TestDockerComposeSameOriginStack:
         """The frontend service must pass the runtime proxy target."""
         env = self.compose["services"]["frontend"].get("environment", {})
         assert env.get("GATEWAY_UPSTREAM") == "http://gateway:8000"
+
+    def test_frontend_upstream_never_localhost(self):
+        """The compose GATEWAY_UPSTREAM must never reference localhost.
+
+        `localhost` can resolve to IPv6 [::1] while the Gateway listens on
+        IPv4 127.0.0.1 — proxying to it causes Connection Refused on
+        pod restart (issue #378).
+        """
+        env = self.compose["services"]["frontend"].get("environment", {})
+        upstream = env.get("GATEWAY_UPSTREAM", "")
+        assert upstream, "frontend service must set GATEWAY_UPSTREAM"
+        assert "localhost" not in upstream, (
+            f"GATEWAY_UPSTREAM must resolve to IPv4, got {upstream!r}"
+        )
+        assert upstream.startswith("http://"), (
+            f"GATEWAY_UPSTREAM must be an http:// URL, got {upstream!r}"
+        )
 
 

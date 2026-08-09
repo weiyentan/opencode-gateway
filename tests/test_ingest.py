@@ -95,6 +95,19 @@ def _auth_row(
     return row
 
 
+def _add_transaction_support(mock_conn: AsyncMock) -> None:
+    """Set up ``mock_conn.transaction()`` to return an async context manager
+    matching the shape of ``asyncpg.Connection.transaction()``.
+
+    Needed by tests that exercise ``_apply_replay_merge``, which wraps
+    its SELECT FOR UPDATE + COALESCE UPDATE + aggregate repair inside
+    ``async with conn.transaction():``."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=None)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    mock_conn.transaction = MagicMock(return_value=ctx)
+
+
 def _build_ingest_app(
     mock_conn: AsyncMock,
     *,
@@ -106,7 +119,13 @@ def _build_ingest_app(
     token behaviour.  Sets the ``Authorization`` header to carry the
     collector token *and* configures the mock connection to return a
     valid auth row regardless of the token value.
+
+    Adds transaction support to ``mock_conn`` so that the winner-path and
+    replay-merge ``async with conn.transaction()`` blocks work correctly
+    in tests.
     """
+    _add_transaction_support(mock_conn)
+
     monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
     monkeypatch.setenv("GATEWAY_ENV", "development")
     import importlib
@@ -129,16 +148,19 @@ def _build_ingest_app(
 def _new_record_side_effect(record_count: int = 1) -> list:
     """Build a fetchrow side-effect list for ``record_count`` new records.
 
-    Structure: [sd_check] + [dedup, model, session_upsert] * record_count.
+    Structure: [sd_check] + [model, atomic_insert, session_upsert] * record_count.
 
-    The session upsert always returns a row with ``id`` (the new or existing
+    The atomic INSERT ON CONFLICT must return a row (winner path); the
+    session upsert always returns a row with ``id`` (the new or existing
     internal session UUID).
     """
     per_record: list = [None]  # sd check (once per batch)
     for _ in range(record_count):
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-        per_record.extend([None, None, session_row])  # dedup, model, session
+        per_record.extend([None, insert_row, session_row])  # model, atomic_insert, session
     return per_record
 
 
@@ -341,20 +363,37 @@ class TestDuplicateBatchIdempotent:
         mock_conn = AsyncMock()
         auth = _auth_row()
         # Existing record with matching values
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 100,
             "output_tokens": 50,
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        # Existing model (idempotent — harmless)
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
+        # lock_row for _apply_replay_merge FOR UPDATE (all-None — no enrichment)
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth,          # 1. auth
-            None,          # 2. source_database check (new)
-            existing_row,  # 3. dedup check → match found (return early)
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -385,21 +424,38 @@ class TestDuplicateBatchIdempotent:
     async def test_v12_duplicate_uses_effective_cached_tokens(self, monkeypatch):
         """v1.2 duplicates compare against stored cache_read + cache_write tokens."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 100,
             "output_tokens": 50,
             "cached_tokens": 15,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,
             None,
-            existing_row,
+            existing_model,  # model upsert
+            None,            # atomic INSERT → conflict
+            existing_dedup,  # dedup query → identical
+            lock_row,        # _apply_replay_merge: SELECT FOR UPDATE
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -453,20 +509,24 @@ class TestDivergentDuplicate:
         mock_conn = AsyncMock()
         auth = _auth_row()
         # Existing record with DIFFERENT values
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 200,   # different!
             "output_tokens": 50,
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth,          # 1. auth
-            None,          # 2. source_database check (new)
-            existing_row,  # 3. dedup check → divergent match
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → divergent match
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -703,12 +763,14 @@ class TestSourceDatabaseUpsert:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow.side_effect = [
             auth,          # 1. auth
             existing_sd,   # 2. source_database check → exists (UPDATE)
-            None,          # 3. dedup check → not found
-            None,          # 4. model check → not found
+            None,          # 3. model check → not found
+            insert_row,    # 4. atomic INSERT → winner
             session_row,   # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -773,15 +835,17 @@ class TestModelUpsert:
 
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
-        # Order: auth | sd_check | dedup | model_check | session upsert
+        # Order: auth | sd_check | model | atomic_insert | session
         mock_conn.fetchrow.side_effect = [
-            auth,            # 1. auth
-            None,            # 2. source_database check → not found
-            None,            # 3. dedup check → not found (proceed)
-            existing_model,  # 4. model check → found (UPDATE)
-            session_row,     # 5. session upsert → returns new id
+            auth,               # 1. auth
+            None,               # 2. source_database check → not found
+            existing_model,     # 3. model check → found (UPDATE)
+            insert_row,         # 4. atomic INSERT → winner
+            session_row,        # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -896,12 +960,14 @@ class TestSessionIdAcceptsSesString:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
-            None,          # dedup check (new)
             None,          # model check (new)
-            session_row,    # session upsert → returns new id
+            insert_row,    # atomic INSERT → winner
+            session_row,   # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -944,8 +1010,10 @@ class TestSessionIdAcceptsSesString:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, session_row,
+            auth, None, None, insert_row, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -988,11 +1056,13 @@ class TestResolveSessionCreatesNewRow:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
-            None,          # dedup check (new)
             None,          # model check (new)
+            insert_row,    # atomic INSERT → winner
             session_row,    # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -1015,17 +1085,24 @@ class TestResolveSessionCreatesNewRow:
         ]
         assert len(session_upserts) == 1
 
-        # Verify the usage record INSERT received a resolved session UUID,
-        # not the raw external session ID string
+        # Verify the atomic usage-record INSERT was attempted via fetchrow
+        # and succeeded (winner path), then session_id was backfilled via
+        # an UPDATE execute call.
         record_inserts = [
-            call for call in mock_conn.execute.call_args_list
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO opencode_usage_records" in str(call)
         ]
         assert len(record_inserts) == 1
-        # The session_id argument in the usage record INSERT should be a UUID,
-        # not a string (the 6th positional arg after VALUES)
-        usage_insert_call = record_inserts[0]
-        session_id_arg = usage_insert_call.args[5]  # 6th positional arg (after SQL) = session_id
+        # The session_id argument in the atomic INSERT is NULL,
+        # then backfilled via UPDATE after session resolution.
+        session_id_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records SET session_id" in str(call)
+        ]
+        assert len(session_id_updates) == 1
+        # The UPDATE's session_id argument must be a UUID, not a string
+        update_call = session_id_updates[0]
+        session_id_arg = update_call.args[1]  # 2nd positional arg = session_id
         assert isinstance(session_id_arg, uuid.UUID)
 
 
@@ -1041,13 +1118,15 @@ class TestResolveSessionReturnsExisting:
         existing_session_id = uuid.uuid4()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": existing_session_id}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,           # auth
             None,           # source_database check (new)
-            None,           # dedup check (new)
             None,           # model check (new)
+            insert_row,     # atomic INSERT → winner
             session_row,    # session upsert → returns existing id (ON CONFLICT path)
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -1072,14 +1151,15 @@ class TestResolveSessionReturnsExisting:
         assert len(session_upserts) == 1
         assert "ON CONFLICT" in str(session_upserts[0])
 
-        # Verify the usage record was inserted with the existing session UUID
-        record_inserts = [
+        # Verify the session_id was backfilled via UPDATE after session
+        # resolution (atomic INSERT uses NULL initially).
+        session_id_updates = [
             call for call in mock_conn.execute.call_args_list
-            if "INSERT INTO opencode_usage_records" in str(call)
+            if "UPDATE opencode_usage_records SET session_id" in str(call)
         ]
-        assert len(record_inserts) == 1
-        usage_insert_call = record_inserts[0]
-        session_id_arg = usage_insert_call.args[5]
+        assert len(session_id_updates) == 1
+        update_call = session_id_updates[0]
+        session_id_arg = update_call.args[1]
         assert session_id_arg == existing_session_id
 
 
@@ -1163,7 +1243,7 @@ class TestIdempotencyWithSessionResolution:
         without triggering session resolution again."""
         mock_conn = AsyncMock()
         auth = _auth_row()
-        # Existing record with matching values — dedup will short-circuit
+        # Existing record with matching values — atomic INSERT will conflict
         existing_dedup = MagicMock()
         existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
@@ -1172,12 +1252,27 @@ class TestIdempotencyWithSessionResolution:
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth,            # 1. auth
-            None,            # 2. source_database check (new)
-            existing_dedup,  # 3. dedup → match (returns early, no session resolve)
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -1214,8 +1309,10 @@ class TestSchemaVersion11Accepted:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, session_row,
+            auth, None, None, insert_row, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -1762,15 +1859,19 @@ class TestSessionUpsertAgent:
         session_id = _SESSION_ID
         internal_session = MagicMock()
         internal_session.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_2 = MagicMock()
+        insert_row_2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow.side_effect = [
             auth,              # auth
             None,              # sd check (batch level)
-            None,              # dedup rec-1
             None,              # model rec-1
+            insert_row_1,      # atomic INSERT rec-1 → winner
             internal_session,  # session upsert rec-1 (ON CONFLICT inserted)
-            None,              # dedup rec-2
             None,              # model rec-2
+            insert_row_2,      # atomic INSERT rec-2 → winner
             internal_session,  # session upsert rec-2 (ON CONFLICT updated)
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -1905,15 +2006,16 @@ class TestCachedTokensComputation:
         assert data["results"][0]["status"] == "accepted"
 
         # Verify the wire cached_tokens=42 was persisted (not 0 from enrichment defaults)
-        # The execute call should use effective_cached_tokens=$9=42 for v1.0 payload
-        execute_call = next(
-            call for call in mock_conn.execute.call_args_list
+        # The atomic INSERT ON CONFLICT uses effective_cached_tokens at position
+        # $8 in the fetchrow call (session_id is NULL inline, so all indices
+        # shifted down by one).
+        atomic_insert_call = next(
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO opencode_usage_records" in str(call)
         )
-        # args[0] = SQL, args[1..18] = $1..$18 parameters
-        # $9 = effective_cached_tokens at args[9]
-        assert execute_call is not None
-        cached_tokens_param = execute_call[0][9]
+        assert atomic_insert_call is not None
+        # $8 = effective_cached_tokens at args[0][8]
+        cached_tokens_param = atomic_insert_call[0][8]
         assert cached_tokens_param == 42, (
             f"Expected effective_cached_tokens=42 for v1.0 wire value, "
             f"got {cached_tokens_param}"
@@ -2068,14 +2170,19 @@ class TestSessionCacheTokensUpdate:
             r.__getitem__.side_effect = {"id": _id}.__getitem__
             return r
 
+        def _insert_row():
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+            return r
+
         mock_conn.fetchrow.side_effect = [
             auth,                    # 0. auth
             None,                    # 1. source_database check (new)
-            None,                    # 2. dedup rec-001 (new)
-            None,                    # 3. model gpt-4 (new)
+            None,                    # 2. model gpt-4 (new)
+            _insert_row(),           # 3. atomic INSERT rec-001 → winner
             _session_row(),          # 4. session upsert rec-001 → returns shared id
-            None,                    # 5. dedup rec-002 (new)
-            None,                    # 6. model claude-3 (new)
+            None,                    # 5. model claude-3 (new)
+            _insert_row(),           # 6. atomic INSERT rec-002 → winner
             _session_row(),          # 7. session upsert rec-002 → returns shared id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -2171,14 +2278,19 @@ class TestSessionCacheTokensUpdate:
             r.__getitem__.side_effect = {"id": _id}.__getitem__
             return r
 
+        def _insert_row():
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+            return r
+
         mock_conn.fetchrow.side_effect = [
             auth,                    # 0. auth
             None,                    # 1. source_database check (new)
-            None,                    # 2. dedup rec-v10 (new)
-            None,                    # 3. model gpt-4 (new)
+            None,                    # 2. model gpt-4 (new)
+            _insert_row(),           # 3. atomic INSERT rec-v10 → winner
             _session_row(),          # 4. session upsert rec-v10 → shared id
-            None,                    # 5. dedup rec-v12 (new)
-            None,                    # 6. model claude-3 (new)
+            None,                    # 5. model claude-3 (new)
+            _insert_row(),           # 6. atomic INSERT rec-v12 → winner
             _session_row(),          # 7. session upsert rec-v12 → shared id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -2441,12 +2553,16 @@ class TestSessionCacheTokenBackfill:
         auth = _auth_row()
 
         # Two records for the same session.
-        # Structure: [auth] + [sd_check] + [dedup, model, session] * 2
+        # Structure: [auth] + [sd_check] + [model, insert, session] * 2
         fetchrow_side_effects = [auth, None]  # auth + source-database check
         for _ in range(2):
+            insert_row = MagicMock()
+            insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
             session_row = MagicMock()
             session_row.__getitem__.side_effect = {"id": _SESSION_ID}.__getitem__
-            fetchrow_side_effects.extend([None, None, session_row])  # dedup, model, session
+            fetchrow_side_effects.extend(
+                [None, insert_row, session_row]
+            )  # model, atomic_insert, session
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = fetchrow_side_effects
@@ -3120,6 +3236,124 @@ class TestProjectDirectoryReplace:
         ]
         assert len(insert_calls) == 3
 
+    @pytest.mark.asyncio
+    async def test_duplicate_directories_collapsed(self, monkeypatch):
+        """Duplicate directory paths in one snapshot produce one row each."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="/tmp/b"),
+                _mk_directory_payload(directory="/tmp/a"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 2
+        assert data["projection_rejected_count"] == 0
+
+        # One DELETE, then exactly one INSERT per distinct directory
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 2
+
+        inserted_dirs = sorted(call.args[4] for call in insert_calls)
+        assert inserted_dirs == ["/tmp/a", "/tmp/b"]
+
+    @pytest.mark.asyncio
+    async def test_blank_directories_filtered(self, monkeypatch):
+        """Blank and whitespace-only directory paths never reach INSERT."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="   "),
+                _mk_directory_payload(directory="\t\n"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 0
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 1
+        assert insert_calls[0].args[4] == "/tmp/a"
+
+    @pytest.mark.asyncio
+    async def test_empty_directory_rejected_at_validation(self, monkeypatch):
+        """An empty directory string fails schema validation with 422."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory=""),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        # Pydantic min_length=1 rejects empty directory at validation → 422
+        assert response.status_code == 422
+
 
 class TestSessionTodoReplace:
     """Session todos are replaced per external session within the batch."""
@@ -3463,6 +3697,161 @@ class TestProjectionIndependentPaths:
         assert data["projection_rejected_count"] == 0
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #375 — Atomic usage record deduplication under concurrent replay
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestConcurrentIdenticalRecords:
+    """Two concurrent identical records produce one row and one aggregate increment."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_identical_records_single_insert_and_increment(self, monkeypatch):
+        """Two identical concurrent records: both return accepted, but only one
+        row is inserted into opencode_usage_records and session aggregates /
+        source database record count are incremented exactly once."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        # ── Build fetchrow side-effect list ───────────────────────────
+        fetchrow_responses = [auth]  # auth
+
+        # Source database check
+        fetchrow_responses.append(None)  # new source database
+
+        # Two records, same dedup key
+        # Record 1:
+        #  - model upsert → new model (None)
+        #  - atomic INSERT ON CONFLICT → WINNER (returns row with id)
+        #  - session resolve → returns session UUID
+        fetchrow_responses.append(None)  # model check (new)
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(insert_row_1)  # atomic INSERT → winner
+        session_row_1 = MagicMock()
+        session_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(session_row_1)  # session resolve
+
+        # Record 2 (same source_record_id):
+        #  - model upsert → existing model (we return a row)
+        #  - atomic INSERT ON CONFLICT → LOSER (returns None)
+        #  - existing record query → returns matching values (identical)
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(existing_model)  # model check (existing)
+        fetchrow_responses.append(None)  # atomic INSERT → conflict
+        existing_dedup_row = MagicMock()
+        existing_dedup_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        fetchrow_responses.append(existing_dedup_row)  # dedup query → identical
+        # _apply_replay_merge SELECT FOR UPDATE
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        fetchrow_responses.append(lock_row)
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = fetchrow_responses
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-concurrent-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-concurrent-001",  # SAME dedup key
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+
+        # Both records return accepted
+        assert data["accepted_count"] == 2
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # ── Exactly ONE usage record inserted ─────────────────────────
+        record_inserts_via_execute = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(record_inserts_via_execute) == 0, (
+            "Usage record INSERT should happen via atomic INSERT ON CONFLICT "
+            "(fetchrow call), not via execute"
+        )
+
+        atomic_inserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+            and "ON CONFLICT" in str(call)
+        ]
+        assert len(atomic_inserts) == 2, (
+            "Two atomic INSERT attempts (one winner, one loser)"
+        )
+
+        # ── Session resolve called exactly ONCE ───────────────────────
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 1, (
+            f"Session resolve should be called exactly once (winner only), "
+            f"got {len(session_calls)}"
+        )
+
+        # ── Source database record count bumped exactly ONCE ──────────
+        sd_bumps = [
+            call for call in mock_conn.execute.call_args_list
+            if "record_count = record_count + 1" in str(call)
+        ]
+        assert len(sd_bumps) == 1, (
+            f"Source DB count should be bumped exactly once (winner only), "
+            f"got {len(sd_bumps)}"
+        )
+
+        # ── Second record's result includes idempotent reason ──────────
+        assert "idempotent" in (data["results"][1].get("reason") or "").lower()
+
+
 class TestProjectionCombinedPayloads:
     """Payloads with both usage records and multiple projection types."""
 
@@ -3476,15 +3865,17 @@ class TestProjectionCombinedPayloads:
 
         auth = _auth_row()
 
-        # Side effects: auth, sd, usage record (dedup, model, session=3 items)
+        # Side effects: auth, sd, usage record (model, insert, session=3 items)
         # Then: 2 session contexts (resolve session, resolve proj each = 4)
         # Then: 1 todo resolve
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,                   # auth
             None,                   # sd check
-            None, None, session_row,  # usage record: dedup, model, session
+            None, insert_row, session_row,  # usage record: model, atomic_insert, session
             None, None,             # ctx1: resolve session_id, resolve source_project
             None, None,             # ctx2: resolve session_id, resolve source_project
             None,                   # todo: resolve session_id
@@ -3531,3 +3922,1779 @@ class TestProjectionCombinedPayloads:
         assert data["accepted_count"] == 1
         assert data["projection_accepted_count"] == 5  # 1 proj + 2 ctx + 1 dir + 1 todo
         assert data["projection_rejected_count"] == 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #379 — Replay Merge: enrich absent fields without erasing populated values
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestReplayMergeFillAbsent:
+    """Replay with identical required values + additional enrichment fills only NULL fields."""
+
+    @pytest.mark.asyncio
+    async def test_replay_fills_absent_provider(self, monkeypatch):
+        """A replay with identical required values and a new provider fills
+        provider on the stored record without touching other fields."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert
+            None,             # 4. atomic INSERT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "openai",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # Verify an UPDATE was issued for provider
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+            and "provider" in str(call)
+        ]
+        assert len(enrichment_updates) == 1
+
+    @pytest.mark.asyncio
+    async def test_replay_fills_absent_numeric_enrichment(self, monkeypatch):
+        """A replay with identical required values fills absent numeric
+        enrichment fields (reasoning_tokens, cache_read_tokens, etc.)."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                    "reasoning_tokens": 42,
+                    "finish_reason": "stop",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # Verify updates include all enrichment fields
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 1
+        update_sql = str(enrichment_updates[0])
+        assert "reasoning_tokens" in update_sql
+        assert "cache_read_tokens" in update_sql
+        assert "cache_write_tokens" in update_sql
+        assert "finish_reason" in update_sql
+
+    @pytest.mark.asyncio
+    async def test_zero_numeric_is_valid_not_missing(self, monkeypatch):
+        """Numeric zero is a valid observed value — a stored NULL is
+        filled with 0 from the replay, and a stored 0 is NOT treated
+        as missing."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "reasoning_tokens": 0,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # Verify 0 was written for reasoning_tokens
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 1
+        update_sql = str(enrichment_updates[0])
+        assert "reasoning_tokens" in update_sql
+
+    @pytest.mark.asyncio
+    async def test_concurrent_replays_with_differing_enrichment_do_not_overwrite(self, monkeypatch):
+        """Two concurrent replay losers with identical accounting values but
+        differing enrichment payloads must not overwrite each other's writes.
+        The COALESCE-based UPDATE is atomic — each fill lands in its own NULL
+        column and Postgres row-level locking serialises the two UPDATEs, so
+        no populated value is erased."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row_a = MagicMock()
+        lock_row_a.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        lock_row_b = MagicMock()
+        lock_row_b.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert (record A)
+            None,             # 4. atomic INSERT → conflict (record A, loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row_a,       # 6. _apply_replay_merge FOR UPDATE (record A)
+            # Record B:
+            existing_model,   # 7. model upsert (record B)
+            None,             # 8. atomic INSERT → conflict (record B, loser)
+            existing_dedup,   # 9. dedup query → identical match
+            lock_row_b,       # 10. _apply_replay_merge FOR UPDATE (record B)
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-concurrent-fill-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "openai",
+                },
+                {
+                    "source_record_id": "rec-concurrent-fill-001",  # SAME dedup key
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "mode": "chat",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # Both records should report enrichment applied since each fills a
+        # different NULL column.
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+        assert "enrichment applied" in (data["results"][1]["reason"] or "")
+
+        # Verify enrichment UPDATEs used COALESCE (the atomic guard)
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 2, (
+            f"Expected 2 enrichment UPDATEs (one per record), "
+            f"got {len(enrichment_updates)}"
+        )
+
+        # First UPDATE should use COALESCE for provider
+        update_1_sql = str(enrichment_updates[0])
+        assert "COALESCE" in update_1_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        assert "provider" in update_1_sql
+
+        # Second UPDATE should use COALESCE for mode
+        update_2_sql = str(enrichment_updates[1])
+        assert "COALESCE" in update_2_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        assert "mode" in update_2_sql
+
+        # Neither UPDATE should contain a bare "provider = $" (without COALESCE)
+        # or "mode = $" — the COALESCE wrapper is the invariant guard.
+        import re
+        bare_set = re.compile(
+            r"\b(provider|mode|finish_reason|reasoning_tokens"
+            r"|cache_read_tokens|cache_write_tokens)\s*=\s*\$"
+        )
+        assert not bare_set.search(update_1_sql), (
+            f"UPDATE must not contain bare SET column = $n (COALESCE guard missing): {update_1_sql}"
+        )
+        assert not bare_set.search(update_2_sql), (
+            f"UPDATE must not contain bare SET column = $n (COALESCE guard missing): {update_2_sql}"
+        )
+
+
+class TestReplayMergeNoOverwrite:
+    """Replay with identical required values must NOT overwrite populated enrichment fields."""
+
+    @pytest.mark.asyncio
+    async def test_replay_does_not_overwrite_populated_provider(self, monkeypatch):
+        """When the stored record already has a provider, a replay with a
+        different provider does NOT overwrite it, and no enrichment UPDATE
+        is issued because no column is fillable."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": "openai",    # stored value — NOT fillable
+            "mode": None,            # stored NULL — fillable
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "anthropic",  # DIFFERENT provider
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        # Stored provider is already populated → no column is fillable
+        # → no enrichment UPDATE issued.
+        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        # Verify NO enrichment UPDATE was issued
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 0, (
+            "No enrichment UPDATE expected when no column is fillable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_fills_absent_but_does_not_overwrite_others(self, monkeypatch):
+        """A replay fills an absent 'mode' field while leaving an already-populated
+        'provider' untouched — only the absent field is updated."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": "openai",    # stored value — NOT fillable
+            "mode": None,            # stored NULL — fillable
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "anthropic",  # should NOT overwrite "openai"
+                    "mode": "chat",           # should be filled
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # Verify UPDATE includes mode (fillable) but NOT provider (already
+        # populated — not fillable).  Each SET clause is guarded by COALESCE.
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 1
+        update_sql = str(enrichment_updates[0])
+        assert "mode" in update_sql
+        assert "provider" not in update_sql, (
+            "Provider must NOT be in the UPDATE — stored value is already populated"
+        )
+        assert "COALESCE" in update_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        # Verify no bare SET column = $n (COALESCE guard is present)
+        import re
+        bare_set = re.compile(
+            r'\b(provider|mode)\s*=\s*\$'
+        )
+        assert not bare_set.search(update_sql), (
+            f"mode must be guarded by COALESCE, got: {update_sql}"
+        )
+
+
+class TestReplayMergeWhitespaceNormalization:
+    """Whitespace-only optional text values are treated as missing under Replay Merge."""
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_provider_treated_as_missing(self, monkeypatch):
+        """A replay with provider='   ' (whitespace-only) is normalised to None
+        and does NOT overwrite a NULL stored provider."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "   ",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        # Whitespace-only → treated as missing → no enrichment applied
+        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        # Verify NO enrichment UPDATE was issued
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 0
+
+    @pytest.mark.asyncio
+    async def test_single_space_provider_treated_as_missing(self, monkeypatch):
+        """provider=' ' (single space) is also normalised to None."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": " ",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 0
+
+    @pytest.mark.asyncio
+    async def test_whitespace_finish_reason_treated_as_missing(self, monkeypatch):
+        """finish_reason='  ' (whitespace-only) treated as missing."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "finish_reason": "  ",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 0
+
+    @pytest.mark.asyncio
+    async def test_newline_only_provider_treated_as_missing(self, monkeypatch):
+        """A provider='\n' (whitespace-only after strip) is treated as
+        missing — no enrichment applied."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": _SESSION_ID,
+        }.__getitem__
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "\n",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        # newline-only → stripped to empty → treated as missing
+        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #380 — Replay enrichment: aggregate repair without double-counting
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestReplayEnrichmentSessionAggregateRepair:
+    """When replay merge fills cache_read_tokens / cache_write_tokens on a
+    usage record, the session aggregate's derived totals are repaired
+    without inflating base totals or message_count."""
+
+    @pytest.mark.asyncio
+    async def test_replay_enrichment_updates_session_cache_totals(self, monkeypatch):
+        """A replay that fills cache_read_tokens=10 and cache_write_tokens=5
+        on a previously-stored record updates the session's total_cache_read_tokens
+        and total_cache_write_tokens via atomic aggregate repair UPDATEs."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,  # 10 + 5 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        # FOR UPDATE returns: cache_read_tokens=NULL, cache_write_tokens=NULL
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert
+            None,             # 4. atomic INSERT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # ── Verify session aggregate repair UPDATEs were issued ─────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+
+        # cache_read_tokens repair
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Expected 1 session total_cache_read_tokens repair UPDATE, "
+            f"got {len(cr_repairs)}"
+        )
+        assert "+ $1" in cr_repairs[0] or "total_cache_read_tokens +" in cr_repairs[0], (
+            "Repair UPDATE must add (not overwrite) the delta"
+        )
+
+        # cache_write_tokens repair
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cw_repairs) == 1, (
+            f"Expected 1 session total_cache_write_tokens repair UPDATE, "
+            f"got {len(cw_repairs)}"
+        )
+        assert "+ $1" in cw_repairs[0] or "total_cache_write_tokens +" in cw_repairs[0], (
+            "Repair UPDATE must add (not overwrite) the delta"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_enrichment_does_not_inflate_base_totals(self, monkeypatch):
+        """A replay delivery that fills cache tokens must NOT increment
+        total_input_tokens, total_output_tokens, total_cached_tokens,
+        or message_count on the session aggregate.  The session resolution
+        path (winner) is never reached for a dedup loser."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 28,  # 20 + 8 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,             # source_database check
+            existing_model,   # model upsert
+            None,             # atomic INSERT → conflict
+            existing_dedup,   # dedup query → identical
+            lock_row,         # _apply_replay_merge: SELECT FOR UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 20,
+                    "cache_write_tokens": 8,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+
+        # ── Verify NO session resolution was triggered ──────────────────
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 0, (
+            "Replay delivery (loser path) must NOT call _resolve_session — "
+            "base totals must not be incremented"
+        )
+
+        # ── Verify NO base-total or message_count UPDATEs ───────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        base_total_fields = [
+            "total_input_tokens", "total_output_tokens",
+            "total_cached_tokens", "message_count",
+        ]
+        for field in base_total_fields:
+            bad_updates = [
+                call for call in all_execute_calls if field in call
+            ]
+            assert len(bad_updates) == 0, (
+                f"Replay delivery must NOT update {field} on session aggregate. "
+                f"Found: {bad_updates}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_delivery_does_not_double_count(self, monkeypatch):
+        """A second identical replay delivery must NOT double-count any
+        session aggregate.  The FOR UPDATE sees already-filled cache token
+        columns and produces a zero delta, so no repair UPDATE is issued."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,  # 10 + 5 — matches effective cached
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+
+        # First record: cache tokens are NULL → deltas will be applied
+        lock_row_first = MagicMock()
+        lock_row_first.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        # Second record (duplicate): cache tokens are already filled → deltas = 0
+        lock_row_second = MagicMock()
+        lock_row_second.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": 10,   # already filled by first replay
+            "cache_write_tokens": 5,   # already filled by first replay
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                   # 1. auth
+            None,                   # 2. source_database check
+            existing_model,         # 3. model upsert (record 1)
+            None,                   # 4. atomic INSERT → conflict (record 1)
+            existing_dedup,         # 5. dedup query → identical (record 1)
+            lock_row_first,         # 6. _apply_replay_merge FOR UPDATE (record 1)
+            existing_model,         # 7. model upsert (record 2, duplicate)
+            None,                   # 8. atomic INSERT → conflict (record 2)
+            existing_dedup,         # 9. dedup query → identical (record 2)
+            lock_row_second,        # 10. _apply_replay_merge FOR UPDATE (record 2)
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        base_record = {
+            "source_record_id": "rec-001",
+            "session_id": str(_SESSION_ID),
+            "model": "gpt-4",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": "0.0035",
+            "reported_at": _mk_ts().isoformat(),
+            "cache_read_tokens": 10,
+            "cache_write_tokens": 5,
+        }
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[dict(base_record), dict(base_record)],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # ── Verify exactly ONE set of session repair UPDATEs ────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Duplicate delivery must NOT double-count cache_read_tokens. "
+            f"Found {len(cr_repairs)} repair UPDATEs: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 1, (
+            f"Duplicate delivery must NOT double-count cache_write_tokens. "
+            f"Found {len(cw_repairs)} repair UPDATEs: {cw_repairs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_with_zero_cache_tokens_zero_delta(self, monkeypatch):
+        """A replay with cache_read_tokens=0, cache_write_tokens=0 fills
+        the stored fields but produces a delta of 0, so no session aggregate
+        repair is issued (adding 0 is a no-op)."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        # ── Verify NO session repair UPDATEs for zero deltas ────────────
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 0, (
+            f"Zero delta must not issue cache_read repair UPDATE. "
+            f"Found: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 0, (
+            f"Zero delta must not issue cache_write repair UPDATE. "
+            f"Found: {cw_repairs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_replay_only_cache_read_fills_only_that_total(self, monkeypatch):
+        """A replay with only cache_read_tokens (cache_write_tokens omitted)
+        updates only total_cache_read_tokens, not total_cache_write_tokens."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # cache_read_tokens provided, cache_write_tokens NOT in payload
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Expected cache_read repair when cache_read_tokens=10. "
+            f"Found: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 0, (
+            f"Expected NO cache_write repair when cache_write_tokens is absent. "
+            f"Found: {cw_repairs}"
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PR #382 review fixes — new tests
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestF2WinnerTransactionAtomicity:
+    """F2: The winner path's atomic INSERT + side effects run inside a transaction."""
+
+    @pytest.mark.asyncio
+    async def test_winner_path_runs_in_transaction(self, monkeypatch):
+        """When the atomic INSERT wins, all side effects are inside
+        conn.transaction()."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        # _build_ingest_app already calls _add_transaction_support, which
+        # replaces conn.transaction with a MagicMock we can count calls on.
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        # _build_ingest_app calls _add_transaction_support, which replaces
+        # conn.transaction with a MagicMock we can count calls on (never
+        # called during setup). The single-record winner scenario enters
+        # exactly one transaction.
+        assert mock_conn.transaction.call_count == 1, (
+            "Winner path must enter exactly one explicit transaction"
+        )
+
+
+class TestC6PerRecordExceptionHandling:
+    """C6: A transient error in one record does not abort the whole batch."""
+
+    @pytest.mark.asyncio
+    async def test_single_record_failure_does_not_abort_batch(self, monkeypatch):
+        """One record's _process_one_record raising → 200, that record
+        rejected, others accepted."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+
+        # Record 0 (index 0): _process_one_record raises an exception
+        # Record 1 (index 1): normal winner path
+
+        # We need the fetchrow side_effect to be complex:
+        # For record 0: auth -> sd_check -> ... -> atomic INSERT raises
+        # For record 1: normal winner path
+
+        # Simpler approach: make the model upsert raise for record 0 but
+        # work for record 1.  _upsert_model is a fetchrow call.
+
+        # Side effect: auth, sd_check(None), then model upsert → Exception
+        # But the exception actually raises from fetchrow. Let's make
+        # the atomic INSERT for record 0 raise by making fetchrow raise
+        # for that specific call.
+
+        # Actually, let's just make the model upsert for record 0 raise.
+        model_id_row = MagicMock()
+        model_id_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        # Record 0: model upsert raises Exception
+        mock_conn.fetchrow.side_effect = [
+            auth,           # auth
+            None,           # sd check
+            Exception("DB connection lost"),  # model upsert for record 0 → boom
+            # Record 1: normal winner path
+            None,           # model upsert for record 1
+            insert_row,     # atomic INSERT winner
+            session_row,    # session resolve
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-fail",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-ok",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        # Response is still 200, batch succeeds with partial results
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1, f"Expected 1 accepted, got {data}"
+        assert data["rejected_count"] == 1, f"Expected 1 rejected, got {data}"
+
+        results = data["results"]
+        assert results[0]["status"] == "rejected"
+        assert "Processing error" in (results[0]["reason"] or "")
+        assert results[1]["status"] == "accepted"
+
+
+class TestC3WhitespaceDirectoryDedup:
+    """C3: directory dedup uses stripped canonical paths."""
+
+    @pytest.mark.asyncio
+    async def test_trailing_whitespace_directory_collapsed(self, monkeypatch):
+        """Directories '/tmp/a' and '/tmp/a ' (trailing whitespace) in one
+        snapshot collapse to ONE row stored as '/tmp/a'."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory="/tmp/a "),
+                _mk_directory_payload(directory=" /tmp/b"),
+                _mk_directory_payload(directory="/tmp/b"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # 4 entries collapse to 2 canonical: /tmp/a and /tmp/b
+        assert data["projection_accepted_count"] == 2
+        assert data["projection_rejected_count"] == 0
+
+        # One DELETE, then exactly two INSERTs
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 2
+        inserted_dirs = sorted(call.args[4] for call in insert_calls)
+        assert inserted_dirs == ["/tmp/a", "/tmp/b"]
+
+
+class Test380SessionIdNullFallback:
+    """#380: session_id=NULL fallback path and repair delta args in
+    _apply_replay_merge."""
+
+    @pytest.mark.asyncio
+    async def test_session_id_null_fallback_resolves_session(self, monkeypatch):
+        """When the FOR UPDATE lock row has session_id=NULL, the merge path
+        calls _resolve_internal_session_id and repairs the right session."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        resolved_session_id = uuid.uuid4()
+
+        # FOR UPDATE lock row: session_id=NULL
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": None,  # not backfilled yet
+        }.__getitem__
+
+        # _resolve_internal_session_id query result
+        resolve_row = MagicMock()
+        resolve_row.__getitem__.side_effect = {"id": resolved_session_id}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check
+            existing_model,   # 3. model upsert
+            None,             # 4. atomic INSERT → conflict
+            existing_dedup,   # 5. dedup query → identical
+            lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+            resolve_row,      # 7. _resolve_internal_session_id SELECT
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+
+        # Verify session aggregate repair uses the RESOLVED session id
+        all_execute_calls = [
+            str(call) for call in mock_conn.execute.call_args_list
+        ]
+        # Look for the repair UPDATE targeting resolved_session_id
+        cr_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_read_tokens" in call
+            and str(resolved_session_id) in call
+        ]
+        cw_repairs = [
+            call for call in all_execute_calls
+            if "total_cache_write_tokens" in call
+            and str(resolved_session_id) in call
+        ]
+        assert len(cr_repairs) == 1, (
+            f"Expected cache_read repair targeting resolved session "
+            f"{resolved_session_id}. Found: {cr_repairs}"
+        )
+        assert len(cw_repairs) == 1, (
+            f"Expected cache_write repair targeting resolved session. "
+            f"Found: {cw_repairs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_repair_delta_args_are_correct_values(self, monkeypatch):
+        """When stored cache_read_tokens=NULL, cache_write_tokens=NULL and
+        incoming values are 10 and 5, the aggregate UPDATEs carry the exact
+        incoming values as deltas."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 15,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        session_id_for_repair = uuid.uuid4()
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "reasoning_tokens": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "session_id": session_id_for_repair,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth, None, existing_model, None, existing_dedup, lock_row,
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "cache_read_tokens": 10,
+                    "cache_write_tokens": 5,
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Inspect execute call args for the cache token repair UPDATEs
+        all_call_args = mock_conn.execute.call_args_list
+
+        cr_call = None
+        cw_call = None
+        for call in all_call_args:
+            sql = str(call)
+            if "total_cache_read_tokens" in sql:
+                cr_call = call
+            elif "total_cache_write_tokens" in sql:
+                cw_call = call
+
+        assert cr_call is not None, "Missing total_cache_read_tokens repair UPDATE"
+        assert cw_call is not None, "Missing total_cache_write_tokens repair UPDATE"
+
+        # Verify delta arguments: total_cache_read_tokens + 10, total_cache_write_tokens + 5
+        cr_args = cr_call.args
+        assert cr_args[1] == 10, (
+            f"cache_read repair delta expected 10, got {cr_args[1]}"
+        )
+        assert cr_args[2] == session_id_for_repair, (
+            f"cache_read repair session_id expected {session_id_for_repair}, "
+            f"got {cr_args[2]}"
+        )
+
+        cw_args = cw_call.args
+        assert cw_args[1] == 5, (
+            f"cache_write repair delta expected 5, got {cw_args[1]}"
+        )
+        assert cw_args[2] == session_id_for_repair, (
+            f"cache_write repair session_id expected {session_id_for_repair}, "
+            f"got {cw_args[2]}"
+        )

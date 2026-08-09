@@ -59,12 +59,23 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # Liveness probe: verifies PID 1 is alive AND its /proc/1/cmdline
+          # contains "app.consumer". The exec-form `command` above makes the
+          # consumer PID 1 by construction, so the probe checks the consumer
+          # process itself.
+          #
+          # This probe command MUST stay byte-identical with the
+          # Dockerfile.consumer HEALTHCHECK command (issue #377 contract).
+          # It is a process-liveness probe only (same fidelity as the former
+          # pgrep probe); it does NOT verify Kafka connectivity. Note it will
+          # silently false-negative if a future deployment adds an init
+          # container, tini, or command wrapper around the consumer.
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - "-f"
-                - "python -m app.consumer"
+                - python
+                - -c
+                - "import os,sys; os.kill(1,0); sys.exit(0 if b'app.consumer' in open('/proc/1/cmdline','rb').read() else 1)"
             initialDelaySeconds: 30
             periodSeconds: 30
       restartPolicy: Always
