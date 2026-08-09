@@ -170,8 +170,8 @@ class OpenCodeUsageRecord(Base):
         ForeignKey("source_databases.id"), nullable=False
     )
     source_record_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("sessions.id"), nullable=False
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("sessions.id"), nullable=True
     )
     model_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("observed_models.id"), nullable=False

@@ -263,6 +263,42 @@ class TestFrontendDockerfileBakesNginxConfig:
             "frontend/Dockerfile must set the envsubst entrypoint"
         )
 
+    def test_dockerfile_localhost_is_healthcheck_self_check_not_upstream(self):
+        """The only localhost reference must be the HEALTHCHECK self-check.
+
+        ``localhost`` in the frontend Dockerfile is the frontend's OWN nginx:
+        the HEALTHCHECK runs ``curl -f http://localhost/`` inside the
+        container, hitting the frontend nginx on port 80. It is NOT a gateway
+        upstream, so it does not violate the no-localhost-upstream policy of
+        issue #378 (the IPv6 [::1] Connection Refused regression). Any
+        localhost reference outside the HEALTHCHECK command — or a HEALTHCHECK
+        that targets the gateway upstream on port 8000 — must fail this test.
+        """
+        lines = self.content.splitlines()
+
+        healthcheck_lines = [
+            line for line in lines if line.lstrip().startswith("HEALTHCHECK")
+        ]
+        assert healthcheck_lines, "frontend/Dockerfile must define a HEALTHCHECK"
+
+        localhost_lines = [line for line in lines if "localhost" in line]
+        assert localhost_lines, (
+            "frontend/Dockerfile must reference localhost in its HEALTHCHECK"
+        )
+        for line in localhost_lines:
+            assert "curl -f http://localhost/" in line, (
+                "the only localhost reference must be the HEALTHCHECK "
+                f"self-check command, got: {line!r}"
+            )
+            assert "8000" not in line, (
+                "HEALTHCHECK must self-check the frontend's own nginx, not "
+                f"the gateway upstream on port 8000, got: {line!r}"
+            )
+            assert "proxy_pass" not in line and "GATEWAY_UPSTREAM" not in line, (
+                "HEALTHCHECK must not target a gateway upstream, "
+                f"got: {line!r}"
+            )
+
 
 class TestDockerComposeSameOriginStack:
     """The docker-compose.yaml must implement the same-origin local stack.
