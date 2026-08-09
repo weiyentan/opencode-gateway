@@ -243,6 +243,24 @@ display name, name, workspace directory basename, external project ID, then
 identity.
 _Avoid_: Project ID when referring to a display label
 
+**Canonical Client Name**:
+The client name under which multiple per-workspace client registrations
+are aggregated for reporting. Per-workspace clients — one registration per
+AWX workspace — share a canonical name so their usage rolls up under a
+single deployment identity; a client without a canonical name reports
+under its own name. The canonical name is assigned manually per client;
+the relationship between a workspace client's own name and its canonical
+name is a deliberate mapping, not a derived transformation.
+_Avoid_: Client alias, merged client
+
+**Client Project Rollup**:
+A pre-aggregated usage summary per (client, project, day) holding only
+additive token and cost totals, maintained at ingest time. Session counts
+and model counts are not part of the rollup and are computed from raw
+records. Raw usage records are authoritative; if the rollup disagrees with
+those records, the rollup is the value to correct.
+_Avoid_: Aggregated table, rollup view
+
 **Drilldown State**:
 The user's current expanded/collapsed view within an Aurora Glass summary,
 such as which Client rows are expanded in the Client / Project Usage
