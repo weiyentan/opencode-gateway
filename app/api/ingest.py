@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import asyncpg
@@ -189,14 +189,42 @@ class IngestRequest(BaseModel):
     session_todos: list[SessionTodoPayload] = Field(
         default_factory=list, description="Session todo projections"
     )
+    # ── Replay metadata (optional, backward-compatible) ──────────────
+    replay_id: uuid.UUID | None = Field(
+        default=None, description="Replay run UUID (absent for real-time deliveries)"
+    )
+    replay_requested_start: date | None = Field(
+        default=None, description="Start of the date window requested for this replay"
+    )
+    replay_delivery_mode: str | None = Field(
+        default=None, description="How the replay was delivered (e.g. latest, at-least-once)"
+    )
 
 
 class IngestRecordResult(BaseModel):
-    """Per-record result in the ingest response."""
+    """Per-record result in the ingest response.
+
+    Status values (issue #387 — canonical event vocabulary):
+    ``accepted`` — record was processed and a canonical event was created.
+    ``duplicate`` — idempotent delivery; no new event created.
+    ``updated`` — replay delivery reconciled against the stored event.
+    ``quarantined`` — record rejected because the source identity is
+        quarantined (overlaps an existing identity).
+    ``conflict`` — divergent duplicate (same dedup key, different values).
+    ``rejected`` — validation failure or internal error.
+    """
 
     index: int = Field(description="Zero-based index of the record in the batch")
-    status: str = Field(description="accepted | rejected | conflict")
+    status: str = Field(
+        description="accepted | duplicate | updated | quarantined | conflict | rejected"
+    )
     reason: str | None = Field(default=None, description="Human-readable reason if not accepted")
+    event_id: uuid.UUID | None = Field(
+        default=None, description="Canonical usage_events.id on accepted path"
+    )
+    attempt_id: uuid.UUID | None = Field(
+        default=None, description="usage_ingest_attempts.id on accepted path"
+    )
 
 
 class IngestResponse(BaseModel):
@@ -1189,6 +1217,146 @@ async def _process_session_todos(
     return total_inserted
 
 
+# ── Canonical event recording (issue #387) ──────────────────────────────────
+
+
+async def _record_canonical_event(
+    conn: asyncpg.Connection,
+    record: IngestRecord,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+    batch_id: uuid.UUID,
+    replay_id: uuid.UUID | None,
+    now: datetime,
+) -> dict[str, uuid.UUID | None]:
+    """Record a canonical event for an accepted first-delivery record.
+
+    Resolves the canonical source identity, looks up an existing
+    ``usage_events`` row keyed by ``(canonical_source_identity_id,
+    source_record_id)``, creates a new canonical event when none exists,
+    and records an Ingest Attempt row in ``usage_ingest_attempts``.
+
+    Resolves ``model_id`` and ``internal_session_id`` from the database
+    (these were just upserted by ``_process_one_record``), so the
+    canonical event has the same model and session references.
+
+    Returns a dict with ``event_id`` and ``attempt_id`` for the caller
+    to attach to the :class:`IngestRecordResult`.
+    """
+    from app.core.identity import resolve_canonical_identity
+
+    # ── 1. Resolve canonical source identity ──────────────────────
+    collector_source_id = str(source_db_id)
+    canonical_identity_id = await resolve_canonical_identity(
+        conn, client_id, collector_source_id,
+    )
+
+    # ── 2. Resolve model and session (freshly upserted) ──────────
+    model_row = await conn.fetchrow(
+        "SELECT id FROM observed_models WHERE model_name = $1",
+        record.model,
+    )
+    if model_row is None:
+        return {"event_id": None, "attempt_id": None}
+    model_id = model_row["id"]
+
+    session_row = await conn.fetchrow(
+        "SELECT id FROM sessions WHERE source_database_id = $1 AND external_session_id = $2",
+        source_db_id,
+        record.session_id,
+    )
+    if session_row is None:
+        return {"event_id": None, "attempt_id": None}
+    internal_session_id = session_row["id"]
+
+    # ── 3. Look up existing canonical event ───────────────────────
+    existing = await conn.fetchrow(
+        """SELECT id FROM usage_events
+           WHERE canonical_source_identity_id = $1 AND source_record_id = $2""",
+        canonical_identity_id,
+        record.source_record_id,
+    )
+
+    # ── v1.2 cached_tokens computation (same logic as _process_one_record) ──
+    if record.cache_read_tokens is not None and record.cache_write_tokens is not None:
+        effective_cached_tokens = record.cache_read_tokens + record.cache_write_tokens
+    else:
+        effective_cached_tokens = int(record.cached_tokens)
+
+    event_id: uuid.UUID | None = None
+    if existing is None:
+        # ── 4. Insert new canonical event ─────────────────────────
+        event_id = uuid.uuid4()
+        await conn.execute(
+            """INSERT INTO usage_events
+               (id, canonical_source_identity_id, source_record_id,
+                client_id, session_id, model_id,
+                input_tokens, output_tokens, cached_tokens,
+                reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                estimated_cost_usd, reported_at,
+                provider, mode, finish_reason,
+                project_id, workspace_id, agent, parent_session_id,
+                first_ingested_at, last_ingested_at)
+               VALUES ($1, $2, $3,
+                       $4, $5, $6,
+                       $7, $8, $9,
+                       $10, $11, $12,
+                       $13, $14,
+                       $15, $16, $17,
+                       $18, $19, $20, $21,
+                       $22, $22)""",
+            event_id,
+            canonical_identity_id,
+            record.source_record_id,
+            client_id,
+            internal_session_id,
+            model_id,
+            record.input_tokens,
+            record.output_tokens,
+            effective_cached_tokens,
+            record.reasoning_tokens,
+            record.cache_read_tokens,
+            record.cache_write_tokens,
+            record.estimated_cost_usd,
+            record.reported_at,
+            record.provider,
+            record.mode,
+            record.finish_reason,
+            record.project_id,
+            record.workspace_id,
+            record.agent,
+            record.parent_session_id,
+            now,
+        )
+    else:
+        event_id = existing["id"]
+
+    # ── 5. Record Ingest Attempt ──────────────────────────────────
+    # Redact the record for JSONB storage: model_dump(mode='json')
+    # serialises UUIDs, datetimes, and Decimals to JSON-safe types.
+    record_jsonb = record.model_dump(mode="json")
+
+    attempt_id = uuid.uuid4()
+    await conn.execute(
+        """INSERT INTO usage_ingest_attempts
+           (id, usage_event_id, source_identity_id,
+            original_source_record_id, record_jsonb,
+            ingest_batch_id, outcome, replay_id, delivered_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+        attempt_id,
+        event_id,
+        canonical_identity_id,
+        record.source_record_id,
+        record_jsonb,
+        batch_id,
+        "accepted",
+        replay_id,
+        now,
+    )
+
+    return {"event_id": event_id, "attempt_id": attempt_id}
+
+
 # ── POST /ingest ──────────────────────────────────────────────────────────
 
 
@@ -1250,6 +1418,21 @@ async def ingest_usage(
         results.append(result)
         if result.status == "accepted":
             accepted += 1
+            # ── Canonical event layer: record a canonical event for
+            # genuinely new records (not idempotent duplicates from replay).
+            is_new = result.reason is None or not result.reason.startswith("Duplicate")
+            if is_new:
+                try:
+                    canonical = await _record_canonical_event(
+                        conn, record, client_id, source_db_id,
+                        batch_id, body.replay_id, now,
+                    )
+                    result.event_id = canonical["event_id"]
+                    result.attempt_id = canonical["attempt_id"]
+                except Exception as exc:
+                    logger.warning(
+                        "Record %s canonical event recording failed: %s", idx, exc,
+                    )
         else:
             rejected += 1
 

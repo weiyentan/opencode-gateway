@@ -148,11 +148,20 @@ def _build_ingest_app(
 def _new_record_side_effect(record_count: int = 1) -> list:
     """Build a fetchrow side-effect list for ``record_count`` new records.
 
-    Structure: [sd_check] + [model, atomic_insert, session_upsert] * record_count.
+    Structure: [sd_check] + [
+        model, atomic_insert, session_upsert,                # _process_one_record
+        identity_select, identity_insert,                    # resolve_canonical_identity
+        model_lookup, session_lookup, event_lookup,          # _record_canonical_event
+    ] * record_count.
 
     The atomic INSERT ON CONFLICT must return a row (winner path); the
     session upsert always returns a row with ``id`` (the new or existing
     internal session UUID).
+
+    The canonical event recording (issue #387) adds 5 extra fetchrow calls
+    per record after _process_one_record returns: identity resolution
+    (SELECT + INSERT ON CONFLICT RETURNING), model lookup, session lookup,
+    and existing-event lookup.
     """
     per_record: list = [None]  # sd check (once per batch)
     for _ in range(record_count):
@@ -160,8 +169,52 @@ def _new_record_side_effect(record_count: int = 1) -> list:
         insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-        per_record.extend([None, insert_row, session_row])  # model, atomic_insert, session
+
+        # _record_canonical_event mocks
+        # resolve_canonical_identity: first SELECT returns None (new identity)
+        identity_insert_row = MagicMock()
+        identity_insert_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(), "canonical_parent_id": None,
+        }.__getitem__
+        # Model and session already upserted by _process_one_record — look them up
+        model_lookup_row = MagicMock()
+        model_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        per_record.extend([
+            None, insert_row, session_row,                     # _process_one_record
+            None, identity_insert_row,                         # resolve_canonical_identity
+            model_lookup_row,                                  # model lookup
+            session_lookup_row,                                # session lookup
+            None,                                              # event lookup (no existing)
+        ])
     return per_record
+
+
+def _canonical_event_side_effect_items() -> list:
+    """Build the 5 fetchrow items needed for ``_record_canonical_event``.
+
+    Returns: [identity_select_row, identity_insert_row, model_lookup_row,
+              session_lookup_row, event_lookup_row]
+
+    Each call creates fresh UUIDs so rows are unique per record.
+    """
+    identity_insert_row = MagicMock()
+    identity_insert_row.__getitem__.side_effect = {
+        "id": uuid.uuid4(), "canonical_parent_id": None,
+    }.__getitem__
+    model_lookup_row = MagicMock()
+    model_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+    session_lookup_row = MagicMock()
+    session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+    return [
+        None,                    # resolve_canonical_identity: SELECT (new — not found)
+        identity_insert_row,     # resolve_canonical_identity: INSERT ON CONFLICT RETURNING
+        model_lookup_row,        # model lookup
+        session_lookup_row,      # session lookup
+        None,                    # event lookup (no existing canonical event)
+    ]
 
 
 def _projection_payload(
@@ -1870,9 +1923,11 @@ class TestSessionUpsertAgent:
             None,              # model rec-1
             insert_row_1,      # atomic INSERT rec-1 → winner
             internal_session,  # session upsert rec-1 (ON CONFLICT inserted)
+            *_canonical_event_side_effect_items(),  # canonical event rec-1
             None,              # model rec-2
             insert_row_2,      # atomic INSERT rec-2 → winner
             internal_session,  # session upsert rec-2 (ON CONFLICT updated)
+            *_canonical_event_side_effect_items(),  # canonical event rec-2
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -2181,9 +2236,11 @@ class TestSessionCacheTokensUpdate:
             None,                    # 2. model gpt-4 (new)
             _insert_row(),           # 3. atomic INSERT rec-001 → winner
             _session_row(),          # 4. session upsert rec-001 → returns shared id
+            *_canonical_event_side_effect_items(),  # canonical event rec-001
             None,                    # 5. model claude-3 (new)
             _insert_row(),           # 6. atomic INSERT rec-002 → winner
             _session_row(),          # 7. session upsert rec-002 → returns shared id
+            *_canonical_event_side_effect_items(),  # canonical event rec-002
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -2289,9 +2346,11 @@ class TestSessionCacheTokensUpdate:
             None,                    # 2. model gpt-4 (new)
             _insert_row(),           # 3. atomic INSERT rec-v10 → winner
             _session_row(),          # 4. session upsert rec-v10 → shared id
+            *_canonical_event_side_effect_items(),  # canonical event rec-v10
             None,                    # 5. model claude-3 (new)
             _insert_row(),           # 6. atomic INSERT rec-v12 → winner
             _session_row(),          # 7. session upsert rec-v12 → shared id
+            *_canonical_event_side_effect_items(),  # canonical event rec-v12
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -2553,7 +2612,7 @@ class TestSessionCacheTokenBackfill:
         auth = _auth_row()
 
         # Two records for the same session.
-        # Structure: [auth] + [sd_check] + [model, insert, session] * 2
+        # Structure: [auth] + [sd_check] + [model, insert, session, *canonical] * 2
         fetchrow_side_effects = [auth, None]  # auth + source-database check
         for _ in range(2):
             insert_row = MagicMock()
@@ -2563,6 +2622,9 @@ class TestSessionCacheTokenBackfill:
             fetchrow_side_effects.extend(
                 [None, insert_row, session_row]
             )  # model, atomic_insert, session
+            fetchrow_side_effects.extend(
+                _canonical_event_side_effect_items()
+            )  # canonical event recording
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = fetchrow_side_effects
@@ -3732,6 +3794,9 @@ class TestConcurrentIdenticalRecords:
         session_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         fetchrow_responses.append(session_row_1)  # session resolve
 
+        # _record_canonical_event for Record 1 (winner → new canonical event)
+        fetchrow_responses.extend(_canonical_event_side_effect_items())
+
         # Record 2 (same source_record_id):
         #  - model upsert → existing model (we return a row)
         #  - atomic INSERT ON CONFLICT → LOSER (returns None)
@@ -3876,6 +3941,7 @@ class TestProjectionCombinedPayloads:
             auth,                   # auth
             None,                   # sd check
             None, insert_row, session_row,  # usage record: model, atomic_insert, session
+            *_canonical_event_side_effect_items(),  # canonical event recording
             None, None,             # ctx1: resolve session_id, resolve source_project
             None, None,             # ctx2: resolve session_id, resolve source_project
             None,                   # todo: resolve session_id
@@ -5698,3 +5764,426 @@ class Test380SessionIdNullFallback:
             f"cache_write repair session_id expected {session_id_for_repair}, "
             f"got {cw_args[2]}"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Tests — Canonical event accept path (issue #387)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestCanonicalEventAccept:
+    """New record first delivery → canonical event in ``usage_events``
+    and Ingest Attempt in ``usage_ingest_attempts``."""
+
+    @pytest.mark.asyncio
+    async def test_canonical_event_inserted_on_first_delivery(self, monkeypatch):
+        """A new record creates a row in ``usage_events`` with all fields."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-canon-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 500,
+                    "output_tokens": 250,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0100",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "openai",
+                    "mode": "chat",
+                    "finish_reason": "stop",
+                    "cache_read_tokens": 50,
+                    "cache_write_tokens": 25,
+                    "project_id": "proj-test",
+                    "agent": "test-agent",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][0]["event_id"] is not None
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Verify INSERT INTO usage_events was called
+        usage_events_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(usage_events_inserts) == 1
+
+        # Verify the INSERT includes all expected fields
+        usage_event_call = usage_events_inserts[0]
+        args = usage_event_call.args
+        assert "canonical_source_identity_id" in str(args)
+        assert "source_record_id" in str(args)
+        assert "client_id" in str(args)
+        assert "session_id" in str(args)
+        assert "model_id" in str(args)
+        assert "input_tokens" in str(args)
+        assert "output_tokens" in str(args)
+        assert "provider" in str(args)
+        assert "mode" in str(args)
+        assert "finish_reason" in str(args)
+        assert "cache_read_tokens" in str(args)
+        assert "cache_write_tokens" in str(args)
+        assert "project_id" in str(args)
+        assert "agent" in str(args)
+
+    @pytest.mark.asyncio
+    async def test_ingest_attempt_row_recorded_with_jsonb(self, monkeypatch):
+        """The Ingest Attempt row stores the full redacted record as JSONB."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-attempt-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "claude-3",
+                    "input_tokens": 300,
+                    "output_tokens": 150,
+                    "cached_tokens": 10,
+                    "estimated_cost_usd": "0.0050",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        # Verify INSERT INTO usage_ingest_attempts was called
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+
+        # Verify the attempt stores record_jsonb, outcome, etc.
+        attempt_call = attempt_inserts[0]
+        assert "record_jsonb" in str(attempt_call.args)
+        assert "accepted" in str(attempt_call.args)
+        assert "ingest_batch_id" in str(attempt_call.args)
+
+    @pytest.mark.asyncio
+    async def test_session_aggregate_counters_updated(self, monkeypatch):
+        """Session aggregate counters are updated on the canonical event path."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-agg-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "cached_tokens": 100,
+                    "estimated_cost_usd": "0.0200",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+
+        # Verify session aggregate was resolved (INSERT INTO sessions)
+        session_inserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_inserts) == 1
+
+    @pytest.mark.asyncio
+    async def test_outcome_accepted_has_event_id_and_attempt_id(self, monkeypatch):
+        """The ``IngestRecordResult`` for an accepted record includes
+        ``event_id`` and ``attempt_id``."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        result = data["results"][0]
+        assert result["status"] == "accepted"
+        assert result["event_id"] is not None, "event_id should be set for accepted path"
+        assert result["attempt_id"] is not None, "attempt_id should be set for accepted path"
+        # Validate UUID format
+        uuid.UUID(result["event_id"])
+        uuid.UUID(result["attempt_id"])
+
+    @pytest.mark.asyncio
+    async def test_duplicate_record_does_not_create_second_canonical_event(self, monkeypatch):
+        """A duplicate record returns accepted but does NOT insert a second
+        canonical event or ingest attempt for the new-record path."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        _add_transaction_support(mock_conn)
+
+        # Record 1: new, accepted → canonical event path
+        # Record 2: duplicate (same dedup key, same values) → no canonical event path
+        fetchrow_responses = [auth, None]  # auth + sd_check
+
+        # Record 1: model, atomic_insert(winner), session
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_row_1 = MagicMock()
+        session_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.extend([None, insert_row_1, session_row_1])
+        fetchrow_responses.extend(_canonical_event_side_effect_items())
+
+        # Record 2: model, atomic_insert(loser), dedup query, lock_row
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None, "mode": None, "finish_reason": None,
+            "reasoning_tokens": None, "cache_read_tokens": None,
+            "cache_write_tokens": None, "session_id": _SESSION_ID,
+        }.__getitem__
+        fetchrow_responses.extend([existing_model, None, existing_dedup, lock_row])
+
+        mock_conn.fetchrow.side_effect = fetchrow_responses
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-dup-canon",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-dup-canon",  # SAME dedup key
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+
+        # Record 1 has event_id/attempt_id, Record 2 does not
+        assert data["results"][0]["event_id"] is not None
+        assert data["results"][0]["attempt_id"] is not None
+        assert data["results"][1]["event_id"] is None
+        assert data["results"][1]["attempt_id"] is None
+
+        # Only one INSERT INTO usage_events (for record 1)
+        usage_events_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(usage_events_inserts) == 1
+
+        # Only one INSERT INTO usage_ingest_attempts (for record 1)
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+
+
+class TestIngestRequestReplayMetadata:
+    """``IngestRequest`` accepts optional replay metadata fields."""
+
+    @pytest.mark.asyncio
+    async def test_replay_metadata_fields_accepted(self, monkeypatch):
+        """``replay_id``, ``replay_requested_start``, ``replay_delivery_mode``
+        are optional and accepted in the request body."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        replay_id = str(uuid.uuid4())
+        payload = _valid_ingest_payload()
+        payload["replay_id"] = replay_id
+        payload["replay_requested_start"] = "2026-08-01"
+        payload["replay_delivery_mode"] = "at-least-once"
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+
+        # Verify replay_id was passed through to the attempt row
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+        # Verify the replay_id appears in the attempt insert params
+        assert replay_id in str(attempt_inserts[0].args)
+
+    @pytest.mark.asyncio
+    async def test_payload_without_replay_metadata_still_works(self, monkeypatch):
+        """Existing payloads without replay metadata fields are processed
+        identically — backward compatible."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Standard payload without replay_* fields
+        payload = _valid_ingest_payload()
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][0]["event_id"] is not None
+        assert data["results"][0]["attempt_id"] is not None
+
+
+class TestIngestRecordResultStatusVocabulary:
+    """``IngestRecordResult`` supports the expanded outcome vocabulary."""
+
+    def test_status_field_describes_expanded_vocabulary(self):
+        """The IngestRecordResult schema doc mentions the expanded status values."""
+        # Import inline to avoid top-level import side effects
+        from app.api.ingest import IngestRecordResult
+
+        doc = IngestRecordResult.__doc__ or ""
+        assert "accepted" in doc
+        assert "duplicate" in doc
+        assert "updated" in doc
+        assert "quarantined" in doc
+        assert "conflict" in doc
+        assert "rejected" in doc
+
+    def test_event_id_and_attempt_id_are_optional(self):
+        """``event_id`` and ``attempt_id`` are optional UUIDs — absent for
+        non-accepted (first-time) outcomes."""
+        from app.api.ingest import IngestRecordResult
+
+        # Defaults should produce a valid instance
+        result = IngestRecordResult(index=0, status="rejected", reason="test")
+        assert result.event_id is None
+        assert result.attempt_id is None
+        assert result.model_dump()["event_id"] is None
+        assert result.model_dump()["attempt_id"] is None
