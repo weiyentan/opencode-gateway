@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 EVENT_REQUEST_COMPLETED = "request.completed"
 EVENT_OPERATION_COMPLETED = "operation.completed"
 EVENT_OPERATION_TIMEOUT = "operation.timeout"
+EVENT_LOCK_ACQUIRED = "lock.acquired"
 
 # Default operation timeout budget in milliseconds when
 # GATEWAY_OPERATION_TIMEOUT_MS is unset or invalid.

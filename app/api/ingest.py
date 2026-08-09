@@ -1369,6 +1369,13 @@ async def _record_canonical_event(
     already passed those checks and only handles: model/session lookup,
     canonical event creation, and ingest attempt recording.
 
+    Concurrent first-delivery attempts for the same canonical identity
+    and source record are serialised with a per-transaction advisory
+    lock (``pg_advisory_xact_lock``) on ``hashtext(canonical_source_identity_id
+    || source_record_id)``.  The second delivery blocks until the first
+    commits, then re-reads and finds the event already present
+    (re-read-after-commit pattern — issue #395).
+
     Resolves ``model_id`` and ``internal_session_id`` from the database
     (these were just upserted by ``_process_one_record``), so the
     canonical event has the same model and session references.
@@ -1401,7 +1408,8 @@ async def _record_canonical_event(
     to attach to the :class:`IngestRecordResult`.
     """
     from app.core.identity import resolve_canonical_identity
-    from app.core.reconciliation import IngestOutcome, apply_replay_merge
+    from app.core.reconciliation import IngestOutcome, acquire_canonical_event_lock, apply_replay_merge
+    from app.core.telemetry import EVENT_LOCK_ACQUIRED, timed_operation
 
     # ── 1. Resolve model and session (already upserted by _process_one_record) ──
     model_row = await conn.fetchrow(
@@ -1421,94 +1429,107 @@ async def _record_canonical_event(
         return {"event_id": None, "attempt_id": None}
     internal_session_id = session_row["id"]
 
-    # ── 2. Look up existing canonical event ───────────────────────
-    existing = await conn.fetchrow(
-        """SELECT id, canonical_source_identity_id
-           FROM usage_events
-           WHERE canonical_source_identity_id = $1 AND source_record_id = $2""",
-        canonical_identity_id,
-        record.source_record_id,
-    )
-
     # ── v1.2 cached_tokens computation (same logic as _process_one_record) ──
     if record.cache_read_tokens is not None and record.cache_write_tokens is not None:
         effective_cached_tokens = record.cache_read_tokens + record.cache_write_tokens
     else:
         effective_cached_tokens = int(record.cached_tokens)
 
-    event_id: uuid.UUID
-    outcome_str: str
+    # ── 3. Serialise concurrent first-delivery attempts ──────────
+    # Wrap the SELECT+INSERT+attempt in an EXPLICIT transaction so the
+    # xact-scoped advisory lock spans the entire critical section.
+    # Before the lock the event may not exist (first delivery) or it
+    # may have been created by a concurrent request that committed
+    # while we were blocked (re-read-after-commit pattern).
+    event_id: uuid.UUID | None = None
+    attempt_id: uuid.UUID | None = None
+    outcome_str: str = "accepted"
     reason: str | None = None
+    record_jsonb = record.model_dump(mode="json")
 
-    if existing is None:
-        # ── 4a. NEW — insert canonical event ──────────────────────
-        event_id = uuid.uuid4()
-        await conn.execute(
-            """INSERT INTO usage_events
-               (id, canonical_source_identity_id, source_record_id,
-                client_id, session_id, model_id,
-                input_tokens, output_tokens, cached_tokens,
-                reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                estimated_cost_usd, reported_at,
-                provider, mode, finish_reason,
-                project_id, workspace_id, agent, parent_session_id,
-                first_ingested_at, last_ingested_at)
-               VALUES ($1, $2, $3,
-                       $4, $5, $6,
-                       $7, $8, $9,
-                       $10, $11, $12,
-                       $13, $14,
-                       $15, $16, $17,
-                       $18, $19, $20, $21,
-                       $22, $22)""",
-            event_id,
+    async with conn.transaction():
+        # Lock wait time tracked via telemetry — duration_ms in the
+        # "lock.acquired" event is the time spent blocked waiting for
+        # the concurrent transaction to commit.
+        async with timed_operation(EVENT_LOCK_ACQUIRED, "lock"):
+            await acquire_canonical_event_lock(
+                conn, canonical_identity_id, record.source_record_id,
+            )
+
+        # ── Re-read after lock: another tx may have inserted ─────
+        existing = await conn.fetchrow(
+            """SELECT id FROM usage_events
+               WHERE canonical_source_identity_id = $1 AND source_record_id = $2
+               FOR UPDATE""",
             canonical_identity_id,
             record.source_record_id,
-            client_id,
-            internal_session_id,
-            model_id,
-            record.input_tokens,
-            record.output_tokens,
-            effective_cached_tokens,
-            record.reasoning_tokens,
-            record.cache_read_tokens,
-            record.cache_write_tokens,
-            record.estimated_cost_usd,
-            record.reported_at,
-            record.provider,
-            record.mode,
-            record.finish_reason,
-            record.project_id,
-            record.workspace_id,
-            record.agent,
-            record.parent_session_id,
-            now,
-        )
-        outcome_str = "accepted"
-    else:
-        # ── 4b. EXISTING canonical event — compare for duplicate vs update ─
-        event_id = existing["id"]
-
-        # Read full canonical event for comparison
-        stored = await conn.fetchrow(
-            """SELECT input_tokens, output_tokens, cached_tokens,
-                      reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                      estimated_cost_usd, provider, mode, finish_reason
-               FROM usage_events WHERE id = $1""",
-            event_id,
         )
 
-        if _canonical_fields_identical(stored, record, effective_cached_tokens):
-            # All compared fields identical → duplicate
-            outcome_str = "duplicate"
+        if existing is None:
+            # ── 4a. NEW — insert canonical event ──────────────────
+            event_id = uuid.uuid4()
+            await conn.execute(
+                """INSERT INTO usage_events
+                   (id, canonical_source_identity_id, source_record_id,
+                    client_id, session_id, model_id,
+                    input_tokens, output_tokens, cached_tokens,
+                    reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                    estimated_cost_usd, reported_at,
+                    provider, mode, finish_reason,
+                    project_id, workspace_id, agent, parent_session_id,
+                    first_ingested_at, last_ingested_at)
+                   VALUES ($1, $2, $3,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, $11, $12,
+                           $13, $14,
+                           $15, $16, $17,
+                           $18, $19, $20, $21,
+                           $22, $22)""",
+                event_id,
+                canonical_identity_id,
+                record.source_record_id,
+                client_id,
+                internal_session_id,
+                model_id,
+                record.input_tokens,
+                record.output_tokens,
+                effective_cached_tokens,
+                record.reasoning_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.estimated_cost_usd,
+                record.reported_at,
+                record.provider,
+                record.mode,
+                record.finish_reason,
+                record.project_id,
+                record.workspace_id,
+                record.agent,
+                record.parent_session_id,
+                now,
+            )
+            outcome_str = "accepted"
         else:
-            # Any differing non-null collector field → apply replay merge
-            # The entire merge sequence runs inside an explicit transaction
-            # so the advisory lock on the event row spans the read-compute-
-            # write across apply_replay_merge and the enrichment fill.
-            async with conn.transaction():
-                # Build new_values mapping for apply_replay_merge
-                # (delta-computable fields from the collector)
+            # ── 4b. EXISTING canonical event — compare for duplicate vs update ─
+            event_id = existing["id"]
+
+            # Read full canonical event for comparison (FOR UPDATE holds the lock)
+            stored = await conn.fetchrow(
+                """SELECT input_tokens, output_tokens, cached_tokens,
+                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                          estimated_cost_usd, provider, mode, finish_reason
+                   FROM usage_events WHERE id = $1""",
+                event_id,
+            )
+
+            if _canonical_fields_identical(stored, record, effective_cached_tokens):
+                # All compared fields identical → duplicate
+                outcome_str = "duplicate"
+            else:
+                # Any differing non-null collector field → apply replay merge
+                # The advisory lock on the event row spans the read-compute-
+                # write across apply_replay_merge and the enrichment fill.
                 new_values: dict[str, object] = {
                     "input_tokens": record.input_tokens,
                     "output_tokens": record.output_tokens,
@@ -1541,27 +1562,25 @@ async def _record_canonical_event(
                     # applied the same correction).  Treat as duplicate.
                     outcome_str = "duplicate"
 
-    # ── 5. Record Ingest Attempt ──────────────────────────────────
-    # Redact the record for JSONB storage: model_dump(mode='json')
-    # serialises UUIDs, datetimes, and Decimals to JSON-safe types.
-    record_jsonb = record.model_dump(mode="json")
-    attempt_id = uuid.uuid4()
-    await conn.execute(
-        """INSERT INTO usage_ingest_attempts
-           (id, usage_event_id, source_identity_id,
-            original_source_record_id, record_jsonb,
-            ingest_batch_id, outcome, replay_id, delivered_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
-        attempt_id,
-        event_id,
-        canonical_identity_id,
-        record.source_record_id,
-        record_jsonb,
-        batch_id,
-        outcome_str,
-        replay_id,
-        now,
-    )
+        # ── 5. Record Ingest Attempt (inside transaction) ─────────
+        attempt_id = uuid.uuid4()
+        await conn.execute(
+            """INSERT INTO usage_ingest_attempts
+               (id, usage_event_id, source_identity_id,
+                original_source_record_id, record_jsonb,
+                ingest_batch_id, outcome, replay_id, delivered_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            attempt_id,
+            event_id,
+            canonical_identity_id,
+            record.source_record_id,
+            record_jsonb,
+            batch_id,
+            outcome_str,
+            replay_id,
+            now,
+        )
+
 
     result: dict[str, uuid.UUID | None] = {
         "event_id": event_id,
