@@ -85,3 +85,23 @@ class ClientWithTokens(ClientRead):
     """Client details including its associated credential tokens (metadata only)."""
 
     tokens: list[TokenRead]
+
+
+# ── Quarantine schemas ─────────────────────────────────────────────────────
+
+
+class QuarantineRead(BaseModel):
+    """Read model for a quarantined source identity.
+
+    Represents one active row from ``source_identity_quarantine`` joined
+    to ``source_identities`` (twice) so both the quarantined identity and
+    the identity it overlaps expose their collector source IDs.
+    """
+
+    quarantine_id: uuid.UUID
+    source_identity_id: uuid.UUID
+    collector_source_id: str
+    overlapping_identity_id: uuid.UUID
+    overlapping_collector_source_id: str
+    overlap_count: int
+    quarantined_at: datetime
