@@ -1402,6 +1402,26 @@ async def ingest_usage(
     # ── Upsert source database (create if first time) ────────────────
     await _upsert_source_database(conn, source_db_id, client_id, credential_id, now)
 
+    # ── Create ingest batch row BEFORE the records loop ──────────────
+    # Must exist before any _record_canonical_event() inserts a
+    # usage_ingest_attempts row referencing ingest_batches.id (FK is
+    # immediate and non-deferrable; the batch row must be written first).
+    await conn.execute(
+        """INSERT INTO ingest_batches
+           (id, collector_credential_id, client_id, collector_version,
+            schema_version, record_count, accepted_count, rejected_count, ingested_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+        batch_id,
+        credential_id,
+        client_id,
+        body.collector_version,
+        body.schema_version,
+        len(body.records),
+        0,  # accepted_count — updated after the records loop
+        0,  # rejected_count — updated after the records loop
+        now,
+    )
+
     # ── Process records ──────────────────────────────────────────────
     results: list[IngestRecordResult] = []
     accepted = 0
@@ -1430,27 +1450,20 @@ async def ingest_usage(
                     result.event_id = canonical["event_id"]
                     result.attempt_id = canonical["attempt_id"]
                 except Exception as exc:
-                    logger.warning(
+                    logger.error(
                         "Record %s canonical event recording failed: %s", idx, exc,
                     )
         else:
             rejected += 1
 
-    # ── Record ingest batch ──────────────────────────────────────────
+    # ── Update ingest batch with final counts ────────────────────────
     await conn.execute(
-        """INSERT INTO ingest_batches
-           (id, collector_credential_id, client_id, collector_version,
-            schema_version, record_count, accepted_count, rejected_count, ingested_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
-        batch_id,
-        credential_id,
-        client_id,
-        body.collector_version,
-        body.schema_version,
-        len(body.records),
+        """UPDATE ingest_batches
+           SET accepted_count = $1, rejected_count = $2
+           WHERE id = $3""",
         accepted,
         rejected,
-        now,
+        batch_id,
     )
 
     # ── Record per-record audit ──────────────────────────────────────

@@ -6187,3 +6187,95 @@ class TestIngestRecordResultStatusVocabulary:
         assert result.attempt_id is None
         assert result.model_dump()["event_id"] is None
         assert result.model_dump()["attempt_id"] is None
+
+
+class TestIngestBatchFKOrdering:
+    """Regression test: the ``ingest_batches`` row must be created BEFORE
+    any ``usage_ingest_attempts`` row that references it via FK.
+
+    Migration 0021 created ``usage_ingest_attempts.ingest_batch_id`` as an
+    immediate, non-deferrable foreign key referencing ``ingest_batches.id``.
+    Inserting an attempt before the batch row raises an FK violation on a
+    real Postgres database.  This test verifies that the execute call order
+    in the mock is correct: the batch INSERT precedes every attempt INSERT.
+    """
+
+    @pytest.mark.asyncio
+    async def test_batch_inserted_before_attempts(self, monkeypatch):
+        """Verify that ``INSERT INTO ingest_batches`` appears before
+        ``INSERT INTO usage_ingest_attempts`` in the execute call sequence."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=2),
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-fk-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-fk-002",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 10,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+
+        # Collect execute calls and their positions
+        all_execute_calls = mock_conn.execute.call_args_list
+        batch_insert_pos: int | None = None
+        attempt_positions: list[int] = []
+
+        for i, call in enumerate(all_execute_calls):
+            sql = str(call)
+            if "INSERT INTO ingest_batches" in sql:
+                if batch_insert_pos is None:
+                    batch_insert_pos = i
+            if "INSERT INTO usage_ingest_attempts" in sql:
+                attempt_positions.append(i)
+
+        assert batch_insert_pos is not None, (
+            "Expected INSERT INTO ingest_batches in execute calls"
+        )
+        assert len(attempt_positions) == 2, (
+            f"Expected 2 INSERT INTO usage_ingest_attempts, "
+            f"got {len(attempt_positions)}"
+        )
+
+        # Every attempt INSERT must come AFTER the batch INSERT
+        for pos in attempt_positions:
+            assert pos > batch_insert_pos, (
+                f"usage_ingest_attempts INSERT at position {pos} must come after "
+                f"ingest_batches INSERT at position {batch_insert_pos} — "
+                f"otherwise the FK constraint would fail on a real database"
+            )
