@@ -129,16 +129,19 @@ def _build_ingest_app(
 def _new_record_side_effect(record_count: int = 1) -> list:
     """Build a fetchrow side-effect list for ``record_count`` new records.
 
-    Structure: [sd_check] + [dedup, model, session_upsert] * record_count.
+    Structure: [sd_check] + [model, atomic_insert, session_upsert] * record_count.
 
-    The session upsert always returns a row with ``id`` (the new or existing
+    The atomic INSERT ON CONFLICT must return a row (winner path); the
+    session upsert always returns a row with ``id`` (the new or existing
     internal session UUID).
     """
     per_record: list = [None]  # sd check (once per batch)
     for _ in range(record_count):
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-        per_record.extend([None, None, session_row])  # dedup, model, session
+        per_record.extend([None, insert_row, session_row])  # model, atomic_insert, session
     return per_record
 
 
@@ -341,20 +344,25 @@ class TestDuplicateBatchIdempotent:
         mock_conn = AsyncMock()
         auth = _auth_row()
         # Existing record with matching values
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 100,
             "output_tokens": 50,
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        # Existing model (idempotent — harmless)
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth,          # 1. auth
-            None,          # 2. source_database check (new)
-            existing_row,  # 3. dedup check → match found (return early)
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -386,20 +394,24 @@ class TestDuplicateBatchIdempotent:
         """v1.2 duplicates compare against stored cache_read + cache_write tokens."""
         mock_conn = AsyncMock()
         auth = _auth_row()
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 100,
             "output_tokens": 50,
             "cached_tokens": 15,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,
             None,
-            existing_row,
+            existing_model,  # model upsert
+            None,            # atomic INSERT → conflict
+            existing_dedup,  # dedup query → identical
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -453,20 +465,24 @@ class TestDivergentDuplicate:
         mock_conn = AsyncMock()
         auth = _auth_row()
         # Existing record with DIFFERENT values
-        existing_row = MagicMock()
-        existing_row.__getitem__.side_effect = {
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "input_tokens": 200,   # different!
             "output_tokens": 50,
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth,          # 1. auth
-            None,          # 2. source_database check (new)
-            existing_row,  # 3. dedup check → divergent match
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → divergent match
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -703,12 +719,14 @@ class TestSourceDatabaseUpsert:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow.side_effect = [
             auth,          # 1. auth
             existing_sd,   # 2. source_database check → exists (UPDATE)
-            None,          # 3. dedup check → not found
-            None,          # 4. model check → not found
+            None,          # 3. model check → not found
+            insert_row,    # 4. atomic INSERT → winner
             session_row,   # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -773,15 +791,17 @@ class TestModelUpsert:
 
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
-        # Order: auth | sd_check | dedup | model_check | session upsert
+        # Order: auth | sd_check | model | atomic_insert | session
         mock_conn.fetchrow.side_effect = [
-            auth,            # 1. auth
-            None,            # 2. source_database check → not found
-            None,            # 3. dedup check → not found (proceed)
-            existing_model,  # 4. model check → found (UPDATE)
-            session_row,     # 5. session upsert → returns new id
+            auth,               # 1. auth
+            None,               # 2. source_database check → not found
+            existing_model,     # 3. model check → found (UPDATE)
+            insert_row,         # 4. atomic INSERT → winner
+            session_row,        # 5. session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -896,12 +916,14 @@ class TestSessionIdAcceptsSesString:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
-            None,          # dedup check (new)
             None,          # model check (new)
-            session_row,    # session upsert → returns new id
+            insert_row,    # atomic INSERT → winner
+            session_row,   # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -944,8 +966,10 @@ class TestSessionIdAcceptsSesString:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, session_row,
+            auth, None, None, insert_row, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -988,11 +1012,13 @@ class TestResolveSessionCreatesNewRow:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,          # auth
             None,          # source_database check (new)
-            None,          # dedup check (new)
             None,          # model check (new)
+            insert_row,    # atomic INSERT → winner
             session_row,    # session upsert → returns new id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -1015,17 +1041,24 @@ class TestResolveSessionCreatesNewRow:
         ]
         assert len(session_upserts) == 1
 
-        # Verify the usage record INSERT received a resolved session UUID,
-        # not the raw external session ID string
+        # Verify the atomic usage-record INSERT was attempted via fetchrow
+        # and succeeded (winner path), then session_id was backfilled via
+        # an UPDATE execute call.
         record_inserts = [
-            call for call in mock_conn.execute.call_args_list
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO opencode_usage_records" in str(call)
         ]
         assert len(record_inserts) == 1
-        # The session_id argument in the usage record INSERT should be a UUID,
-        # not a string (the 6th positional arg after VALUES)
-        usage_insert_call = record_inserts[0]
-        session_id_arg = usage_insert_call.args[5]  # 6th positional arg (after SQL) = session_id
+        # The session_id argument in the atomic INSERT is NULL,
+        # then backfilled via UPDATE after session resolution.
+        session_id_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records SET session_id" in str(call)
+        ]
+        assert len(session_id_updates) == 1
+        # The UPDATE's session_id argument must be a UUID, not a string
+        update_call = session_id_updates[0]
+        session_id_arg = update_call.args[1]  # 2nd positional arg = session_id
         assert isinstance(session_id_arg, uuid.UUID)
 
 
@@ -1041,13 +1074,15 @@ class TestResolveSessionReturnsExisting:
         existing_session_id = uuid.uuid4()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": existing_session_id}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,           # auth
             None,           # source_database check (new)
-            None,           # dedup check (new)
             None,           # model check (new)
+            insert_row,     # atomic INSERT → winner
             session_row,    # session upsert → returns existing id (ON CONFLICT path)
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
@@ -1072,14 +1107,15 @@ class TestResolveSessionReturnsExisting:
         assert len(session_upserts) == 1
         assert "ON CONFLICT" in str(session_upserts[0])
 
-        # Verify the usage record was inserted with the existing session UUID
-        record_inserts = [
+        # Verify the session_id was backfilled via UPDATE after session
+        # resolution (atomic INSERT uses NULL initially).
+        session_id_updates = [
             call for call in mock_conn.execute.call_args_list
-            if "INSERT INTO opencode_usage_records" in str(call)
+            if "UPDATE opencode_usage_records SET session_id" in str(call)
         ]
-        assert len(record_inserts) == 1
-        usage_insert_call = record_inserts[0]
-        session_id_arg = usage_insert_call.args[5]
+        assert len(session_id_updates) == 1
+        update_call = session_id_updates[0]
+        session_id_arg = update_call.args[1]
         assert session_id_arg == existing_session_id
 
 
@@ -1163,7 +1199,7 @@ class TestIdempotencyWithSessionResolution:
         without triggering session resolution again."""
         mock_conn = AsyncMock()
         auth = _auth_row()
-        # Existing record with matching values — dedup will short-circuit
+        # Existing record with matching values — atomic INSERT will conflict
         existing_dedup = MagicMock()
         existing_dedup.__getitem__.side_effect = {
             "id": uuid.uuid4(),
@@ -1172,12 +1208,16 @@ class TestIdempotencyWithSessionResolution:
             "cached_tokens": 0,
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth,            # 1. auth
-            None,            # 2. source_database check (new)
-            existing_dedup,  # 3. dedup → match (returns early, no session resolve)
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert → existing
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → identical match
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -1214,8 +1254,10 @@ class TestSchemaVersion11Accepted:
         mock_conn.fetchrow = AsyncMock()
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
-            auth, None, None, None, session_row,
+            auth, None, None, insert_row, session_row,
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 
@@ -1762,15 +1804,19 @@ class TestSessionUpsertAgent:
         session_id = _SESSION_ID
         internal_session = MagicMock()
         internal_session.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_2 = MagicMock()
+        insert_row_2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
 
         mock_conn.fetchrow.side_effect = [
             auth,              # auth
             None,              # sd check (batch level)
-            None,              # dedup rec-1
             None,              # model rec-1
+            insert_row_1,      # atomic INSERT rec-1 → winner
             internal_session,  # session upsert rec-1 (ON CONFLICT inserted)
-            None,              # dedup rec-2
             None,              # model rec-2
+            insert_row_2,      # atomic INSERT rec-2 → winner
             internal_session,  # session upsert rec-2 (ON CONFLICT updated)
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -1905,15 +1951,16 @@ class TestCachedTokensComputation:
         assert data["results"][0]["status"] == "accepted"
 
         # Verify the wire cached_tokens=42 was persisted (not 0 from enrichment defaults)
-        # The execute call should use effective_cached_tokens=$9=42 for v1.0 payload
-        execute_call = next(
-            call for call in mock_conn.execute.call_args_list
+        # The atomic INSERT ON CONFLICT uses effective_cached_tokens at position
+        # $8 in the fetchrow call (session_id is NULL inline, so all indices
+        # shifted down by one).
+        atomic_insert_call = next(
+            call for call in mock_conn.fetchrow.call_args_list
             if "INSERT INTO opencode_usage_records" in str(call)
         )
-        # args[0] = SQL, args[1..18] = $1..$18 parameters
-        # $9 = effective_cached_tokens at args[9]
-        assert execute_call is not None
-        cached_tokens_param = execute_call[0][9]
+        assert atomic_insert_call is not None
+        # $8 = effective_cached_tokens at args[0][8]
+        cached_tokens_param = atomic_insert_call[0][8]
         assert cached_tokens_param == 42, (
             f"Expected effective_cached_tokens=42 for v1.0 wire value, "
             f"got {cached_tokens_param}"
@@ -2068,14 +2115,19 @@ class TestSessionCacheTokensUpdate:
             r.__getitem__.side_effect = {"id": _id}.__getitem__
             return r
 
+        def _insert_row():
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+            return r
+
         mock_conn.fetchrow.side_effect = [
             auth,                    # 0. auth
             None,                    # 1. source_database check (new)
-            None,                    # 2. dedup rec-001 (new)
-            None,                    # 3. model gpt-4 (new)
+            None,                    # 2. model gpt-4 (new)
+            _insert_row(),           # 3. atomic INSERT rec-001 → winner
             _session_row(),          # 4. session upsert rec-001 → returns shared id
-            None,                    # 5. dedup rec-002 (new)
-            None,                    # 6. model claude-3 (new)
+            None,                    # 5. model claude-3 (new)
+            _insert_row(),           # 6. atomic INSERT rec-002 → winner
             _session_row(),          # 7. session upsert rec-002 → returns shared id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -2171,14 +2223,19 @@ class TestSessionCacheTokensUpdate:
             r.__getitem__.side_effect = {"id": _id}.__getitem__
             return r
 
+        def _insert_row():
+            r = MagicMock()
+            r.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+            return r
+
         mock_conn.fetchrow.side_effect = [
             auth,                    # 0. auth
             None,                    # 1. source_database check (new)
-            None,                    # 2. dedup rec-v10 (new)
-            None,                    # 3. model gpt-4 (new)
+            None,                    # 2. model gpt-4 (new)
+            _insert_row(),           # 3. atomic INSERT rec-v10 → winner
             _session_row(),          # 4. session upsert rec-v10 → shared id
-            None,                    # 5. dedup rec-v12 (new)
-            None,                    # 6. model claude-3 (new)
+            None,                    # 5. model claude-3 (new)
+            _insert_row(),           # 6. atomic INSERT rec-v12 → winner
             _session_row(),          # 7. session upsert rec-v12 → shared id
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -2441,12 +2498,16 @@ class TestSessionCacheTokenBackfill:
         auth = _auth_row()
 
         # Two records for the same session.
-        # Structure: [auth] + [sd_check] + [dedup, model, session] * 2
+        # Structure: [auth] + [sd_check] + [model, insert, session] * 2
         fetchrow_side_effects = [auth, None]  # auth + source-database check
         for _ in range(2):
+            insert_row = MagicMock()
+            insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
             session_row = MagicMock()
             session_row.__getitem__.side_effect = {"id": _SESSION_ID}.__getitem__
-            fetchrow_side_effects.extend([None, None, session_row])  # dedup, model, session
+            fetchrow_side_effects.extend(
+                [None, insert_row, session_row]
+            )  # model, atomic_insert, session
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = fetchrow_side_effects
@@ -3463,6 +3524,149 @@ class TestProjectionIndependentPaths:
         assert data["projection_rejected_count"] == 0
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #375 — Atomic usage record deduplication under concurrent replay
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestConcurrentIdenticalRecords:
+    """Two concurrent identical records produce one row and one aggregate increment."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_identical_records_single_insert_and_increment(self, monkeypatch):
+        """Two identical concurrent records: both return accepted, but only one
+        row is inserted into opencode_usage_records and session aggregates /
+        source database record count are incremented exactly once."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        # ── Build fetchrow side-effect list ───────────────────────────
+        fetchrow_responses = [auth]  # auth
+
+        # Source database check
+        fetchrow_responses.append(None)  # new source database
+
+        # Two records, same dedup key
+        # Record 1:
+        #  - model upsert → new model (None)
+        #  - atomic INSERT ON CONFLICT → WINNER (returns row with id)
+        #  - session resolve → returns session UUID
+        fetchrow_responses.append(None)  # model check (new)
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(insert_row_1)  # atomic INSERT → winner
+        session_row_1 = MagicMock()
+        session_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(session_row_1)  # session resolve
+
+        # Record 2 (same source_record_id):
+        #  - model upsert → existing model (we return a row)
+        #  - atomic INSERT ON CONFLICT → LOSER (returns None)
+        #  - existing record query → returns matching values (identical)
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        fetchrow_responses.append(existing_model)  # model check (existing)
+        fetchrow_responses.append(None)  # atomic INSERT → conflict
+        existing_dedup_row = MagicMock()
+        existing_dedup_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        fetchrow_responses.append(existing_dedup_row)  # dedup query → identical
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = fetchrow_responses
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-concurrent-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-concurrent-001",  # SAME dedup key
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+
+        # Both records return accepted
+        assert data["accepted_count"] == 2
+        assert data["rejected_count"] == 0
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # ── Exactly ONE usage record inserted ─────────────────────────
+        record_inserts_via_execute = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(record_inserts_via_execute) == 0, (
+            "Usage record INSERT should happen via atomic INSERT ON CONFLICT "
+            "(fetchrow call), not via execute"
+        )
+
+        atomic_inserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+            and "ON CONFLICT" in str(call)
+        ]
+        assert len(atomic_inserts) == 2, (
+            "Two atomic INSERT attempts (one winner, one loser)"
+        )
+
+        # ── Session resolve called exactly ONCE ───────────────────────
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 1, (
+            f"Session resolve should be called exactly once (winner only), "
+            f"got {len(session_calls)}"
+        )
+
+        # ── Source database record count bumped exactly ONCE ──────────
+        sd_bumps = [
+            call for call in mock_conn.execute.call_args_list
+            if "record_count = record_count + 1" in str(call)
+        ]
+        assert len(sd_bumps) == 1, (
+            f"Source DB count should be bumped exactly once (winner only), "
+            f"got {len(sd_bumps)}"
+        )
+
+        # ── Second record's result includes idempotent reason ──────────
+        assert "idempotent" in (data["results"][1].get("reason") or "").lower()
+
+
 class TestProjectionCombinedPayloads:
     """Payloads with both usage records and multiple projection types."""
 
@@ -3476,15 +3680,17 @@ class TestProjectionCombinedPayloads:
 
         auth = _auth_row()
 
-        # Side effects: auth, sd, usage record (dedup, model, session=3 items)
+        # Side effects: auth, sd, usage record (model, insert, session=3 items)
         # Then: 2 session contexts (resolve session, resolve proj each = 4)
         # Then: 1 todo resolve
         session_row = MagicMock()
         session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
         mock_conn.fetchrow.side_effect = [
             auth,                   # auth
             None,                   # sd check
-            None, None, session_row,  # usage record: dedup, model, session
+            None, insert_row, session_row,  # usage record: model, atomic_insert, session
             None, None,             # ctx1: resolve session_id, resolve source_project
             None, None,             # ctx2: resolve session_id, resolve source_project
             None,                   # todo: resolve session_id

@@ -384,7 +384,15 @@ async def _process_one_record(
     source_db_id: uuid.UUID,
     now: datetime,
 ) -> IngestRecordResult:
-    """Process a single ingest record — idempotency, validation, upsert.
+    """Process a single ingest record — validate, deduplicate, upsert.
+
+    Uses an atomic ``INSERT … ON CONFLICT … DO NOTHING RETURNING id``
+    on ``(client_id, source_database_id, source_record_id)`` to
+    determine the winner under concurrent replay.  The winning request
+    runs all first-time side effects (session resolution with aggregate
+    increment, source-database record count bump).  A losing identical
+    duplicate returns ``accepted``; a losing divergent duplicate returns
+    ``conflict``.
 
     Returns an :class:`IngestRecordResult` regardless of outcome so the
     caller can implement partial-success semantics.
@@ -427,7 +435,76 @@ async def _process_one_record(
     else:
         effective_cached_tokens = cached_tokens
 
-    # ── 2. Idempotency check ─────────────────────────────────────────
+    # ── 2. Upsert observed model (idempotent — harmless for losers) ──
+    model_id = await _upsert_model(conn, record.model, now)
+
+    # ── 3. Atomic dedup INSERT — first writer wins ────────────────────
+    # Under concurrent replay, two requests can both pass a SELECT check
+    # before either commits.  The atomic INSERT ... ON CONFLICT ... DO
+    # NOTHING determines the winner in a single statement with no race
+    # window.  The winning request performs all first-time side effects;
+    # the losing request queries the committed row to discriminate
+    # identical vs divergent.
+    record_uuid = uuid.uuid4()
+    row = await conn.fetchrow(
+        """INSERT INTO opencode_usage_records
+           (id, client_id, source_database_id, source_record_id, session_id,
+            model_id, input_tokens, output_tokens, cached_tokens,
+            estimated_cost_usd, reported_at, ingested_at,
+            provider, mode, finish_reason, reasoning_tokens,
+            cache_read_tokens, cache_write_tokens)
+           VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11,
+                   $12, $13, $14, $15, $16, $17)
+           ON CONFLICT (client_id, source_database_id, source_record_id)
+           DO NOTHING
+           RETURNING id""",
+        record_uuid,
+        client_id,
+        source_db_id,
+        record.source_record_id,
+        model_id,
+        input_tokens,
+        output_tokens,
+        effective_cached_tokens,
+        record.estimated_cost_usd,
+        record.reported_at,
+        now,
+        record.provider,
+        record.mode,
+        record.finish_reason,
+        record.reasoning_tokens,
+        record.cache_read_tokens,
+        record.cache_write_tokens,
+    )
+
+    if row is not None:
+        # ── WINNER — first writer, run first-time side effects ────────
+        # 4. Resolve session (upsert + increment aggregates)
+        internal_session_id = await _resolve_session(
+            conn, source_db_id, client_id, record.session_id,
+            input_tokens, output_tokens, effective_cached_tokens,
+            record.estimated_cost_usd, now,
+            project_id=record.project_id,
+            workspace_id=record.workspace_id,
+            agent=record.agent,
+            parent_session_id=record.parent_session_id,
+            cache_read_tokens=record.cache_read_tokens or 0,
+            cache_write_tokens=record.cache_write_tokens or 0,
+        )
+
+        # 5. Backfill session_id on the usage record
+        await conn.execute(
+            "UPDATE opencode_usage_records SET session_id = $1 WHERE id = $2",
+            internal_session_id,
+            record_uuid,
+        )
+
+        # 6. Bump source database record count
+        await _increment_source_database_record_count(conn, source_db_id, now)
+
+        return IngestRecordResult(index=index, status="accepted")
+
+    # ── LOSER — dedup match, discriminate identical vs divergent ──────
     existing = await conn.fetchrow(
         """SELECT id, input_tokens, output_tokens, cached_tokens, estimated_cost_usd
            FROM opencode_usage_records
@@ -457,57 +534,12 @@ async def _process_one_record(
             reason="Divergent duplicate: same dedup key but different values",
         )
 
-    # ── 3. Upsert observed model ─────────────────────────────────────
-    model_id = await _upsert_model(conn, record.model, now)
-
-    # ── 4. Resolve session (upsert + increment aggregates) ───────────
-    internal_session_id = await _resolve_session(
-        conn, source_db_id, client_id, record.session_id,
-        input_tokens, output_tokens, effective_cached_tokens,
-        record.estimated_cost_usd, now,
-        project_id=record.project_id,
-        workspace_id=record.workspace_id,
-        agent=record.agent,
-        parent_session_id=record.parent_session_id,
-        cache_read_tokens=record.cache_read_tokens or 0,
-        cache_write_tokens=record.cache_write_tokens or 0,
+    # Should not reach here: if ON CONFLICT fired, the row must exist.
+    return IngestRecordResult(
+        index=index,
+        status="rejected",
+        reason="Unexpected dedup state: conflict detected but row not found",
     )
-
-    # ── 5. Insert usage record ───────────────────────────────────────
-    record_uuid = uuid.uuid4()
-    await conn.execute(
-        """INSERT INTO opencode_usage_records
-           (id, client_id, source_database_id, source_record_id, session_id,
-            model_id, input_tokens, output_tokens, cached_tokens,
-            estimated_cost_usd, reported_at, ingested_at,
-            provider, mode, finish_reason, reasoning_tokens,
-            cache_read_tokens, cache_write_tokens)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                   $13, $14, $15, $16, $17, $18)""",
-        record_uuid,
-        client_id,
-        source_db_id,
-        record.source_record_id,
-        internal_session_id,
-        model_id,
-        input_tokens,
-        output_tokens,
-        effective_cached_tokens,
-        record.estimated_cost_usd,
-        record.reported_at,
-        now,
-        record.provider,
-        record.mode,
-        record.finish_reason,
-        record.reasoning_tokens,
-        record.cache_read_tokens,
-        record.cache_write_tokens,
-    )
-
-    # ── 6. Bump source database record count ─────────────────────────
-    await _increment_source_database_record_count(conn, source_db_id, now)
-
-    return IngestRecordResult(index=index, status="accepted")
 
 
 # ── Projection processing helpers ─────────────────────────────────────────
