@@ -62,9 +62,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - pgrep
-                - "-f"
-                - "python -m app.consumer"
+                - python
+                - -c
+                - "import os,sys; os.kill(1,0); sys.exit(0 if b'app.consumer' in open('/proc/1/cmdline','rb').read() else 1)"
             initialDelaySeconds: 30
             periodSeconds: 30
       restartPolicy: Always
