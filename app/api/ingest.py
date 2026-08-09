@@ -225,6 +225,85 @@ def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
         return False
 
 
+def _normalise_optional_text(value: str | None) -> str | None:
+    """Normalise an optional text value for Replay Merge.
+    
+    Whitespace-only strings are treated as missing and become ``None``.
+    Non-empty strings and ``None`` pass through unchanged.
+    """
+    if value is not None and isinstance(value, str) and value.strip() == "":
+        return None
+    return value
+
+
+async def _apply_replay_merge(
+    conn: asyncpg.Connection,
+    record: IngestRecord,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+) -> bool:
+    """Apply Replay Merge: fill absent enrichment fields on the stored record.
+
+    Queries the stored record's enrichment fields and fills any that are
+    NULL with the incoming payload's values.  Populated fields are never
+    overwritten.  Whitespace-only text values are treated as missing.
+
+    Returns ``True`` if any enrichment was applied.
+    """
+    stored = await conn.fetchrow(
+        """SELECT id, provider, mode, finish_reason, reasoning_tokens,
+                  cache_read_tokens, cache_write_tokens, estimated_cost_usd
+           FROM opencode_usage_records
+           WHERE client_id = $1 AND source_database_id = $2 AND source_record_id = $3""",
+        client_id,
+        source_db_id,
+        record.source_record_id,
+    )
+
+    if stored is None:
+        return False
+
+    set_clauses: list[str] = []
+    params: list = []
+    param_idx = 1
+
+    # ── Text enrichment fields ───────────────────────────────────────
+    _TEXT_ENRICHMENT: list[str] = ["provider", "mode", "finish_reason"]
+    for field_name in _TEXT_ENRICHMENT:
+        incoming = _normalise_optional_text(getattr(record, field_name, None))
+        stored_val = stored[field_name]
+        if stored_val is None and incoming is not None:
+            set_clauses.append(f"{field_name} = ${param_idx}")
+            params.append(incoming)
+            param_idx += 1
+
+    # ── Numeric enrichment fields (zero is valid) ─────────────────────
+    _NUMERIC_ENRICHMENT: list[str] = [
+        "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
+    ]
+    for field_name in _NUMERIC_ENRICHMENT:
+        incoming = getattr(record, field_name, None)
+        stored_val = stored[field_name]
+        if stored_val is None and incoming is not None:
+            set_clauses.append(f"{field_name} = ${param_idx}")
+            params.append(incoming)
+            param_idx += 1
+
+    if not set_clauses:
+        return False
+
+    params.extend([client_id, source_db_id, record.source_record_id])
+    await conn.execute(
+        f"""UPDATE opencode_usage_records
+            SET {', '.join(set_clauses)}
+            WHERE client_id = ${param_idx}
+              AND source_database_id = ${param_idx + 1}
+              AND source_record_id = ${param_idx + 2}""",
+        *params,
+    )
+    return True
+
+
 async def _upsert_source_database(
     conn: asyncpg.Connection,
     source_db_id: uuid.UUID,
@@ -522,10 +601,17 @@ async def _process_one_record(
             and existing["cached_tokens"] == effective_cached_tokens
             and _decimal_equal(existing["estimated_cost_usd"], record.estimated_cost_usd)
         ):
+            # ── Replay Merge: fill absent enrichment fields ──────────
+            enrichment_applied = await _apply_replay_merge(
+                conn, record, client_id, source_db_id,
+            )
+            reason = "Duplicate (idempotent)"
+            if enrichment_applied:
+                reason += " — enrichment applied"
             return IngestRecordResult(
                 index=index,
                 status="accepted",
-                reason="Duplicate (idempotent)",
+                reason=reason,
             )
         # Different values → conflict
         return IngestRecordResult(
@@ -707,16 +793,16 @@ async def _process_session_context(
         source_db_id,
         ctx.external_session_id,
         resolved_session_id,
-        ctx.parent_external_session_id,
+        _normalise_optional_text(ctx.parent_external_session_id),
         resolved_parent_session_id,
-        ctx.external_project_id,
+        _normalise_optional_text(ctx.external_project_id),
         resolved_source_project_id,
-        ctx.source_directory,
-        ctx.source_path,
-        ctx.title,
-        ctx.slug,
-        ctx.version,
-        ctx.session_model,
+        _normalise_optional_text(ctx.source_directory),
+        _normalise_optional_text(ctx.source_path),
+        _normalise_optional_text(ctx.title),
+        _normalise_optional_text(ctx.slug),
+        _normalise_optional_text(ctx.version),
+        _normalise_optional_text(ctx.session_model),
         ctx.session_cost,
         ctx.source_input_tokens,
         ctx.source_output_tokens,
@@ -802,14 +888,14 @@ async def _process_project(
         source_db_id,
         proj.external_project_id,
         proj.source_project_id,
-        proj.worktree,
-        proj.vcs,
+        _normalise_optional_text(proj.worktree),
+        _normalise_optional_text(proj.vcs),
         proj.sandboxes,
-        proj.name,
-        proj.display_name,
-        proj.icon,
-        proj.icon_color,
-        proj.raw_commands,
+        _normalise_optional_text(proj.name),
+        _normalise_optional_text(proj.display_name),
+        _normalise_optional_text(proj.icon),
+        _normalise_optional_text(proj.icon_color),
+        _normalise_optional_text(proj.raw_commands),
         proj.parsed_commands,
         proj.source_created_at,
         proj.source_updated_at,
