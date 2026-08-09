@@ -28,19 +28,24 @@ with grouping applied at read time. Clients are not merged.
    canonical name is a manual mapping, not a regex strip.
 2. **Additive rollup table.** A new `client_project_rollup` aggregate table,
    keyed by `(client_id, project_label, day)`, stores only additive columns:
-   input/output/cache tokens and estimated cost. Session counts and model
-   counts are NOT stored in the rollup — they remain distinct-count queries
-   over raw usage records.
+   input/output/cache/reasoning tokens and estimated cost. Session counts
+   and model counts are NOT stored in the rollup — they remain
+   distinct-count queries over raw usage records.
 3. **Rollup maintenance.** The rollup is maintained inline at ingest, in
    the same transaction as the usage-record insert, as additive UPSERT
    increments. Raw usage records remain authoritative; if the rollup
    disagrees with raw records, the rollup is the value to correct — the
-   same discipline as the existing Session Cache-Write Total entry.
+   same correction discipline used for the session-level
+   `total_cache_write_tokens` aggregate (see the Session Cache-Write Total
+   glossary entry and `scripts/backfill_cache_write_tokens.py`).
 4. **Hybrid read path.** The client-project aggregation reads the rollup
    table; all other aggregate dimensions (model, session, day/week/month)
    keep scanning raw records. Canonical grouping
    (`COALESCE(canonical_name, name)`) is applied at read time on both
-   paths, so a canonical-name change never requires table recompute.
+   paths, so a canonical-name change never requires table recompute. This
+   includes the reasoning-token total (`total_reasoning_tokens`) that the
+   client-project aggregation currently surfaces, so the rollup-backed
+   read path exposes the same metric set as the raw-record path.
 5. **Backfill out of scope.** The rollup starts empty and is filled by new
    ingests only; a separate decision will cover backfill.
 
