@@ -221,7 +221,7 @@ async def _fetch_aggregates(
                 COUNT(*) AS record_count,
                 COUNT(DISTINCT our.session_id) AS session_count,
                 COUNT(DISTINCT om.model_name) AS model_count
-            FROM opencode_usage_records our
+            FROM usage_events our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
             WHERE {where_clause}
@@ -261,7 +261,7 @@ async def _fetch_aggregates(
     )
     project_join = (
         "LEFT JOIN opencode_source_projects osp "
-        "  ON osp.source_database_id = our.source_database_id "
+        "  ON osp.source_database_id = s.source_database_id "
         "  AND osp.external_project_id = s.project_id"
         if has_project
         else ""
@@ -289,7 +289,7 @@ async def _fetch_aggregates(
             COUNT(*) AS record_count,
             COUNT(DISTINCT our.session_id) AS session_count,
             COUNT(DISTINCT om.model_name) AS model_count
-        FROM opencode_usage_records our
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         LEFT JOIN opencode_clients oc ON oc.id = our.client_id
         {sessions_join}
@@ -396,7 +396,7 @@ async def _fetch_records(
     # Total count
     count_sql = f"""
         SELECT COUNT(*)
-        FROM opencode_usage_records our
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         WHERE {where_clause}
     """
@@ -407,12 +407,12 @@ async def _fetch_records(
             total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
-    order_col = "our.reported_at" if sort_by == "reported_at" else "our.ingested_at"
+    order_col = "our.reported_at" if sort_by == "reported_at" else "our.first_ingested_at"
     data_sql = f"""
         SELECT
             our.id,
             our.client_id,
-            our.source_database_id,
+            s.source_database_id,
             our.session_id,
             om.model_name,
             our.input_tokens,
@@ -426,9 +426,10 @@ async def _fetch_records(
             our.cache_write_tokens,
             our.estimated_cost_usd,
             our.reported_at,
-            our.ingested_at
-        FROM opencode_usage_records our
+            our.first_ingested_at AS ingested_at
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
+        JOIN sessions s ON s.id = our.session_id
         WHERE {where_clause}
         ORDER BY {order_col} {sort_dir}
         LIMIT ${len(query_params) + 1}
@@ -1462,12 +1463,12 @@ _PROJECT_LABEL_SQL = """
 _RWC_SESSION_JOIN = "JOIN sessions s ON s.id = our.session_id"
 _RWC_CONTEXT_JOIN = """
     LEFT JOIN opencode_session_contexts osc
-        ON osc.source_database_id = our.source_database_id
+        ON osc.source_database_id = s.source_database_id
         AND osc.external_session_id = s.external_session_id
 """
 _RWC_PROJECT_JOIN = """
     LEFT JOIN opencode_source_projects osp
-        ON osp.source_database_id = our.source_database_id
+        ON osp.source_database_id = s.source_database_id
         AND osp.external_project_id = s.project_id
 """
 
@@ -1558,7 +1559,7 @@ async def _fetch_records_with_context(
     # ── Total count ─────────────────────────────────────────────────
     count_sql = f"""
         SELECT COUNT(*)
-        FROM opencode_usage_records our
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         {_RWC_SESSION_JOIN}
         WHERE {where_clause}
@@ -1574,7 +1575,7 @@ async def _fetch_records_with_context(
         SELECT
             our.id,
             our.client_id,
-            our.source_database_id,
+            s.source_database_id,
             our.session_id,
             om.model_name,
             our.input_tokens,
@@ -1588,11 +1589,11 @@ async def _fetch_records_with_context(
             our.cache_write_tokens,
             our.estimated_cost_usd,
             our.reported_at,
-            our.ingested_at,
+            our.first_ingested_at AS ingested_at,
             s.agent,
             osc.title AS session_title,
             {_PROJECT_LABEL_SQL} AS project_label
-        FROM opencode_usage_records our
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         {_RWC_SESSION_JOIN}
         {_RWC_CONTEXT_JOIN}
@@ -1725,7 +1726,7 @@ async def _fetch_records_with_context_grouped(
             COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
             SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
             COUNT(*) AS record_count
-        FROM opencode_usage_records our
+        FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         {_RWC_SESSION_JOIN}
         {_RWC_CONTEXT_JOIN}

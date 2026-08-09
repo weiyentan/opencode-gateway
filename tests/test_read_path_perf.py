@@ -476,7 +476,7 @@ def _setup_synthetic_mocks(mock_conn: AsyncMock) -> None:
             ]
         # Usage records queries (must match BEFORE sessions join to avoid wrong-shape rows).
         # Augments with context fields so records-with-context endpoint gets them.
-        if "opencode_usage_records" in sql:
+        if "usage_events" in sql:
             rows = []
             for j in range(50):
                 r = _mk_record_row(
@@ -937,7 +937,7 @@ def _setup_production_shaped_mocks(mock_conn: AsyncMock) -> None:
                 for i in range(5)
             ]
         # Usage records queries (must match BEFORE sessions join to avoid wrong-shape rows).
-        if "opencode_usage_records" in sql:
+        if "usage_events" in sql:
             rows = []
             for i in range(1000):
                 r = _mk_record_row(
