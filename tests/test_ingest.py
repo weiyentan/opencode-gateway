@@ -4718,7 +4718,7 @@ class TestReplayMergeWhitespaceNormalization:
         assert len(enrichment_updates) == 0
 
     @pytest.mark.asyncio
-    async def test_non_empty_string_after_whitespace_normalization_fills(self, monkeypatch):
+    async def test_newline_only_provider_treated_as_missing(self, monkeypatch):
         """A provider='\n' (whitespace-only after strip) is treated as
         missing — no enrichment applied."""
         mock_conn = AsyncMock()
@@ -5337,13 +5337,12 @@ class TestF2WinnerTransactionAtomicity:
         data = response.json()["data"]
         assert data["accepted_count"] == 1
 
-        # The transaction was entered (once by _build_ingest_app setup,
-        # once by the winner path)
-        # Since _build_ingest_app calls _add_transaction_support which
-        # replaces conn.transaction with a MagicMock, we can count calls.
-        # The winner path should have entered the transaction at least once.
-        assert mock_conn.transaction.call_count >= 1, (
-            "Winner path must enter an explicit transaction"
+        # _build_ingest_app calls _add_transaction_support, which replaces
+        # conn.transaction with a MagicMock we can count calls on (never
+        # called during setup). The single-record winner scenario enters
+        # exactly one transaction.
+        assert mock_conn.transaction.call_count == 1, (
+            "Winner path must enter exactly one explicit transaction"
         )
 
 
