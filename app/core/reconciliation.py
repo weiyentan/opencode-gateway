@@ -511,7 +511,6 @@ async def scan_duplicate_groups(
         ORDER BY ue.source_record_id, ue.first_ingested_at, ue.id
         """,
         *params,
-        *params,  # params passed twice — once for inner, once for outer
     )
 
     # Group rows by source_record_id

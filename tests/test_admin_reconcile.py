@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+from app.core.reconciliation import scan_duplicate_groups
 from tests.conftest import create_client, mock_row
 
 # ── Shared test data ───────────────────────────────────────────────────────
@@ -364,6 +365,79 @@ class TestActualReconciliation:
         ]
         assert len(lock_calls) == 1, "Expected one advisory lock acquisition"
 
+        # Verify the advisory lock was acquired inside an explicit transaction
+        mock_conn.transaction.assert_called_once()
+
+    async def test_non_dry_run_wraps_reconcile_in_explicit_transaction(
+        self, mock_conn: AsyncMock
+    ):
+        """Non-dry-run path uses conn.transaction() for atomicity.
+
+        The lock + re-scan + perform_reconciliation must all run inside a
+        single explicit transaction so the pg_advisory_xact_lock spans the
+        work and UPDATE/DELETE/aggregate-rebuild are atomic.
+        """
+        canonical = _mk_event(
+            event_id=uuid.uuid4(),
+            source_record_id="rec-001",
+            input_tokens=100,
+            output_tokens=50,
+            first_ingested_at=_EARLY,
+            reported_at=_LATER,
+        )
+        non_canonical = _mk_event(
+            event_id=uuid.uuid4(),
+            source_record_id="rec-001",
+            input_tokens=200,
+            output_tokens=60,
+            first_ingested_at=_LATER,
+            reported_at=_LATER,
+        )
+
+        rebuild_agg = mock_row({
+            "session_id": _SESSION_A,
+            "total_input_tokens": 100,
+            "total_output_tokens": 50,
+            "total_cached_tokens": 0,
+            "total_cache_read_tokens": 0,
+            "total_cache_write_tokens": 0,
+            "total_estimated_cost_usd": Decimal("0.0100"),
+        })
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [canonical, non_canonical],  # scan before lock
+                [canonical, non_canonical],  # scan after lock
+                [rebuild_agg],               # rebuild
+            ]
+        )
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchval = AsyncMock()
+        client = create_client(mock_conn)
+
+        resp = await client.post(
+            "/admin/reconcile-historical-duplicates",
+            json=_reconcile_body(dry_run=False),
+        )
+
+        assert resp.status_code == 200
+
+        # The non-dry-run path must open exactly one explicit transaction
+        mock_conn.transaction.assert_called_once()
+
+    async def test_dry_run_does_not_open_transaction(self, mock_conn: AsyncMock):
+        """Dry-run path is read-only — no explicit transaction needed."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchval = AsyncMock()
+        client = create_client(mock_conn)
+
+        await client.post(
+            "/admin/reconcile-historical-duplicates",
+            json=_reconcile_body(dry_run=True),
+        )
+
+        mock_conn.transaction.assert_not_called()
+
     async def test_canonical_selection_earliest_first_ingested_at(
         self, mock_conn: AsyncMock
     ):
@@ -523,3 +597,93 @@ class TestReconcileValidation:
         )
 
         assert resp.status_code == 422
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  scan_duplicate_groups parameter passing (BUG 1 regression)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestScanDuplicateGroupsParams:
+    """scan_duplicate_groups passes params to conn.fetch exactly once.
+
+    The SQL uses positional $1..$N placeholders that are shared between the
+    inner subquery and outer query WHERE clauses.  Passing *params twice
+    (2N values for N placeholders) causes asyncpg InterfaceError on any
+    real DB call with filters.
+    """
+
+    async def test_passes_params_once_with_client_id_and_dates(
+        self, mock_conn: AsyncMock
+    ):
+        """With client_id + date_from + date_to, fetch receives exactly 3 args."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        client_id = uuid.UUID("a0000000-0000-0000-0000-000000000001")
+        date_from = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        date_to = datetime(2026, 1, 31, tzinfo=timezone.utc)
+
+        await scan_duplicate_groups(
+            mock_conn,
+            client_id=client_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+        # conn.fetch was called once with 4 positional args: sql, $1, $2, $3
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args
+        positional_args = call_args[0]
+        # First arg is the SQL string; remaining args are the params
+        params_passed = positional_args[1:]
+        assert len(params_passed) == 3, (
+            f"Expected 3 params (client_id, date_from, date_to) but got "
+            f"{len(params_passed)}: {params_passed}"
+        )
+
+    async def test_passes_params_once_with_client_id_only(
+        self, mock_conn: AsyncMock
+    ):
+        """With only client_id, fetch receives exactly 1 positional arg."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        client_id = uuid.UUID("a0000000-0000-0000-0000-000000000001")
+
+        await scan_duplicate_groups(mock_conn, client_id=client_id)
+
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args
+        params_passed = call_args[0][1:]
+        assert len(params_passed) == 1, (
+            f"Expected 1 param (client_id) but got {len(params_passed)}"
+        )
+
+    async def test_passes_params_once_with_no_filters(
+        self, mock_conn: AsyncMock
+    ):
+        """With no filters, fetch receives 0 positional args (unfiltered scan)."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        await scan_duplicate_groups(mock_conn)
+
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args
+        params_passed = call_args[0][1:]
+        assert len(params_passed) == 0, (
+            f"Expected 0 params (no filters) but got {len(params_passed)}"
+        )
+
+    async def test_passes_params_once_with_dates_only(
+        self, mock_conn: AsyncMock
+    ):
+        """With date_from + date_to only, fetch receives exactly 2 positional args."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        date_from = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        date_to = datetime(2026, 1, 31, tzinfo=timezone.utc)
+
+        await scan_duplicate_groups(mock_conn, date_from=date_from, date_to=date_to)
+
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args
+        params_passed = call_args[0][1:]
+        assert len(params_passed) == 2, (
+            f"Expected 2 params (date_from, date_to) but got {len(params_passed)}"
+        )

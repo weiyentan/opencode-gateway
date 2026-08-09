@@ -101,31 +101,35 @@ async def reconcile_historical_duplicates(
     lock_client_id = body.client_id or uuid.UUID("00000000-0000-0000-0000-000000000000")
     lock_key = lock_client_id.int & 0xFFFFFFFF
 
-    # Acquire a transaction-scoped advisory lock to serialise concurrent
-    # reconciliation runs per client.
-    await conn.fetchval(
-        "SELECT pg_advisory_xact_lock($1, $2)",
-        RECONCILE_LOCK_CLASS,
-        lock_key,
-    )
+    # Wrap the full reconcile flow in a single explicit transaction so the
+    # advisory lock spans re-scan + reconciliation and the DELETE/UPDATE/
+    # aggregate-rebuild are atomic (matching the ingest.py pattern).
+    async with conn.transaction():
+        # Acquire a transaction-scoped advisory lock to serialise concurrent
+        # reconciliation runs per client.
+        await conn.fetchval(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            RECONCILE_LOCK_CLASS,
+            lock_key,
+        )
 
-    # Re-scan inside the lock to ensure we see committed state
-    groups = await scan_duplicate_groups(
-        conn,
-        client_id=body.client_id,
-        date_from=date_from_dt,
-        date_to=date_to_dt,
-    )
+        # Re-scan inside the lock to ensure we see committed state
+        groups = await scan_duplicate_groups(
+            conn,
+            client_id=body.client_id,
+            date_from=date_from_dt,
+            date_to=date_to_dt,
+        )
 
-    if not groups:
-        return ReconcileResponse(dry_run=False)
+        if not groups:
+            return ReconcileResponse(dry_run=False)
 
-    actual = await perform_reconciliation(conn, groups)
+        actual = await perform_reconciliation(conn, groups)
 
-    return ReconcileResponse(
-        dry_run=False,
-        events_to_merge=actual.events_to_merge,
-        aggregates_affected=actual.aggregates_affected,
-        token_adjustment=actual.token_adjustment,
-        cost_adjustment_usd=str(actual.cost_adjustment),
-    )
+        return ReconcileResponse(
+            dry_run=False,
+            events_to_merge=actual.events_to_merge,
+            aggregates_affected=actual.aggregates_affected,
+            token_adjustment=actual.token_adjustment,
+            cost_adjustment_usd=str(actual.cost_adjustment),
+        )
