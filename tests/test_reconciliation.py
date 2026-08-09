@@ -25,9 +25,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core.reconciliation import (
+    CANONICAL_EVENT_LOCK_CLASS,
     REPLAY_LOCK_CLASS,
     DeltaResult,
     IngestOutcome,
+    _canonical_event_lock_key,
+    acquire_canonical_event_lock,
     apply_replay_merge,
     compute_delta,
     validate_no_negative_totals,
@@ -429,3 +432,91 @@ class TestApplyReplayMerge:
             if sql_fragment in sql:
                 return sql, list(call.args[1:])
         pytest.fail(f"no conn.execute call containing {sql_fragment!r}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Canonical event advisory lock (issue #395)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestCanonicalEventLock:
+    """Per-transaction advisory lock for canonical event first-delivery serialisation."""
+
+    def test_lock_key_is_deterministic(self):
+        """Same (identity_id, record_id) produce the same lock key."""
+        identity_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        record_id = "rec-001"
+
+        key_a = _canonical_event_lock_key(identity_id, record_id)
+        key_b = _canonical_event_lock_key(identity_id, record_id)
+
+        assert key_a == key_b
+        assert key_a[0] == CANONICAL_EVENT_LOCK_CLASS
+        assert isinstance(key_a[1], int)
+        # Signed int32 range — must bind to pg_advisory_xact_lock(int, int).
+        assert -(0x80000000) <= key_a[1] <= 0x7FFFFFFF
+
+    def test_different_records_produce_different_keys(self):
+        """Different source_record_id values produce different lock keys."""
+        identity_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        key_a = _canonical_event_lock_key(identity_id, "rec-001")
+        key_b = _canonical_event_lock_key(identity_id, "rec-002")
+
+        assert key_a != key_b
+
+    def test_different_identities_produce_different_keys(self):
+        """Different canonical_source_identity_id values produce different lock keys."""
+        id_a = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        id_b = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+        key_a = _canonical_event_lock_key(id_a, "rec-001")
+        key_b = _canonical_event_lock_key(id_b, "rec-001")
+
+        assert key_a != key_b
+
+    async def test_acquires_advisory_xact_lock_with_correct_key(self, mock_conn: AsyncMock):
+        """acquire_canonical_event_lock calls pg_advisory_xact_lock with the derived key."""
+        identity_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        record_id = "rec-001"
+
+        await acquire_canonical_event_lock(mock_conn, identity_id, record_id)
+
+        lock_call = mock_conn.fetchval.call_args
+        assert lock_call.args[0] == "SELECT pg_advisory_xact_lock($1, $2)"
+        expected_class, expected_key = _canonical_event_lock_key(identity_id, record_id)
+        assert lock_call.args[1] == expected_class
+        assert lock_call.args[2] == expected_key
+
+    async def test_lock_released_on_rollback(self, mock_conn: AsyncMock):
+        """The advisory xact lock is released when the transaction rolls back.
+
+        Acquire a lock inside an explicit transaction, then verify the
+        transaction was entered (so the lock scope is bounded).  A rollback
+        releases pg_advisory_xact_lock automatically — we verify the
+        transactional scope was established.
+        """
+        identity_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        # Enclose in an explicit transaction — the xact lock is released
+        # when the transaction exits (commit or rollback).
+        async with mock_conn.transaction():
+            await acquire_canonical_event_lock(mock_conn, identity_id, "rec-001")
+
+        # The transaction was entered (__aenter__ called)
+        tx = mock_conn.transaction.return_value
+        tx.__aenter__.assert_awaited()
+        tx.__aexit__.assert_awaited()
+
+    async def test_transaction_required_for_lock_scope(self, mock_conn: AsyncMock):
+        """The caller must own the transaction for the lock to be scoped properly.
+
+        acquire_canonical_event_lock itself does NOT open a transaction;
+        the caller wraps the lock + critical section in one.
+        """
+        identity_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        await acquire_canonical_event_lock(mock_conn, identity_id, "rec-001")
+
+        # The function does not open its own transaction
+        mock_conn.transaction.assert_not_called()

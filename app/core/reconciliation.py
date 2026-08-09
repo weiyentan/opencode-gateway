@@ -113,6 +113,74 @@ def _replay_lock_key(event_id: uuid.UUID) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Advisory lock key — per-canonical-event first-delivery serialisation
+# (issue #395)
+# ---------------------------------------------------------------------------
+
+CANONICAL_EVENT_LOCK_CLASS = 47_005
+"""High 32 bits of the two-arg per-canonical-event insertion lock.
+
+Follows the ``app/db/lock.py`` convention (``PORT_LOCK_KEY`` = 47_001,
+``CLEANUP_LOCK_CLASS`` = 47_002, ``REPLAY_LOCK_CLASS`` = 47_003,
+``RECONCILE_LOCK_CLASS`` = 47_004).  The low 32 bits are derived from
+``hashtext(canonical_source_identity_id || source_record_id)`` so that
+concurrent first-delivery attempts for the same canonical identity and
+source record are serialised — the second blocks until the first commits,
+then re-reads and finds the event already present.
+"""
+
+
+def _canonical_event_lock_key(
+    canonical_source_identity_id: uuid.UUID,
+    source_record_id: str,
+) -> tuple[int, int]:
+    """Derive the two-arg advisory lock key for a canonical event insertion.
+
+    Uses a deterministic hash of ``(canonical_source_identity_id || source_record_id)``
+    consistent with PostgreSQL's ``hashtext()`` semantics: the concatenated
+    text is MD5-hashed and the first 32 bits become the low-order key.
+    The 32-bit value is interpreted as a SIGNED int32 (the same range
+    ``hashtext()`` returns) so the key always binds to the ``int4``
+    arguments of ``pg_advisory_xact_lock(int, int)`` — an unsigned
+    interpretation can exceed ``INT32_MAX`` and asyncpg raises
+    ``OverflowError: value out of int32 range`` at bind time.
+    """
+    import hashlib
+
+    text = f"{canonical_source_identity_id}||{source_record_id}"
+    hash_bytes = hashlib.md5(text.encode()).digest()[:4]
+    key = int.from_bytes(hash_bytes, byteorder="big", signed=True)
+    return (CANONICAL_EVENT_LOCK_CLASS, key)
+
+
+async def acquire_canonical_event_lock(
+    conn: asyncpg.Connection,
+    canonical_source_identity_id: uuid.UUID,
+    source_record_id: str,
+) -> None:
+    """Acquire a per-transaction advisory lock for canonical event insertion.
+
+    Serialises concurrent first-delivery attempts for the same
+    ``(canonical_source_identity_id, source_record_id)``.  The lock is
+    transaction-scoped (``pg_advisory_xact_lock``) — released on commit
+    or rollback — so the caller MUST wrap the lock acquisition and the
+    subsequent SELECT+INSERT critical section in an explicit transaction.
+
+    The second concurrent delivery blocks here until the first commits;
+    after lock acquisition it re-reads ``usage_events`` and finds the
+    event already present (re-read-after-commit pattern).
+    """
+    lock_class, lock_key = _canonical_event_lock_key(
+        canonical_source_identity_id, source_record_id,
+    )
+    await conn.fetchval(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        lock_class,
+        lock_key,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Outcome enum
 # ---------------------------------------------------------------------------
 

@@ -5406,9 +5406,10 @@ class TestF2WinnerTransactionAtomicity:
         # _build_ingest_app calls _add_transaction_support, which replaces
         # conn.transaction with a MagicMock we can count calls on (never
         # called during setup). The single-record winner scenario enters
-        # exactly one transaction.
-        assert mock_conn.transaction.call_count == 1, (
-            "Winner path must enter exactly one explicit transaction"
+        # two transactions: one in _process_one_record (atomic dedup) and
+        # one in _record_canonical_event (advisory lock + canonical insert).
+        assert mock_conn.transaction.call_count == 2, (
+            "Winner path must enter exactly two explicit transactions"
         )
 
 
