@@ -195,6 +195,14 @@ Breakdowns for Sessions and Agent Runs use the row's raw cache read value as
 **Cache-Hit Input**, not an averaged value.
 _Avoid_: Average cache read in compact row displays
 
+**Session Cache-Write Total**:
+The session-level aggregate of cache write tokens
+(`sessions.total_cache_write_tokens`), incremented at ingest and
+corrected from raw usage records when it drifts (see
+`scripts/backfill_cache_write_tokens.py`). Raw usage records are
+authoritative; the aggregate is the value to correct on disagreement.
+_Avoid_: Cache write total without a defined session scope
+
 **Token Breakdown**:
 A compact per-title presentation of usage tokens for a session or run.
 Aurora Glass summary rows display a flat two-line breakdown with an
@@ -242,6 +250,25 @@ display name, name, workspace directory basename, external project ID, then
 `unknown`. Project Label is display-only and must not be treated as project
 identity.
 _Avoid_: Project ID when referring to a display label
+
+**Canonical Client Name**:
+The client name under which multiple per-workspace client registrations
+are aggregated for reporting. Per-workspace clients — one registration per
+AWX workspace — share a canonical name so their usage rolls up under a
+single deployment identity; a client without a canonical name reports
+under its own name. The canonical name is assigned manually per client;
+the relationship between a workspace client's own name and its canonical
+name is a deliberate mapping, not a derived transformation.
+_Avoid_: Client alias, merged client
+
+**Client Project Rollup**:
+A pre-aggregated usage summary per (client, project, day) holding only
+additive token and cost totals (input, output, cache, and reasoning
+tokens plus estimated cost), maintained at ingest time. Session counts
+and model counts are not part of the rollup and are computed from raw
+records. Raw usage records are authoritative; if the rollup disagrees with
+those records, the rollup is the value to correct.
+_Avoid_: Aggregated table, rollup view
 
 **Drilldown State**:
 The user's current expanded/collapsed view within an Aurora Glass summary,
