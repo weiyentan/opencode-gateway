@@ -244,25 +244,20 @@ async def _apply_replay_merge(
 ) -> bool:
     """Apply Replay Merge: fill absent enrichment fields on the stored record.
 
-    Queries the stored record's enrichment fields and fills any that are
-    NULL with the incoming payload's values.  Populated fields are never
-    overwritten.  Whitespace-only text values are treated as missing.
+    Uses COALESCE within a single atomic UPDATE so the write itself never
+    overwrites a populated value regardless of concurrent replays with
+    differing enrichment values.  Each SET clause reads ``col =
+    COALESCE(col, $n)`` — if the column is already populated the
+    COALESCE keeps the stored value; if NULL the incoming value is
+    written.  Postgres row-level locking serialises concurrent UPDATEs,
+    so interleaved replays cannot overwrite each other's fills.
 
-    Returns ``True`` if any enrichment was applied.
+    Whitespace-only text values are treated as missing (normalised to
+    None before the SET clause is built, so COALESCE is a no-op and the
+    column is simply not included in the UPDATE).
+
+    Returns ``True`` if an enrichment UPDATE was issued.
     """
-    stored = await conn.fetchrow(
-        """SELECT id, provider, mode, finish_reason, reasoning_tokens,
-                  cache_read_tokens, cache_write_tokens, estimated_cost_usd
-           FROM opencode_usage_records
-           WHERE client_id = $1 AND source_database_id = $2 AND source_record_id = $3""",
-        client_id,
-        source_db_id,
-        record.source_record_id,
-    )
-
-    if stored is None:
-        return False
-
     set_clauses: list[str] = []
     params: list = []
     param_idx = 1
@@ -271,9 +266,10 @@ async def _apply_replay_merge(
     _TEXT_ENRICHMENT: list[str] = ["provider", "mode", "finish_reason"]
     for field_name in _TEXT_ENRICHMENT:
         incoming = _normalise_optional_text(getattr(record, field_name, None))
-        stored_val = stored[field_name]
-        if stored_val is None and incoming is not None:
-            set_clauses.append(f"{field_name} = ${param_idx}")
+        if incoming is not None:
+            set_clauses.append(
+                f"{field_name} = COALESCE({field_name}, ${param_idx})",
+            )
             params.append(incoming)
             param_idx += 1
 
@@ -283,11 +279,20 @@ async def _apply_replay_merge(
     ]
     for field_name in _NUMERIC_ENRICHMENT:
         incoming = getattr(record, field_name, None)
-        stored_val = stored[field_name]
-        if stored_val is None and incoming is not None:
-            set_clauses.append(f"{field_name} = ${param_idx}")
+        if incoming is not None:
+            set_clauses.append(
+                f"{field_name} = COALESCE({field_name}, ${param_idx})",
+            )
             params.append(incoming)
             param_idx += 1
+
+    # estimated_cost_usd is excluded from enrichment: it is part of the
+    # dedup identity (compared via _decimal_equal at the merge gate).
+    # At this point the stored value is either non-NULL (populated — no
+    # fill needed) or both stored and incoming are NULL (nothing to
+    # fill).  A stored-NULL + incoming-populated cost fails the identity
+    # check and goes to conflict (preserving TestDivergentDuplicate), so
+    # including it in the SET clauses would be unreachable dead code.
 
     if not set_clauses:
         return False

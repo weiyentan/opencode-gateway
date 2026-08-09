@@ -241,31 +241,6 @@ def _mk_todo_payload(
     return defaults
 
 
-def _enrichment_row(
-    *,
-    provider: str | None = None,
-    mode: str | None = None,
-    finish_reason: str | None = None,
-    reasoning_tokens: int | None = None,
-    cache_read_tokens: int | None = None,
-    cache_write_tokens: int | None = None,
-    estimated_cost_usd: Decimal | None = None,
-) -> MagicMock:
-    """Return a mock row for the enrichment query in _apply_replay_merge."""
-    row = MagicMock()
-    row.__getitem__.side_effect = {
-        "id": uuid.uuid4(),
-        "provider": provider,
-        "mode": mode,
-        "finish_reason": finish_reason,
-        "reasoning_tokens": reasoning_tokens,
-        "cache_read_tokens": cache_read_tokens,
-        "cache_write_tokens": cache_write_tokens,
-        "estimated_cost_usd": estimated_cost_usd,
-    }.__getitem__
-    return row
-
-
 # ════════════════════════════════════════════════════════════════════════════
 #  Tests
 # ════════════════════════════════════════════════════════════════════════════
@@ -388,7 +363,7 @@ class TestDuplicateBatchIdempotent:
             existing_model,   # 3. model upsert → existing model
             None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
-            _enrichment_row(),   # 6. enrichment query → no enrichment to fill
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -438,7 +413,7 @@ class TestDuplicateBatchIdempotent:
             existing_model,  # model upsert
             None,            # atomic INSERT → conflict
             existing_dedup,  # dedup query → identical
-            _enrichment_row(),  # enrichment query → no enrichment to fill
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -1245,7 +1220,7 @@ class TestIdempotencyWithSessionResolution:
             existing_model,   # 3. model upsert → existing
             None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
-            _enrichment_row(),  # 6. enrichment query → no enrichment to fill
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3604,7 +3579,8 @@ class TestConcurrentIdenticalRecords:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
         fetchrow_responses.append(existing_dedup_row)  # dedup query → identical
-        fetchrow_responses.append(_enrichment_row())  # enrichment query → no enrichment
+        # _apply_replay_merge no longer queries enrichment individually;
+        # it uses a single atomic COALESCE-based UPDATE instead.
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = fetchrow_responses
@@ -3794,17 +3770,6 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # Enrichment query returns all fields NULL (nothing populated yet)
-        enrichment_row = _enrichment_row(
-            provider=None,
-            mode=None,
-            finish_reason=None,
-            reasoning_tokens=None,
-            cache_read_tokens=None,
-            cache_write_tokens=None,
-            estimated_cost_usd=None,
-        )
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             auth,             # 1. auth
@@ -3812,7 +3777,7 @@ class TestReplayMergeFillAbsent:
             existing_model,   # 3. model upsert
             None,             # 4. atomic INSERT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
-            enrichment_row,   # 6. enrichment query → all NULL
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3875,19 +3840,10 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        enrichment_row = _enrichment_row(
-            provider=None,
-            mode=None,
-            finish_reason=None,
-            reasoning_tokens=None,
-            cache_read_tokens=None,
-            cache_write_tokens=None,
-            estimated_cost_usd=None,
-        )
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3956,12 +3912,10 @@ class TestReplayMergeFillAbsent:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # reasoning_tokens is NULL in stored row → should be filled with 0
-        enrichment_row = _enrichment_row(reasoning_tokens=None)
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4005,6 +3959,130 @@ class TestReplayMergeFillAbsent:
         update_sql = str(enrichment_updates[0])
         assert "reasoning_tokens" in update_sql
 
+    @pytest.mark.asyncio
+    async def test_concurrent_replays_with_differing_enrichment_do_not_overwrite(self, monkeypatch):
+        """Two concurrent replay losers with identical accounting values but
+        differing enrichment payloads must not overwrite each other's writes.
+        The COALESCE-based UPDATE is atomic — each fill lands in its own NULL
+        column and Postgres row-level locking serialises the two UPDATEs, so
+        no populated value is erased."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            existing_model,   # 3. model upsert (record A)
+            None,             # 4. atomic INSERT → conflict (record A, loser)
+            existing_dedup,   # 5. dedup query → identical match
+            # _apply_replay_merge for record A: COALESCE-based UPDATE
+            # Record B:
+            existing_model,   # 6. model upsert (record B)
+            None,             # 7. atomic INSERT → conflict (record B, loser)
+            existing_dedup,   # 8. dedup query → identical match
+            # _apply_replay_merge for record B: COALESCE-based UPDATE
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            schema_version="1.2",
+            records=[
+                {
+                    "source_record_id": "rec-concurrent-fill-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "provider": "openai",
+                },
+                {
+                    "source_record_id": "rec-concurrent-fill-001",  # SAME dedup key
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                    "mode": "chat",
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 2
+        assert data["results"][0]["status"] == "accepted"
+        assert data["results"][1]["status"] == "accepted"
+
+        # Both records should report enrichment applied since each fills a
+        # different NULL column.
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
+        assert "enrichment applied" in (data["results"][1]["reason"] or "")
+
+        # Verify enrichment UPDATEs used COALESCE (the atomic guard)
+        enrichment_updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(call)
+        ]
+        assert len(enrichment_updates) == 2, (
+            f"Expected 2 enrichment UPDATEs (one per record), "
+            f"got {len(enrichment_updates)}"
+        )
+
+        # First UPDATE should use COALESCE for provider
+        update_1_sql = str(enrichment_updates[0])
+        assert "COALESCE" in update_1_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        assert "provider" in update_1_sql
+
+        # Second UPDATE should use COALESCE for mode
+        update_2_sql = str(enrichment_updates[1])
+        assert "COALESCE" in update_2_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        assert "mode" in update_2_sql
+
+        # Neither UPDATE should contain a bare "provider = $" (without COALESCE)
+        # or "mode = $" — the COALESCE wrapper is the invariant guard.
+        import re
+        bare_set = re.compile(
+            r"\b(provider|mode|finish_reason|reasoning_tokens"
+            r"|cache_read_tokens|cache_write_tokens)\s*=\s*\$"
+        )
+        assert not bare_set.search(update_1_sql), (
+            f"UPDATE must not contain bare SET column = $n (COALESCE guard missing): {update_1_sql}"
+        )
+        assert not bare_set.search(update_2_sql), (
+            f"UPDATE must not contain bare SET column = $n (COALESCE guard missing): {update_2_sql}"
+        )
+
 
 class TestReplayMergeNoOverwrite:
     """Replay with identical required values must NOT overwrite populated enrichment fields."""
@@ -4027,20 +4105,10 @@ class TestReplayMergeNoOverwrite:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # Stored record HAS provider="openai" — must NOT be overwritten
-        enrichment_row = _enrichment_row(
-            provider="openai",
-            mode=None,
-            finish_reason=None,
-            reasoning_tokens=None,
-            cache_read_tokens=None,
-            cache_write_tokens=None,
-            estimated_cost_usd=None,
-        )
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4074,17 +4142,29 @@ class TestReplayMergeNoOverwrite:
         data = response.json()["data"]
         assert data["accepted_count"] == 1
         assert data["results"][0]["status"] == "accepted"
-        # Should NOT say "enrichment applied" — provider was already populated
-        assert "enrichment applied" not in (data["results"][0]["reason"] or "")
+        # The enrichment UPDATE is issued (incoming provider is non-NULL),
+        # but COALESCE ensures the populated stored value is preserved.
+        assert "enrichment applied" in (data["results"][0]["reason"] or "")
         assert "idempotent" in (data["results"][0]["reason"] or "").lower()
 
-        # Verify NO enrichment UPDATE was issued
+        # Verify the UPDATE uses COALESCE for provider (the atomic guard
+        # that prevents overwriting stored values)
         enrichment_updates = [
             call for call in mock_conn.execute.call_args_list
             if "UPDATE opencode_usage_records" in str(call)
-            and "provider" in str(call)
         ]
-        assert len(enrichment_updates) == 0
+        assert len(enrichment_updates) == 1
+        update_sql = str(enrichment_updates[0])
+        assert "COALESCE" in update_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        assert "provider" in update_sql
+        # Verify no bare SET column = $n (COALESCE guard is present)
+        import re
+        bare_set = re.compile(r'\bprovider\s*=\s*\$')
+        assert not bare_set.search(update_sql), (
+            f"provider must be guarded by COALESCE, got: {update_sql}"
+        )
 
     @pytest.mark.asyncio
     async def test_replay_fills_absent_but_does_not_overwrite_others(self, monkeypatch):
@@ -4104,20 +4184,10 @@ class TestReplayMergeNoOverwrite:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # Stored record: provider is populated, mode is NULL
-        enrichment_row = _enrichment_row(
-            provider="openai",
-            mode=None,
-            finish_reason=None,
-            reasoning_tokens=None,
-            cache_read_tokens=None,
-            cache_write_tokens=None,
-            estimated_cost_usd=None,
-        )
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4153,15 +4223,28 @@ class TestReplayMergeNoOverwrite:
         assert data["accepted_count"] == 1
         assert "enrichment applied" in (data["results"][0]["reason"] or "")
 
-        # Verify UPDATE includes "mode" but NOT "provider"
+        # Verify UPDATE includes both mode and provider, each guarded by
+        # COALESCE — the COALESCE wrapper is the invariant guard that
+        # prevents overwriting populated values.
         enrichment_updates = [
             call for call in mock_conn.execute.call_args_list
             if "UPDATE opencode_usage_records" in str(call)
-            and "mode" in str(call)
         ]
         assert len(enrichment_updates) == 1
         update_sql = str(enrichment_updates[0])
-        assert "provider" not in update_sql
+        assert "mode" in update_sql
+        assert "provider" in update_sql
+        assert "COALESCE" in update_sql, (
+            "UPDATE must use COALESCE for atomic non-overwriting fill"
+        )
+        # Verify no bare SET column = $n (both have COALESCE guards)
+        import re
+        bare_set = re.compile(
+            r'\b(provider|mode)\s*=\s*\$'
+        )
+        assert not bare_set.search(update_sql), (
+            f"provider/mode must be guarded by COALESCE, got: {update_sql}"
+        )
 
 
 class TestReplayMergeWhitespaceNormalization:
@@ -4185,20 +4268,10 @@ class TestReplayMergeWhitespaceNormalization:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # Stored record: all enrichment fields NULL
-        enrichment_row = _enrichment_row(
-            provider=None,
-            mode=None,
-            finish_reason=None,
-            reasoning_tokens=None,
-            cache_read_tokens=None,
-            cache_write_tokens=None,
-            estimated_cost_usd=None,
-        )
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4260,11 +4333,10 @@ class TestReplayMergeWhitespaceNormalization:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        enrichment_row = _enrichment_row(provider=None)
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4323,11 +4395,10 @@ class TestReplayMergeWhitespaceNormalization:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        enrichment_row = _enrichment_row(finish_reason=None)
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4387,12 +4458,10 @@ class TestReplayMergeWhitespaceNormalization:
             "estimated_cost_usd": Decimal("0.0035"),
         }.__getitem__
 
-        # provider is NULL in stored row
-        enrichment_row = _enrichment_row(provider=None)
-
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = [
-            auth, None, existing_model, None, existing_dedup, enrichment_row,
+            auth, None, existing_model, None, existing_dedup,
+            # _apply_replay_merge uses atomic COALESCE UPDATE — no enrichment SELECT
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
