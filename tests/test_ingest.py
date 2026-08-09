@@ -28,7 +28,6 @@ from httpx import ASGITransport, AsyncClient
 from app.core.factory import create_app
 from app.db.session import get_session
 
-
 # ── Shared test data ────────────────────────────────────────────────────────
 
 _CLIENT_ID = uuid.uuid4()
@@ -108,6 +107,17 @@ def _add_transaction_support(mock_conn: AsyncMock) -> None:
     mock_conn.transaction = MagicMock(return_value=ctx)
 
 
+def _add_quarantine_defaults(mock_conn: AsyncMock) -> None:
+    """Set default return values for quarantine-related mock methods.
+
+    ``is_quarantined()`` uses ``fetchval`` → defaults to ``False``.
+    ``check_quarantine_overlap()`` uses ``fetch`` → defaults to ``[]``.
+    Tests that exercise quarantine routing can override these.
+    """
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_conn.fetch = AsyncMock(return_value=[])
+
+
 def _build_ingest_app(
     mock_conn: AsyncMock,
     *,
@@ -125,6 +135,7 @@ def _build_ingest_app(
     in tests.
     """
     _add_transaction_support(mock_conn)
+    _add_quarantine_defaults(mock_conn)
 
     monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
     monkeypatch.setenv("GATEWAY_ENV", "development")
@@ -188,15 +199,16 @@ def _new_record_side_effect(record_count: int = 1) -> list:
             model_lookup_row,                                  # model lookup
             session_lookup_row,                                # session lookup
             None,                                              # event lookup (no existing)
+            None,                                              # cross-identity check
         ])
     return per_record
 
 
 def _canonical_event_side_effect_items() -> list:
-    """Build the 5 fetchrow items needed for ``_record_canonical_event``.
+    """Build the 6 fetchrow items needed for ``_record_canonical_event``.
 
     Returns: [identity_select_row, identity_insert_row, model_lookup_row,
-              session_lookup_row, event_lookup_row]
+              session_lookup_row, event_lookup_row, cross_identity_check_row]
 
     Each call creates fresh UUIDs so rows are unique per record.
     """
@@ -214,6 +226,7 @@ def _canonical_event_side_effect_items() -> list:
         model_lookup_row,        # model lookup
         session_lookup_row,      # session lookup
         None,                    # event lookup (no existing canonical event)
+        None,                    # cross-identity conflict check (no conflict)
     ]
 
 
@@ -960,7 +973,6 @@ class TestHealthExtended:
         mock_conn4.fetchrow = AsyncMock(return_value=ts_row)
 
         from app.db.session import get_session
-        from app.db.session import DatabasePool
 
         app = create_app(configure_logging=False)
         mock_pool = AsyncMock()
@@ -1225,9 +1237,9 @@ class TestDifferentSourceDbSameExternalId:
     ):
         """Two ingests with the same external session ID but different
         source_database_id produce different internal session UUIDs."""
-        from app.api.ingest import _resolve_session
-
         from decimal import Decimal
+
+        from app.api.ingest import _resolve_session
 
         mock_conn = AsyncMock()
         session_a_id = uuid.uuid4()
@@ -1410,9 +1422,10 @@ class TestResolveSessionConcurrentSafety:
     async def test_concurrent_calls_same_external_id(self, monkeypatch):
         """Two concurrent _resolve_session() calls with the same
         (source_database_id, external_session_id) return the same UUID."""
-        from app.api.ingest import _resolve_session
-        from decimal import Decimal
         import asyncio
+        from decimal import Decimal
+
+        from app.api.ingest import _resolve_session
 
         expected_id = uuid.uuid4()
 
@@ -1499,6 +1512,7 @@ class TestValidationDetailLogging:
         monkeypatch.setenv("GATEWAY_ENV", "development")
 
         import importlib
+
         import app.core.config as _cfg
         importlib.reload(_cfg)
 
@@ -6279,3 +6293,367 @@ class TestIngestBatchFKOrdering:
                 f"ingest_batches INSERT at position {batch_insert_pos} — "
                 f"otherwise the FK constraint would fail on a real database"
             )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Issue #389 — Ingest endpoint: quarantine + conflict routing
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestQuarantinedIdentity:
+    """Records whose resolved canonical identity has an active quarantine
+    resolve to outcome ``quarantined`` — no canonical event created, no
+    session aggregate updated, ingest attempt recorded with full JSONB."""
+
+    @pytest.mark.asyncio
+    async def test_quarantined_identity_returns_quarantined(self, monkeypatch):
+        """A record from a source identity with an active (uncleared) quarantine
+        returns status=quarantined, records an attempt, and creates no canonical event."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        # Build fetchrow side-effects for _process_one_record (winner path)
+        # and the first part of _record_canonical_event (identity resolution).
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        # resolve_canonical_identity: SELECT returns existing identity
+        existing_identity_id = uuid.uuid4()
+        identity_select_row = MagicMock()
+        identity_select_row.__getitem__.side_effect = {
+            "id": existing_identity_id, "canonical_parent_id": None,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,               # 0. auth row
+            None,               # 1. source_database check (new)
+            None,               # 2. model check (new)
+            insert_row,         # 3. atomic INSERT → winner
+            session_row,        # 4. session upsert
+            identity_select_row,  # 5. resolve_canonical_identity: SELECT → existing
+        ]
+
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Override after _build_ingest_app so quarantine check returns True
+        mock_conn.fetchval = AsyncMock(return_value=True)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "quarantined"
+        assert "quarantine" in (data["results"][0]["reason"] or "").lower()
+        # event_id must be None (no canonical event created)
+        assert data["results"][0]["event_id"] is None
+        # attempt_id must be present (attempt recorded)
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Verify a usage_ingest_attempts row was inserted with outcome=quarantined
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+        # Verify the outcome value is "quarantined" in the INSERT params
+        attempt_call_str = str(attempt_inserts[0])
+        assert "quarantined" in attempt_call_str
+
+        # Verify no canonical event INSERT was issued
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 0, (
+            "No canonical event should be created for quarantined records"
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_identity_with_overlap_triggers_quarantine(self, monkeypatch):
+        """When a new source identity has records that overlap with an existing
+        identity (detected via check_quarantine_overlap), a quarantine entry is
+        created and the record returns status=quarantined."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        new_identity_id = uuid.uuid4()
+        identity_insert_row = MagicMock()
+        identity_insert_row.__getitem__.side_effect = {
+            "id": new_identity_id, "canonical_parent_id": None,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                # 0. auth
+            None,                # 1. source_database check (new)
+            None,                # 2. model check (new)
+            insert_row,          # 3. atomic INSERT → winner
+            session_row,         # 4. session upsert
+            None,                # 5. resolve_canonical_identity: SELECT → not found
+            identity_insert_row, # 6. resolve_canonical_identity: INSERT ON CONFLICT RETURNING
+        ]
+
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # check_quarantine_overlap → returns overlap evidence as asyncpg Records
+        overlapping_identity_id = uuid.uuid4()
+        mock_overlap_row = MagicMock()
+        mock_overlap_row.__getitem__.side_effect = {
+            "overlapping_identity_id": overlapping_identity_id,
+            "overlap_count": 3,
+        }.__getitem__
+        mock_conn.fetch = AsyncMock(return_value=[mock_overlap_row])
+        # quarantine_identity call returns a quarantine UUID via fetchrow
+        mock_quarantine_row = MagicMock()
+        mock_quarantine_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow.side_effect = list(mock_conn.fetchrow.side_effect) + [
+            mock_quarantine_row,
+        ]
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "quarantined"
+        assert "quarantine" in (data["results"][0]["reason"] or "").lower()
+        assert data["results"][0]["event_id"] is None
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Verify quarantine INSERT was called (uses fetchrow, not execute)
+        quarantine_inserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO source_identity_quarantine" in str(call)
+        ]
+        assert len(quarantine_inserts) == 1, (
+            "Expected quarantine entry to be created for overlapping identity"
+        )
+
+        # Verify attempt recorded with quarantined outcome
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "quarantined" in str(attempt_inserts[0])
+
+        # Verify no canonical event created
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 0
+
+    @pytest.mark.asyncio
+    async def test_cross_identity_conflict(self, monkeypatch):
+        """When a canonical event exists for a different unresolved identity,
+        the record returns status=conflict with no merge across identities."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row = MagicMock()
+        insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        our_identity_id = uuid.uuid4()
+        identity_select_row = MagicMock()
+        identity_select_row.__getitem__.side_effect = {
+            "id": our_identity_id, "canonical_parent_id": None,
+        }.__getitem__
+
+        model_lookup_row = MagicMock()
+        model_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        # cross-identity check: event exists under a DIFFERENT identity
+        different_identity_id = uuid.uuid4()
+        cross_event_row = MagicMock()
+        cross_event_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "canonical_source_identity_id": different_identity_id,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                # 0. auth
+            None,                # 1. source_database check
+            None,                # 2. model check (new)
+            insert_row,          # 3. atomic INSERT → winner
+            session_row,         # 4. session upsert
+            identity_select_row, # 5. resolve_canonical_identity: SELECT → existing
+            model_lookup_row,    # 6. model lookup
+            session_lookup_row,  # 7. session lookup
+            None,                # 8. event lookup (our identity → no event)
+            cross_event_row,     # 9. cross-identity check → other identity has it!
+        ]
+
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "conflict"
+        assert "cross-identity" in (data["results"][0]["reason"] or "").lower()
+        assert data["results"][0]["event_id"] is None
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Verify attempt recorded with conflict outcome
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "conflict" in str(attempt_inserts[0])
+
+        # Verify no canonical event INSERT
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 0, (
+            "No canonical event should be created for conflict records"
+        )
+
+
+class TestReplayBatchQuarantinedIdentity:
+    """A replay batch arriving for an event whose source identity is
+    quarantined quarantines every record in the batch independently."""
+
+    @pytest.mark.asyncio
+    async def test_replay_batch_all_records_quarantined(self, monkeypatch):
+        """When a replay batch has 2 records for a quarantined identity,
+        both resolve to quarantined independently (no partial acceptance)."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        existing_identity_id = uuid.uuid4()
+        # Two records, both from the same quarantined identity
+        session_row = MagicMock()
+        session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_1 = MagicMock()
+        insert_row_1.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        insert_row_2 = MagicMock()
+        insert_row_2.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        # resolve_canonical_identity called twice (once per record), returns same identity
+        identity_select_row = MagicMock()
+        identity_select_row.__getitem__.side_effect = {
+            "id": existing_identity_id, "canonical_parent_id": None,
+        }.__getitem__
+
+        # Per record: model(None), insert(row), session(row), identity_select(row)
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                # 0. auth
+            None,                # 1. sd check
+            # Record 0
+            None,                # 2. model rec-0 → new
+            insert_row_1,        # 3. atomic INSERT rec-0 → winner
+            session_row,         # 4. session upsert rec-0
+            identity_select_row, # 5. resolve_canonical_identity rec-0 → existing
+            # Record 1
+            None,                # 6. model rec-1 → new
+            insert_row_2,        # 7. atomic INSERT rec-1 → winner
+            session_row,         # 8. session upsert rec-1
+            identity_select_row, # 9. resolve_canonical_identity rec-1 → existing
+        ]
+
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # Both records see the identity as quarantined
+        mock_conn.fetchval = AsyncMock(return_value=True)
+
+        payload = _valid_ingest_payload(
+            records=[
+                {
+                    "source_record_id": "rec-replay-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+                {
+                    "source_record_id": "rec-replay-002",
+                    "session_id": str(uuid.uuid4()),
+                    "model": "gpt-4",
+                    "input_tokens": 200,
+                    "output_tokens": 75,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0070",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        # Both records quarantined — none accepted
+        assert data["accepted_count"] == 0
+        assert data["rejected_count"] == 2
+        assert data["results"][0]["status"] == "quarantined"
+        assert data["results"][1]["status"] == "quarantined"
+
+        # Both records have attempt_id but no event_id
+        assert data["results"][0]["attempt_id"] is not None
+        assert data["results"][0]["event_id"] is None
+        assert data["results"][1]["attempt_id"] is not None
+        assert data["results"][1]["event_id"] is None
+
+        # Verify 2 attempt INSERTs, both with quarantined outcome
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 2
+        for call in attempt_inserts:
+            assert "quarantined" in str(call)
+
+        # Verify NO canonical events created
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 0
