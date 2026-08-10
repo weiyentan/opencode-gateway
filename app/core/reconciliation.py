@@ -542,11 +542,18 @@ async def scan_duplicate_groups(
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> list[list[asyncpg.Record]]:
-    """Scan usage_events for duplicate source_record_id groups.
+    """Scan usage_events for duplicate (canonical_source_identity_id, source_record_id) groups.
 
     Returns a list of groups — each group is a list of ``usage_events``
-    rows sharing the same ``source_record_id`` within the filter window.
-    Only groups with >1 row are returned.
+    rows sharing the same ``(canonical_source_identity_id, source_record_id)``
+    within the filter window.  Only groups with >1 row are returned.
+
+    Groups are scoped per canonical source identity (the table's unique
+    key), so an unfiltered scan never merges events across different
+    clients/tenants.  ``source_record_id`` is collector-furnished and not
+    globally unique; without the identity key, two clients that happen to
+    share a record ID would have their events merged and one client's
+    events deleted — a cross-tenant data-integrity issue.
 
     Filtering:
     - ``client_id``: optional — when provided, scans only that client's events.
@@ -579,22 +586,28 @@ async def scan_duplicate_groups(
         SELECT ue.*
         FROM usage_events ue
         JOIN (
-            SELECT source_record_id
+            SELECT ue2.canonical_source_identity_id, ue2.source_record_id
             FROM usage_events ue2
             WHERE {where_clause.replace('ue.', 'ue2.')}
-            GROUP BY source_record_id
+            GROUP BY ue2.canonical_source_identity_id, ue2.source_record_id
             HAVING COUNT(*) > 1
-        ) dup ON ue.source_record_id = dup.source_record_id
+        ) dup ON ue.canonical_source_identity_id = dup.canonical_source_identity_id
+              AND ue.source_record_id = dup.source_record_id
         WHERE {where_clause}
-        ORDER BY ue.source_record_id, ue.first_ingested_at, ue.id
+        ORDER BY ue.canonical_source_identity_id, ue.source_record_id,
+                 ue.first_ingested_at, ue.id
         """,
         *params,
     )
 
-    # Group rows by source_record_id
-    groups: dict[str, list[asyncpg.Record]] = {}
+    # Group rows by (canonical_source_identity_id, source_record_id) —
+    # scoped per identity so a client_id-less scan NEVER merges events
+    # across tenants.
+    groups: dict[tuple[uuid.UUID, str], list[asyncpg.Record]] = {}
     for row in rows:
-        groups.setdefault(row["source_record_id"], []).append(row)
+        groups.setdefault(
+            (row["canonical_source_identity_id"], row["source_record_id"]), []
+        ).append(row)
 
     return list(groups.values())
 

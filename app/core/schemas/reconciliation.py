@@ -14,10 +14,15 @@ from pydantic import BaseModel, Field, model_validator
 class ReconcileRequest(BaseModel):
     """Request body for triggering historical usage reconciliation.
 
-    Scans ``usage_events`` for duplicate ``source_record_id`` values within
+    Scans ``usage_events`` for duplicate
+    ``(canonical_source_identity_id, source_record_id)`` values within
     the specified client/date range, deterministically selects the canonical
     row per group, and either previews (``dry_run: true``) or performs
     (``dry_run: false``) the reconciliation.
+
+    Duplicate groups are scoped per canonical source identity (the table's
+    unique key), so an unfiltered (no ``client_id``) scan never merges
+    events across different clients — each identity's groups are isolated.
     """
 
     dry_run: bool = Field(description="If true, preview only — no data is modified")
