@@ -49,6 +49,86 @@ class TestFrontendFilesExist:
         assert "OpenCode Gateway Observability" in content
 
 
+class TestMergedDashboardView:
+    """The dashboard renders ONE merged Sessions + Agent Runs table (issue #402).
+
+    The separate Sessions panel/tab was merged into the Agent Runs table,
+    which is driven by /api/v1/usage/agent-runs (a superset: session_title,
+    model, currentStatus, token breakdown, total_estimated_cost_usd) with
+    the /agent-runs/{id} detail overlay.  The frontend sessions fetch and
+    SESSION_LIMIT are gone from the dashboard; the backend /sessions
+    endpoint remains untouched (presentation-only merge).
+    """
+
+    def test_merged_table_exists_in_markup(self):
+        """index.html carries the merged table id and tbody."""
+        content = (FRONTEND_DIR / "index.html").read_text()
+        assert 'id="agent-runs-table"' in content, (
+            "merged table must carry id=\"agent-runs-table\""
+        )
+        assert 'id="agent-runs-tbody"' in content, (
+            "merged table must render into #agent-runs-tbody"
+        )
+
+    def test_sessions_panel_removed_from_markup(self):
+        """The separate Sessions panel/tab/table is removed from the dashboard."""
+        content = (FRONTEND_DIR / "index.html").read_text()
+        assert "sessions-table" not in content, (
+            "#sessions-table must be removed (merged into #agent-runs-table)"
+        )
+        assert "sessions-tbody" not in content, (
+            "#sessions-tbody must be removed"
+        )
+        assert 'data-tab="sessions"' not in content, (
+            "the Sessions top-nav tab must be removed"
+        )
+        assert 'id="tab-sessions"' not in content, (
+            "the #tab-sessions panel must be removed"
+        )
+
+    def test_app_js_drops_sessions_fetch_and_session_limit(self):
+        """The dashboard no longer fetches /api/v1/usage/sessions."""
+        content = (FRONTEND_DIR / "app.js").read_text()
+        # The fetch is gone: no apiFetch call targets the sessions endpoint
+        # (comments may still reference the URL to document the removal).
+        assert "apiFetch('/api/v1/usage/sessions" not in content, (
+            "the frontend sessions fetch must be dropped from the dashboard"
+        )
+        assert "/api/v1/usage/sessions?" not in content, (
+            "the frontend sessions fetch URL must be dropped from the dashboard"
+        )
+        assert "SESSION_LIMIT" not in content, (
+            "SESSION_LIMIT must be removed with the sessions fetch"
+        )
+        assert "/api/v1/usage/agent-runs" in content, (
+            "the merged table stays driven by /api/v1/usage/agent-runs"
+        )
+
+    def test_app_js_merged_table_uses_shared_token_breakdown(self):
+        """The merged table renders tokens via the shared compact formatter."""
+        content = (FRONTEND_DIR / "app.js").read_text()
+        assert "fmtTokenBreakdownCompact" in content, (
+            "the shared compact Token Breakdown formatter must remain in use"
+        )
+        assert "fmtAgentRunTokens" in content, (
+            "the agent-runs token cell delegates to the shared formatter"
+        )
+
+    def test_app_js_current_status_semantics(self):
+        """The status badge uses currentStatus semantics (active-badge gone)."""
+        content = (FRONTEND_DIR / "app.js").read_text()
+        assert "currentStatus" in content, (
+            "the merged table status column must use currentStatus semantics"
+        )
+        assert "statusBadgeClass" in content, (
+            "statusBadgeClass must remain the badge resolver"
+        )
+        assert "badge-active" not in content and "data-active" not in content, (
+            "the sessions active-badge heuristic must be removed"
+        )
+
+
+
 class TestNginxProxyConfiguration:
     """The frontend nginx.conf must proxy API paths to the Gateway backend.
 

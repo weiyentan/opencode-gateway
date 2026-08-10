@@ -13,7 +13,6 @@
     10
   ) || 30000; // 30s default; override via <meta name="refresh-interval" content="...">
   const RECORD_LIMIT = 100;
-  const SESSION_LIMIT = 20;
   const CLIENT_LIMIT = 100;
   /**
    * Client metadata cache expiry policy: the client_id → name map is fetched
@@ -23,11 +22,6 @@
    * background refresh at any time (see ensureClientName).
    */
   const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
-  /** Session is considered "active" if last_message_at is within this window.
-   *  This is a heuristic — long-running but infrequent sessions may be
-   *  incorrectly marked as "ended", and very recent sessions that have
-   *  completed may briefly show as "active". */
-  const SESSION_ACTIVE_WINDOW_MS = 3600000; // 1 hour
   const AGENT_RUN_LIMIT = 50;
 
   // ── Element refs ───────────────────────────────────────────────────────
@@ -61,9 +55,8 @@
     collectorDist:  $('collector-dist-chart'),
     collectorsTbody: $('collectors-tbody'),
     agentsTbody:    $('agents-tbody'),
-    sessionsTbody:  $('sessions-tbody'),
 
-    // Agent Runs
+    // Agent Runs — merged Sessions + Agent Runs table (issue #402)
     arTbody:        $('agent-runs-tbody'),
     arFilterFrom:   $('ar-filter-from'),
     arFilterTo:     $('ar-filter-to'),
@@ -78,12 +71,6 @@
     // Client/Project
     cpTbody:         $('cp-tbody'),
     cpPanelSubtitle: $('cp-panel-subtitle'),
-
-    // Session detail
-    sdDetailOverlay: $('sd-detail-overlay'),
-    sdDetailTitle:   $('sd-detail-title'),
-    sdDetailBody:    $('sd-detail-body'),
-    sdDetailClose:   $('sd-detail-close'),
 
     // Date range bar
     drPreset:       $('dr-preset'),
@@ -122,18 +109,20 @@
   // Which fetch endpoint keys feed each panel — used to resolve a panel to
   // 'stale' when any of its endpoints failed in the current refresh cycle.
   // 'agentRuns' maps to the agentRunsFetchError channel (fetched separately).
+  // The merged Sessions + Agent Runs view (issue #402) reads the Sessions KPI
+  // from the aggregates total row and the events feed from the agent-runs
+  // channel; the /api/v1/usage/sessions endpoint is no longer fetched.
   const PANEL_ENDPOINTS = {
     'kpi-tokens':     ['aggTotal'],
     'kpi-cost':       ['aggTotal'],
-    'kpi-sessions':   ['sessions'],
+    'kpi-sessions':   ['aggTotal'],
     'kpi-collectors': ['health'],
     'kpi-source-dbs': ['health'],
     'model-mix':     ['aggByModel'],
-    events:          ['health', 'sessions'],
+    events:          ['health', 'agentRuns'],
     'collector-dist': ['health'],
     collectors:      ['health'],
     agents:          ['aggByModel', 'health'],
-    sessions:        ['sessions'],
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
   };
@@ -478,18 +467,6 @@
     return String(id).substring(0, 8);
   }
 
-  /** Format a compact Token Breakdown HTML string.
-   *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
-   *  @param {number|null} inputTokens
-   *  @param {number|null} outputTokens
-   *  @param {number|null} cacheReadTokens
-   *  @param {number|null} cacheWriteTokens
-   *  @returns {string} HTML for the cell content
-   */
-  function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
-    return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
-  }
-
   /** Format a compact multi-line Token Breakdown HTML string.
    *  Flat two-line breakdown with optional cache line:
    *    {total} total
@@ -751,12 +728,15 @@
         : Promise.resolve(null);
 
       // Parallel fetches
-      const [health, aggTotal, aggByModel, sessions, records, clients, agentRuns, aggClientProjectResult] =
+      // The /api/v1/usage/sessions fetch was dropped in the merged
+      // Sessions + Agent Runs view (issue #402): the merged table is driven
+      // by the agent-runs endpoint (a superset), and the Sessions KPI reads
+      // the aggregates total row's session_count.
+      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
-          apiFetch('/api/v1/usage/sessions?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + SESSION_LIMIT),
           apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
           clientsPromise,
           apiFetch(arUrl),
@@ -766,7 +746,6 @@
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
       results.aggTotal  = aggTotal.status  === 'fulfilled' ? aggTotal.value  : null;
       results.aggByModel= aggByModel.status=== 'fulfilled' ? aggByModel.value: null;
-      results.sessions  = sessions.status  === 'fulfilled' ? sessions.value  : null;
       results.records   = records.status   === 'fulfilled' ? records.value   : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
@@ -777,7 +756,6 @@
       if (health.status    !== 'fulfilled') fetchErrors.health    = health.reason?.message    || 'Health check failed';
       if (aggTotal.status  !== 'fulfilled') fetchErrors.aggTotal  = aggTotal.reason?.message  || 'Aggregates (total) failed';
       if (aggByModel.status!== 'fulfilled') fetchErrors.aggByModel= aggByModel.reason?.message|| 'Aggregates (by model) failed';
-      if (sessions.status  !== 'fulfilled') fetchErrors.sessions  = sessions.reason?.message  || 'Sessions query failed';
       if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
@@ -854,7 +832,7 @@
     }
   }
 
-  /** KPI Row — per-card freshness so a single failing endpoint (e.g. sessions)
+  /** KPI Row — per-card freshness so a single failing endpoint (e.g. aggTotal)
    *  never freezes the entire row (issue N2). */
   function renderKPIs(data) {
     // Apply per-card freshness labels (replaces the old row-level label)
@@ -892,10 +870,14 @@
       }
     }
 
-    // Sessions from sessions API — gated on kpi-sessions card freshness
+    // Sessions from the aggregates total row — gated on kpi-sessions card
+    // freshness.  The merged Sessions + Agent Runs view (issue #402) no
+    // longer fetches /api/v1/usage/sessions; the aggregates total row already
+    // carries the range-scoped COUNT(DISTINCT session_id), so the KPI keeps
+    // its date-range semantics from an already-fetched endpoint.
     if (shouldRenderPanel(panelStates, 'kpi-sessions')) {
-      if (data.sessions) {
-        els.kpiSessions.textContent = fmtNum(data.sessions.total || 0);
+      if (data.aggTotal && data.aggTotal.length > 0) {
+        els.kpiSessions.textContent = fmtNum(data.aggTotal[0].session_count || 0);
       }
     }
 
@@ -1027,17 +1009,18 @@
       });
     }
 
-    // Also add high-token sessions as alerts
-    if (data.sessions && data.sessions.items) {
-      data.sessions.items.slice(0, 5).forEach(function (s) {
-        var tokens = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
+    // Also add high-usage agent runs as alerts (merged view, issue #402:
+    // the agent-runs response supersedes the dropped sessions fetch)
+    if (data.agentRuns && data.agentRuns.items) {
+      data.agentRuns.items.slice(0, 5).forEach(function (r) {
+        var tokens = (r.total_input_tokens || 0) + (r.total_output_tokens || 0);
         if (tokens > 100000) {
-          var label = ensureClientName(s.client_id) || s.client_id;
+          var label = ensureClientName(r.client_id) || r.client_id;
           events.push({
             type: 'info',
             icon: '\uD83D\uDCCA',  // 📊
-            text: 'High-usage session: <strong>' + escHtml(label) + '</strong> — ' + fmtNum(tokens) + ' tokens',
-            time: s.last_message_at || now
+            text: 'High-usage run: <strong>' + escHtml(label) + '</strong> — ' + fmtNum(tokens) + ' tokens',
+            time: r.last_updated_at || now
           });
         }
       });
@@ -1171,75 +1154,16 @@
     els.agentsTbody.innerHTML = html;
   }
 
-  /** Build a single session row <tr> HTML string (extracted for testability).
-   *  Balanced Quiet Rows: activity is communicated through the compact
-   *  outlined badge in the Status column (Badge Only) — the row itself carries
-   *  no status-driven visual treatment. Titles render in full inside a
-   *  .session-title span so CSS can ellipsis-clip them in the flexible title
-   *  column; the hard 40-char JS truncation is gone.
-   *  @param {object} s - session summary object from the API
-   *  @param {string} clientName - resolved client display name
-   *  @param {number} [now] - reference timestamp (defaults to Date.now()); exposed for deterministic tests
-   *  @returns {string} <tr> HTML with data-active, data-status, class="session-row", data-id, and three .num cells
-   */
-  function buildSessionRowHtml(s, clientName, now) {
-    var cost = s.total_estimated_cost_usd;
-    var duration = fmtDuration(s.first_message_at, s.last_message_at);
-    var title = s.session_title || '--';
-    var ts = now != null ? now : Date.now();
-    var isActive = s.last_message_at && (ts - new Date(s.last_message_at).getTime()) < SESSION_ACTIVE_WINDOW_MS;
-    var rowStatus = isActive ? 'active' : 'idle';
-
-    return '<tr class="session-row" data-id="' + s.id + '" tabindex="0" data-active="' + (isActive ? 'true' : 'false') + '" data-status="' + rowStatus + '">' +
-      '<td data-label="Client">' + escHtml(clientName) + '</td>' +
-      '<td class="session-title-col" data-label="Session Title" title="' + escHtml(title) + '"><span class="session-title">' + escHtml(title) + '</span></td>' +
-      '<td class="sess-col-low" data-label="First Message">' + fmtDT(s.first_message_at) + '</td>' +
-      '<td data-label="Last Message">' + fmtDT(s.last_message_at) + '</td>' +
-      '<td class="sess-col-low" data-label="Duration">' + duration + '</td>' +
-      '<td class="sess-col-low" data-label="Messages"><span class="num">' + (s.message_count || 0) + '</span></td>' +
-      '<td class="sess-col-low" data-label="Tokens"><span class="num">' + fmtTokenBreakdown(s.total_input_tokens, s.total_output_tokens, s.total_cache_read_tokens, s.total_cache_write_tokens) + '</span></td>' +
-      '<td data-label="Cost"><span class="num">' + fmtCost(cost) + '</span></td>' +
-      '<td data-label="Status">' + badge(isActive ? 'active' : 'ended', isActive ? 'badge-active' : 'badge-inactive').outerHTML + '</td>' +
-      '</tr>';
-  }
-
-  /** Recent Sessions */
-  function renderSessionsTable(data) {
-    applyPanelFreshness('sessions');
-    if (!shouldRenderPanel(panelStates, 'sessions')) return; // failed fetch → keep previous rows
-
-    if (!data.sessions || !data.sessions.items || data.sessions.items.length === 0) {
-      els.sessionsTbody.innerHTML = '<tr><td colspan="9" class="empty-state">No sessions found' + errorIndicator('sessions') + '</td></tr>';
-      return;
-    }
-
-    var html = '';
-    data.sessions.items.forEach(function (s) {
-      var clientName = ensureClientName(s.client_id) || (typeof s.client_id === 'string' ? s.client_id.substring(0, 8) : '--');
-      html += buildSessionRowHtml(s, clientName);
-    });
-
-    els.sessionsTbody.innerHTML = html;
-
-    // Attach click handlers for session detail view
-    var sessionRows = els.sessionsTbody.querySelectorAll('.session-row');
-    sessionRows.forEach(function (row) {
-      row.addEventListener('click', function () {
-        var id = row.getAttribute('data-id');
-        if (id) openSessionDetail(id);
-      });
-      // Keyboard activation: Enter or Space on a focused row opens the detail overlay
-      row.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          var id = row.getAttribute('data-id');
-          if (id) openSessionDetail(id);
-        }
-      });
-    });
-  }
-
-  /** Agent Runs Table */
+  /** Agent Runs Table — the merged Sessions + Agent Runs dashboard table
+   *  (issue #402).  Driven by /api/v1/usage/agent-runs (a superset of the
+   *  sessions list: session_title, model, currentStatus, token breakdown,
+   *  total_estimated_cost_usd); rows open the /agent-runs/{id} detail
+   *  overlay.  The separate sessions table, its /sessions fetch, and the
+   *  active/idle badge heuristic are gone — status renders from the run's
+   *  currentStatus semantics (falling back to status) via statusBadgeClass.
+   *  Cells carry the responsive hooks: data-label on every cell (≤760px
+   *  stacked rows) and ar-col-low on the low-priority columns hidden at
+   *  761–1024px tablet widths. */
   function renderAgentRunsTable(data) {
     applyPanelFreshness('agent-runs');
     if (!shouldRenderPanel(panelStates, 'agent-runs')) return; // failed fetch → keep previous rows
@@ -1260,29 +1184,37 @@
       var statusCls = statusBadgeClass(r.currentStatus || r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
 
-      html += '<tr class="ar-row" data-id="' + r.id + '">' +
-        '<td class="clickable ar-title">' + escHtml(displayTitle) + '</td>' +
-        '<td>' + badge(r.currentStatus || r.status, statusCls).outerHTML + '</td>' +
-        '<td>' + escHtml(r.agent || '--') + '</td>' +
-        '<td>' + fmtModel(r.model) + '</td>' +
-        '<td>' + escHtml(projectStr) + '</td>' +
-        '<td>' + todoProgress + '</td>' +
-        '<td>' + fmtCodeChanges(r.code_changes_total) + '</td>' +
-        '<td>' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
-        '<td>' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
-        '<td>' + fmtRelative(r.last_updated_at) + '</td>' +
-        '<td>' + (r.child_run_count || 0) + '</td>' +
+      html += '<tr class="ar-row" data-id="' + r.id + '" tabindex="0">' +
+        '<td class="clickable ar-title" data-label="Title">' + escHtml(displayTitle) + '</td>' +
+        '<td data-label="Status">' + badge(r.currentStatus || r.status, statusCls).outerHTML + '</td>' +
+        '<td class="ar-col-low" data-label="Agent">' + escHtml(r.agent || '--') + '</td>' +
+        '<td data-label="Model">' + fmtModel(r.model) + '</td>' +
+        '<td data-label="Project / Worktree">' + escHtml(projectStr) + '</td>' +
+        '<td class="ar-col-low" data-label="Todo">' + todoProgress + '</td>' +
+        '<td class="ar-col-low" data-label="Files">' + fmtCodeChanges(r.code_changes_total) + '</td>' +
+        '<td data-label="Cost">' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
+        '<td data-label="Tokens">' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
+        '<td data-label="Last Updated">' + fmtRelative(r.last_updated_at) + '</td>' +
+        '<td class="ar-col-low" data-label="Children">' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
     });
 
     els.arTbody.innerHTML = html;
 
-    // Attach click handlers for detail view
+    // Attach click + keyboard handlers for the detail overlay
     var rows = els.arTbody.querySelectorAll('.ar-row');
     rows.forEach(function (row) {
       row.addEventListener('click', function () {
         var id = row.getAttribute('data-id');
         if (id) openAgentRunDetail(id);
+      });
+      // Keyboard activation: Enter or Space on a focused row opens the detail overlay
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var id = row.getAttribute('data-id');
+          if (id) openAgentRunDetail(id);
+        }
       });
     });
   }
@@ -1575,116 +1507,6 @@
     els.arDetailBody.innerHTML = html;
   }
 
-  /** Fetch and display session detail */
-  async function openSessionDetail(sessionId) {
-    els.sdDetailOverlay.classList.add('visible');
-    els.sdDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
-    els.sdDetailTitle.textContent = 'Session Detail';
-
-    try {
-      var data = await apiFetch('/api/v1/usage/agent-runs/' + encodeURIComponent(sessionId));
-      renderSessionDetail(data);
-    } catch (e) {
-      els.sdDetailBody.innerHTML = '<p class="empty-state">Failed to load detail: ' + escHtml(e.message) + '</p>';
-      console.error('Session detail fetch error:', e);
-    }
-  }
-
-  /** Close the session detail overlay */
-  function closeSessionDetail() {
-    els.sdDetailOverlay.classList.remove('visible');
-  }
-
-  /** Render Session Detail Panel */
-  function renderSessionDetail(d) {
-    if (!d) {
-      els.sdDetailBody.innerHTML = '<p class="empty-state">No detail data available</p>';
-      return;
-    }
-
-    els.sdDetailTitle.textContent = escHtml(d.title || 'Session Detail');
-
-    var duration = fmtDuration(d.first_message_at, d.last_message_at);
-    var projectStr = fmtProjectLabel(d);
-
-    // Extract session context fields
-    var ctx = d.session_context || {};
-    var model = ctx.session_model || '--';
-    var additions = ctx.code_change_additions != null ? Number(ctx.code_change_additions) : 0;
-    var deletions = ctx.code_change_deletions != null ? Number(ctx.code_change_deletions) : 0;
-    var netChange = additions - deletions;
-    var netLabel = netChange >= 0 ? '+' + fmtNum(netChange) : fmtNum(netChange);
-
-    var html = '';
-
-    // ── Project ──
-    html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Project</div>' +
-      '<div class="detail-grid">' +
-        fieldHtml('Project / Worktree', escHtml(projectStr)) +
-        fieldHtml('Source Directory', escHtml(ctx.source_directory || '--')) +
-      '</div></div>';
-
-    // ── Code Changes ──
-    html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Code Changes</div>' +
-      '<div class="detail-grid">' +
-        fieldHtml('Files Changed', fmtCodeChanges(d.code_changes_total)) +
-        fieldHtml('Additions', fmtNum(additions || 0)) +
-        fieldHtml('Deletions', fmtNum(deletions || 0)) +
-        fieldHtml('Net Change', netLabel) +
-      '</div></div>';
-
-    // ── Todos ──
-    html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
-    if (d.todo_rows && d.todo_rows.length > 0) {
-      html += '<div class="detail-todo-list">';
-      d.todo_rows.forEach(function (t) {
-        var iconCls = t.status || 'pending';
-        var iconMap = { completed: '\u2713', blocked: '\u2717', in_progress: '\u25D4', pending: '\u25CB' };
-        var icon = iconMap[iconCls] || '\u25CB';
-        var priorityMark = t.priority
-          ? ' <span class="detail-todo-priority">[' + escHtml(t.priority) + ']</span>'
-          : '';
-        html += '<div class="detail-todo-item">' +
-          '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
-          '<span>' + escHtml(t.description) + priorityMark + '</span>' +
-          '</div>';
-      });
-      html += '</div>';
-    } else {
-      html += '<div class="detail-field-value" style="color:var(--text-muted)">No todos recorded</div>';
-    }
-    html += '</div>';
-
-    // ── Session Metadata ──
-    html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Session Metadata</div>' +
-      '<div class="detail-grid">' +
-        fieldHtml('Model', escHtml(model)) +
-        fieldHtml('Agent', escHtml(d.agent || '--')) +
-        fieldHtml('Duration', duration) +
-        fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
-        fieldHtml('First Message', fmtDT(d.first_message_at)) +
-        fieldHtml('Last Message', fmtDT(d.last_message_at)) +
-        fieldHtml('Input Tokens', fmtNum(d.total_input_tokens)) +
-        fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
-        fieldHtml('Cache Read Tokens', fmtNum(d.total_cache_read_tokens)) +
-        fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
-        fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
-      '</div></div>';
-
-    // ── Drill-down Link ──
-    if (d.loki_search_url) {
-      html += '<div class="detail-section">' +
-        '<a href="' + escHtml(d.loki_search_url) + '" target="_blank" rel="noopener" class="detail-loki-link">' +
-        '\u2197 Open in Grafana Explore</a></div>';
-    }
-
-    els.sdDetailBody.innerHTML = html;
-  }
-
   /** Helper: build a detail grid field row */
   function fieldHtml(label, value) {
     return '<div class="detail-field">' +
@@ -1793,7 +1615,6 @@
       renderCollectorDistribution(data);
       renderCollectorsTable(data);
       renderAgentsTable(data);
-      renderSessionsTable(data);
       renderAgentRunsTable(data.agentRuns);
       renderClientProjectBreakdown(data);
     } catch (e) {
@@ -1871,29 +1692,12 @@
       });
     }
 
-    // Session detail close button
-    if (els.sdDetailClose) {
-      els.sdDetailClose.addEventListener('click', closeSessionDetail);
-    }
-
-    // Session detail overlay click to close
-    if (els.sdDetailOverlay) {
-      els.sdDetailOverlay.addEventListener('click', function (e) {
-        if (e.target === els.sdDetailOverlay) {
-          closeSessionDetail();
-        }
-      });
-    }
-
-    // ESC key to close any open overlay
+    // ESC key closes the agent run detail overlay
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') {
-        if (els.sdDetailOverlay && els.sdDetailOverlay.classList.contains('visible')) {
-          closeSessionDetail();
-        } else if (els.arDetailOverlay && els.arDetailOverlay.classList.contains('visible')) {
-          els.arDetailOverlay.classList.remove('visible');
-          agentRunDetail = null;
-        }
+      if (e.key === 'Escape' &&
+          els.arDetailOverlay && els.arDetailOverlay.classList.contains('visible')) {
+        els.arDetailOverlay.classList.remove('visible');
+        agentRunDetail = null;
       }
     });
 
@@ -2018,7 +1822,6 @@
 
   // Expose for tests
   window.resolveProjectLabel = resolveProjectLabel;
-  window.buildSessionRowHtml = buildSessionRowHtml;
   window.createClientCache = createClientCache;
   window.ensureClientName = ensureClientName;
   window.refreshClientCache = refreshClientCache;

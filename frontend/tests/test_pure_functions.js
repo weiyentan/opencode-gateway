@@ -13,11 +13,11 @@ if (typeof window === 'undefined') {
 }
 
 // Load the REAL production functions from frontend/app.js.
-// app.js runs as an IIFE that exposes resolveProjectLabel and
-// buildSessionRowHtml on window.  Evaluating it inside a Node vm sandbox
-// (with a minimal DOM stub) means these tests exercise the production code
-// itself — not a copy-pasted duplicate — so the rendered session-row markup
-// is guaranteed to match what the real dashboard renders.
+// app.js runs as an IIFE that exposes resolveProjectLabel and the pure
+// helpers on window.  Evaluating it inside a Node vm sandbox (with a
+// minimal DOM stub) means these tests exercise the production code
+// itself — not a copy-pasted duplicate — so the rendered markup and
+// helpers are guaranteed to match what the real dashboard renders.
 var fs = require('fs');
 var vm = require('vm');
 var path = require('path');
@@ -73,7 +73,6 @@ var pendingAsyncBlocks = 0;
   vm.runInContext(source, sandbox, { filename: 'app.js' });
 
   window.resolveProjectLabel = sandboxWindow.resolveProjectLabel;
-  window.buildSessionRowHtml = sandboxWindow.buildSessionRowHtml;
   window.createClientCache = sandboxWindow.createClientCache;
   window.ensureClientName = sandboxWindow.ensureClientName;
   window.refreshClientCache = sandboxWindow.refreshClientCache;
@@ -199,18 +198,6 @@ function truncate(str, maxLen) {
 function shortUUID(id) {
   if (!id) return '--';
   return String(id).substring(0, 8);
-}
-
-/** Format a compact Token Breakdown HTML string.
- *  Delegates to fmtTokenBreakdownCompact for the shared compact format.
- *  @param {number|null} inputTokens
- *  @param {number|null} outputTokens
- *  @param {number|null} cacheReadTokens
- *  @param {number|null} cacheWriteTokens
- *  @returns {string} HTML for the cell content
- */
-function fmtTokenBreakdown(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
-  return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
 }
 
 /** Format a compact multi-line Token Breakdown HTML string.
@@ -946,39 +933,6 @@ assert(stripExpandIcon('  ') === '', 'whitespace only → empty');
   assert(result['Client A'] === true, 'Client A expanded despite duplicate name');
 })();
 
-// ── Tests for fmtTokenBreakdown ─────────────────────────────────────────
-
-console.log('\u25B6 fmtTokenBreakdown');
-
-// Delegates to fmtTokenBreakdownCompact; verify the flat two-line + optional cache line format
-assert(fmtTokenBreakdown(0, 0, 0, 0) === '0 total<br>0 in | 0 out', 'all zeros, no cache line');
-assert(fmtTokenBreakdown(null, null, null, null) === '0 total<br>0 in | 0 out', 'all nulls, no cache line');
-assert(fmtTokenBreakdown(undefined, undefined, undefined, undefined) === '0 total<br>0 in | 0 out', 'all undefined, no cache line');
-
-(function () {
-  var result = fmtTokenBreakdown(60000, 36500, 120400, 8200);
-  // total=225.1K (input + output + cacheRead + cacheWrite)
-  assert(result === '225.1K total<br>60.0K in | 36.5K out<br>120.4K cache read + 8.2K cache write', 'full breakdown with cache read + write — flat two-line + cache line');
-})();
-
-assert(fmtTokenBreakdown(100000, 50000, 0, 0) === '150.0K total<br>100.0K in | 50.0K out', 'cache zero both → no cache line');
-assert(fmtTokenBreakdown(100000, 50000, null, null) === '150.0K total<br>100.0K in | 50.0K out', 'cache null both → no cache line');
-
-(function () {
-  var result = fmtTokenBreakdown(1000, 2000, 3000, 0);
-  // total=6.0K (input + output + cacheRead + cacheWrite)
-  assert(result === '6.0K total<br>1.0K in | 2.0K out<br>3.0K cache read', 'cache read non-zero → cache read line only');
-})();
-
-(function () {
-  var result = fmtTokenBreakdown(1000, 2000, 0, 3000);
-  // total=6.0K
-  assert(result === '6.0K total<br>1.0K in | 2.0K out<br>3.0K cache write', 'cache write non-zero → cache write line only');
-})();
-
-assert(fmtTokenBreakdown(1500, 2500, 0, 0).indexOf('active') === -1, 'no "active" label in compact format');
-assert(fmtTokenBreakdown(0, 0, 500, 500) === '1.0K total<br>0 in | 0 out<br>500 cache read + 500 cache write', 'cache line present when cache values exist even if input/output are zero');
-
 // ── Tests for fmtTokenBreakdownCompact ────────────────────────────────────
 
 console.log('\u25B6 fmtTokenBreakdownCompact');
@@ -1110,268 +1064,6 @@ console.log('\u25B6 fmtAgentRunTokens');
   var direct = fmtTokenBreakdownCompact(34900, 5100, 755500, 32);
   var viaAgent = fmtAgentRunTokens(34900, 5100, 755500, 32);
   assert(direct === viaAgent, 'fmtAgentRunTokens delegates to fmtTokenBreakdownCompact: same output for (34900, 5100, 755500, 32)');
-})();
-
-// ── buildSessionRowHtml (production function loaded from app.js) ────────
-// The REAL implementation lives in frontend/app.js (exposed on
-// window.buildSessionRowHtml by the vm sandbox loader above).  This thin
-// wrapper delegates so tests always exercise the production markup contract
-// — class="session-row", data-id, data-active, data-status, and exactly
-// three .num cells — never a copy-pasted duplicate.
-
-function buildSessionRowHtml(s, clientName, now) {
-  return window.buildSessionRowHtml(s, clientName, now);
-}
-
-// ── Tests for buildSessionRowHtml ──────────────────────────────────────
-
-console.log('\u25B6 buildSessionRowHtml');
-
-// Reference timestamp for deterministic tests: 2026-08-04 12:00:00 UTC
-var testNow = Date.UTC(2026, 7, 4, 12, 0, 0); // Aug 4, 2026
-
-(function () {
-  // Active session: last_message_at within SESSION_ACTIVE_WINDOW_MS
-  var recentTime = new Date(testNow - 600000).toISOString(); // 10 min ago
-  var session = {
-    id: 'ses-abc-123',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 15,
-    total_input_tokens: 1000,
-    total_output_tokens: 500,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.05,
-    session_title: 'Test Session'
-  };
-  var html = buildSessionRowHtml(session, 'TestClient', testNow);
-  assert(html.indexOf('data-active="true"') !== -1, 'active session: data-active="true"');
-  assert(html.indexOf('data-status="active"') !== -1, 'active session: data-status="active"');
-  assert(html.indexOf('data-id="ses-abc-123"') !== -1, 'active session: data-id matches session id');
-})();
-
-(function () {
-  // Idle session: last_message_at outside SESSION_ACTIVE_WINDOW_MS
-  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
-  var session = {
-    id: 'ses-idle-456',
-    first_message_at: oldTime,
-    last_message_at: oldTime,
-    message_count: 3,
-    total_input_tokens: 200,
-    total_output_tokens: 100,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.01,
-    session_title: null
-  };
-  var html = buildSessionRowHtml(session, 'IdleClient', testNow);
-  assert(html.indexOf('data-active="false"') !== -1, 'idle session: data-active="false"');
-  assert(html.indexOf('data-status="idle"') !== -1, 'idle session: data-status="idle"');
-  assert(html.indexOf('data-id="ses-idle-456"') !== -1, 'idle session: data-id matches session id');
-})();
-
-(function () {
-  // Defensive: the sessions API exposes no error signal today — SessionSummary
-  // has no `error` field and the sessions query selects no error column — so a
-  // session object carrying an unexpected extra `error` key must still render a
-  // plain active/idle status. The row markup must never emit data-status="error".
-  var recentTime = new Date(testNow - 300000).toISOString(); // 5 min ago
-  var session = {
-    id: 'ses-def-789',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 1,
-    total_input_tokens: 50,
-    total_output_tokens: 10,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.001,
-    session_title: 'Defensive Session',
-    error: 'unexpected extra field (not part of SessionSummary)'
-  };
-  var html = buildSessionRowHtml(session, 'DefClient', testNow);
-  assert(html.indexOf('data-status="active"') !== -1, 'extra error key ignored: data-status="active" while active');
-  assert(html.indexOf('data-status="error"') === -1, 'row markup never emits data-status="error" (no error signal in API)');
-})();
-
-(function () {
-  // Idle variant: extra error key must not flip an idle session to an error state.
-  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
-  var session = {
-    id: 'ses-def-idle',
-    first_message_at: oldTime,
-    last_message_at: oldTime,
-    message_count: 3,
-    total_input_tokens: 200,
-    total_output_tokens: 100,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.01,
-    session_title: null,
-    error: 'ignored'
-  };
-  var html = buildSessionRowHtml(session, 'DefClient2', testNow);
-  assert(html.indexOf('data-status="idle"') !== -1, 'extra error key ignored: data-status="idle" for idle session');
-  assert(html.indexOf('data-status="error"') === -1, 'idle row never emits data-status="error"');
-})();
-
-(function () {
-  // Verify three .num cells in the row markup
-  var recentTime = new Date(testNow - 600000).toISOString();
-  var session = {
-    id: 'ses-num-test',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 42,
-    total_input_tokens: 100,
-    total_output_tokens: 50,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.5,
-    session_title: 'Numeric Test'
-  };
-  var html = buildSessionRowHtml(session, 'NumClient', testNow);
-  var numMatches = html.match(/class="num"/g);
-  var numCount = numMatches ? numMatches.length : 0;
-  assert(numCount === 3, 'session row: exactly three .num cells (' + numCount + ' found)');
-})();
-
-(function () {
-  // class="session-row" is present
-  var recentTime = new Date(testNow - 600000).toISOString();
-  var session = {
-    id: 'ses-cls-test',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 1,
-    total_input_tokens: 0,
-    total_output_tokens: 0,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0,
-    session_title: null
-  };
-  var html = buildSessionRowHtml(session, 'ClsClient', testNow);
-  assert(html.indexOf('class="session-row"') !== -1, 'session row: has class="session-row"');
-})();
-
-(function () {
-  // Balanced Quiet Rows — readable titles: the flexible title column renders
-  // the FULL session title (overflow is handled by CSS ellipsis on the
-  // .session-title span), never a hard 40-char JS truncation. The tooltip
-  // attribute and title column class are preserved.
-  var recentTime = new Date(testNow - 600000).toISOString();
-  var longTitle = 'A deliberately long session title that exceeds forty characters to verify full-title rendering';
-  var session = {
-    id: 'ses-long-title',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 1,
-    total_input_tokens: 0,
-    total_output_tokens: 0,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0,
-    session_title: longTitle
-  };
-  var html = buildSessionRowHtml(session, 'LongClient', testNow);
-  assert(html.indexOf(longTitle) !== -1, 'title cell renders the full session title (no hard truncation)');
-  assert(html.indexOf('&hellip;') === -1, 'title cell does not insert a JS ellipsis (CSS overflow handles clipping)');
-  assert(html.indexOf('<span class="session-title">') !== -1, 'title cell wraps text in .session-title span (flexible column ellipsis hook)');
-  assert(html.indexOf('class="session-title-col"') !== -1, 'title cell keeps session-title-col class');
-})();
-
-(function () {
-  // Balanced Quiet Rows — Badge Only status treatment: activity is
-  // communicated exclusively through the compact outlined badge in the
-  // Status column. Active sessions render badge-active with "active" text;
-  // idle sessions render badge-inactive with "ended" text.
-  var recentTime = new Date(testNow - 600000).toISOString();
-  var activeSession = {
-    id: 'ses-badge-active',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 5,
-    total_input_tokens: 100,
-    total_output_tokens: 50,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.01,
-    session_title: 'Badge Active'
-  };
-  var activeHtml = buildSessionRowHtml(activeSession, 'BadgeClient', testNow);
-  assert(activeHtml.indexOf('<span class="badge badge-active">active</span>') !== -1,
-    'active session: status cell is the badge-active span with "active" text');
-  assert(activeHtml.indexOf('<span class="badge badge-inactive">') === -1,
-    'active session: no inactive badge emitted');
-
-  var oldTime = new Date(testNow - 7200000).toISOString(); // 2 hours ago
-  var idleSession = {
-    id: 'ses-badge-idle',
-    first_message_at: oldTime,
-    last_message_at: oldTime,
-    message_count: 3,
-    total_input_tokens: 200,
-    total_output_tokens: 100,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.01,
-    session_title: null
-  };
-  var idleHtml = buildSessionRowHtml(idleSession, 'BadgeClient2', testNow);
-  assert(idleHtml.indexOf('<span class="badge badge-inactive">ended</span>') !== -1,
-    'idle session: status cell is the badge-inactive span with "ended" text');
-  assert(idleHtml.indexOf('<span class="badge badge-active">') === -1,
-    'idle session: no active badge emitted');
-})();
-
-(function () {
-  // Responsive Hybrid — stacked-row markup hooks: every cell carries a
-  // data-label attribute (the ≤760px stacked-row CSS renders it as the
-  // label on each label/value line) and the four low-priority cells carry
-  // the sess-col-low class (hidden at 761–1024px tablet widths). Client,
-  // Session Title, Last Message, Cost, and Status must remain unmarked.
-  var recentTime = new Date(testNow - 600000).toISOString();
-  var session = {
-    id: 'ses-resp-hooks',
-    first_message_at: recentTime,
-    last_message_at: recentTime,
-    message_count: 7,
-    total_input_tokens: 100,
-    total_output_tokens: 50,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_estimated_cost_usd: 0.02,
-    session_title: 'Responsive Hooks'
-  };
-  var html = buildSessionRowHtml(session, 'RespClient', testNow);
-
-  // All nine labels present, in table column order
-  var labels = ['Client', 'Session Title', 'First Message', 'Last Message', 'Duration', 'Messages', 'Tokens', 'Cost', 'Status'];
-  var labelPos = -1;
-  labels.forEach(function (label) {
-    var idx = html.indexOf('data-label="' + label + '"');
-    assert(idx !== -1, 'session row: cell carries data-label="' + label + '"');
-    assert(idx > labelPos, 'session row: data-label="' + label + '" appears after the previous column label (column order preserved)');
-    labelPos = idx;
-  });
-
-  // Low-priority cells carry sess-col-low; retained columns do not
-  var low = ['First Message', 'Duration', 'Messages', 'Tokens'];
-  var kept = ['Client', 'Session Title', 'Last Message', 'Cost', 'Status'];
-  low.forEach(function (label) {
-    assert(html.indexOf('class="sess-col-low" data-label="' + label + '"') !== -1,
-      'session row: low-priority cell "' + label + '" carries class="sess-col-low"');
-  });
-  kept.forEach(function (label) {
-    assert(html.indexOf('class="sess-col-low" data-label="' + label + '"') === -1,
-      'session row: retained column "' + label + '" is not marked sess-col-low');
-  });
-
-  // Focus attribute on the row (keyboard reachability)
-  assert(html.indexOf('tabindex="0"') !== -1, 'session row: tabindex="0" keeps the row keyboard-focusable');
 })();
 
 // ── Client metadata cache (production code loaded from app.js) ───────────
@@ -1607,7 +1299,7 @@ console.log('\u25B6 computePanelFreshness');
   var h = window.computePanelFreshness({ events: { status: 'ok', updatedAt: now - 120000 } }, 'events', now);
   assert(h && h.status === 'ok' && h.label === 'Updated 2m ago', 'ok state renders "Updated 2m ago"');
 
-  var i = window.computePanelFreshness({ sessions: { status: 'ok', updatedAt: now } }, 'sessions', now);
+  var i = window.computePanelFreshness({ 'agent-runs': { status: 'ok', updatedAt: now } }, 'agent-runs', now);
   assert(i && i.label === 'Updated just now', 'ok state renders "Updated just now" for a fresh update');
 
   var j = window.computePanelFreshness({ kpi: { status: 'ok', updatedAt: null } }, 'kpi', now);
@@ -1620,7 +1312,7 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
   // No endpoint errors → every panel resolves to 'ok'
   var allOk = window.resolvePanelStatuses({});
   ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
-   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'sessions', 'agent-runs', 'client-project']
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
     });
@@ -1631,8 +1323,8 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
     'aggByModel failure: model-mix and agents go stale');
   assert(modelMixFailed['kpi-tokens'] === 'ok' && modelMixFailed['kpi-cost'] === 'ok' &&
          modelMixFailed['kpi-sessions'] === 'ok' && modelMixFailed['kpi-collectors'] === 'ok' &&
-         modelMixFailed['kpi-source-dbs'] === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed.sessions === 'ok',
-    'aggByModel failure: unrelated panels (KPI cards, events, sessions) stay ok');
+         modelMixFailed['kpi-source-dbs'] === 'ok' && modelMixFailed.events === 'ok' && modelMixFailed['agent-runs'] === 'ok',
+    'aggByModel failure: unrelated panels (KPI cards, events, agent runs) stay ok');
 
   var healthFailed = window.resolvePanelStatuses({ health: 'down' });
   assert(healthFailed['kpi-collectors'] === 'stale' && healthFailed['kpi-source-dbs'] === 'stale' &&
@@ -1641,12 +1333,14 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
          healthFailed.agents === 'stale',
     'health failure: every health-fed panel (kpi-collectors, kpi-source-dbs, events, collector-dist, collectors, agents) goes stale');
   assert(healthFailed['kpi-tokens'] === 'ok' && healthFailed['kpi-cost'] === 'ok' &&
-         healthFailed['kpi-sessions'] === 'ok' && healthFailed.sessions === 'ok',
-    'health failure: sessions panel and non-health KPI cards stay ok');
+         healthFailed['kpi-sessions'] === 'ok' && healthFailed['agent-runs'] === 'ok',
+    'health failure: agent-runs panel and non-health KPI cards stay ok');
 
   var agentRunsFailed = window.resolvePanelStatuses({ agentRuns: 'boom' });
-  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed['kpi-tokens'] === 'ok',
-    'agentRuns failure: only the agent-runs panel goes stale');
+  assert(agentRunsFailed['agent-runs'] === 'stale' && agentRunsFailed.events === 'stale',
+    'agentRuns failure: the agent-runs panel and the events feed (high-usage run alerts) go stale');
+  assert(agentRunsFailed['kpi-tokens'] === 'ok' && agentRunsFailed['kpi-sessions'] === 'ok',
+    'agentRuns failure: KPI cards stay ok (kpi-sessions reads the aggregates total row, not agent runs)');
 
   // Failed panel retains its previous data: the state map keeps the old
   // updatedAt, shouldRenderPanel refuses the re-render, and the label flips
@@ -1759,32 +1453,38 @@ console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
 })();
 
 // N2 — per-card KPI staleness: each KPI card resolves independently, so a
-// single failing endpoint (e.g. sessions) never freezes the tokens/cost cards
+// single failing endpoint never freezes the other cards.  The merged
+// Sessions + Agent Runs view (issue #402) backs the Sessions KPI with the
+// aggregates total row (the /sessions endpoint is no longer fetched), so
+// only an aggTotal failure stales kpi-sessions.
 console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)');
 
 (function () {
-  // Only sessions fails → only kpi-sessions goes stale
-  var sessionFail = window.resolvePanelStatuses({ sessions: 'boom' });
-  assert(sessionFail['kpi-tokens'] === 'ok', 'sessions fail: kpi-tokens stays ok (aggTotal is fine)');
-  assert(sessionFail['kpi-cost'] === 'ok', 'sessions fail: kpi-cost stays ok (aggTotal is fine)');
-  assert(sessionFail['kpi-sessions'] === 'stale', 'sessions fail: kpi-sessions goes stale');
-  assert(sessionFail['kpi-collectors'] === 'ok', 'sessions fail: kpi-collectors stays ok (health is fine)');
-  assert(sessionFail['kpi-source-dbs'] === 'ok', 'sessions fail: kpi-source-dbs stays ok (health is fine)');
+  // Only aggTotal fails → kpi-tokens, kpi-cost, and kpi-sessions go stale
+  var aggFail = window.resolvePanelStatuses({ aggTotal: 'boom' });
+  assert(aggFail['kpi-tokens'] === 'stale', 'aggTotal fail: kpi-tokens goes stale');
+  assert(aggFail['kpi-cost'] === 'stale', 'aggTotal fail: kpi-cost goes stale');
+  assert(aggFail['kpi-sessions'] === 'stale', 'aggTotal fail: kpi-sessions goes stale (KPI reads the aggregates total row)');
+  assert(aggFail['kpi-collectors'] === 'ok', 'aggTotal fail: kpi-collectors stays ok (health is fine)');
+  assert(aggFail['kpi-source-dbs'] === 'ok', 'aggTotal fail: kpi-source-dbs stays ok (health is fine)');
 
   // Only health fails → only kpi-collectors and kpi-source-dbs go stale
   var healthFail = window.resolvePanelStatuses({ health: 'down' });
   assert(healthFail['kpi-tokens'] === 'ok', 'health fail: kpi-tokens stays ok (aggTotal is fine)');
   assert(healthFail['kpi-cost'] === 'ok', 'health fail: kpi-cost stays ok (aggTotal is fine)');
-  assert(healthFail['kpi-sessions'] === 'ok', 'health fail: kpi-sessions stays ok (sessions is fine)');
+  assert(healthFail['kpi-sessions'] === 'ok', 'health fail: kpi-sessions stays ok (aggTotal is fine)');
   assert(healthFail['kpi-collectors'] === 'stale', 'health fail: kpi-collectors goes stale');
   assert(healthFail['kpi-source-dbs'] === 'stale', 'health fail: kpi-source-dbs goes stale');
 
-  // aggTotal fails → kpi-tokens and kpi-cost go stale, rest stay ok
-  var aggFail = window.resolvePanelStatuses({ aggTotal: 'boom' });
-  assert(aggFail['kpi-tokens'] === 'stale', 'aggTotal fail: kpi-tokens goes stale');
-  assert(aggFail['kpi-cost'] === 'stale', 'aggTotal fail: kpi-cost goes stale');
-  assert(aggFail['kpi-sessions'] === 'ok', 'aggTotal fail: kpi-sessions stays ok');
-  assert(aggFail['kpi-collectors'] === 'ok', 'aggTotal fail: kpi-collectors stays ok');
+  // Only agentRuns fails → no KPI card goes stale (the merged table keeps
+  // its previous rows and shows "Showing previous data"; kpi-sessions reads
+  // the aggregates total row, not the agent-runs channel)
+  var runFail = window.resolvePanelStatuses({ agentRuns: 'boom' });
+  assert(runFail['kpi-tokens'] === 'ok', 'agentRuns fail: kpi-tokens stays ok (aggTotal is fine)');
+  assert(runFail['kpi-cost'] === 'ok', 'agentRuns fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(runFail['kpi-sessions'] === 'ok', 'agentRuns fail: kpi-sessions stays ok (aggTotal is fine)');
+  assert(runFail['kpi-collectors'] === 'ok', 'agentRuns fail: kpi-collectors stays ok (health is fine)');
+  assert(runFail['kpi-source-dbs'] === 'ok', 'agentRuns fail: kpi-source-dbs stays ok (health is fine)');
 
   // No errors → all KPI cards ok
   var allOk = window.resolvePanelStatuses({});
@@ -1797,10 +1497,11 @@ console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)')
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
-// index.html markup: the four top-nav tabs exist and are keyboard-focusable
-// (tabindex="0"), each has a matching tab-content panel, and the sessions
-// table carries the responsive hooks (#sessions-table + sess-col-low header
-// cells) that the breakpoint CSS targets.
+// index.html markup: the three top-nav tabs exist and are keyboard-focusable
+// (tabindex="0"), each has a matching tab-content panel, the merged
+// Sessions + Agent Runs table (issue #402) carries the responsive hooks
+// (#agent-runs-table + ar-col-low header cells) that the breakpoint CSS
+// targets, and the removed Sessions tab/table is gone.
 
 console.log('\u25B6 index.html markup (smoke check)');
 
@@ -1808,33 +1509,41 @@ console.log('\u25B6 index.html markup (smoke check)');
   var indexPath = path.join(__dirname, '..', 'index.html');
   var html = fs.readFileSync(indexPath, 'utf8');
 
-  // Four tabs: top-nav item + matching content panel
-  var tabs = ['overview', 'sessions', 'agent-runs', 'clients-projects'];
+  // Three tabs: top-nav item + matching content panel (the Sessions tab was
+  // merged into Agent Runs — issue #402)
+  var tabs = ['overview', 'agent-runs', 'clients-projects'];
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '"') !== -1, 'top nav: item for tab "' + tab + '" exists');
     assert(html.indexOf('id="tab-' + tab + '"') !== -1, 'top nav: tab-content panel #tab-' + tab + ' exists');
   });
 
   // Keyboard reachability: every top-nav item is focusable (tabindex="0"),
-  // so tabbing enters Overview → Sessions → Agent Runs → Clients / Projects.
+  // so tabbing enters Overview → Agent Runs → Clients / Projects.
   var navItemCount = (html.match(/class="top-nav-item/g) || []).length;
-  assert(navItemCount === 4, 'top nav: exactly four top-nav-item elements (' + navItemCount + ' found)');
+  assert(navItemCount === 3, 'top nav: exactly three top-nav-item elements (' + navItemCount + ' found)');
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '" tabindex="0"') !== -1,
       'top nav: tab "' + tab + '" is keyboard-focusable (tabindex="0")');
   });
 
-  // Responsive hooks: the sessions table is addressable by id and its four
-  // low-priority header cells carry sess-col-low (hidden at 761–1024px).
-  assert(html.indexOf('<table id="sessions-table">') !== -1, 'sessions table carries id="sessions-table"');
-  ['First Message', 'Duration', 'Messages', 'Tokens'].forEach(function (label) {
-    assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') !== -1,
-      'sessions header: "' + label + '" marked sess-col-low');
+  // Responsive hooks: the merged table is addressable by id and its four
+  // low-priority header cells carry ar-col-low (hidden at 761–1024px).
+  assert(html.indexOf('<table id="agent-runs-table">') !== -1, 'merged table carries id="agent-runs-table"');
+  ['Agent', 'Todo', 'Files', 'Children'].forEach(function (label) {
+    assert(html.indexOf('<th class="ar-col-low">' + label + '</th>') !== -1,
+      'merged header: "' + label + '" marked ar-col-low');
   });
-  ['Client', 'Session Title', 'Last Message', 'Cost', 'Status'].forEach(function (label) {
-    assert(html.indexOf('<th class="sess-col-low">' + label + '</th>') === -1,
-      'sessions header: retained column "' + label + '" is not marked sess-col-low');
+  ['Title', 'Status', 'Model', 'Project / Worktree', 'Cost', 'Tokens', 'Last Updated'].forEach(function (label) {
+    assert(html.indexOf('<th class="ar-col-low">' + label + '</th>') === -1,
+      'merged header: retained column "' + label + '" is not marked ar-col-low');
   });
+
+  // The separate Sessions panel/tab is gone (issue #402): no sessions table,
+  // no sessions tab-content, no sessions nav item.
+  assert(html.indexOf('id="sessions-table"') === -1, 'index.html: #sessions-table removed');
+  assert(html.indexOf('id="sessions-tbody"') === -1, 'index.html: #sessions-tbody removed');
+  assert(html.indexOf('data-tab="sessions"') === -1, 'index.html: Sessions tab removed');
+  assert(html.indexOf('id="tab-sessions"') === -1, 'index.html: #tab-sessions panel removed');
 
   // Events panel title (issue #355): the "Live Events" panel was renamed to
   // "Operational Events" — a label-only change. The event badge and the
@@ -1865,11 +1574,12 @@ console.log('\u25B6 index.html markup (smoke check)');
   // Freshness indicators (issue #357): the header carries a labeled
   // "Last refreshed" clock, and each instrumented panel carries a
   // .panel-freshness span in its title row (KPI row, Model Mix,
-  // Operational Events, Sessions, plus the remaining data panels).
+  // Operational Events, plus the remaining data panels — the Sessions
+  // panel freshness span was removed with the merged table, issue #402).
   assert(html.indexOf('id="last-refreshed"') !== -1 && html.indexOf('Last refreshed') !== -1,
     'header: #last-refreshed element with "Last refreshed" label exists');
   ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
-   'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'sessions', 'agent-runs', 'client-project']
+   'model-mix', 'collectors', 'events', 'collector-dist', 'agents', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(html.indexOf('id="freshness-' + panelId + '"') !== -1,
         'panel: freshness span #freshness-' + panelId + ' exists in the markup');
@@ -1883,7 +1593,9 @@ console.log('\u25B6 index.html markup (smoke check)');
 // against the real stylesheet: the three viewport bands (>1024px full table,
 // 761–1024px condensed, ≤760px stacked), the reduced-motion animation kills,
 // focus-visible rules, and the Balanced Quiet Rows regression guards (no
-// green active-row cast, no cyan row stripe in live rules).
+// green active-row cast, no cyan row stripe in live rules).  The hooks now
+// target the merged Sessions + Agent Runs table (#agent-runs-table, .ar-row,
+// .ar-col-low — issue #402).
 
 console.log('\u25B6 style.css responsive + reduced-motion (static verification)');
 
@@ -1896,21 +1608,21 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(css.indexOf('@media (max-width: 1024px)') !== -1, 'style.css: tablet breakpoint @media (max-width: 1024px) exists');
   assert(css.indexOf('@media (max-width: 760px)') !== -1, 'style.css: phone breakpoint @media (max-width: 760px) exists');
 
-  // 761–1024px tablet band: low-priority sessions columns hidden via sess-col-low
+  // 761–1024px tablet band: low-priority merged-table columns hidden via ar-col-low
   var tabletBlock = css.slice(css.indexOf('@media (max-width: 1024px)'), css.indexOf('@media (max-width: 760px)'));
-  assert(tabletBlock.indexOf('#sessions-table .sess-col-low') !== -1 && tabletBlock.indexOf('display: none') !== -1,
-    'tablet block hides #sessions-table .sess-col-low (First Message, Duration, Messages, Tokens)');
+  assert(tabletBlock.indexOf('#agent-runs-table .ar-col-low') !== -1 && tabletBlock.indexOf('display: none') !== -1,
+    'tablet block hides #agent-runs-table .ar-col-low (Agent, Todo, Files, Children)');
 
-  // ≤760px phone band: stacked session rows — header removed, rows become
+  // ≤760px phone band: stacked agent run rows — header removed, rows become
   // block cards, cells render label/value lines via attr(data-label)
   // (lastIndexOf: the file-header comment also mentions the reduced-motion
   // media query, so anchor on the real block after the 760px one)
   var rmStart = css.lastIndexOf('@media (prefers-reduced-motion: reduce)');
   var phoneBlock = css.slice(css.indexOf('@media (max-width: 760px)'), rmStart);
-  assert(phoneBlock.indexOf('#sessions-table thead') !== -1 && phoneBlock.indexOf('display: none') !== -1,
-    'phone block removes the sessions table header (stacked rows carry their own labels)');
-  assert(phoneBlock.indexOf('tr.session-row') !== -1 && phoneBlock.indexOf('display: block') !== -1,
-    'phone block turns session rows into stacked block cards');
+  assert(phoneBlock.indexOf('#agent-runs-table thead') !== -1 && phoneBlock.indexOf('display: none') !== -1,
+    'phone block removes the merged table header (stacked rows carry their own labels)');
+  assert(phoneBlock.indexOf('tr.ar-row') !== -1 && phoneBlock.indexOf('display: block') !== -1,
+    'phone block turns agent run rows into stacked block cards');
   assert(phoneBlock.indexOf('attr(data-label)') !== -1,
     'phone block labels stacked cells via attr(data-label)');
 
@@ -1924,20 +1636,24 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(rmBlock.indexOf('.badge-running') !== -1 && rmBlock.indexOf('animation: none') !== -1,
     'reduced motion: badge pulse disabled (.badge-running animation: none)');
   assert(rmBlock.indexOf('.badge-active') === -1,
-    'reduced motion: session status badge styling untouched (static border/text cues retained)');
-  assert(rmBlock.indexOf('.session-row:focus-visible td') !== -1,
+    'reduced motion: no session active-badge styling remains (removed with the sessions table)');
+  assert(rmBlock.indexOf('.ar-row:focus-visible td') !== -1,
     'reduced motion: keyboard focus ring retained (focus is not motion)');
 
   // Focus visibility at base
-  assert(css.indexOf('.session-row:focus-visible td') !== -1, 'style.css: session-row focus ring rule exists');
+  assert(css.indexOf('.ar-row:focus-visible td') !== -1, 'style.css: agent run row focus ring rule exists');
   assert(css.indexOf('.top-nav-item:focus-visible') !== -1, 'style.css: top-nav-item focus ring rule exists');
 
   // Balanced Quiet Rows regression guards — no green active-row cast and no
-  // cyan row stripe in live rules (status visuals live in the badge only)
+  // cyan row stripe in live rules (status visuals live in the badge only).
+  // The active/idle [data-active] row hooks were removed with the sessions
+  // table (issue #402); the merged table renders status via currentStatus.
   assert(live.indexOf('[data-active') === -1,
     'no status-driven [data-active] row selector in live CSS (no green active-row cast)');
-  assert(!/\.session-row[^{]*\{[^}]*border-left[^}]*\}/.test(live),
-    'no .session-row rule paints a left rail/stripe in live CSS');
+  assert(!/\.ar-row[^{]*\{[^}]*border-left[^}]*\}/.test(live),
+    'no .ar-row rule paints a left rail/stripe in live CSS');
+  assert(live.indexOf('.session-row') === -1,
+    'no .session-row rules remain in live CSS (sessions table removed)');
 
   // Freshness styles (issue #357): subtle muted labels in panel titles —
   // inline in the title's existing flex row (no layout shifts) — plus the
