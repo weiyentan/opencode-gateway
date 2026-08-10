@@ -7459,6 +7459,17 @@ class TestCanonicalDuplicateDetection:
         results = data["results"]
         assert len(results) == 3
 
+        # Batch counters: accepted / duplicate / updated are all successful
+        # outcomes and count as accepted, so the invariant
+        # accepted_count + rejected_count == len(records) holds.
+        assert data["accepted_count"] == 3, (
+            f"Expected 3 accepted (incl. duplicate/updated), got {data['accepted_count']}"
+        )
+        assert data["rejected_count"] == 0, (
+            f"Expected 0 rejected, got {data['rejected_count']}"
+        )
+        assert data["accepted_count"] + data["rejected_count"] == len(results)
+
         assert results[0]["status"] == "accepted", (
             f"Record 0 should be accepted, got '{results[0]['status']}'"
         )
@@ -7488,6 +7499,18 @@ class TestCanonicalDuplicateDetection:
         assert any("accepted" in o for o in outcomes), "Missing 'accepted' attempt"
         assert any("duplicate" in o for o in outcomes), "Missing 'duplicate' attempt"
         assert any("updated" in o for o in outcomes), "Missing 'updated' attempt"
+
+        # The ingest_batches UPDATE must carry the consistent totals:
+        # accepted_count = 3, rejected_count = 0 (sum == record_count).
+        batch_updates = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE ingest_batches" in str(c)
+        ]
+        assert len(batch_updates) == 1
+        # conn.execute(sql, accepted, rejected, batch_id) — params follow the SQL string.
+        update_args = batch_updates[0].args
+        assert update_args[1] == 3, f"accepted_count written to ingest_batches: {update_args[1]}"
+        assert update_args[2] == 0, f"rejected_count written to ingest_batches: {update_args[2]}"
 
     @pytest.mark.asyncio
     async def test_cache_tokens_field_change_triggers_delta(self, monkeypatch):
