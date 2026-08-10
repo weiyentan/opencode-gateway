@@ -783,10 +783,12 @@ class TestClientProjectAggregates:
             )
         assert response.status_code == 200
 
-        # Capture the SQL sent to conn.fetch
-        call_args = mock_conn.fetch.call_args
-        assert call_args is not None
-        sql = call_args[0][0]
+        # Hybrid read: 2 queries — rollup (additive totals) + count (distinct counts).
+        # The first call is the rollup SQL; check its shape.
+        assert len(mock_conn.fetch.call_args_list) >= 1, (
+            "Expected at least 1 fetch call for rollup SQL"
+        )
+        sql = mock_conn.fetch.call_args_list[0][0][0]
 
         # Must reference the rollup table, not usage_events
         assert "FROM client_project_rollup" in sql, (

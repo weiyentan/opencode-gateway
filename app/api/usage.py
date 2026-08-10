@@ -189,6 +189,30 @@ def _build_aggregate_filters(
     return " AND ".join(filters), params
 
 
+# Project-label resolution SQL for the rollup read path.  Mirrors
+# ``_PROJECT_LABEL_SQL`` but adapted for ``client_project_rollup``, which
+# has no ``sessions`` join — ``r.project_id`` is the external project ID,
+# and ``opencode_source_projects`` is matched via a LATERAL subquery.
+_ROLLUP_PROJECT_LABEL_SQL = """
+    COALESCE(
+        osp.display_name,
+        osp.name,
+        CASE
+            WHEN osp.worktree IS NULL
+                  OR osp.worktree = ''
+                  OR osp.worktree = '/' THEN NULL
+            ELSE substring(osp.worktree, '([^/]+)$')
+        END,
+        CASE
+            WHEN r.project_id IS NULL THEN NULL
+            WHEN length(r.project_id) > 12 THEN substring(r.project_id, 1, 12) || '…'
+            ELSE r.project_id
+        END,
+        'unknown'
+    )
+"""
+
+
 async def _fetch_aggregates_rollup(
     conn: asyncpg.Connection,
     start_date: datetime,
@@ -196,16 +220,16 @@ async def _fetch_aggregates_rollup(
     client_id: uuid.UUID | None,
     db_timeout_seconds: int,
 ) -> list[AggregateRow]:
-    """Execute the client,project aggregates query against the rollup table.
+    """Execute the client,project aggregates as a hybrid read.
 
-    Reads pre-aggregated additive totals from ``client_project_rollup``,
-    applying ``COALESCE(oc.canonical_name, oc.name)`` at read time so
-    canonical-name changes never require a table recompute.
-
-    The rollup stores only additive token/cost columns (input, output,
-    cache_read, cache_write, estimated_cost).  Counts (record, session,
-    model) and non-additive token columns (cached, reasoning) return 0.
+    Reads pre-aggregated additive totals from ``client_project_rollup``
+    (ADR 0015) and resolves the human-readable project label at read time
+    from ``opencode_source_projects`` via a LATERAL join.  Counts
+    (record, session, model) are derived from a second distinct-count
+    query over raw ``usage_events`` grouped by the same
+    (client, project-label) dimension, then merged in Python.
     """
+    # ── Rollup query (additive token/cost totals) ────────────────────
     params: list = [start_date, end_date]
     filters: list[str] = [
         "r.day >= $1",
@@ -218,48 +242,123 @@ async def _fetch_aggregates_rollup(
 
     where_clause = " AND ".join(filters)
 
-    sql = f"""
+    rollup_sql = f"""
+        WITH rollup_with_label AS (
+            SELECT
+                r.client_id,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.estimated_cost_usd,
+                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label
+            FROM client_project_rollup r
+            LEFT JOIN LATERAL (
+                SELECT osp.display_name, osp.name, osp.worktree
+                FROM opencode_source_projects osp
+                WHERE osp.client_id = r.client_id
+                  AND osp.external_project_id = r.project_id
+                LIMIT 1
+            ) osp ON true
+            WHERE {where_clause}
+        )
         SELECT
-            COALESCE(oc.canonical_name, oc.name) || '|' || r.project_id AS group_value,
-            SUM(r.input_tokens) AS total_input_tokens,
-            SUM(r.output_tokens) AS total_output_tokens,
-            0 AS total_cached_tokens,
-            0 AS total_reasoning_tokens,
-            SUM(r.cache_read_tokens) AS total_cache_read_tokens,
-            SUM(r.cache_write_tokens) AS total_cache_write_tokens,
-            SUM(r.estimated_cost_usd) AS total_estimated_cost_usd,
+            COALESCE(oc.canonical_name, oc.name) || '|' || rl.project_label AS group_value,
+            SUM(rl.input_tokens)::bigint AS total_input_tokens,
+            SUM(rl.output_tokens)::bigint AS total_output_tokens,
+            0::bigint AS total_cached_tokens,
+            0::bigint AS total_reasoning_tokens,
+            SUM(rl.cache_read_tokens)::bigint AS total_cache_read_tokens,
+            SUM(rl.cache_write_tokens)::bigint AS total_cache_write_tokens,
+            SUM(rl.estimated_cost_usd) AS total_estimated_cost_usd,
             0 AS record_count,
             0 AS session_count,
             0 AS model_count,
-            r.project_id AS project_label
-        FROM client_project_rollup r
-        JOIN opencode_clients oc ON oc.id = r.client_id
-        WHERE {where_clause}
-        GROUP BY COALESCE(oc.canonical_name, oc.name), r.project_id
+            rl.project_label
+        FROM rollup_with_label rl
+        JOIN opencode_clients oc ON oc.id = rl.client_id
+        GROUP BY COALESCE(oc.canonical_name, oc.name), rl.project_label
         ORDER BY group_value
     """
     async with timed_operation("db.query.aggregates.client_project_rollup", "db"):
         async with _db_timeout(
             "db.query.aggregates.client_project_rollup", db_timeout_seconds
         ):
-            rows = await conn.fetch(sql, *params)
-    return [
-        AggregateRow(
-            group_value=str(r["group_value"]),
-            total_input_tokens=r["total_input_tokens"],
-            total_output_tokens=r["total_output_tokens"],
-            total_cached_tokens=r["total_cached_tokens"],
-            total_reasoning_tokens=r["total_reasoning_tokens"],
-            total_cache_read_tokens=r["total_cache_read_tokens"],
-            total_cache_write_tokens=r["total_cache_write_tokens"],
-            total_estimated_cost_usd=r["total_estimated_cost_usd"],
-            record_count=r["record_count"],
-            session_count=r["session_count"],
-            model_count=r["model_count"],
-            project_label=r["project_label"],
-        )
-        for r in rows
+            rollup_rows = await conn.fetch(rollup_sql, *params)
+
+    # ── Count query (distinct counts over raw usage_events) ──────────
+    # The rollup stores only additive token/cost totals (ADR 0015);
+    # record_count, session_count, and model_count are derived from a
+    # separate distinct-count scan over raw ``usage_events``, grouped by
+    # the same (client, project-label) dimension.
+    count_params: list = [start_date, end_date]
+    count_filters: list[str] = [
+        "our.reported_at >= $1",
+        "our.reported_at <= $2",
     ]
+    if client_id is not None:
+        count_filters.append(f"our.client_id = ${len(count_params) + 1}")
+        count_params.append(client_id)
+    count_where = " AND ".join(count_filters)
+
+    count_sql = f"""
+        SELECT
+            COALESCE(oc.canonical_name, oc.name) || '|' || ({_PROJECT_LABEL_SQL}) AS group_value,
+            COUNT(*) AS record_count,
+            COUNT(DISTINCT our.session_id) AS session_count,
+            COUNT(DISTINCT om.model_name) AS model_count
+        FROM usage_events our
+        JOIN observed_models om ON om.id = our.model_id
+        JOIN opencode_clients oc ON oc.id = our.client_id
+        JOIN sessions s ON s.id = our.session_id
+        LEFT JOIN opencode_source_projects osp
+            ON osp.source_database_id = s.source_database_id
+            AND osp.external_project_id = s.project_id
+        WHERE {count_where}
+        GROUP BY COALESCE(oc.canonical_name, oc.name), ({_PROJECT_LABEL_SQL})
+    """
+    async with timed_operation("db.query.aggregates.client_project_counts", "db"):
+        async with _db_timeout(
+            "db.query.aggregates.client_project_counts", db_timeout_seconds
+        ):
+            count_rows = await conn.fetch(count_sql, *count_params)
+
+    # Build a lookup of counts by group_value
+    count_by_group: dict[str, dict[str, int]] = {}
+    for cr in count_rows:
+        gv = str(cr["group_value"])
+        count_by_group[gv] = {
+            "record_count": cr["record_count"],
+            "session_count": cr["session_count"],
+            "model_count": cr["model_count"],
+        }
+
+    # ── Merge counts into rollup rows ────────────────────────────────
+    result: list[AggregateRow] = []
+    for r in rollup_rows:
+        gv = str(r["group_value"])
+        counts = count_by_group.get(gv, {
+            "record_count": 0,
+            "session_count": 0,
+            "model_count": 0,
+        })
+        result.append(
+            AggregateRow(
+                group_value=gv,
+                total_input_tokens=r["total_input_tokens"],
+                total_output_tokens=r["total_output_tokens"],
+                total_cached_tokens=r["total_cached_tokens"],
+                total_reasoning_tokens=r["total_reasoning_tokens"],
+                total_cache_read_tokens=r["total_cache_read_tokens"],
+                total_cache_write_tokens=r["total_cache_write_tokens"],
+                total_estimated_cost_usd=r["total_estimated_cost_usd"],
+                record_count=counts["record_count"],
+                session_count=counts["session_count"],
+                model_count=counts["model_count"],
+                project_label=r["project_label"],
+            )
+        )
+    return result
 
 
 async def _fetch_aggregates(
@@ -323,9 +422,14 @@ async def _fetch_aggregates(
         ]
 
     # ── Hybrid read dispatch: client,project → rollup path ─────────
+    # Only dispatch to the rollup when no filter that the rollup cannot
+    # express is present.  The rollup stores only (client_id, project_id, day)
+    # and cannot filter by model or session_id — falling back to the raw
+    # usage_events scan preserves those filters (Finding 2 / PR #407 review).
     _is_client_project = set(group_parts) == {"client", "project"}
+    _rollup_safe = model is None and session_id is None
 
-    if _is_client_project:
+    if _is_client_project and _rollup_safe:
         return await _fetch_aggregates_rollup(
             conn, start_date, end_date, client_id, db_timeout_seconds
         )

@@ -221,13 +221,17 @@ class TestAggregatesQueryCount:
             )
 
         assert response.status_code == 200
-        assert mock_conn.fetch.call_count == 1
+        # Hybrid read: 2 queries — rollup (additive totals) + count (distinct counts)
+        assert mock_conn.fetch.call_count == 2, (
+            f"Expected 2 fetch calls (rollup + count), got {mock_conn.fetch.call_count}"
+        )
         assert mock_conn.fetchrow.call_count == 0
 
-        # SQL-shape: must reference client_project_rollup, not usage_events
-        call_args = mock_conn.fetch.call_args
-        assert call_args is not None
-        sql = call_args[0][0]
+        # SQL-shape: the first call is the rollup query, which must reference
+        # client_project_rollup (not usage_events)
+        assert len(mock_conn.fetch.call_args_list) >= 1
+        first_call_args = mock_conn.fetch.call_args_list[0]
+        sql = first_call_args[0][0]
         assert "FROM client_project_rollup" in sql, (
             f"Expected rollup-backed SQL, got: {sql[:200]}"
         )
