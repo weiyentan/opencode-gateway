@@ -1,4 +1,4 @@
-# ADR 0010: Session currentStatus Heuristic
+# ADR 0013: Session currentStatus Heuristic
 
 ## Status
 

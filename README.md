@@ -367,10 +367,10 @@ opencode-gateway/
 | [0008](docs/adr/0008-gateway-owned-opencode-projection-tables.md) | Gateway-Owned OpenCode Projection Tables | Accepted |
 | [0009](docs/adr/0009-explicit-replay-corrections.md) | Explicit Replay Corrections | Accepted |
 | [0010](docs/adr/0010-backend-computed-run-status.md) | Backend-Computed Agent Run Status | Accepted |
-| [0010](docs/adr/0010-session-currentstatus-heuristic.md) | Session currentStatus Heuristic | Accepted |
-| [0011](docs/adr/0011-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 | [0011](docs/adr/0011-replay-merge-semantics.md) | Replay Merge Semantics | Accepted |
 | [0012](docs/adr/0012-canonical-event-replay-merge.md) | Canonical Event Replay Merge | Accepted |
+| [0013](docs/adr/0013-session-currentstatus-heuristic.md) | Session currentStatus Heuristic | Accepted |
+| [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 
 ---
 
