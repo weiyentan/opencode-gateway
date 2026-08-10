@@ -41,15 +41,24 @@ HEALTHCHECK_RETRIES = 3   # number of consecutive 200s required for readiness
 
 
 def _docker_compose_available() -> bool:
-    """Return True if ``docker compose`` is installed and responsive."""
+    """Return True if Compose is installed and the Docker daemon is ready."""
     try:
-        result = subprocess.run(
+        compose_result = subprocess.run(
             ["docker", "compose", "version"],
             capture_output=True,
             text=True,
             timeout=15,
         )
-        return result.returncode == 0
+        if compose_result.returncode != 0:
+            return False
+
+        daemon_result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return daemon_result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
@@ -125,10 +134,10 @@ def stack_url() -> str:
     """Start the full Docker Compose stack, wait for readiness, yield the
     frontend entrypoint URL, and tear down when the module finishes.
 
-    Skips the test if ``docker compose`` is not available.
+    Skips the test if Docker Compose or the Docker daemon is not available.
     """
     if not _docker_compose_available():
-        pytest.skip("docker compose is not installed; cannot run smoke test")
+        pytest.skip("docker compose and a running Docker daemon are required")
 
     # Ensure GATEWAY_ENV is set for the shell (used by docker-compose.smoke.yml)
     env = os.environ.copy()
