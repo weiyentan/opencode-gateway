@@ -1434,6 +1434,8 @@ async def _record_canonical_event(
     """
     from app.core.reconciliation import (
         IngestOutcome,
+        _rollup_day,
+        _upsert_client_project_rollup,
         acquire_canonical_event_lock,
         apply_replay_merge,
     )
@@ -1538,6 +1540,24 @@ async def _record_canonical_event(
                 now,
             )
             outcome_str = "accepted"
+
+            # ── Maintain Client Project Rollup (first insert: full increment) ──
+            if record.project_id is not None:
+                day = _rollup_day(record.reported_at)
+                cost = record.estimated_cost_usd
+                if cost is None:
+                    cost = Decimal("0")
+                await _upsert_client_project_rollup(
+                    conn,
+                    client_id=client_id,
+                    project_id=record.project_id,
+                    day=day,
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    cache_read_tokens=record.cache_read_tokens or 0,
+                    cache_write_tokens=record.cache_write_tokens or 0,
+                    estimated_cost_usd=cost,
+                )
         else:
             # ── 4b. EXISTING canonical event — compare for duplicate vs update ─
             event_id = existing["id"]
@@ -1567,7 +1587,10 @@ async def _record_canonical_event(
                     "reasoning_tokens": record.reasoning_tokens,
                     "estimated_cost_usd": record.estimated_cost_usd,
                 }
-                merge_outcome = await apply_replay_merge(conn, event_id, new_values)
+                merge_outcome = await apply_replay_merge(
+                    conn, event_id, new_values,
+                    client_id=client_id,
+                )
 
                 # COALESCE-fill text enrichment fields (non-erasing)
                 enrichment_filled = await _fill_canonical_text_enrichment(
