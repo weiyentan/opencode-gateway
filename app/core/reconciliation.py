@@ -482,8 +482,18 @@ serialise concurrent reconciliation runs per client.
 
 
 def _reconcile_lock_key(client_id: uuid.UUID) -> tuple[int, int]:
-    """Derive the two-arg advisory lock key for a reconciliation client."""
-    return (RECONCILE_LOCK_CLASS, client_id.int & 0xFFFFFFFF)
+    """Derive the two-arg advisory lock key for a reconciliation client.
+
+    The low 32 bits of ``client_id.int`` are interpreted as a SIGNED int32
+    so the key always binds to the ``int4`` arguments of
+    ``pg_advisory_xact_lock(int, int)`` — an unsigned interpretation can
+    exceed ``INT32_MAX`` and asyncpg raises ``OverflowError: value out of
+    int32 range`` at bind time.  This is the same signed-int32 mapping used
+    by :func:`_replay_lock_key`.
+    """
+    unsigned = client_id.int & 0xFFFFFFFF
+    key = unsigned if unsigned <= 0x7FFFFFFF else unsigned - 0x100000000
+    return (RECONCILE_LOCK_CLASS, key)
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, status
 
 from app.core.reconciliation import (
     RECONCILE_LOCK_CLASS,
+    _reconcile_lock_key,
     compute_reconcile_preview,
     perform_reconciliation,
     scan_duplicate_groups,
@@ -99,7 +100,11 @@ async def reconcile_historical_duplicates(
     # ── Non-dry-run: lock + transaction + reconcile ──────────────────────
     # Use client_id as the lock key when available; fall back to a sentinel.
     lock_client_id = body.client_id or uuid.UUID("00000000-0000-0000-0000-000000000000")
-    lock_key = lock_client_id.int & 0xFFFFFFFF
+    # _reconcile_lock_key applies the signed int32 mapping so the low 32
+    # bits always bind to pg_advisory_xact_lock's int4 argument — an
+    # unsigned value above INT32_MAX raises asyncpg OverflowError at bind
+    # time (the same fix as _replay_lock_key in issue #395).
+    _, lock_key = _reconcile_lock_key(lock_client_id)
 
     # Wrap the full reconcile flow in a single explicit transaction so the
     # advisory lock spans re-scan + reconciliation and the DELETE/UPDATE/

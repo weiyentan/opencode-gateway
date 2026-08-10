@@ -26,9 +26,11 @@ import pytest
 
 from app.core.reconciliation import (
     CANONICAL_EVENT_LOCK_CLASS,
+    RECONCILE_LOCK_CLASS,
     DeltaResult,
     IngestOutcome,
     _canonical_event_lock_key,
+    _reconcile_lock_key,
     _replay_lock_key,
     acquire_canonical_event_lock,
     apply_replay_merge,
@@ -521,6 +523,49 @@ class TestCanonicalEventLock:
 
         # The function does not open its own transaction
         mock_conn.transaction.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Reconcile advisory lock key — signed int32 mapping
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestReconcileLockKey:
+    """Per-client reconciliation advisory lock key (signed int32 mapping).
+
+    Mirrors the ``_replay_lock_key`` fix: the low 32 bits of the client
+    UUID are interpreted as a SIGNED int32 so the key always binds to the
+    ``int4`` arguments of ``pg_advisory_xact_lock(int, int)``.
+    """
+
+    def test_high_bit_client_id_maps_to_negative_signed_key(self):
+        """A UUID whose low 32 bits exceed INT32_MAX maps to a negative key.
+
+        The unsigned low 32 bits would exceed the ``int4`` bind range and
+        raise asyncpg ``OverflowError``; the signed mapping keeps the key
+        within ``-(0x80000000) <= key <= 0x7FFFFFFF``.
+        """
+        # Low 32 bits = 0x80000000 (> INT32_MAX) — the boundary case.
+        client_id = uuid.UUID(int=0x80000000)
+
+        lock_class, lock_key = _reconcile_lock_key(client_id)
+
+        assert lock_class == RECONCILE_LOCK_CLASS
+        assert client_id.int & 0xFFFFFFFF > 0x7FFFFFFF
+        assert lock_key == -0x80000000
+        assert lock_key < 0
+        # Signed int32 range — must bind to pg_advisory_xact_lock(int, int).
+        assert -(0x80000000) <= lock_key <= 0x7FFFFFFF
+
+    def test_low_bit_client_id_maps_to_unsigned_value_unchanged(self):
+        """A UUID with low 32 bits within INT32_MAX maps unchanged."""
+        client_id = uuid.UUID(int=0x00000001)
+
+        lock_class, lock_key = _reconcile_lock_key(client_id)
+
+        assert lock_class == RECONCILE_LOCK_CLASS
+        assert lock_key == client_id.int & 0xFFFFFFFF
+        assert 0 <= lock_key <= 0x7FFFFFFF
 
 
 # ══════════════════════════════════════════════════════════════════════════
