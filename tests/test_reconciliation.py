@@ -585,9 +585,20 @@ class TestConcurrentSameEventDelivery:
     async def test_two_concurrent_deliveries_produce_one_event_two_attempts(
         self, mock_conn: AsyncMock,
     ) -> None:
-        """The second delivery re-reads after the lock and finds the event."""
+        """Two genuinely concurrent deliveries serialise on the advisory lock.
+
+        The two ``_record_canonical_event`` coroutines are scheduled with
+        ``asyncio.create_task`` and awaited with ``asyncio.gather`` so they
+        interleave on the event loop.  The stateful fake DB simulates the
+        real ``pg_advisory_xact_lock`` serialisation with an ``asyncio.Lock``
+        acquired at the lock SELECT and released when the fake transaction
+        exits — the second delivery deterministically blocks there, then
+        re-reads the event (re-read-after-commit) and records only its own
+        ingest attempt.  No double-insert.
+        """
+        import asyncio
         from datetime import datetime, timezone
-        from unittest.mock import patch
+        from unittest.mock import MagicMock, patch
 
         from app.api.ingest import IngestRecord, _record_canonical_event
 
@@ -600,9 +611,35 @@ class TestConcurrentSameEventDelivery:
         now = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)  # noqa: UP017
 
         # ── Stateful fake DB for usage_events ─────────────────────
+        # Mirrors the real pg_advisory_xact_lock: an asyncio.Lock is
+        # acquired at "SELECT pg_advisory_xact_lock" and released when
+        # the transaction exits (commit/rollback releases the xact lock).
+        # The 0-sleep yields in every fake handler guarantee the two
+        # tasks interleave on the event loop instead of one running to
+        # completion before the other starts.
         fake_usage_events: dict[tuple, dict] = {}
+        db_lock = asyncio.Lock()
+        current_delivery = 0           # which delivery currently holds the lock
+        lock_waits: list[int] = []     # deliveries that blocked on the lock
+        call_events: list[tuple[int, str]] = []  # chronological (delivery, event)
 
-        def _fetchrow_for(*args, **kwargs):
+        async def _fetchval_for(*args):
+            await asyncio.sleep(0)  # yield so the other task can interleave
+            sql = str(args[0]) if args else ""
+            if "SELECT pg_advisory_xact_lock" in sql:
+                nonlocal current_delivery
+                blocked = db_lock.locked()
+                await db_lock.acquire()
+                current_delivery += 1
+                call_events.append((current_delivery, "lock-acquired"))
+                if blocked:
+                    # The lock was already held — this delivery genuinely
+                    # blocked until the first delivery's transaction exited.
+                    lock_waits.append(current_delivery)
+            return None
+
+        async def _fetchrow_for(*args, **kwargs):
+            await asyncio.sleep(0)  # yield so the other task can interleave
             sql = str(args[0]) if args else ""
             if "SELECT id FROM observed_models" in sql:
                 return mock_row({"id": model_id})
@@ -611,6 +648,7 @@ class TestConcurrentSameEventDelivery:
             if "SELECT input_tokens, output_tokens" in sql and "FROM usage_events" in sql:
                 # Full canonical event field read for duplicate/replay-merge
                 # Return values matching the record → identical → "duplicate"
+                call_events.append((current_delivery, "duplicate-field-read"))
                 return mock_row({
                     "input_tokens": 100,
                     "output_tokens": 50,
@@ -624,6 +662,9 @@ class TestConcurrentSameEventDelivery:
                     "finish_reason": None,
                 })
             if "SELECT id FROM usage_events" in sql:
+                # FOR UPDATE re-read after the advisory lock — the
+                # re-read-after-commit path (issue #395).
+                call_events.append((current_delivery, "for-update-select"))
                 key = (str(identity_id), "rec-001")
                 row = fake_usage_events.get(key)
                 if row is not None:
@@ -632,15 +673,33 @@ class TestConcurrentSameEventDelivery:
             return None
 
         async def _execute_for(*args):
+            await asyncio.sleep(0)  # yield so the other task can interleave
             sql = str(args[0])
             if "INSERT INTO usage_events" in sql and "canonical_source_identity_id" in sql:
                 event_id = args[1]
                 fake_usage_events[(str(identity_id), str(args[3]))] = {"id": event_id}
+                call_events.append((current_delivery, "event-insert"))
+            elif "INSERT INTO usage_ingest_attempts" in sql:
+                call_events.append((current_delivery, "attempt-insert"))
             return None
 
+        class _SerialisedTx:
+            """Fake transaction — releases the advisory lock on commit/rollback."""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                # xact-scoped lock: released when the transaction exits.
+                if db_lock.locked():
+                    db_lock.release()
+                    call_events.append((current_delivery, "lock-released"))
+                return None
+
         mock_conn.fetchrow = AsyncMock(side_effect=_fetchrow_for)
-        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.fetchval = AsyncMock(side_effect=_fetchval_for)
         mock_conn.execute = AsyncMock(side_effect=_execute_for)
+        mock_conn.transaction = MagicMock(return_value=_SerialisedTx())
 
         record = IngestRecord(
             source_record_id="rec-001",
@@ -651,20 +710,23 @@ class TestConcurrentSameEventDelivery:
             reported_at=now,
         )
 
+        def _make_delivery():
+            """Coroutine for one delivery through _record_canonical_event."""
+            return _record_canonical_event(
+                mock_conn, record, client_id, source_db_id,
+                batch_id, None, now,
+                canonical_identity_id=identity_id,
+            )
+
         with patch(
             "app.core.identity.resolve_canonical_identity",
             return_value=identity_id,
         ):
-            result1 = await _record_canonical_event(
-                mock_conn, record, client_id, source_db_id,
-                batch_id, None, now,
-                canonical_identity_id=identity_id,
-            )
-            result2 = await _record_canonical_event(
-                mock_conn, record, client_id, source_db_id,
-                batch_id, None, now,
-                canonical_identity_id=identity_id,
-            )
+            results = await asyncio.gather(*[
+                asyncio.create_task(_make_delivery()) for _ in range(2)
+            ])
+
+        result1, result2 = results
 
         # ── Assertions ─────────────────────────────────────────────
         # Both deliveries resolved the same event id
@@ -693,6 +755,30 @@ class TestConcurrentSameEventDelivery:
         )
         assert attempt_insert_count == 2, (
             f"expected 2 INSERT INTO usage_ingest_attempts, got {attempt_insert_count}"
+        )
+
+        # ── Concurrency / serialisation proof (issue #395) ─────────
+        # Delivery 1 accepted (inserted the event); delivery 2 re-read the
+        # existing event under the lock and resolved to "duplicate".
+        assert result1["status"] == "accepted", result1
+        assert result2["status"] == "duplicate", result2
+
+        # Delivery 2 genuinely blocked on the advisory lock while delivery 1
+        # held it.  Only TRUE asyncio concurrency can produce this — a
+        # sequential await-then-await version would always find the lock
+        # free and record no wait.
+        assert lock_waits == [2], (
+            f"expected delivery 2 to block on the advisory lock, got waits {lock_waits}; "
+            f"events: {call_events}"
+        )
+
+        # Blocked-then-re-read ordering: delivery 2's FOR UPDATE re-read
+        # happened strictly AFTER delivery 1's event INSERT, so it saw the
+        # committed row instead of double-inserting.
+        d1_insert = call_events.index((1, "event-insert"))
+        d2_select = call_events.index((2, "for-update-select"))
+        assert d2_select > d1_insert, (
+            f"delivery 2 must re-read after delivery 1's insert; events: {call_events}"
         )
 
 
