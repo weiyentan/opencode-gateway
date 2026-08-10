@@ -1128,6 +1128,74 @@ class TestRecords:
         assert response.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_sort_by_source_created_at_accepted(self, client: AsyncClient, mock_conn: AsyncMock):
+        """sort_by=source_created_at is accepted as a valid sort option."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "sort_by": "source_created_at",
+                    "sort_dir": "desc",
+                },
+            )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_default_sort_is_source_created_at(self, client: AsyncClient, mock_conn: AsyncMock):
+        """The default sort_by is source_created_at (not reported_at)."""
+        rows = [_mk_record_row()]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        # Verify the SQL uses COALESCE with source_created_at_tz
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        assert "source_created_at_tz" in sql.lower(), (
+            f"Default sort should use source_created_at_tz, got: {sql[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sort_by_source_created_at_uses_coalesce(self, client: AsyncClient, mock_conn: AsyncMock):
+        """sort_by=source_created_at generates SQL with COALESCE(source_created_at_tz, reported_at)."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "sort_by": "source_created_at",
+                    "sort_dir": "asc",
+                },
+            )
+
+        assert response.status_code == 200
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        assert "COALESCE" in sql, f"Expected COALESCE in ORDER BY, got: {sql[:500]}"
+        assert "source_created_at_tz" in sql.lower(), (
+            f"Expected source_created_at_tz in COALESCE, got: {sql[:500]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_invalid_sort_by_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
         """An invalid sort_by value returns 400."""
         async with client as c:

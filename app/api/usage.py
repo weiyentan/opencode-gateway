@@ -438,11 +438,11 @@ def _build_record_filters(
 def _validate_sort(sort_by: str, sort_dir: str) -> tuple[str, str]:
     """Validate and normalise sort parameters; raise 400 on invalid values."""
     sort_by = sort_by.strip().lower()
-    if sort_by not in ("reported_at", "ingested_at"):
+    if sort_by not in ("reported_at", "ingested_at", "source_created_at"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid sort_by: '{sort_by}'. "
-            f"Must be 'reported_at' or 'ingested_at'.",
+            f"Must be 'reported_at', 'ingested_at', or 'source_created_at'.",
         )
     sort_dir = sort_dir.strip().lower()
     if sort_dir not in ("asc", "desc"):
@@ -489,7 +489,13 @@ async def _fetch_records(
             total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
-    order_col = "our.reported_at" if sort_by == "reported_at" else "our.first_ingested_at"
+    if sort_by == "source_created_at":
+        order_col = "COALESCE(osc.source_created_at_tz, our.reported_at)"
+    elif sort_by == "ingested_at":
+        order_col = "our.first_ingested_at"
+    else:
+        order_col = "our.reported_at"
+
     data_sql = f"""
         SELECT
             our.id,
@@ -512,6 +518,9 @@ async def _fetch_records(
         FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         JOIN sessions s ON s.id = our.session_id
+        LEFT JOIN opencode_session_contexts osc
+            ON osc.source_database_id = s.source_database_id
+            AND osc.external_session_id = s.external_session_id
         WHERE {where_clause}
         ORDER BY {order_col} {sort_dir}
         LIMIT ${len(query_params) + 1}
@@ -734,7 +743,7 @@ async def get_records(
     session_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    sort_by: str = Query(default="reported_at"),
+    sort_by: str = Query(default="source_created_at"),
     sort_dir: str = Query(default="desc"),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[RecordRow]:
@@ -743,6 +752,12 @@ async def get_records(
     Each record includes a ``loki_search_url`` pointing to the Grafana
     Explore view filtered to the record's client, source database, and
     session.
+
+    **Sort options**: ``source_created_at`` (default), ``reported_at``,
+    ``ingested_at``.  When sorting by ``source_created_at``, the query
+    uses ``COALESCE(source_created_at_tz, reported_at)`` — preferring
+    the timezone-aware source-created timestamp when available, falling
+    back to the collector-reported time.
     """
     _validate_date_range(start_date, end_date)
     sort_by, sort_dir = _validate_sort(sort_by, sort_dir)
@@ -1681,7 +1696,7 @@ async def _fetch_records_with_context(
         {_RWC_CONTEXT_JOIN}
         {_RWC_PROJECT_JOIN}
         WHERE {where_clause}
-        ORDER BY our.reported_at DESC
+        ORDER BY COALESCE(osc.source_created_at_tz, our.reported_at) DESC
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
