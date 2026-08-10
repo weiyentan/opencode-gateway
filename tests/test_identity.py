@@ -54,6 +54,7 @@ def _client_row(
     name: str = "test-client",
     description: str | None = "A test client",
     is_active: bool = True,
+    canonical_name: str | None = None,
 ) -> MagicMock:
     """Return a mock row resembling an opencode_clients row."""
     row = MagicMock()
@@ -62,6 +63,7 @@ def _client_row(
         "name": name,
         "description": description,
         "is_active": is_active,
+        "canonical_name": canonical_name,
         "created_at": _TS,
         "updated_at": _TS,
     }.__getitem__
@@ -70,6 +72,7 @@ def _client_row(
         "name": name,
         "description": description,
         "is_active": is_active,
+        "canonical_name": canonical_name,
         "created_at": _TS,
         "updated_at": _TS,
     }.get
@@ -169,6 +172,25 @@ class TestCreateClient:
         data = response.json()
         assert data["data"]["description"] is None
 
+    @pytest.mark.asyncio
+    async def test_create_client_response_includes_canonical_name_null(self):
+        """A newly created client has canonical_name null in the response."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_client_row(name="deploy-1", canonical_name=None)
+        )
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.post(
+                "/admin/clients",
+                json={"name": "deploy-1", "description": "Per-workspace client"},
+            )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["data"]["canonical_name"] is None
+
 
 class TestListClients:
     """GET /admin/clients"""
@@ -245,6 +267,40 @@ class TestGetClient:
         assert token["token_prefix"] == "abcdefgh"
 
     @pytest.mark.asyncio
+    async def test_get_client_includes_canonical_name(self):
+        """Getting a client by ID returns canonical_name in the response (null when unset)."""
+        mock_conn = AsyncMock()
+        c_row = _client_row(canonical_name="deployment-1")
+        t_row = _token_row()
+        mock_conn.fetchrow = AsyncMock(return_value=c_row)
+        mock_conn.fetch = AsyncMock(return_value=[t_row])
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/admin/clients/{_CLIENT_ID}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["canonical_name"] == "deployment-1"
+
+    @pytest.mark.asyncio
+    async def test_get_client_canonical_name_null(self):
+        """A client with no canonical name returns canonical_name as null."""
+        mock_conn = AsyncMock()
+        c_row = _client_row(canonical_name=None)
+        t_row = _token_row()
+        mock_conn.fetchrow = AsyncMock(return_value=c_row)
+        mock_conn.fetch = AsyncMock(return_value=[t_row])
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.get(f"/admin/clients/{_CLIENT_ID}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["canonical_name"] is None
+
+    @pytest.mark.asyncio
     async def test_get_client_not_found(self):
         """Getting a nonexistent client returns 404."""
         mock_conn = AsyncMock()
@@ -292,6 +348,79 @@ class TestUpdateClient:
             )
 
         assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_client_set_canonical_name(self):
+        """Patching canonical_name sets it on the client."""
+        mock_conn = AsyncMock()
+        updated = _client_row(name="test-client", canonical_name="deployment-1")
+        mock_conn.fetchrow = AsyncMock(return_value=updated)
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.patch(
+                f"/admin/clients/{_CLIENT_ID}",
+                json={"canonical_name": "deployment-1"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["canonical_name"] == "deployment-1"
+
+    @pytest.mark.asyncio
+    async def test_update_client_clear_canonical_name(self):
+        """Patching canonical_name with null clears it."""
+        mock_conn = AsyncMock()
+        updated = _client_row(name="test-client", canonical_name=None)
+        mock_conn.fetchrow = AsyncMock(return_value=updated)
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.patch(
+                f"/admin/clients/{_CLIENT_ID}",
+                json={"canonical_name": None},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["canonical_name"] is None
+
+    @pytest.mark.asyncio
+    async def test_update_client_omit_canonical_name(self):
+        """Patching without canonical_name leaves existing value unchanged."""
+        mock_conn = AsyncMock()
+        updated = _client_row(name="new-name", canonical_name="deployment-1")
+        mock_conn.fetchrow = AsyncMock(return_value=updated)
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.patch(
+                f"/admin/clients/{_CLIENT_ID}",
+                json={"name": "new-name"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["name"] == "new-name"
+        assert data["data"]["canonical_name"] == "deployment-1"
+
+    @pytest.mark.asyncio
+    async def test_update_client_update_canonical_name(self):
+        """Patching canonical_name changes it from the prior value."""
+        mock_conn = AsyncMock()
+        updated = _client_row(name="test-client", canonical_name="deployment-2")
+        mock_conn.fetchrow = AsyncMock(return_value=updated)
+        client = _build_client(mock_conn)
+
+        async with client as c:
+            response = await c.patch(
+                f"/admin/clients/{_CLIENT_ID}",
+                json={"canonical_name": "deployment-2"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["canonical_name"] == "deployment-2"
 
 
 class TestDeleteClient:
