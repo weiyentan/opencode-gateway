@@ -80,16 +80,6 @@ no rollup column — they map to sessions only.  The rollup stores only
 additive token/cost totals (ADR 0015 decision 3).
 """
 
-# Field name → rollup column name (same for all five currently, but
-# explicit for clarity and forward compatibility).
-ROLLUP_COLUMN_MAP: dict[str, str] = {
-    "input_tokens": "input_tokens",
-    "output_tokens": "output_tokens",
-    "cache_read_tokens": "cache_read_tokens",
-    "cache_write_tokens": "cache_write_tokens",
-    "estimated_cost_usd": "estimated_cost_usd",
-}
-
 SESSION_TOKEN_FIELDS: tuple[str, ...] = (
     "input_tokens",
     "output_tokens",
@@ -451,12 +441,20 @@ async def apply_replay_merge(
     event values, and adjusts the owning ``sessions`` aggregate by the
     delta — clamping any total that would go negative to zero.
 
-    When ``client_id``, ``project_id``, and ``reported_at`` are all
-    provided, the Client Project Rollup table is also adjusted by the
-    same per-field delta (the subset of :data:`ROLLUP_FIELDS`), inside
-    the same transaction.  ``project_id`` must be non-None (the rollup
-    PK is all NOT NULL).  ``reported_at`` is used to derive the UTC day
-    bucket.
+    The Client Project Rollup is also maintained inside the same
+    transaction.  The rollup key (``client_id``, ``project_id``, ``day``)
+    and UTC day bucket are derived from the **stored** canonical event's
+    ``client_id``, ``project_id`` and ``reported_at`` columns — NOT from
+    the incoming replay record.  This guarantees the delta is applied to
+    the same bucket that ``SUM(usage_events)`` groups by, preventing
+    divergence when a replay carries a day-crossing ``reported_at`` or a
+    different ``project_id`` from the original delivery (issue #403).
+
+    ``project_id`` must be non-None on the stored event (the rollup PK
+    is all NOT NULL).  The ``client_id``, ``project_id`` and
+    ``reported_at`` keyword arguments are retained for backward
+    compatibility with existing callers but are no longer used for
+    rollup keying.
 
     No transaction is opened here: the caller owns the transaction, so
     the advisory lock and the ``FOR UPDATE`` row reads span the entire
@@ -485,7 +483,8 @@ async def apply_replay_merge(
     current = await conn.fetchrow(
         """SELECT input_tokens, output_tokens, cached_tokens,
                   reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                  estimated_cost_usd, session_id
+                  estimated_cost_usd, session_id,
+                  client_id, project_id, reported_at
            FROM usage_events
            WHERE id = $1
            FOR UPDATE""",
@@ -555,8 +554,14 @@ async def apply_replay_merge(
                 )
 
     # ── 5. Maintain Client Project Rollup (subset of delta fields) ────
-    if client_id is not None and project_id is not None and reported_at is not None:
-        day = _rollup_day(reported_at)
+    # The rollup key MUST be derived from the STORED event's project_id
+    # and reported_at — never the incoming record's — so that a replay
+    # carrying a day-crossing reported_at or a changed project_id applies
+    # the delta to the same (client_id, project_id, day) bucket as
+    # SUM(usage_events) groups by, avoiding divergence (issue #403).
+    stored_project_id = current["project_id"]
+    if stored_project_id is not None:
+        day = _rollup_day(current["reported_at"])
         rollup_deltas: dict[str, int | Decimal] = {}
         for field_name in ROLLUP_FIELDS:
             field_delta = delta.deltas[field_name]
@@ -566,8 +571,8 @@ async def apply_replay_merge(
             cost_delta = rollup_deltas.get("estimated_cost_usd", Decimal("0"))
             await _upsert_client_project_rollup(
                 conn,
-                client_id=client_id,
-                project_id=project_id,
+                client_id=current["client_id"],
+                project_id=stored_project_id,
                 day=day,
                 input_tokens=int(rollup_deltas.get("input_tokens", 0)),
                 output_tokens=int(rollup_deltas.get("output_tokens", 0)),

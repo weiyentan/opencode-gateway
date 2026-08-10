@@ -19,6 +19,7 @@ Uses the shared ``mock_row`` / ``mock_conn`` fixtures from
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -53,6 +54,9 @@ def _event(**overrides: object) -> dict:
         "reasoning_tokens": 5,
         "estimated_cost_usd": Decimal("1.25"),
         "session_id": _event_uuid(),
+        "client_id": uuid.uuid4(),
+        "project_id": "test-project",
+        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc),
     }
     row.update(overrides)
     return row
