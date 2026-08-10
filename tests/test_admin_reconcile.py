@@ -27,6 +27,8 @@ _SESSION_A = uuid.UUID("b0000000-0000-0000-0000-000000000001")
 _SESSION_B = uuid.UUID("b0000000-0000-0000-0000-000000000002")
 _MODEL_ID = uuid.UUID("c0000000-0000-0000-0000-000000000001")
 _SOURCE_ID = uuid.UUID("d0000000-0000-0000-0000-000000000001")
+_CANONICAL_SOURCE_IDENTITY_ID = uuid.UUID("f0000000-0000-0000-0000-000000000001")
+_CANONICAL_SOURCE_IDENTITY_ID_2 = uuid.UUID("f0000000-0000-0000-0000-000000000002")
 
 _EARLY = datetime(2026, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
 _LATER = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -41,6 +43,7 @@ def _mk_event(
     *,
     event_id: uuid.UUID | None = None,
     source_record_id: str = "rec-001",
+    canonical_source_identity_id: uuid.UUID = _CANONICAL_SOURCE_IDENTITY_ID,
     client_id: uuid.UUID = _CLIENT_ID,
     session_id: uuid.UUID = _SESSION_A,
     input_tokens: int = 100,
@@ -56,6 +59,7 @@ def _mk_event(
     return mock_row({
         "id": event_id or uuid.uuid4(),
         "source_record_id": source_record_id,
+        "canonical_source_identity_id": canonical_source_identity_id,
         "client_id": client_id,
         "session_id": session_id,
         "input_tokens": input_tokens,
@@ -687,3 +691,112 @@ class TestScanDuplicateGroupsParams:
         assert len(params_passed) == 2, (
             f"Expected 2 params (date_from, date_to) but got {len(params_passed)}"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Cross-tenant safety — scan_duplicate_groups scoped by canonical identity
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestScanDuplicateGroupsCrossTenant:
+    """scan_duplicate_groups scopes each duplicate group per canonical source identity.
+
+    Two events sharing the same ``source_record_id`` across different
+    canonical source identities (different clients/tenants) MUST be
+    returned as SEPARATE groups — merging them would delete one client's
+    data from the other's reconcile run.
+    """
+
+    async def test_different_identity_same_record_id_produces_two_groups(
+        self, mock_conn: AsyncMock
+    ):
+        """Same source_record_id, different identities → two groups of 1 each."""
+        event_a = _mk_event(
+            source_record_id="rec-common",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID,
+            client_id=_CLIENT_ID,
+            input_tokens=50,
+            first_ingested_at=_EARLY,
+            reported_at=_LATER,
+        )
+        event_b = _mk_event(
+            source_record_id="rec-common",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID_2,
+            client_id=uuid.UUID("a0000000-0000-0000-0000-000000000099"),
+            input_tokens=100,
+            first_ingested_at=_LATER,
+            reported_at=_LATER,
+        )
+
+        mock_conn.fetch = AsyncMock(return_value=[event_a, event_b])
+
+        groups = await scan_duplicate_groups(mock_conn)
+
+        # Two separate groups — NOT merged into one cross-tenant group
+        assert len(groups) == 2, f"Expected 2 groups, got {len(groups)}"
+        assert len(groups[0]) == 1
+        assert len(groups[1]) == 1
+
+    async def test_same_identity_same_record_id_forms_one_group(
+        self, mock_conn: AsyncMock
+    ):
+        """Same source_record_id AND same identity → single group of 2."""
+        event_a = _mk_event(
+            source_record_id="rec-001",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID,
+            input_tokens=50,
+            first_ingested_at=_EARLY,
+            reported_at=_LATER,
+        )
+        event_b = _mk_event(
+            source_record_id="rec-001",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID,
+            input_tokens=150,
+            first_ingested_at=_LATER,
+            reported_at=_LATER,
+        )
+
+        mock_conn.fetch = AsyncMock(return_value=[event_a, event_b])
+
+        groups = await scan_duplicate_groups(mock_conn)
+
+        # One group containing both events
+        assert len(groups) == 1, f"Expected 1 group, got {len(groups)}"
+        assert len(groups[0]) == 2
+
+    async def test_client_id_filter_still_scans_restricted_to_client(
+        self, mock_conn: AsyncMock
+    ):
+        """When client_id is provided, the scan restricts to that client."""
+        event_a = _mk_event(
+            source_record_id="rec-001",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID,
+            client_id=_CLIENT_ID,
+            input_tokens=50,
+            first_ingested_at=_EARLY,
+            reported_at=_LATER,
+        )
+        event_b = _mk_event(
+            source_record_id="rec-001",
+            canonical_source_identity_id=_CANONICAL_SOURCE_IDENTITY_ID,
+            client_id=_CLIENT_ID,
+            input_tokens=150,
+            first_ingested_at=_LATER,
+            reported_at=_LATER,
+        )
+
+        mock_conn.fetch = AsyncMock(return_value=[event_a, event_b])
+
+        groups = await scan_duplicate_groups(mock_conn, client_id=_CLIENT_ID)
+
+        # Parameter count check: client_id is one param
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        # The SQL must reference ue.client_id in the WHERE clause
+        assert "ue.client_id" in sql, "client_id filter not present in SQL"
+        # The subquery must also scope by client (ue2.client_id)
+        assert "ue2.client_id" in sql, "client_id scope missing from subquery"
+
+        assert len(groups) == 1, f"Expected 1 group, got {len(groups)}"
+        assert len(groups[0]) == 2
