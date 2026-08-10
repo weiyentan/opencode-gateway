@@ -252,23 +252,46 @@ identity.
 _Avoid_: Project ID when referring to a display label
 
 **Canonical Client Name**:
-The client name under which multiple per-workspace client registrations
-are aggregated for reporting. Per-workspace clients — one registration per
-AWX workspace — share a canonical name so their usage rolls up under a
-single deployment identity; a client without a canonical name reports
-under its own name. The canonical name is assigned manually per client;
-the relationship between a workspace client's own name and its canonical
-name is a deliberate mapping, not a derived transformation.
+The per-deployment identity label under which multiple per-workspace client
+registrations are aggregated for reporting. Per-workspace clients — one
+registration per AWX workspace — share a canonical name so their usage rolls
+up under a single deployment identity; a client without a canonical name
+reports under its own name. The canonical name is assigned manually per
+client; the relationship between a workspace client's own name and its
+canonical name is a deliberate mapping, not a derived transformation.
+Aggregation applies ``COALESCE(canonical_name, name)`` at read time, so
+changing a canonical name never requires a table recompute.
 _Avoid_: Client alias, merged client
 
 **Client Project Rollup**:
-A pre-aggregated usage summary per (client, project, day) holding only
-additive token and cost totals (input, output, cache, and reasoning
-tokens plus estimated cost), maintained at ingest time. Session counts
-and model counts are not part of the rollup and are computed from raw
-records. Raw usage records are authoritative; if the rollup disagrees with
-those records, the rollup is the value to correct.
-_Avoid_: Aggregated table, rollup view
+A pre-aggregated read-model of the canonical ``usage_events`` table keyed by
+``(client_id, project_id, day)``, storing only additive token and cost totals
+(input, output, cache read, cache write tokens plus estimated cost). It is a
+derived convenience, not the source of truth: it is maintained in the same
+atomic ingest transaction as the canonical event write, moved by the same
+replay-merge deltas the reconciliation layer computes, and corrected against
+``usage_events`` when it disagrees (ADR 0015). Backfilled by
+``scripts/backfill_client_project_rollup.py``, which recomputes rows from
+``usage_events`` with the same additive math. Session counts and model counts
+are not part of the rollup and are computed from raw records.
+_Avoid_: Aggregated table, rollup view, source of truth, raw-record-backed rollup
+
+**Project Rollup Key**:
+The stable project identifier used as the key of the Client Project Rollup
+(``project_id`` in ``(client_id, project_id, day)``), distinct from the
+volatile human-readable display label. The Project Label is resolved at read
+time from source project metadata; keying on the label string would fragment
+the table when labels change.
+_Avoid_: Project Label, project name (when identity is meant)
+
+**Hybrid Aggregates Read**:
+The client-project usage aggregation strategy: the ``client,project``
+dimension reads the pre-aggregated Client Project Rollup table, while every
+other aggregate dimension (model, session, day, week, month) keeps scanning
+raw ``usage_events``. ``COALESCE(canonical_name, name)`` is applied at read
+time on both paths, so a canonical name change never requires a table
+recompute.
+_Avoid_: Rollup-only reads, rollup for every dimension
 
 **Drilldown State**:
 The user's current expanded/collapsed view within an Aurora Glass summary,
@@ -447,6 +470,8 @@ manages.
 - An **Ingest Attempt** records each delivery processed through the canonical layer and references the owning **Canonical Event** when one exists
 - A **Source Identity Quarantine** belongs to one **Canonical Source Identity**; while it is active the identity's records route to the `quarantined` **Ingest Outcome** with no canonical event or session aggregate change
 - The usage query endpoints read from the **Canonical Event** table (`usage_events`), not `opencode_usage_records` (API contracts unchanged)
+- A **Client Project Rollup** row is keyed by `(client_id, project_id, day)` and stores only additive token and cost totals, never session or model counts
+- The client-project aggregate read path reads the **Client Project Rollup** (ADR 0015); all other aggregate dimensions scan **Canonical Event** rows (`usage_events`)
 - Concurrent deliveries of the same **Canonical Event** are serialised with a transaction-scoped advisory lock (`pg_advisory_xact_lock`); a second delivery re-reads after the first commits
 - A **Replay Merge** applies only to a duplicate **Usage Record** that passed the dedup identity check; a divergent duplicate goes to conflict instead (legacy `opencode_usage_records` path, ADR 0011)
 - A **Replay Merge** fills only currently-NULL nullable enrichment fields on the stored **Usage Record** and never erases populated values (legacy `opencode_usage_records` path, ADR 0011)

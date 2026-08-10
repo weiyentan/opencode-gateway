@@ -371,6 +371,7 @@ opencode-gateway/
 | [0012](docs/adr/0012-canonical-event-replay-merge.md) | Canonical Event Replay Merge | Accepted |
 | [0013](docs/adr/0013-session-currentstatus-heuristic.md) | Session currentStatus Heuristic | Accepted |
 | [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
+| [0015](docs/adr/0015-client-project-rollup-as-usage-events-read-model.md) | Client Project Rollup as a usage_events read-model | Accepted |
 
 ---
 
