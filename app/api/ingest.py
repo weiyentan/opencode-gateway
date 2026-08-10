@@ -1894,13 +1894,12 @@ async def ingest_usage(
         # either new, idempotent, or reconciled).  Only records with
         # status "quarantined", "conflict", or "rejected" increment the
         # rejected count.
-        if result.status in ("accepted",):
+        if result.status in ("accepted", "duplicate", "updated"):
+            # "duplicate" (idempotent replay) and "updated" (replay merge)
+            # are successful processing outcomes — no event creation, no
+            # error — and count as accepted so that
+            # accepted_count + rejected_count == len(records) always holds.
             accepted += 1
-        elif result.status in ("duplicate", "updated"):
-            # Successfully processed — no event creation, no error.
-            # Neither accepted nor rejected; per-record result carries the
-            # canonical outcome.
-            pass
         else:
             rejected += 1
 
