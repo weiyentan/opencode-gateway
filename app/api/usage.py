@@ -291,31 +291,56 @@ async def _fetch_aggregates_rollup(
     # record_count, session_count, and model_count are derived from a
     # separate distinct-count scan over raw ``usage_events``, grouped by
     # the same (client, project-label) dimension.
+    #
+    # The count query MUST resolve the project label through the SAME
+    # ``(client_id, external_project_id)`` LATERAL lookup the rollup
+    # query uses.  Keying on ``usage_events.project_id`` (NOT
+    # ``sessions.project_id``) and matching against
+    # ``opencode_source_projects`` via ``(client_id, external_project_id)``
+    # produces byte-identical ``group_value`` strings to the rollup query.
+    # This prevents count-zeroing when one client reports the same project
+    # from multiple source databases (the canonical-client scenario) or
+    # when ``usage_events.project_id`` differs from
+    # ``sessions.project_id``.  The constant ``_ROLLUP_PROJECT_LABEL_SQL``
+    # references ``r.project_id`` and ``osp`` — aliasing ``usage_events``
+    # as ``r`` lets the same constant serve both queries.
     count_params: list = [start_date, end_date]
     count_filters: list[str] = [
-        "our.reported_at >= $1",
-        "our.reported_at <= $2",
+        "r.reported_at >= $1",
+        "r.reported_at <= $2",
+        "r.project_id IS NOT NULL",
     ]
     if client_id is not None:
-        count_filters.append(f"our.client_id = ${len(count_params) + 1}")
+        count_filters.append(f"r.client_id = ${len(count_params) + 1}")
         count_params.append(client_id)
     count_where = " AND ".join(count_filters)
 
     count_sql = f"""
+        WITH usage_with_label AS (
+            SELECT
+                r.client_id,
+                r.session_id,
+                r.model_id,
+                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label
+            FROM usage_events r
+            LEFT JOIN LATERAL (
+                SELECT osp.display_name, osp.name, osp.worktree
+                FROM opencode_source_projects osp
+                WHERE osp.client_id = r.client_id
+                  AND osp.external_project_id = r.project_id
+                LIMIT 1
+            ) osp ON true
+            WHERE {count_where}
+        )
         SELECT
-            COALESCE(oc.canonical_name, oc.name) || '|' || ({_PROJECT_LABEL_SQL}) AS group_value,
+            COALESCE(oc.canonical_name, oc.name) || '|' || ul.project_label AS group_value,
             COUNT(*) AS record_count,
-            COUNT(DISTINCT our.session_id) AS session_count,
+            COUNT(DISTINCT ul.session_id) AS session_count,
             COUNT(DISTINCT om.model_name) AS model_count
-        FROM usage_events our
-        JOIN observed_models om ON om.id = our.model_id
-        JOIN opencode_clients oc ON oc.id = our.client_id
-        JOIN sessions s ON s.id = our.session_id
-        LEFT JOIN opencode_source_projects osp
-            ON osp.source_database_id = s.source_database_id
-            AND osp.external_project_id = s.project_id
-        WHERE {count_where}
-        GROUP BY COALESCE(oc.canonical_name, oc.name), ({_PROJECT_LABEL_SQL})
+        FROM usage_with_label ul
+        JOIN observed_models om ON om.id = ul.model_id
+        JOIN opencode_clients oc ON oc.id = ul.client_id
+        GROUP BY COALESCE(oc.canonical_name, oc.name), ul.project_label
     """
     async with timed_operation("db.query.aggregates.client_project_counts", "db"):
         async with _db_timeout(

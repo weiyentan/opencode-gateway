@@ -957,6 +957,147 @@ class TestClientProjectAggregates:
         assert r["model_count"] == 0
         assert r["project_label"] == "Project X"
 
+    @pytest.mark.asyncio
+    async def test_rollup_count_query_sql_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The count query uses the same (client_id, project_id) LATERAL
+        project-label lookup as the rollup query, not the old divergent
+        (source_database_id, s.project_id) join.
+
+        The two queries must produce byte-identical ``group_value`` strings
+        so the Python merge keys on ``group_value`` reliably attach counts
+        to rollup rows.  A mismatch silently zeroes Sessions/Models columns.
+        """
+        rollup_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                record_count=0, session_count=0, model_count=0,
+                project_label="Proj X",
+            )
+        ]
+        count_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=0,
+                total_output_tokens=0,
+                record_count=3, session_count=2, model_count=1,
+                project_label="Proj X",
+            )
+        ]
+        mock_conn.fetch = AsyncMock(side_effect=[rollup_rows, count_rows])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        # Two fetch calls: rollup + count
+        assert mock_conn.fetch.call_count == 2
+
+        rollup_sql = mock_conn.fetch.call_args_list[0][0][0]
+        count_sql = mock_conn.fetch.call_args_list[1][0][0]
+
+        # ── Rollup query shape assertions ──
+        assert "FROM client_project_rollup" in rollup_sql
+        assert "osp.client_id = r.client_id" in rollup_sql
+        assert "osp.external_project_id = r.project_id" in rollup_sql
+        assert "COALESCE(oc.canonical_name, oc.name)" in rollup_sql
+
+        # ── Count query shape assertions ──
+        assert "FROM usage_events" in count_sql, (
+            "Count query must scan usage_events"
+        )
+        # Uses the same LATERAL join as the rollup
+        assert "osp.client_id = r.client_id" in count_sql, (
+            "Count query LATERAL must key on client_id, "
+            f"got: {count_sql[:400]}"
+        )
+        assert "osp.external_project_id = r.project_id" in count_sql, (
+            "Count query LATERAL must key on external_project_id, "
+            f"got: {count_sql[:400]}"
+        )
+        # Must NOT use the old divergent join
+        assert "osp.source_database_id" not in count_sql, (
+            "Count query must not use source_database_id join, "
+            f"got: {count_sql[:400]}"
+        )
+        assert "s.project_id" not in count_sql, (
+            "Count query must not reference sessions.project_id, "
+            f"got: {count_sql[:400]}"
+        )
+        # Both use the same group_value expression shape
+        assert "COALESCE(oc.canonical_name, oc.name)" in count_sql
+        assert " || '|' || " in count_sql
+
+    @pytest.mark.asyncio
+    async def test_rollup_merge_counts_when_group_values_match(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """When the rollup and count queries produce matching group_values,
+        the count values (record_count, session_count, model_count) are
+        merged into the rollup row — not zeroed."""
+        rollup_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                total_cache_read_tokens=10,
+                total_cache_write_tokens=5,
+                cost=Decimal("0.0123"),
+                record_count=0, session_count=0, model_count=0,
+                project_label="Proj X",
+            )
+        ]
+        count_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=0,
+                total_output_tokens=0,
+                total_cache_read_tokens=0,
+                total_cache_write_tokens=0,
+                cost=None,
+                record_count=3, session_count=2, model_count=1,
+                project_label="Proj X",
+            )
+        ]
+        mock_conn.fetch = AsyncMock(side_effect=[rollup_rows, count_rows])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        r = data[0]
+        assert r["group_value"] == "ClientA|Proj X"
+        # Additive totals from the rollup
+        assert r["total_input_tokens"] == 100
+        assert r["total_output_tokens"] == 50
+        assert r["total_cache_read_tokens"] == 10
+        assert r["total_cache_write_tokens"] == 5
+        # Counts from the count query (merged, not zeroed)
+        assert r["record_count"] == 3, f"Expected record_count=3, got {r['record_count']}"
+        assert r["session_count"] == 2, f"Expected session_count=2, got {r['session_count']}"
+        assert r["model_count"] == 1, f"Expected model_count=1, got {r['model_count']}"
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
 # ══════════════════════════════════════════════════════════════════════════
