@@ -1434,6 +1434,7 @@ async def _record_canonical_event(
     """
     from app.core.reconciliation import (
         IngestOutcome,
+        _rollup_day,
         _upsert_client_project_rollup,
         acquire_canonical_event_lock,
         apply_replay_merge,
@@ -1542,12 +1543,7 @@ async def _record_canonical_event(
 
             # ── Maintain Client Project Rollup (first insert: full increment) ──
             if record.project_id is not None:
-                import datetime as _dt
-                day = record.reported_at
-                if day.tzinfo is not None:
-                    day = day.astimezone(_dt.timezone.utc).date()
-                else:
-                    day = day.date()
+                day = _rollup_day(record.reported_at)
                 cost = record.estimated_cost_usd
                 if cost is None:
                     cost = Decimal("0")
@@ -1594,8 +1590,6 @@ async def _record_canonical_event(
                 merge_outcome = await apply_replay_merge(
                     conn, event_id, new_values,
                     client_id=client_id,
-                    project_id=record.project_id,
-                    reported_at=record.reported_at,
                 )
 
                 # COALESCE-fill text enrichment fields (non-erasing)

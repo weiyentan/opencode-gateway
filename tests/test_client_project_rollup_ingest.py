@@ -238,6 +238,9 @@ class TestReplayMergeRollupDelta:
             "cache_read_tokens": 10, "cache_write_tokens": 10,
             "estimated_cost_usd": Decimal("0.0035"),
             "session_id": uuid.uuid4(),
+            "client_id": _CLIENT_ID,
+            "project_id": "proj-test-abc",
+            "reported_at": _mk_ts(),
         })
         items.append(merge_event_row)
 
@@ -356,6 +359,9 @@ class TestReplayMergeRollupDelta:
             "cache_read_tokens": 10, "cache_write_tokens": 10,
             "estimated_cost_usd": Decimal("1.00"),
             "session_id": uuid.uuid4(),
+            "client_id": _CLIENT_ID,
+            "project_id": "proj-test-abc",
+            "reported_at": _mk_ts(),
         })
         items.append(merge_event_row)
 
@@ -730,6 +736,9 @@ class TestBackfillLiveEquivalence:
             "cache_write_tokens": 20,
             "estimated_cost_usd": Decimal("2.00"),
             "session_id": uuid.uuid4(),
+            "client_id": client_id,
+            "project_id": project_id,
+            "reported_at": reported_at,
         })
 
         # Session aggregate row
@@ -789,6 +798,9 @@ class TestBackfillLiveEquivalence:
             "cache_read_tokens": 30, "cache_write_tokens": 20,
             "estimated_cost_usd": Decimal("2.00"),
             "session_id": uuid.uuid4(),
+            "client_id": uuid.uuid4(),
+            "project_id": None,
+            "reported_at": datetime(2025, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
         })
 
         session_row = mock_row({
@@ -817,6 +829,151 @@ class TestBackfillLiveEquivalence:
         assert len(rollup_calls) == 0, (
             "apply_replay_merge without rollup params should not touch client_project_rollup"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Regression: replay-merge rollup keying on stored event, not incoming record
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRollupKeyingRegression:
+    """Issue #403 regression: rollup delta must not key on the incoming record.
+
+    A replay carrying a day-crossing ``reported_at`` or a changed
+    ``project_id`` must apply the delta to the STORED event's
+    (client_id, project_id, day) bucket — NOT the incoming record's —
+    and must never create a phantom row for the incoming record's
+    project/day.
+    """
+
+    @pytest.mark.asyncio
+    async def test_day_crossing_replay_keys_on_stored_day(
+        self, mock_conn,
+    ):
+        """A replay whose reported_at drifts across a UTC day boundary must
+        apply the delta to the STORED event's day bucket."""
+        client_id = uuid.uuid4()
+        event_id = uuid.uuid4()
+        stored_project_id = "stored-proj"
+        # Stored event: day 2025-08-01
+        stored_reported_at = datetime(2025, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # Incoming replay: day 2025-08-02 (crossing the boundary)
+        incoming_reported_at = datetime(2025, 8, 2, 3, 0, 0, tzinfo=timezone.utc)
+
+        stored_row = mock_row({
+            "input_tokens": 100, "output_tokens": 50,
+            "cached_tokens": 0, "reasoning_tokens": 0,
+            "cache_read_tokens": 10, "cache_write_tokens": 10,
+            "estimated_cost_usd": Decimal("0.50"),
+            "session_id": uuid.uuid4(),
+            "client_id": client_id,
+            "project_id": stored_project_id,
+            "reported_at": stored_reported_at,
+        })
+
+        session_row = mock_row({
+            "total_input_tokens": 1000, "total_output_tokens": 500,
+            "total_cached_tokens": 0, "total_cache_read_tokens": 100,
+            "total_cache_write_tokens": 100,
+            "total_estimated_cost_usd": Decimal("10.00"),
+        })
+
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[stored_row, session_row],
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        # Replay with differing token values and a day-crossing reported_at
+        outcome = await apply_replay_merge(
+            mock_conn, event_id,
+            {"input_tokens": 200, "output_tokens": 30, "cached_tokens": 0,
+             "cache_read_tokens": 25, "cache_write_tokens": 10,
+             "reasoning_tokens": 0, "estimated_cost_usd": Decimal("0.75")},
+            client_id=client_id,
+            project_id=stored_project_id,
+            reported_at=incoming_reported_at,  # day 2025-08-02
+        )
+
+        assert outcome == IngestOutcome.UPDATED
+
+        # Verify the rollup delta was written to the STORED event's day
+        rollup_calls = _rollup_execute_calls(mock_conn)
+        assert len(rollup_calls) == 1, (
+            "Expected exactly 1 rollup call for the stored event's bucket"
+        )
+        rollup_args = rollup_calls[0].args
+        assert rollup_args[1] == client_id
+        assert rollup_args[2] == stored_project_id
+        # Day must be the STORED event's day (2025-08-01), not incoming (2025-08-02)
+        assert rollup_args[3] == stored_reported_at.date(), (
+            f"Rollup day must be stored event's day {stored_reported_at.date()}, "
+            f"not incoming record's day {incoming_reported_at.date()}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_project_id_keys_on_stored_project(
+        self, mock_conn,
+    ):
+        """A replay carrying a different project_id must apply the delta
+        to the STORED event's project_id bucket, and must NOT create a
+        phantom row for the incoming record's project_id."""
+        client_id = uuid.uuid4()
+        event_id = uuid.uuid4()
+        stored_project_id = "stored-proj"
+        incoming_project_id = "different-proj"
+        reported_at = datetime(2025, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        stored_row = mock_row({
+            "input_tokens": 100, "output_tokens": 50,
+            "cached_tokens": 0, "reasoning_tokens": 0,
+            "cache_read_tokens": 10, "cache_write_tokens": 10,
+            "estimated_cost_usd": Decimal("0.50"),
+            "session_id": uuid.uuid4(),
+            "client_id": client_id,
+            "project_id": stored_project_id,
+            "reported_at": reported_at,
+        })
+
+        session_row = mock_row({
+            "total_input_tokens": 1000, "total_output_tokens": 500,
+            "total_cached_tokens": 0, "total_cache_read_tokens": 100,
+            "total_cache_write_tokens": 100,
+            "total_estimated_cost_usd": Decimal("10.00"),
+        })
+
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[stored_row, session_row],
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        # Replay with differing values and a changed project_id
+        outcome = await apply_replay_merge(
+            mock_conn, event_id,
+            {"input_tokens": 200, "output_tokens": 30, "cached_tokens": 0,
+             "cache_read_tokens": 25, "cache_write_tokens": 10,
+             "reasoning_tokens": 0, "estimated_cost_usd": Decimal("0.75")},
+            client_id=client_id,
+            project_id=incoming_project_id,  # different from stored
+            reported_at=reported_at,
+        )
+
+        assert outcome == IngestOutcome.UPDATED
+
+        # Verify only ONE rollup call, keyed on the STORED event's project_id
+        rollup_calls = _rollup_execute_calls(mock_conn)
+        assert len(rollup_calls) == 1, (
+            "Expected exactly 1 rollup call; no phantom row for incoming project_id"
+        )
+        rollup_args = rollup_calls[0].args
+        assert rollup_args[1] == client_id
+        assert rollup_args[2] == stored_project_id, (
+            f"Rollup project_id must be stored event's '{stored_project_id}', "
+            f"not incoming record's '{incoming_project_id}'"
+        )
+        # Day must be derived from the stored event's reported_at
+        assert rollup_args[3] == reported_at.date()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -927,6 +1084,9 @@ class TestNullProjectSkipsRollup:
             "cache_read_tokens": 10, "cache_write_tokens": 10,
             "estimated_cost_usd": Decimal("0.0035"),
             "session_id": uuid.uuid4(),
+            "client_id": _CLIENT_ID,
+            "project_id": None,
+            "reported_at": _mk_ts(),
         })
         items.append(merge_event_row)
 
