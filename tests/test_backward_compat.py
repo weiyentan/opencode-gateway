@@ -287,6 +287,7 @@ class TestLegacyIngestPayloads:
             None,              # atomic INSERT → ON CONFLICT (loser)
             existing_dedup,    # dedup query → identical match
             lock_row,          # _apply_replay_merge: SELECT FOR UPDATE
+            MagicMock(),       # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
 

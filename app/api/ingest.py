@@ -1852,6 +1852,22 @@ async def ingest_usage(
             # ── Canonical event layer: record a canonical event for
             # genuinely new records (not idempotent duplicates from replay).
             is_new = result.reason is None or not result.reason.startswith("Duplicate")
+            if not is_new:
+                # Legacy duplicate (idempotent replay of a pre-existing
+                # record ingested before the canonical event layer was
+                # deployed).  Check whether a canonical event already
+                # exists for this identity and source record — if not,
+                # backfill one so that pre-deploy usage data is not
+                # permanently invisible (PR #396, finding #8).
+                existing = await conn.fetchrow(
+                    "SELECT 1 FROM usage_events"
+                    " WHERE canonical_source_identity_id = $1"
+                    "   AND source_record_id = $2",
+                    canonical_identity_id,
+                    record.source_record_id,
+                )
+                if existing is None:
+                    is_new = True  # backfill — no canonical event exists yet
             if is_new:
                 try:
                     canonical = await _record_canonical_event(
