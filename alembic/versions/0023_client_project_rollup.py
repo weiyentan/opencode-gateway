@@ -25,8 +25,8 @@ The foreign key toward the pre-existing ``opencode_clients`` table follows
 the repo default of no ``ON DELETE`` action (mirroring 0021's FKs toward
 pre-existing tables).
 
-Revision ID: 0022
-Revises:     0021
+Revision ID: 0023
+Revises:     0022
 Create Date: 2026-08-10
 """
 
@@ -36,8 +36,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0022"
-down_revision: Union[str, None] = "0021"
+revision: str = "0023"
+down_revision: Union[str, None] = "0022"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

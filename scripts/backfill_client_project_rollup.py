@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backfill client_project_rollup rows from canonical usage_events.
 
-The Client Project Rollup (migration 0022, ADR 0015) is a pre-aggregated
+The Client Project Rollup (migration 0023, ADR 0015) is a pre-aggregated
 read-model of the canonical ``usage_events`` table keyed by
 ``(client_id, project_id, day)``, maintained at ingest time (#403).  Rows
 can drift from their source of truth — e.g. events ingested before the

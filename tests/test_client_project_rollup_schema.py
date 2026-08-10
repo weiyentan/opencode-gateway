@@ -1,8 +1,8 @@
-"""Tests for the client_project_rollup table migration 0022.
+"""Tests for the client_project_rollup table migration 0023.
 
 Migration-only schema (no ORM models yet, ADR 0015), so this module
-verifies the rendered SQL of ``alembic upgrade 0021:0022 --sql`` and
-``alembic downgrade 0022:0021 --sql``:
+verifies the rendered SQL of ``alembic upgrade 0022:0023 --sql`` and
+``alembic downgrade 0023:0022 --sql``:
 
 1. Upgrade creates the ``client_project_rollup`` table keyed by
    ``(client_id, project_id, day)`` — the stable project ID, not the
@@ -38,7 +38,7 @@ def _alembic_cfg() -> Config:
     return cfg
 
 
-def _run_alembic_upgrade_sql(start: str = "0021", revision: str = "0022") -> str:
+def _run_alembic_upgrade_sql(start: str = "0022", revision: str = "0023") -> str:
     """Run ``alembic upgrade <start>:<revision> --sql`` and return the SQL string."""
     from alembic.command import upgrade
 
@@ -49,14 +49,14 @@ def _run_alembic_upgrade_sql(start: str = "0021", revision: str = "0022") -> str
     return buf.getvalue()
 
 
-def _run_alembic_downgrade_sql(revision: str = "0021") -> str:
-    """Run ``alembic downgrade 0022:<revision> --sql`` and return the SQL string."""
+def _run_alembic_downgrade_sql(revision: str = "0022") -> str:
+    """Run ``alembic downgrade 0023:<revision> --sql`` and return the SQL string."""
     from alembic.command import downgrade
 
     cfg = _alembic_cfg()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        downgrade(cfg, f"0022:{revision}", sql=True)
+        downgrade(cfg, f"0023:{revision}", sql=True)
     return buf.getvalue()
 
 
@@ -88,11 +88,11 @@ def _extract_table_ddl(sql: str, table_name: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestMigration0022Upgrade:
-    """Verify Alembic migration 0022 upgrade creates the rollup table."""
+class TestMigration0023Upgrade:
+    """Verify Alembic migration 0023 upgrade creates the rollup table."""
 
     def _get_upgrade_sql(self) -> str:
-        """Run migration 0022 in offline mode and return SQL output."""
+        """Run migration 0023 in offline mode and return SQL output."""
         return _run_alembic_upgrade_sql()
 
     def test_upgrade_creates_client_project_rollup_table(self):
@@ -165,22 +165,22 @@ class TestMigration0022Upgrade:
         )
 
     def test_upgrade_does_not_touch_existing_tables(self):
-        """0022 should create exactly one table and no other DDL."""
+        """0023 should create exactly one table and no other DDL."""
         sql = self._get_upgrade_sql()
 
         assert sql.count("CREATE TABLE") == 1, (
-            "Expected exactly one CREATE TABLE from migration 0022"
+            "Expected exactly one CREATE TABLE from migration 0023"
         )
-        assert "ALTER TABLE" not in sql, "Migration 0022 should not ALTER tables"
-        assert "DROP TABLE" not in sql, "Migration 0022 should not DROP tables"
+        assert "ALTER TABLE" not in sql, "Migration 0023 should not ALTER tables"
+        assert "DROP TABLE" not in sql, "Migration 0023 should not DROP tables"
 
 
-class TestMigration0022Downgrade:
-    """Verify Alembic migration 0022 downgrade is fully reversible."""
+class TestMigration0023Downgrade:
+    """Verify Alembic migration 0023 downgrade is fully reversible."""
 
     def _get_downgrade_sql(self) -> str:
-        """Run downgrade to 0021 in offline mode and return SQL output."""
-        return _run_alembic_downgrade_sql("0021")
+        """Run downgrade to 0022 in offline mode and return SQL output."""
+        return _run_alembic_downgrade_sql("0022")
 
     def test_downgrade_drops_client_day_index(self):
         """Downgrade should drop the rollup's (client_id, day) index."""
