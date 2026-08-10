@@ -10,9 +10,10 @@ Accepted (2026-08-10)
 > read-model of `usage_events` (not of legacy `opencode_usage_records`), it is
 > keyed on the stable project ID (not the volatile project label), and backfill
 > is in scope. ADR 0014's rollup column list is also revised — the rollup
-> stores only the additive token and cost totals listed below (ADR 0014 also
-> listed reasoning tokens). The canonical-client-name decisions in ADR 0014 are
-> unchanged.
+> stores only the additive token and cost totals listed below, so ADR 0014
+> decision 4's "same metric set" guarantee is withdrawn for the rollup-backed
+> client-project dimension: it no longer surfaces `total_reasoning_tokens`.
+> The canonical-client-name decisions in ADR 0014 are unchanged.
 
 ## Context
 
@@ -36,11 +37,11 @@ have since changed:
    string would fragment the table every time a label changes, splitting one
    logical project across many rollup rows.
 
-The upcoming Client Project Rollup work (#371 rollup table and maintenance,
-#372 rollup integration with the aggregate read path, #373 hybrid aggregates
-and the frontend view merge) implements the rollup. The implementing agents
-read `CONTEXT.md` and `docs/adr/` first, so these decisions are recorded before
-implementation begins.
+The upcoming Client Project Rollup work (#371 canonical client name in the
+client registry, #372 rollup table and ingest-time maintenance, #373 hybrid
+aggregates read with canonical grouping) implements the rollup. The
+implementing agents read `CONTEXT.md` and `docs/adr/` first, so these
+decisions are recorded before implementation begins.
 
 ## Decision
 
@@ -61,9 +62,13 @@ implementation begins.
 
 3. **Additive columns only.**
    Each row stores only additive token totals — input, output, cache read,
-   cache write — plus estimated cost. No session counts and no model counts:
-   those remain distinct-count queries over raw records (per issue #372),
-   because distinct counts do not aggregate additively across days.
+   cache write — plus estimated cost. No session counts, no model counts,
+   and no reasoning-token total: those remain distinct-count or sum queries
+   over raw records (per issue #372), because distinct counts do not
+   aggregate additively across days. This amends ADR 0014 decision 4's
+   "same metric set" requirement: the rollup-backed client-project path no
+   longer surfaces `total_reasoning_tokens`; the metric set parity guarantee
+   is withdrawn for that dimension.
 
 4. **Maintenance is the replay-merge delta path, in the same atomic ingest
    transaction as the `usage_event` write.**
