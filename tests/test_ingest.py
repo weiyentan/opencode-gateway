@@ -241,6 +241,14 @@ def _handler_routing_side_effect_items() -> list:
     return [None]
 
 
+def _canonical_exists_row() -> MagicMock:
+    """Return a mock row signalling that a canonical event already exists
+    (used as a fetchrow response for the backfill existence check)."""
+    row = MagicMock()
+    # Any non-None row means "event exists"
+    return row
+
+
 def _projection_payload(
     *,
     schema_version: str = "1.0",
@@ -438,6 +446,7 @@ class TestDuplicateBatchIdempotent:
     async def test_duplicate_batch_accepted_idempotently(self, monkeypatch):
         """Same dedup key + same values → accepted, no insert."""
         mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
         auth = _auth_row()
         # Existing record with matching values
         existing_dedup = MagicMock()
@@ -473,6 +482,8 @@ class TestDuplicateBatchIdempotent:
             None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
             lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+            None,             # 7. existence check → no canonical event (backfill)
+            *_canonical_event_side_effect_items(),  # 8-10. _record_canonical_event
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -492,7 +503,11 @@ class TestDuplicateBatchIdempotent:
         assert data["results"][0]["status"] == "accepted"
         assert "idempotent" in (data["results"][0]["reason"] or "").lower()
 
-        # Verify no new usage record was inserted for the duplicate
+        # Event was backfilled — event_id and attempt_id are populated
+        assert data["results"][0]["event_id"] is not None
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Verify no new legacy usage record was inserted for the duplicate
         insert_calls = [
             call for call in mock_conn.execute.call_args_list
             if "INSERT INTO opencode_usage_records" in str(call)
@@ -537,6 +552,8 @@ class TestDuplicateBatchIdempotent:
             None,            # atomic INSERT → conflict
             existing_dedup,  # dedup query → identical
             lock_row,        # _apply_replay_merge: SELECT FOR UPDATE
+            None,            # existence check → no canonical event (backfill)
+            *_canonical_event_side_effect_items(),  # model, session, event lookups
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -1377,6 +1394,7 @@ class TestIdempotencyWithSessionResolution:
             None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
             lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+            _canonical_exists_row(),  # 7. existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -3920,6 +3938,7 @@ class TestConcurrentIdenticalRecords:
             "session_id": _SESSION_ID,
         }.__getitem__
         fetchrow_responses.append(lock_row)
+        fetchrow_responses.append(_canonical_exists_row())
 
         mock_conn.fetchrow = AsyncMock()
         mock_conn.fetchrow.side_effect = fetchrow_responses
@@ -4134,6 +4153,7 @@ class TestReplayMergeFillAbsent:
             None,             # 4. atomic INSERT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
             lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4213,6 +4233,7 @@ class TestReplayMergeFillAbsent:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4298,6 +4319,7 @@ class TestReplayMergeFillAbsent:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4395,6 +4417,7 @@ class TestReplayMergeFillAbsent:
             None,             # 4. atomic INSERT → conflict (record A, loser)
             existing_dedup,   # 5. dedup query → identical match
             lock_row_a,       # 6. _apply_replay_merge FOR UPDATE (record A)
+            _canonical_exists_row(),  # existence check → canonical event exists
             # Record B:
             # handler: cross-identity conflict check
             *_handler_routing_side_effect_items(),
@@ -4402,6 +4425,7 @@ class TestReplayMergeFillAbsent:
             None,             # 8. atomic INSERT → conflict (record B, loser)
             existing_dedup,   # 9. dedup query → identical match
             lock_row_b,       # 10. _apply_replay_merge FOR UPDATE (record B)
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4531,6 +4555,7 @@ class TestReplayMergeNoOverwrite:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4613,6 +4638,7 @@ class TestReplayMergeNoOverwrite:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4709,6 +4735,7 @@ class TestReplayMergeWhitespaceNormalization:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4785,6 +4812,7 @@ class TestReplayMergeWhitespaceNormalization:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4858,6 +4886,7 @@ class TestReplayMergeWhitespaceNormalization:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -4932,6 +4961,7 @@ class TestReplayMergeWhitespaceNormalization:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5022,6 +5052,7 @@ class TestReplayEnrichmentSessionAggregateRepair:
             None,             # 4. atomic INSERT → conflict (loser)
             existing_dedup,   # 5. dedup query → identical match
             lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5132,6 +5163,7 @@ class TestReplayEnrichmentSessionAggregateRepair:
             None,             # atomic INSERT → conflict
             existing_dedup,   # dedup query → identical
             lock_row,         # _apply_replay_merge: SELECT FOR UPDATE
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5250,12 +5282,14 @@ class TestReplayEnrichmentSessionAggregateRepair:
             None,                   # 4. atomic INSERT → conflict (record 1)
             existing_dedup,         # 5. dedup query → identical (record 1)
             lock_row_first,         # 6. _apply_replay_merge FOR UPDATE (record 1)
+            _canonical_exists_row(),  # existence check → canonical event exists
             # handler: cross-identity conflict check
             *_handler_routing_side_effect_items(),
             existing_model,         # 7. model upsert (record 2, duplicate)
             None,                   # 8. atomic INSERT → conflict (record 2)
             existing_dedup,         # 9. dedup query → identical (record 2)
             lock_row_second,        # 10. _apply_replay_merge FOR UPDATE (record 2)
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5350,6 +5384,7 @@ class TestReplayEnrichmentSessionAggregateRepair:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5441,6 +5476,7 @@ class TestReplayEnrichmentSessionAggregateRepair:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5741,6 +5777,7 @@ class Test380SessionIdNullFallback:
             existing_dedup,   # 5. dedup query → identical
             lock_row,         # 6. _apply_replay_merge: SELECT FOR UPDATE
             resolve_row,      # 7. _resolve_internal_session_id SELECT
+            _canonical_exists_row(),  # existence check → canonical event exists
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -5837,6 +5874,7 @@ class Test380SessionIdNullFallback:
             auth, None,
             *_handler_routing_side_effect_items(),
             existing_model, None, existing_dedup, lock_row,
+        _canonical_exists_row(),  # existence check
         ]
         mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
@@ -6160,6 +6198,9 @@ class TestCanonicalEventAccept:
         }.__getitem__
         fetchrow_responses.extend(_handler_routing_side_effect_items())
         fetchrow_responses.extend([existing_model, None, existing_dedup, lock_row])
+        # Existence check: canonical event already inserted by record 1
+        canonical_exists = MagicMock()
+        fetchrow_responses.append(canonical_exists)
 
         mock_conn.fetchrow.side_effect = fetchrow_responses
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -6221,6 +6262,111 @@ class TestCanonicalEventAccept:
             if "INSERT INTO usage_ingest_attempts" in str(call)
         ]
         assert len(attempt_inserts) == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_duplicate_without_canonical_event_backfills(self, monkeypatch):
+        """A legacy duplicate (idempotent replay of a pre-existing record)
+        with NO canonical event backfills one — the existence check returns
+        None and a canonical event + ingest attempt are created.
+
+        This is the self-healing replay path for PR #396, finding #8:
+        pre-deploy records are backfilled at their first post-deploy replay.
+        """
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        _add_transaction_support(mock_conn)
+
+        # Single legacy record: pre-existing in opencode_usage_records,
+        # no canonical event exists yet.
+        fetchrow_responses = [auth, None]  # auth + sd_check
+
+        # Handler routing: cross-identity conflict check
+        fetchrow_responses.extend(_handler_routing_side_effect_items())
+
+        # _process_one_record (loser path): model, atomic_insert(loser→None),
+        # dedup query (identical → idempotent), lock row (no enrichment)
+        model_lookup = MagicMock()
+        model_lookup.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None, "mode": None, "finish_reason": None,
+            "reasoning_tokens": None, "cache_read_tokens": None,
+            "cache_write_tokens": None, "session_id": _SESSION_ID,
+        }.__getitem__
+        fetchrow_responses.extend([model_lookup, None, existing_dedup, lock_row])
+
+        # Existence check → None (no canonical event yet → backfill)
+        fetchrow_responses.append(None)
+
+        # _record_canonical_event: model lookup, session lookup, event lookup
+        fetchrow_responses.extend(_canonical_event_side_effect_items())
+
+        mock_conn.fetchrow.side_effect = fetchrow_responses
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-legacy-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+
+        # Legacy duplicate with no canonical event → backfilled
+        result = data["results"][0]
+        assert result["status"] == "accepted", (
+            f"Expected 'accepted' for backfilled legacy record, got '{result['status']}'"
+        )
+        assert result["event_id"] is not None, (
+            "Legacy record must get a canonical event_id after backfill"
+        )
+        assert result["attempt_id"] is not None, (
+            "Legacy record must get an attempt_id after backfill"
+        )
+
+        # Verify one canonical event INSERT was issued
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 1, (
+            f"Expected 1 INSERT INTO usage_events, got {len(event_inserts)}"
+        )
+
+        # Verify one ingest attempt INSERT was issued
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1, (
+            f"Expected 1 INSERT INTO usage_ingest_attempts, got {len(attempt_inserts)}"
+        )
 
 
 class TestIngestRequestReplayMetadata:
