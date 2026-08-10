@@ -232,8 +232,8 @@ async def _fetch_aggregates_rollup(
     # ── Rollup query (additive token/cost totals) ────────────────────
     params: list = [start_date, end_date]
     filters: list[str] = [
-        "r.day >= $1",
-        "r.day <= $2",
+        "r.day >= ($1 AT TIME ZONE 'UTC')::date",
+        "r.day <= ($2 AT TIME ZONE 'UTC')::date",
     ]
 
     if client_id is not None:
@@ -306,8 +306,8 @@ async def _fetch_aggregates_rollup(
     # as ``r`` lets the same constant serve both queries.
     count_params: list = [start_date, end_date]
     count_filters: list[str] = [
-        "r.reported_at >= $1",
-        "r.reported_at <= $2",
+        "(r.reported_at AT TIME ZONE 'UTC')::date >= ($1 AT TIME ZONE 'UTC')::date",
+        "(r.reported_at AT TIME ZONE 'UTC')::date <= ($2 AT TIME ZONE 'UTC')::date",
         "r.project_id IS NOT NULL",
     ]
     if client_id is not None:

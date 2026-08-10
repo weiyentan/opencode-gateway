@@ -1098,6 +1098,94 @@ class TestClientProjectAggregates:
         assert r["session_count"] == 2, f"Expected session_count=2, got {r['session_count']}"
         assert r["model_count"] == 1, f"Expected model_count=1, got {r['model_count']}"
 
+    @pytest.mark.asyncio
+    async def test_rollup_date_boundary_utc_day_normalisation(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Both the rollup and count queries normalise date boundaries to UTC
+        days so they select identical event sets regardless of whether the
+        query parameters land on a UTC midnight.
+
+        A preset-style boundary — e.g. start_date=2026-07-31T12:00:00Z
+        (local midnight in a non-UTC browser) — must produce the same first
+        included UTC day in both queries.  Without the cast the rollup query
+        compares a ``date`` to a ``timestamptz``, dropping or over-including
+        the first day, and the count query filters on the raw instant,
+        selecting a different event set.
+        """
+        rollup_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                record_count=0, session_count=0, model_count=0,
+                project_label="Proj X",
+            )
+        ]
+        count_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=0,
+                total_output_tokens=0,
+                record_count=3, session_count=2, model_count=1,
+                project_label="Proj X",
+            )
+        ]
+        mock_conn.fetch = AsyncMock(side_effect=[rollup_rows, count_rows])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2026-07-31T12:00:00Z",
+                    "end_date": "2026-08-15T18:30:00Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetch.call_count == 2
+
+        rollup_sql = mock_conn.fetch.call_args_list[0][0][0]
+        count_sql = mock_conn.fetch.call_args_list[1][0][0]
+
+        # Rollup filters must normalise to UTC day
+        assert "r.day >= ($1 AT TIME ZONE 'UTC')::date" in rollup_sql, (
+            f"Rollup date-start filter must use UTC-day cast, got:\n{rollup_sql}"
+        )
+        assert "r.day <= ($2 AT TIME ZONE 'UTC')::date" in rollup_sql, (
+            f"Rollup date-end filter must use UTC-day cast, got:\n{rollup_sql}"
+        )
+
+        # Count filters must normalise to UTC day on both sides
+        assert (
+            "(r.reported_at AT TIME ZONE 'UTC')::date >= ($1 AT TIME ZONE 'UTC')::date"
+        ) in count_sql, (
+            f"Count date-start filter must use UTC-day cast on both sides, got:\n{count_sql}"
+        )
+        assert (
+            "(r.reported_at AT TIME ZONE 'UTC')::date <= ($2 AT TIME ZONE 'UTC')::date"
+        ) in count_sql, (
+            f"Count date-end filter must use UTC-day cast on both sides, got:\n{count_sql}"
+        )
+
+        # Legacy raw-comparison patterns must NOT appear
+        for label, sql in (("rollup", rollup_sql), ("count", count_sql)):
+            assert "r.day >= $1" not in sql, (
+                f"{label} query must not use raw r.day >= $1, got:\n{sql}"
+            )
+            assert "r.day <= $2" not in sql, (
+                f"{label} query must not use raw r.day <= $2, got:\n{sql}"
+            )
+            assert "reported_at >= $1" not in sql, (
+                f"{label} query must not use raw reported_at >= $1, got:\n{sql}"
+            )
+            assert "reported_at <= $2" not in sql, (
+                f"{label} query must not use raw reported_at <= $2, got:\n{sql}"
+            )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
 # ══════════════════════════════════════════════════════════════════════════
