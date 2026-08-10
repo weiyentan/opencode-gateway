@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import asyncpg
@@ -189,14 +189,42 @@ class IngestRequest(BaseModel):
     session_todos: list[SessionTodoPayload] = Field(
         default_factory=list, description="Session todo projections"
     )
+    # ── Replay metadata (optional, backward-compatible) ──────────────
+    replay_id: uuid.UUID | None = Field(
+        default=None, description="Replay run UUID (absent for real-time deliveries)"
+    )
+    replay_requested_start: date | None = Field(
+        default=None, description="Start of the date window requested for this replay"
+    )
+    replay_delivery_mode: str | None = Field(
+        default=None, description="How the replay was delivered (e.g. latest, at-least-once)"
+    )
 
 
 class IngestRecordResult(BaseModel):
-    """Per-record result in the ingest response."""
+    """Per-record result in the ingest response.
+
+    Status values (issue #387 — canonical event vocabulary):
+    ``accepted`` — record was processed and a canonical event was created.
+    ``duplicate`` — idempotent delivery; no new event created.
+    ``updated`` — replay delivery reconciled against the stored event.
+    ``quarantined`` — record rejected because the source identity is
+        quarantined (overlaps an existing identity).
+    ``conflict`` — divergent duplicate (same dedup key, different values).
+    ``rejected`` — validation failure or internal error.
+    """
 
     index: int = Field(description="Zero-based index of the record in the batch")
-    status: str = Field(description="accepted | rejected | conflict")
+    status: str = Field(
+        description="accepted | duplicate | updated | quarantined | conflict | rejected"
+    )
     reason: str | None = Field(default=None, description="Human-readable reason if not accepted")
+    event_id: uuid.UUID | None = Field(
+        default=None, description="Canonical usage_events.id on accepted path"
+    )
+    attempt_id: uuid.UUID | None = Field(
+        default=None, description="usage_ingest_attempts.id on accepted path"
+    )
 
 
 class IngestResponse(BaseModel):
@@ -245,6 +273,50 @@ def _normalise_optional_text(value: str | None) -> str | None:
     if value is not None and isinstance(value, str) and value.strip() == "":
         return None
     return value
+
+
+def _validate_tokens(record: IngestRecord) -> tuple[int, int, int]:
+    """Validate the token fields on an ingest record.
+
+    Single source of truth for token validation, shared by the ``/ingest``
+    handler's pre-routing Step 1 check and by ``_process_one_record`` so the
+    two validation copies cannot drift — both call sites reject the record
+    when this helper raises, with the exact reason string it carries.
+
+    Checks performed, in order:
+    - ``input_tokens`` / ``output_tokens`` / ``cached_tokens`` must be
+      int-convertible; a ``ValueError`` / ``TypeError`` from ``int()`` is
+      re-raised as ``ValueError`` carrying the exact
+      ``Non-numeric token value: ...`` reason text.
+    - The three base token values must be non-negative.
+    - The enrichment tokens (``reasoning_tokens``, ``cache_read_tokens``,
+      ``cache_write_tokens``) must be non-negative when present.
+
+    Raises:
+        ValueError: with the exact rejection reason string (``Non-numeric
+            token value: ...`` or ``Negative token value``) that callers
+            surface verbatim on the per-record :class:`IngestRecordResult`.
+
+    Returns:
+        The validated ``(input_tokens, output_tokens, cached_tokens)`` as
+        ints.
+    """
+    try:
+        input_tokens = int(record.input_tokens)
+        output_tokens = int(record.output_tokens)
+        cached_tokens = int(record.cached_tokens)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Non-numeric token value: {exc}") from exc
+
+    if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
+        raise ValueError("Negative token value")
+
+    if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
+        or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
+        or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
+        raise ValueError("Negative token value")
+
+    return input_tokens, output_tokens, cached_tokens
 
 
 async def _apply_replay_merge(
@@ -592,31 +664,12 @@ async def _process_one_record(
 
     # ── 1. Validate token / cost fields ──────────────────────────────
     try:
-        input_tokens = int(record.input_tokens)
-        output_tokens = int(record.output_tokens)
-        cached_tokens = int(record.cached_tokens)
-    except (ValueError, TypeError) as exc:
+        input_tokens, output_tokens, cached_tokens = _validate_tokens(record)
+    except ValueError as exc:
         return IngestRecordResult(
             index=index,
             status="rejected",
-            reason=f"Non-numeric token value: {exc}",
-        )
-
-    if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
-        return IngestRecordResult(
-            index=index,
-            status="rejected",
-            reason="Negative token value",
-        )
-
-    # ── Negative validation for enrichment token fields ───────────────
-    if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
-        or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
-        or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
-        return IngestRecordResult(
-            index=index,
-            status="rejected",
-            reason="Negative token value",
+            reason=str(exc),
         )
 
     # ── v1.2 cached_tokens computation ────────────────────────────
@@ -1189,6 +1242,384 @@ async def _process_session_todos(
     return total_inserted
 
 
+# ── Canonical event helpers (issue #388) ────────────────────────────────────
+
+
+def _canonical_fields_identical(
+    stored: asyncpg.Record, record: IngestRecord, effective_cached_tokens: int,
+) -> bool:
+    """Compare all observable collector fields against the stored canonical event.
+
+    Returns ``True`` when every compared field of the stored event matches
+    the incoming record — the replay is an identical delivery.  Returns
+    ``False`` when any field differs (including when the incoming value is
+    non-null and authoritative).
+
+    Compared fields (executor design decision for issue #388):
+    - Token/cost fields: ``input_tokens``, ``output_tokens``,
+      ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
+      ``cache_write_tokens``, ``estimated_cost_usd``.
+    - Text enrichment: ``provider``, ``mode``, ``finish_reason``.
+
+    ``reported_at`` is deliberately excluded — replays may carry slightly
+    different timestamps for the same logical record, so timestamp drift
+    must not force a spurious update.
+    """
+    if stored["input_tokens"] != record.input_tokens:
+        return False
+    if stored["output_tokens"] != record.output_tokens:
+        return False
+    if stored["cached_tokens"] != effective_cached_tokens:
+        return False
+    # Nullable numeric fields: when the incoming value is None, the field
+    # was omitted from the replay — treat as identical (ADR 0011: null
+    # produces zero delta, never erases).  Only a non-None incoming that
+    # differs from the stored value is a difference.  Numeric zero is a
+    # valid observed value and is never treated as missing.
+    if record.reasoning_tokens is not None and (
+        stored["reasoning_tokens"] or 0
+    ) != record.reasoning_tokens:
+        return False
+    if record.cache_read_tokens is not None and (
+        stored["cache_read_tokens"] or 0
+    ) != record.cache_read_tokens:
+        return False
+    if record.cache_write_tokens is not None and (
+        stored["cache_write_tokens"] or 0
+    ) != record.cache_write_tokens:
+        return False
+    # estimated_cost_usd: only compare when incoming is non-None
+    if record.estimated_cost_usd is not None and not _decimal_equal(
+        stored["estimated_cost_usd"], record.estimated_cost_usd,
+    ):
+        return False
+
+    # Text enrichment — normalised comparison (whitespace-only → None).
+    # **Non-erasing semantics (ADR 0011)**: a None/omitted incoming value
+    # can never erase a populated stored value, so those are treated as
+    # identical.  Only a non-None incoming that differs from the stored
+    # value is considered a difference.
+    stored_provider = _normalise_optional_text(stored["provider"])
+    incoming_provider = _normalise_optional_text(record.provider)
+    if incoming_provider is not None and incoming_provider != stored_provider:
+        return False
+    stored_mode = _normalise_optional_text(stored["mode"])
+    incoming_mode = _normalise_optional_text(record.mode)
+    if incoming_mode is not None and incoming_mode != stored_mode:
+        return False
+    stored_fr = _normalise_optional_text(stored["finish_reason"])
+    incoming_fr = _normalise_optional_text(record.finish_reason)
+    if incoming_fr is not None and incoming_fr != stored_fr:
+        return False
+
+    return True
+
+
+async def _fill_canonical_text_enrichment(
+    conn: asyncpg.Connection,
+    event_id: uuid.UUID,
+    record: IngestRecord,
+) -> bool:
+    """COALESCE-fill text enrichment fields on a canonical event (non-erasing).
+
+    For each of ``provider``, ``mode``, ``finish_reason``: when the stored
+    value is NULL and the incoming value is non-NULL (after whitespace
+    normalisation), the column is filled via ``COALESCE(col, $n)`` —
+    populated stored values are never erased.  Numeric zero semantics do
+    not apply to text fields.
+
+    Returns ``True`` when at least one enrichment column was filled.
+    """
+    enrichment: dict[str, str] = {}
+    for field_name in ("provider", "mode", "finish_reason"):
+        incoming = _normalise_optional_text(getattr(record, field_name, None))
+        if incoming is not None:
+            enrichment[field_name] = incoming
+
+    if not enrichment:
+        return False
+
+    # Read stored values under FOR UPDATE (caller owns the transaction)
+    current = await conn.fetchrow(
+        "SELECT provider, mode, finish_reason FROM usage_events WHERE id = $1 FOR UPDATE",
+        event_id,
+    )
+    if current is None:
+        return False
+
+    fillable: dict[str, str] = {}
+    for field_name, incoming in enrichment.items():
+        stored = current[field_name]
+        if stored is None:
+            fillable[field_name] = incoming
+
+    if not fillable:
+        return False
+
+    set_clauses: list[str] = []
+    params: list[object] = []
+    param_idx = 1
+    for field_name, value in fillable.items():
+        set_clauses.append(f"{field_name} = COALESCE({field_name}, ${param_idx})")
+        params.append(value)
+        param_idx += 1
+    params.append(event_id)
+
+    await conn.execute(
+        f"UPDATE usage_events SET {', '.join(set_clauses)} WHERE id = ${param_idx}",
+        *params,
+    )
+    return True
+
+
+# ── Canonical event recording (issue #387) ──────────────────────────────────
+
+
+async def _record_canonical_event(
+    conn: asyncpg.Connection,
+    record: IngestRecord,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+    batch_id: uuid.UUID,
+    replay_id: uuid.UUID | None,
+    now: datetime,
+    *,
+    canonical_identity_id: uuid.UUID,
+) -> dict[str, uuid.UUID | None]:
+    """Record a canonical event for an accepted first-delivery record.
+
+    Quarantine, overlap detection, and cross-identity conflict checks
+    are handled upstream in the ingest handler BEFORE ``_process_one_record()``
+    (issue #389 — Findings 1 & 2).  This function assumes the record has
+    already passed those checks and only handles: model/session lookup,
+    canonical event creation, and ingest attempt recording.
+
+    Concurrent first-delivery attempts for the same canonical identity
+    and source record are serialised with a per-transaction advisory
+    lock (``pg_advisory_xact_lock``) on ``hashtext(canonical_source_identity_id
+    || source_record_id)``.  The second delivery blocks until the first
+    commits, then re-reads and finds the event already present
+    (re-read-after-commit pattern — issue #395).
+
+    Resolves ``model_id`` and ``internal_session_id`` from the database
+    (these were just upserted by ``_process_one_record``), so the
+    canonical event has the same model and session references.
+
+    **Replay Merge (issue #388):** When a canonical event already exists
+    for ``(canonical_source_identity_id, source_record_id)``, the incoming
+    record's observable fields are compared against the stored event:
+
+    * All compared fields identical → outcome ``"duplicate"`` — no event
+      modification; the attempt is recorded with the ``"duplicate"``
+      outcome.
+    * Any differing non-null collector field → the replay merge path:
+      ``apply_replay_merge()`` (from ``app.core.reconciliation``) computes
+      per-field deltas and adjusts session aggregates;
+      ``_fill_canonical_text_enrichment()`` COALESCE-fills text
+      enrichment fields (provider, mode, finish_reason) without erasing;
+      ``last_ingested_at`` is bumped; outcome is ``"updated"``.
+
+    **Compared field set**: ``input_tokens``, ``output_tokens``,
+    ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
+    ``cache_write_tokens``, ``estimated_cost_usd``, ``provider``,
+    ``mode``, ``finish_reason``.  These are the collector-furnished
+    fields observable on a canonical event and represent the full set
+    of collector data captured in the event row.  ``reported_at`` is
+    deliberately excluded — replays may carry slightly different
+    timestamps for the same logical record.
+
+    Returns a dict with ``event_id``, ``attempt_id``, and ``status``
+    (``"accepted"``, ``"duplicate"``, or ``"updated"``) for the caller
+    to attach to the :class:`IngestRecordResult`.
+    """
+    from app.core.reconciliation import (
+        IngestOutcome,
+        acquire_canonical_event_lock,
+        apply_replay_merge,
+    )
+    from app.core.telemetry import EVENT_LOCK_ACQUIRED, timed_operation
+
+    # ── 1. Resolve model and session (already upserted by _process_one_record) ──
+    model_row = await conn.fetchrow(
+        "SELECT id FROM observed_models WHERE model_name = $1",
+        record.model,
+    )
+    if model_row is None:
+        return {"event_id": None, "attempt_id": None}
+    model_id = model_row["id"]
+
+    session_row = await conn.fetchrow(
+        "SELECT id FROM sessions WHERE source_database_id = $1 AND external_session_id = $2",
+        source_db_id,
+        record.session_id,
+    )
+    if session_row is None:
+        return {"event_id": None, "attempt_id": None}
+    internal_session_id = session_row["id"]
+
+    # ── v1.2 cached_tokens computation (same logic as _process_one_record) ──
+    if record.cache_read_tokens is not None and record.cache_write_tokens is not None:
+        effective_cached_tokens = record.cache_read_tokens + record.cache_write_tokens
+    else:
+        effective_cached_tokens = int(record.cached_tokens)
+
+    # ── 3. Serialise concurrent first-delivery attempts ──────────
+    # Wrap the SELECT+INSERT+attempt in an EXPLICIT transaction so the
+    # xact-scoped advisory lock spans the entire critical section.
+    # Before the lock the event may not exist (first delivery) or it
+    # may have been created by a concurrent request that committed
+    # while we were blocked (re-read-after-commit pattern).
+    event_id: uuid.UUID | None = None
+    attempt_id: uuid.UUID | None = None
+    outcome_str: str = "accepted"
+    reason: str | None = None
+    record_jsonb = record.model_dump(mode="json")
+
+    async with conn.transaction():
+        # Lock wait time tracked via telemetry — duration_ms in the
+        # "lock.acquired" event is the time spent blocked waiting for
+        # the concurrent transaction to commit.
+        async with timed_operation(EVENT_LOCK_ACQUIRED, "lock"):
+            await acquire_canonical_event_lock(
+                conn, canonical_identity_id, record.source_record_id,
+            )
+
+        # ── Re-read after lock: another tx may have inserted ─────
+        existing = await conn.fetchrow(
+            """SELECT id FROM usage_events
+               WHERE canonical_source_identity_id = $1 AND source_record_id = $2
+               FOR UPDATE""",
+            canonical_identity_id,
+            record.source_record_id,
+        )
+
+        if existing is None:
+            # ── 4a. NEW — insert canonical event ──────────────────
+            event_id = uuid.uuid4()
+            await conn.execute(
+                """INSERT INTO usage_events
+                   (id, canonical_source_identity_id, source_record_id,
+                    client_id, session_id, model_id,
+                    input_tokens, output_tokens, cached_tokens,
+                    reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                    estimated_cost_usd, reported_at,
+                    provider, mode, finish_reason,
+                    project_id, workspace_id, agent, parent_session_id,
+                    first_ingested_at, last_ingested_at)
+                   VALUES ($1, $2, $3,
+                           $4, $5, $6,
+                           $7, $8, $9,
+                           $10, $11, $12,
+                           $13, $14,
+                           $15, $16, $17,
+                           $18, $19, $20, $21,
+                           $22, $22)""",
+                event_id,
+                canonical_identity_id,
+                record.source_record_id,
+                client_id,
+                internal_session_id,
+                model_id,
+                record.input_tokens,
+                record.output_tokens,
+                effective_cached_tokens,
+                record.reasoning_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.estimated_cost_usd,
+                record.reported_at,
+                record.provider,
+                record.mode,
+                record.finish_reason,
+                record.project_id,
+                record.workspace_id,
+                record.agent,
+                record.parent_session_id,
+                now,
+            )
+            outcome_str = "accepted"
+        else:
+            # ── 4b. EXISTING canonical event — compare for duplicate vs update ─
+            event_id = existing["id"]
+
+            # Read full canonical event for comparison (FOR UPDATE holds the lock)
+            stored = await conn.fetchrow(
+                """SELECT input_tokens, output_tokens, cached_tokens,
+                          reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                          estimated_cost_usd, provider, mode, finish_reason
+                   FROM usage_events WHERE id = $1""",
+                event_id,
+            )
+
+            if _canonical_fields_identical(stored, record, effective_cached_tokens):
+                # All compared fields identical → duplicate
+                outcome_str = "duplicate"
+            else:
+                # Any differing non-null collector field → apply replay merge
+                # The advisory lock on the event row spans the read-compute-
+                # write across apply_replay_merge and the enrichment fill.
+                new_values: dict[str, object] = {
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "cached_tokens": effective_cached_tokens,
+                    "cache_read_tokens": record.cache_read_tokens,
+                    "cache_write_tokens": record.cache_write_tokens,
+                    "reasoning_tokens": record.reasoning_tokens,
+                    "estimated_cost_usd": record.estimated_cost_usd,
+                }
+                merge_outcome = await apply_replay_merge(conn, event_id, new_values)
+
+                # COALESCE-fill text enrichment fields (non-erasing)
+                enrichment_filled = await _fill_canonical_text_enrichment(
+                    conn, event_id, record,
+                )
+
+                # Update last_ingested_at to reflect this replay delivery
+                await conn.execute(
+                    "UPDATE usage_events SET last_ingested_at = $1 WHERE id = $2",
+                    now,
+                    event_id,
+                )
+
+                # Outcome: "updated" if either token/cost or enrichment changed
+                if merge_outcome == IngestOutcome.UPDATED or enrichment_filled:
+                    outcome_str = "updated"
+                else:
+                    # Rare: pre-check saw a difference but under the lock
+                    # nothing actually changed (concurrent merge already
+                    # applied the same correction).  Treat as duplicate.
+                    outcome_str = "duplicate"
+
+        # ── 5. Record Ingest Attempt (inside transaction) ─────────
+        attempt_id = uuid.uuid4()
+        await conn.execute(
+            """INSERT INTO usage_ingest_attempts
+               (id, usage_event_id, source_identity_id,
+                original_source_record_id, record_jsonb,
+                ingest_batch_id, outcome, replay_id, delivered_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            attempt_id,
+            event_id,
+            canonical_identity_id,
+            record.source_record_id,
+            record_jsonb,
+            batch_id,
+            outcome_str,
+            replay_id,
+            now,
+        )
+
+
+    result: dict[str, uuid.UUID | None] = {
+        "event_id": event_id,
+        "attempt_id": attempt_id,
+        "status": outcome_str,
+    }
+    if reason:
+        result["reason"] = reason
+    return result
+
+
 # ── POST /ingest ──────────────────────────────────────────────────────────
 
 
@@ -1234,26 +1665,10 @@ async def ingest_usage(
     # ── Upsert source database (create if first time) ────────────────
     await _upsert_source_database(conn, source_db_id, client_id, credential_id, now)
 
-    # ── Process records ──────────────────────────────────────────────
-    results: list[IngestRecordResult] = []
-    accepted = 0
-    rejected = 0
-
-    for idx, record in enumerate(body.records):
-        try:
-            result = await _process_one_record(conn, record, idx, client_id, source_db_id, now)
-        except Exception as exc:
-            logger.warning("Record %s failed processing: %s", idx, exc)
-            result = IngestRecordResult(
-                index=idx, status="rejected", reason="Processing error — record skipped",
-            )
-        results.append(result)
-        if result.status == "accepted":
-            accepted += 1
-        else:
-            rejected += 1
-
-    # ── Record ingest batch ──────────────────────────────────────────
+    # ── Create ingest batch row BEFORE the records loop ──────────────
+    # Must exist before any _record_canonical_event() inserts a
+    # usage_ingest_attempts row referencing ingest_batches.id (FK is
+    # immediate and non-deferrable; the batch row must be written first).
     await conn.execute(
         """INSERT INTO ingest_batches
            (id, collector_credential_id, client_id, collector_version,
@@ -1265,9 +1680,238 @@ async def ingest_usage(
         body.collector_version,
         body.schema_version,
         len(body.records),
+        0,  # accepted_count — updated after the records loop
+        0,  # rejected_count — updated after the records loop
+        now,
+    )
+
+    # ── Process records ──────────────────────────────────────────────
+    results: list[IngestRecordResult] = []
+    accepted = 0
+    rejected = 0
+
+    from app.core.identity import (
+        check_quarantine_overlap,
+        is_quarantined,
+        quarantine_identity,
+        resolve_canonical_identity,
+    )
+
+    for idx, record in enumerate(body.records):
+        try:
+            # ── Pre-ingest routing: quarantine, overlap, and cross-identity
+            # conflict checks must run BEFORE _process_one_record() so that
+            # quarantined/conflicted records do NOT insert a raw usage record
+            # and do NOT bump session aggregates (issue #389 — Findings 1 & 2).
+
+            # Step 1: Basic validation
+            try:
+                input_tokens, output_tokens, cached_tokens = _validate_tokens(record)
+            except ValueError as exc:
+                result = IngestRecordResult(
+                    index=idx,
+                    status="rejected",
+                    reason=str(exc),
+                )
+                results.append(result)
+                rejected += 1
+                continue
+
+            # Step 2: Resolve canonical source identity
+            collector_source_id = str(source_db_id)
+            canonical_identity_id = await resolve_canonical_identity(
+                conn, client_id, collector_source_id,
+            )
+
+            # Step 3: Active quarantine check
+            if await is_quarantined(conn, canonical_identity_id):
+                record_jsonb = record.model_dump(mode="json")
+                attempt_id = uuid.uuid4()
+                await conn.execute(
+                    """INSERT INTO usage_ingest_attempts
+                       (id, usage_event_id, source_identity_id,
+                        original_source_record_id, record_jsonb,
+                        ingest_batch_id, outcome, replay_id, delivered_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                    attempt_id,
+                    None,
+                    canonical_identity_id,
+                    record.source_record_id,
+                    record_jsonb,
+                    batch_id,
+                    "quarantined",
+                    body.replay_id,
+                    now,
+                )
+                result = IngestRecordResult(
+                    index=idx,
+                    status="quarantined",
+                    reason="Record quarantined — source identity has active quarantine",
+                    attempt_id=attempt_id,
+                    event_id=None,
+                )
+                results.append(result)
+                rejected += 1
+                continue
+
+            # Step 4: Overlap detection for new identities
+            overlaps = await check_quarantine_overlap(conn, client_id, collector_source_id)
+            if overlaps:
+                primary_overlap = overlaps[0]
+                await quarantine_identity(
+                    conn,
+                    canonical_identity_id,
+                    primary_overlap.overlapping_identity_id,
+                    primary_overlap.overlap_count,
+                )
+                record_jsonb = record.model_dump(mode="json")
+                attempt_id = uuid.uuid4()
+                await conn.execute(
+                    """INSERT INTO usage_ingest_attempts
+                       (id, usage_event_id, source_identity_id,
+                        original_source_record_id, record_jsonb,
+                        ingest_batch_id, outcome, replay_id, delivered_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                    attempt_id,
+                    None,
+                    canonical_identity_id,
+                    record.source_record_id,
+                    record_jsonb,
+                    batch_id,
+                    "quarantined",
+                    body.replay_id,
+                    now,
+                )
+                result = IngestRecordResult(
+                    index=idx,
+                    status="quarantined",
+                    reason="Record quarantined — source identity overlap detected",
+                    attempt_id=attempt_id,
+                    event_id=None,
+                )
+                results.append(result)
+                rejected += 1
+                continue
+
+            # Step 5: Cross-identity conflict check
+            cross_event = await conn.fetchrow(
+                """SELECT ue.id, ue.canonical_source_identity_id
+                   FROM usage_events ue
+                   JOIN source_identities si ON si.id = ue.canonical_source_identity_id
+                   WHERE si.client_id = $1
+                     AND ue.source_record_id = $2
+                     AND ue.canonical_source_identity_id <> $3
+                     AND ue.canonical_source_identity_id NOT IN (
+                         SELECT id FROM source_identities
+                         WHERE canonical_parent_id IS NOT NULL
+                     )
+                   LIMIT 1""",
+                client_id,
+                record.source_record_id,
+                canonical_identity_id,
+            )
+            if cross_event is not None:
+                record_jsonb = record.model_dump(mode="json")
+                attempt_id = uuid.uuid4()
+                await conn.execute(
+                    """INSERT INTO usage_ingest_attempts
+                       (id, usage_event_id, source_identity_id,
+                        original_source_record_id, record_jsonb,
+                        ingest_batch_id, outcome, replay_id, delivered_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+                    attempt_id,
+                    None,
+                    canonical_identity_id,
+                    record.source_record_id,
+                    record_jsonb,
+                    batch_id,
+                    "conflict",
+                    body.replay_id,
+                    now,
+                )
+                result = IngestRecordResult(
+                    index=idx,
+                    status="conflict",
+                    reason="Cross-identity conflict — canonical event owned by"
+                           " a different unresolved identity",
+                    attempt_id=attempt_id,
+                    event_id=None,
+                )
+                results.append(result)
+                rejected += 1
+                continue
+
+            # Step 6: Pre-ingest checks passed — proceed with normal ingest
+            result = await _process_one_record(conn, record, idx, client_id, source_db_id, now)
+        except Exception as exc:
+            logger.warning("Record %s failed processing: %s", idx, exc)
+            result = IngestRecordResult(
+                index=idx, status="rejected", reason="Processing error — record skipped",
+            )
+        results.append(result)
+        if result.status == "accepted":
+            # ── Canonical event layer: record a canonical event for
+            # genuinely new records (not idempotent duplicates from replay).
+            is_new = result.reason is None or not result.reason.startswith("Duplicate")
+            if not is_new:
+                # Legacy duplicate (idempotent replay of a pre-existing
+                # record ingested before the canonical event layer was
+                # deployed).  Check whether a canonical event already
+                # exists for this identity and source record — if not,
+                # backfill one so that pre-deploy usage data is not
+                # permanently invisible (PR #396, finding #8).
+                existing = await conn.fetchrow(
+                    "SELECT 1 FROM usage_events"
+                    " WHERE canonical_source_identity_id = $1"
+                    "   AND source_record_id = $2",
+                    canonical_identity_id,
+                    record.source_record_id,
+                )
+                if existing is None:
+                    is_new = True  # backfill — no canonical event exists yet
+            if is_new:
+                try:
+                    canonical = await _record_canonical_event(
+                        conn, record, client_id, source_db_id,
+                        batch_id, body.replay_id, now,
+                        canonical_identity_id=canonical_identity_id,
+                    )
+                    result.event_id = canonical["event_id"]
+                    result.attempt_id = canonical["attempt_id"]
+                    # Propagate the canonical-level status when it differs
+                    # from "accepted" (e.g. duplicate / updated on replay).
+                    canonical_status = canonical.get("status")
+                    if canonical_status and canonical_status != "accepted":
+                        result.status = canonical_status
+                        if canonical.get("reason"):
+                            result.reason = canonical["reason"]
+                except Exception as exc:
+                    logger.error(
+                        "Record %s canonical event recording failed: %s", idx, exc,
+                    )
+
+        # ── Counting — records with status "accepted", "duplicate", or
+        # "updated" all represent successful processing (the record was
+        # either new, idempotent, or reconciled).  Only records with
+        # status "quarantined", "conflict", or "rejected" increment the
+        # rejected count.
+        if result.status in ("accepted", "duplicate", "updated"):
+            # "duplicate" (idempotent replay) and "updated" (replay merge)
+            # are successful processing outcomes — no event creation, no
+            # error — and count as accepted so that
+            # accepted_count + rejected_count == len(records) always holds.
+            accepted += 1
+        else:
+            rejected += 1
+
+    # ── Update ingest batch with final counts ────────────────────────
+    await conn.execute(
+        """UPDATE ingest_batches
+           SET accepted_count = $1, rejected_count = $2
+           WHERE id = $3""",
         accepted,
         rejected,
-        now,
+        batch_id,
     )
 
     # ── Record per-record audit ──────────────────────────────────────

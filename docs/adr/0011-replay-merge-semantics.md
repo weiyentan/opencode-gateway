@@ -4,6 +4,15 @@
 
 Accepted
 
+> **Scope note:** This ADR governs the legacy `opencode_usage_records` path,
+> which is still written at ingest but is no longer the usage query source.
+> The canonical event layer (`usage_events`, migration 0021) applies a
+> different reconciliation rule — delta-based correction where non-null
+> collector values are authoritative — documented in
+> [ADR 0012](0012-canonical-event-replay-merge.md). The non-erasing principle
+> (populated values are never erased; numeric zero is a valid observation)
+> carries over to the canonical path.
+
 ## Context
 
 Usage Record ingestion is replay-safe by design: collector deliveries can be

@@ -315,26 +315,88 @@ validation failure) or requests that received a 4xx response from the
 Gateway ingest endpoint. DLQ messages include the original payload and a
 reason string describing the failure.
 
+**Canonical Event**:
+A row in the ``usage_events`` table (migration 0021) — the canonical
+accounting event for one logical collector record, keyed by
+``(canonical_source_identity_id, source_record_id)``. Written at ingest time
+for genuinely-new records, corrected by a Replay Merge when a later delivery
+carries authoritative non-null values, and never deleted by normal replay.
+The usage query endpoints (``app/api/usage.py``) read from ``usage_events``;
+the legacy ``opencode_usage_records`` table is still written but is no longer
+the query source. The canonical row is selected per duplicate group as the
+earliest ``first_ingested_at`` (lowest ``id`` tiebreaker).
+_Avoid_: Usage Record (in canonical context), raw record, duplicate row
+
+**Canonical Source Identity**:
+A row in ``source_identities`` mapping a collector's source ID
+(``collector_source_id``) to a client-owned identity UUID, resolved at ingest
+time by ``resolve_canonical_identity()``. An identity resolved into a parent
+links to it via ``canonical_parent_id`` and its records then attribute to the
+parent. Overlapping identities are quarantined until resolved.
+_Avoid_: Collector identity, source database identity (ambiguous)
+
+**Source Identity Quarantine**:
+An active row in ``source_identity_quarantine`` recording that a source
+identity's records overlap an existing identity (``overlap_count`` shared
+source record IDs). While a quarantine is active, the overlapping identity's
+records route to the ``quarantined`` ingest outcome and no canonical event or
+session aggregate change is made. Quarantines are listed via
+``GET /admin/quarantined-identities`` and cleared via
+``POST /admin/resolve-source-identity``, which links the identity to a
+canonical parent and records the decision in ``source_identity_resolutions``.
+_Avoid_: Blocked identity, suspended collector
+
+**Ingest Attempt**:
+A row in ``usage_ingest_attempts`` recording each delivery of a record
+processed through the canonical layer — the original JSONB payload, the
+resolved canonical source identity, the canonical event (when one exists), the
+per-record outcome, and the optional ``replay_id``. Attempts are the audit
+trail of replay-safe ingest: ``duplicate``, ``quarantined``, and ``conflict``
+deliveries are recorded as attempts even though no canonical event changes.
+_Avoid_: Ingest log line, delivery row
+
+**Ingest Outcome**:
+The per-record result status returned by ``/ingest``:
+``accepted`` — a new canonical event was created;
+``duplicate`` — idempotent replay, no event modification;
+``updated`` — a Replay Merge reconciled the stored canonical event and
+delta-adjusted session aggregates;
+``quarantined`` — the source identity has an active quarantine or was newly
+quarantined for overlap;
+``conflict`` — the canonical event is owned by a different, unresolved
+identity (cross-identity conflict);
+``rejected`` — validation failure or internal error.
+All outcomes are 2xx at batch level so the Usage Record Consumer commits
+Kafka offsets; only invalid payloads and 4xx/5xx responses route to the DLQ.
+_Avoid_: The legacy accepted/rejected/conflict-only vocabulary
+
 **Replay Merge**:
-The non-erasing rule applied at ingest when a losing duplicate Usage Record
-passes the dedup identity check (identical ``input_tokens``, ``output_tokens``,
-``cached_tokens``, ``estimated_cost_usd``): the stored Usage Record remains
-authoritative, and the replay fills only currently-NULL nullable enrichment
-fields — ``provider``, ``mode``, ``finish_reason``, ``reasoning_tokens``,
-``cache_read_tokens``, ``cache_write_tokens``. Populated values are never
-erased by a replay (each SET clause is ``COALESCE(col, $n)`` in a single atomic
-UPDATE). ``estimated_cost_usd`` is excluded as a fill candidate because it is
-part of the dedup identity comparison — a stored-NULL + populated-incoming cost
-goes to conflict instead of being filled. Null and whitespace-only optional
-text is treated as "missing" (fillable); numeric zero is a valid observed value
-and is never treated as missing. When Replay Merge backfills cache token
-columns, the session aggregate's derived enrichment totals
-(``total_cache_read_tokens``, ``total_cache_write_tokens``) are repaired exactly
-once inside an explicit transaction with ``SELECT ... FOR UPDATE``, while base
-totals (``total_input_tokens``, ``total_output_tokens``, ``total_cached_tokens``,
-``message_count``) are never incremented by a replay delivery. The same
-non-erasing principle applies to Session Context and Project projections while
-preserving their snapshot semantics.
+The reconciliation rule applied at ingest when a canonical event already
+exists for ``(canonical_source_identity_id, source_record_id)``
+(``app/core/reconciliation.py``, ADR 0012). It is the canonical-event
+counterpart of the legacy usage-record Replay Merge (ADR 0011). A losing
+replay is neither re-appended (double-count) nor blindly overwritten:
+- **Non-null collector values are authoritative.** A replay carrying a
+  non-null value different from the stored event corrects the event toward
+  the collector's latest observation and moves the owning session aggregate
+  by the per-field delta (``new − old``) — the aggregate is delta-adjusted,
+  never re-incremented, so replay cannot double-count.
+- **Omitted/null collector values produce a zero delta (no erasure).** A
+  replay that lacks a field can never erase a populated value; numeric zero
+  is a valid observed value and is never treated as missing. Text enrichment
+  (``provider``, ``mode``, ``finish_reason``) is COALESCE-filled without
+  erasing.
+- **Session totals are clamped to zero** so no negative total is ever
+  written. ``reasoning_tokens`` deltas correct the event but are not applied
+  to the session (the ``sessions`` table carries no reasoning aggregate).
+- **Concurrent deliveries are serialised** with a transaction-scoped advisory
+  lock (``pg_advisory_xact_lock``) covering the read-compute-write sequence;
+  a second delivery blocks until the first commits, then re-reads
+  (re-read-after-commit) and resolves to ``duplicate`` or ``updated``.
+- Outcomes: ``duplicate`` when all deltas are zero (no UPDATE issued);
+  ``updated`` when the event and/or session aggregate were adjusted. The
+  legacy ``opencode_usage_records`` path keeps the fill-absent COALESCE rule
+  of ADR 0011 unchanged.
 _Avoid_: Overwrite-on-replay, replay append (double-counting), uncached/derived
 merge on base totals
 
@@ -380,10 +442,18 @@ manages.
 - A **Usage Record Consumer** reads from the ``opencode-usage`` Kafka topic
 - A **Usage Record Consumer** POSTs to the Gateway's ``/ingest`` endpoint using a **Collector Credential**
 - Unprocessable messages are sent to the **Dead Letter Queue (DLQ)** topic ``opencode-usage-dlq``
-- A **Replay Merge** applies only to a duplicate **Usage Record** that passed the dedup identity check; a divergent duplicate goes to conflict instead
-- A **Replay Merge** fills only currently-NULL nullable enrichment fields on the stored **Usage Record** and never erases populated values
-- A **Replay Merge** that backfills ``cache_read_tokens``/``cache_write_tokens`` triggers a one-time repair of the owning session aggregate's derived enrichment totals (``total_cache_read_tokens``/``total_cache_write_tokens``), never its base totals
+- A **Canonical Source Identity** belongs to exactly one **OpenCode Client** and is keyed by `(client_id, collector_source_id)`
+- A **Canonical Event** belongs to one **Canonical Source Identity** and is keyed by `(canonical_source_identity_id, source_record_id)`
+- An **Ingest Attempt** records each delivery processed through the canonical layer and references the owning **Canonical Event** when one exists
+- A **Source Identity Quarantine** belongs to one **Canonical Source Identity**; while it is active the identity's records route to the `quarantined` **Ingest Outcome** with no canonical event or session aggregate change
+- The usage query endpoints read from the **Canonical Event** table (`usage_events`), not `opencode_usage_records` (API contracts unchanged)
+- Concurrent deliveries of the same **Canonical Event** are serialised with a transaction-scoped advisory lock (`pg_advisory_xact_lock`); a second delivery re-reads after the first commits
+- A **Replay Merge** applies only to a duplicate **Usage Record** that passed the dedup identity check; a divergent duplicate goes to conflict instead (legacy `opencode_usage_records` path, ADR 0011)
+- A **Replay Merge** fills only currently-NULL nullable enrichment fields on the stored **Usage Record** and never erases populated values (legacy `opencode_usage_records` path, ADR 0011)
+- A **Replay Merge** that backfills ``cache_read_tokens``/``cache_write_tokens`` triggers a one-time repair of the owning session aggregate's derived enrichment totals (``total_cache_read_tokens``/``total_cache_write_tokens``), never its base totals (legacy `opencode_usage_records` path, ADR 0011)
 - The **Replay Merge** non-erasing fill-absent principle also applies to **Session Context** and Project projections while preserving their snapshot semantics
+- A **Canonical Event Replay Merge** (ADR 0012) corrects a stored **Canonical Event** toward the collector's latest non-null observation and moves the owning session aggregate by the per-field delta, never re-incrementing it
+- A **Canonical Event Replay Merge** never erases a populated value: null/omitted collector values produce a zero delta, and text enrichment is COALESCE-filled
 
 ## Flagged Ambiguities
 

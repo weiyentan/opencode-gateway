@@ -196,11 +196,19 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | `GET` | `/admin/clients/{id}/tokens` | List credential tokens for a client — metadata only, no raw tokens. |
 | `POST` | `/admin/clients/{id}/tokens/{token_id}/revoke` | Revoke a collector credential token immediately. |
 
+### Admin — Replay-Safe Usage Accounting
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/admin/quarantined-identities` | List active (uncleared) quarantined source identities, paginated (`limit`/`offset`, default `limit=50`). Optionally narrows to one client via `client_id`. |
+| `POST` | `/admin/resolve-source-identity` | Resolve a quarantined source identity into a canonical parent. Body: `quarantine_id`, `resolving_identity_id`, optional `reason`. Returns 404 for an unknown quarantine, 400 if the quarantine is already cleared or the resolving identity does not exist. |
+| `POST` | `/admin/reconcile-historical-duplicates` | Reconcile duplicate canonical events in `usage_events`. Body: `dry_run` (required), optional `client_id`, `date_from`, `date_to`. `dry_run: true` scans duplicate `source_record_id` groups and returns a preview without writing; `dry_run: false` removes non-canonical rows (earliest `first_ingested_at`, lowest `id` tiebreaker), preserves them as ingest-attempt history, and rebuilds affected session aggregates. Serialised per client with an advisory lock. |
+
 ### Telemetry Ingest
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. Uses first-write-wins idempotency, supports partial-success semantics (per-record accepted/rejected/conflict), and empty-batch heartbeats. Authenticated via collector bearer token. |
+| `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. First-delivery records create canonical events in `usage_events`; every delivery processed through the canonical layer is recorded as an ingest attempt (audit trail covering `accepted`, `duplicate`, `updated`, `quarantined`, and `conflict` outcomes). Per-record outcomes: `accepted` (new canonical event), `duplicate` (idempotent replay), `updated` (replay merged — event corrected and session aggregates delta-adjusted), `quarantined` (source identity quarantined or overlapping), `conflict` (canonical event owned by a different unresolved identity), `rejected` (validation failure or internal error). All outcomes are 2xx at batch level so the consumer commits Kafka offsets; invalid payloads and 4xx/5xx responses route to the DLQ. Optional replay metadata fields (`replay_id`, `replay_requested_start`, `replay_delivery_mode`) mark replay deliveries. Empty-batch heartbeats supported. Authenticated via collector bearer token. |
 
 ### Collector Cursor
 
@@ -218,6 +226,11 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` and `model` enrichment from Session Context. |
 | `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including `session_context` (title, model, code changes) and `todo_rows` (latest OpenCode todo snapshot) alongside usage data. |
 | `GET` | `/api/v1/usage/records-with-context` | Paginated usage records enriched with `session_title`, `project_label`, and `agent`. Supports `group_by` aggregation by `project`, `agent`, `session`, or `model`. |
+
+> **Note:** Usage query endpoints read from the canonical `usage_events` table
+> (replay-safe accounting, migration 0021). API contracts are unchanged. The
+> legacy `opencode_usage_records` table is still written at ingest but is no
+> longer the query source.
 
 ---
 
@@ -288,6 +301,9 @@ opencode-gateway/
 │   │   ├── __init__.py
 │   │   ├── health.py             # GET /health endpoint
 │   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
+│   │   ├── admin_quarantines.py  # GET /admin/quarantined-identities
+│   │   ├── admin_reconcile.py    # POST /admin/reconcile-historical-duplicates
+│   │   ├── admin_resolve_source_identity.py  # POST /admin/resolve-source-identity
 │   │   ├── cursor.py             # GET /cursor collector cursor endpoint
 │   │   ├── ingest.py             # POST /ingest telemetry endpoint
 │   │   └── usage.py              # GET aggregates, records, sessions
@@ -301,14 +317,16 @@ opencode-gateway/
 │   │   ├── auth.py               # API key + collector token middleware
 │   │   ├── envelope.py           # Response envelope middleware
 │   │   ├── factory.py            # create_app() FastAPI factory
-│   │   ├── identity.py           # Token generation & SHA-256 hashing
+│   │   ├── identity.py           # Token generation/hashing + canonical source identity & quarantine resolution
 │   │   ├── loki.py               # Grafana Explore URL builder
 │   │   ├── logging.py            # RedactingFormatter
+│   │   ├── reconciliation.py     # Canonical replay-merge deltas + historical duplicate reconciliation
 │   │   ├── secrets.py            # Secret detection utilities
 │   │   ├── telemetry.py          # Request timing middleware, operation/timeout helpers, structured timing log events
 │   │   └── schemas/
 │   │       ├── __init__.py
-│   │       ├── identity.py       # Pydantic schemas for clients & tokens
+│   │       ├── identity.py       # Pydantic schemas for clients, tokens & quarantined identities
+│   │       ├── reconciliation.py # Pydantic schemas for historical reconciliation
 │   │       └── usage.py          # Pydantic schemas for usage reporting
 │   └── db/
 │       ├── session.py            # DatabasePool (asyncpg wrapper)
@@ -345,6 +363,14 @@ opencode-gateway/
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Never Holds Infrastructure Secrets | Accepted |
 | [0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md) | Separate Aurora Glass from Gateway Service | Accepted |
 | [0006](docs/adr/0006-session-identity-resolution.md) | Session Identity Resolution | Accepted |
+| [0007](docs/adr/0007-two-layer-collector-auth.md) | Two-Layer Collector Auth | Accepted |
+| [0008](docs/adr/0008-gateway-owned-opencode-projection-tables.md) | Gateway-Owned OpenCode Projection Tables | Accepted |
+| [0009](docs/adr/0009-explicit-replay-corrections.md) | Explicit Replay Corrections | Accepted |
+| [0010](docs/adr/0010-backend-computed-run-status.md) | Backend-Computed Agent Run Status | Accepted |
+| [0011](docs/adr/0011-replay-merge-semantics.md) | Replay Merge Semantics | Accepted |
+| [0012](docs/adr/0012-canonical-event-replay-merge.md) | Canonical Event Replay Merge | Accepted |
+| [0013](docs/adr/0013-session-currentstatus-heuristic.md) | Session currentStatus Heuristic | Accepted |
+| [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 
 ---
 

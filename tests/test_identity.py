@@ -9,14 +9,25 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
 from app.core.factory import create_app
-from app.core.identity import generate_collector_token, hash_token
+from app.core.identity import (
+    OverlapEvidence,
+    QuarantineRow,
+    check_quarantine_overlap,
+    generate_collector_token,
+    get_active_quarantines,
+    hash_token,
+    is_quarantined,
+    quarantine_identity,
+    resolve_canonical_identity,
+    resolve_identity,
+)
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -253,7 +264,6 @@ class TestUpdateClient:
     async def test_update_client_name(self):
         """Patching a client's name updates it."""
         mock_conn = AsyncMock()
-        original = _client_row(name="old-name")
         updated = _client_row(name="new-name")
         mock_conn.fetchrow = AsyncMock(return_value=updated)
         client = _build_client(mock_conn)
@@ -475,7 +485,7 @@ class TestCollectorTokenAuth:
         ``get_session`` and disabling API-key auth so only the collector
         token dependency is tested.
         """
-        from fastapi import APIRouter, Depends, Request
+        from fastapi import APIRouter, Depends
 
         from app.core.auth import require_collector_token
         from app.db.session import get_session
@@ -677,3 +687,349 @@ class TestTokenGeneration:
         t2 = generate_collector_token()
         assert t1[0] != t2[0]
         assert t1[1] != t2[1]
+
+
+# ── Canonical source identity resolution tests ─────────────────────────────
+
+_IDENTITY_A = uuid.uuid4()  # an existing canonical identity
+_IDENTITY_B = uuid.uuid4()  # an identity resolved into _IDENTITY_A
+_IDENTITY_PARENT = _IDENTITY_A
+_QUARANTINE_ID = uuid.uuid4()
+_RESOLUTION_ID = uuid.uuid4()
+_COLLECTOR_SOURCE_ID = "collector-source-a"
+
+
+def _row(data: dict) -> MagicMock:
+    """Return a MagicMock that behaves like an asyncpg Record for dict access."""
+    row = MagicMock()
+    row.__getitem__.side_effect = data.__getitem__
+    row.get.side_effect = data.get
+    return row
+
+
+def _identity_row(
+    id: uuid.UUID,
+    canonical_parent_id: uuid.UUID | None = None,
+) -> MagicMock:
+    """Return a mock row resembling a source_identities row."""
+    return _row(
+        {
+            "id": id,
+            "client_id": _CLIENT_ID,
+            "collector_source_id": _COLLECTOR_SOURCE_ID,
+            "is_canonical": canonical_parent_id is None,
+            "canonical_parent_id": canonical_parent_id,
+            "resolved_at": None if canonical_parent_id is None else _TS,
+            "created_at": _TS,
+        }
+    )
+
+
+class TestResolveCanonicalIdentity:
+    """resolve_canonical_identity maps collector source IDs to canonical UUIDs."""
+
+    @pytest.mark.asyncio
+    async def test_new_source_id_creates_identity_row(self, mock_conn: AsyncMock):
+        """An unknown collector source ID creates a source_identities row."""
+        new_id = uuid.uuid4()
+        mock_conn.fetchrow = AsyncMock(side_effect=[None, _identity_row(new_id)])
+
+        result = await resolve_canonical_identity(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == new_id
+        calls = mock_conn.fetchrow.call_args_list
+        assert len(calls) == 2
+        lookup_sql, lookup_params = calls[0].args[0], calls[0].args[1:]
+        assert "SELECT id, canonical_parent_id FROM source_identities" in lookup_sql
+        assert lookup_params == (_CLIENT_ID, _COLLECTOR_SOURCE_ID)
+        insert_sql, insert_params = calls[1].args[0], calls[1].args[1:]
+        assert "INSERT INTO source_identities" in insert_sql
+        assert "ON CONFLICT" in insert_sql
+        assert insert_params == (_CLIENT_ID, _COLLECTOR_SOURCE_ID)
+
+    @pytest.mark.asyncio
+    async def test_known_source_id_returns_existing_identity(self, mock_conn: AsyncMock):
+        """An already-known collector source ID returns its identity UUID."""
+        mock_conn.fetchrow = AsyncMock(return_value=_identity_row(_IDENTITY_A))
+
+        result = await resolve_canonical_identity(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == _IDENTITY_A
+        assert mock_conn.fetchrow.await_count == 1
+        sql = mock_conn.fetchrow.call_args.args[0]
+        assert "SELECT id, canonical_parent_id FROM source_identities" in sql
+
+    @pytest.mark.asyncio
+    async def test_resolved_source_id_returns_parent_id(self, mock_conn: AsyncMock):
+        """A resolved identity resolves to its canonical parent's UUID."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_identity_row(_IDENTITY_B, canonical_parent_id=_IDENTITY_PARENT)
+        )
+
+        result = await resolve_canonical_identity(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == _IDENTITY_PARENT
+
+    @pytest.mark.asyncio
+    async def test_lost_insert_race_re_reads_committed_row(self, mock_conn: AsyncMock):
+        """A conflicting INSERT falls back to reading the winner's row."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[None, None, _identity_row(_IDENTITY_A)]
+        )
+
+        result = await resolve_canonical_identity(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == _IDENTITY_A
+        assert mock_conn.fetchrow.await_count == 3
+
+
+def _overlap_row(identity_id: uuid.UUID, count: int) -> MagicMock:
+    """Return a mock row resembling one check_quarantine_overlap result row."""
+    return _row({"overlapping_identity_id": identity_id, "overlap_count": count})
+
+
+class TestCheckQuarantineOverlap:
+    """check_quarantine_overlap detects record overlap with existing identities."""
+
+    @pytest.mark.asyncio
+    async def test_returns_overlap_evidence(self, mock_conn: AsyncMock):
+        """Overlapping deliveries produce OverlapEvidence per existing identity."""
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _overlap_row(_IDENTITY_A, 4),
+                _overlap_row(_IDENTITY_B, 2),
+            ]
+        )
+
+        result = await check_quarantine_overlap(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == [
+            OverlapEvidence(overlapping_identity_id=_IDENTITY_A, overlap_count=4),
+            OverlapEvidence(overlapping_identity_id=_IDENTITY_B, overlap_count=2),
+        ]
+        sql, params = (
+            mock_conn.fetch.call_args.args[0],
+            mock_conn.fetch.call_args.args[1:],
+        )
+        assert "usage_ingest_attempts" in sql
+        assert "GROUP BY" in sql
+        assert params == (_CLIENT_ID, _COLLECTOR_SOURCE_ID)
+
+    @pytest.mark.asyncio
+    async def test_no_overlap_returns_empty_list(self, mock_conn: AsyncMock):
+        """A candidate with no shared source_record_ids has no overlap evidence."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        result = await check_quarantine_overlap(
+            mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_resolved_identities_are_not_overlap_targets(self, mock_conn: AsyncMock):
+        """Identities already resolved into a parent do not trigger quarantine."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        await check_quarantine_overlap(mock_conn, _CLIENT_ID, _COLLECTOR_SOURCE_ID)
+
+        sql = mock_conn.fetch.call_args.args[0]
+        assert "canonical_parent_id IS NOT NULL" in sql
+
+
+class TestQuarantineIdentity:
+    """quarantine_identity creates a quarantine entry for an overlapping identity."""
+
+    @pytest.mark.asyncio
+    async def test_creates_quarantine_and_returns_id(self, mock_conn: AsyncMock):
+        """A quarantine row is inserted and its id returned."""
+        mock_conn.fetchrow = AsyncMock(return_value=_row({"id": _QUARANTINE_ID}))
+
+        result = await quarantine_identity(
+            mock_conn, _IDENTITY_B, _IDENTITY_A, overlap_count=4
+        )
+
+        assert result == _QUARANTINE_ID
+        sql, params = (
+            mock_conn.fetchrow.call_args.args[0],
+            mock_conn.fetchrow.call_args.args[1:],
+        )
+        assert "INSERT INTO source_identity_quarantine" in sql
+        assert params == (_IDENTITY_B, _IDENTITY_A, 4)
+
+
+def _quarantine_row(
+    id: uuid.UUID = _QUARANTINE_ID,
+    source_identity_id: uuid.UUID = _IDENTITY_B,
+    overlapping_identity_id: uuid.UUID = _IDENTITY_A,
+    overlap_count: int = 4,
+    cleared_at: datetime | None = None,
+    resolution_id: uuid.UUID | None = None,
+) -> MagicMock:
+    """Return a mock row resembling a source_identity_quarantine row."""
+    return _row(
+        {
+            "id": id,
+            "source_identity_id": source_identity_id,
+            "overlapping_identity_id": overlapping_identity_id,
+            "overlap_count": overlap_count,
+            "quarantined_at": _TS,
+            "cleared_at": cleared_at,
+            "resolution_id": resolution_id,
+        }
+    )
+
+
+class TestGetActiveQuarantines:
+    """get_active_quarantines lists unresolved quarantines per client."""
+
+    @pytest.mark.asyncio
+    async def test_lists_unresolved_quarantines(self, mock_conn: AsyncMock):
+        """Uncleared quarantines are returned as QuarantineRow objects."""
+        other_quarantine = uuid.uuid4()
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _quarantine_row(),
+                _quarantine_row(
+                    id=other_quarantine,
+                    source_identity_id=_IDENTITY_A,
+                    overlapping_identity_id=_IDENTITY_B,
+                    overlap_count=1,
+                ),
+            ]
+        )
+
+        result = await get_active_quarantines(mock_conn, _CLIENT_ID)
+
+        assert result == [
+            QuarantineRow(
+                id=_QUARANTINE_ID,
+                source_identity_id=_IDENTITY_B,
+                overlapping_identity_id=_IDENTITY_A,
+                overlap_count=4,
+                quarantined_at=_TS,
+                cleared_at=None,
+                resolution_id=None,
+            ),
+            QuarantineRow(
+                id=other_quarantine,
+                source_identity_id=_IDENTITY_A,
+                overlapping_identity_id=_IDENTITY_B,
+                overlap_count=1,
+                quarantined_at=_TS,
+                cleared_at=None,
+                resolution_id=None,
+            ),
+        ]
+        sql, params = (
+            mock_conn.fetch.call_args.args[0],
+            mock_conn.fetch.call_args.args[1:],
+        )
+        assert "source_identity_quarantine" in sql
+        assert "cleared_at IS NULL" in sql
+        assert params == (_CLIENT_ID,)
+
+    @pytest.mark.asyncio
+    async def test_no_active_quarantines_returns_empty(self, mock_conn: AsyncMock):
+        """A client with no unresolved quarantines gets an empty list."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        result = await get_active_quarantines(mock_conn, _CLIENT_ID)
+
+        assert result == []
+
+
+class TestIsQuarantined:
+    """is_quarantined reports whether an identity has an active quarantine."""
+
+    @pytest.mark.asyncio
+    async def test_true_when_quarantine_is_active(self, mock_conn: AsyncMock):
+        """An uncleared quarantine means the identity is quarantined."""
+        mock_conn.fetchval = AsyncMock(return_value=True)
+
+        result = await is_quarantined(mock_conn, _IDENTITY_B)
+
+        assert result is True
+        sql, params = (
+            mock_conn.fetchval.call_args.args[0],
+            mock_conn.fetchval.call_args.args[1:],
+        )
+        assert "cleared_at IS NULL" in sql
+        assert params == (_IDENTITY_B,)
+
+    @pytest.mark.asyncio
+    async def test_false_when_no_active_quarantine(self, mock_conn: AsyncMock):
+        """A cleared or absent quarantine means the identity is not quarantined."""
+        mock_conn.fetchval = AsyncMock(return_value=False)
+
+        result = await is_quarantined(mock_conn, _IDENTITY_B)
+
+        assert result is False
+
+
+class TestResolveIdentity:
+    """resolve_identity clears a quarantine and links the candidate to a parent."""
+
+    @pytest.mark.asyncio
+    async def test_records_resolution_clears_quarantine_and_links_identity(
+        self, mock_conn: AsyncMock
+    ):
+        """Resolution is audited, the quarantine cleared, and the identity linked."""
+        mock_conn.fetchrow = AsyncMock(return_value=_row({"id": _RESOLUTION_ID}))
+        mock_conn.execute = AsyncMock()
+
+        await resolve_identity(
+            mock_conn,
+            _QUARANTINE_ID,
+            _IDENTITY_A,
+            reason="same collector replayed after redeploy",
+            resolved_by="admin@example.com",
+        )
+
+        # Audit row first: source_identity_resolutions
+        insert_sql, insert_params = (
+            mock_conn.fetchrow.call_args.args[0],
+            mock_conn.fetchrow.call_args.args[1:],
+        )
+        assert "INSERT INTO source_identity_resolutions" in insert_sql
+        assert insert_params == (
+            _QUARANTINE_ID,
+            _IDENTITY_A,
+            "admin@example.com",
+            "same collector replayed after redeploy",
+        )
+
+        # Then clear the quarantine and link the identity
+        update_calls = mock_conn.execute.call_args_list
+        assert len(update_calls) == 2
+        clear_sql, clear_params = update_calls[0].args[0], update_calls[0].args[1:]
+        assert "UPDATE source_identity_quarantine" in clear_sql
+        assert "cleared_at" in clear_sql
+        assert clear_params == (_QUARANTINE_ID, _RESOLUTION_ID)
+        link_sql, link_params = update_calls[1].args[0], update_calls[1].args[1:]
+        assert "UPDATE source_identities" in link_sql
+        assert "is_canonical = false" in link_sql
+        assert "canonical_parent_id" in link_sql
+        assert link_params == (_QUARANTINE_ID, _IDENTITY_A)
+
+    @pytest.mark.asyncio
+    async def test_optional_reason_and_resolver_are_nullable(self, mock_conn: AsyncMock):
+        """resolve_identity accepts None reason and resolved_by."""
+        mock_conn.fetchrow = AsyncMock(return_value=_row({"id": _RESOLUTION_ID}))
+        mock_conn.execute = AsyncMock()
+
+        await resolve_identity(mock_conn, _QUARANTINE_ID, _IDENTITY_A, None, None)
+
+        insert_params = mock_conn.fetchrow.call_args.args[1:]
+        assert insert_params == (_QUARANTINE_ID, _IDENTITY_A, None, None)
+        assert mock_conn.execute.await_count == 2
