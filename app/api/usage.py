@@ -189,6 +189,203 @@ def _build_aggregate_filters(
     return " AND ".join(filters), params
 
 
+# Project-label resolution SQL for the rollup read path.  Mirrors
+# ``_PROJECT_LABEL_SQL`` but adapted for ``client_project_rollup``, which
+# has no ``sessions`` join — ``r.project_id`` is the external project ID,
+# and ``opencode_source_projects`` is matched via a LATERAL subquery.
+_ROLLUP_PROJECT_LABEL_SQL = """
+    COALESCE(
+        osp.display_name,
+        osp.name,
+        CASE
+            WHEN osp.worktree IS NULL
+                  OR osp.worktree = ''
+                  OR osp.worktree = '/' THEN NULL
+            ELSE substring(osp.worktree, '([^/]+)$')
+        END,
+        CASE
+            WHEN r.project_id IS NULL THEN NULL
+            WHEN length(r.project_id) > 12 THEN substring(r.project_id, 1, 12) || '…'
+            ELSE r.project_id
+        END,
+        'unknown'
+    )
+"""
+
+
+async def _fetch_aggregates_rollup(
+    conn: asyncpg.Connection,
+    start_date: datetime,
+    end_date: datetime,
+    client_id: uuid.UUID | None,
+    db_timeout_seconds: int,
+) -> list[AggregateRow]:
+    """Execute the client,project aggregates as a hybrid read.
+
+    Reads pre-aggregated additive totals from ``client_project_rollup``
+    (ADR 0015) and resolves the human-readable project label at read time
+    from ``opencode_source_projects`` via a LATERAL join.  Counts
+    (record, session, model) are derived from a second distinct-count
+    query over raw ``usage_events`` grouped by the same
+    (client, project-label) dimension, then merged in Python.
+    """
+    # ── Rollup query (additive token/cost totals) ────────────────────
+    params: list = [start_date, end_date]
+    filters: list[str] = [
+        "r.day >= ($1 AT TIME ZONE 'UTC')::date",
+        "r.day <= ($2 AT TIME ZONE 'UTC')::date",
+    ]
+
+    if client_id is not None:
+        filters.append(f"r.client_id = ${len(params) + 1}")
+        params.append(client_id)
+
+    where_clause = " AND ".join(filters)
+
+    rollup_sql = f"""
+        WITH rollup_with_label AS (
+            SELECT
+                r.client_id,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.estimated_cost_usd,
+                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label
+            FROM client_project_rollup r
+            LEFT JOIN LATERAL (
+                SELECT osp.display_name, osp.name, osp.worktree
+                FROM opencode_source_projects osp
+                WHERE osp.client_id = r.client_id
+                  AND osp.external_project_id = r.project_id
+                LIMIT 1
+            ) osp ON true
+            WHERE {where_clause}
+        )
+        SELECT
+            COALESCE(oc.canonical_name, oc.name) || '|' || rl.project_label AS group_value,
+            SUM(rl.input_tokens)::bigint AS total_input_tokens,
+            SUM(rl.output_tokens)::bigint AS total_output_tokens,
+            0::bigint AS total_cached_tokens,
+            0::bigint AS total_reasoning_tokens,
+            SUM(rl.cache_read_tokens)::bigint AS total_cache_read_tokens,
+            SUM(rl.cache_write_tokens)::bigint AS total_cache_write_tokens,
+            SUM(rl.estimated_cost_usd) AS total_estimated_cost_usd,
+            0 AS record_count,
+            0 AS session_count,
+            0 AS model_count,
+            rl.project_label
+        FROM rollup_with_label rl
+        JOIN opencode_clients oc ON oc.id = rl.client_id
+        GROUP BY COALESCE(oc.canonical_name, oc.name), rl.project_label
+        ORDER BY group_value
+    """
+    async with timed_operation("db.query.aggregates.client_project_rollup", "db"):
+        async with _db_timeout(
+            "db.query.aggregates.client_project_rollup", db_timeout_seconds
+        ):
+            rollup_rows = await conn.fetch(rollup_sql, *params)
+
+    # ── Count query (distinct counts over raw usage_events) ──────────
+    # The rollup stores only additive token/cost totals (ADR 0015);
+    # record_count, session_count, and model_count are derived from a
+    # separate distinct-count scan over raw ``usage_events``, grouped by
+    # the same (client, project-label) dimension.
+    #
+    # The count query MUST resolve the project label through the SAME
+    # ``(client_id, external_project_id)`` LATERAL lookup the rollup
+    # query uses.  Keying on ``usage_events.project_id`` (NOT
+    # ``sessions.project_id``) and matching against
+    # ``opencode_source_projects`` via ``(client_id, external_project_id)``
+    # produces byte-identical ``group_value`` strings to the rollup query.
+    # This prevents count-zeroing when one client reports the same project
+    # from multiple source databases (the canonical-client scenario) or
+    # when ``usage_events.project_id`` differs from
+    # ``sessions.project_id``.  The constant ``_ROLLUP_PROJECT_LABEL_SQL``
+    # references ``r.project_id`` and ``osp`` — aliasing ``usage_events``
+    # as ``r`` lets the same constant serve both queries.
+    count_params: list = [start_date, end_date]
+    count_filters: list[str] = [
+        "(r.reported_at AT TIME ZONE 'UTC')::date >= ($1 AT TIME ZONE 'UTC')::date",
+        "(r.reported_at AT TIME ZONE 'UTC')::date <= ($2 AT TIME ZONE 'UTC')::date",
+        "r.project_id IS NOT NULL",
+    ]
+    if client_id is not None:
+        count_filters.append(f"r.client_id = ${len(count_params) + 1}")
+        count_params.append(client_id)
+    count_where = " AND ".join(count_filters)
+
+    count_sql = f"""
+        WITH usage_with_label AS (
+            SELECT
+                r.client_id,
+                r.session_id,
+                r.model_id,
+                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label
+            FROM usage_events r
+            LEFT JOIN LATERAL (
+                SELECT osp.display_name, osp.name, osp.worktree
+                FROM opencode_source_projects osp
+                WHERE osp.client_id = r.client_id
+                  AND osp.external_project_id = r.project_id
+                LIMIT 1
+            ) osp ON true
+            WHERE {count_where}
+        )
+        SELECT
+            COALESCE(oc.canonical_name, oc.name) || '|' || ul.project_label AS group_value,
+            COUNT(*) AS record_count,
+            COUNT(DISTINCT ul.session_id) AS session_count,
+            COUNT(DISTINCT om.model_name) AS model_count
+        FROM usage_with_label ul
+        JOIN observed_models om ON om.id = ul.model_id
+        JOIN opencode_clients oc ON oc.id = ul.client_id
+        GROUP BY COALESCE(oc.canonical_name, oc.name), ul.project_label
+    """
+    async with timed_operation("db.query.aggregates.client_project_counts", "db"):
+        async with _db_timeout(
+            "db.query.aggregates.client_project_counts", db_timeout_seconds
+        ):
+            count_rows = await conn.fetch(count_sql, *count_params)
+
+    # Build a lookup of counts by group_value
+    count_by_group: dict[str, dict[str, int]] = {}
+    for cr in count_rows:
+        gv = str(cr["group_value"])
+        count_by_group[gv] = {
+            "record_count": cr["record_count"],
+            "session_count": cr["session_count"],
+            "model_count": cr["model_count"],
+        }
+
+    # ── Merge counts into rollup rows ────────────────────────────────
+    result: list[AggregateRow] = []
+    for r in rollup_rows:
+        gv = str(r["group_value"])
+        counts = count_by_group.get(gv, {
+            "record_count": 0,
+            "session_count": 0,
+            "model_count": 0,
+        })
+        result.append(
+            AggregateRow(
+                group_value=gv,
+                total_input_tokens=r["total_input_tokens"],
+                total_output_tokens=r["total_output_tokens"],
+                total_cached_tokens=r["total_cached_tokens"],
+                total_reasoning_tokens=r["total_reasoning_tokens"],
+                total_cache_read_tokens=r["total_cache_read_tokens"],
+                total_cache_write_tokens=r["total_cache_write_tokens"],
+                total_estimated_cost_usd=r["total_estimated_cost_usd"],
+                record_count=counts["record_count"],
+                session_count=counts["session_count"],
+                model_count=counts["model_count"],
+                project_label=r["project_label"],
+            )
+        )
+    return result
+
+
 async def _fetch_aggregates(
     conn: asyncpg.Connection,
     start_date: datetime,
@@ -249,6 +446,20 @@ async def _fetch_aggregates(
             )
         ]
 
+    # ── Hybrid read dispatch: client,project → rollup path ─────────
+    # Only dispatch to the rollup when no filter that the rollup cannot
+    # express is present.  The rollup stores only (client_id, project_id, day)
+    # and cannot filter by model or session_id — falling back to the raw
+    # usage_events scan preserves those filters (Finding 2 / PR #407 review).
+    _is_client_project = set(group_parts) == {"client", "project"}
+    _rollup_safe = model is None and session_id is None
+
+    if _is_client_project and _rollup_safe:
+        return await _fetch_aggregates_rollup(
+            conn, start_date, end_date, client_id, db_timeout_seconds
+        )
+
+    # ── All other dimensions: raw usage_events scan ───────────────
     group_expr = _group_expression(group_parts)
     has_project = "project" in group_parts
 
@@ -356,11 +567,11 @@ def _build_record_filters(
 def _validate_sort(sort_by: str, sort_dir: str) -> tuple[str, str]:
     """Validate and normalise sort parameters; raise 400 on invalid values."""
     sort_by = sort_by.strip().lower()
-    if sort_by not in ("reported_at", "ingested_at"):
+    if sort_by not in ("reported_at", "ingested_at", "source_created_at"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid sort_by: '{sort_by}'. "
-            f"Must be 'reported_at' or 'ingested_at'.",
+            f"Must be 'reported_at', 'ingested_at', or 'source_created_at'.",
         )
     sort_dir = sort_dir.strip().lower()
     if sort_dir not in ("asc", "desc"):
@@ -407,7 +618,13 @@ async def _fetch_records(
             total = await conn.fetchval(count_sql, *query_params)
 
     # Data query
-    order_col = "our.reported_at" if sort_by == "reported_at" else "our.first_ingested_at"
+    if sort_by == "source_created_at":
+        order_col = "COALESCE(osc.source_created_at_tz, our.reported_at)"
+    elif sort_by == "ingested_at":
+        order_col = "our.first_ingested_at"
+    else:
+        order_col = "our.reported_at"
+
     data_sql = f"""
         SELECT
             our.id,
@@ -430,6 +647,9 @@ async def _fetch_records(
         FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         JOIN sessions s ON s.id = our.session_id
+        LEFT JOIN opencode_session_contexts osc
+            ON osc.source_database_id = s.source_database_id
+            AND osc.external_session_id = s.external_session_id
         WHERE {where_clause}
         ORDER BY {order_col} {sort_dir}
         LIMIT ${len(query_params) + 1}
@@ -652,7 +872,7 @@ async def get_records(
     session_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    sort_by: str = Query(default="reported_at"),
+    sort_by: str = Query(default="source_created_at"),
     sort_dir: str = Query(default="desc"),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[RecordRow]:
@@ -661,6 +881,12 @@ async def get_records(
     Each record includes a ``loki_search_url`` pointing to the Grafana
     Explore view filtered to the record's client, source database, and
     session.
+
+    **Sort options**: ``source_created_at`` (default), ``reported_at``,
+    ``ingested_at``.  When sorting by ``source_created_at``, the query
+    uses ``COALESCE(source_created_at_tz, reported_at)`` — preferring
+    the timezone-aware source-created timestamp when available, falling
+    back to the collector-reported time.
     """
     _validate_date_range(start_date, end_date)
     sort_by, sort_dir = _validate_sort(sort_by, sort_dir)
@@ -1599,7 +1825,7 @@ async def _fetch_records_with_context(
         {_RWC_CONTEXT_JOIN}
         {_RWC_PROJECT_JOIN}
         WHERE {where_clause}
-        ORDER BY our.reported_at DESC
+        ORDER BY COALESCE(osc.source_created_at_tz, our.reported_at) DESC
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """

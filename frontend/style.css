@@ -7,7 +7,7 @@
 
 /* ═══════════════════════════════════════════════════════════════════════════
    REUSABLE VISUAL PATTERNS (S1–S5, Aurora Glass-inspired reskin)
-   Reference for future work — e.g. the detail panel (#sd-detail-overlay).
+   Reference for future work — e.g. the detail panel (#ar-detail-overlay).
    Comment-only documentation of the patterns established in S1–S4; no
    style rules live in this block.
 
@@ -23,15 +23,15 @@
 
    2. State-driven styling via data-* attributes (state lives in markup, not
       modifier classes):
-        .session-row[data-active="true"]  { …active row glow/ring… }
-        .session-row[data-status="error"] { …error tinting… }
-      Current base fallback: .session-row:hover td { background: rgba(124,140,255,0.06); }
+        .ar-row[data-status="…"]  { …status tinting… }
+      Current base fallback: .ar-row:hover td { background: rgba(124,140,255,0.06); }
       S1–S4 extend this with [data-*] attribute selectors so app.js renders
       state once and CSS drives the visuals.
-      #350 (Balanced Quiet Rows) SUPERSEDES the row-level state styling for
-      the SESSIONS table: rows keep the data-active/data-status attributes as
-      data hooks, but status visuals live in the compact outlined badge only
-      (Badge Only) — no active-row background, rail, shadow, glow, or pulse.
+      #350 (Balanced Quiet Rows) SUPERSEDES the row-level state styling: the
+      merged Sessions + Agent Runs table (issue #402) communicates status
+      through the compact outlined badge only (Badge Only) — no active-row
+      background, rail, shadow, glow, or pulse.  Run status semantics come
+      from currentStatus (falling back to status) via statusBadgeClass.
       The [data-*] pattern remains available for other surfaces.
 
    3. Token usage checklist — token → visual effect → example selector:
@@ -42,9 +42,9 @@
         --accent-cyan    #5ef2ff brand/active    → .kpi-tokens .kpi-value, .logo, .badge-running
         --accent-pink    #ff75b5 brand/accent    → .kpi-source-dbs .kpi-value
         --accent-gold    #ffd86f brand/accent    → .kpi-cost .kpi-value
-        --status-healthy success/green           → .badge-active, .badge-completed, .live-indicator
+        --status-healthy success/green           → .badge-completed, .live-indicator
         --status-stale   warning/amber           → .badge-stale, .badge-blocked, .live-indicator.stale
-        --status-unknown neutral/grey            → .badge-unknown, .badge-inactive
+        --status-unknown neutral/grey            → .badge-unknown
         --status-error   error/red               → .live-indicator.error
       S1–S4 forward-reference tokens (arrive with the reskin slices; verify
       they exist before use): --glow-error-tint, --glass-bg-wash,
@@ -385,7 +385,8 @@ body {
 
 /* Keyboard focus on nav items — visible ring with a sensible tab order
    (nav items are focusable via tabindex="0", so tabbing enters
-   Overview → Sessions → Agent Runs → Clients / Projects). */
+   Overview → Agent Runs → Clients / Projects; the Sessions tab was
+   merged into Agent Runs — issue #402). */
 .top-nav-item:focus-visible {
   outline: 2px solid var(--accent-indigo);
   outline-offset: -2px;
@@ -613,10 +614,6 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.panel-sessions .panel-title {
-  color: var(--accent-purple);
 }
 
 .event-badge {
@@ -883,23 +880,6 @@ tbody tr:hover td {
 .badge-healthy  { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-stale    { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
-/* Sessions status badges — Balanced Quiet Rows: compact OUTLINED treatment
-   (Badge Only). Transparent fill, 1px border, full-opacity semantic text.
-   Status is communicated by the badge alone — the row itself carries no
-   background wash, left rail, shadow, glow, or pulse. */
-.badge-active {
-  color: var(--status-healthy);
-  border: 1px solid rgba(74, 222, 128, 0.5);
-  background: transparent;
-  padding: 1px 8px;
-}
-
-.badge-inactive {
-  color: var(--status-unknown);
-  border: 1px solid rgba(148, 163, 184, 0.5);
-  background: transparent;
-  padding: 1px 8px;
-}
 
 /* Fetch error indicator — shown inline in empty states when an endpoint failed */
 .fetch-error {
@@ -1059,58 +1039,38 @@ td.clickable:hover {
   color: var(--accent-cyan);
 }
 
-/* Session row clickable (for session detail panel) — Balanced Quiet Rows.
-   No status-driven row background: activity is communicated by the compact
-   outlined badge in the Status column (Badge Only), so no green background
-   wash, green left rail, green box shadow, glow ring, animated pulse, or
-   bright cyan stripe is applied to the row. */
-.session-row {
+/* Agent run row (merged Sessions + Agent Runs table, issue #402) — clickable
+   for the /agent-runs/{id} detail overlay.  Balanced Quiet Rows: no
+   status-driven row background — run status is communicated by the compact
+   outlined badge in the Status column (Badge Only, currentStatus semantics),
+   so no green background wash, green left rail, green box shadow, glow ring,
+   animated pulse, or bright cyan stripe is applied to the row. */
+.ar-row {
   cursor: pointer;
   transition: background var(--transition);
 }
 
-/* Keyboard focus: visible ring when tabbing to a session row.
+/* Keyboard focus: visible ring when tabbing to an agent run row.
    Uses an inset box-shadow on the cells rather than outline on the <tr>,
    because Firefox does not render outlines on table-row elements
    (Bugzilla 893137); inset shadows render reliably in Chrome/Edge/Safari/Firefox. */
-.session-row:focus-visible td {
+.ar-row:focus-visible td {
   box-shadow: inset 0 0 0 2px var(--accent-indigo);
 }
 
-.session-row td {
+.ar-row td {
   transition: background var(--transition);
 }
 
 /* Hover feedback is a subtle NEUTRAL surface change only — it must not
    imitate a status state (no cyan/green tint, no accent border). */
-.session-row:hover td {
+.ar-row:hover td {
   background: var(--glass-fg-surface-hover);
 }
 
-/* Flexible title column: absorbs the remaining table width so titles stay
-   readable; overflow is clipped with a CSS ellipsis on the .session-title
-   span (full title remains available in the tooltip). */
-.session-title-col {
-  width: 100%;
-}
-
-.session-title-col .session-title {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary); /* readable title over muted metadata */
-}
-
-/* Numeric cells (messages, tokens, cost) — tabular numerals (inherited from
-   tbody td and .num) plus right alignment for stable column alignment. */
-.session-row td:has(.num) {
-  text-align: right;
-}
-
 /* Badge pulse — additional non-color cue for RUNNING agent runs only.
-   Session badges are static compact outlined badges (Balanced Quiet Rows);
-   active session rows no longer pulse. */
+   Run badges are static compact outlined badges (Balanced Quiet Rows);
+   running rows pulse the badge alone. */
 .badge-running { animation: badge-pulse-running 2s ease-in-out infinite; }
 
 @keyframes badge-pulse-running {
@@ -1396,11 +1356,12 @@ td.clickable:hover {
   }
 
   /* Responsive Hybrid — tablet band (761–1024px): hide the low-priority
-     sessions columns (First Message, Duration, Messages, Tokens, marked
-     .sess-col-low in index.html/app.js) so client, title, recent activity,
-     cost, and status stay readable without horizontal scrolling. Above
-     1024px the complete Balanced Quiet Rows table is untouched. */
-  #sessions-table .sess-col-low {
+     merged-table columns (Agent, Todo, Files, Children, marked
+     .ar-col-low in index.html/app.js) so title, status, model, project,
+     cost, tokens, and last-updated stay readable without horizontal
+     scrolling. Above 1024px the complete Balanced Quiet Rows table is
+     untouched. */
+  #agent-runs-table .ar-col-low {
     display: none;
   }
 }
@@ -1562,17 +1523,17 @@ td.clickable:hover {
     gap: 8px;
   }
 
-  /* Responsive Hybrid — phone band (≤760px): the sessions table becomes a
-     stacked card list so rows stay readable without horizontal desktop-table
-     scrolling. The header row is removed; each session row renders as a card
-     whose cells become label/value lines (label from the data-label hook
-     emitted by buildSessionRowHtml). Low-priority cells stay hidden from the
-     1024px rule above. */
-  #sessions-table thead {
+  /* Responsive Hybrid — phone band (≤760px): the merged Sessions + Agent
+     Runs table becomes a stacked card list so rows stay readable without
+     horizontal desktop-table scrolling. The header row is removed; each
+     agent run row renders as a card whose cells become label/value lines
+     (label from the data-label hook emitted by renderAgentRunsTable).
+     Low-priority cells stay hidden from the 1024px rule above. */
+  #agent-runs-table thead {
     display: none;
   }
 
-  #sessions-table tr.session-row {
+  #agent-runs-table tr.ar-row {
     display: block;
     border: 1px solid var(--glass-border);
     border-radius: 12px;
@@ -1581,7 +1542,7 @@ td.clickable:hover {
     background: rgba(255, 255, 255, 0.02);
   }
 
-  #sessions-table tr.session-row td {
+  #agent-runs-table tr.ar-row td {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
@@ -1591,7 +1552,7 @@ td.clickable:hover {
     white-space: normal;
   }
 
-  #sessions-table tr.session-row td::before {
+  #agent-runs-table tr.ar-row td::before {
     content: attr(data-label);
     font-size: 0.62rem;
     font-weight: 600;
@@ -1608,12 +1569,12 @@ td.clickable:hover {
      !important wins the cascade over the reduced-motion inset ring rule
      (which is !important too), preserving the single card outline under
      prefers-reduced-motion. */
-  #sessions-table tr.session-row:focus-visible {
+  #agent-runs-table tr.ar-row:focus-visible {
     outline: 2px solid var(--accent-indigo);
     outline-offset: 2px;
   }
 
-  #sessions-table tr.session-row:focus-visible td {
+  #agent-runs-table tr.ar-row:focus-visible td {
     box-shadow: none !important;
   }
 }
@@ -1621,8 +1582,8 @@ td.clickable:hover {
 /* ═══════════════════════════════════════════════════════════════════════════
    ACCESSIBILITY: reduced motion (S4)
    Respects the OS/browser prefers-reduced-motion setting: collapses all
-   animation/transition motion. Session rows (Balanced Quiet Rows) carry no
-   animated treatments — the badge is static, so only the agent-runs pulse
+   animation/transition motion. Agent run rows (Balanced Quiet Rows) carry no
+   animated treatments — the badge is static, so only the running pulse
    and the keyboard focus ring need handling here.
    ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1636,7 +1597,7 @@ td.clickable:hover {
     scroll-behavior: auto !important;
   }
 
-  /* Disable badge pulse (agent runs running) — session badges are static
+  /* Disable badge pulse (running agent runs) — run badges are static
      compact outlined badges (Balanced Quiet Rows), no pulse to disable */
   .badge-running {
     animation: none !important;
@@ -1655,7 +1616,7 @@ td.clickable:hover {
 
   /* Focus indicators are not motion — keep the keyboard focus ring visible
      even when animations are disabled. */
-  .session-row:focus-visible td {
+  .ar-row:focus-visible td {
     box-shadow: inset 0 0 0 2px var(--accent-indigo) !important;
   }
 }

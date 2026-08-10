@@ -38,6 +38,7 @@ def _row_to_client_read(row: asyncpg.Record) -> ClientRead:
     return ClientRead(
         id=row["id"],
         name=row["name"],
+        canonical_name=row["canonical_name"],
         description=row["description"],
         is_active=row["is_active"],
         created_at=row["created_at"],
@@ -70,7 +71,7 @@ async def create_client(
         """
         INSERT INTO opencode_clients (name, description)
         VALUES ($1, $2)
-        RETURNING id, name, description, is_active, created_at, updated_at
+        RETURNING id, name, canonical_name, description, is_active, created_at, updated_at
         """,
         body.name,
         body.description,
@@ -88,7 +89,7 @@ async def list_clients(
     total: int = await conn.fetchval("SELECT COUNT(*) FROM opencode_clients")
 
     rows = await conn.fetch(
-        "SELECT id, name, description, is_active, created_at, updated_at "
+        "SELECT id, name, canonical_name, description, is_active, created_at, updated_at "
         "FROM opencode_clients ORDER BY name "
         "LIMIT $1 OFFSET $2",
         limit,
@@ -105,7 +106,7 @@ async def get_client(
 ) -> ClientWithTokens:
     """Get a client by ID, including its credential tokens (metadata only)."""
     client_row = await conn.fetchrow(
-        "SELECT id, name, description, is_active, created_at, updated_at "
+        "SELECT id, name, canonical_name, description, is_active, created_at, updated_at "
         "FROM opencode_clients WHERE id = $1",
         client_id,
     )
@@ -120,6 +121,7 @@ async def get_client(
     return ClientWithTokens(
         id=client_row["id"],
         name=client_row["name"],
+        canonical_name=client_row["canonical_name"],
         description=client_row["description"],
         is_active=client_row["is_active"],
         created_at=client_row["created_at"],
@@ -141,7 +143,7 @@ async def update_client(
     """
     # Fetch current state first to verify existence
     existing = await conn.fetchrow(
-        "SELECT id, name, description, is_active, created_at, updated_at "
+        "SELECT id, name, canonical_name, description, is_active, created_at, updated_at "
         "FROM opencode_clients WHERE id = $1",
         client_id,
     )
@@ -160,6 +162,12 @@ async def update_client(
             params.append(value)
             idx += 1
 
+    # canonical_name is handled separately so explicit null clears the value
+    if "canonical_name" in body.model_fields_set:
+        set_parts.append(f"canonical_name = ${idx}")
+        params.append(body.canonical_name)
+        idx += 1
+
     if not set_parts:
         # Nothing to update — return current state
         return _row_to_client_read(existing)
@@ -177,7 +185,7 @@ async def update_client(
         UPDATE opencode_clients
         SET {set_clause}
         WHERE id = ${idx}
-        RETURNING id, name, description, is_active, created_at, updated_at
+        RETURNING id, name, canonical_name, description, is_active, created_at, updated_at
         """,
         *params,
     )

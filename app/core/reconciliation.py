@@ -66,6 +66,20 @@ DELTA_FIELDS: tuple[str, ...] = (
 )
 """Every canonical-event field that participates in delta computation."""
 
+ROLLUP_FIELDS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "estimated_cost_usd",
+)
+"""The subset of DELTA_FIELDS with corresponding client_project_rollup columns.
+
+``cached_tokens`` and ``reasoning_tokens`` are in DELTA_FIELDS but have
+no rollup column — they map to sessions only.  The rollup stores only
+additive token/cost totals (ADR 0015 decision 3).
+"""
+
 SESSION_TOKEN_FIELDS: tuple[str, ...] = (
     "input_tokens",
     "output_tokens",
@@ -354,10 +368,69 @@ def validate_no_negative_totals(
 # ---------------------------------------------------------------------------
 
 
+async def _upsert_client_project_rollup(
+    conn: asyncpg.Connection,
+    *,
+    client_id: uuid.UUID,
+    project_id: str,
+    day: Any,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    estimated_cost_usd: Decimal | None = None,
+) -> None:
+    """Upsert a client_project_rollup row within the caller's transaction.
+
+    For a first-time record the values are the full token/cost amounts;
+    for a replay-merge correction they are the per-field deltas (which
+    may be negative).  The ON CONFLICT clause adds the values to the
+    existing row — ``existing + EXCLUDED`` — so the same SQL works for
+    both full increment and delta adjustment without requiring the caller
+    to track whether the row already exists.
+
+    ``project_id`` must be non-None — the rollup PK is all NOT NULL and
+    events with a NULL project_id cannot be keyed.  Callers should skip
+    the rollup write when ``project_id`` is absent.
+
+    ``day`` is a ``datetime.date`` derived from the UTC date of the
+    event's ``reported_at``.
+    """
+    if estimated_cost_usd is None:
+        estimated_cost_usd = Decimal("0")
+
+    await conn.execute(
+        """INSERT INTO client_project_rollup
+           (client_id, project_id, day,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            estimated_cost_usd)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (client_id, project_id, day)
+           DO UPDATE SET
+             input_tokens = client_project_rollup.input_tokens + EXCLUDED.input_tokens,
+             output_tokens = client_project_rollup.output_tokens + EXCLUDED.output_tokens,
+             cache_read_tokens = client_project_rollup.cache_read_tokens + EXCLUDED.cache_read_tokens,
+             cache_write_tokens = client_project_rollup.cache_write_tokens + EXCLUDED.cache_write_tokens,
+             estimated_cost_usd = client_project_rollup.estimated_cost_usd + EXCLUDED.estimated_cost_usd""",
+        client_id,
+        project_id,
+        day,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        estimated_cost_usd,
+    )
+
+
 async def apply_replay_merge(
     conn: asyncpg.Connection,
     event_id: uuid.UUID,
     new_values: Mapping[str, Any],
+    *,
+    client_id: uuid.UUID | None = None,
+    project_id: str | None = None,
+    reported_at: datetime | None = None,
 ) -> IngestOutcome:
     """Apply the canonical Replay Merge within the caller's transaction.
 
@@ -367,6 +440,21 @@ async def apply_replay_merge(
     via :func:`compute_delta`, writes the authoritative (non-erasing)
     event values, and adjusts the owning ``sessions`` aggregate by the
     delta — clamping any total that would go negative to zero.
+
+    The Client Project Rollup is also maintained inside the same
+    transaction.  The rollup key (``client_id``, ``project_id``, ``day``)
+    and UTC day bucket are derived from the **stored** canonical event's
+    ``client_id``, ``project_id`` and ``reported_at`` columns — NOT from
+    the incoming replay record.  This guarantees the delta is applied to
+    the same bucket that ``SUM(usage_events)`` groups by, preventing
+    divergence when a replay carries a day-crossing ``reported_at`` or a
+    different ``project_id`` from the original delivery (issue #403).
+
+    ``project_id`` must be non-None on the stored event (the rollup PK
+    is all NOT NULL).  The ``client_id``, ``project_id`` and
+    ``reported_at`` keyword arguments are retained for backward
+    compatibility with existing callers but are no longer used for
+    rollup keying.
 
     No transaction is opened here: the caller owns the transaction, so
     the advisory lock and the ``FOR UPDATE`` row reads span the entire
@@ -395,7 +483,8 @@ async def apply_replay_merge(
     current = await conn.fetchrow(
         """SELECT input_tokens, output_tokens, cached_tokens,
                   reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                  estimated_cost_usd, session_id
+                  estimated_cost_usd, session_id,
+                  client_id, project_id, reported_at
            FROM usage_events
            WHERE id = $1
            FOR UPDATE""",
@@ -464,7 +553,51 @@ async def apply_replay_merge(
                     *params,
                 )
 
+    # ── 5. Maintain Client Project Rollup (subset of delta fields) ────
+    # The rollup key MUST be derived from the STORED event's project_id
+    # and reported_at — never the incoming record's — so that a replay
+    # carrying a day-crossing reported_at or a changed project_id applies
+    # the delta to the same (client_id, project_id, day) bucket as
+    # SUM(usage_events) groups by, avoiding divergence (issue #403).
+    stored_project_id = current["project_id"]
+    if stored_project_id is not None:
+        day = _rollup_day(current["reported_at"])
+        rollup_deltas: dict[str, int | Decimal] = {}
+        for field_name in ROLLUP_FIELDS:
+            field_delta = delta.deltas[field_name]
+            if field_delta != 0:
+                rollup_deltas[field_name] = field_delta
+        if rollup_deltas:
+            cost_delta = rollup_deltas.get("estimated_cost_usd", Decimal("0"))
+            await _upsert_client_project_rollup(
+                conn,
+                client_id=current["client_id"],
+                project_id=stored_project_id,
+                day=day,
+                input_tokens=int(rollup_deltas.get("input_tokens", 0)),
+                output_tokens=int(rollup_deltas.get("output_tokens", 0)),
+                cache_read_tokens=int(rollup_deltas.get("cache_read_tokens", 0)),
+                cache_write_tokens=int(rollup_deltas.get("cache_write_tokens", 0)),
+                estimated_cost_usd=(
+                    cost_delta if isinstance(cost_delta, Decimal)
+                    else Decimal(str(cost_delta))
+                ),
+            )
+
     return IngestOutcome.UPDATED
+
+
+def _rollup_day(reported_at: datetime) -> Any:
+    """Extract the UTC date from a tz-aware or naive ``reported_at``.
+
+    Returns a ``datetime.date`` suitable as the ``day`` key for
+    ``client_project_rollup``.  Naive datetimes are treated as UTC.
+    """
+    import datetime as _dt
+
+    if reported_at.tzinfo is not None:
+        return reported_at.astimezone(_dt.timezone.utc).date()
+    return reported_at.date()
 
 
 # ---------------------------------------------------------------------------

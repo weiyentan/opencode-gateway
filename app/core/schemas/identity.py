@@ -26,6 +26,7 @@ class ClientUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None
+    canonical_name: Optional[str] = None
 
 
 class ClientRead(BaseModel):
@@ -35,6 +36,7 @@ class ClientRead(BaseModel):
 
     id: uuid.UUID
     name: str
+    canonical_name: Optional[str] = None
     description: Optional[str] = None
     is_active: bool
     created_at: datetime

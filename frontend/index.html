@@ -39,14 +39,6 @@
           </span>
           <span class="top-nav-label">Overview</span>
         </li>
-        <li class="top-nav-item" data-tab="sessions" tabindex="0">
-          <span class="top-nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false">
-              <path d="M4 6h16M4 12h16M4 18h12" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"></path>
-            </svg>
-          </span>
-          <span class="top-nav-label">Sessions</span>
-        </li>
         <li class="top-nav-item" data-tab="agent-runs" tabindex="0">
           <span class="top-nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" focusable="false">
@@ -217,45 +209,15 @@
 
     </div><!-- .content-grid -->
 
-    <!-- Sessions Summary (full width) -->
-    <section class="glass-panel panel-sessions">
-      <h2 class="panel-title">Sessions</h2>
-      <p class="empty-state">Session details are available in the <strong>Sessions</strong> tab.</p>
-    </section>
-
     </div><!-- #tab-overview -->
 
-    <!-- ── Tab: Sessions ──────────────────────────────────────────────── -->
-    <div class="tab-content" id="tab-sessions">
-
-    <!-- Sessions Table (full width) -->
-    <section class="glass-panel panel-sessions">
-      <h2 class="panel-title">All Sessions<span class="panel-freshness" id="freshness-sessions"></span></h2>
-      <div class="table-scroll">
-        <table id="sessions-table">
-          <thead>
-            <tr>
-              <th>Client</th>
-              <th class="session-title-col">Session Title</th>
-              <th class="sess-col-low">First Message</th>
-              <th>Last Message</th>
-              <th class="sess-col-low">Duration</th>
-              <th class="sess-col-low">Messages</th>
-              <th class="sess-col-low">Tokens</th>
-              <th>Cost</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="sessions-tbody">
-            <tr><td colspan="9" class="empty-state">Loading&hellip;</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    </div><!-- #tab-sessions -->
-
     <!-- ── Tab: Agent Runs ─────────────────────────────────────────────── -->
+    <!-- The merged Sessions + Agent Runs dashboard table (issue #402):
+         driven by /api/v1/usage/agent-runs — a superset of the sessions
+         list (session_title, model, currentStatus, token breakdown,
+         total_estimated_cost_usd) — with the /agent-runs/{id} detail
+         overlay.  The separate Sessions panel/tab and its /sessions fetch
+         were removed; the backend /sessions endpoint is untouched. -->
     <div class="tab-content" id="tab-agent-runs">
 
     <!-- Agent Runs (full width) -->
@@ -287,20 +249,20 @@
         <button class="filter-apply" id="ar-filter-apply">Apply</button>
       </div>
       <div class="table-scroll">
-        <table>
+        <table id="agent-runs-table">
           <thead>
             <tr>
               <th>Title</th>
               <th>Status</th>
-              <th>Agent</th>
+              <th class="ar-col-low">Agent</th>
               <th>Model</th>
               <th>Project / Worktree</th>
-              <th>Todo</th>
-              <th>Files</th>
+              <th class="ar-col-low">Todo</th>
+              <th class="ar-col-low">Files</th>
               <th>Cost</th>
               <th>Tokens</th>
               <th>Last Updated</th>
-              <th>Children</th>
+              <th class="ar-col-low">Children</th>
             </tr>
           </thead>
           <tbody id="agent-runs-tbody">
@@ -339,19 +301,6 @@
     </div><!-- #tab-clients-projects -->
 
   </main>
-
-  <!-- Session Detail Panel -->
-  <div class="detail-overlay" id="sd-detail-overlay">
-    <div class="detail-panel glass-panel" id="sd-detail-panel">
-      <div class="detail-header">
-        <h2 class="detail-title" id="sd-detail-title">Session Detail</h2>
-        <button class="detail-close" id="sd-detail-close">&times;</button>
-      </div>
-      <div class="detail-body" id="sd-detail-body">
-        <p class="empty-state">Loading detail&hellip;</p>
-      </div>
-    </div>
-  </div>
 
   <!-- Agent Run Detail Panel -->
   <div class="detail-overlay" id="ar-detail-overlay">
