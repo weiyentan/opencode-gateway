@@ -194,6 +194,50 @@ class TestAggregatesQueryCount:
         assert mock_conn.fetch.call_count == 1
         assert mock_conn.fetchrow.call_count == 0
 
+    @pytest.mark.asyncio
+    async def test_aggregates_client_project_hits_rollup(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The client,project aggregate path uses the Client Project Rollup
+        (contains `FROM client_project_rollup`, not `FROM usage_events`)."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="canonical-client|My Project",
+                record_count=0, session_count=0, model_count=0,
+                project_label="My Project",
+            )
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetch.call_count == 1
+        assert mock_conn.fetchrow.call_count == 0
+
+        # SQL-shape: must reference client_project_rollup, not usage_events
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        sql = call_args[0][0]
+        assert "FROM client_project_rollup" in sql, (
+            f"Expected rollup-backed SQL, got: {sql[:200]}"
+        )
+        assert "FROM usage_events" not in sql, (
+            f"Rollup path must not scan usage_events, got: {sql[:200]}"
+        )
+        assert "COALESCE(oc.canonical_name, oc.name)" in sql, (
+            f"Expected canonical-name COALESCE in rollup SQL, got: {sql[:200]}"
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Telemetry middleware integration tests
