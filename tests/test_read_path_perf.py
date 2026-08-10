@@ -63,7 +63,8 @@ _REGENERATE_ENV = "REGENERATE_BASELINES"
 
 # How many times to repeat single-session measurements (more -> better p50/p95)
 _WARMUP_ITERATIONS = 2
-_MEASUREMENT_ITERATIONS = 10
+# More samples make p95 less sensitive to a single CI runner scheduling pause.
+_MEASUREMENT_ITERATIONS = 20
 
 # Regression threshold: p95 must not exceed baseline_p95 * _REGRESSION_FACTOR
 _REGRESSION_FACTOR = 2.0
