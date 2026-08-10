@@ -189,6 +189,79 @@ def _build_aggregate_filters(
     return " AND ".join(filters), params
 
 
+async def _fetch_aggregates_rollup(
+    conn: asyncpg.Connection,
+    start_date: datetime,
+    end_date: datetime,
+    client_id: uuid.UUID | None,
+    db_timeout_seconds: int,
+) -> list[AggregateRow]:
+    """Execute the client,project aggregates query against the rollup table.
+
+    Reads pre-aggregated additive totals from ``client_project_rollup``,
+    applying ``COALESCE(oc.canonical_name, oc.name)`` at read time so
+    canonical-name changes never require a table recompute.
+
+    The rollup stores only additive token/cost columns (input, output,
+    cache_read, cache_write, estimated_cost).  Counts (record, session,
+    model) and non-additive token columns (cached, reasoning) return 0.
+    """
+    params: list = [start_date, end_date]
+    filters: list[str] = [
+        "r.day >= $1",
+        "r.day <= $2",
+    ]
+
+    if client_id is not None:
+        filters.append(f"r.client_id = ${len(params) + 1}")
+        params.append(client_id)
+
+    where_clause = " AND ".join(filters)
+
+    sql = f"""
+        SELECT
+            COALESCE(oc.canonical_name, oc.name) || '|' || r.project_id AS group_value,
+            SUM(r.input_tokens) AS total_input_tokens,
+            SUM(r.output_tokens) AS total_output_tokens,
+            0 AS total_cached_tokens,
+            0 AS total_reasoning_tokens,
+            SUM(r.cache_read_tokens) AS total_cache_read_tokens,
+            SUM(r.cache_write_tokens) AS total_cache_write_tokens,
+            SUM(r.estimated_cost_usd) AS total_estimated_cost_usd,
+            0 AS record_count,
+            0 AS session_count,
+            0 AS model_count,
+            r.project_id AS project_label
+        FROM client_project_rollup r
+        JOIN opencode_clients oc ON oc.id = r.client_id
+        WHERE {where_clause}
+        GROUP BY COALESCE(oc.canonical_name, oc.name), r.project_id
+        ORDER BY group_value
+    """
+    async with timed_operation("db.query.aggregates.client_project_rollup", "db"):
+        async with _db_timeout(
+            "db.query.aggregates.client_project_rollup", db_timeout_seconds
+        ):
+            rows = await conn.fetch(sql, *params)
+    return [
+        AggregateRow(
+            group_value=str(r["group_value"]),
+            total_input_tokens=r["total_input_tokens"],
+            total_output_tokens=r["total_output_tokens"],
+            total_cached_tokens=r["total_cached_tokens"],
+            total_reasoning_tokens=r["total_reasoning_tokens"],
+            total_cache_read_tokens=r["total_cache_read_tokens"],
+            total_cache_write_tokens=r["total_cache_write_tokens"],
+            total_estimated_cost_usd=r["total_estimated_cost_usd"],
+            record_count=r["record_count"],
+            session_count=r["session_count"],
+            model_count=r["model_count"],
+            project_label=r["project_label"],
+        )
+        for r in rows
+    ]
+
+
 async def _fetch_aggregates(
     conn: asyncpg.Connection,
     start_date: datetime,
@@ -249,6 +322,15 @@ async def _fetch_aggregates(
             )
         ]
 
+    # ── Hybrid read dispatch: client,project → rollup path ─────────
+    _is_client_project = set(group_parts) == {"client", "project"}
+
+    if _is_client_project:
+        return await _fetch_aggregates_rollup(
+            conn, start_date, end_date, client_id, db_timeout_seconds
+        )
+
+    # ── All other dimensions: raw usage_events scan ───────────────
     group_expr = _group_expression(group_parts)
     has_project = "project" in group_parts
 

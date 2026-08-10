@@ -761,12 +761,13 @@ class TestClientProjectAggregates:
     async def test_group_by_client_project_sql_shape(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
-        """Verify the generated SQL includes the standalone _PROJECT_LABEL_SQL expression
-        in the GROUP BY clause, not just within the concatenated group_expr."""
+        """Verify the generated SQL for client,project uses the rollup path:
+        references client_project_rollup (not usage_events) and applies
+        COALESCE(canonical_name, name) for canonical client grouping."""
         mock_conn.fetch = AsyncMock(return_value=[
             _mk_aggregate_row(
                 group_value="Acme Corp|Friendly Project Name",
-                record_count=10, session_count=3, model_count=2,
+                record_count=0, session_count=0, model_count=0,
                 project_label="Friendly Project Name",
             )
         ])
@@ -787,23 +788,172 @@ class TestClientProjectAggregates:
         assert call_args is not None
         sql = call_args[0][0]
 
-        # The GROUP BY clause must contain both the concatenated expression
-        # AND the standalone _PROJECT_LABEL_SQL
+        # Must reference the rollup table, not usage_events
+        assert "FROM client_project_rollup" in sql, (
+            f"Expected rollup-backed SQL, got: {sql[:300]}"
+        )
+        assert "FROM usage_events" not in sql, (
+            f"Rollup path must not scan usage_events, got: {sql[:300]}"
+        )
+
+        # Must apply canonical-name COALESCE for client grouping
+        assert "COALESCE(oc.canonical_name, oc.name)" in sql, (
+            f"Expected canonical-name COALESCE in rollup SQL, got: {sql[:300]}"
+        )
+
+        # GROUP BY must contain canonical client name and project label
         assert "GROUP BY" in sql.upper(), "SQL must contain GROUP BY"
-
-        # Extract the GROUP BY clause (everything between GROUP BY and ORDER BY)
         group_by_match = sql.upper().split("GROUP BY")[1].split("ORDER BY")[0].strip()
-
-        # There should be a comma in the GROUP BY clause indicating two entries:
-        # the concatenated group_expr and the standalone _PROJECT_LABEL_SQL
-        assert "," in group_by_match, (
-            "Expected GROUP BY to have multiple entries (concatenated expr + standalone label), "
-            f"got: {group_by_match}"
-        )
         assert "COALESCE" in group_by_match, (
-            "Expected GROUP BY to contain COALESCE expression for project_label, "
-            f"got: {group_by_match}"
+            f"Expected COALESCE in GROUP BY clause, got: {group_by_match}"
         )
+
+    @pytest.mark.asyncio
+    async def test_canonical_name_rolls_up_workspace_clients(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Clients sharing a canonical_name are consolidated into a single row."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="my-deployment|Project A",
+                record_count=0, session_count=0, model_count=0,
+                project_label="Project A",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["group_value"] == "my-deployment|Project A"
+
+    @pytest.mark.asyncio
+    async def test_canonical_name_multi_project(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A canonical client with multiple projects returns one row per project."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="shared-deployment|Project A",
+                record_count=0, session_count=0, model_count=0,
+                project_label="Project A",
+            ),
+            _mk_aggregate_row(
+                group_value="shared-deployment|Project B",
+                record_count=0, session_count=0, model_count=0,
+                project_label="Project B",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        assert data[0]["group_value"] == "shared-deployment|Project A"
+        assert data[1]["group_value"] == "shared-deployment|Project B"
+
+    @pytest.mark.asyncio
+    async def test_no_canonical_name_groups_under_own_name(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Clients without a canonical_name group under their own name (unchanged behavior)."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="standalone-client|My Project",
+                record_count=0, session_count=0, model_count=0,
+                project_label="My Project",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["group_value"] == "standalone-client|My Project"
+
+    @pytest.mark.asyncio
+    async def test_rollup_path_maps_rollup_columns(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Rollup-backed client,project path maps only additive columns (input,
+        output, cache_read, cache_write tokens + cost) and returns 0 for
+        cached_tokens, reasoning_tokens, record_count, session_count, model_count."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="canonical|Project X",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                total_cached_tokens=0,
+                total_reasoning_tokens=0,
+                total_cache_read_tokens=10,
+                total_cache_write_tokens=5,
+                cost=Decimal("0.0123"),
+                record_count=0,
+                session_count=0,
+                model_count=0,
+                project_label="Project X",
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        r = data[0]
+        assert r["total_input_tokens"] == 100
+        assert r["total_output_tokens"] == 50
+        assert r["total_cached_tokens"] == 0
+        assert r["total_reasoning_tokens"] == 0
+        assert r["total_cache_read_tokens"] == 10
+        assert r["total_cache_write_tokens"] == 5
+        assert r["record_count"] == 0
+        assert r["session_count"] == 0
+        assert r["model_count"] == 0
+        assert r["project_label"] == "Project X"
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
