@@ -16,7 +16,8 @@ Or rely on the ``stack_url`` fixture which handles the lifecycle:
 
     pytest tests/test_smoke_local_stack.py -v
 
-The test skips itself if ``docker compose`` is not installed.
+The test skips itself if ``docker compose`` is not installed or the
+Docker daemon is unavailable.
 """
 
 from __future__ import annotations
