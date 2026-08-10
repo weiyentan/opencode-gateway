@@ -275,6 +275,50 @@ def _normalise_optional_text(value: str | None) -> str | None:
     return value
 
 
+def _validate_tokens(record: IngestRecord) -> tuple[int, int, int]:
+    """Validate the token fields on an ingest record.
+
+    Single source of truth for token validation, shared by the ``/ingest``
+    handler's pre-routing Step 1 check and by ``_process_one_record`` so the
+    two validation copies cannot drift — both call sites reject the record
+    when this helper raises, with the exact reason string it carries.
+
+    Checks performed, in order:
+    - ``input_tokens`` / ``output_tokens`` / ``cached_tokens`` must be
+      int-convertible; a ``ValueError`` / ``TypeError`` from ``int()`` is
+      re-raised as ``ValueError`` carrying the exact
+      ``Non-numeric token value: ...`` reason text.
+    - The three base token values must be non-negative.
+    - The enrichment tokens (``reasoning_tokens``, ``cache_read_tokens``,
+      ``cache_write_tokens``) must be non-negative when present.
+
+    Raises:
+        ValueError: with the exact rejection reason string (``Non-numeric
+            token value: ...`` or ``Negative token value``) that callers
+            surface verbatim on the per-record :class:`IngestRecordResult`.
+
+    Returns:
+        The validated ``(input_tokens, output_tokens, cached_tokens)`` as
+        ints.
+    """
+    try:
+        input_tokens = int(record.input_tokens)
+        output_tokens = int(record.output_tokens)
+        cached_tokens = int(record.cached_tokens)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Non-numeric token value: {exc}") from exc
+
+    if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
+        raise ValueError("Negative token value")
+
+    if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
+        or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
+        or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
+        raise ValueError("Negative token value")
+
+    return input_tokens, output_tokens, cached_tokens
+
+
 async def _apply_replay_merge(
     conn: asyncpg.Connection,
     record: IngestRecord,
@@ -620,31 +664,12 @@ async def _process_one_record(
 
     # ── 1. Validate token / cost fields ──────────────────────────────
     try:
-        input_tokens = int(record.input_tokens)
-        output_tokens = int(record.output_tokens)
-        cached_tokens = int(record.cached_tokens)
-    except (ValueError, TypeError) as exc:
+        input_tokens, output_tokens, cached_tokens = _validate_tokens(record)
+    except ValueError as exc:
         return IngestRecordResult(
             index=index,
             status="rejected",
-            reason=f"Non-numeric token value: {exc}",
-        )
-
-    if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
-        return IngestRecordResult(
-            index=index,
-            status="rejected",
-            reason="Negative token value",
-        )
-
-    # ── Negative validation for enrichment token fields ───────────────
-    if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
-        or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
-        or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
-        return IngestRecordResult(
-            index=index,
-            status="rejected",
-            reason="Negative token value",
+            reason=str(exc),
         )
 
     # ── v1.2 cached_tokens computation ────────────────────────────
@@ -1681,36 +1706,12 @@ async def ingest_usage(
 
             # Step 1: Basic validation
             try:
-                input_tokens = int(record.input_tokens)
-                output_tokens = int(record.output_tokens)
-                cached_tokens = int(record.cached_tokens)
-            except (ValueError, TypeError) as exc:
+                input_tokens, output_tokens, cached_tokens = _validate_tokens(record)
+            except ValueError as exc:
                 result = IngestRecordResult(
                     index=idx,
                     status="rejected",
-                    reason=f"Non-numeric token value: {exc}",
-                )
-                results.append(result)
-                rejected += 1
-                continue
-
-            if input_tokens < 0 or output_tokens < 0 or cached_tokens < 0:
-                result = IngestRecordResult(
-                    index=idx,
-                    status="rejected",
-                    reason="Negative token value",
-                )
-                results.append(result)
-                rejected += 1
-                continue
-
-            if (record.reasoning_tokens is not None and record.reasoning_tokens < 0) \
-                or (record.cache_read_tokens is not None and record.cache_read_tokens < 0) \
-                or (record.cache_write_tokens is not None and record.cache_write_tokens < 0):
-                result = IngestRecordResult(
-                    index=idx,
-                    status="rejected",
-                    reason="Negative token value",
+                    reason=str(exc),
                 )
                 results.append(result)
                 rejected += 1
