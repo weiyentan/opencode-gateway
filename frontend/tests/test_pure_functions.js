@@ -33,6 +33,54 @@ var appJsSandbox = null;
 // ++ calls and the = 0 assignment later clobbers the counter.
 var pendingAsyncBlocks = 0;
 
+// Element registry for the vm document stub (issue #7 filter-wiring tests).
+// app.js captures its element refs via getElementById at IIFE load time, so
+// fake filter-bar elements must be registered BEFORE loadRealAppJs runs —
+// after load, els.* already points at the captured (null) refs.  Ids that
+// are never registered still resolve to null, preserving the existing
+// no-DOM behavior of every other test.
+var elementRegistry = {};
+
+/** Minimal DOM-element fake backed by the registry: value/disabled state,
+ *  a classList (add/remove/toggle/contains), innerHTML storage, stored
+ *  event listeners, and a no-op querySelectorAll (table render path). */
+function makeFakeElement(id) {
+  var listeners = {};
+  return {
+    id: id,
+    value: '',
+    disabled: false,
+    innerHTML: '',
+    classList: {
+      _classes: {},
+      add: function (c) { this._classes[c] = true; },
+      remove: function (c) { delete this._classes[c]; },
+      toggle: function (c, force) {
+        var on = (force === undefined) ? !this._classes[c] : !!force;
+        if (on) { this._classes[c] = true; } else { delete this._classes[c]; }
+        return on;
+      },
+      contains: function (c) { return !!this._classes[c]; }
+    },
+    addEventListener: function (type, fn) { listeners[type] = fn; },
+    _handlers: listeners,
+    querySelectorAll: function () { return []; }
+  };
+}
+
+// Agent Runs filter-bar fakes (issue #7): the two date inputs, the Clear
+// button, and the table tbody (renderAgentRunsTable writes its empty-state
+// row there after the Clear re-fetch).  Initial state matches the real page:
+// both inputs empty, Clear disabled by default.
+var arFilterFromEl = makeFakeElement('ar-filter-from');
+var arFilterToEl = makeFakeElement('ar-filter-to');
+var arFilterClearEl = makeFakeElement('ar-filter-clear');
+var arTbodyEl = makeFakeElement('agent-runs-tbody');
+elementRegistry['ar-filter-from'] = arFilterFromEl;
+elementRegistry['ar-filter-to'] = arFilterToEl;
+elementRegistry['ar-filter-clear'] = arFilterClearEl;
+elementRegistry['agent-runs-tbody'] = arTbodyEl;
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -40,7 +88,7 @@ var pendingAsyncBlocks = 0;
   var documentStub = {
     readyState: 'loading',
     querySelector: function () { return null; },
-    getElementById: function () { return null; },
+    getElementById: function (id) { return elementRegistry[id] || null; },
     querySelectorAll: function () { return []; },
     addEventListener: function () {},
     createElement: function (tag) {
@@ -84,6 +132,11 @@ var pendingAsyncBlocks = 0;
   window.formatClockTime = sandboxWindow.formatClockTime;
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
+  window.readFiltersFromUI = sandboxWindow.readFiltersFromUI;
+  window.computeArDateFilterState = sandboxWindow.computeArDateFilterState;
+  window.syncArDateFilterUI = sandboxWindow.syncArDateFilterUI;
+  window.clearArDateFilters = sandboxWindow.clearArDateFilters;
+  window.setupAgentRunEventHandlers = sandboxWindow.setupAgentRunEventHandlers;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1494,6 +1547,151 @@ console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)')
     });
 })();
 
+// ── Agent Runs date filters — active state + Clear control (issue #7) ───
+// The state logic lives in the production app.js helpers
+// (computeArDateFilterState / syncArDateFilterUI / clearArDateFilters /
+// readFiltersFromUI) exposed through the vm-sandbox window bridge, and the
+// wiring is exercised through the production setupAgentRunEventHandlers()
+// against the fake filter-bar elements registered before app.js loaded.
+
+console.log('\u25B6 agent-runs date filters — active/disabled state (issue #7)');
+
+// Pure state helper: per-input active flags + Clear disabled state, driven
+// by the raw From/To input values ('' when empty).
+(function () {
+  var bothEmpty = window.computeArDateFilterState('', '');
+  assert(bothEmpty.clearDisabled === true && bothEmpty.fromActive === false && bothEmpty.toActive === false,
+    'empty From/To: Clear disabled, no active inputs');
+
+  var fromOnly = window.computeArDateFilterState('2026-07-01', '');
+  assert(fromOnly.fromActive === true && fromOnly.toActive === false && fromOnly.clearDisabled === false,
+    'From only: From active, To inactive, Clear enabled');
+
+  var toOnly = window.computeArDateFilterState('', '2026-07-31');
+  assert(toOnly.toActive === true && toOnly.fromActive === false && toOnly.clearDisabled === false,
+    'To only: To active, From inactive, Clear enabled');
+
+  var both = window.computeArDateFilterState('2026-07-01', '2026-07-31');
+  assert(both.fromActive === true && both.toActive === true && both.clearDisabled === false,
+    'both populated: both active, Clear enabled');
+
+  var nullish = window.computeArDateFilterState(null, undefined);
+  assert(nullish.clearDisabled === true && nullish.fromActive === false && nullish.toActive === false,
+    'null/undefined values treated as empty: Clear disabled, no active inputs');
+})();
+
+// Regression lock: readFiltersFromUI — partial ranges and the UTC-boundary
+// conversion (from_date + T00:00:00Z, to_date + T23:59:59Z) are unchanged.
+console.log('\u25B6 agent-runs date filters — readFiltersFromUI unchanged (issue #7)');
+
+(function () {
+  // From only → partial range, UTC midnight boundary
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '';
+  var f = window.readFiltersFromUI();
+  assert(f.from_date === '2026-07-01T00:00:00Z', 'From only: from_date uses the UTC midnight boundary (T00:00:00Z)');
+  assert(f.to_date === undefined, 'From only: no to_date — partial range preserved');
+
+  // To only → partial range, UTC end-of-day boundary
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '2026-07-31';
+  var t = window.readFiltersFromUI();
+  assert(t.to_date === '2026-07-31T23:59:59Z', 'To only: to_date uses the UTC end-of-day boundary (T23:59:59Z)');
+  assert(t.from_date === undefined, 'To only: no from_date — partial range preserved');
+
+  // Both → both boundaries applied
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '2026-07-31';
+  var b = window.readFiltersFromUI();
+  assert(b.from_date === '2026-07-01T00:00:00Z' && b.to_date === '2026-07-31T23:59:59Z',
+    'both set: UTC midnight + end-of-day boundaries applied');
+
+  // Both empty → no date filters at all (unfiltered request)
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '';
+  var e = window.readFiltersFromUI();
+  assert(e.from_date === undefined && e.to_date === undefined, 'both empty: no date filters (unfiltered)');
+})();
+
+// Wiring: the Clear control and the active/disabled state drive the real
+// production elements through setupAgentRunEventHandlers(), and clicking
+// Clear empties both date inputs and re-applies the existing filter path
+// (readFiltersFromUI -> applyFilters -> buildAgentRunsUrl -> apiFetch).
+console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)');
+
+(function () {
+  // Reset fakes to a pristine state, then wire like startAutoRefresh does.
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '';
+  arFilterClearEl.disabled = false;
+  arFilterFromEl.classList._classes = {};
+  arFilterToEl.classList._classes = {};
+  arTbodyEl.innerHTML = '';
+  window.setupAgentRunEventHandlers();
+
+  // Initial sync: both inputs empty → Clear disabled, no active classes
+  assert(arFilterClearEl.disabled === true, 'initial state: Clear disabled with both inputs empty');
+  assert(arFilterFromEl.classList.contains('active') === false &&
+         arFilterToEl.classList.contains('active') === false,
+    'initial state: no active styling on empty inputs');
+
+  // Populate From → active styling appears on From, Clear becomes enabled
+  arFilterFromEl.value = '2026-07-01';
+  arFilterFromEl._handlers.input();
+  assert(arFilterFromEl.classList.contains('active') === true, 'populated From: active styling applied');
+  assert(arFilterToEl.classList.contains('active') === false, 'empty To: no active styling');
+  assert(arFilterClearEl.disabled === false, 'populated From: Clear enabled');
+
+  // Populate To → both inputs active
+  arFilterToEl.value = '2026-07-31';
+  arFilterToEl._handlers.input();
+  assert(arFilterToEl.classList.contains('active') === true, 'populated To: active styling applied');
+  assert(arFilterFromEl.classList.contains('active') === true, 'From still populated: stays active');
+  assert(arFilterClearEl.disabled === false, 'both populated: Clear enabled');
+
+  // Empty To again → its active styling drops, Clear stays enabled (From set)
+  arFilterToEl.value = '';
+  arFilterToEl._handlers.input();
+  assert(arFilterToEl.classList.contains('active') === false, 'cleared To: active styling removed');
+  assert(arFilterFromEl.classList.contains('active') === true, 'From still populated: active styling kept');
+  assert(arFilterClearEl.disabled === false, 'From still populated: Clear enabled');
+
+  // Click Clear → both inputs emptied, active styling removed, Clear
+  // disabled, and the existing filter path re-applied with the unfiltered
+  // URL (no from_date/to_date params) — the agent-runs endpoint only.
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [] }); }
+    });
+  };
+
+  arFilterClearEl._handlers.click();
+  assert(arFilterFromEl.value === '' && arFilterToEl.value === '',
+    'Clear click: both date inputs emptied');
+  assert(arFilterFromEl.classList.contains('active') === false &&
+         arFilterToEl.classList.contains('active') === false,
+    'Clear click: active styling removed from both inputs');
+  assert(arFilterClearEl.disabled === true, 'Clear click: Clear disabled again');
+  assert(calls.length === 1, 'Clear click: exactly one agent-runs fetch triggered');
+  assert(calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'Clear click: fetches the agent-runs endpoint (existing filter path, no new mechanism)');
+  assert(calls[0].indexOf('from_date=') === -1 && calls[0].indexOf('to_date=') === -1,
+    'Clear click: unfiltered URL — no from_date/to_date params (restores the unfiltered list)');
+  assert(calls[0].indexOf('start_date=') === -1 && calls[0].indexOf('end_date=') === -1,
+    'Clear click: URL carries no Overview global date-range params (filters are independent)');
+
+  // The re-applied fetch renders the unfiltered (empty-state) table
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+      'Clear click: unfiltered render completed (empty-state row written to the table)');
+    pendingAsyncBlocks--;
+  }, 10);
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
@@ -1662,6 +1860,41 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(live.indexOf('.freshness-refreshing') !== -1, 'style.css: .freshness-refreshing state rule exists');
   assert(live.indexOf('.freshness-stale') !== -1, 'style.css: .freshness-stale state rule exists');
   assert(live.indexOf('.last-refreshed') !== -1, 'style.css: .last-refreshed header clock rule exists');
+})();
+
+// ── Agent Runs date-filter control: markup + styling (issue #7) ─────────
+// Static verification of the Clear button in the real index.html filter bar
+// and the active-state / Clear-control rules in the real style.css (the
+// repo's established substitute for browser-level checks).
+
+console.log('\u25B6 index.html + style.css — Clear control + active state (issue #7)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  // Clear button: always present inside the .agent-runs-filters bar, after
+  // the Apply button, and starts disabled (both date inputs are empty).
+  assert(html.indexOf('id="ar-filter-clear"') !== -1,
+    'index.html: #ar-filter-clear button exists in the filter bar');
+  assert(html.indexOf('class="filter-clear" id="ar-filter-clear"') !== -1,
+    'index.html: Clear button carries class="filter-clear"');
+  assert(/<button[^>]*id="ar-filter-clear"[^>]*disabled/.test(html),
+    'index.html: Clear button starts disabled (both date inputs empty)');
+  assert(html.indexOf('id="ar-filter-clear"') > html.indexOf('id="ar-filter-apply"'),
+    'index.html: Clear button sits after the Apply button in the filter bar');
+
+  // Active styling for populated date inputs — distinct rule, not just focus
+  assert(live.indexOf('.filter-input.active') !== -1,
+    'style.css: .filter-input.active rule exists (populated input active styling)');
+  assert(live.indexOf('.filter-input.active') > live.indexOf('.filter-input:focus'),
+    'style.css: .filter-input.active is a separate rule from :focus');
+
+  // Clear control styles: base rule + :disabled state
+  assert(live.indexOf('.filter-clear') !== -1, 'style.css: .filter-clear base rule exists');
+  assert(live.indexOf('.filter-clear:disabled') !== -1,
+    'style.css: .filter-clear:disabled rule exists (disabled state styling)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
