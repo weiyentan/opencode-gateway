@@ -418,6 +418,40 @@
     });
   }
 
+  /** Format an Agent Runs "Last Updated" timestamp as a year-inclusive
+   *  absolute local datetime, e.g. "Aug 11, 2026, 9:41 AM" (issue #4).
+   *  Missing/unparseable input → '--' (fmtDT/fmtRelative fallback style).
+   *  Pure — no DOM access.  Accepts an injected clock for deterministic
+   *  tests (precedent: createClientCache now-fn); when omitted it defaults
+   *  to the real clock so production callers can pass just the ISO string.
+   *  Future timestamps (backend clock skew) clamp to the injected now,
+   *  mirroring formatUpdatedAgo's future-clamp behavior.
+   *  @param {*} isoStr - ISO 8601 timestamp string
+   *  @param {*} [now]  - injected clock: Date, ms number, or now-fn
+   *  @returns {string} e.g. "Aug 11, 2026, 9:41 AM" | "--" */
+  function formatAgentRunTimestamp(isoStr, now) {
+    if (!isoStr) return '--';
+    let d = new Date(isoStr);
+    if (isNaN(d.getTime())) return '--';
+    // Duck-type the injected clock (cross-realm Dates from the Node test
+    // harness fail instanceof, so check getTime — same trick as kpiSubtitle).
+    let nowMs;
+    if (typeof now === 'function') {
+      nowMs = now();
+    } else if (now != null && typeof now.getTime === 'function') {
+      nowMs = now.getTime();
+    } else if (typeof now === 'number') {
+      nowMs = now;
+    } else {
+      nowMs = Date.now();
+    }
+    if (d.getTime() > nowMs) d = new Date(nowMs);
+    return d.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit'
+    });
+  }
+
   /** Derive LLM provider from model name */
   function deriveProvider(modelName) {
     const m = (modelName || '').toLowerCase();
@@ -1832,6 +1866,7 @@
   window.resolvePanelStatuses = resolvePanelStatuses;
   window.formatClockTime = formatClockTime;
   window.kpiSubtitle = kpiSubtitle;
+  window.formatAgentRunTimestamp = formatAgentRunTimestamp;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

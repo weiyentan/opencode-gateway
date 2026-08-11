@@ -84,6 +84,7 @@ var pendingAsyncBlocks = 0;
   window.formatClockTime = sandboxWindow.formatClockTime;
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
+  window.formatAgentRunTimestamp = sandboxWindow.formatAgentRunTimestamp;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1450,6 +1451,52 @@ console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
     'kpi-collectors: subtitle never carries the date-range label');
   assert(window.kpiSubtitle('kpi-source-dbs', rangeLabel, t).indexOf(rangeLabel) === -1,
     'kpi-source-dbs: subtitle never carries the date-range label');
+})();
+
+// ── Agent Runs "Last Updated" timestamp (issue #4) ──────────────────────
+// Year-inclusive absolute local datetime for the Agent Runs table, e.g.
+// "Aug 11, 2026, 9:41 AM".  Pure — no wall-clock reads: the injected
+// clock (now) makes the output fully deterministic, so these tests never
+// depend on Date.now()/new Date() (precedent: createClientCache now-fn,
+// computeDateRange now param).  Exercised through the vm-sandbox export
+// of the production helper.
+
+console.log('\u25B6 formatAgentRunTimestamp (issue #4)');
+
+(function () {
+  // Deterministic injected clock: Aug 11, 2026, 23:59:59 local (end of the
+  // day — every valid same-day timestamp below is in the past, so the
+  // future-clamp only affects the dedicated skew test case)
+  var refNow = new Date(2026, 7, 11, 23, 59, 59);
+
+  // Valid ISO timestamp → year-inclusive absolute local datetime
+  assert(window.formatAgentRunTimestamp('2026-08-11T09:41:00', refNow) === 'Aug 11, 2026, 9:41 AM',
+    'valid ISO timestamp \u2192 "Aug 11, 2026, 9:41 AM" (year-inclusive absolute local datetime)');
+  assert(window.formatAgentRunTimestamp('2026-08-11T19:05:30', refNow) === 'Aug 11, 2026, 7:05 PM',
+    'evening timestamp \u2192 "Aug 11, 2026, 7:05 PM" (12-hour with AM/PM, no leading-zero hour)');
+
+  // Missing/unparseable input → "--" fallback (fmtDT/fmtRelative style)
+  assert(window.formatAgentRunTimestamp(null, refNow) === '--', 'null \u2192 --');
+  assert(window.formatAgentRunTimestamp(undefined, refNow) === '--', 'undefined \u2192 --');
+  assert(window.formatAgentRunTimestamp('', refNow) === '--', 'empty string \u2192 --');
+  assert(window.formatAgentRunTimestamp('not-a-date', refNow) === '--', 'unparseable string \u2192 --');
+
+  // Injected-clock determinism: fixed ISO + fixed injected clock → identical
+  // output, regardless of the wall clock (no Date.now() in tests)
+  var a = window.formatAgentRunTimestamp('2026-08-11T09:41:00', refNow);
+  var b = window.formatAgentRunTimestamp('2026-08-11T09:41:00', new Date(refNow.getTime()));
+  assert(a === b, 'deterministic: same ISO + same injected clock \u2192 same output');
+
+  // The clock may be injected as a now-fn too (createClientCache precedent)
+  var t = refNow.getTime();
+  assert(window.formatAgentRunTimestamp('2026-08-11T09:41:00', function () { return t; }) === 'Aug 11, 2026, 9:41 AM',
+    'now may be injected as a function (createClientCache-style now-fn)');
+
+  // Future timestamps (backend clock skew) clamp to the injected now —
+  // the table never shows a "Last Updated" time that hasn't happened yet
+  // (mirrors formatUpdatedAgo's future-clamp behavior)
+  assert(window.formatAgentRunTimestamp('2030-01-01T00:00:00', refNow) === 'Aug 11, 2026, 11:59 PM',
+    'future timestamp (clock skew) clamps to the injected now');
 })();
 
 // N2 — per-card KPI staleness: each KPI card resolves independently, so a
