@@ -136,3 +136,105 @@ session totals whenever a corrected replay follows an accepted first delivery.
 expensive on the hot ingest path; the delta adjustment covers the common
 single-event correction, and full rebuilds are reserved for the historical
 reconciliation endpoint (`POST /admin/reconcile-historical-duplicates`).
+
+## Backfill Execution Log (2026-08-11)
+
+Operational log for issue #409 ("Overview dashboard shows zero usage because
+`usage_events` is empty after the read-model switch"). The one-time backfill
+(`scripts/backfill_usage_events.py`, added in PR #396, commit `72a3f43`) was
+never run against the intended database after the read-model cutover
+(migration 0021), leaving `usage_events` empty while the legacy raw table
+`opencode_usage_records` holds **27,669 August-2026 rows** for source database
+`ddff3824-19d6-481b-8214-c02792da9642`. This is a data migration gap, not a
+code bug — remediation is an operational run only, with no API, ingest, or
+frontend changes.
+
+### Status: NOT EXECUTED — target database unreachable from the execution environment
+
+The live backfill was **NOT executed** in this environment. No verified
+target database was reachable: no `GATEWAY_DATABASE_*` / `DATABASE_*`
+environment variables are set, no Docker daemon is available, and no local
+PostgreSQL is present. Per the issue's acceptance criteria, no results are
+fabricated and no rows were promoted. The production backfill remains
+**pending and requires the owner to run it** in the target-DB environment
+(**escalation path: `ask_user`** — production database access required).
+
+#### Pre-flight evidence gathered (2026-08-11)
+
+- `scripts/backfill_usage_events.py` verified present, **413 lines** (commit
+  `72a3f43`, PR #396), unmodified. Verified by inspection: `--dry-run` and
+  `--limit N` flags; the `MISMATCH_COUNT_SQL` gate (`COUNT(*) ... WHERE
+  session_id IS NOT NULL AND ue.id IS NULL`); the per-row idempotency guard
+  (`CANONICAL_EVENT_EXISTS_SQL` on `(canonical_source_identity_id,
+  source_record_id)`); and the quarantined-identity skip (`is_quarantined`).
+- Migration `alembic/versions/0021_add_canonical_event_schema.py` only
+  `create_table`s `usage_events` — no data inserts in the migration, so the
+  table starts empty after cutover (`SELECT COUNT(*) FROM usage_events`
+  expected **0**).
+- Environment variables: `env | grep -iE 'GATEWAY|DATABASE'` returned
+  **nothing** — no `GATEWAY_DATABASE_HOST/PORT/NAME/USER/PASSWORD` set
+  (`.env.example` lines 25–33 name the expected variables; `docker-compose.yaml`
+  wires `GATEWAY_DATABASE_*` to the bundled `postgres` service on port 5432).
+- No Docker daemon (`docker: command not found`); no local PostgreSQL
+  (`pg_isready`/`psql`/`postgres` binaries absent; no listener on ports
+  5432/5433; no `/var/run/postgresql`).
+- One dry-run attempt was made: `GATEWAY_ENV=development python3
+  scripts/backfill_usage_events.py --dry-run`. Settings validated and resolved
+  to `localhost:5432/opencode_gateway` (user `opencode`); the connection
+  attempt hung and was killed at the timeout — confirming no reachable target
+  database. Not retried (stop condition: repeated connection failures without
+  new signal).
+
+#### Results to be recorded by the owner (NOT measured here)
+
+The following counters could not be measured without a reachable database and
+are **not fabricated**:
+
+| Measurement | Value |
+|---|---|
+| Pre-backfill `usage_events` count | **not measured** (expected 0 per migration 0021) |
+| Legacy `opencode_usage_records` total | **not measured** (issue states 27,669 August-2026 rows) |
+| NULL `session_id` legacy count | **not measured** |
+| Dry-run planned count | **not measured** |
+| Live promoted count | **not measured** |
+| Re-run result (idempotency) | **not measured** |
+| Final `MISMATCH_COUNT_SQL` | **not measured** (target: 0) |
+| Aggregate API verification | **not measured** |
+
+Out-of-scope decision (pre-decided by the script, to be confirmed by the
+owner's pre-flight count): legacy rows with NULL `session_id` are permanently
+excluded by design — `LEGACY_RECORDS_QUERY` filters `WHERE
+our.session_id IS NOT NULL` — and are out of scope for this backfill.
+Quarantined-identity residuals are expected by design (`is_quarantined`
+skip); a non-zero residual after the live run is expected and is not a
+failure — it must be documented with its count.
+
+#### Commands for the owner to complete the run (target-DB environment)
+
+Set `GATEWAY_DATABASE_HOST/PORT/NAME/USER/PASSWORD` to the intended database,
+plus `GATEWAY_ENV=development` (or `GATEWAY_API_KEY` in production), then:
+
+```bash
+# 1. Pre-flight read-only SQL (record all three counts, plus the NULL-session_id count)
+psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM usage_events;"
+psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM opencode_usage_records;"
+psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM opencode_usage_records WHERE session_id IS NULL;"
+
+# 2. Dry-run — planned count must match the promotable (session_id IS NOT NULL) legacy count
+python scripts/backfill_usage_events.py --dry-run
+
+# 3. Live run — script's MISMATCH_COUNT_SQL verification must report 0
+python scripts/backfill_usage_events.py
+
+# 4. Idempotency re-run — expect "No backfill needed", exit 0
+python scripts/backfill_usage_events.py
+
+# 5. Aggregate API verification — expect non-zero August-2026 totals
+curl -s -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  "http://localhost:8000/api/v1/usage/aggregates?start_date=2026-08-01T00:00:00Z&end_date=2026-08-12T00:00:00Z"
+```
+
+Record the measured values in the table above, the final mismatch count
+(expected 0, plus any quarantined-identity residual), and the verification
+result, and re-run step 5's check of the Overview dashboard (August-2026 KPI
+cards, Model Mix, Recent Records).
