@@ -33,6 +33,12 @@ var appJsSandbox = null;
 // ++ calls and the = 0 assignment later clobbers the counter.
 var pendingAsyncBlocks = 0;
 
+// Completion handshake between the issue #7 Clear-wiring block and the
+// issue #5 render block (Nit 2): both share the arTbodyEl fake, so the
+// issue #5 block waits on this flag instead of a fixed wall-clock delay
+// — deterministic under timer drift.
+var arClearWiringCompleted = false;
+
 // Element registry for the vm document stub (issue #7 filter-wiring tests).
 // app.js captures its element refs via getElementById at IIFE load time, so
 // fake filter-bar elements must be registered BEFORE loadRealAppJs runs —
@@ -1223,11 +1229,17 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
     assert(window.ensureClientName('c2') === 'c2',
       'background refresh: id without a name falls back to the id');
 
-    // Stale-while-failure: a failing background refresh keeps last-known names
+    // Stale-while-failure: a failing background refresh keeps last-known names.
+    // The 500 is intentional here: this block exercises the production
+    // stale-while-failure catch (app.js refreshClientCache), which emits an
+    // EXPECTED console.error.  Suppress that error for this block only and
+    // restore the real console.error once the assertions have run (Nit 3).
     appJsSandbox.fetch = function (url) {
       calls.push(url);
       return Promise.resolve({ ok: false, status: 500 });
     };
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
     window.ensureClientName('unknown-2'); // miss → background refresh → fetch fails
     pendingAsyncBlocks++;
     setTimeout(function () {
@@ -1235,6 +1247,12 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
         'stale-while-failure: labels survive a failed background refresh');
       assert(calls.length === 2,
         'one fetch per miss: hits never fetch, a failed refresh never clears the map');
+      appJsSandbox.console.error = savedConsoleError; // restore the real console.error
+      // Restore a benign default fetch stub so any subsequent background
+      // refresh in later blocks never hits the intentional 500 stub (Nit 3).
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
       pendingAsyncBlocks--;
     }, 10);
     pendingAsyncBlocks--;
@@ -1735,6 +1753,7 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
   setTimeout(function () {
     assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
       'Clear click: unfiltered render completed (empty-state row written to the table)');
+    arClearWiringCompleted = true; // handshake: the issue #5 render block may proceed (Nit 2)
     pendingAsyncBlocks--;
   }, 10);
 })();
@@ -1743,14 +1762,14 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
 // Structural row-markup coverage for the Last Updated cell: the production
 // row template (renderAgentRunsTable) renders the year-inclusive absolute
 // local timestamp (issue #4 formatter) as the primary value with the
-// relative label as muted secondary text, and a bare '--' when the
-// timestamp is missing.  Driven through the real render path
-// (clearArDateFilters -> applyFilters -> apiFetch -> renderAgentRunsTable)
-// with a stubbed fetch, so the assertions run against the actual app.js
-// row markup.  The expected absolute string is derived FROM the
-// window.formatAgentRunTimestamp seam itself (not hard-coded), proving the
-// cell output comes from the production formatter — no copy-pasted
-// duplicate.
+// relative label as muted secondary text after a middot separator ('·'),
+// and a bare '--' when the timestamp is missing.  Driven through the real
+// render path (clearArDateFilters -> applyFilters -> apiFetch ->
+// renderAgentRunsTable) with a stubbed fetch, so the assertions run
+// against the actual app.js row markup.  The expected absolute string is
+// derived FROM the window.formatAgentRunTimestamp seam itself (not
+// hard-coded), proving the cell output comes from the production
+// formatter — no copy-pasted duplicate.
 
 console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted relative secondary (issue #5)');
 
@@ -1798,16 +1817,35 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
   ];
 
   // The render flow is deferred past the issue #7 Clear-wiring block's
-  // async assertions (both blocks share the arTbodyEl fake): issue #7
-  // asserts at ~10ms, so this block's fetch-driven render starts at ~20ms
-  // and never clobbers the earlier block's expected empty-state markup.
+  // async assertions (both blocks share the arTbodyEl fake): instead of a
+  // fixed wall-clock delay, this block polls the arClearWiringCompleted
+  // flag that the issue #7 block sets after its assertions, so ordering is
+  // deterministic under timer drift and never clobbers the earlier block's
+  // expected empty-state markup (Nit 2).
+  // The block's single pendingAsyncBlocks++ is balanced only in the
+  // innermost callback, so the summary poll can never observe
+  // pendingAsyncBlocks === 0 while any nested callback is still pending.
   pendingAsyncBlocks++;
-  setTimeout(function () {
+  var clearWaitAttempts = 0;
+  (function proceedWhenClearWiringDone() {
+    if (!arClearWiringCompleted) {
+      clearWaitAttempts++;
+      if (clearWaitAttempts > 200) {
+        throw new Error('issue #5 block: arClearWiringCompleted never set ' +
+          '(issue #7 Clear-wiring block did not complete within 1s)');
+      }
+      setTimeout(proceedWhenClearWiringDone, 5);
+      return;
+    }
     // Reset the fakes and wire the Clear handler like the app bootstrap does.
     arFilterFromEl.value = '';
     arFilterToEl.value = '';
     arFilterClearEl.disabled = false;
     arTbodyEl.innerHTML = '';
+    // Stub the vm-context clock so the production render path
+    // (formatAgentRunTimestamp without an injected now, and fmtRelative)
+    // is deterministic — no wall-clock dependency (Finding 1).
+    vm.runInContext('Date.now = function () { return ' + refNow.getTime() + '; }', appJsSandbox);
     window.setupAgentRunEventHandlers();
 
     // Render the two fixture rows through the real filter path.
@@ -1821,15 +1859,17 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
       assert(html.indexOf('data-id="run-abs-1"') !== -1 && html.indexOf('data-id="run-missing-2"') !== -1,
         'render: both fixture rows written to the tbody');
 
-      // Timestamp row: absolute primary + muted relative secondary in the SAME
-      // Last Updated cell, and nothing else.
+      // Timestamp row: absolute primary + middot + muted relative secondary
+      // in the SAME Last Updated cell, and nothing else.  With Date.now
+      // stubbed to refNow, the fixture (30 days + 1.5h in the past) renders
+      // the deterministic label "30d ago" — asserted exactly (Finding 1).
       var rowAbs = html.slice(html.indexOf('data-id="run-abs-1"'),
         html.indexOf('</tr>', html.indexOf('data-id="run-abs-1"')) + 5);
       var cellAbs = rowAbs.slice(rowAbs.indexOf('<td data-label="Last Updated">'),
         rowAbs.indexOf('</td>', rowAbs.indexOf('<td data-label="Last Updated">')) + 5);
       assert(new RegExp('^<td data-label="Last Updated">' + expectedAbs +
-        ' <span class="ar-rel-time">\\d+d ago<\\/span><\\/td>$').test(cellAbs),
-        'row markup: absolute timestamp primary + relative label ("Nd ago") as muted secondary span in one cell');
+        ' · <span class="ar-rel-time">30d ago<\\/span><\\/td>$').test(cellAbs),
+        'row markup: absolute timestamp primary + deterministic relative label ("30d ago") as muted secondary span in one cell');
       assert(cellAbs.indexOf('--') === -1,
         'row markup: no -- fallback when the timestamp is present');
 
@@ -1847,19 +1887,15 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
         return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
       };
       arFilterClearEl._handlers.click();
-      pendingAsyncBlocks++;
       setTimeout(function () {
         assert(arTbodyEl.innerHTML.indexOf('colspan="11"') !== -1,
           'empty state: colspan="11" preserved');
         assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
           'empty state: "No agent runs" message intact');
-        pendingAsyncBlocks--;
+        pendingAsyncBlocks--; // balances the block's single increment (above)
       }, 10);
-
-      pendingAsyncBlocks--;
     }, 10);
-    pendingAsyncBlocks--;
-  }, 20);
+  })();
 })();
 
 // ── Static markup smoke check (frontend/index.html) ─────────────────────

@@ -426,7 +426,9 @@
    *  tests (precedent: createClientCache now-fn); when omitted it defaults
    *  to the real clock so production callers can pass just the ISO string.
    *  Future timestamps (backend clock skew) clamp to the injected now,
-   *  mirroring formatUpdatedAgo's future-clamp behavior.
+   *  mirroring formatUpdatedAgo's future-clamp behavior.  A non-finite
+   *  injected clock (invalid Date, now-fn returning a string/NaN) falls
+   *  back to Date.now() so the clamp can never render "Invalid Date".
    *  @param {*} isoStr - ISO 8601 timestamp string
    *  @param {*} [now]  - injected clock: Date, ms number, or now-fn
    *  @returns {string} e.g. "Aug 11, 2026, 9:41 AM" | "--" */
@@ -446,6 +448,12 @@
     } else {
       nowMs = Date.now();
     }
+    // Guard the injected clock: coerce it to a finite epoch-ms number so a
+    // non-finite result (invalid Date whose getTime() is NaN, or a now-fn
+    // returning a string) falls back to the real clock instead of silently
+    // skipping the future-clamp or rendering "Invalid Date".
+    nowMs = Number(nowMs);
+    if (!isFinite(nowMs)) nowMs = Date.now();
     if (d.getTime() > nowMs) d = new Date(nowMs);
     return d.toLocaleString('en-US', {
       month: 'short', day: 'numeric', year: 'numeric',
@@ -1220,12 +1228,13 @@
       var displayTitle = r.session_title || r.title || '(untitled)';
       // Last Updated cell (issue #5): year-inclusive absolute local
       // timestamp (issue #4 formatter) as the primary value, with the
-      // relative label as muted secondary text.  Missing/unparseable
+      // relative label as muted secondary text after a middot separator
+      // ('·') so the two values read as distinct.  Missing/unparseable
       // timestamps render a bare '--' (no secondary).
       var lastUpdatedAbs = formatAgentRunTimestamp(r.last_updated_at);
       var lastUpdatedCell = lastUpdatedAbs === '--'
         ? '--'
-        : lastUpdatedAbs + ' <span class="ar-rel-time">' + fmtRelative(r.last_updated_at) + '</span>';
+        : lastUpdatedAbs + ' · <span class="ar-rel-time">' + fmtRelative(r.last_updated_at) + '</span>';
 
       html += '<tr class="ar-row" data-id="' + r.id + '" tabindex="0">' +
         '<td class="clickable ar-title" data-label="Title">' + escHtml(displayTitle) + '</td>' +
@@ -1754,6 +1763,13 @@
     applyFilters();
   }
 
+  /** Wire the Agent Runs filter-bar/detail DOM events against the captured
+   *  element refs: Apply, Clear (issue #7), live input styling, and the
+   *  detail overlay close handlers.  Exported on the window test seam —
+   *  broader than the pure-function exports — so the Node test harness can
+   *  drive it against fake elements; readFiltersFromUI, clearArDateFilters,
+   *  computeArDateFilterState, and syncArDateFilterUI are exported alongside
+   *  it for the same reason. */
   function setupAgentRunEventHandlers() {
     // Apply button
     if (els.arFilterApply) {

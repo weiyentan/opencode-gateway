@@ -89,6 +89,7 @@
   --text-muted:   #808aa8;
   --accent-indigo: #7c8cff;
   --accent-cyan:   #5ef2ff;
+  --accent-cyan-soft: rgba(94, 242, 255, 0.10); /* 10% cyan tint for active-input fills */
   --accent-pink:   #ff75b5;
   --accent-gold:   #ffd86f;
   --status-healthy: #4ade80;
@@ -1003,7 +1004,7 @@ tbody tr:hover td {
    even while unfocused; toggled on value changes by syncArDateFilterUI(). */
 .filter-input.active {
   border-color: var(--accent-cyan);
-  background: rgba(94, 242, 255, 0.10);
+  background: var(--accent-cyan-soft); /* 10% cyan tint (--accent-cyan-soft) */
 }
 
 .filter-input::placeholder {
