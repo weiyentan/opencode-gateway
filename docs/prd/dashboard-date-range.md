@@ -6,7 +6,7 @@ The Sessions panel hardcodes "last 7 days" in its subtitle, and the Client/Proje
 
 ## Solution
 
-Replace the hardcoded date windows with a date-range bar above the KPI row. The bar has a preset dropdown and optional custom date inputs. All panels on the Overview tab (KPIs, Model Mix, Sessions, Agents & LLMs, Client/Project Breakdown) respect the same selected range.
+Replace the hardcoded date windows with a date-range bar above the KPI row. The bar has a preset dropdown and optional custom date inputs. The date-range bar and KPI row are shared chrome above the tab panels — they render on every tab, not just Overview — so the aggregate totals (Active Tokens, Est. Cost, Sessions) are visible on the Agent Runs tab with the same selected range applied (issue #411). All panels on the Overview tab (KPIs, Model Mix, Agents & LLMs, Client/Project Breakdown) respect the same selected range.
 
 The range defaults to **current calendar month-to-date** on first load, so it immediately aligns with the user's billing period. Presets let the user switch to last month, the last 30 days, or a fully custom range.
 
@@ -73,3 +73,7 @@ The existing `GET /api/v1/usage/aggregates` endpoint accepts `start_date` and `e
 ## Further Notes
 
 The date-range bar renders the selected range label in the KPI subtitles, replacing the current "input X / output Y" breakdown. The input/output breakdown is still visible on hover or in the detail views. This ensures the period is always visible without cluttering the KPI card.
+
+### Implementation Note (issue #411)
+
+The date-range bar and KPI row are implemented as shared chrome **above** the tab panels (`#tab-overview` and `#tab-agent-runs`), not scoped inside the Overview tab. The aggregate totals (Active Tokens, Est. Cost, Sessions — read from the aggregates total row by `renderKPIs`) therefore render on every tab, including the Agent Runs tab, with the dashboard date range applied. The Agent Runs tab additionally uses a full-viewport layout: when active it becomes a flex column sized from the viewport, the panel stretches to fill it, and its `.table-scroll` owns the vertical scroll region so a long run list scrolls inside the panel rather than the page. The three responsive viewport bands (full table, condensed, stacked cards) are unchanged.
