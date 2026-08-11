@@ -3450,7 +3450,12 @@ class TestProjectDirectoryReplace:
 
     @pytest.mark.asyncio
     async def test_blank_directories_filtered(self, monkeypatch):
-        """Blank and whitespace-only directory paths never reach INSERT."""
+        """Blank and whitespace-only directory paths never reach INSERT.
+
+        Issue #413: filtered entries are reported in
+        ``projection_rejected_count`` so the response shows how many
+        projection items were dropped.
+        """
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock()
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -3479,7 +3484,8 @@ class TestProjectDirectoryReplace:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["projection_accepted_count"] == 1
-        assert data["projection_rejected_count"] == 0
+        # 2 whitespace-only entries filtered per item and reported
+        assert data["projection_rejected_count"] == 2
 
         insert_calls = [
             call for call in mock_conn.execute.call_args_list
@@ -3489,8 +3495,14 @@ class TestProjectDirectoryReplace:
         assert insert_calls[0].args[4] == "/tmp/a"
 
     @pytest.mark.asyncio
-    async def test_empty_directory_rejected_at_validation(self, monkeypatch):
-        """An empty directory string fails schema validation with 422."""
+    async def test_empty_directory_filtered_per_item(self, monkeypatch):
+        """An empty directory string is filtered per item, not rejected at batch level.
+
+        Issue #413: ``directory=""`` previously failed ``min_length=1`` schema
+        validation and rejected the entire /ingest batch with 422.  Empty
+        strings now pass validation and are dropped per projection item,
+        matching the whitespace-only filtering behaviour.
+        """
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock()
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -3514,8 +3526,95 @@ class TestProjectDirectoryReplace:
                 headers={"Authorization": "Bearer collector-token"},
             )
 
-        # Pydantic min_length=1 rejects empty directory at validation → 422
-        assert response.status_code == 422
+        # Empty directory is filtered per item — the batch still succeeds
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_valid_record_with_blank_directory_ingests(self, monkeypatch):
+        """A valid usage record ingests even when a directory entry is blank.
+
+        Issue #413 regression: an empty directory entry must not 422 the batch
+        or block the valid usage record — the record is written to both
+        ``usage_events`` and ``opencode_usage_records``, the valid directory
+        entry is stored, and the blank entry is reported as rejected.
+        """
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            *_new_record_side_effect(record_count=1),
+        ]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[
+                {
+                    "source_record_id": "rec-001",
+                    "session_id": str(_SESSION_ID),
+                    "model": "gpt-4",
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cached_tokens": 0,
+                    "estimated_cost_usd": "0.0035",
+                    "reported_at": _mk_ts().isoformat(),
+                },
+            ],
+            project_directories=[
+                _mk_directory_payload(directory="/tmp/a"),
+                _mk_directory_payload(directory=""),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        # Batch succeeds — no whole-batch 422
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert data["results"][0]["status"] == "accepted"
+        # Valid directory stored, blank entry reported as rejected
+        assert data["projection_accepted_count"] == 1
+        assert data["projection_rejected_count"] == 1
+
+        # Valid usage record written to both tables
+        usage_events_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(usage_events_inserts) == 1
+        # The legacy opencode_usage_records write is the atomic dedup INSERT,
+        # issued via fetchrow (winner path)
+        usage_records_inserts = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO opencode_usage_records" in str(call)
+        ]
+        assert len(usage_records_inserts) == 1
+
+        # Only the valid directory is stored
+        directory_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(directory_inserts) == 1
+        assert directory_inserts[0].args[4] == "/tmp/a"
 
 
 class TestSessionTodoReplace:

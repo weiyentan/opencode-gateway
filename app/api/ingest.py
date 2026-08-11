@@ -124,18 +124,16 @@ class ProjectPayload(BaseModel):
 class ProjectDirectoryPayload(BaseModel):
     """A project directory projection from an OpenCode collector.
 
-    **Validation vs filtering asymmetry**: ``directory=""`` (empty string)
-    fails Pydantic ``min_length=1`` validation → HTTP 422, which rejects
-    the *entire* /ingest batch (all records lost to DLQ). In contrast,
-    ``directory="  "`` (whitespace-only) passes Pydantic validation and is
-    silently filtered at processing time in ``_process_project_directories``
-    without affecting other records in the batch.  Both satisfy the
-    ``#376`` contract AC1 ("rejected or filtered"), but the blast radius
-    differs: empty strings kill the whole batch; whitespace-only paths
-    are dropped per-row.
+    **Blank-path filtering (issue #413)**: ``directory`` is required but is
+    not constrained to a minimum length.  Empty (``""``) and whitespace-only
+    (``"  "``) paths pass validation and are filtered per projection item at
+    processing time in ``_process_project_directories`` — a blank entry can
+    never reject the *entire* /ingest batch.  Filtered items are reported in
+    ``IngestResponse.projection_rejected_count`` so the response shows how
+    many projection items were dropped.
     """
 
-    directory: str = Field(min_length=1, description="Directory path")
+    directory: str = Field(description="Directory path")
     directory_type: str | None = Field(default=None, description="Directory type")
     strategy: str | None = Field(default=None, description="Directory strategy")
     source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
@@ -1077,7 +1075,7 @@ async def _process_project_directories(
     client_id: uuid.UUID,
     source_db_id: uuid.UUID,
     now: datetime,
-) -> int:
+) -> tuple[int, int]:
     """Replace project directory rows for a source database and client.
 
     **Replace semantics**: deletes all existing directory rows scoped
@@ -1090,13 +1088,26 @@ async def _process_project_directories(
     paths (after trimming) within the batch are collapsed to a single
     entry stored with the canonical stripped form.  Replaying a snapshot
     therefore cannot produce duplicate or empty rows.
+
+    Returns ``(inserted_count, filtered_count)``: the number of rows
+    actually inserted, and the number of blank/empty/whitespace-only
+    items dropped by filtering.  Filtered items are logged per item with
+    their batch index and the offending field name — never the raw
+    path value (issue #413).
     """
     # ── Normalise batch: trim, drop blank paths, collapse duplicates ──
     seen: set[str] = set()
     batch: list[ProjectDirectoryPayload] = []
-    for entry in directories:
+    filtered = 0
+    for index, entry in enumerate(directories):
         path = entry.directory.strip()
         if not path:
+            logger.warning(
+                "Projection directory filtered: projection=project_directories "
+                "index=%d field='directory' value is empty or whitespace-only",
+                index,
+            )
+            filtered += 1
             continue
         if path in seen:
             continue
@@ -1152,7 +1163,7 @@ async def _process_project_directories(
         )
         count += 1
 
-    return count
+    return count, filtered
 
 
 async def _process_session_todos(
@@ -1982,12 +1993,17 @@ async def ingest_usage(
 
     # ── Project directories (replace per batch) ───────────────────────
     try:
-        inserted = await _process_project_directories(
+        inserted, filtered = await _process_project_directories(
             conn, body.project_directories, client_id, source_db_id, now,
         )
         projection_accepted += inserted
+        projection_rejected += filtered
     except Exception as exc:
-        logger.warning("Projection directories rejected: error=%s", exc)
+        logger.warning(
+            "Projection directories rejected: projection=project_directories "
+            "field='directory' error=%s",
+            exc,
+        )
         projection_rejected += len(body.project_directories)
 
     # ── Session todos (replace per session) ───────────────────────────
