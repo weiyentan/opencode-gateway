@@ -1766,10 +1766,12 @@
     if (els.arFilterClear) els.arFilterClear.disabled = state.clearDisabled;
   }
 
-  /** Clear both date inputs and re-apply the existing filter path, restoring
-   *  the unfiltered agent-runs list (issue #7).  Reuses applyFilters() —
-   *  readFiltersFromUI() reads the emptied inputs, so the re-fetch carries
-   *  no date params; no new fetch mechanism. */
+  /** Clear both date inputs and re-apply the existing filter path (issue #7):
+   *  with the From/To inputs emptied they are no longer explicit filters, so
+   *  buildAgentRunsUrl() falls back to the shared dashboard date range via
+   *  resolveDateRange(dateRangeState) — per boundary, an unset input inherits
+   *  the dashboard range on that side (issue #412).  Reuses applyFilters() →
+   *  readFiltersFromUI() → buildAgentRunsUrl(); no new fetch mechanism. */
   function clearArDateFilters() {
     if (els.arFilterFrom) els.arFilterFrom.value = '';
     if (els.arFilterTo) els.arFilterTo.value = '';
@@ -1791,8 +1793,10 @@
     }
 
     // Clear button (issue #7): empties both date inputs and re-applies the
-    // existing filter path (readFiltersFromUI -> applyFilters), restoring
-    // the unfiltered agent-runs list.
+    // existing filter path (readFiltersFromUI -> applyFilters ->
+    // buildAgentRunsUrl).  With the date inputs cleared the list inherits the
+    // shared dashboard date range — per-boundary fallback via
+    // resolveDateRange(dateRangeState), issue #412 — not an unfiltered view.
     if (els.arFilterClear) {
       els.arFilterClear.addEventListener('click', clearArDateFilters);
     }
