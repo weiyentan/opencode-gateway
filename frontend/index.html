@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="refresh-interval" content="30000">
   <title>Aurora Glass &mdash; OpenCode Gateway</title>
-  <link rel="stylesheet" href="/style.css?v=20260727-cache-control">
+  <link rel="stylesheet" href="/style.css?v=20260811-cache-control">
 </head>
 <body>
 
@@ -247,6 +247,10 @@
           </select>
         </div>
         <button class="filter-apply" id="ar-filter-apply">Apply</button>
+        <!-- Clear (issue #7): always visible; disabled while both date inputs
+             are empty; empties both inputs and re-applies the filter.  The
+             disabled/active state is kept in sync by syncArDateFilterUI(). -->
+        <button class="filter-clear" id="ar-filter-clear" disabled>Clear</button>
       </div>
       <div class="table-scroll">
         <table id="agent-runs-table">
@@ -323,6 +327,6 @@
     <span>Auto-refresh every <strong id="footer-interval">30</strong>s</span>
   </footer>
 
-  <script src="/app.js?v=20260727-cache-control"></script>
+  <script src="/app.js?v=20260811-cache-control"></script>
 </body>
 </html>

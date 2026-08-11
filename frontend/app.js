@@ -63,6 +63,7 @@
     arFilterAgent:  $('ar-filter-agent'),
     arFilterStatus: $('ar-filter-status'),
     arFilterApply:  $('ar-filter-apply'),
+    arFilterClear:  $('ar-filter-clear'),
     arDetailOverlay: $('ar-detail-overlay'),
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
@@ -415,6 +416,48 @@
     return d.toLocaleString('en-US', {
       month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  /** Format an Agent Runs "Last Updated" timestamp as a year-inclusive
+   *  absolute local datetime, e.g. "Aug 11, 2026, 9:41 AM" (issue #4).
+   *  Missing/unparseable input → '--' (fmtDT/fmtRelative fallback style).
+   *  Pure — no DOM access.  Accepts an injected clock for deterministic
+   *  tests (precedent: createClientCache now-fn); when omitted it defaults
+   *  to the real clock so production callers can pass just the ISO string.
+   *  Future timestamps (backend clock skew) clamp to the injected now,
+   *  mirroring formatUpdatedAgo's future-clamp behavior.  A non-finite
+   *  injected clock (invalid Date, now-fn returning a string/NaN) falls
+   *  back to Date.now() so the clamp can never render "Invalid Date".
+   *  @param {*} isoStr - ISO 8601 timestamp string
+   *  @param {*} [now]  - injected clock: Date, ms number, or now-fn
+   *  @returns {string} e.g. "Aug 11, 2026, 9:41 AM" | "--" */
+  function formatAgentRunTimestamp(isoStr, now) {
+    if (!isoStr) return '--';
+    let d = new Date(isoStr);
+    if (isNaN(d.getTime())) return '--';
+    // Duck-type the injected clock (cross-realm Dates from the Node test
+    // harness fail instanceof, so check getTime — same trick as kpiSubtitle).
+    let nowMs;
+    if (typeof now === 'function') {
+      nowMs = now();
+    } else if (now != null && typeof now.getTime === 'function') {
+      nowMs = now.getTime();
+    } else if (typeof now === 'number') {
+      nowMs = now;
+    } else {
+      nowMs = Date.now();
+    }
+    // Guard the injected clock: coerce it to a finite epoch-ms number so a
+    // non-finite result (invalid Date whose getTime() is NaN, or a now-fn
+    // returning a string) falls back to the real clock instead of silently
+    // skipping the future-clamp or rendering "Invalid Date".
+    nowMs = Number(nowMs);
+    if (!isFinite(nowMs)) nowMs = Date.now();
+    if (d.getTime() > nowMs) d = new Date(nowMs);
+    return d.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit'
     });
   }
 
@@ -1183,6 +1226,15 @@
       var projectStr = fmtProjectLabel(r);
       var statusCls = statusBadgeClass(r.currentStatus || r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
+      // Last Updated cell (issue #5): year-inclusive absolute local
+      // timestamp (issue #4 formatter) as the primary value, with the
+      // relative label as muted secondary text after a middot separator
+      // ('·') so the two values read as distinct.  Missing/unparseable
+      // timestamps render a bare '--' (no secondary).
+      var lastUpdatedAbs = formatAgentRunTimestamp(r.last_updated_at);
+      var lastUpdatedCell = lastUpdatedAbs === '--'
+        ? '--'
+        : lastUpdatedAbs + ' · <span class="ar-rel-time">' + fmtRelative(r.last_updated_at) + '</span>';
 
       html += '<tr class="ar-row" data-id="' + r.id + '" tabindex="0">' +
         '<td class="clickable ar-title" data-label="Title">' + escHtml(displayTitle) + '</td>' +
@@ -1194,7 +1246,7 @@
         '<td class="ar-col-low" data-label="Files">' + fmtCodeChanges(r.code_changes_total) + '</td>' +
         '<td data-label="Cost">' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
         '<td data-label="Tokens">' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
-        '<td data-label="Last Updated">' + fmtRelative(r.last_updated_at) + '</td>' +
+        '<td data-label="Last Updated">' + lastUpdatedCell + '</td>' +
         '<td class="ar-col-low" data-label="Children">' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
     });
@@ -1404,6 +1456,7 @@
         fieldHtml('Source DB', shortUUID(d.source_database_id)) +
         fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
         fieldHtml('Duration', duration) +
+        fieldHtml('Last Updated', formatAgentRunTimestamp(d.last_updated_at)) +
       '</div></div>';
 
     // ── Agent & Project ──
@@ -1668,11 +1721,80 @@
     });
   }
 
+  /** Pure state for the Agent Runs date-filter bar (issue #7): which of the
+   *  From/To inputs is populated (drives the active styling) and whether the
+   *  Clear button must be disabled (both empty).  Pure — no DOM access — so
+   *  the Node test harness exercises it through the vm-sandbox exports.
+   *  @param {string} fromValue raw #ar-filter-from value ('' when empty)
+   *  @param {string} toValue   raw #ar-filter-to value ('' when empty)
+   *  @returns {{fromActive: boolean, toActive: boolean, clearDisabled: boolean}} */
+  function computeArDateFilterState(fromValue, toValue) {
+    var fromActive = !!(fromValue && fromValue.length > 0);
+    var toActive = !!(toValue && toValue.length > 0);
+    return {
+      fromActive: fromActive,
+      toActive: toActive,
+      clearDisabled: !fromActive && !toActive
+    };
+  }
+
+  /** Sync the date-filter bar's visual state from the current From/To input
+   *  values: toggles the active class on populated inputs (visible active
+   *  styling) and enables the Clear button whenever either input has a
+   *  value (issue #7). */
+  function syncArDateFilterUI() {
+    var state = computeArDateFilterState(
+      els.arFilterFrom ? els.arFilterFrom.value : '',
+      els.arFilterTo ? els.arFilterTo.value : ''
+    );
+    if (els.arFilterFrom) els.arFilterFrom.classList.toggle('active', state.fromActive);
+    if (els.arFilterTo) els.arFilterTo.classList.toggle('active', state.toActive);
+    if (els.arFilterClear) els.arFilterClear.disabled = state.clearDisabled;
+  }
+
+  /** Clear both date inputs and re-apply the existing filter path, restoring
+   *  the unfiltered agent-runs list (issue #7).  Reuses applyFilters() —
+   *  readFiltersFromUI() reads the emptied inputs, so the re-fetch carries
+   *  no date params; no new fetch mechanism. */
+  function clearArDateFilters() {
+    if (els.arFilterFrom) els.arFilterFrom.value = '';
+    if (els.arFilterTo) els.arFilterTo.value = '';
+    syncArDateFilterUI();
+    applyFilters();
+  }
+
+  /** Wire the Agent Runs filter-bar/detail DOM events against the captured
+   *  element refs: Apply, Clear (issue #7), live input styling, and the
+   *  detail overlay close handlers.  Exported on the window test seam —
+   *  broader than the pure-function exports — so the Node test harness can
+   *  drive it against fake elements; readFiltersFromUI, clearArDateFilters,
+   *  computeArDateFilterState, and syncArDateFilterUI are exported alongside
+   *  it for the same reason. */
   function setupAgentRunEventHandlers() {
     // Apply button
     if (els.arFilterApply) {
       els.arFilterApply.addEventListener('click', applyFilters);
     }
+
+    // Clear button (issue #7): empties both date inputs and re-applies the
+    // existing filter path (readFiltersFromUI -> applyFilters), restoring
+    // the unfiltered agent-runs list.
+    if (els.arFilterClear) {
+      els.arFilterClear.addEventListener('click', clearArDateFilters);
+    }
+
+    // Live active styling + Clear enable state: repaint the visual state
+    // whenever either date input's value changes (issue #7).
+    if (els.arFilterFrom) {
+      els.arFilterFrom.addEventListener('input', syncArDateFilterUI);
+    }
+    if (els.arFilterTo) {
+      els.arFilterTo.addEventListener('input', syncArDateFilterUI);
+    }
+
+    // Initial visual state: both inputs start empty → no active classes,
+    // Clear disabled.
+    syncArDateFilterUI();
 
     // Agent run detail close button
     if (els.arDetailClose) {
@@ -1832,6 +1954,15 @@
   window.resolvePanelStatuses = resolvePanelStatuses;
   window.formatClockTime = formatClockTime;
   window.kpiSubtitle = kpiSubtitle;
+  window.formatAgentRunTimestamp = formatAgentRunTimestamp;
+  // Agent Runs date-filter state + Clear control (issue #7) — pure state
+  // helper, DOM sync, the Clear action, the filter reader (UTC-boundary
+  // conversion regression), and the wiring entry point for the test harness.
+  window.readFiltersFromUI = readFiltersFromUI;
+  window.computeArDateFilterState = computeArDateFilterState;
+  window.syncArDateFilterUI = syncArDateFilterUI;
+  window.clearArDateFilters = clearArDateFilters;
+  window.setupAgentRunEventHandlers = setupAgentRunEventHandlers;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

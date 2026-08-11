@@ -33,6 +33,60 @@ var appJsSandbox = null;
 // ++ calls and the = 0 assignment later clobbers the counter.
 var pendingAsyncBlocks = 0;
 
+// Completion handshake between the issue #7 Clear-wiring block and the
+// issue #5 render block (Nit 2): both share the arTbodyEl fake, so the
+// issue #5 block waits on this flag instead of a fixed wall-clock delay
+// — deterministic under timer drift.
+var arClearWiringCompleted = false;
+
+// Element registry for the vm document stub (issue #7 filter-wiring tests).
+// app.js captures its element refs via getElementById at IIFE load time, so
+// fake filter-bar elements must be registered BEFORE loadRealAppJs runs —
+// after load, els.* already points at the captured (null) refs.  Ids that
+// are never registered still resolve to null, preserving the existing
+// no-DOM behavior of every other test.
+var elementRegistry = {};
+
+/** Minimal DOM-element fake backed by the registry: value/disabled state,
+ *  a classList (add/remove/toggle/contains), innerHTML storage, stored
+ *  event listeners, and a no-op querySelectorAll (table render path). */
+function makeFakeElement(id) {
+  var listeners = {};
+  return {
+    id: id,
+    value: '',
+    disabled: false,
+    innerHTML: '',
+    classList: {
+      _classes: {},
+      add: function (c) { this._classes[c] = true; },
+      remove: function (c) { delete this._classes[c]; },
+      toggle: function (c, force) {
+        var on = (force === undefined) ? !this._classes[c] : !!force;
+        if (on) { this._classes[c] = true; } else { delete this._classes[c]; }
+        return on;
+      },
+      contains: function (c) { return !!this._classes[c]; }
+    },
+    addEventListener: function (type, fn) { listeners[type] = fn; },
+    _handlers: listeners,
+    querySelectorAll: function () { return []; }
+  };
+}
+
+// Agent Runs filter-bar fakes (issue #7): the two date inputs, the Clear
+// button, and the table tbody (renderAgentRunsTable writes its empty-state
+// row there after the Clear re-fetch).  Initial state matches the real page:
+// both inputs empty, Clear disabled by default.
+var arFilterFromEl = makeFakeElement('ar-filter-from');
+var arFilterToEl = makeFakeElement('ar-filter-to');
+var arFilterClearEl = makeFakeElement('ar-filter-clear');
+var arTbodyEl = makeFakeElement('agent-runs-tbody');
+elementRegistry['ar-filter-from'] = arFilterFromEl;
+elementRegistry['ar-filter-to'] = arFilterToEl;
+elementRegistry['ar-filter-clear'] = arFilterClearEl;
+elementRegistry['agent-runs-tbody'] = arTbodyEl;
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -40,7 +94,7 @@ var pendingAsyncBlocks = 0;
   var documentStub = {
     readyState: 'loading',
     querySelector: function () { return null; },
-    getElementById: function () { return null; },
+    getElementById: function (id) { return elementRegistry[id] || null; },
     querySelectorAll: function () { return []; },
     addEventListener: function () {},
     createElement: function (tag) {
@@ -84,6 +138,12 @@ var pendingAsyncBlocks = 0;
   window.formatClockTime = sandboxWindow.formatClockTime;
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
+  window.formatAgentRunTimestamp = sandboxWindow.formatAgentRunTimestamp;
+  window.readFiltersFromUI = sandboxWindow.readFiltersFromUI;
+  window.computeArDateFilterState = sandboxWindow.computeArDateFilterState;
+  window.syncArDateFilterUI = sandboxWindow.syncArDateFilterUI;
+  window.clearArDateFilters = sandboxWindow.clearArDateFilters;
+  window.setupAgentRunEventHandlers = sandboxWindow.setupAgentRunEventHandlers;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1169,11 +1229,17 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
     assert(window.ensureClientName('c2') === 'c2',
       'background refresh: id without a name falls back to the id');
 
-    // Stale-while-failure: a failing background refresh keeps last-known names
+    // Stale-while-failure: a failing background refresh keeps last-known names.
+    // The 500 is intentional here: this block exercises the production
+    // stale-while-failure catch (app.js refreshClientCache), which emits an
+    // EXPECTED console.error.  Suppress that error for this block only and
+    // restore the real console.error once the assertions have run (Nit 3).
     appJsSandbox.fetch = function (url) {
       calls.push(url);
       return Promise.resolve({ ok: false, status: 500 });
     };
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
     window.ensureClientName('unknown-2'); // miss → background refresh → fetch fails
     pendingAsyncBlocks++;
     setTimeout(function () {
@@ -1181,6 +1247,12 @@ console.log('\u25B6 client metadata cache — background refresh wiring');
         'stale-while-failure: labels survive a failed background refresh');
       assert(calls.length === 2,
         'one fetch per miss: hits never fetch, a failed refresh never clears the map');
+      appJsSandbox.console.error = savedConsoleError; // restore the real console.error
+      // Restore a benign default fetch stub so any subsequent background
+      // refresh in later blocks never hits the intentional 500 stub (Nit 3).
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
       pendingAsyncBlocks--;
     }, 10);
     pendingAsyncBlocks--;
@@ -1452,6 +1524,52 @@ console.log('\u25B6 kpiSubtitle (historical vs current, issue #358)');
     'kpi-source-dbs: subtitle never carries the date-range label');
 })();
 
+// ── Agent Runs "Last Updated" timestamp (issue #4) ──────────────────────
+// Year-inclusive absolute local datetime for the Agent Runs table, e.g.
+// "Aug 11, 2026, 9:41 AM".  Pure — no wall-clock reads: the injected
+// clock (now) makes the output fully deterministic, so these tests never
+// depend on Date.now()/new Date() (precedent: createClientCache now-fn,
+// computeDateRange now param).  Exercised through the vm-sandbox export
+// of the production helper.
+
+console.log('\u25B6 formatAgentRunTimestamp (issue #4)');
+
+(function () {
+  // Deterministic injected clock: Aug 11, 2026, 23:59:59 local (end of the
+  // day — every valid same-day timestamp below is in the past, so the
+  // future-clamp only affects the dedicated skew test case)
+  var refNow = new Date(2026, 7, 11, 23, 59, 59);
+
+  // Valid ISO timestamp → year-inclusive absolute local datetime
+  assert(window.formatAgentRunTimestamp('2026-08-11T09:41:00', refNow) === 'Aug 11, 2026, 9:41 AM',
+    'valid ISO timestamp \u2192 "Aug 11, 2026, 9:41 AM" (year-inclusive absolute local datetime)');
+  assert(window.formatAgentRunTimestamp('2026-08-11T19:05:30', refNow) === 'Aug 11, 2026, 7:05 PM',
+    'evening timestamp \u2192 "Aug 11, 2026, 7:05 PM" (12-hour with AM/PM, no leading-zero hour)');
+
+  // Missing/unparseable input → "--" fallback (fmtDT/fmtRelative style)
+  assert(window.formatAgentRunTimestamp(null, refNow) === '--', 'null \u2192 --');
+  assert(window.formatAgentRunTimestamp(undefined, refNow) === '--', 'undefined \u2192 --');
+  assert(window.formatAgentRunTimestamp('', refNow) === '--', 'empty string \u2192 --');
+  assert(window.formatAgentRunTimestamp('not-a-date', refNow) === '--', 'unparseable string \u2192 --');
+
+  // Injected-clock determinism: fixed ISO + fixed injected clock → identical
+  // output, regardless of the wall clock (no Date.now() in tests)
+  var a = window.formatAgentRunTimestamp('2026-08-11T09:41:00', refNow);
+  var b = window.formatAgentRunTimestamp('2026-08-11T09:41:00', new Date(refNow.getTime()));
+  assert(a === b, 'deterministic: same ISO + same injected clock \u2192 same output');
+
+  // The clock may be injected as a now-fn too (createClientCache precedent)
+  var t = refNow.getTime();
+  assert(window.formatAgentRunTimestamp('2026-08-11T09:41:00', function () { return t; }) === 'Aug 11, 2026, 9:41 AM',
+    'now may be injected as a function (createClientCache-style now-fn)');
+
+  // Future timestamps (backend clock skew) clamp to the injected now —
+  // the table never shows a "Last Updated" time that hasn't happened yet
+  // (mirrors formatUpdatedAgo's future-clamp behavior)
+  assert(window.formatAgentRunTimestamp('2030-01-01T00:00:00', refNow) === 'Aug 11, 2026, 11:59 PM',
+    'future timestamp (clock skew) clamps to the injected now');
+})();
+
 // N2 — per-card KPI staleness: each KPI card resolves independently, so a
 // single failing endpoint never freezes the other cards.  The merged
 // Sessions + Agent Runs view (issue #402) backs the Sessions KPI with the
@@ -1492,6 +1610,292 @@ console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)')
     .forEach(function (kpiId) {
       assert(allOk[kpiId] === 'ok', 'no errors: KPI card "' + kpiId + '" resolves to ok');
     });
+})();
+
+// ── Agent Runs date filters — active state + Clear control (issue #7) ───
+// The state logic lives in the production app.js helpers
+// (computeArDateFilterState / syncArDateFilterUI / clearArDateFilters /
+// readFiltersFromUI) exposed through the vm-sandbox window bridge, and the
+// wiring is exercised through the production setupAgentRunEventHandlers()
+// against the fake filter-bar elements registered before app.js loaded.
+
+console.log('\u25B6 agent-runs date filters — active/disabled state (issue #7)');
+
+// Pure state helper: per-input active flags + Clear disabled state, driven
+// by the raw From/To input values ('' when empty).
+(function () {
+  var bothEmpty = window.computeArDateFilterState('', '');
+  assert(bothEmpty.clearDisabled === true && bothEmpty.fromActive === false && bothEmpty.toActive === false,
+    'empty From/To: Clear disabled, no active inputs');
+
+  var fromOnly = window.computeArDateFilterState('2026-07-01', '');
+  assert(fromOnly.fromActive === true && fromOnly.toActive === false && fromOnly.clearDisabled === false,
+    'From only: From active, To inactive, Clear enabled');
+
+  var toOnly = window.computeArDateFilterState('', '2026-07-31');
+  assert(toOnly.toActive === true && toOnly.fromActive === false && toOnly.clearDisabled === false,
+    'To only: To active, From inactive, Clear enabled');
+
+  var both = window.computeArDateFilterState('2026-07-01', '2026-07-31');
+  assert(both.fromActive === true && both.toActive === true && both.clearDisabled === false,
+    'both populated: both active, Clear enabled');
+
+  var nullish = window.computeArDateFilterState(null, undefined);
+  assert(nullish.clearDisabled === true && nullish.fromActive === false && nullish.toActive === false,
+    'null/undefined values treated as empty: Clear disabled, no active inputs');
+})();
+
+// Regression lock: readFiltersFromUI — partial ranges and the UTC-boundary
+// conversion (from_date + T00:00:00Z, to_date + T23:59:59Z) are unchanged.
+console.log('\u25B6 agent-runs date filters — readFiltersFromUI unchanged (issue #7)');
+
+(function () {
+  // From only → partial range, UTC midnight boundary
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '';
+  var f = window.readFiltersFromUI();
+  assert(f.from_date === '2026-07-01T00:00:00Z', 'From only: from_date uses the UTC midnight boundary (T00:00:00Z)');
+  assert(f.to_date === undefined, 'From only: no to_date — partial range preserved');
+
+  // To only → partial range, UTC end-of-day boundary
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '2026-07-31';
+  var t = window.readFiltersFromUI();
+  assert(t.to_date === '2026-07-31T23:59:59Z', 'To only: to_date uses the UTC end-of-day boundary (T23:59:59Z)');
+  assert(t.from_date === undefined, 'To only: no from_date — partial range preserved');
+
+  // Both → both boundaries applied
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '2026-07-31';
+  var b = window.readFiltersFromUI();
+  assert(b.from_date === '2026-07-01T00:00:00Z' && b.to_date === '2026-07-31T23:59:59Z',
+    'both set: UTC midnight + end-of-day boundaries applied');
+
+  // Both empty → no date filters at all (unfiltered request)
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '';
+  var e = window.readFiltersFromUI();
+  assert(e.from_date === undefined && e.to_date === undefined, 'both empty: no date filters (unfiltered)');
+})();
+
+// Wiring: the Clear control and the active/disabled state drive the real
+// production elements through setupAgentRunEventHandlers(), and clicking
+// Clear empties both date inputs and re-applies the existing filter path
+// (readFiltersFromUI -> applyFilters -> buildAgentRunsUrl -> apiFetch).
+console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)');
+
+(function () {
+  // Reset fakes to a pristine state, then wire like startAutoRefresh does.
+  arFilterFromEl.value = '';
+  arFilterToEl.value = '';
+  arFilterClearEl.disabled = false;
+  arFilterFromEl.classList._classes = {};
+  arFilterToEl.classList._classes = {};
+  arTbodyEl.innerHTML = '';
+  window.setupAgentRunEventHandlers();
+
+  // Initial sync: both inputs empty → Clear disabled, no active classes
+  assert(arFilterClearEl.disabled === true, 'initial state: Clear disabled with both inputs empty');
+  assert(arFilterFromEl.classList.contains('active') === false &&
+         arFilterToEl.classList.contains('active') === false,
+    'initial state: no active styling on empty inputs');
+
+  // Populate From → active styling appears on From, Clear becomes enabled
+  arFilterFromEl.value = '2026-07-01';
+  arFilterFromEl._handlers.input();
+  assert(arFilterFromEl.classList.contains('active') === true, 'populated From: active styling applied');
+  assert(arFilterToEl.classList.contains('active') === false, 'empty To: no active styling');
+  assert(arFilterClearEl.disabled === false, 'populated From: Clear enabled');
+
+  // Populate To → both inputs active
+  arFilterToEl.value = '2026-07-31';
+  arFilterToEl._handlers.input();
+  assert(arFilterToEl.classList.contains('active') === true, 'populated To: active styling applied');
+  assert(arFilterFromEl.classList.contains('active') === true, 'From still populated: stays active');
+  assert(arFilterClearEl.disabled === false, 'both populated: Clear enabled');
+
+  // Empty To again → its active styling drops, Clear stays enabled (From set)
+  arFilterToEl.value = '';
+  arFilterToEl._handlers.input();
+  assert(arFilterToEl.classList.contains('active') === false, 'cleared To: active styling removed');
+  assert(arFilterFromEl.classList.contains('active') === true, 'From still populated: active styling kept');
+  assert(arFilterClearEl.disabled === false, 'From still populated: Clear enabled');
+
+  // Click Clear → both inputs emptied, active styling removed, Clear
+  // disabled, and the existing filter path re-applied with the unfiltered
+  // URL (no from_date/to_date params) — the agent-runs endpoint only.
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [] }); }
+    });
+  };
+
+  arFilterClearEl._handlers.click();
+  assert(arFilterFromEl.value === '' && arFilterToEl.value === '',
+    'Clear click: both date inputs emptied');
+  assert(arFilterFromEl.classList.contains('active') === false &&
+         arFilterToEl.classList.contains('active') === false,
+    'Clear click: active styling removed from both inputs');
+  assert(arFilterClearEl.disabled === true, 'Clear click: Clear disabled again');
+  assert(calls.length === 1, 'Clear click: exactly one agent-runs fetch triggered');
+  assert(calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'Clear click: fetches the agent-runs endpoint (existing filter path, no new mechanism)');
+  assert(calls[0].indexOf('from_date=') === -1 && calls[0].indexOf('to_date=') === -1,
+    'Clear click: unfiltered URL — no from_date/to_date params (restores the unfiltered list)');
+  assert(calls[0].indexOf('start_date=') === -1 && calls[0].indexOf('end_date=') === -1,
+    'Clear click: URL carries no Overview global date-range params (filters are independent)');
+
+  // The re-applied fetch renders the unfiltered (empty-state) table
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+      'Clear click: unfiltered render completed (empty-state row written to the table)');
+    arClearWiringCompleted = true; // handshake: the issue #5 render block may proceed (Nit 2)
+    pendingAsyncBlocks--;
+  }, 10);
+})();
+
+// ── Agent Runs "Last Updated" cell — absolute + muted relative (issue #5) ─
+// Structural row-markup coverage for the Last Updated cell: the production
+// row template (renderAgentRunsTable) renders the year-inclusive absolute
+// local timestamp (issue #4 formatter) as the primary value with the
+// relative label as muted secondary text after a middot separator ('·'),
+// and a bare '--' when the timestamp is missing.  Driven through the real
+// render path (clearArDateFilters -> applyFilters -> apiFetch ->
+// renderAgentRunsTable) with a stubbed fetch, so the assertions run
+// against the actual app.js row markup.  The expected absolute string is
+// derived FROM the window.formatAgentRunTimestamp seam itself (not
+// hard-coded), proving the cell output comes from the production
+// formatter — no copy-pasted duplicate.
+
+console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted relative secondary (issue #5)');
+
+(function () {
+  // Deterministic fixture: a 2025 timestamp is safely in the past for any
+  // wall clock, so the issue #4 formatter's future-clamp never fires and
+  // the absolute output is stable (ISO without offset parses as local time
+  // and re-formats in the same local timezone — timezone-independent).
+  var refNow = new Date(2025, 6, 15, 12, 0, 0);
+  var expectedAbs = window.formatAgentRunTimestamp('2025-06-15T10:30:00', refNow);
+  assert(expectedAbs === 'Jun 15, 2025, 10:30 AM',
+    'seam sanity: window.formatAgentRunTimestamp derives "Jun 15, 2025, 10:30 AM" (issue #4 formatter)');
+
+  // Static: the 11-column header is unchanged (no new column for the
+  // relative label — it lives inside the existing Last Updated cell).
+  var headerHtml = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var arThead = headerHtml.slice(
+    headerHtml.indexOf('<table id="agent-runs-table">'),
+    headerHtml.indexOf('</thead>', headerHtml.indexOf('<table id="agent-runs-table">'))
+  );
+  // <th> followed by '>' or whitespace — <thead> does not count as a column
+  var thCount = (arThead.match(/<th[\s>]/g) || []).length;
+  assert(thCount === 11, 'index.html: agent-runs header keeps exactly 11 columns (' + thCount + ' found)');
+  assert(arThead.indexOf('<th>Last Updated</th>') !== -1,
+    'index.html: "Last Updated" header cell present and not ar-col-low (visible at all widths)');
+
+  // Static: the muted-secondary rule for the relative label exists in the
+  // real stylesheet (no inline style — class-based, per repo convention).
+  var relCss = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  var relRule = relCss.match(/\.ar-rel-time\s*\{[^}]*\}/);
+  assert(relRule !== null && relRule[0].indexOf('var(--text-muted)') !== -1,
+    'style.css: .ar-rel-time rule mutes the relative label (color: var(--text-muted))');
+
+  // Fixtures: one row with a timestamp, one with a missing timestamp.
+  var rows = [
+    { id: 'run-abs-1', title: 'Alpha run', currentStatus: 'completed', model: 'gpt-4o', agent: 'alpha',
+      todo_completed: 2, todo_total: 3, code_changes_total: 4, total_estimated_cost_usd: 0.12,
+      total_input_tokens: 100, total_output_tokens: 50, total_cache_read_tokens: 10,
+      total_cache_write_tokens: 5, child_run_count: 0, last_updated_at: '2025-06-15T10:30:00' },
+    { id: 'run-missing-2', title: 'Beta run', currentStatus: 'running', model: 'claude-sonnet', agent: 'beta',
+      todo_completed: 0, todo_total: 0, code_changes_total: 0, total_estimated_cost_usd: 0,
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, child_run_count: 2, last_updated_at: null }
+  ];
+
+  // The render flow is deferred past the issue #7 Clear-wiring block's
+  // async assertions (both blocks share the arTbodyEl fake): instead of a
+  // fixed wall-clock delay, this block polls the arClearWiringCompleted
+  // flag that the issue #7 block sets after its assertions, so ordering is
+  // deterministic under timer drift and never clobbers the earlier block's
+  // expected empty-state markup (Nit 2).
+  // The block's single pendingAsyncBlocks++ is balanced only in the
+  // innermost callback, so the summary poll can never observe
+  // pendingAsyncBlocks === 0 while any nested callback is still pending.
+  pendingAsyncBlocks++;
+  var clearWaitAttempts = 0;
+  (function proceedWhenClearWiringDone() {
+    if (!arClearWiringCompleted) {
+      clearWaitAttempts++;
+      if (clearWaitAttempts > 200) {
+        throw new Error('issue #5 block: arClearWiringCompleted never set ' +
+          '(issue #7 Clear-wiring block did not complete within 1s)');
+      }
+      setTimeout(proceedWhenClearWiringDone, 5);
+      return;
+    }
+    // Reset the fakes and wire the Clear handler like the app bootstrap does.
+    arFilterFromEl.value = '';
+    arFilterToEl.value = '';
+    arFilterClearEl.disabled = false;
+    arTbodyEl.innerHTML = '';
+    // Stub the vm-context clock so the production render path
+    // (formatAgentRunTimestamp without an injected now, and fmtRelative)
+    // is deterministic — no wall-clock dependency (Finding 1).
+    vm.runInContext('Date.now = function () { return ' + refNow.getTime() + '; }', appJsSandbox);
+    window.setupAgentRunEventHandlers();
+
+    // Render the two fixture rows through the real filter path.
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: rows }); } });
+    };
+    arFilterClearEl._handlers.click();
+
+    setTimeout(function () {
+      var html = arTbodyEl.innerHTML;
+      assert(html.indexOf('data-id="run-abs-1"') !== -1 && html.indexOf('data-id="run-missing-2"') !== -1,
+        'render: both fixture rows written to the tbody');
+
+      // Timestamp row: absolute primary + middot + muted relative secondary
+      // in the SAME Last Updated cell, and nothing else.  With Date.now
+      // stubbed to refNow, the fixture (30 days + 1.5h in the past) renders
+      // the deterministic label "30d ago" — asserted exactly (Finding 1).
+      var rowAbs = html.slice(html.indexOf('data-id="run-abs-1"'),
+        html.indexOf('</tr>', html.indexOf('data-id="run-abs-1"')) + 5);
+      var cellAbs = rowAbs.slice(rowAbs.indexOf('<td data-label="Last Updated">'),
+        rowAbs.indexOf('</td>', rowAbs.indexOf('<td data-label="Last Updated">')) + 5);
+      assert(new RegExp('^<td data-label="Last Updated">' + expectedAbs +
+        ' · <span class="ar-rel-time">30d ago<\\/span><\\/td>$').test(cellAbs),
+        'row markup: absolute timestamp primary + deterministic relative label ("30d ago") as muted secondary span in one cell');
+      assert(cellAbs.indexOf('--') === -1,
+        'row markup: no -- fallback when the timestamp is present');
+
+      // Missing-timestamp row: bare '--' only — no secondary span, row intact.
+      var rowMiss = html.slice(html.indexOf('data-id="run-missing-2"'),
+        html.indexOf('</tr>', html.indexOf('data-id="run-missing-2"')) + 5);
+      var cellMiss = rowMiss.slice(rowMiss.indexOf('<td data-label="Last Updated">'),
+        rowMiss.indexOf('</td>', rowMiss.indexOf('<td data-label="Last Updated">')) + 5);
+      assert(/^<td data-label="Last Updated">--<\/td>$/.test(cellMiss),
+        'row markup: missing timestamp renders bare -- without breaking the row');
+
+      // Empty state: the colspan="11" invariant is unchanged after the cell
+      // rework (row markup still spans the full 11-column table).
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
+      arFilterClearEl._handlers.click();
+      setTimeout(function () {
+        assert(arTbodyEl.innerHTML.indexOf('colspan="11"') !== -1,
+          'empty state: colspan="11" preserved');
+        assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+          'empty state: "No agent runs" message intact');
+        pendingAsyncBlocks--; // balances the block's single increment (above)
+      }, 10);
+    }, 10);
+  })();
 })();
 
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
@@ -1662,6 +2066,41 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(live.indexOf('.freshness-refreshing') !== -1, 'style.css: .freshness-refreshing state rule exists');
   assert(live.indexOf('.freshness-stale') !== -1, 'style.css: .freshness-stale state rule exists');
   assert(live.indexOf('.last-refreshed') !== -1, 'style.css: .last-refreshed header clock rule exists');
+})();
+
+// ── Agent Runs date-filter control: markup + styling (issue #7) ─────────
+// Static verification of the Clear button in the real index.html filter bar
+// and the active-state / Clear-control rules in the real style.css (the
+// repo's established substitute for browser-level checks).
+
+console.log('\u25B6 index.html + style.css — Clear control + active state (issue #7)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  // Clear button: always present inside the .agent-runs-filters bar, after
+  // the Apply button, and starts disabled (both date inputs are empty).
+  assert(html.indexOf('id="ar-filter-clear"') !== -1,
+    'index.html: #ar-filter-clear button exists in the filter bar');
+  assert(html.indexOf('class="filter-clear" id="ar-filter-clear"') !== -1,
+    'index.html: Clear button carries class="filter-clear"');
+  assert(/<button[^>]*id="ar-filter-clear"[^>]*disabled/.test(html),
+    'index.html: Clear button starts disabled (both date inputs empty)');
+  assert(html.indexOf('id="ar-filter-clear"') > html.indexOf('id="ar-filter-apply"'),
+    'index.html: Clear button sits after the Apply button in the filter bar');
+
+  // Active styling for populated date inputs — distinct rule, not just focus
+  assert(live.indexOf('.filter-input.active') !== -1,
+    'style.css: .filter-input.active rule exists (populated input active styling)');
+  assert(live.indexOf('.filter-input.active') > live.indexOf('.filter-input:focus'),
+    'style.css: .filter-input.active is a separate rule from :focus');
+
+  // Clear control styles: base rule + :disabled state
+  assert(live.indexOf('.filter-clear') !== -1, 'style.css: .filter-clear base rule exists');
+  assert(live.indexOf('.filter-clear:disabled') !== -1,
+    'style.css: .filter-clear:disabled rule exists (disabled state styling)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

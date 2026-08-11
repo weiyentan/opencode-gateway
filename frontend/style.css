@@ -89,6 +89,7 @@
   --text-muted:   #808aa8;
   --accent-indigo: #7c8cff;
   --accent-cyan:   #5ef2ff;
+  --accent-cyan-soft: rgba(94, 242, 255, 0.10); /* 10% cyan tint for active-input fills */
   --accent-pink:   #ff75b5;
   --accent-gold:   #ffd86f;
   --status-healthy: #4ade80;
@@ -997,6 +998,15 @@ tbody tr:hover td {
   border-color: var(--accent-indigo);
 }
 
+/* Active (populated) date inputs — issue #7: a visible "this filter is
+   engaged" state distinct from the unfocused empty input.  Uses the cyan
+   accent (vs the indigo :focus ring) so a populated input is recognizable
+   even while unfocused; toggled on value changes by syncArDateFilterUI(). */
+.filter-input.active {
+  border-color: var(--accent-cyan);
+  background: var(--accent-cyan-soft); /* 10% cyan tint (--accent-cyan-soft) */
+}
+
 .filter-input::placeholder {
   color: var(--text-muted);
 }
@@ -1022,6 +1032,34 @@ tbody tr:hover td {
 
 .filter-apply:hover {
   background: rgba(124, 140, 255, 0.25);
+}
+
+/* Clear control (issue #7): always visible in the filter bar; disabled
+   while both date inputs are empty (state kept in sync by
+   syncArDateFilterUI()).  Neutral styling so it reads as a secondary
+   action next to the indigo Apply button. */
+.filter-clear {
+  font-family: var(--font);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+  white-space: nowrap;
+}
+
+.filter-clear:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+}
+
+.filter-clear:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
@@ -1066,6 +1104,12 @@ td.clickable:hover {
    imitate a status state (no cyan/green tint, no accent border). */
 .ar-row:hover td {
   background: var(--glass-fg-surface-hover);
+}
+
+/* Last Updated cell (issue #5): the relative label ("3h ago") renders as
+   muted secondary text beside the absolute timestamp primary. */
+.ar-rel-time {
+  color: var(--text-muted);
 }
 
 /* Badge pulse — additional non-color cue for RUNNING agent runs only.
@@ -1463,6 +1507,11 @@ td.clickable:hover {
   .filter-apply {
     font-size: 0.7rem;
     padding: 5px 14px;
+  }
+
+  .filter-clear {
+    font-size: 0.7rem;
+    padding: 5px 12px;
   }
 
   .detail-grid {
