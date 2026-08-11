@@ -3539,13 +3539,114 @@ class TestProjectDirectoryReplace:
         assert len(insert_calls) == 0
 
     @pytest.mark.asyncio
-    async def test_valid_record_with_blank_directory_ingests(self, monkeypatch):
+    async def test_all_blank_directories_preserve_existing_rows(self, monkeypatch):
+        """An all-blank directory batch must NOT delete previously-stored rows.
+
+        Issue #413 review finding: when the batch is non-empty but every
+        entry filters out as blank/whitespace-only, the function returns
+        early with no DELETE — existing directory rows for the scope are
+        preserved.  An explicit empty array still clears (covered by the
+        sibling test that asserts the DELETE runs).
+        """
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(
+            records=[],
+            project_directories=[
+                _mk_directory_payload(directory=""),
+                _mk_directory_payload(directory="   "),
+                _mk_directory_payload(directory="\t\n"),
+            ],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        # Batch still succeeds; all three entries reported as rejected
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 3
+
+        # No DELETE and no INSERT issued — existing rows preserved
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 0
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_directories_array_clears(self, monkeypatch):
+        """An explicit empty ``project_directories`` array still runs the DELETE.
+
+        The all-blank guard only applies when the batch contained entries
+        that were filtered out.  ``[]`` is an authoritative "no directories"
+        snapshot and must preserve the pre-existing replace/clear semantics.
+        """
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        auth = _auth_row()
+        mock_conn.fetchrow.side_effect = [auth, None]
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _projection_payload(records=[], project_directories=[])
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["projection_accepted_count"] == 0
+        assert data["projection_rejected_count"] == 0
+
+        # DELETE still runs (clear semantics); no INSERT
+        delete_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "DELETE FROM opencode_project_directories" in str(call)
+        ]
+        assert len(delete_calls) == 1
+
+        insert_calls = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO opencode_project_directories" in str(call)
+        ]
+        assert len(insert_calls) == 0
+
+    @pytest.mark.parametrize("blank_directory", ["", "   ", "\t\n"])
+    @pytest.mark.asyncio
+    async def test_valid_record_with_blank_directory_ingests(
+        self, monkeypatch, blank_directory,
+    ):
         """A valid usage record ingests even when a directory entry is blank.
 
-        Issue #413 regression: an empty directory entry must not 422 the batch
-        or block the valid usage record — the record is written to both
-        ``usage_events`` and ``opencode_usage_records``, the valid directory
-        entry is stored, and the blank entry is reported as rejected.
+        Issue #413 regression: an empty or whitespace-only directory entry
+        must not 422 the batch or block the valid usage record — the record
+        is written to both ``usage_events`` and ``opencode_usage_records``,
+        the valid directory entry is stored, and the blank entry is reported
+        as rejected.
         """
         mock_conn = AsyncMock()
         mock_conn.fetchrow = AsyncMock()
@@ -3574,7 +3675,7 @@ class TestProjectDirectoryReplace:
             ],
             project_directories=[
                 _mk_directory_payload(directory="/tmp/a"),
-                _mk_directory_payload(directory=""),
+                _mk_directory_payload(directory=blank_directory),
             ],
         )
 

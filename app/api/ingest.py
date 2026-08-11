@@ -1094,6 +1094,13 @@ async def _process_project_directories(
     items dropped by filtering.  Filtered items are logged per item with
     their batch index and the offending field name — never the raw
     path value (issue #413).
+
+    A no-op guard protects existing rows: when the incoming batch is
+    non-empty but every entry filters out as blank/whitespace-only, the
+    function returns early with no DELETE — a collector snapshot bug
+    must not destroy previously-valid directory rows.  An explicit
+    empty array (``directories == []``) is still treated as an
+    authoritative "no directories" snapshot and runs the DELETE.
     """
     # ── Normalise batch: trim, drop blank paths, collapse duplicates ──
     seen: set[str] = set()
@@ -1116,6 +1123,14 @@ async def _process_project_directories(
         batch.append(entry)
 
     # ── Delete existing directories for this scope ───────────────────
+    # If the batch contained entries but every one was filtered out as
+    # blank, treat it as a no-op rather than an authoritative
+    # "no directories" snapshot — a collector snapshot bug must not
+    # destroy previously-valid directory rows.  An explicit empty array
+    # (directories == []) still runs the DELETE, preserving the
+    # pre-existing replace/clear semantics.
+    if not batch and directories:
+        return 0, filtered
     await conn.execute(
         "DELETE FROM opencode_project_directories WHERE client_id = $1 AND source_database_id = $2",
         client_id,
