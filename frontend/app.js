@@ -727,16 +727,30 @@
 
   // ── Data Fetching ─────────────────────────────────────────────────────
 
-  /** Build the agent runs URL from current filter state */
+  /** Build the agent runs URL from current filter state.
+   *  Issue #412: when the user has NOT explicitly set From/To filter dates,
+   *  from_date/to_date fall back to the shared dashboard date range
+   *  (dateRangeState via resolveDateRange — the same derivation the
+   *  aggregates/records URLs use), so the run list shares the KPI time
+   *  window.  Re-derivation is automatic: buildAgentRunsUrl is called from
+   *  fetchAll() on every refresh, and date-range changes trigger
+   *  refreshDashboard() → fetchAll().  Explicit filter values (set via
+   *  Apply) always win — per boundary, so an unset From/To input still
+   *  inherits the dashboard range on that side. */
   function buildAgentRunsUrl() {
     var params = [];
     var filters = agentRunFilters;
+    var dateRange = resolveDateRange(dateRangeState);
 
     if (filters.from_date) {
       params.push('from_date=' + encodeURIComponent(filters.from_date));
+    } else {
+      params.push('from_date=' + encodeURIComponent(dateRange.startDate.toISOString()));
     }
     if (filters.to_date) {
       params.push('to_date=' + encodeURIComponent(filters.to_date));
+    } else {
+      params.push('to_date=' + encodeURIComponent(dateRange.endDate.toISOString()));
     }
     if (filters.agent) {
       params.push('agent=' + encodeURIComponent(filters.agent));
@@ -1752,10 +1766,12 @@
     if (els.arFilterClear) els.arFilterClear.disabled = state.clearDisabled;
   }
 
-  /** Clear both date inputs and re-apply the existing filter path, restoring
-   *  the unfiltered agent-runs list (issue #7).  Reuses applyFilters() —
-   *  readFiltersFromUI() reads the emptied inputs, so the re-fetch carries
-   *  no date params; no new fetch mechanism. */
+  /** Clear both date inputs and re-apply the existing filter path (issue #7):
+   *  with the From/To inputs emptied they are no longer explicit filters, so
+   *  buildAgentRunsUrl() falls back to the shared dashboard date range via
+   *  resolveDateRange(dateRangeState) — per boundary, an unset input inherits
+   *  the dashboard range on that side (issue #412).  Reuses applyFilters() →
+   *  readFiltersFromUI() → buildAgentRunsUrl(); no new fetch mechanism. */
   function clearArDateFilters() {
     if (els.arFilterFrom) els.arFilterFrom.value = '';
     if (els.arFilterTo) els.arFilterTo.value = '';
@@ -1777,8 +1793,10 @@
     }
 
     // Clear button (issue #7): empties both date inputs and re-applies the
-    // existing filter path (readFiltersFromUI -> applyFilters), restoring
-    // the unfiltered agent-runs list.
+    // existing filter path (readFiltersFromUI -> applyFilters ->
+    // buildAgentRunsUrl).  With the date inputs cleared the list inherits the
+    // shared dashboard date range — per-boundary fallback via
+    // resolveDateRange(dateRangeState), issue #412 — not an unfiltered view.
     if (els.arFilterClear) {
       els.arFilterClear.addEventListener('click', clearArDateFilters);
     }
@@ -1963,6 +1981,14 @@
   window.syncArDateFilterUI = syncArDateFilterUI;
   window.clearArDateFilters = clearArDateFilters;
   window.setupAgentRunEventHandlers = setupAgentRunEventHandlers;
+  // Agent Runs URL builder + state hooks (issue #412): buildAgentRunsUrl
+  // derives from_date/to_date from the closure state (agentRunFilters,
+  // dateRangeState), so the node harness gets the builder itself plus
+  // setters to exercise the dashboard-range fallback and the
+  // explicit-override behavior without a DOM.
+  window.buildAgentRunsUrl = buildAgentRunsUrl;
+  window.setAgentRunFilters = function (filters) { agentRunFilters = filters; };
+  window.setDateRangeState = function (state) { dateRangeState = state; };
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

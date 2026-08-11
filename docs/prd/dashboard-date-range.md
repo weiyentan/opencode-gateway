@@ -6,7 +6,7 @@ The Sessions panel hardcodes "last 7 days" in its subtitle, and the Client/Proje
 
 ## Solution
 
-Replace the hardcoded date windows with a date-range bar above the KPI row. The bar has a preset dropdown and optional custom date inputs. All panels on the Overview tab (KPIs, Model Mix, Sessions, Agents & LLMs, Client/Project Breakdown) respect the same selected range.
+Replace the hardcoded date windows with a date-range bar above the KPI row. The bar has a preset dropdown and optional custom date inputs. The date-range bar and KPI row are shared chrome above the tab panels — they render on every tab, not just Overview — so the aggregate totals (Active Tokens, Est. Cost, Sessions) are visible on the Agent Runs tab with the same selected range applied (issue #411). All panels — KPIs, Model Mix, Agents & LLMs, and the Client/Project breakdown — respect the same selected range across all three tabs.
 
 The range defaults to **current calendar month-to-date** on first load, so it immediately aligns with the user's billing period. Presets let the user switch to last month, the last 30 days, or a fully custom range.
 
@@ -20,7 +20,7 @@ The backend aggregates API already accepts `start_date` and `end_date` parameter
 4. As a dashboard user, I want a "Last 30 Days" preset, so that I can see a trailing window when I need it.
 5. As a dashboard user, I want a "Last 7 Days" preset, so that I can inspect recent usage at a glance.
 6. As a dashboard user, I want a "Custom" option with date-from and date-to inputs, so that I can inspect any arbitrary period.
-7. As a dashboard user, I want the selected range to apply to all panels on the Overview tab — KPIs, Model Mix, Sessions, Agents & LLMs, and Client/Project Breakdown — so that the dashboard is internally consistent.
+7. As a dashboard user, I want the selected range to apply to all panels across all three tabs — KPIs, Model Mix, Sessions, Agents & LLMs, and Client/Project Breakdown — so that the dashboard is internally consistent.
 8. As a dashboard user, I want the KPI subtitles to show the resolved range (e.g. "Jul 1–27, 2026" instead of "input X / output Y"), so that the period is always visible at a glance.
 9. As a maintainer, I want the date-range logic extracted as testable pure functions, so that it can be unit tested without a browser.
 
@@ -73,3 +73,11 @@ The existing `GET /api/v1/usage/aggregates` endpoint accepts `start_date` and `e
 ## Further Notes
 
 The date-range bar renders the selected range label in the KPI subtitles, replacing the current "input X / output Y" breakdown. The input/output breakdown is still visible on hover or in the detail views. This ensures the period is always visible without cluttering the KPI card.
+
+### Implementation Note (issue #411)
+
+The date-range bar and KPI row are implemented as shared chrome **above** the tab panels (`#tab-overview`, `#tab-agent-runs`, and `#tab-clients-projects`), not scoped inside the Overview tab. The aggregate totals (Active Tokens, Est. Cost, Sessions — read from the aggregates total row by `renderKPIs`) therefore render on every tab, including the Agent Runs tab, with the dashboard date range applied. The Agent Runs tab additionally uses a full-viewport layout: when active it becomes a flex column sized from the viewport, the panel stretches to fill it, and its `.table-scroll` owns the vertical scroll region so a long run list scrolls inside the panel rather than the page. The full-viewport height is band-scoped so the three responsive viewport bands (full table, condensed, stacked cards) each fit the viewport without a page-level double scroll.
+
+### Implementation Note (issue #412)
+
+The Agent Runs list's From/To filter dates inherit the shared dashboard range: `buildAgentRunsUrl` derives `from_date`/`to_date` from the resolved `dateRangeState` when the user has not explicitly set a filter boundary, per boundary — so an unset From or To input still follows the dashboard range on that side. Explicit filter values set via Apply always win. Re-derivation is automatic on every refresh cycle, and the date-range bar covers the full tab set (`#tab-overview`, `#tab-agent-runs`, `#tab-clients-projects`).

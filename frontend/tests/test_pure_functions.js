@@ -144,6 +144,13 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
   window.syncArDateFilterUI = sandboxWindow.syncArDateFilterUI;
   window.clearArDateFilters = sandboxWindow.clearArDateFilters;
   window.setupAgentRunEventHandlers = sandboxWindow.setupAgentRunEventHandlers;
+  // Issue #412: the Agent Runs URL builder derives from_date/to_date from
+  // the closure state (agentRunFilters + dateRangeState), so the harness
+  // gets the builder itself plus setters to drive the fallback and
+  // explicit-override behavior without a DOM.
+  window.buildAgentRunsUrl = sandboxWindow.buildAgentRunsUrl;
+  window.setAgentRunFilters = sandboxWindow.setAgentRunFilters;
+  window.setDateRangeState = sandboxWindow.setDateRangeState;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1722,8 +1729,10 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
   assert(arFilterClearEl.disabled === false, 'From still populated: Clear enabled');
 
   // Click Clear → both inputs emptied, active styling removed, Clear
-  // disabled, and the existing filter path re-applied with the unfiltered
-  // URL (no from_date/to_date params) — the agent-runs endpoint only.
+  // disabled, and the existing filter path re-applied with no EXPLICIT
+  // filter dates — the URL then falls back to the shared dashboard date
+  // range (issue #412: unset boundaries inherit the dashboard range, so
+  // Clear restores the dashboard-scoped list instead of an all-time one).
   var calls = [];
   appJsSandbox.fetch = function (url) {
     calls.push(url);
@@ -1743,8 +1752,19 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
   assert(calls.length === 1, 'Clear click: exactly one agent-runs fetch triggered');
   assert(calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
     'Clear click: fetches the agent-runs endpoint (existing filter path, no new mechanism)');
-  assert(calls[0].indexOf('from_date=') === -1 && calls[0].indexOf('to_date=') === -1,
-    'Clear click: unfiltered URL — no from_date/to_date params (restores the unfiltered list)');
+  // Issue #412: with no explicit From/To dates the URL derives the shared
+  // dashboard range (default this-month preset here) instead of carrying
+  // no date params at all.  The to_date end is "now" (millisecond
+  // precision), so compare the start exactly and the end within a small
+  // tolerance to avoid clock-skew flakes.
+  var clearExpected = resolveDateRange({ preset: 'this-month' });
+  assert(calls[0].indexOf('from_date=' + encodeURIComponent(clearExpected.startDate.toISOString())) !== -1,
+    'Clear click: from_date derives the shared dashboard range start (issue #412)');
+  var clearToMatch = calls[0].match(/to_date=([^&]+)/);
+  assert(clearToMatch !== null &&
+         !isNaN(new Date(decodeURIComponent(clearToMatch[1])).getTime()) &&
+         Math.abs(new Date(decodeURIComponent(clearToMatch[1])).getTime() - clearExpected.endDate.getTime()) < 10000,
+    'Clear click: to_date derives the shared dashboard range end (issue #412)');
   assert(calls[0].indexOf('start_date=') === -1 && calls[0].indexOf('end_date=') === -1,
     'Clear click: URL carries no Overview global date-range params (filters are independent)');
 
@@ -2017,6 +2037,13 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(tabletBlock.indexOf('#agent-runs-table .ar-col-low') !== -1 && tabletBlock.indexOf('display: none') !== -1,
     'tablet block hides #agent-runs-table .ar-col-low (Agent, Todo, Files, Children)');
 
+  // 761–1024px tablet band (issue #412): the shared chrome is taller than
+  // desktop (the 5-card KPI row wraps to two rows in the 3-column grid), so
+  // the Agent Runs full-viewport height gets a per-band override here.
+  assert(tabletBlock.indexOf('#tab-agent-runs.active') !== -1 &&
+         tabletBlock.indexOf('height: calc(100vh') !== -1,
+    'tablet block scopes a per-band Agent Runs tab height (taller chrome offset, issue #412)');
+
   // ≤760px phone band: stacked agent run rows — header removed, rows become
   // block cards, cells render label/value lines via attr(data-label)
   // (lastIndexOf: the file-header comment also mentions the reduced-motion
@@ -2029,6 +2056,14 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
     'phone block turns agent run rows into stacked block cards');
   assert(phoneBlock.indexOf('attr(data-label)') !== -1,
     'phone block labels stacked cells via attr(data-label)');
+
+  // ≤760px phone band (issue #412): the shared chrome is tallest here (the
+  // KPI row wraps to three rows in the 2-column grid, the header wraps, the
+  // date-range bar wraps), so the Agent Runs full-viewport height gets its
+  // own per-band override — the stacked-card table scrolls inside the panel.
+  assert(phoneBlock.indexOf('#tab-agent-runs.active') !== -1 &&
+         phoneBlock.indexOf('height: calc(100vh') !== -1,
+    'phone block scopes a per-band Agent Runs tab height (stacked-cards chrome offset, issue #412)');
 
   // Reduced motion: aurora drift, live pulse, badge pulse disabled; status
   // badges (static border/text cues) untouched; focus ring retained
@@ -2101,6 +2136,191 @@ console.log('\u25B6 index.html + style.css — Clear control + active state (iss
   assert(live.indexOf('.filter-clear') !== -1, 'style.css: .filter-clear base rule exists');
   assert(live.indexOf('.filter-clear:disabled') !== -1,
     'style.css: .filter-clear:disabled rule exists (disabled state styling)');
+})();
+
+// ── Agent Runs full-viewport layout + aggregate population (issue #411) ─
+// Two-part dashboard fix, verified statically against the real stylesheet
+// and markup (the repo's established substitute for browser-level checks):
+// (1) the active Agent Runs tab fills the viewport — the panel becomes a
+// flex column and its .table-scroll owns the vertical scroll region, so a
+// long run list scrolls inside the panel instead of the page; (2) the
+// shared date-range bar and KPI row (aggregate totals — Active Tokens,
+// Est. Cost, Sessions from the aggregates total row) sit ABOVE the tab
+// panels, so the aggregate totals render on the Agent Runs tab with the
+// dashboard date range applied.  The viewport-derived tab height is
+// band-scoped (issue #412): the 459px chrome estimate holds for >1024px
+// desktop only, so the desktop height lives inside a
+// @media (min-width: 1025px) wrapper, and the 761–1024px / ≤760px bands
+// carry per-band height overrides inside their existing media blocks (the
+// .active display/flex properties stay available across all bands).
+
+console.log('\u25B6 Agent Runs full-viewport layout + aggregate population (issue #411)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+
+  // ── Part 1: full-viewport layout ────────────────────────────────────
+  // The active Agent Runs tab is a flex column sized from the viewport
+  // (leaving room for the fixed chrome), so the panel can fill it.  The
+  // display/flex properties are shared across all viewport bands; only the
+  // viewport-derived height is band-scoped (issue #412).
+  var arTabRule = css.match(/#tab-agent-runs\.active\s*\{[^}]*\}/);
+  assert(arTabRule !== null,
+    'style.css: #tab-agent-runs.active rule exists (full-viewport layout hook)');
+  assert(arTabRule[0].indexOf('display: flex') !== -1 &&
+         arTabRule[0].indexOf('flex-direction: column') !== -1,
+    'style.css: the active Agent Runs tab is a flex column (all viewport bands)');
+  assert(arTabRule[0].indexOf('calc(100vh') === -1,
+    'style.css: the viewport-derived height is band-scoped, not top-level (issue #412)');
+  assert(arTabRule[0].indexOf('min-height: 340px') !== -1,
+    'style.css: the active Agent Runs tab keeps the 340px min-height floor');
+
+  // Desktop (>1024px) band: the 459px-chrome height lives inside a
+  // min-width media query so it cannot leak into the narrower bands.
+  var desktopIdx = css.indexOf('@media (min-width: 1025px)');
+  assert(desktopIdx !== -1,
+    'style.css: desktop media query @media (min-width: 1025px) exists (issue #412)');
+  var desktopBlock = css.slice(desktopIdx, css.indexOf('@media (max-width: 1024px)'));
+  assert(desktopBlock.indexOf('#tab-agent-runs.active') !== -1 &&
+         desktopBlock.indexOf('calc(100vh - 459px)') !== -1,
+    'style.css: the 459px desktop height is scoped inside @media (min-width: 1025px)');
+
+  // The panel stretches to fill the tab and stacks title → filters →
+  // scroll region vertically; min-height: 0 lets the scroll region shrink
+  // instead of overflowing the fixed tab height.
+  var arPanelRule = css.match(/\.panel-agent-runs\s*\{[^}]*\}/);
+  assert(arPanelRule !== null,
+    'style.css: .panel-agent-runs rule exists');
+  assert(arPanelRule[0].indexOf('display: flex') !== -1 &&
+         arPanelRule[0].indexOf('flex-direction: column') !== -1,
+    'style.css: .panel-agent-runs is a flex column (title + filters + scroll region stack)');
+  assert(arPanelRule[0].indexOf('flex: 1') !== -1,
+    'style.css: .panel-agent-runs flexes to fill the active tab');
+  assert(arPanelRule[0].indexOf('min-height: 0') !== -1,
+    'style.css: .panel-agent-runs min-height: 0 (inner scroll region may shrink, no clip)');
+
+  // The table scroll region owns BOTH axes: horizontal overflow from the
+  // base .table-scroll rule, vertical overflow added for the full-viewport
+  // panel — the page itself must not scroll for long run lists.
+  var arScrollRule = css.match(/\.panel-agent-runs \.table-scroll\s*\{[^}]*\}/);
+  assert(arScrollRule !== null,
+    'style.css: .panel-agent-runs .table-scroll rule exists');
+  assert(arScrollRule[0].indexOf('overflow-y: auto') !== -1,
+    'style.css: the Agent Runs table-scroll owns the vertical scroll region');
+  assert(arScrollRule[0].indexOf('flex: 1') !== -1,
+    'style.css: the Agent Runs table-scroll flexes to fill the panel');
+
+  // ── Part 2: aggregate data population in the Agent Runs view ────────
+  // The date-range bar and the KPI row (aggregate totals from the
+  // aggregates total row) live ABOVE the tab panels — outside
+  // #tab-overview — so they render on every tab, including Agent Runs,
+  // with the dashboard date range applied (renderKPIs already populates
+  // them from aggTotal on every refresh cycle).
+  var tabOverviewIdx = html.indexOf('id="tab-overview"');
+  assert(tabOverviewIdx !== -1, 'index.html: #tab-overview still exists');
+  var drBarIdx = html.indexOf('id="date-range-bar"');
+  var kpiRowIdx = html.indexOf('id="kpi-row"');
+  assert(drBarIdx !== -1 && drBarIdx < tabOverviewIdx,
+    'index.html: #date-range-bar sits above the tab panels (shared across tabs, not scoped to Overview)');
+  assert(kpiRowIdx !== -1 && kpiRowIdx < tabOverviewIdx,
+    'index.html: #kpi-row (aggregate totals) sits above the tab panels (visible on the Agent Runs tab)');
+
+  // The Agent Runs tab itself keeps its full structure: panel, filters,
+  // table id, and tbody — the layout/aggregate fix must not drop markup.
+  var arTabHtml = html.slice(html.indexOf('id="tab-agent-runs"'));
+  assert(arTabHtml.indexOf('panel-agent-runs') !== -1,
+    'index.html: Agent Runs tab still carries the .panel-agent-runs panel');
+  assert(arTabHtml.indexOf('id="agent-runs-filters"') !== -1,
+    'index.html: Agent Runs tab still carries the filter bar');
+  assert(arTabHtml.indexOf('<table id="agent-runs-table">') !== -1 &&
+         arTabHtml.indexOf('id="agent-runs-tbody"') !== -1,
+    'index.html: Agent Runs tab still carries the merged table + tbody');
+})();
+
+// ── Agent Runs date-range fallback (issue #412) ─────────────────────────
+// buildAgentRunsUrl() must share the dashboard date range: when the user
+// has NOT explicitly set From/To filter dates, from_date/to_date derive
+// from dateRangeState via resolveDateRange (the same helper the aggregates
+// URLs use), so the run list shares the KPI time window.  Explicit filter
+// dates (set via Apply) always win; a dashboard range change re-derives
+// the URL on the next fetch (buildAgentRunsUrl is called from fetchAll()).
+// The builder is exercised through the window test seam against the REAL
+// app.js closure state (set via the setAgentRunFilters/setDateRangeState
+// hooks) — a custom preset pins the expected date values exactly.
+
+console.log('\u25B6 buildAgentRunsUrl date-range fallback (issue #412)');
+
+(function () {
+  if (typeof window.buildAgentRunsUrl !== 'function' ||
+      typeof window.setAgentRunFilters !== 'function' ||
+      typeof window.setDateRangeState !== 'function') {
+    assert(false, 'app.js: buildAgentRunsUrl + state setters exposed on the window test seam');
+    return;
+  }
+
+  // Fallback: empty filters + dashboard range → URL derives from/to dates
+  // from dateRangeState.  Custom preset makes the expected values exact.
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'custom', customStartDate: '2026-06-01', customEndDate: '2026-06-30' });
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('/api/v1/usage/agent-runs?') === 0,
+    'fallback: URL still targets the agent-runs endpoint');
+  assert(url.indexOf('from_date=2026-06-01T00%3A00%3A00.000Z') !== -1,
+    'fallback: empty filters derive from_date from dateRangeState (2026-06-01)');
+  assert(url.indexOf('to_date=2026-06-30T23%3A59%3A59.000Z') !== -1,
+    'fallback: empty filters derive to_date from dateRangeState (2026-06-30)');
+
+  // Explicit filter dates (set via Apply) always win over the derived ones.
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z', to_date: '2026-01-31T23:59:59Z' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1 &&
+         url.indexOf('to_date=2026-01-31T23%3A59%3A59Z') !== -1,
+    'explicit: Apply-set From/To dates win over the derived range');
+  assert(url.indexOf('2026-06-01') === -1,
+    'explicit: the derived from_date is suppressed when an explicit one is set');
+
+  // Per-side fallback: an unset boundary inherits from the dashboard range
+  // while the explicitly-set boundary stays.
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1 &&
+         url.indexOf('to_date=2026-06-30T23%3A59%3A59.000Z') !== -1,
+    'per-side: explicit from_date kept, unset to_date inherits the dashboard range');
+
+  // Re-derivation: changing the dashboard date range changes the fallback
+  // dates (buildAgentRunsUrl is re-called from fetchAll on every refresh).
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'custom', customStartDate: '2026-07-01', customEndDate: '2026-07-31' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('from_date=2026-07-01T00%3A00%3A00.000Z') !== -1 &&
+         url.indexOf('to_date=2026-07-31T23%3A59%3A59.000Z') !== -1,
+    're-derive: a dashboard range change re-derives from_date/to_date');
+  assert(url.indexOf('2026-06-01') === -1,
+    're-derive: the previous derived range is gone after the range change');
+
+  // Default this-month preset: falls back to the same derivation the
+  // aggregates URLs use (compare against the harness resolveDateRange).
+  // The to_date end is "now" (millisecond precision), so compare it within
+  // a small tolerance to avoid clock-skew flakes.
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+  url = window.buildAgentRunsUrl();
+  var expected = resolveDateRange({ preset: 'this-month' });
+  assert(url.indexOf('from_date=' + encodeURIComponent(expected.startDate.toISOString())) !== -1,
+    'this-month: default preset derives from_date matching resolveDateRange');
+  var toMatch = url.match(/to_date=([^&]+)/);
+  assert(toMatch !== null &&
+         !isNaN(new Date(decodeURIComponent(toMatch[1])).getTime()) &&
+         Math.abs(new Date(decodeURIComponent(toMatch[1])).getTime() - expected.endDate.getTime()) < 10000,
+    'this-month: default preset derives to_date matching resolveDateRange');
+
+  // Agent/status filters still ride along with the derived dates.
+  window.setAgentRunFilters({ agent: 'bob', status: 'completed' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
+         url.indexOf('from_date=') !== -1 && url.indexOf('to_date=') !== -1,
+    'agent/status: non-date filters are appended alongside the derived range');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
