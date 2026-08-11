@@ -1218,6 +1218,14 @@
       var projectStr = fmtProjectLabel(r);
       var statusCls = statusBadgeClass(r.currentStatus || r.status);
       var displayTitle = r.session_title || r.title || '(untitled)';
+      // Last Updated cell (issue #5): year-inclusive absolute local
+      // timestamp (issue #4 formatter) as the primary value, with the
+      // relative label as muted secondary text.  Missing/unparseable
+      // timestamps render a bare '--' (no secondary).
+      var lastUpdatedAbs = formatAgentRunTimestamp(r.last_updated_at);
+      var lastUpdatedCell = lastUpdatedAbs === '--'
+        ? '--'
+        : lastUpdatedAbs + ' <span class="ar-rel-time">' + fmtRelative(r.last_updated_at) + '</span>';
 
       html += '<tr class="ar-row" data-id="' + r.id + '" tabindex="0">' +
         '<td class="clickable ar-title" data-label="Title">' + escHtml(displayTitle) + '</td>' +
@@ -1229,7 +1237,7 @@
         '<td class="ar-col-low" data-label="Files">' + fmtCodeChanges(r.code_changes_total) + '</td>' +
         '<td data-label="Cost">' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
         '<td data-label="Tokens">' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
-        '<td data-label="Last Updated">' + fmtRelative(r.last_updated_at) + '</td>' +
+        '<td data-label="Last Updated">' + lastUpdatedCell + '</td>' +
         '<td class="ar-col-low" data-label="Children">' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
     });

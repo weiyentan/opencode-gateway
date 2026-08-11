@@ -1105,6 +1105,12 @@ td.clickable:hover {
   background: var(--glass-fg-surface-hover);
 }
 
+/* Last Updated cell (issue #5): the relative label ("3h ago") renders as
+   muted secondary text beside the absolute timestamp primary. */
+.ar-rel-time {
+  color: var(--text-muted);
+}
+
 /* Badge pulse — additional non-color cue for RUNNING agent runs only.
    Run badges are static compact outlined badges (Balanced Quiet Rows);
    running rows pulse the badge alone. */

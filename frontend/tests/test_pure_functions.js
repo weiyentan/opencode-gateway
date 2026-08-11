@@ -1739,6 +1739,129 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
   }, 10);
 })();
 
+// ── Agent Runs "Last Updated" cell — absolute + muted relative (issue #5) ─
+// Structural row-markup coverage for the Last Updated cell: the production
+// row template (renderAgentRunsTable) renders the year-inclusive absolute
+// local timestamp (issue #4 formatter) as the primary value with the
+// relative label as muted secondary text, and a bare '--' when the
+// timestamp is missing.  Driven through the real render path
+// (clearArDateFilters -> applyFilters -> apiFetch -> renderAgentRunsTable)
+// with a stubbed fetch, so the assertions run against the actual app.js
+// row markup.  The expected absolute string is derived FROM the
+// window.formatAgentRunTimestamp seam itself (not hard-coded), proving the
+// cell output comes from the production formatter — no copy-pasted
+// duplicate.
+
+console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted relative secondary (issue #5)');
+
+(function () {
+  // Deterministic fixture: a 2025 timestamp is safely in the past for any
+  // wall clock, so the issue #4 formatter's future-clamp never fires and
+  // the absolute output is stable (ISO without offset parses as local time
+  // and re-formats in the same local timezone — timezone-independent).
+  var refNow = new Date(2025, 6, 15, 12, 0, 0);
+  var expectedAbs = window.formatAgentRunTimestamp('2025-06-15T10:30:00', refNow);
+  assert(expectedAbs === 'Jun 15, 2025, 10:30 AM',
+    'seam sanity: window.formatAgentRunTimestamp derives "Jun 15, 2025, 10:30 AM" (issue #4 formatter)');
+
+  // Static: the 11-column header is unchanged (no new column for the
+  // relative label — it lives inside the existing Last Updated cell).
+  var headerHtml = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var arThead = headerHtml.slice(
+    headerHtml.indexOf('<table id="agent-runs-table">'),
+    headerHtml.indexOf('</thead>', headerHtml.indexOf('<table id="agent-runs-table">'))
+  );
+  // <th> followed by '>' or whitespace — <thead> does not count as a column
+  var thCount = (arThead.match(/<th[\s>]/g) || []).length;
+  assert(thCount === 11, 'index.html: agent-runs header keeps exactly 11 columns (' + thCount + ' found)');
+  assert(arThead.indexOf('<th>Last Updated</th>') !== -1,
+    'index.html: "Last Updated" header cell present and not ar-col-low (visible at all widths)');
+
+  // Static: the muted-secondary rule for the relative label exists in the
+  // real stylesheet (no inline style — class-based, per repo convention).
+  var relCss = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  var relRule = relCss.match(/\.ar-rel-time\s*\{[^}]*\}/);
+  assert(relRule !== null && relRule[0].indexOf('var(--text-muted)') !== -1,
+    'style.css: .ar-rel-time rule mutes the relative label (color: var(--text-muted))');
+
+  // Fixtures: one row with a timestamp, one with a missing timestamp.
+  var rows = [
+    { id: 'run-abs-1', title: 'Alpha run', currentStatus: 'completed', model: 'gpt-4o', agent: 'alpha',
+      todo_completed: 2, todo_total: 3, code_changes_total: 4, total_estimated_cost_usd: 0.12,
+      total_input_tokens: 100, total_output_tokens: 50, total_cache_read_tokens: 10,
+      total_cache_write_tokens: 5, child_run_count: 0, last_updated_at: '2025-06-15T10:30:00' },
+    { id: 'run-missing-2', title: 'Beta run', currentStatus: 'running', model: 'claude-sonnet', agent: 'beta',
+      todo_completed: 0, todo_total: 0, code_changes_total: 0, total_estimated_cost_usd: 0,
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, child_run_count: 2, last_updated_at: null }
+  ];
+
+  // The render flow is deferred past the issue #7 Clear-wiring block's
+  // async assertions (both blocks share the arTbodyEl fake): issue #7
+  // asserts at ~10ms, so this block's fetch-driven render starts at ~20ms
+  // and never clobbers the earlier block's expected empty-state markup.
+  pendingAsyncBlocks++;
+  setTimeout(function () {
+    // Reset the fakes and wire the Clear handler like the app bootstrap does.
+    arFilterFromEl.value = '';
+    arFilterToEl.value = '';
+    arFilterClearEl.disabled = false;
+    arTbodyEl.innerHTML = '';
+    window.setupAgentRunEventHandlers();
+
+    // Render the two fixture rows through the real filter path.
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: rows }); } });
+    };
+    arFilterClearEl._handlers.click();
+
+    setTimeout(function () {
+      var html = arTbodyEl.innerHTML;
+      assert(html.indexOf('data-id="run-abs-1"') !== -1 && html.indexOf('data-id="run-missing-2"') !== -1,
+        'render: both fixture rows written to the tbody');
+
+      // Timestamp row: absolute primary + muted relative secondary in the SAME
+      // Last Updated cell, and nothing else.
+      var rowAbs = html.slice(html.indexOf('data-id="run-abs-1"'),
+        html.indexOf('</tr>', html.indexOf('data-id="run-abs-1"')) + 5);
+      var cellAbs = rowAbs.slice(rowAbs.indexOf('<td data-label="Last Updated">'),
+        rowAbs.indexOf('</td>', rowAbs.indexOf('<td data-label="Last Updated">')) + 5);
+      assert(new RegExp('^<td data-label="Last Updated">' + expectedAbs +
+        ' <span class="ar-rel-time">\\d+d ago<\\/span><\\/td>$').test(cellAbs),
+        'row markup: absolute timestamp primary + relative label ("Nd ago") as muted secondary span in one cell');
+      assert(cellAbs.indexOf('--') === -1,
+        'row markup: no -- fallback when the timestamp is present');
+
+      // Missing-timestamp row: bare '--' only — no secondary span, row intact.
+      var rowMiss = html.slice(html.indexOf('data-id="run-missing-2"'),
+        html.indexOf('</tr>', html.indexOf('data-id="run-missing-2"')) + 5);
+      var cellMiss = rowMiss.slice(rowMiss.indexOf('<td data-label="Last Updated">'),
+        rowMiss.indexOf('</td>', rowMiss.indexOf('<td data-label="Last Updated">')) + 5);
+      assert(/^<td data-label="Last Updated">--<\/td>$/.test(cellMiss),
+        'row markup: missing timestamp renders bare -- without breaking the row');
+
+      // Empty state: the colspan="11" invariant is unchanged after the cell
+      // rework (row markup still spans the full 11-column table).
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
+      arFilterClearEl._handlers.click();
+      pendingAsyncBlocks++;
+      setTimeout(function () {
+        assert(arTbodyEl.innerHTML.indexOf('colspan="11"') !== -1,
+          'empty state: colspan="11" preserved');
+        assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+          'empty state: "No agent runs" message intact');
+        pendingAsyncBlocks--;
+      }, 10);
+
+      pendingAsyncBlocks--;
+    }, 10);
+    pendingAsyncBlocks--;
+  }, 20);
+})();
+
 // ── Static markup smoke check (frontend/index.html) ─────────────────────
 // The repo has no browser test harness, so the "browser-level or equivalent
 // smoke check" acceptance criterion maps to static assertions on the real
