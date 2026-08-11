@@ -1439,6 +1439,7 @@
         fieldHtml('Source DB', shortUUID(d.source_database_id)) +
         fieldHtml('Messages', d.message_count != null ? fmtNum(d.message_count) : '--') +
         fieldHtml('Duration', duration) +
+        fieldHtml('Last Updated', formatAgentRunTimestamp(d.last_updated_at)) +
       '</div></div>';
 
     // ── Agent & Project ──
