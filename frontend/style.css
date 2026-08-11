@@ -1071,14 +1071,25 @@ tbody tr:hover td {
    dashboard padding 24px/40px, the shared date-range bar + KPI row above
    the tabs ~256px, and the ~37px footer), the panel stretches to fill it,
    and the table-scroll owns the vertical scroll region so a long run list
-   scrolls inside the panel instead of the page.  The three responsive
-   viewport bands (>1024px full table, 761–1024px condensed, ≤760px
-   stacked cards) are untouched. */
+   scrolls inside the panel instead of the page.  The viewport-derived
+   height is band-scoped (issue #412): the 459px chrome estimate only holds
+   for >1024px desktop, so the desktop height lives in a
+   @media (min-width: 1025px) block and the 761–1024px / ≤760px bands carry
+   their own height overrides inside their media blocks below. */
 #tab-agent-runs.active {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 459px); /* header 56 + top-nav 46 + dash padding 24/40 + shared bars 256 + footer 37 */
   min-height: 340px; /* floor: short viewports keep a usable table area */
+}
+
+/* Desktop (>1024px): the 459px chrome estimate (header 56 + top-nav 46 +
+   dash padding 24/40 + shared bars 256 + footer 37) only holds for the
+   uncompressed desktop chrome — the viewport-derived height is scoped to
+   this band so it cannot leak into the narrower bands. */
+@media (min-width: 1025px) {
+  #tab-agent-runs.active {
+    height: calc(100vh - 459px); /* header 56 + top-nav 46 + dash padding 24/40 + shared bars 256 + footer 37 */
+  }
 }
 
 .panel-agent-runs {
@@ -1438,6 +1449,15 @@ td.clickable:hover {
   #agent-runs-table .ar-col-low {
     display: none;
   }
+
+  /* Agent Runs full-viewport height — tablet band (761–1024px, issue
+     #412): the shared chrome is taller than desktop (the 5-card KPI row
+     wraps to two rows in the 3-column grid), so the viewport-derived
+     height uses a larger offset.  The 340px min-height floor from the base
+     rule still applies; the .active flex properties are inherited. */
+  #tab-agent-runs.active {
+    height: calc(100vh - 600px);
+  }
 }
 
 /* ≤760px — single-column layout */
@@ -1655,6 +1675,15 @@ td.clickable:hover {
 
   #agent-runs-table tr.ar-row:focus-visible td {
     box-shadow: none !important;
+  }
+
+  /* Agent Runs full-viewport height — phone band (≤760px, issue #412):
+     the shared chrome is tallest here (the KPI row wraps to three rows in
+     the 2-column grid, the header wraps, and the date-range bar wraps), so
+     the offset grows again; the stacked-card table scrolls inside the
+     panel.  The 340px min-height floor from the base rule still applies. */
+  #tab-agent-runs.active {
+    height: calc(100vh - 700px);
   }
 }
 
