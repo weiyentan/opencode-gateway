@@ -63,9 +63,11 @@
 
   <main class="dashboard">
 
-    <!-- ── Tab: Overview ──────────────────────────────────────────────── -->
-    <div class="tab-content active" id="tab-overview">
-
+    <!-- Shared date-range bar + KPI row (issue #411): the aggregate totals
+         (Active Tokens, Est. Cost, Sessions — from the aggregates total row)
+         render on EVERY tab — including the Agent Runs tab — with the
+         dashboard date range applied.  Previously scoped inside
+         #tab-overview, the Agent Runs tab showed no aggregate data. -->
     <!-- Date Range Bar -->
     <div class="date-range-bar" id="date-range-bar">
       <div class="dr-preset-group">
@@ -123,6 +125,9 @@
         <span class="kpi-sub" id="kpi-source-dbs-detail">--</span>
       </div>
     </section>
+
+    <!-- ── Tab: Overview ──────────────────────────────────────────────── -->
+    <div class="tab-content active" id="tab-overview">
 
     <!-- Two-column content grid -->
     <div class="content-grid">

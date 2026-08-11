@@ -127,6 +127,28 @@ class TestMergedDashboardView:
             "the sessions active-badge heuristic must be removed"
         )
 
+    def test_aggregate_kpi_row_shared_across_tabs(self):
+        """The date-range bar + KPI row sit ABOVE the tab panels (issue #411).
+
+        The aggregate totals (Active Tokens, Est. Cost, Sessions — read from
+        the aggregates total row by renderKPIs) must render on the Agent Runs
+        tab with the dashboard date range applied.  They were previously
+        scoped inside #tab-overview, so the Agent Runs tab showed no
+        aggregate data; the fix moves them above all tab panels.
+        """
+        content = (FRONTEND_DIR / "index.html").read_text()
+        tab_overview = content.index('id="tab-overview"')
+        date_bar = content.index('id="date-range-bar"')
+        kpi_row = content.index('id="kpi-row"')
+        assert date_bar < tab_overview, (
+            "the dashboard date-range bar must sit above the tab panels "
+            "(shared across tabs, not scoped to #tab-overview)"
+        )
+        assert kpi_row < tab_overview, (
+            "the KPI row (aggregate totals) must sit above the tab panels "
+            "so the Agent Runs tab renders tokens/sessions/cost"
+        )
+
 
 
 class TestNginxProxyConfiguration:

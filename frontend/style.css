@@ -1064,8 +1064,38 @@ tbody tr:hover td {
 
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
 
+/* Full-viewport layout (issue #411): when the Agent Runs tab is active,
+   the merged Sessions + Agent Runs view fills the viewport — the tab is a
+   flex column sized from the viewport (leaving room for the fixed chrome:
+   header 56px — the same constant .app-layout uses — top-nav ~46px,
+   dashboard padding 24px/40px, the shared date-range bar + KPI row above
+   the tabs ~256px, and the ~37px footer), the panel stretches to fill it,
+   and the table-scroll owns the vertical scroll region so a long run list
+   scrolls inside the panel instead of the page.  The three responsive
+   viewport bands (>1024px full table, 761–1024px condensed, ≤760px
+   stacked cards) are untouched. */
+#tab-agent-runs.active {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 459px); /* header 56 + top-nav 46 + dash padding 24/40 + shared bars 256 + footer 37 */
+  min-height: 340px; /* floor: short viewports keep a usable table area */
+}
+
 .panel-agent-runs {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0; /* the inner table-scroll may shrink — no clipped overflow */
   margin-top: 24px;
+}
+
+/* The Agent Runs scroll region owns BOTH axes: overflow-x comes from the
+   base .table-scroll rule; overflow-y is added here so the full-height
+   panel scrolls internally instead of scrolling the page. */
+.panel-agent-runs .table-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 td.clickable {

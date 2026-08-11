@@ -2103,6 +2103,88 @@ console.log('\u25B6 index.html + style.css — Clear control + active state (iss
     'style.css: .filter-clear:disabled rule exists (disabled state styling)');
 })();
 
+// ── Agent Runs full-viewport layout + aggregate population (issue #411) ─
+// Two-part dashboard fix, verified statically against the real stylesheet
+// and markup (the repo's established substitute for browser-level checks):
+// (1) the active Agent Runs tab fills the viewport — the panel becomes a
+// flex column and its .table-scroll owns the vertical scroll region, so a
+// long run list scrolls inside the panel instead of the page; (2) the
+// shared date-range bar and KPI row (aggregate totals — Active Tokens,
+// Est. Cost, Sessions from the aggregates total row) sit ABOVE the tab
+// panels, so the aggregate totals render on the Agent Runs tab with the
+// dashboard date range applied.  The three responsive viewport bands stay
+// untouched (verified by the existing band assertions above).
+
+console.log('\u25B6 Agent Runs full-viewport layout + aggregate population (issue #411)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+
+  // ── Part 1: full-viewport layout ────────────────────────────────────
+  // The active Agent Runs tab is a flex column sized from the viewport
+  // (leaving room for the fixed chrome), so the panel can fill it.
+  var arTabRule = css.match(/#tab-agent-runs\.active\s*\{[^}]*\}/);
+  assert(arTabRule !== null,
+    'style.css: #tab-agent-runs.active rule exists (full-viewport layout hook)');
+  assert(arTabRule[0].indexOf('display: flex') !== -1 &&
+         arTabRule[0].indexOf('flex-direction: column') !== -1,
+    'style.css: the active Agent Runs tab is a flex column');
+  assert(arTabRule[0].indexOf('calc(100vh') !== -1,
+    'style.css: the active Agent Runs tab height is viewport-derived (fills below header/nav/footer)');
+
+  // The panel stretches to fill the tab and stacks title → filters →
+  // scroll region vertically; min-height: 0 lets the scroll region shrink
+  // instead of overflowing the fixed tab height.
+  var arPanelRule = css.match(/\.panel-agent-runs\s*\{[^}]*\}/);
+  assert(arPanelRule !== null,
+    'style.css: .panel-agent-runs rule exists');
+  assert(arPanelRule[0].indexOf('display: flex') !== -1 &&
+         arPanelRule[0].indexOf('flex-direction: column') !== -1,
+    'style.css: .panel-agent-runs is a flex column (title + filters + scroll region stack)');
+  assert(arPanelRule[0].indexOf('flex: 1') !== -1,
+    'style.css: .panel-agent-runs flexes to fill the active tab');
+  assert(arPanelRule[0].indexOf('min-height: 0') !== -1,
+    'style.css: .panel-agent-runs min-height: 0 (inner scroll region may shrink, no clip)');
+
+  // The table scroll region owns BOTH axes: horizontal overflow from the
+  // base .table-scroll rule, vertical overflow added for the full-viewport
+  // panel — the page itself must not scroll for long run lists.
+  var arScrollRule = css.match(/\.panel-agent-runs \.table-scroll\s*\{[^}]*\}/);
+  assert(arScrollRule !== null,
+    'style.css: .panel-agent-runs .table-scroll rule exists');
+  assert(arScrollRule[0].indexOf('overflow-y: auto') !== -1,
+    'style.css: the Agent Runs table-scroll owns the vertical scroll region');
+  assert(arScrollRule[0].indexOf('flex: 1') !== -1,
+    'style.css: the Agent Runs table-scroll flexes to fill the panel');
+
+  // ── Part 2: aggregate data population in the Agent Runs view ────────
+  // The date-range bar and the KPI row (aggregate totals from the
+  // aggregates total row) live ABOVE the tab panels — outside
+  // #tab-overview — so they render on every tab, including Agent Runs,
+  // with the dashboard date range applied (renderKPIs already populates
+  // them from aggTotal on every refresh cycle).
+  var tabOverviewIdx = html.indexOf('id="tab-overview"');
+  assert(tabOverviewIdx !== -1, 'index.html: #tab-overview still exists');
+  var drBarIdx = html.indexOf('id="date-range-bar"');
+  var kpiRowIdx = html.indexOf('id="kpi-row"');
+  assert(drBarIdx !== -1 && drBarIdx < tabOverviewIdx,
+    'index.html: #date-range-bar sits above the tab panels (shared across tabs, not scoped to Overview)');
+  assert(kpiRowIdx !== -1 && kpiRowIdx < tabOverviewIdx,
+    'index.html: #kpi-row (aggregate totals) sits above the tab panels (visible on the Agent Runs tab)');
+
+  // The Agent Runs tab itself keeps its full structure: panel, filters,
+  // table id, and tbody — the layout/aggregate fix must not drop markup.
+  var arTabHtml = html.slice(html.indexOf('id="tab-agent-runs"'));
+  assert(arTabHtml.indexOf('panel-agent-runs') !== -1,
+    'index.html: Agent Runs tab still carries the .panel-agent-runs panel');
+  assert(arTabHtml.indexOf('id="agent-runs-filters"') !== -1,
+    'index.html: Agent Runs tab still carries the filter bar');
+  assert(arTabHtml.indexOf('<table id="agent-runs-table">') !== -1 &&
+         arTabHtml.indexOf('id="agent-runs-tbody"') !== -1,
+    'index.html: Agent Runs tab still carries the merged table + tbody');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
 // completed (deterministic, not a fixed timer).  A safety cap at 5 s
