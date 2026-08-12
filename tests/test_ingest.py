@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -111,7 +112,7 @@ def _add_quarantine_defaults(mock_conn: AsyncMock) -> None:
     """Set default return values for quarantine-related mock methods.
 
     ``is_quarantined()`` uses ``fetchval`` → defaults to ``False``.
-    ``check_batch_overlap()`` (issue #416) uses ``fetch`` → defaults to ``[]``.
+    ``check_quarantine_overlap()`` uses ``fetch`` → defaults to ``[]``.
     Tests that exercise quarantine routing can override these.
     """
     mock_conn.fetchval = AsyncMock(return_value=False)
@@ -179,7 +180,7 @@ def _new_record_side_effect(record_count: int = 1) -> list:
     ``resolve_canonical_identity`` is monkeypatched in ``_build_ingest_app``
     to return a fixed UUID without consuming fetchrow slots.
     ``is_quarantined`` → fetchval (False by default) and
-    ``check_batch_overlap`` → fetch (empty by default) are handled by
+    ``check_quarantine_overlap`` → fetch (empty by default) are handled by
     ``_add_quarantine_defaults``.
 
     The atomic INSERT ON CONFLICT must return a row (winner path); the
@@ -6357,6 +6358,15 @@ class TestCanonicalEventAccept:
         uuid.UUID(result["event_id"])
         uuid.UUID(result["attempt_id"])
 
+        attempt_insert = next(
+            call
+            for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        )
+        record_jsonb = attempt_insert.args[5]
+        assert isinstance(record_jsonb, str)
+        assert json.loads(record_jsonb)["source_record_id"] == "rec-001"
+
     @pytest.mark.asyncio
     async def test_duplicate_record_does_not_create_second_canonical_event(self, monkeypatch):
         """A duplicate record returns accepted but does NOT insert a second
@@ -6829,6 +6839,7 @@ class TestQuarantinedIdentity:
         ]
         assert len(attempt_inserts) == 1
         assert "quarantined" in str(attempt_inserts[0])
+        assert isinstance(attempt_inserts[0].args[5], str)
 
         # Verify no canonical event INSERT was issued
         event_inserts = [
@@ -6842,10 +6853,10 @@ class TestQuarantinedIdentity:
     @pytest.mark.asyncio
     async def test_new_identity_with_overlap_triggers_quarantine(self, monkeypatch):
         """When a new source identity has records that overlap with an existing
-        identity (detected via batch-level check_batch_overlap, issue #416),
-        a quarantine entry is created and all records return status=quarantined.
-        Quarantine check runs BEFORE _process_one_record() — no session aggregate
-        update (issue #389 — Finding 2)."""
+        identity (detected via check_quarantine_overlap), a quarantine entry is
+        created and the record returns status=quarantined.  Quarantine check
+        runs BEFORE _process_one_record() — no session aggregate update
+        (issue #389 — Finding 2)."""
         mock_conn = AsyncMock()
         auth = _auth_row()
 
@@ -6864,7 +6875,7 @@ class TestQuarantinedIdentity:
 
         client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
 
-        # check_batch_overlap via fetch → returns overlap evidence (issue #416)
+        # check_quarantine_overlap via fetch → returns overlap evidence
         overlapping_identity_id = uuid.uuid4()
         mock_overlap_row = MagicMock()
         mock_overlap_row.__getitem__.side_effect = {
@@ -6978,6 +6989,7 @@ class TestQuarantinedIdentity:
         ]
         assert len(attempt_inserts) == 1
         assert "conflict" in str(attempt_inserts[0])
+        assert isinstance(attempt_inserts[0].args[5], str)
 
         # Verify no canonical event INSERT
         event_inserts = [
@@ -7218,10 +7230,9 @@ class TestReplayBatchQuarantinedIdentity:
 # Issue #388 — Ingest duplicate detection + replay merge on canonical events
 # ──────────────────────────────────────────────────────────────────────────────
 # Adjusted for #389 handler routing: _build_ingest_app monkeypatches
-# resolve_canonical_identity and is_quarantined.  check_batch_overlap
-# (issue #416) uses fetch and defaults to [].  The handler's cross-identity
-# conflict check consumes one fetchrow slot per record
-# (via _handler_routing_side_effect_items).
+# resolve_canonical_identity, is_quarantined, and check_quarantine_overlap.
+# The handler's cross-identity conflict check consumes one fetchrow slot
+# per record (via _handler_routing_side_effect_items).
 
 
 class TestCanonicalDuplicateDetection:
@@ -7921,60 +7932,14 @@ class TestCanonicalDuplicateDetection:
         assert new_values["cache_write_tokens"] == 15
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Issue #416 — Query-count regression: at most one historical overlap query
-#  per ingest batch
-# ════════════════════════════════════════════════════════════════════════════
-
-
 class TestBatchOverlapQueryCount:
-    """Verify that a 100-record ingest batch performs at most one historical
-    overlap query (issue #416).  The old per-record check_quarantine_overlap
-    would self-join ``usage_ingest_attempts`` once per record; the new
-    check_batch_overlap queries ``usage_events`` once for the entire batch."""
+    """Issue #416 batch overlap routing regressions."""
 
-    @pytest.mark.asyncio
-    async def test_100_record_batch_uses_one_overlap_query(self, monkeypatch):
-        """A 100-record non-overlapping batch calls fetch (the overlap query)
-        at most once.  fetch is the only call site that performs a historical
-        overlap scan — there must be no per-record overlap query."""
-        mock_conn = AsyncMock()
-        auth = _auth_row()
-
-        # Side-effect list: 100 records × (
-        #   cross-identity conflict (None — no conflict),
-        #   model upsert (None), atomic INSERT, session,
-        #   model_lookup, session_lookup, event_lookup (None)
-        # ) = 7 fetchrow calls per record = 700 total + 1 sd_check
-        side_effects = [auth, None]  # auth + sd_check
-        for _ in range(100):
-            insert_row = MagicMock()
-            insert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-            session_row = MagicMock()
-            session_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-            model_lookup_row = MagicMock()
-            model_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-            session_lookup_row = MagicMock()
-            session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-            side_effects.extend([
-                None,               # cross-identity conflict
-                None,               # model upsert (None = insert path)
-                insert_row,         # atomic INSERT RETURNING id
-                session_row,        # session resolution
-                model_lookup_row,   # canonical: model lookup
-                session_lookup_row, # canonical: session lookup
-                None,               # canonical: event lookup
-            ])
-
-        mock_conn.fetchrow = AsyncMock(side_effect=side_effects)
-        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
-
-        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
-
-        # Build 100 records with unique source_record_ids
-        records = [
+    @staticmethod
+    def _records(count: int) -> list[dict]:
+        return [
             {
-                "source_record_id": f"rec-{i:03d}",
+                "source_record_id": f"batch-rec-{index:03d}",
                 "session_id": str(_SESSION_ID),
                 "model": "gpt-4",
                 "input_tokens": 100,
@@ -7983,73 +7948,54 @@ class TestBatchOverlapQueryCount:
                 "estimated_cost_usd": "0.0035",
                 "reported_at": _mk_ts().isoformat(),
             }
-            for i in range(100)
+            for index in range(count)
         ]
+
+    @pytest.mark.asyncio
+    async def test_100_records_execute_one_overlap_query(self, monkeypatch):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), *_new_record_side_effect(100)],
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
 
         async with client as c:
             response = await c.post(
                 "/ingest",
-                json=_valid_ingest_payload(records=records),
+                json=_valid_ingest_payload(records=self._records(100)),
                 headers={"Authorization": "Bearer collector-token"},
             )
 
         assert response.status_code == 200
-        data = response.json()["data"]
-        assert data["accepted_count"] == 100
-        assert data["rejected_count"] == 0
-
-        # The critical assertion: at most ONE fetch call (the batch-level
-        # check_batch_overlap query).  With the old per-record approach
-        # this would be 100 fetch calls — one per record.
-        assert mock_conn.fetch.call_count <= 1, (
-            f"Expected at most 1 fetch call (batch overlap query), "
-            f"got {mock_conn.fetch.call_count} — per-record overlap scan "
-            f"regression detected (issue #416)"
-        )
+        assert response.json()["data"]["accepted_count"] == 100
+        assert mock_conn.fetch.await_count == 1
+        sql = mock_conn.fetch.call_args.args[0]
+        assert "source_record_id = ANY($2::text[])" in sql
+        assert "usage_ingest_attempts" not in sql
 
     @pytest.mark.asyncio
-    async def test_batch_overlap_quarantines_all_records(self, monkeypatch):
-        """When batch overlap is detected, ALL 100 records are quarantined
-        and the identity is quarantined once — no per-record overlap scans."""
+    async def test_overlap_quarantines_batch_before_accounting(self, monkeypatch):
         mock_conn = AsyncMock()
-        auth = _auth_row()
-
-        # quarantine_identity returns the new quarantine row
-        mock_quarantine_row = MagicMock()
-        mock_quarantine_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
-
-        mock_conn.fetchrow = AsyncMock(side_effect=[auth, None, mock_quarantine_row])
+        quarantine_row = MagicMock()
+        quarantine_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, quarantine_row],
+        )
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
-
         client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
 
-        # Set up overlap detection: check_batch_overlap returns evidence
-        overlapping_identity_id = uuid.uuid4()
-        mock_overlap_row = MagicMock()
-        mock_overlap_row.__getitem__.side_effect = {
-            "overlapping_identity_id": overlapping_identity_id,
+        overlap_row = MagicMock()
+        overlap_row.__getitem__.side_effect = {
+            "overlapping_identity_id": uuid.uuid4(),
             "overlap_count": 50,
         }.__getitem__
-        mock_conn.fetch = AsyncMock(return_value=[mock_overlap_row])
-
-        records = [
-            {
-                "source_record_id": f"rec-{i:03d}",
-                "session_id": str(_SESSION_ID),
-                "model": "gpt-4",
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "cached_tokens": 0,
-                "estimated_cost_usd": "0.0035",
-                "reported_at": _mk_ts().isoformat(),
-            }
-            for i in range(100)
-        ]
+        mock_conn.fetch = AsyncMock(return_value=[overlap_row])
 
         async with client as c:
             response = await c.post(
                 "/ingest",
-                json=_valid_ingest_payload(records=records),
+                json=_valid_ingest_payload(records=self._records(100)),
                 headers={"Authorization": "Bearer collector-token"},
             )
 
@@ -8057,34 +8003,53 @@ class TestBatchOverlapQueryCount:
         data = response.json()["data"]
         assert data["accepted_count"] == 0
         assert data["rejected_count"] == 100
-        assert all(r["status"] == "quarantined" for r in data["results"])
+        assert all(result["status"] == "quarantined" for result in data["results"])
+        assert mock_conn.fetch.await_count == 1
 
-        # Exactly one fetch call (batch-level overlap query)
-        assert mock_conn.fetch.call_count == 1, (
-            f"Expected exactly 1 fetch call for batch overlap, "
-            f"got {mock_conn.fetch.call_count}"
-        )
-
-        # Exactly one quarantine_identity call
-        quarantine_inserts = [
-            call for call in mock_conn.fetchrow.call_args_list
-            if "INSERT INTO source_identity_quarantine" in str(call)
-        ]
-        assert len(quarantine_inserts) == 1
-
-        # All 100 records recorded as quarantined attempts
-        attempt_inserts = [
-            call for call in mock_conn.execute.call_args_list
+        fetchrow_sql = [str(call.args[0]) for call in mock_conn.fetchrow.call_args_list]
+        execute_sql = [str(call.args[0]) for call in mock_conn.execute.call_args_list]
+        assert sum("INSERT INTO source_identity_quarantine" in sql for sql in fetchrow_sql) == 1
+        assert not any("INSERT INTO opencode_usage_records" in sql for sql in fetchrow_sql)
+        assert not any("INSERT INTO sessions" in sql for sql in fetchrow_sql)
+        assert not any("INSERT INTO usage_events" in sql for sql in execute_sql)
+        assert sum("INSERT INTO usage_ingest_attempts" in sql for sql in execute_sql) == 100
+        attempt_calls = [
+            call
+            for call in mock_conn.execute.call_args_list
             if "INSERT INTO usage_ingest_attempts" in str(call)
-            and "quarantined" in str(call)
         ]
-        assert len(attempt_inserts) == 100, (
-            f"Expected 100 quarantined attempts, got {len(attempt_inserts)}"
-        )
+        assert all(isinstance(call.args[5], str) for call in attempt_calls)
 
-        # No canonical events created
-        event_inserts = [
-            call for call in mock_conn.execute.call_args_list
-            if "INSERT INTO usage_events" in str(call)
-        ]
-        assert len(event_inserts) == 0
+    @pytest.mark.asyncio
+    async def test_invalid_record_remains_rejected_in_overlapping_batch(self, monkeypatch):
+        mock_conn = AsyncMock()
+        quarantine_row = MagicMock()
+        quarantine_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, quarantine_row],
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        overlap_row = MagicMock()
+        overlap_row.__getitem__.side_effect = {
+            "overlapping_identity_id": uuid.uuid4(),
+            "overlap_count": 1,
+        }.__getitem__
+        mock_conn.fetch = AsyncMock(return_value=[overlap_row])
+        records = self._records(2)
+        records[0]["input_tokens"] = -1
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(records=records),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        results = response.json()["data"]["results"]
+        assert results[0]["status"] == "rejected"
+        assert results[0]["reason"] == "Negative token value"
+        assert results[1]["status"] == "quarantined"
+        assert "overlap detected" in results[1]["reason"]

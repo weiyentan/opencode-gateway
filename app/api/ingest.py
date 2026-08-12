@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import date, datetime, timezone
@@ -1501,7 +1502,7 @@ async def _record_canonical_event(
     attempt_id: uuid.UUID | None = None
     outcome_str: str = "accepted"
     reason: str | None = None
-    record_jsonb = record.model_dump(mode="json")
+    record_jsonb = json.dumps(record.model_dump(mode="json"))
 
     async with conn.transaction():
         # Lock wait time tracked via telemetry — duration_ms in the
@@ -1746,44 +1747,55 @@ async def ingest_usage(
         resolve_canonical_identity,
     )
 
-    # ── Batch-level identity resolution and quarantine checks ─────────
-    # (issue #416): resolve the canonical source identity ONCE per batch,
-    # check active quarantine ONCE per batch, and perform a SINGLE
-    # set-based overlap check over the batch's source_record_ids instead
-    # of a per-record full-history self-join.
-    collector_source_id = str(source_db_id)
-    canonical_identity_id = await resolve_canonical_identity(
-        conn, client_id, collector_source_id,
-    )
+    canonical_identity_id: uuid.UUID | None = None
+    quarantined = False
+    newly_quarantined = False
+    validation_errors: dict[int, str] = {}
+    valid_records: list[IngestRecord] = []
+    for idx, record in enumerate(body.records):
+        try:
+            _validate_tokens(record)
+            valid_records.append(record)
+        except ValueError as exc:
+            validation_errors[idx] = str(exc)
 
-    quarantined = await is_quarantined(conn, canonical_identity_id)
-
-    if not quarantined:
-        # Batch-level overlap check: compare the incoming source_record_ids
-        # against canonical events owned by other unresolved identities
-        # in ONE query (replaces per-record check_quarantine_overlap).
-        source_record_ids = [r.source_record_id for r in body.records]
-        overlaps = await check_batch_overlap(
-            conn, client_id, canonical_identity_id, source_record_ids,
+    if valid_records:
+        collector_source_id = str(source_db_id)
+        canonical_identity_id = await resolve_canonical_identity(
+            conn, client_id, collector_source_id,
         )
-        if overlaps:
-            primary_overlap = overlaps[0]
-            await quarantine_identity(
+        quarantined = await is_quarantined(conn, canonical_identity_id)
+
+        if not quarantined:
+            overlaps = await check_batch_overlap(
                 conn,
+                client_id,
                 canonical_identity_id,
-                primary_overlap.overlapping_identity_id,
-                primary_overlap.overlap_count,
+                [record.source_record_id for record in valid_records],
             )
-            quarantined = True  # newly quarantined — treat as active
+            if overlaps:
+                primary_overlap = overlaps[0]
+                await quarantine_identity(
+                    conn,
+                    canonical_identity_id,
+                    primary_overlap.overlapping_identity_id,
+                    primary_overlap.overlap_count,
+                )
+                quarantined = True
+                newly_quarantined = True
 
-    if quarantined:
-        # Identity is quarantined — all records in the batch are
-        # immediately quarantined BEFORE any accounting side effects.
-        reason = (
-            "Record quarantined — source identity has active quarantine"
-        )
+    if canonical_identity_id is not None and quarantined:
+        # Quarantine the whole batch before legacy or canonical accounting.
         for idx, record in enumerate(body.records):
-            record_jsonb = record.model_dump(mode="json")
+            if idx in validation_errors:
+                results.append(
+                    IngestRecordResult(
+                        index=idx,
+                        status="rejected",
+                        reason=validation_errors[idx],
+                    )
+                )
+                continue
             attempt_id = uuid.uuid4()
             await conn.execute(
                 """INSERT INTO usage_ingest_attempts
@@ -1795,7 +1807,7 @@ async def ingest_usage(
                 None,
                 canonical_identity_id,
                 record.source_record_id,
-                record_jsonb,
+                json.dumps(record.model_dump(mode="json")),
                 batch_id,
                 "quarantined",
                 body.replay_id,
@@ -1805,37 +1817,31 @@ async def ingest_usage(
                 IngestRecordResult(
                     index=idx,
                     status="quarantined",
-                    reason=reason,
+                    reason=(
+                        "Record quarantined — source identity overlap detected"
+                        if newly_quarantined
+                        else "Record quarantined — source identity has active quarantine"
+                    ),
                     attempt_id=attempt_id,
                     event_id=None,
                 )
             )
         rejected = len(body.records)
-    else:
+    elif canonical_identity_id is not None:
         for idx, record in enumerate(body.records):
             try:
-                # ── Pre-ingest routing: cross-identity conflict check must
-                # run BEFORE _process_one_record() so that conflicted records
-                # do NOT insert a raw usage record and do NOT bump session
-                # aggregates (issue #389 — Findings 1 & 2).
-                # Batch-level identity resolution and quarantine checks were
-                # performed above (issue #416).
-
-                # Step 1: Basic validation
-                try:
-                    _validate_tokens(record)
-                except ValueError as exc:
+                # Record-specific routing remains per record, but the historical
+                # overlap scan has already run once for the entire batch.
+                if idx in validation_errors:
                     result = IngestRecordResult(
                         index=idx,
                         status="rejected",
-                        reason=str(exc),
+                        reason=validation_errors[idx],
                     )
                     results.append(result)
                     rejected += 1
                     continue
 
-                # Step 2: Cross-identity conflict check (per-record —
-                # record-specific behaviour is required here)
                 cross_event = await conn.fetchrow(
                     """SELECT ue.id, ue.canonical_source_identity_id
                        FROM usage_events ue
@@ -1853,7 +1859,6 @@ async def ingest_usage(
                     canonical_identity_id,
                 )
                 if cross_event is not None:
-                    record_jsonb = record.model_dump(mode="json")
                     attempt_id = uuid.uuid4()
                     await conn.execute(
                         """INSERT INTO usage_ingest_attempts
@@ -1865,7 +1870,7 @@ async def ingest_usage(
                         None,
                         canonical_identity_id,
                         record.source_record_id,
-                        record_jsonb,
+                        json.dumps(record.model_dump(mode="json")),
                         batch_id,
                         "conflict",
                         body.replay_id,
@@ -1883,8 +1888,9 @@ async def ingest_usage(
                     rejected += 1
                     continue
 
-                # Step 3: Pre-ingest checks passed — proceed with normal ingest
-                result = await _process_one_record(conn, record, idx, client_id, source_db_id, now)
+                result = await _process_one_record(
+                    conn, record, idx, client_id, source_db_id, now,
+                )
             except Exception as exc:
                 logger.warning("Record %s failed processing: %s", idx, exc)
                 result = IngestRecordResult(
@@ -1892,16 +1898,8 @@ async def ingest_usage(
                 )
             results.append(result)
             if result.status == "accepted":
-                # ── Canonical event layer: record a canonical event for
-                # genuinely new records (not idempotent duplicates from replay).
                 is_new = result.reason is None or not result.reason.startswith("Duplicate")
                 if not is_new:
-                    # Legacy duplicate (idempotent replay of a pre-existing
-                    # record ingested before the canonical event layer was
-                    # deployed).  Check whether a canonical event already
-                    # exists for this identity and source record — if not,
-                    # backfill one so that pre-deploy usage data is not
-                    # permanently invisible (PR #396, finding #8).
                     existing = await conn.fetchrow(
                         "SELECT 1 FROM usage_events"
                         " WHERE canonical_source_identity_id = $1"
@@ -1910,7 +1908,7 @@ async def ingest_usage(
                         record.source_record_id,
                     )
                     if existing is None:
-                        is_new = True  # backfill — no canonical event exists yet
+                        is_new = True
                 if is_new:
                     try:
                         canonical = await _record_canonical_event(
@@ -1920,8 +1918,6 @@ async def ingest_usage(
                         )
                         result.event_id = canonical["event_id"]
                         result.attempt_id = canonical["attempt_id"]
-                        # Propagate the canonical-level status when it differs
-                        # from "accepted" (e.g. duplicate / updated on replay).
                         canonical_status = canonical.get("status")
                         if canonical_status and canonical_status != "accepted":
                             result.status = canonical_status
@@ -1932,19 +1928,16 @@ async def ingest_usage(
                             "Record %s canonical event recording failed: %s", idx, exc,
                         )
 
-            # ── Counting — records with status "accepted", "duplicate", or
-            # "updated" all represent successful processing (the record was
-            # either new, idempotent, or reconciled).  Only records with
-            # status "quarantined", "conflict", or "rejected" increment the
-            # rejected count.
             if result.status in ("accepted", "duplicate", "updated"):
-                # "duplicate" (idempotent replay) and "updated" (replay merge)
-                # are successful processing outcomes — no event creation, no
-                # error — and count as accepted so that
-                # accepted_count + rejected_count == len(records) always holds.
                 accepted += 1
             else:
                 rejected += 1
+    elif validation_errors:
+        for idx, reason in validation_errors.items():
+            results.append(
+                IngestRecordResult(index=idx, status="rejected", reason=reason)
+            )
+        rejected = len(validation_errors)
 
     # ── Update ingest batch with final counts ────────────────────────
     await conn.execute(
