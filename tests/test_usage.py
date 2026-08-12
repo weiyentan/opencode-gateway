@@ -1185,6 +1185,110 @@ class TestClientProjectAggregates:
                 f"{label} query must not use raw reported_at <= $2, got:\n{sql}"
             )
 
+    @pytest.mark.asyncio
+    async def test_project_label_strips_numeric_suffix_sql_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The project-label COALESCE chains strip the workspace numeric
+        suffix at read time in both read paths.
+
+        ``_ROLLUP_PROJECT_LABEL_SQL`` (rollup + count queries) and
+        ``_PROJECT_LABEL_SQL`` (raw usage_events aggregate) must both wrap
+        the ``osp.name`` branch in
+        ``NULLIF(regexp_replace(osp.name, '-\\d+$', ''), '')``
+        so workspace variants like ``opencode-gateway-6791`` and
+        ``opencode-gateway-6800`` collapse into a single ``opencode-gateway``
+        row in the Client/Project breakdown, while a name that strips to an
+        empty string (e.g. ``-6791``) becomes NULL and falls through the
+        COALESCE chain to the worktree/project_id/'unknown' fallbacks.
+        """
+        rollup_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=100,
+                total_output_tokens=50,
+                record_count=0, session_count=0, model_count=0,
+                project_label="Proj X",
+            )
+        ]
+        count_rows = [
+            _mk_aggregate_row(
+                group_value="ClientA|Proj X",
+                total_input_tokens=0,
+                total_output_tokens=0,
+                record_count=3, session_count=2, model_count=1,
+                project_label="Proj X",
+            )
+        ]
+        project_rows = [
+            _mk_aggregate_row(
+                group_value="Proj X",
+                record_count=3, session_count=2, model_count=1,
+                project_label="Proj X",
+            )
+        ]
+        mock_conn.fetch = AsyncMock(
+            side_effect=[rollup_rows, count_rows, project_rows]
+        )
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            # Rollup path: client,project → client_project_rollup + count query
+            resp_rollup = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                },
+            )
+            assert resp_rollup.status_code == 200
+            # Non-rollup path: project → raw usage_events scan
+            resp_project = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
+                },
+            )
+            assert resp_project.status_code == 200
+
+        # 3 fetch calls: rollup, count, raw project aggregate
+        assert mock_conn.fetch.call_count == 3
+        rollup_sql = mock_conn.fetch.call_args_list[0][0][0]
+        count_sql = mock_conn.fetch.call_args_list[1][0][0]
+        project_sql = mock_conn.fetch.call_args_list[2][0][0]
+
+        strip = "regexp_replace(osp.name, '-\\d+$', '')"
+        strip_nullif = "NULLIF(regexp_replace(osp.name, '-\\d+$', ''), '')"
+        for label, sql in (
+            ("rollup", rollup_sql),
+            ("count", count_sql),
+            ("project aggregate", project_sql),
+        ):
+            assert strip in sql, (
+                f"{label} SQL must strip the workspace numeric suffix from "
+                f"osp.name, got: {sql[:400]}"
+            )
+            # The stripped name must be NULLIF-wrapped so a name consisting
+            # only of a numeric suffix (e.g. ``-6791``) becomes NULL and the
+            # COALESCE chain falls through to the worktree / project_id /
+            # 'unknown' fallbacks instead of rendering a blank label.
+            assert strip_nullif in sql, (
+                f"{label} SQL must NULLIF-wrap the stripped name so an empty "
+                f"strip result falls through the COALESCE chain, "
+                f"got: {sql[:400]}"
+            )
+            # The strip must apply to the name branch only: display_name and
+            # the worktree/project_id fallbacks stay untouched.
+            assert "regexp_replace(osp.display_name" not in sql, (
+                f"{label} SQL must not strip display_name, got: {sql[:400]}"
+            )
+            assert "regexp_replace(osp.worktree" not in sql, (
+                f"{label} SQL must not strip the worktree fallback, got: {sql[:400]}"
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Records endpoint tests
