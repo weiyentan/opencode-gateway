@@ -19,6 +19,7 @@ from app.core.factory import create_app
 from app.core.identity import (
     OverlapEvidence,
     QuarantineRow,
+    check_batch_overlap,
     check_quarantine_overlap,
     generate_collector_token,
     get_active_quarantines,
@@ -974,6 +975,36 @@ class TestCheckQuarantineOverlap:
 
         sql = mock_conn.fetch.call_args.args[0]
         assert "canonical_parent_id IS NOT NULL" in sql
+
+
+class TestCheckBatchOverlap:
+    """check_batch_overlap performs one client-scoped set lookup."""
+
+    @pytest.mark.asyncio
+    async def test_returns_grouped_overlap_evidence(self, mock_conn: AsyncMock):
+        other_identity = uuid.uuid4()
+        record_ids = ["rec-1", "rec-2"]
+        mock_conn.fetch = AsyncMock(return_value=[_overlap_row(other_identity, 2)])
+
+        result = await check_batch_overlap(
+            mock_conn, _CLIENT_ID, _IDENTITY_A, record_ids,
+        )
+
+        assert result == [OverlapEvidence(other_identity, 2)]
+        assert mock_conn.fetch.await_count == 1
+        sql, *params = mock_conn.fetch.call_args.args
+        assert "usage_events" in sql
+        assert "source_record_id = ANY($2::text[])" in sql
+        assert "si.client_id = $1" in sql
+        assert "usage_ingest_attempts" not in sql
+        assert params == [_CLIENT_ID, record_ids, _IDENTITY_A]
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_skips_database(self, mock_conn: AsyncMock):
+        result = await check_batch_overlap(mock_conn, _CLIENT_ID, _IDENTITY_A, [])
+
+        assert result == []
+        mock_conn.fetch.assert_not_awaited()
 
 
 class TestQuarantineIdentity:
