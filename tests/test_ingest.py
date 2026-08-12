@@ -6988,6 +6988,96 @@ class TestQuarantinedIdentity:
             "No canonical event should be created for conflict records"
         )
 
+    @pytest.mark.asyncio
+    async def test_cross_identity_conflict_checks_attempts_history(self, monkeypatch):
+        """The per-record cross-identity conflict check consults BOTH the
+        canonical events table AND the complete delivery history
+        (usage_ingest_attempts) — so legacy pre-canonical records that were
+        accepted before usage_events existed cannot escape the conflict
+        check (PR #418 review finding)."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+
+        # cross-identity check: evidence comes back from the conflict-check
+        # fetchrow (the attempts leg of the UNION ALL query); only its
+        # non-None-ness matters for routing to "conflict".
+        different_identity_id = uuid.uuid4()
+        cross_event_row = MagicMock()
+        cross_event_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "canonical_source_identity_id": different_identity_id,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,                # 0. auth
+            None,                # 1. source_database check
+            cross_event_row,     # 2. cross-identity conflict check
+        ]
+
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "conflict"
+
+        # The conflict-check fetchrow is the ONLY fetchrow whose SQL unions
+        # usage_ingest_attempts (the batch overlap check uses conn.fetch).
+        conflict_checks = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "usage_ingest_attempts" in call.args[0]
+            and "UNION ALL" in call.args[0]
+        ]
+        assert len(conflict_checks) == 1, (
+            "Expected exactly one conflict-check fetchrow consulting "
+            "usage_ingest_attempts"
+        )
+        conflict_sql = conflict_checks[0].args[0]
+        assert "usage_ingest_attempts" in conflict_sql
+        assert "original_source_record_id" in conflict_sql
+        assert "a.outcome IN ('accepted', 'duplicate', 'updated')" in conflict_sql
+        assert "canonical_parent_id IS NOT NULL" in conflict_sql
+
+        # Unchanged routing behaviour: conflict record is not merged
+        assert "cross-identity" in (data["results"][0]["reason"] or "").lower()
+        assert data["results"][0]["event_id"] is None
+        assert data["results"][0]["attempt_id"] is not None
+
+        # Finding 2: session aggregate must NOT be updated
+        session_calls = [
+            call for call in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(call)
+        ]
+        assert len(session_calls) == 0, (
+            "Conflict record must NOT resolve session or bump session aggregates"
+        )
+
+        # Verify attempt recorded with conflict outcome
+        attempt_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "conflict" in str(attempt_inserts[0])
+
+        # Verify no canonical event INSERT
+        event_inserts = [
+            call for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(call)
+        ]
+        assert len(event_inserts) == 0, (
+            "No canonical event should be created for conflict records"
+        )
+
 
 class TestReplayBatchQuarantinedIdentity:
     """A replay batch arriving for an event whose source identity is
@@ -7960,7 +8050,7 @@ class TestBatchOverlapQueryCount:
         assert mock_conn.fetch.await_count == 1
         sql = mock_conn.fetch.call_args.args[0]
         assert "source_record_id = ANY($2::text[])" in sql
-        assert "usage_ingest_attempts" not in sql
+        assert "usage_ingest_attempts" in sql
 
     @pytest.mark.asyncio
     async def test_overlap_quarantines_batch_before_accounting(self, monkeypatch):
@@ -8035,3 +8125,37 @@ class TestBatchOverlapQueryCount:
         assert results[0]["reason"] == "Negative token value"
         assert results[1]["status"] == "quarantined"
         assert "overlap detected" in results[1]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_attempts_overlap_quarantines_batch(self, monkeypatch):
+        """Overlap evidence surfaced via the attempts leg still routes the
+        entire batch to quarantine before any accounting is written."""
+        mock_conn = AsyncMock()
+        quarantine_row = MagicMock()
+        quarantine_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, quarantine_row],
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        overlap_row = MagicMock()
+        overlap_row.__getitem__.side_effect = {
+            "overlapping_identity_id": uuid.uuid4(),
+            "overlap_count": 2,
+        }.__getitem__
+        mock_conn.fetch = AsyncMock(return_value=[overlap_row])
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(records=self._records(2)),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 0
+        assert data["rejected_count"] == 2
+        assert all(result["status"] == "quarantined" for result in data["results"])
+        assert mock_conn.fetch.await_count == 1

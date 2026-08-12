@@ -1841,8 +1841,14 @@ async def ingest_usage(
                     rejected += 1
                     continue
 
+                # Mirrors the batch overlap check (check_batch_overlap) for the
+                # complete delivery history: consults both usage_events AND
+                # usage_ingest_attempts so legacy pre-canonical records
+                # (accepted before usage_events existed) cannot escape the
+                # per-record cross-identity conflict check.
                 cross_event = await conn.fetchrow(
-                    """SELECT ue.id, ue.canonical_source_identity_id
+                    """SELECT 'event' AS evidence_source,
+                              ue.canonical_source_identity_id AS owner_identity_id
                        FROM usage_events ue
                        JOIN source_identities si ON si.id = ue.canonical_source_identity_id
                        WHERE si.client_id = $1
@@ -1852,6 +1858,19 @@ async def ingest_usage(
                              SELECT id FROM source_identities
                              WHERE canonical_parent_id IS NOT NULL
                          )
+                       UNION ALL
+                       SELECT 'attempt' AS evidence_source,
+                              a.source_identity_id AS owner_identity_id
+                       FROM usage_ingest_attempts a
+                       JOIN source_identities si ON si.id = a.source_identity_id
+                       WHERE si.client_id = $1
+                         AND a.original_source_record_id = $2
+                         AND a.source_identity_id <> $3
+                         AND a.source_identity_id NOT IN (
+                             SELECT id FROM source_identities
+                             WHERE canonical_parent_id IS NOT NULL
+                         )
+                         AND a.outcome IN ('accepted', 'duplicate', 'updated')
                        LIMIT 1""",
                     client_id,
                     record.source_record_id,

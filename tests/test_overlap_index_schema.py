@@ -1,4 +1,4 @@
-"""Tests for migration 0024's batch-overlap lookup index."""
+"""Tests for migrations 0024 and 0025 — batch-overlap lookup indexes."""
 
 from __future__ import annotations
 
@@ -35,3 +35,21 @@ def test_downgrade_drops_index_concurrently() -> None:
         downgrade(_config(), "0024:0023", sql=True)
 
     assert "DROP INDEX CONCURRENTLY ix_usage_events_source_record_id" in output.getvalue()
+
+
+def test_upgrade_0025_creates_concurrent_attempts_index() -> None:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        upgrade(_config(), "0024:0025", sql=True)
+
+    sql = output.getvalue()
+    assert "CREATE INDEX CONCURRENTLY ix_usage_ingest_attempts_original_source_record_id" in sql
+    assert "ON usage_ingest_attempts (original_source_record_id)" in sql
+
+
+def test_downgrade_0025_drops_index_concurrently() -> None:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        downgrade(_config(), "0025:0024", sql=True)
+
+    assert "DROP INDEX CONCURRENTLY ix_usage_ingest_attempts_original_source_record_id" in output.getvalue()

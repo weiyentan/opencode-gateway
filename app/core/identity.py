@@ -124,7 +124,16 @@ async def check_quarantine_overlap(
     client_id: uuid.UUID,
     candidate_source_id: str,
 ) -> list[OverlapEvidence]:
-    """Check whether a candidate source identity's records overlap existing ones.
+    """[DEPRECATED] Superseded by ``check_batch_overlap`` (issue #416, PR #418).
+
+    ``check_batch_overlap`` performs one client-scoped set lookup per
+    batch against BOTH ``usage_events`` AND ``usage_ingest_attempts``,
+    covering legacy pre-canonical records that exist only as attempts.
+    This function is no longer used in the production ingest path but
+    is retained because tests reference it.
+
+    ---
+    Check whether a candidate source identity's records overlap existing ones.
 
     Compares the candidate's ``usage_ingest_attempts`` deliveries against
     every other identity's deliveries for the same client, returning one
@@ -167,23 +176,56 @@ async def check_batch_overlap(
     canonical_identity_id: uuid.UUID,
     source_record_ids: list[str],
 ) -> list[OverlapEvidence]:
-    """Check a batch for records owned by other unresolved identities."""
+    """Check a batch for records owned by other unresolved identities.
+
+    Sources overlap evidence from TWO legs unioned in a single query:
+
+    * **canonical events** (``usage_events``) — the primary accounting
+      table where accepted and replay-merged records live.
+    * **complete delivery history** (``usage_ingest_attempts``) — covers
+      legacy pre-canonical records that were accepted before the
+      ``usage_events`` table existed.  These records have an attempt row
+      with an accounting outcome (``accepted`` / ``duplicate`` /
+      ``updated``) but no corresponding ``usage_events`` row.
+
+    The attempts leg filters to ``outcome IN ('accepted', 'duplicate',
+    'updated')`` so that quarantined, conflicted, and rejected deliveries
+    (which never produced accounting) are not flagged as overlap evidence
+    — preserving the positive property that the events-only leg already
+    has.
+    """
     if not source_record_ids:
         return []
 
     rows = await conn.fetch(
-        """SELECT ue.canonical_source_identity_id AS overlapping_identity_id,
-                  COUNT(*)::int AS overlap_count
-           FROM usage_events ue
-           JOIN source_identities si ON si.id = ue.canonical_source_identity_id
-           WHERE si.client_id = $1
-             AND ue.source_record_id = ANY($2::text[])
-             AND ue.canonical_source_identity_id <> $3
-             AND ue.canonical_source_identity_id NOT IN (
-                 SELECT id FROM source_identities
-                 WHERE canonical_parent_id IS NOT NULL
-             )
-           GROUP BY ue.canonical_source_identity_id
+        """SELECT overlapping_identity_id, COUNT(*)::int AS overlap_count
+           FROM (
+               SELECT ue.canonical_source_identity_id AS overlapping_identity_id,
+                      ue.source_record_id AS source_record_id
+               FROM usage_events ue
+               JOIN source_identities si ON si.id = ue.canonical_source_identity_id
+               WHERE si.client_id = $1
+                 AND ue.source_record_id = ANY($2::text[])
+                 AND ue.canonical_source_identity_id <> $3
+                 AND ue.canonical_source_identity_id NOT IN (
+                     SELECT id FROM source_identities
+                     WHERE canonical_parent_id IS NOT NULL
+                 )
+               UNION
+               SELECT a.source_identity_id AS overlapping_identity_id,
+                      a.original_source_record_id AS source_record_id
+               FROM usage_ingest_attempts a
+               JOIN source_identities si ON si.id = a.source_identity_id
+               WHERE si.client_id = $1
+                 AND a.original_source_record_id = ANY($2::text[])
+                 AND a.source_identity_id <> $3
+                 AND a.source_identity_id NOT IN (
+                     SELECT id FROM source_identities
+                     WHERE canonical_parent_id IS NOT NULL
+                 )
+                 AND a.outcome IN ('accepted', 'duplicate', 'updated')
+           ) shared_records
+           GROUP BY overlapping_identity_id
            ORDER BY overlap_count DESC""",
         client_id,
         source_record_ids,

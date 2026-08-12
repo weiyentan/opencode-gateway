@@ -994,10 +994,37 @@ class TestCheckBatchOverlap:
         assert mock_conn.fetch.await_count == 1
         sql, *params = mock_conn.fetch.call_args.args
         assert "usage_events" in sql
+        assert "usage_ingest_attempts" in sql
+        assert "original_source_record_id" in sql
+        assert "UNION" in sql
         assert "source_record_id = ANY($2::text[])" in sql
         assert "si.client_id = $1" in sql
-        assert "usage_ingest_attempts" not in sql
         assert params == [_CLIENT_ID, record_ids, _IDENTITY_A]
+
+    @pytest.mark.asyncio
+    async def test_attempts_leg_filters_to_accounting_outcomes(self, mock_conn: AsyncMock):
+        """The attempts leg only flags accounting outcomes (accepted/duplicate/updated),
+        not quarantined/conflicted/rejected deliveries that never produced accounting."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        await check_batch_overlap(mock_conn, _CLIENT_ID, _IDENTITY_A, ["rec-1"])
+        sql = mock_conn.fetch.call_args.args[0]
+        assert "a.outcome IN ('accepted', 'duplicate', 'updated')" in sql
+        # Verify both exclusion rules appear in the SQL
+        assert "canonical_parent_id IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_legacy_only_overlap_returns_evidence(self, mock_conn: AsyncMock):
+        """Overlap evidence surfaced exclusively from the attempts leg
+        (legacy pre-canonical records) is still returned."""
+        other_identity = uuid.uuid4()
+        mock_conn.fetch = AsyncMock(
+            return_value=[_overlap_row(other_identity, 3)],
+        )
+        result = await check_batch_overlap(
+            mock_conn, _CLIENT_ID, _IDENTITY_A, ["rec-1"],
+        )
+        assert result == [OverlapEvidence(other_identity, 3)]
+        assert mock_conn.fetch.await_count == 1
 
     @pytest.mark.asyncio
     async def test_empty_batch_skips_database(self, mock_conn: AsyncMock):
