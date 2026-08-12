@@ -161,6 +161,43 @@ async def check_quarantine_overlap(
     ]
 
 
+async def check_batch_overlap(
+    conn: asyncpg.Connection,
+    client_id: uuid.UUID,
+    canonical_identity_id: uuid.UUID,
+    source_record_ids: list[str],
+) -> list[OverlapEvidence]:
+    """Check a batch for records owned by other unresolved identities."""
+    if not source_record_ids:
+        return []
+
+    rows = await conn.fetch(
+        """SELECT ue.canonical_source_identity_id AS overlapping_identity_id,
+                  COUNT(*)::int AS overlap_count
+           FROM usage_events ue
+           JOIN source_identities si ON si.id = ue.canonical_source_identity_id
+           WHERE si.client_id = $1
+             AND ue.source_record_id = ANY($2::text[])
+             AND ue.canonical_source_identity_id <> $3
+             AND ue.canonical_source_identity_id NOT IN (
+                 SELECT id FROM source_identities
+                 WHERE canonical_parent_id IS NOT NULL
+             )
+           GROUP BY ue.canonical_source_identity_id
+           ORDER BY overlap_count DESC""",
+        client_id,
+        source_record_ids,
+        canonical_identity_id,
+    )
+    return [
+        OverlapEvidence(
+            overlapping_identity_id=row["overlapping_identity_id"],
+            overlap_count=row["overlap_count"],
+        )
+        for row in rows
+    ]
+
+
 async def quarantine_identity(
     conn: asyncpg.Connection,
     source_identity_id: uuid.UUID,
