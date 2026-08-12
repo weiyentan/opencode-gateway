@@ -86,7 +86,7 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
     # ── Resolve connection params from the same env vars as Settings ─────────
     kwargs: dict[str, object] = {
         "host": os.environ.get("GATEWAY_DATABASE_HOST", "localhost"),
-        "port": int(os.environ.get("GATEWAY_DATABASE_PORT", "5432")),
+        "port": os.environ.get("GATEWAY_DATABASE_PORT", "5432"),
         "database": os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway"),
         "user": os.environ.get("GATEWAY_DATABASE_USER", "opencode"),
         "password": os.environ.get("GATEWAY_DATABASE_PASSWORD", ""),
@@ -259,6 +259,16 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
         assert "ix_usage_ingest_attempts_original_source_record_id" in plan, (
             "Attempts leg must be served by the "
             "ix_usage_ingest_attempts_original_source_record_id index"
+        )
+        assert "usage_events" in plan, (
+            "EXPLAIN plan must reference the events table"
+        )
+        assert "Seq Scan on usage_events" not in plan, (
+            "Events leg must use an index scan, not a sequential scan"
+        )
+        assert "ix_usage_events_source_record_id" in plan, (
+            "Events leg must be served by the "
+            "ix_usage_events_source_record_id index"
         )
 
     finally:
