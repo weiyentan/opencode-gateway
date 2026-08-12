@@ -201,12 +201,15 @@ _ROLLUP_PROJECT_LABEL_SQL = """
             WHEN osp.worktree IS NULL
                   OR osp.worktree = ''
                   OR osp.worktree = '/' THEN NULL
-            ELSE substring(osp.worktree, '([^/]+)$')
+            ELSE NULLIF(
+                regexp_replace(substring(osp.worktree, '([^/]+)$'), '-\\d+$', ''),
+                ''
+            )
         END,
         CASE
             WHEN r.project_id IS NULL THEN NULL
             WHEN length(r.project_id) > 12 THEN substring(r.project_id, 1, 12) || '…'
-            ELSE r.project_id
+            ELSE NULLIF(regexp_replace(r.project_id, '-\\d+$', ''), '')
         END,
         'unknown'
     )
@@ -1676,12 +1679,15 @@ _PROJECT_LABEL_SQL = """
             WHEN osp.worktree IS NULL
                   OR osp.worktree = ''
                   OR osp.worktree = '/' THEN NULL
-            ELSE substring(osp.worktree, '([^/]+)$')
+            ELSE NULLIF(
+                regexp_replace(substring(osp.worktree, '([^/]+)$'), '-\\d+$', ''),
+                ''
+            )
         END,
         CASE
             WHEN s.project_id IS NULL THEN NULL
             WHEN length(s.project_id) > 12 THEN substring(s.project_id, 1, 12) || '…'
-            ELSE s.project_id
+            ELSE NULLIF(regexp_replace(s.project_id, '-\\d+$', ''), '')
         END,
         'unknown'
     )

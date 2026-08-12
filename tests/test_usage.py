@@ -1285,6 +1285,14 @@ class TestClientProjectAggregates:
             assert "regexp_replace(osp.display_name, '-\\d+$', '')" in sql, (
                 f"{label} SQL must strip the display_name suffix, got: {sql[:400]}"
             )
+            if label in ("rollup", "count"):
+                assert "regexp_replace(r.project_id, '-\\d+$', '')" in sql, (
+                    f"{label} SQL must strip the project_id suffix, got: {sql[:400]}"
+                )
+            else:
+                assert "regexp_replace(s.project_id, '-\\d+$', '')" in sql, (
+                    f"{label} SQL must strip the project_id suffix, got: {sql[:400]}"
+                )
             assert "regexp_replace(osp.worktree" not in sql, (
                 f"{label} SQL must not strip the worktree fallback, got: {sql[:400]}"
             )
