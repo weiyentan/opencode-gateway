@@ -126,6 +126,13 @@ async def check_quarantine_overlap(
 ) -> list[OverlapEvidence]:
     """Check whether a candidate source identity's records overlap existing ones.
 
+    .. deprecated:: 0.1.0 (issue #416)
+       Superseded by :func:`check_batch_overlap` — the ``POST /ingest``
+       pipeline now performs one set-based overlap query per ingest batch
+       instead of this per-record full-history self-join over
+       ``usage_ingest_attempts``.  Retained for reference and tests only;
+       do not wire this back into the ingest hot path.
+
     Compares the candidate's ``usage_ingest_attempts`` deliveries against
     every other identity's deliveries for the same client, returning one
     :class:`OverlapEvidence` per overlapping identity with the count of
@@ -167,7 +174,18 @@ async def check_batch_overlap(
     canonical_identity_id: uuid.UUID,
     source_record_ids: list[str],
 ) -> list[OverlapEvidence]:
-    """Check a batch for records owned by other unresolved identities."""
+    """Check whether incoming source record IDs overlap existing canonical events.
+
+    Performs ONE set-based query over ``usage_events`` instead of a
+    per-record self-join over ``usage_ingest_attempts``.  The batch's
+    ``source_record_ids`` are compared against records owned by other
+    unresolved identities — when an overlap is found the entire batch
+    should be quarantined before any accounting side effects are
+    written.
+
+    This is the batch-level replacement for :func:`check_quarantine_overlap`
+    in the ``POST /ingest`` pipeline (issue #416).
+    """
     if not source_record_ids:
         return []
 
