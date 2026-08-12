@@ -193,6 +193,10 @@ def _build_aggregate_filters(
 # ``_PROJECT_LABEL_SQL`` but adapted for ``client_project_rollup``, which
 # has no ``sessions`` join — ``r.project_id`` is the external project ID,
 # and ``opencode_source_projects`` is matched via a LATERAL subquery.
+# Like the metadata branches, the worktree-basename fallback and the
+# ``r.project_id`` fallback are normalized at read time: trailing
+# ``-\d+$`` workspace numeric suffixes are stripped, and empty strip
+# results cascade to 'unknown'.
 _ROLLUP_PROJECT_LABEL_SQL = """
     COALESCE(
         NULLIF(regexp_replace(osp.display_name, '-\\d+$', ''), ''),
@@ -1669,8 +1673,10 @@ RECORDS_WITH_CONTEXT_GROUP_BY: frozenset[str] = frozenset(
 
 # SQL expression for project label resolution
 # COALESCE(display_name w/o workspace suffix, name w/o workspace suffix,
-#          basename(NULLIF(worktree, '/')),
-#          external_project_id, 'unknown')
+#          worktree basename w/o workspace suffix,
+#          external_project_id w/o workspace suffix, 'unknown')
+# Every branch strips a trailing workspace numeric suffix (``-\d+$``);
+# empty strip results cascade to 'unknown'.
 _PROJECT_LABEL_SQL = """
     COALESCE(
         NULLIF(regexp_replace(osp.display_name, '-\\d+$', ''), ''),
