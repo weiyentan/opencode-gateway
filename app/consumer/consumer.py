@@ -21,6 +21,7 @@ from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from app.consumer.models import IngestRequest
+
 logger = logging.getLogger(__name__)
 
 # ── Defaults ────────────────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ _DEFAULT_CONSUMER_GROUP_ID = "opencode-gateway"
 _MAX_RETRIES = 5
 _INITIAL_BACKOFF_SECONDS = 1.0
 _MAX_BACKOFF_SECONDS = 60.0
+_DEFAULT_HTTP_TIMEOUT_SECONDS = 40.0
 
 
 class Consumer:
@@ -59,6 +61,7 @@ class Consumer:
         max_retries: int = _MAX_RETRIES,
         initial_backoff: float = _INITIAL_BACKOFF_SECONDS,
         max_backoff: float = _MAX_BACKOFF_SECONDS,
+        http_timeout_seconds: float = _DEFAULT_HTTP_TIMEOUT_SECONDS,
     ) -> None:
         self._kafka_brokers = kafka_brokers
         self._gateway_base_url = gateway_base_url.rstrip("/")
@@ -69,6 +72,7 @@ class Consumer:
         self._max_retries = max_retries
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
+        self._http_timeout_seconds = http_timeout_seconds
 
         self._consumer: AIOKafkaConsumer | None = None
         self._producer: AIOKafkaProducer | None = None
@@ -89,7 +93,8 @@ class Consumer:
 
         Optional env vars (fall back to defaults):
             ``GATEWAY_KAFKA_TOPIC``, ``GATEWAY_KAFKA_DLQ_TOPIC``,
-            ``GATEWAY_CONSUMER_GROUP_ID``
+            ``GATEWAY_CONSUMER_GROUP_ID``,
+            ``GATEWAY_CONSUMER_HTTP_TIMEOUT_SECONDS``
         """
         kafka_brokers = os.getenv("GATEWAY_KAFKA_BROKERS", "")
         base_url = os.getenv("GATEWAY_BASE_URL", "")
@@ -115,6 +120,12 @@ class Consumer:
             kafka_topic=os.getenv("GATEWAY_KAFKA_TOPIC", _DEFAULT_KAFKA_TOPIC),
             kafka_dlq_topic=os.getenv("GATEWAY_KAFKA_DLQ_TOPIC", _DEFAULT_KAFKA_DLQ_TOPIC),
             consumer_group_id=os.getenv("GATEWAY_CONSUMER_GROUP_ID", _DEFAULT_CONSUMER_GROUP_ID),
+            http_timeout_seconds=float(
+                os.getenv(
+                    "GATEWAY_CONSUMER_HTTP_TIMEOUT_SECONDS",
+                    str(_DEFAULT_HTTP_TIMEOUT_SECONDS),
+                )
+            ),
         )
 
     # ── Lifecycle ──────────────────────────────────────────────────────
@@ -124,6 +135,7 @@ class Consumer:
         self._http_client = httpx.AsyncClient(
             base_url=self._gateway_base_url,
             headers={"Authorization": f"Bearer {self._gateway_collector_token}"},
+            timeout=self._http_timeout_seconds,
         )
         self._consumer = AIOKafkaConsumer(
             self._kafka_topic,
