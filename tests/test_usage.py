@@ -1280,10 +1280,10 @@ class TestClientProjectAggregates:
                 f"strip result falls through the COALESCE chain, "
                 f"got: {sql[:400]}"
             )
-            # The strip must apply to the name branch only: display_name and
+            # Both metadata label branches can contain workspace suffixes;
             # the worktree/project_id fallbacks stay untouched.
-            assert "regexp_replace(osp.display_name" not in sql, (
-                f"{label} SQL must not strip display_name, got: {sql[:400]}"
+            assert "regexp_replace(osp.display_name, '-\\d+$', '')" in sql, (
+                f"{label} SQL must strip the display_name suffix, got: {sql[:400]}"
             )
             assert "regexp_replace(osp.worktree" not in sql, (
                 f"{label} SQL must not strip the worktree fallback, got: {sql[:400]}"

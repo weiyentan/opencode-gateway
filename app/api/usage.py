@@ -195,7 +195,7 @@ def _build_aggregate_filters(
 # and ``opencode_source_projects`` is matched via a LATERAL subquery.
 _ROLLUP_PROJECT_LABEL_SQL = """
     COALESCE(
-        osp.display_name,
+        NULLIF(regexp_replace(osp.display_name, '-\\d+$', ''), ''),
         NULLIF(regexp_replace(osp.name, '-\\d+$', ''), ''),
         CASE
             WHEN osp.worktree IS NULL
@@ -1665,11 +1665,12 @@ RECORDS_WITH_CONTEXT_GROUP_BY: frozenset[str] = frozenset(
 )
 
 # SQL expression for project label resolution
-# COALESCE(display_name, NULLIF(name w/o workspace suffix, ''), basename(NULLIF(worktree, '/')),
+# COALESCE(display_name w/o workspace suffix, name w/o workspace suffix,
+#          basename(NULLIF(worktree, '/')),
 #          external_project_id, 'unknown')
 _PROJECT_LABEL_SQL = """
     COALESCE(
-        osp.display_name,
+        NULLIF(regexp_replace(osp.display_name, '-\\d+$', ''), ''),
         NULLIF(regexp_replace(osp.name, '-\\d+$', ''), ''),
         CASE
             WHEN osp.worktree IS NULL
