@@ -421,7 +421,10 @@ def _build_ingest_app_for_integration(
 
     Disables the API-key middleware when ``api_key`` is ``None``; provides
     an ``Authorization: Bearer <api_key>`` header otherwise so the
-    middleware passes (GATEWAY_ENV=development allows any key).
+    middleware passes — the bearer token must exactly match
+    ``GATEWAY_API_KEY``, pinned to ``test-api-key`` by ``tests/conftest.py``
+    (the seeded collector credential hash matches it), so both auth layers
+    succeed.  ``GATEWAY_ENV=development`` does not bypass API-key checks.
     """
     from app.core.factory import create_app
     from app.db.session import get_session
