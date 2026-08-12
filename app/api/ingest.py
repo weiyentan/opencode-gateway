@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import date, datetime, timezone
@@ -1501,7 +1502,7 @@ async def _record_canonical_event(
     attempt_id: uuid.UUID | None = None
     outcome_str: str = "accepted"
     reason: str | None = None
-    record_jsonb = record.model_dump(mode="json")
+    record_jsonb = json.dumps(record.model_dump(mode="json"))
 
     async with conn.transaction():
         # Lock wait time tracked via telemetry — duration_ms in the
@@ -1806,7 +1807,7 @@ async def ingest_usage(
                 None,
                 canonical_identity_id,
                 record.source_record_id,
-                record.model_dump(mode="json"),
+                json.dumps(record.model_dump(mode="json")),
                 batch_id,
                 "quarantined",
                 body.replay_id,
@@ -1869,7 +1870,7 @@ async def ingest_usage(
                         None,
                         canonical_identity_id,
                         record.source_record_id,
-                        record.model_dump(mode="json"),
+                        json.dumps(record.model_dump(mode="json")),
                         batch_id,
                         "conflict",
                         body.replay_id,
