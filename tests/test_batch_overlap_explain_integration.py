@@ -7,6 +7,15 @@ confidence in the index plan (PR #418, Finding 1 / Note B).  The test
 is marked ``@pytest.mark.integration`` so CI excludes it with
 ``-m "not integration"``.  When no database is reachable it skips
 gracefully.
+
+To make the index-plan verification deterministic the test seeds a
+realistic dataset (thousands of rows) and disables ``enable_seqscan``
+for the EXPLAIN run: with sequential scans disabled the planner MUST
+serve the ``usage_ingest_attempts`` predicate through
+``ix_usage_ingest_attempts_original_source_record_id`` when the index
+exists, and can only fall back to a ``Seq Scan`` when the index is
+genuinely missing — so the ``no Seq Scan`` assertion is a true guard
+for the migration's index rather than an accident of tiny tables.
 """
 
 from __future__ import annotations
@@ -16,6 +25,10 @@ import uuid
 
 import asyncpg
 import pytest
+
+_FILLER_IDENTITY_COUNT = 20
+_FILLER_ROWS_PER_IDENTITY = 100
+_TARGET_RECORD_IDS = ["rec-1", "rec-2"]
 
 
 @pytest.mark.integration
@@ -86,35 +99,65 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
             "ON usage_ingest_attempts (original_source_record_id)"
         )
 
-        # ── Insert test data ────────────────────────────────────────────
+        # ── Seed a realistic dataset so the planner genuinely prefers ───
+        # ── the index over a seq scan on tiny fresh tables.            ──
         client_id = uuid.uuid4()
         identity_a = uuid.uuid4()
         identity_b = uuid.uuid4()
-
-        await conn.execute(
+        filler_identities = [
+            uuid.uuid4() for _ in range(_FILLER_IDENTITY_COUNT)
+        ]
+        all_identities = [(identity_a, "collector-a"), (identity_b, "collector-b")]
+        all_identities.extend(
+            (filler_id, f"collector-filler-{i}")
+            for i, filler_id in enumerate(filler_identities)
+        )
+        await conn.executemany(
             "INSERT INTO source_identities (id, client_id, collector_source_id) "
             "VALUES ($1, $2, $3)",
-            identity_a, client_id, "collector-a",
-        )
-        await conn.execute(
-            "INSERT INTO source_identities (id, client_id, collector_source_id) "
-            "VALUES ($1, $2, $3)",
-            identity_b, client_id, "collector-b",
+            [(ident, client_id, name) for ident, name in all_identities],
         )
 
-        # usage_events row for identity A
-        await conn.execute(
+        # usage_events: ~2,000 filler rows spread across the filler
+        # identities, plus the target records — rec-1 owned by the excluded
+        # identity A and rec-2 owned by identity B (the expected hit in the
+        # events leg).
+        event_rows = [
+            (
+                uuid.uuid4(),
+                filler_identities[n % _FILLER_IDENTITY_COUNT],
+                f"filler-rec-{n}",
+            )
+            for n in range(_FILLER_IDENTITY_COUNT * _FILLER_ROWS_PER_IDENTITY)
+        ]
+        event_rows.append((uuid.uuid4(), identity_a, "rec-1"))
+        event_rows.append((uuid.uuid4(), identity_b, "rec-2"))
+        await conn.executemany(
             "INSERT INTO usage_events "
             "(id, canonical_source_identity_id, source_record_id) "
             "VALUES ($1, $2, $3)",
-            uuid.uuid4(), identity_a, "rec-1",
+            event_rows,
         )
-        # usage_ingest_attempts row for identity B with outcome accepted
-        await conn.execute(
+
+        # usage_ingest_attempts: ~2,000 filler rows (outcome 'accepted'),
+        # plus target rows for identity B so the attempts leg also resolves
+        # to identity B — present in BOTH legs of the overlap query.
+        attempt_rows = [
+            (
+                uuid.uuid4(),
+                filler_identities[n % _FILLER_IDENTITY_COUNT],
+                f"filler-rec-{n}",
+                "accepted",
+            )
+            for n in range(_FILLER_IDENTITY_COUNT * _FILLER_ROWS_PER_IDENTITY)
+        ]
+        for rec_id in _TARGET_RECORD_IDS:
+            attempt_rows.append((uuid.uuid4(), identity_b, rec_id, "accepted"))
+        await conn.executemany(
             "INSERT INTO usage_ingest_attempts "
             "(id, source_identity_id, original_source_record_id, outcome) "
             "VALUES ($1, $2, $3, $4)",
-            uuid.uuid4(), identity_b, "rec-2", "accepted",
+            attempt_rows,
         )
 
         # ── EXPLAIN the full batch overlap query ────────────────────────
@@ -149,7 +192,17 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
             GROUP BY overlapping_identity_id
             ORDER BY overlap_count DESC"""
 
-        rows = await conn.fetch(explain_sql)
+        # Disable seq scans so the plan MUST use the index when it exists:
+        # with ``enable_seqscan = off`` the planner only falls back to a
+        # Seq Scan when no usable index is present, which makes the
+        # assertion below a genuine guard for the migration's index.
+        # Restored right after EXPLAIN (connection close in ``finally`` is
+        # the backup).
+        await conn.execute("SET enable_seqscan = off")
+        try:
+            rows = await conn.fetch(explain_sql)
+        finally:
+            await conn.execute("SET enable_seqscan = on")
         plan = "\n".join(str(r[0]) for r in rows)
 
         assert "usage_ingest_attempts" in plan, (
@@ -157,6 +210,10 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
         )
         assert "Seq Scan on usage_ingest_attempts" not in plan, (
             "Attempts leg must use an index scan, not a sequential scan"
+        )
+        assert "ix_usage_ingest_attempts_original_source_record_id" in plan, (
+            "Attempts leg must be served by the "
+            "ix_usage_ingest_attempts_original_source_record_id index"
         )
 
     finally:
