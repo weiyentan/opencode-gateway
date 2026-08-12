@@ -441,6 +441,7 @@ async def test_from_env_reads_all_vars():
         "GATEWAY_KAFKA_TOPIC": "my-usage",
         "GATEWAY_KAFKA_DLQ_TOPIC": "my-usage-dlq",
         "GATEWAY_CONSUMER_GROUP_ID": "my-group",
+        "GATEWAY_CONSUMER_HTTP_TIMEOUT_SECONDS": "55",
     }
     with patch.dict(os.environ, env_vars, clear=True):
         c = Consumer.from_env()
@@ -451,6 +452,7 @@ async def test_from_env_reads_all_vars():
     assert c._kafka_topic == "my-usage"
     assert c._kafka_dlq_topic == "my-usage-dlq"
     assert c._consumer_group_id == "my-group"
+    assert c._http_timeout_seconds == 55.0
 
 
 @pytest.mark.asyncio
@@ -468,6 +470,29 @@ async def test_from_env_falls_back_to_defaults():
     assert c._kafka_topic == "opencode-usage"
     assert c._kafka_dlq_topic == "opencode-usage-dlq"
     assert c._consumer_group_id == "opencode-gateway"
+    assert c._http_timeout_seconds == 40.0
+
+
+@pytest.mark.asyncio
+async def test_start_configures_gateway_http_timeout():
+    """The HTTP timeout exceeds the Gateway's 35-second request budget."""
+    consumer = Consumer(
+        kafka_brokers="broker:9092",
+        gateway_base_url="http://gw:8000",
+        gateway_collector_token="tok",
+        http_timeout_seconds=45.0,
+    )
+
+    with (
+        patch("app.consumer.consumer.httpx.AsyncClient") as mock_http_client,
+        patch("app.consumer.consumer.AIOKafkaConsumer") as mock_kafka_consumer,
+        patch("app.consumer.consumer.AIOKafkaProducer") as mock_kafka_producer,
+    ):
+        mock_kafka_consumer.return_value.start = AsyncMock()
+        mock_kafka_producer.return_value.start = AsyncMock()
+        await consumer.start()
+
+    assert mock_http_client.call_args.kwargs["timeout"] == 45.0
 
 
 @pytest.mark.asyncio

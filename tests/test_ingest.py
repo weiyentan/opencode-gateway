@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -6357,6 +6358,15 @@ class TestCanonicalEventAccept:
         uuid.UUID(result["event_id"])
         uuid.UUID(result["attempt_id"])
 
+        attempt_insert = next(
+            call
+            for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        )
+        record_jsonb = attempt_insert.args[5]
+        assert isinstance(record_jsonb, str)
+        assert json.loads(record_jsonb)["source_record_id"] == "rec-001"
+
     @pytest.mark.asyncio
     async def test_duplicate_record_does_not_create_second_canonical_event(self, monkeypatch):
         """A duplicate record returns accepted but does NOT insert a second
@@ -6829,6 +6839,7 @@ class TestQuarantinedIdentity:
         ]
         assert len(attempt_inserts) == 1
         assert "quarantined" in str(attempt_inserts[0])
+        assert isinstance(attempt_inserts[0].args[5], str)
 
         # Verify no canonical event INSERT was issued
         event_inserts = [
@@ -6978,6 +6989,7 @@ class TestQuarantinedIdentity:
         ]
         assert len(attempt_inserts) == 1
         assert "conflict" in str(attempt_inserts[0])
+        assert isinstance(attempt_inserts[0].args[5], str)
 
         # Verify no canonical event INSERT
         event_inserts = [
@@ -8091,6 +8103,12 @@ class TestBatchOverlapQueryCount:
         assert not any("INSERT INTO sessions" in sql for sql in fetchrow_sql)
         assert not any("INSERT INTO usage_events" in sql for sql in execute_sql)
         assert sum("INSERT INTO usage_ingest_attempts" in sql for sql in execute_sql) == 100
+        attempt_calls = [
+            call
+            for call in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(call)
+        ]
+        assert all(isinstance(call.args[5], str) for call in attempt_calls)
 
     @pytest.mark.asyncio
     async def test_invalid_record_remains_rejected_in_overlapping_batch(self, monkeypatch):
