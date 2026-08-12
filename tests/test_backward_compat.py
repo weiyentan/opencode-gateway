@@ -177,7 +177,7 @@ def _build_two_layer_app(
     )
     monkeypatch.setattr(
         _identity_mod,
-        "check_quarantine_overlap",
+        "check_batch_overlap",
         AsyncMock(return_value=[]),
     )
 
