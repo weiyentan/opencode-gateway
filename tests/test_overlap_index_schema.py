@@ -52,4 +52,8 @@ def test_downgrade_0025_drops_index_concurrently() -> None:
     with contextlib.redirect_stdout(output):
         downgrade(_config(), "0025:0024", sql=True)
 
-    assert "DROP INDEX CONCURRENTLY ix_usage_ingest_attempts_original_source_record_id" in output.getvalue()
+    assert (
+        "DROP INDEX CONCURRENTLY "
+        "ix_usage_ingest_attempts_original_source_record_id"
+        in output.getvalue()
+    )

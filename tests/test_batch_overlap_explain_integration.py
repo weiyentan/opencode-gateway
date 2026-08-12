@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Optional
 
 import asyncpg
 import pytest
@@ -93,8 +92,8 @@ async def test_batch_overlap_attempts_leg_uses_index_scan() -> None:
         "password": os.environ.get("GATEWAY_DATABASE_PASSWORD", ""),
     }
 
-    conn: Optional[asyncpg.Connection] = None
-    scratch_schema: Optional[str] = None
+    conn: asyncpg.Connection | None = None
+    scratch_schema: str | None = None
     try:
         try:
             conn = await asyncpg.connect(
