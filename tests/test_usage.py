@@ -1280,14 +1280,27 @@ class TestClientProjectAggregates:
                 f"strip result falls through the COALESCE chain, "
                 f"got: {sql[:400]}"
             )
-            # Both metadata label branches can contain workspace suffixes;
-            # the worktree/project_id fallbacks stay untouched.
+            # The metadata label branches, the worktree-basename fallback,
+            # and the project_id fallback can all carry workspace numeric
+            # suffixes; each branch strips them at read time.
             assert "regexp_replace(osp.display_name, '-\\d+$', '')" in sql, (
                 f"{label} SQL must strip the display_name suffix, got: {sql[:400]}"
             )
-            assert "regexp_replace(osp.worktree" not in sql, (
-                f"{label} SQL must not strip the worktree fallback, got: {sql[:400]}"
-            )
+            if label in ("rollup", "count"):
+                assert "regexp_replace(r.project_id, '-\\d+$', '')" in sql, (
+                    f"{label} SQL must strip the project_id suffix, got: {sql[:400]}"
+                )
+            else:
+                assert "regexp_replace(s.project_id, '-\\d+$', '')" in sql, (
+                    f"{label} SQL must strip the project_id suffix, got: {sql[:400]}"
+                )
+            # The NULLIF wrapper spans lines in the constants, so assert
+            # the contiguous core expression; it can only appear when the
+            # worktree-basename fallback is actually stripped.
+            assert (
+                "regexp_replace(substring(osp.worktree, '([^/]+)$'), '-\\d+$', '')"
+                in sql
+            ), f"{label} SQL must strip the worktree-basename suffix, got: {sql[:400]}"
 
 
 # ══════════════════════════════════════════════════════════════════════════
