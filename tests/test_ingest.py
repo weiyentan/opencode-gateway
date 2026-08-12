@@ -112,7 +112,7 @@ def _add_quarantine_defaults(mock_conn: AsyncMock) -> None:
     """Set default return values for quarantine-related mock methods.
 
     ``is_quarantined()`` uses ``fetchval`` → defaults to ``False``.
-    ``check_quarantine_overlap()`` uses ``fetch`` → defaults to ``[]``.
+    ``check_batch_overlap()`` uses ``fetch`` → defaults to ``[]``.
     Tests that exercise quarantine routing can override these.
     """
     mock_conn.fetchval = AsyncMock(return_value=False)
@@ -180,7 +180,7 @@ def _new_record_side_effect(record_count: int = 1) -> list:
     ``resolve_canonical_identity`` is monkeypatched in ``_build_ingest_app``
     to return a fixed UUID without consuming fetchrow slots.
     ``is_quarantined`` → fetchval (False by default) and
-    ``check_quarantine_overlap`` → fetch (empty by default) are handled by
+    ``check_batch_overlap`` → fetch (empty by default) are handled by
     ``_add_quarantine_defaults``.
 
     The atomic INSERT ON CONFLICT must return a row (winner path); the
@@ -6853,7 +6853,7 @@ class TestQuarantinedIdentity:
     @pytest.mark.asyncio
     async def test_new_identity_with_overlap_triggers_quarantine(self, monkeypatch):
         """When a new source identity has records that overlap with an existing
-        identity (detected via check_quarantine_overlap), a quarantine entry is
+        identity (detected via check_batch_overlap), a quarantine entry is
         created and the record returns status=quarantined.  Quarantine check
         runs BEFORE _process_one_record() — no session aggregate update
         (issue #389 — Finding 2)."""
@@ -6875,7 +6875,7 @@ class TestQuarantinedIdentity:
 
         client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
 
-        # check_quarantine_overlap via fetch → returns overlap evidence
+        # check_batch_overlap via fetch → returns overlap evidence
         overlapping_identity_id = uuid.uuid4()
         mock_overlap_row = MagicMock()
         mock_overlap_row.__getitem__.side_effect = {
@@ -6944,8 +6944,6 @@ class TestQuarantinedIdentity:
         different_identity_id = uuid.uuid4()
         cross_event_row = MagicMock()
         cross_event_row.__getitem__.side_effect = {
-            "id": uuid.uuid4(),
-            "canonical_source_identity_id": different_identity_id,
             "evidence_source": "event",
             "owner_identity_id": different_identity_id,
         }.__getitem__
@@ -7018,8 +7016,6 @@ class TestQuarantinedIdentity:
         different_identity_id = uuid.uuid4()
         cross_event_row = MagicMock()
         cross_event_row.__getitem__.side_effect = {
-            "id": uuid.uuid4(),
-            "canonical_source_identity_id": different_identity_id,
             "evidence_source": "attempt",
             "owner_identity_id": different_identity_id,
         }.__getitem__
@@ -7324,7 +7320,7 @@ class TestReplayBatchQuarantinedIdentity:
 # Issue #388 — Ingest duplicate detection + replay merge on canonical events
 # ──────────────────────────────────────────────────────────────────────────────
 # Adjusted for #389 handler routing: _build_ingest_app monkeypatches
-# resolve_canonical_identity, is_quarantined, and check_quarantine_overlap.
+# resolve_canonical_identity, is_quarantined, and check_batch_overlap.
 # The handler's cross-identity conflict check consumes one fetchrow slot
 # per record (via _handler_routing_side_effect_items).
 
