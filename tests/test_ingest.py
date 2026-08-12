@@ -6946,6 +6946,8 @@ class TestQuarantinedIdentity:
         cross_event_row.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "canonical_source_identity_id": different_identity_id,
+            "evidence_source": "event",
+            "owner_identity_id": different_identity_id,
         }.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
@@ -7018,6 +7020,8 @@ class TestQuarantinedIdentity:
         cross_event_row.__getitem__.side_effect = {
             "id": uuid.uuid4(),
             "canonical_source_identity_id": different_identity_id,
+            "evidence_source": "attempt",
+            "owner_identity_id": different_identity_id,
         }.__getitem__
 
         mock_conn.fetchrow = AsyncMock()
