@@ -315,6 +315,42 @@ async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> Non
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_superseded_link_not_reactivated_on_redelivery(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+
+        run_a = "01J0000000000000000000000008"
+        run_b = "01J0000000000000000000000009"
+
+        # Run A links the entity weakly; run B links it more confidently.
+        await repo.save(_make_run(run_a, confidence=0.5, role="referenced"))
+        await repo.save(_make_run(run_b, confidence=0.9, role="resolved"))
+
+        # Run A is now superseded by run B.
+        before = await conn.fetchval(
+            "SELECT superseded_at FROM afk_run_entities WHERE afk_run_id = $1",
+            run_a,
+        )
+        assert before is not None, "run A should be superseded before re-delivery"
+
+        # Re-deliver run A (a Kafka replay of the same 0.5 confidence).  The
+        # enrich-only conflict update must NOT clear its superseded_at.
+        await repo.save(_make_run(run_a, confidence=0.5, role="referenced"))
+
+        after = await conn.fetchval(
+            "SELECT superseded_at FROM afk_run_entities WHERE afk_run_id = $1",
+            run_a,
+        )
+        assert after is not None, (
+            "re-delivering a superseded link must not re-activate it "
+            "(superseded_at was reset to NULL)"
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_afk_run_entities_afk_run_id_not_null_enforced(
     db_pool: asyncpg.Pool,
 ) -> None:

@@ -112,8 +112,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
     async def save(self, run: AFKRun) -> None:
         """Persist ``run`` with enrich-only, replay-safe write semantics."""
-        await self._log_delivery(run)
+        # The run row must exist before the delivery_log row is written:
+        # ``delivery_log.afk_run_id`` carries a non-deferrable FK to
+        # ``afk_runs.afk_run_id``, so the upsert runs first.
         await self._upsert_run(run)
+        await self._log_delivery(run)
 
         entity_map: dict[str, EngineeringEntity] = {
             entity.entity_id: entity for entity in run.entities
@@ -221,7 +224,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         entity_map: dict[str, EngineeringEntity],
         correlation_map: dict[str, Correlation],
     ) -> None:
-        """Enrich-only upsert of a derived entity link, then mark superseded peers."""
+        """Enrich-only upsert of a derived entity link, then mark superseded peers.
+
+        On conflict the ``superseded_at`` column is deliberately left out of
+        the ``DO UPDATE`` set: a link that was once marked superseded stays
+        superseded across re-deliveries.  Re-delivering the same entity
+        mapping never re-activates it, preserving the one-authoritative-link
+        guarantee relied on by ``get``'s ``superseded_at IS NULL`` filter.
+        """
         entity = entity_map.get(link.entity_id)
         entity_type, external_id = _split_entity_id(link.entity_id)
         repository = entity.repository if entity is not None else ""
@@ -251,7 +261,6 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     EXCLUDED.resolver_version, afk_run_entities.resolver_version
                 ),
                 role = EXCLUDED.role,
-                superseded_at = NULL,
                 last_seen_at = now()
             """,
             link.afk_run_id,

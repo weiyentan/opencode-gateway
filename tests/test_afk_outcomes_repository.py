@@ -218,6 +218,31 @@ def test_save_delivery_log_uses_on_conflict_do_nothing(mock_conn: AsyncMock) -> 
     assert calls[0][1] == ("github", RUN_ID, RUN_ID, "completed")
 
 
+def test_save_upserts_run_before_logging_delivery(mock_conn: AsyncMock) -> None:
+    """The run row must exist before delivery_log references it.
+
+    ``delivery_log.afk_run_id`` has a non-deferrable FK to
+    ``afk_runs.afk_run_id``; on the first save of a new run the upsert must
+    execute before the delivery insert, otherwise the FK is violated.
+    """
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+
+    import asyncio
+
+    asyncio.run(repo.save(run))
+
+    sqls = _execute_calls(mock_conn)
+    run_idx = next(i for i, sql in enumerate(sqls) if "INSERT INTO afk_runs" in sql)
+    delivery_idx = next(
+        i for i, sql in enumerate(sqls) if "INSERT INTO delivery_log" in sql
+    )
+    assert run_idx < delivery_idx, (
+        "afk_runs upsert must precede delivery_log insert (non-deferrable FK): "
+        f"afk_runs@{run_idx}, delivery_log@{delivery_idx}"
+    )
+
+
 # ── Entity links — enrich-only ──────────────────────────────────────────────
 
 
@@ -260,6 +285,32 @@ def test_save_marks_superseded_links_without_delete(mock_conn: AsyncMock) -> Non
     assert "SET superseded_at = now()" in sql
     assert "afk_run_id <> $5" in sql
     assert "correlation_confidence < $6" in sql
+
+
+def test_save_does_not_reactivate_superseded_links(mock_conn: AsyncMock) -> None:
+    """A superseded link stays superseded when the same mapping is re-delivered.
+
+    The enrich-only semantics require ``superseded_at`` to be preserved on
+    conflict: the ``DO UPDATE`` set must not reset it back to ``NULL``.
+    """
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+
+    import asyncio
+
+    asyncio.run(repo.save(run))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO afk_run_entities")
+    assert calls, "no afk_run_entities insert issued"
+    sql = calls[0][0]
+    # Everything after DO UPDATE SET is the conflict-update clause; it must
+    # not mention superseded_at (so a null incoming value never erases a
+    # populated superseded_at).
+    set_clause = sql.split("DO UPDATE SET", 1)[1]
+    assert "superseded_at" not in set_clause, (
+        "entity-link upsert must not reset superseded_at on conflict: "
+        f"conflict SET clause contains superseded_at: {set_clause!r}"
+    )
 
 
 def test_save_never_issues_delete(mock_conn: AsyncMock) -> None:
