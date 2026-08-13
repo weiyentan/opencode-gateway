@@ -238,6 +238,11 @@ var historyStub = {
   // (reset to page 1, history.replaceState URL) join the same window seam.
   window.parseAgentRunPageSize = sandboxWindow.parseAgentRunPageSize;
   window.setAgentRunPageSize = sandboxWindow.setAgentRunPageSize;
+  // Issue #429: Agent Runs pagination resilience — the pure nearest-valid-
+  // page calculator and the shared agent-runs fetch path (refresh-style
+  // refetch, loading/error row retention, invalid-page fallback).
+  window.nearestValidAgentRunPage = sandboxWindow.nearestValidAgentRunPage;
+  window.fetchAgentRunsAndRender = sandboxWindow.fetchAgentRunsAndRender;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -3034,6 +3039,401 @@ console.log('\u25B6 Agent Runs page-size + filter reset (issue #428)');
   assert(calls[0].indexOf('agent=bob') !== -1,
     'selector: the current agent filter rides along after the reset');
 })();
+
+// ── Agent Runs pagination resilience (issue #429) ────────────────────────
+// The pagination flow must stay resilient during automatic refreshes, page
+// loads, request failures, and changing result totals: the current page
+// stays selected and refetches the same offset on refresh; rows and the
+// control remain visible during loading and failures (existing stale/error
+// treatment preserved); and when the fetched total no longer covers the
+// current page, the UI moves to the nearest valid page, updates the URL via
+// replaceState, and refetches it.  Empty results stay on page 1 with the
+// control cleared and never loop.
+//
+// These blocks share the same fakes as every earlier block (fetch stub,
+// table, pagination control, history, page state), so they are SERIALIZED
+// as a completion chain that starts on a delayed timer (60ms) — after the
+// client-cache and issue #7/#5 async chains have fully drained — and each
+// block re-establishes its own fixture inside its callback before running
+// the next, following the file's established deferred-async pattern.
+
+// Shared row fixtures (same field shape as the issue #5 render block).
+var arResilRowA = { id: 'res-a', title: 'Resilient alpha', currentStatus: 'running', model: 'gpt-4o', agent: 'alpha',
+  todo_completed: 1, todo_total: 2, code_changes_total: 0, total_estimated_cost_usd: 0.1,
+  total_input_tokens: 10, total_output_tokens: 5, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 0, last_updated_at: '2026-07-01T10:00:00' };
+var arResilRowB = { id: 'res-b', title: 'Resilient beta', currentStatus: 'completed', model: 'claude-sonnet', agent: 'beta',
+  todo_completed: 2, todo_total: 2, code_changes_total: 3, total_estimated_cost_usd: 0.2,
+  total_input_tokens: 20, total_output_tokens: 10, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 1, last_updated_at: '2026-07-01T09:00:00' };
+var arResilRowC = { id: 'res-c', title: 'Resilient gamma', currentStatus: 'running', model: 'gpt-4o', agent: 'gamma',
+  todo_completed: 0, todo_total: 1, code_changes_total: 0, total_estimated_cost_usd: 0,
+  total_input_tokens: 5, total_output_tokens: 2, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 0, last_updated_at: '2026-07-01T08:00:00' };
+
+// ── Pure calculation: nearest valid page from a fetched total ────────────
+// nearestValidAgentRunPage(total, currentPage, pageSize) returns the page
+// the UI must land on: the current page unchanged while it is still covered
+// by the fetched total, otherwise the last valid page.  An empty result
+// (total=0) resolves to page 1 — from page 1 it returns 1 unchanged so a
+// refetch can never loop, and from a higher page it lands on page 1, never
+// page 0.
+
+console.log('\u25B6 Agent Runs pagination resilience — nearest-valid-page calculation (issue #429)');
+
+(function () {
+  if (typeof window.nearestValidAgentRunPage !== 'function') {
+    assert(false, 'app.js: nearestValidAgentRunPage exposed on the window test seam');
+    return;
+  }
+
+  // Current page still covered by the result total → unchanged.
+  assert(window.nearestValidAgentRunPage(125, 3, 50) === 3,
+    'valid: page 3 of 125 rows (3 pages) stays on page 3');
+  assert(window.nearestValidAgentRunPage(125, 3, 25) === 3,
+    'valid: page 3 of 125 rows at 25/page (5 pages) stays on page 3');
+  assert(window.nearestValidAgentRunPage(50, 1, 50) === 1,
+    'valid: page 1 of exactly one full page stays on page 1');
+
+  // Total shrinks below the current page → nearest valid page.
+  assert(window.nearestValidAgentRunPage(60, 3, 50) === 2,
+    'shrink: 60 rows (2 pages) moves page 3 to page 2');
+  assert(window.nearestValidAgentRunPage(200, 5, 50) === 4,
+    'shrink: 200 rows (4 pages) moves page 5 to page 4');
+  assert(window.nearestValidAgentRunPage(10, 5, 50) === 1,
+    'shrink: 10 rows (1 page) moves page 5 to page 1');
+  assert(window.nearestValidAgentRunPage(50, 2, 50) === 1,
+    'shrink: exactly one full page (50 rows) moves page 2 to page 1');
+
+  // Empty result: resolves to page 1, never page 0; page 1 stays put.
+  assert(window.nearestValidAgentRunPage(0, 3, 50) === 1,
+    'empty: total=0 moves page 3 to page 1 (never page 0)');
+  assert(window.nearestValidAgentRunPage(0, 1, 50) === 1,
+    'empty: total=0 on page 1 stays on page 1 (no navigation)');
+  assert(window.nearestValidAgentRunPage(0, 0, 50) === 1,
+    'guard: a current page below 1 clamps to page 1');
+})();
+
+// ── Refresh refetches the currently selected page and offset ─────────────
+// The automatic-refresh path (and every refresh-style refetch) re-requests
+// the selected page through buildAgentRunsUrl — page state translates to
+// the same offset every cycle, so a refresh on page 3 refetches offset=100
+// rather than resetting to page 1.
+
+console.log('\u25B6 Agent Runs pagination resilience — refresh refetches the selected page (issue #429)');
+
+function resilienceBlockRefresh(next) {
+  // Fixture: the user is on page 3 of 50 rows (deep-link state).
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 100 }); }
+    });
+  };
+
+  window.fetchAgentRunsAndRender();
+  // The refresh-style refetch fires synchronously with the selected page's offset.
+  assert(fetched.length === 1 && fetched[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'refresh: exactly one agent-runs refetch triggered');
+  assert(fetched[0].indexOf('limit=50&offset=100') !== -1,
+    'refresh: the refetch requests the currently selected page 3 (offset=100)');
+
+  setTimeout(function () {
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 3, current page"') !== -1,
+      'refresh: the refetched page 3 renders as the current page');
+    assert(window.buildAgentRunsUrl().indexOf('offset=100') !== -1,
+      'refresh: subsequent requests keep the selected page offset');
+    next();
+  }, 0);
+}
+
+// ── Rows stay visible while a new page is loading ────────────────────────
+// A page request marks the panel 'refreshing' (which renders) and only
+// repaints the table once the response lands — so the previously displayed
+// rows and the pagination control remain on screen during the in-flight
+// request, with no empty-state flash.
+
+console.log('\u25B6 Agent Runs pagination resilience — rows stay visible during loading (issue #429)');
+
+function resilienceBlockLoading(next) {
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Prime the previously displayed page through the real fetch path: two
+  // rows on page 2 of 125 (also resolves the agent-runs panel to 'ok').
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowA, arResilRowB], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1,
+      'loading: fixture rows rendered before the refetch');
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+      'loading: pagination control rendered (page 2 current)');
+
+    // A slow page request: the fetch stays pending while we assert.
+    var resolveFetch = null;
+    appJsSandbox.fetch = function () {
+      return new Promise(function (resolve) { resolveFetch = resolve; });
+    };
+    window.fetchAgentRunsAndRender();
+
+    // While the new page is loading: previous rows and the control remain.
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-b"') !== -1,
+      'loading: previously displayed rows remain visible while the page request is in flight');
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+      'loading: the pagination control remains visible with the current page while loading');
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') === -1,
+      'loading: no empty-state flash while the page request is in flight');
+
+    // Now the page lands: the new rows replace the previous ones.
+    resolveFetch({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowC], total: 125, limit: 50, offset: 50 }); }
+    });
+    setTimeout(function () {
+      assert(arTbodyEl.innerHTML.indexOf('data-id="res-c"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-a"') === -1,
+        'loading: the newly loaded page replaces the previous rows');
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Page-request failure keeps previous rows + error treatment ───────────
+// A failed page request resolves the panel to 'stale' with the previous
+// updatedAt: the table keeps its previously displayed rows, the pagination
+// control keeps its last-known page info (both gated by shouldRenderPanel),
+// and the freshness label swaps to the existing "Showing previous data"
+// treatment — nothing is cleared or replaced.
+
+console.log('\u25B6 Agent Runs pagination resilience — page-request failure keeps rows + error treatment (issue #429)');
+
+function resilienceBlockFailure(next) {
+  // Freshness-label fake: applyPanelFreshness looks the span up at render
+  // time (document.getElementById), so registering it here is enough for
+  // the stale "Showing previous data" label to be observable.
+  var freshnessEl = makeFakeElement('freshness-agent-runs');
+  elementRegistry['freshness-agent-runs'] = freshnessEl;
+
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Establish the previously displayed page through a successful fetch.
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowA, arResilRowB], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1,
+      'failure: previous page rendered before the failing request');
+
+    // Now the page request fails.  The rejection is intentional: suppress
+    // the expected console.error for this block and restore it after
+    // (Nit 3 pattern).
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    appJsSandbox.fetch = function () {
+      return Promise.reject(new Error('network down'));
+    };
+    window.fetchAgentRunsAndRender();
+    setTimeout(function () {
+      assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-b"') !== -1,
+        'failure: previously displayed rows are preserved after the failed page request');
+      assert(arTbodyEl.innerHTML.indexOf('No agent runs') === -1,
+        'failure: no empty-state replacement after the failed page request');
+      assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+        'failure: the pagination control keeps the last-known page info');
+      assert(freshnessEl.textContent === 'Showing previous data',
+        'failure: the "Showing previous data" stale label is preserved (existing error treatment)');
+      appJsSandbox.console.error = savedConsoleError;
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Nearest-valid-page fallback when the total shrinks ───────────────────
+// When the fetched total implies fewer pages than the current page (the
+// result set shrank), the fallback hook moves the closure state to the
+// nearest valid page, REPLACES the URL (no history entry), and refetches
+// the corrected page through the shared path — the UI never sits on an
+// empty offset.
+
+console.log('\u25B6 Agent Runs pagination resilience — nearest-valid-page fallback (issue #429)');
+
+function resilienceBlockFallback(next) {
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Prime through the real fetch path: page 3 of 125 runs (3 pages)
+  // renders and the agent-runs panel resolves to 'ok'.
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 100 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    var page3 = arPaginationEl.querySelectorAll('button')
+      .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+    assert(!!page3, 'fallback: the page-3 button is rendered on page 3 of 125');
+
+    // The result set shrank to 60 runs (2 pages): every subsequent fetch
+    // reports the new total, whichever offset was requested.
+    var fetchCount = 0;
+    var fetched = [];
+    appJsSandbox.fetch = function (url) {
+      fetched.push(url);
+      fetchCount++;
+      return Promise.resolve({
+        ok: true,
+        json: function () {
+          return Promise.resolve({
+            items: [{}],
+            total: 60,
+            limit: 50,
+            offset: fetchCount === 1 ? 100 : 50
+          });
+        }
+      });
+    };
+    historyCalls.length = 0;
+    historyReplaceCalls.length = 0;
+    page3._handlers.click();
+
+    // Synchronous effects: the click pushes page=3, then fetches it.
+    assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=100') !== -1,
+      'fallback: the first fetch requests the stale page 3 (offset=100)');
+    assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=3&page_size=50',
+      'fallback: the page-3 click pushes page=3 into the URL');
+
+    setTimeout(function () {
+      // The stale page's response (total=60 → 2 pages) triggered the
+      // fallback: URL replaced with the nearest valid page and refetched.
+      assert(historyReplaceCalls.length === 1 && historyReplaceCalls[0] === '/index.html?page=2&page_size=50',
+        'fallback: the URL is updated to the nearest valid page via replaceState');
+      assert(historyCalls.length === 1,
+        'fallback: the fallback adds no new browser-history entry');
+      assert(fetched.length === 2 && fetched[1].indexOf('limit=50&offset=50') !== -1,
+        'fallback: the nearest valid page (2, offset=50) is refetched');
+      assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+        'fallback: the control renders the nearest valid page as current');
+      assert(window.buildAgentRunsUrl().indexOf('offset=50') !== -1,
+        'fallback: subsequent requests use the corrected page offset');
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Empty-result guard ───────────────────────────────────────────────────
+// No matching runs (total=0) must stay correct: on page 1 the guard makes
+// no navigation at all (no refetch, no URL change — the control clears and
+// the empty state renders); from a higher page it falls back to page 1
+// exactly once (URL replaced with page=1 — never page 0 — and one refetch),
+// which terminates because page 1 is always valid.
+
+console.log('\u25B6 Agent Runs pagination resilience — empty-result guard (issue #429)');
+
+function resilienceBlockEmpty(next) {
+  // Case 1: already on page 1 when the result set is empty.
+  appJsSandbox.location.search = '?page=1&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [], total: 0, limit: 50, offset: 0 }); } });
+  };
+  window.fetchAgentRunsAndRender();
+  assert(fetched.length === 1,
+    'empty: page 1 fetch fires once');
+  setTimeout(function () {
+    assert(fetched.length === 1,
+      'empty: total=0 on page 1 triggers no refetch (guard prevents a navigation loop)');
+    assert(historyReplaceCalls.length === 0 && historyCalls.length === 0,
+      'empty: total=0 on page 1 changes no URL state');
+    assert(arPaginationEl.innerHTML === '',
+      'empty: the pagination control clears when no runs match');
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+      'empty: the empty-state message renders on page 1');
+
+    // Case 2: on page 3 when the result set becomes empty → fall back to
+    // page 1 exactly once (URL replaced, one refetch, control cleared).
+    appJsSandbox.location.search = '?page=3&page_size=50';
+    window.readAgentRunPaginationFromUrl();
+    historyCalls.length = 0;
+    historyReplaceCalls.length = 0;
+    fetched.length = 0;
+    arTbodyEl.innerHTML = '';
+    window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 100 }); // 3 pages visible
+    var page3 = arPaginationEl.querySelectorAll('button')
+      .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+    assert(!!page3, 'empty: the page-3 button is rendered');
+    page3._handlers.click();
+    setTimeout(function () {
+      assert(historyReplaceCalls.length === 1 &&
+             historyReplaceCalls[0].indexOf('page=1&page_size=50') !== -1,
+        'empty: total=0 from page 3 replaces the URL with page=1 (never page 0)');
+      assert(fetched.length === 2,
+        'empty: total=0 from page 3 refetches exactly once (page 1) — no loop');
+      assert(fetched[1].indexOf('limit=50&offset=0') !== -1,
+        'empty: the refetch requests page 1 (offset=0)');
+      assert(arPaginationEl.innerHTML === '',
+        'empty: the control clears after the empty-result fallback');
+      assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+        'empty: the empty-state message renders after the fallback');
+      // Restore a benign default fetch stub for any later background work.
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
+      next();
+    }, 0);
+  }, 0);
+}
+
+// The five resilience blocks share the same fakes (fetch stub, table,
+// pagination control, history, page state), so they run SERIALIZED — each
+// block calls the next on completion instead of scheduling in parallel —
+// following the file's deferred-async pattern.  The chain starts on a
+// delayed timer so every earlier async block (client-cache, issue #7/#5
+// render chains) has fully drained.
+pendingAsyncBlocks++;
+setTimeout(function () {
+  resilienceBlockRefresh(function () {
+    resilienceBlockLoading(function () {
+      resilienceBlockFailure(function () {
+        resilienceBlockFallback(function () {
+          resilienceBlockEmpty(function () {
+            pendingAsyncBlocks--;
+          });
+        });
+      });
+    });
+  });
+}, 60);
 
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have

@@ -857,6 +857,49 @@
     }
   }
 
+  /** Compute the nearest valid Agent Runs page for a fetched result total
+   *  (issue #429).  When the result set shrinks — runs deleted, or the
+   *  list narrowed elsewhere — the currently selected page may exceed the
+   *  new page count; the UI must land on the nearest valid page instead of
+   *  rendering an empty offset.  An empty result (total=0) resolves to
+   *  page 1: from page 1 the function returns 1 unchanged (no navigation),
+   *  and from a higher page it lands on page 1 — never page 0.  Pure — no
+   *  DOM, location, or fetch access.
+   *  @param {number} total       fetched result total (>= 0)
+   *  @param {number} currentPage currently selected page (>= 1)
+   *  @param {number} pageSize    rows per page (25/50/100)
+   *  @returns {number} the nearest valid page (>= 1) */
+  function nearestValidAgentRunPage(total, currentPage, pageSize) {
+    var pageCount = Math.ceil(total / pageSize);
+    var current = Math.max(currentPage, 1);
+    return Math.min(current, Math.max(1, pageCount));
+  }
+
+  /** Correct the Agent Runs page state after a fetch when the result total
+   *  no longer covers the current page (issue #429).  When the fetched
+   *  total implies fewer pages than the current page (the result set
+   *  shrank), the closure page state moves to the nearest valid page
+   *  (nearestValidAgentRunPage) and the URL is REPLACED
+   *  (history.replaceState, per the #428 precedent) so the fallback does
+   *  not add a browser-history entry.  The caller then refetches the
+   *  corrected page through the normal fetch path — this hook only fixes
+   *  state + URL.  Returns true when a fallback was applied, false
+   *  otherwise (no data, a still-valid page, or an empty result already on
+   *  page 1 — so a refetch can never loop). */
+  function applyAgentRunPageFallback(data) {
+    if (!data) return false;
+    var total = (typeof data.total === 'number')
+      ? data.total
+      : (data.items ? data.items.length : 0);
+    var nearest = nearestValidAgentRunPage(total, agentRunPage, agentRunPageSize);
+    if (nearest === agentRunPage) return false;
+    agentRunPage = nearest;
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', agentRunsUrlWithPagination(agentRunPage, agentRunPageSize));
+    }
+    return true;
+  }
+
   /** Build the agent runs URL from current filter state.
    *  Issue #412: when the user has NOT explicitly set From/To filter dates,
    *  from_date/to_date fall back to the shared dashboard date range
@@ -1816,8 +1859,17 @@
       renderCollectorDistribution(data);
       renderCollectorsTable(data);
       renderAgentsTable(data);
-      renderAgentRunsTable(data.agentRuns);
-      renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
+      // Issue #429: when the fetched total no longer covers the current
+      // page (the result set shrank), correct the page state + URL and
+      // re-fetch the nearest valid page through the shared agent-runs
+      // path.  The stale-offset response is NOT rendered — the previously
+      // displayed rows stay visible while the corrected page loads.
+      if (applyAgentRunPageFallback(data.agentRuns)) {
+        fetchAgentRunsAndRender();
+      } else {
+        renderAgentRunsTable(data.agentRuns);
+        renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
+      }
       renderClientProjectBreakdown(data);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
@@ -1882,6 +1934,15 @@
       agentRunsData = data;
       agentRunsFetchError = null;
       setPanelState('agent-runs', 'ok', Date.now());
+      // Issue #429: when the fetched total no longer covers the current
+      // page (the result set shrank), correct the page state + URL and
+      // re-fetch the nearest valid page through this same path.  Nothing
+      // renders until the corrected page resolves, so the previously
+      // displayed rows stay visible while the new page loads.
+      if (applyAgentRunPageFallback(data)) {
+        fetchAgentRunsAndRender();
+        return;
+      }
       renderAgentRunsTable(data);
       renderAgentRunPagination(data);
     }).catch(function (e) {
@@ -2250,6 +2311,13 @@
   // replace semantics instead of pushing a history entry per adjustment.
   window.parseAgentRunPageSize = parseAgentRunPageSize;
   window.setAgentRunPageSize = setAgentRunPageSize;
+  // Agent Runs pagination resilience (issue #429): the pure nearest-valid-
+  // page calculator (used when a fetched total no longer covers the current
+  // page) and the shared agent-runs fetch path — the refresh-style refetch
+  // that keeps the selected page/offset, preserves rows during loading and
+  // failures, and re-fetches the corrected page after a fallback.
+  window.nearestValidAgentRunPage = nearestValidAgentRunPage;
+  window.fetchAgentRunsAndRender = fetchAgentRunsAndRender;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };
