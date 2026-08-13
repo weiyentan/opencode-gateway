@@ -1,0 +1,119 @@
+{
+  "provider": "gitlab",
+  "repository": "opencode/gateway",
+  "run": {
+    "title": "Develop-Loop: Consolidated run — Implemented issues #115, #116",
+    "status": "completed",
+    "started_at": "2026-08-07T09:00:00Z",
+    "finished_at": "2026-08-07T11:30:00Z",
+    "external_session_id": "ses_01J4T2P0000000000000000001",
+    "session_id": "2f9c3a6e-0000-4000-8000-000000000002"
+  },
+  "issues": [
+    {
+      "iid": 114,
+      "title": "Refactor session state into a shared hook",
+      "state": "opened",
+      "author": {"username": "wyautomation"},
+      "created_at": "2026-08-06T14:00:00Z",
+      "web_url": "https://gitlab.example.com/opencode/gateway/-/issues/114"
+    },
+    {
+      "iid": 115,
+      "title": "Add session context detail panel",
+      "state": "closed",
+      "author": {"username": "wyautomation"},
+      "created_at": "2026-08-04T09:00:00Z",
+      "closed_at": "2026-08-07T11:30:00Z",
+      "web_url": "https://gitlab.example.com/opencode/gateway/-/issues/115"
+    },
+    {
+      "iid": 116,
+      "title": "Expose code-change counts on the session summary",
+      "state": "closed",
+      "author": {"username": "wyautomation"},
+      "created_at": "2026-08-04T09:30:00Z",
+      "closed_at": "2026-08-07T11:30:00Z",
+      "web_url": "https://gitlab.example.com/opencode/gateway/-/issues/116"
+    }
+  ],
+  "merge_requests": [
+    {
+      "iid": 117,
+      "title": "chore: update dependency lockfile",
+      "state": "merged",
+      "author": {"username": "wyautomation"},
+      "created_at": "2026-08-07T08:30:00Z",
+      "merged_at": "2026-08-07T10:40:00Z",
+      "source_branch": "chore/dependency-lockfile",
+      "target_branch": "main",
+      "sha": "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
+      "merge_commit_sha": "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
+      "description": "Routine lockfile refresh.",
+      "web_url": "https://gitlab.example.com/opencode/gateway/-/merge_requests/117"
+    },
+    {
+      "iid": 118,
+      "title": "Develop-Loop: Consolidated run — Implemented issues #115, #116",
+      "state": "merged",
+      "author": {"username": "wyautomation"},
+      "created_at": "2026-08-07T09:00:00Z",
+      "merged_at": "2026-08-07T11:30:00Z",
+      "source_branch": "ai/feat/issues-115-116",
+      "target_branch": "main",
+      "sha": "7c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f",
+      "merge_commit_sha": "7c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f",
+      "description": "Closes #115 and #116.\n\nFollow-up tracked in #114.",
+      "web_url": "https://gitlab.example.com/opencode/gateway/-/merge_requests/118"
+    }
+  ],
+  "commits": [
+    {
+      "id": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      "title": "feat: add session context detail panel (#115)",
+      "author_name": "wyautomation",
+      "created_at": "2026-08-07T09:20:00Z"
+    },
+    {
+      "id": "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+      "title": "feat: expose code-change counts on session summary (#116)",
+      "author_name": "wyautomation",
+      "created_at": "2026-08-07T10:10:00Z"
+    },
+    {
+      "id": "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+      "title": "docs: update README for #117",
+      "author_name": "wyautomation",
+      "created_at": "2026-08-07T10:30:00Z"
+    },
+    {
+      "id": "7c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f",
+      "title": "Merge branch 'ai/feat/issues-115-116' into 'main'",
+      "author_name": "wyautomation",
+      "created_at": "2026-08-07T11:30:00Z"
+    }
+  ],
+  "reviews": [
+    {
+      "id": 912345,
+      "state": "approved",
+      "submitted_at": "2026-08-07T11:20:00Z",
+      "author": {"username": "gatekeeper-bot"},
+      "commit_id": "7c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f"
+    }
+  ],
+  "merge_events": [
+    {
+      "merge_request_iid": 117,
+      "merged_at": "2026-08-07T10:40:00Z",
+      "actor": "wyautomation",
+      "commit_sha": "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
+    },
+    {
+      "merge_request_iid": 118,
+      "merged_at": "2026-08-07T11:30:00Z",
+      "actor": "wyautomation",
+      "commit_sha": "7c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f"
+    }
+  ]
+}
