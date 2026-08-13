@@ -100,6 +100,9 @@ def _mk_session_row(
     parent_session_id: str | None = None,
     cost: Decimal | None = Decimal("0.0175"),
     session_title: str | None = None,
+    code_change_count: int | None = None,
+    code_change_additions: int | None = None,
+    code_change_deletions: int | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for sessions."""
     row = MagicMock()
@@ -122,6 +125,9 @@ def _mk_session_row(
         "parent_session_id": parent_session_id,
         "total_estimated_cost_usd": cost,
         "session_title": session_title,
+        "code_change_count": code_change_count,
+        "code_change_additions": code_change_additions,
+        "code_change_deletions": code_change_deletions,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.__iter__ = MagicMock(return_value=iter(data.keys()))
@@ -151,6 +157,9 @@ def _mk_agent_run_row(
     child_run_count: int = 0,
     session_title: str | None = None,
     session_model: str | None = None,
+    code_change_count: int | None = None,
+    code_change_additions: int | None = None,
+    code_change_deletions: int | None = None,
 ) -> MagicMock:
     """Return a MagicMock that looks like an asyncpg Record row for agent runs."""
     row = MagicMock()
@@ -177,6 +186,9 @@ def _mk_agent_run_row(
         "child_run_count": child_run_count,
         "session_title": session_title,
         "session_model": session_model,
+        "code_change_count": code_change_count,
+        "code_change_additions": code_change_additions,
+        "code_change_deletions": code_change_deletions,
     }
     row.__getitem__.side_effect = data.__getitem__
     row.__iter__ = MagicMock(return_value=iter(data.keys()))
@@ -1739,6 +1751,58 @@ class TestSessions:
         item = response.json()["data"]["items"][0]
         assert item["total_cache_read_tokens"] == 0
         assert item["total_cache_write_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_sessions_include_code_change_fields(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Session summaries surface code_change_* fields from opencode_session_contexts."""
+        row = _mk_session_row(
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+
+    @pytest.mark.asyncio
+    async def test_sessions_code_change_fields_default_to_zero(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Session summaries default code_change_* to 0 when no context row exists."""
+        row = _mk_session_row()  # defaults code_change_* to None
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
 
     @pytest.mark.asyncio
     async def test_filters_by_client_id(self, client: AsyncClient, mock_conn: AsyncMock):

@@ -710,6 +710,20 @@ async def _fetch_records(
 # ── Session helpers ────────────────────────────────────────────────────────
 
 
+def _int_or_zero(row, key: str) -> int:
+    """Read an integer column from a query row, defaulting to 0.
+
+    The code-change projection columns are nullable (a missing Session
+    Context row yields NULL), and a few test row factories predate these
+    columns.  Returns 0 when the column is NULL or absent from the row.
+    """
+    try:
+        value = row[key]
+    except (KeyError, TypeError):
+        return 0
+    return value or 0
+
+
 async def _fetch_sessions(
     conn: asyncpg.Connection,
     start_date: datetime,
@@ -776,6 +790,9 @@ async def _fetch_sessions(
             s.parent_session_id,
             s.total_estimated_cost_usd,
             osc.title AS session_title,
+            osc.code_change_count,
+            osc.code_change_additions,
+            osc.code_change_deletions,
             {_PROJECT_LABEL_SQL} AS project_label
         FROM sessions s
         LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
@@ -813,6 +830,9 @@ async def _fetch_sessions(
             parent_session_id=r["parent_session_id"],
             total_estimated_cost_usd=r["total_estimated_cost_usd"],
             session_title=r["session_title"],
+            code_change_count=_int_or_zero(r, "code_change_count"),
+            code_change_additions=_int_or_zero(r, "code_change_additions"),
+            code_change_deletions=_int_or_zero(r, "code_change_deletions"),
             loki_search_url=build_loki_search_url(
                 client_id=r["client_id"],
                 source_database_id=r["source_database_id"],
@@ -1206,6 +1226,9 @@ async def _fetch_agent_runs(
                     ({status_expr}) AS _status,
                     osc.title AS session_title,
                     osc.session_model AS session_model,
+                    osc.code_change_count,
+                    osc.code_change_additions,
+                    osc.code_change_deletions,
                     {_PROJECT_LABEL_SQL} AS project_label
                 FROM sessions s
                 LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
@@ -1243,6 +1266,9 @@ async def _fetch_agent_runs(
                 ({status_expr}) AS _status,
                 osc.title AS session_title,
                 osc.session_model AS session_model,
+                osc.code_change_count,
+                osc.code_change_additions,
+                osc.code_change_deletions,
                 {_PROJECT_LABEL_SQL} AS project_label
             FROM sessions s
             LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
@@ -1303,7 +1329,10 @@ async def _fetch_agent_runs(
                 todo_total=0,
                 todo_completed=0,
                 todo_blocked=0,
-                code_changes_total=0,
+                code_changes_total=_int_or_zero(r, "code_change_count"),
+                code_change_count=_int_or_zero(r, "code_change_count"),
+                code_change_additions=_int_or_zero(r, "code_change_additions"),
+                code_change_deletions=_int_or_zero(r, "code_change_deletions"),
                 total_input_tokens=r["total_input_tokens"],
                 total_output_tokens=r["total_output_tokens"],
                 total_cached_tokens=r["total_cached_tokens"],
@@ -1539,6 +1568,9 @@ async def _fetch_agent_run_detail(
         todo_completed=todo_completed,
         todo_blocked=todo_blocked,
         code_changes_total=code_changes_total,
+        code_change_count=_int_or_zero(session_row, "code_change_count"),
+        code_change_additions=_int_or_zero(session_row, "code_change_additions"),
+        code_change_deletions=_int_or_zero(session_row, "code_change_deletions"),
         session_context=session_context,
         message_count=session_row["message_count"],
         total_input_tokens=session_row["total_input_tokens"],

@@ -552,7 +552,11 @@ class TestAgentRunsList:
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["todo_blocked"] == 0
+        # Code changes from opencode_session_contexts (0 when no context row)
         assert item["code_changes_total"] == 0
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
 
         # Usage totals
         assert "total_input_tokens" in item
@@ -768,6 +772,9 @@ class TestAgentRunsList:
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["code_changes_total"] == 0
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
 
     @pytest.mark.asyncio
     async def test_model_present_when_session_has_model(
@@ -819,6 +826,55 @@ class TestAgentRunsList:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_code_change_fields_populated_from_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows surface code_change_* fields from opencode_session_contexts."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+        # code_changes_total is derived from code_change_count
+        assert item["code_changes_total"] == 7
+
+    @pytest.mark.asyncio
+    async def test_code_change_fields_zero_without_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows default code_change_* fields to 0 when no context row exists."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            code_change_count=None,
+            code_change_additions=None,
+            code_change_deletions=None,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
+        assert item["code_changes_total"] == 0
 
 
 def _mk_todo_row(
@@ -1013,6 +1069,9 @@ class TestAgentRunsDetail:
         assert data["todo_completed"] == 0
         assert data["todo_blocked"] == 0
         assert data["code_changes_total"] == 0
+        assert data["code_change_count"] == 0
+        assert data["code_change_additions"] == 0
+        assert data["code_change_deletions"] == 0
         assert data["session_context"] is None
 
     @pytest.mark.asyncio
@@ -1273,6 +1332,10 @@ class TestAgentRunsDetail:
         assert data["code_changes_total"] == 42, (
             f"Expected code_changes_total=42, got {data['code_changes_total']}"
         )
+        # top-level code_change_* fields surface the same context values
+        assert data["code_change_count"] == 42
+        assert data["code_change_additions"] == 200
+        assert data["code_change_deletions"] == 50
 
 
 # ══════════════════════════════════════════════════════════════════════════
