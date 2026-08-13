@@ -99,6 +99,22 @@ selected `To` date includes the full selected day. It is a summary view, not
 a replay of OpenCode events or message parts.
 _Avoid_: Event Timeline, transcript replay
 
+**Agent Usage**:
+An Aurora Glass aggregate view that groups observed token usage by the
+recorded OpenCode agent identity. The set of rows is dynamic: every observed
+agent may appear, with missing identities grouped as `unknown`. Agent Usage
+uses the shared dashboard date range and aggregate filters. It summarizes
+usage across runs; it is not an Agent Run list. Rows show a compact token
+breakdown, estimated cost, and request count, ordered by total token usage
+descending with agent name as the tie-breaker.
+Agent grouping is resolved at read time, so usage first observed without
+context may appear under `unknown` and move to the recorded agent after
+Session Context is ingested.
+Agent Usage is independently refreshable from other dashboard panels; a
+failure leaves the rest of Aurora Glass usable and may preserve the last
+successful panel data with a stale/error indication.
+_Avoid_: fixed agent categories, Agent Run Summary
+
 **Source-Created Ordering**:
 The ordering rule behind "most recent" in Aurora Glass usage views: rows
 are ordered by when the underlying activity happened at the source, not by
@@ -471,6 +487,12 @@ manages.
 - **Session Context** is sent as a separate batch-level collection, not duplicated onto each **Usage Record**
 - A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
+- **Aurora Glass** presents **Agent Usage** as a dynamic aggregate grouped by recorded agent identity, using the shared dashboard date range and aggregate filters
+- **Agent Usage** is distinct from the per-run **Agent Run Summary** view
+- **Agent Usage** rows are ordered by total token usage descending, then agent name ascending
+- **Agent Usage** uses the same compact **Token Breakdown** display as Sessions and Agent Run Summary rows
+- **Agent Usage** resolves agent grouping at read time from the latest available **Session Context**
+- **Agent Usage** failure is isolated from other dashboard panels and may preserve the last successful data with a stale/error indication
 - **Aurora Glass** uses the same compact **Token Breakdown** vocabulary for Sessions and **Agent Run Summary** rows
 - **Aurora Glass** orders usage views by **Source-Created Ordering** (Records: `sort_by=source_created_at`; Sessions and Agent Runs: `last_message_at DESC`), never by ingest time
 - **Aurora Glass** treats an Agent Run or Session title as the meaningful scope for a **Token Breakdown** row
