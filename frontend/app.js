@@ -88,6 +88,13 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
+  // Agent Runs pagination state (issue #426): the current page and page
+  // size, read from the URL (?page / ?page_size) on dashboard load and
+  // translated to the existing agent-runs API's limit/offset at request
+  // time.  Defaults match the pre-pagination behavior exactly: page 1 of
+  // AGENT_RUN_LIMIT (50) rows.
+  let agentRunPage = 1;
+  let agentRunPageSize = AGENT_RUN_LIMIT;
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
@@ -727,6 +734,64 @@
 
   // ── Data Fetching ─────────────────────────────────────────────────────
 
+  /** Parse Agent Runs pagination from a URL query string (issue #426).
+   *  Reads `page` and `page_size`; missing, malformed (non-integer), or
+   *  unsupported (outside the API's limit bounds of 1–1000) values fall
+   *  back to page 1 and the default page size (AGENT_RUN_LIMIT = 50).
+   *  Pure — no DOM, location, or fetch access. */
+  function parseAgentRunPagination(queryString) {
+    var page = 1;
+    var pageSize = AGENT_RUN_LIMIT;
+    var params = new URLSearchParams(queryString || '');
+    var rawPage = params.get('page');
+    var rawPageSize = params.get('page_size');
+    var nPage = Number(rawPage);
+    if (rawPage !== null && Number.isInteger(nPage) && nPage >= 1) {
+      page = nPage;
+    }
+    var nPageSize = Number(rawPageSize);
+    if (rawPageSize !== null && Number.isInteger(nPageSize) &&
+        nPageSize >= 1 && nPageSize <= 1000) {
+      pageSize = nPageSize;
+    }
+    return { page: page, pageSize: pageSize };
+  }
+
+  /** Read `page`/`page_size` from the current URL into the pagination
+   *  closure state (issue #426).  Called on dashboard load so a URL such
+   *  as ?page=2&page_size=100 fetches the corresponding Agent Runs page;
+   *  the translation happens in buildAgentRunsUrl on the next fetch. */
+  function readAgentRunPaginationFromUrl() {
+    var query = (typeof location !== 'undefined' && location.search) || '';
+    var pagination = parseAgentRunPagination(query);
+    agentRunPage = pagination.page;
+    agentRunPageSize = pagination.pageSize;
+  }
+
+  /** Build the dashboard URL carrying the given pagination state, keeping
+   *  any other query parameters already present in the URL. */
+  function agentRunsUrlWithPagination(page, pageSize) {
+    var params = new URLSearchParams(
+      (typeof location !== 'undefined' && location.search) || '');
+    params.set('page', String(page));
+    params.set('page_size', String(pageSize));
+    var path = (typeof location !== 'undefined' && location.pathname) || '';
+    return path + '?' + params.toString();
+  }
+
+  /** Set the Agent Runs page and persist it in the URL via browser history
+   *  (issue #426).  Invalid page values fall back to page 1.  The URL
+   *  update itself never changes Agent Runs row content — rows only change
+   *  through the normal fetch path (buildAgentRunsUrl → fetchAll). */
+  function setAgentRunPage(page) {
+    var parsed = parseAgentRunPagination('page=' + page + '&page_size=' + agentRunPageSize);
+    agentRunPage = parsed.page;
+    var url = agentRunsUrlWithPagination(agentRunPage, agentRunPageSize);
+    if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
+      history.pushState({}, '', url);
+    }
+  }
+
   /** Build the agent runs URL from current filter state.
    *  Issue #412: when the user has NOT explicitly set From/To filter dates,
    *  from_date/to_date fall back to the shared dashboard date range
@@ -736,7 +801,10 @@
    *  fetchAll() on every refresh, and date-range changes trigger
    *  refreshDashboard() → fetchAll().  Explicit filter values (set via
    *  Apply) always win — per boundary, so an unset From/To input still
-   *  inherits the dashboard range on that side. */
+   *  inherits the dashboard range on that side.
+   *  Issue #426: page state translates to the existing API pagination
+   *  params — limit=page_size and offset=(page - 1) * page_size — so the
+   *  API contract (limit/offset/total) is unchanged. */
   function buildAgentRunsUrl() {
     var params = [];
     var filters = agentRunFilters;
@@ -758,7 +826,8 @@
     if (filters.status) {
       params.push('status=' + encodeURIComponent(filters.status));
     }
-    params.push('limit=' + AGENT_RUN_LIMIT);
+    params.push('limit=' + agentRunPageSize);
+    params.push('offset=' + ((agentRunPage - 1) * agentRunPageSize));
 
     return '/api/v1/usage/agent-runs?' + params.join('&');
   }
@@ -1942,6 +2011,10 @@
     setupAgentRunEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
+    // Issue #426: read ?page / ?page_size from the URL before the initial
+    // fetch so a deep link such as ?page=2&page_size=100 loads the
+    // corresponding Agent Runs page on dashboard load.
+    readAgentRunPaginationFromUrl();
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();
@@ -1989,6 +2062,13 @@
   window.buildAgentRunsUrl = buildAgentRunsUrl;
   window.setAgentRunFilters = function (filters) { agentRunFilters = filters; };
   window.setDateRangeState = function (state) { dateRangeState = state; };
+  // Agent Runs pagination state + URL persistence (issue #426): the pure
+  // URL-param parser, the on-load URL reader, and the page-change history
+  // hook — page state lives in the closure, so the node harness exercises
+  // it through the builder output and the history stub.
+  window.parseAgentRunPagination = parseAgentRunPagination;
+  window.readAgentRunPaginationFromUrl = readAgentRunPaginationFromUrl;
+  window.setAgentRunPage = setAgentRunPage;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

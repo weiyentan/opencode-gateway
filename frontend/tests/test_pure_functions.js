@@ -87,6 +87,14 @@ elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
 
+// Browser-history stub (issue #426): records pushState URLs so tests can
+// verify that Agent Runs page changes persist to the URL without touching
+// the table DOM (row content changes only through the normal fetch path).
+var historyCalls = [];
+var historyStub = {
+  pushState: function (state, title, url) { historyCalls.push(url); }
+};
+
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
@@ -118,7 +126,12 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
     clearInterval: clearInterval,
     clearTimeout: clearTimeout,
     fetch: function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); },
-    location: { href: '' },
+    // issue #426: location gains search/pathname for the URL-pagination
+    // wiring (read on load + history persistence); URLSearchParams is
+    // provided explicitly because vm contexts do not inherit Node globals.
+    location: { href: '', search: '', pathname: '' },
+    history: historyStub,
+    URLSearchParams: URLSearchParams,
     navigator: {}
   };
   sandbox.window = sandboxWindow;
@@ -151,6 +164,12 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
   window.buildAgentRunsUrl = sandboxWindow.buildAgentRunsUrl;
   window.setAgentRunFilters = sandboxWindow.setAgentRunFilters;
   window.setDateRangeState = sandboxWindow.setDateRangeState;
+  // Issue #426: Agent Runs pagination state + URL persistence — the pure
+  // URL-param parser, the on-load URL reader, and the page-change history
+  // hook are exercised through the same window test seam.
+  window.parseAgentRunPagination = sandboxWindow.parseAgentRunPagination;
+  window.readAgentRunPaginationFromUrl = sandboxWindow.readAgentRunPaginationFromUrl;
+  window.setAgentRunPage = sandboxWindow.setAgentRunPage;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2321,6 +2340,174 @@ console.log('\u25B6 buildAgentRunsUrl date-range fallback (issue #412)');
   assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
          url.indexOf('from_date=') !== -1 && url.indexOf('to_date=') !== -1,
     'agent/status: non-date filters are appended alongside the derived range');
+})();
+
+// ── Agent Runs pagination state (issue #426) ─────────────────────────────
+// The dashboard reads `page` and `page_size` from the URL on load, safely
+// defaults missing/malformed/unsupported values to page 1 and 50 rows,
+// translates page state to the existing agent-runs `limit`/`offset` API
+// params, and persists page changes through browser history.  Agent Runs
+// row content, columns, ordering, and filters are untouched, and the API
+// contract is unchanged (the backend already supports limit/offset/total).
+
+console.log('\u25B6 Agent Runs pagination state (issue #426)');
+
+// ── Parser: defaulting and validation ───────────────────────────────────
+// parseAgentRunPagination() reads page/page_size from a query string;
+// missing, malformed, or unsupported values fall back to page 1 and the
+// default page size (50).  The supported page_size range mirrors the API's
+// limit bounds (1–1000); a valid page is a whole number >= 1.
+
+(function () {
+  if (typeof window.parseAgentRunPagination !== 'function') {
+    assert(false, 'app.js: parseAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Missing params → page 1 / page size 50.
+  var p = window.parseAgentRunPagination('');
+  assert(p.page === 1 && p.pageSize === 50,
+    'parse: empty query defaults to page 1 and page size 50');
+
+  // Valid values are read through.
+  p = window.parseAgentRunPagination('page=2&page_size=100');
+  assert(p.page === 2 && p.pageSize === 100,
+    'parse: page=2&page_size=100 is read through');
+
+  // Malformed values fall back per-field.
+  p = window.parseAgentRunPagination('page=abc&page_size=100');
+  assert(p.page === 1 && p.pageSize === 100,
+    'parse: non-numeric page falls back to 1, valid page_size kept');
+  p = window.parseAgentRunPagination('page=2&page_size=abc');
+  assert(p.page === 2 && p.pageSize === 50,
+    'parse: valid page kept, non-numeric page_size falls back to 50');
+
+  // Out-of-range / non-whole values fall back.
+  p = window.parseAgentRunPagination('page=0');
+  assert(p.page === 1,
+    'parse: page=0 falls back to page 1');
+  p = window.parseAgentRunPagination('page=-3');
+  assert(p.page === 1,
+    'parse: negative page falls back to page 1');
+  p = window.parseAgentRunPagination('page=2.5');
+  assert(p.page === 1,
+    'parse: fractional page falls back to page 1');
+  p = window.parseAgentRunPagination('page_size=0');
+  assert(p.pageSize === 50,
+    'parse: page_size=0 falls back to page size 50');
+  p = window.parseAgentRunPagination('page_size=-10');
+  assert(p.pageSize === 50,
+    'parse: negative page_size falls back to page size 50');
+  p = window.parseAgentRunPagination('page_size=5000');
+  assert(p.pageSize === 50,
+    'parse: page_size above the API limit bound (1000) falls back to 50');
+})();
+
+// ── URL read + limit/offset translation ─────────────────────────────────
+// readAgentRunPaginationFromUrl() seeds the pagination state from
+// location.search on dashboard load; buildAgentRunsUrl() then translates
+// page state to the existing API params — limit=page_size and
+// offset=(page - 1) * page_size — while preserving every existing filter.
+
+(function () {
+  if (typeof window.readAgentRunPaginationFromUrl !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: readAgentRunPaginationFromUrl exposed + sandbox location present');
+    return;
+  }
+
+  // Reset: no URL pagination → page 1, size 50 → limit=50&offset=0.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'custom', customStartDate: '2026-06-01', customEndDate: '2026-06-30' });
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'translate: default state requests limit=50 and offset=0');
+
+  // URL ?page=2&page_size=100 on load → limit=100, offset=100.
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=100') !== -1 && url.indexOf('offset=100') !== -1,
+    'translate: page 2 of 100 rows requests limit=100 and offset=100');
+
+  // ?page=3&page_size=25 → offset=(3-1)*25=50.
+  appJsSandbox.location.search = '?page=3&page_size=25';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=25') !== -1 && url.indexOf('offset=50') !== -1,
+    'translate: page 3 of 25 rows requests limit=25 and offset=50');
+
+  // Invalid URL values fall back to page 1 / 50 rows.
+  appJsSandbox.location.search = '?page=oops&page_size=0';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'translate: invalid URL values fall back to limit=50 and offset=0');
+
+  // Filters are preserved while paging: explicit dates, agent, and status
+  // all ride along with the pagination params.
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z', to_date: '2026-01-31T23:59:59Z', agent: 'bob', status: 'completed' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1 &&
+         url.indexOf('to_date=2026-01-31T23%3A59%3A59Z') !== -1 &&
+         url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
+         url.indexOf('limit=100') !== -1 && url.indexOf('offset=100') !== -1,
+    'translate: date/agent/status filters remain in the URL while paging');
+})();
+
+// ── Page changes persist via browser history ────────────────────────────
+// setAgentRunPage() updates the closure page state and pushes the new URL
+// through history.pushState, preserving any other query params already in
+// the URL.  The URL update alone never changes Agent Runs row content —
+// the table DOM is untouched and the fetch path is not invoked by it.
+
+(function () {
+  if (typeof window.setAgentRunPage !== 'function' || !appJsSandbox.history) {
+    assert(false, 'app.js: setAgentRunPage exposed + sandbox history stub present');
+    return;
+  }
+
+  historyCalls.length = 0;
+
+  // Page change from the default state: URL gains page/page_size, closure
+  // state updates so the next request uses the translated offset.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob', status: 'completed' });
+  window.setAgentRunPage(3);
+  assert(historyCalls.length === 1,
+    'history: setAgentRunPage pushes exactly one history entry');
+  assert(historyCalls[0] === '/index.html?page=3&page_size=50',
+    'history: pushed URL carries page=3 and the current page_size');
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=100') !== -1 &&
+         url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1,
+    'history: after the page change the next request uses offset=100 and keeps filters');
+
+  // Unrelated query params already in the URL survive the page change.
+  appJsSandbox.location.search = '?tab=agent-runs&page=1&page_size=50';
+  window.readAgentRunPaginationFromUrl();
+  historyCalls.length = 0;
+  window.setAgentRunPage(2);
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?tab=agent-runs&page=2&page_size=50',
+    'history: unrelated URL params are preserved when the page changes');
+
+  // The history update never touches the Agent Runs row content.
+  assert(arTbodyEl.innerHTML === '',
+    'history: the URL update leaves the Agent Runs table DOM untouched');
+
+  // Invalid page values fall back to page 1 before persisting.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  historyCalls.length = 0;
+  window.setAgentRunPage(-2);
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=1&page_size=50',
+    'history: an invalid page value falls back to page 1 in the pushed URL');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
