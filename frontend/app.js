@@ -64,10 +64,12 @@
     arFilterStatus: $('ar-filter-status'),
     arFilterApply:  $('ar-filter-apply'),
     arFilterClear:  $('ar-filter-clear'),
+    arPageSize:     $('ar-page-size'),
     arDetailOverlay: $('ar-detail-overlay'),
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
     arDetailClose:  $('ar-detail-close'),
+    arPagination:   $('agent-runs-pagination'), // control block below the panel (issue #427)
 
     // Client/Project
     cpTbody:         $('cp-tbody'),
@@ -88,6 +90,13 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
+  // Agent Runs pagination state (issue #426): the current page and page
+  // size, read from the URL (?page / ?page_size) on dashboard load and
+  // translated to the existing agent-runs API's limit/offset at request
+  // time.  Defaults match the pre-pagination behavior exactly: page 1 of
+  // AGENT_RUN_LIMIT (50) rows.
+  let agentRunPage = 1;
+  let agentRunPageSize = AGENT_RUN_LIMIT;
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
@@ -736,6 +745,194 @@
 
   // ── Data Fetching ─────────────────────────────────────────────────────
 
+  /** Validate an Agent Runs page size against the page-size selector's
+   *  choices (issue #428): exactly 25, 50, or 100 rows per page, with
+   *  AGENT_RUN_LIMIT (50) as the default.  Unsupported values — including
+   *  malformed input — fall back to the default.  Pure — no DOM, location,
+   *  or fetch access. */
+  function parseAgentRunPageSize(rawValue) {
+    var n = Number(rawValue);
+    if (n === 25 || n === 50 || n === 100) {
+      return n;
+    }
+    return AGENT_RUN_LIMIT;
+  }
+
+  /** Parse Agent Runs pagination from a URL query string (issue #426).
+   *  Reads `page` and `page_size`; missing or malformed (non-integer,
+   *  negative, or zero) page values fall back to page 1.  Issue #428: the
+   *  page size is restricted to the selector's choices (25/50/100) — any
+   *  other value falls back to the default page size (AGENT_RUN_LIMIT =
+   *  50).  Pure — no DOM, location, or fetch access. */
+  function parseAgentRunPagination(queryString) {
+    var page = 1;
+    var pageSize = AGENT_RUN_LIMIT;
+    var params = new URLSearchParams(queryString || '');
+    var rawPage = params.get('page');
+    var rawPageSize = params.get('page_size');
+    var nPage = Number(rawPage);
+    if (rawPage !== null && Number.isInteger(nPage) && nPage >= 1) {
+      page = nPage;
+    }
+    pageSize = parseAgentRunPageSize(rawPageSize);
+    return { page: page, pageSize: pageSize };
+  }
+
+  /** Read `page`/`page_size` from the current URL into the pagination
+   *  closure state (issue #426).  Called on dashboard load so a URL such
+   *  as ?page=2&page_size=100 fetches the corresponding Agent Runs page;
+   *  the translation happens in buildAgentRunsUrl on the next fetch. */
+  function readAgentRunPaginationFromUrl() {
+    var query = (typeof location !== 'undefined' && location.search) || '';
+    var pagination = parseAgentRunPagination(query);
+    agentRunPage = pagination.page;
+    agentRunPageSize = pagination.pageSize;
+    // PR #431 review (finding 1): a deep link (e.g. ?page_size=100) must
+    // also sync the visible #ar-page-size selector, so the control never
+    // shows a stale page size that disagrees with the fetched limit.
+    if (els.arPageSize) els.arPageSize.value = String(pagination.pageSize);
+  }
+
+  /** Build the dashboard URL carrying the given pagination state, keeping
+   *  any other query parameters already present in the URL. */
+  function agentRunsUrlWithPagination(page, pageSize) {
+    var params = new URLSearchParams(
+      (typeof location !== 'undefined' && location.search) || '');
+    params.set('page', String(page));
+    params.set('page_size', String(pageSize));
+    var path = (typeof location !== 'undefined' && location.pathname) || '';
+    return path + '?' + params.toString();
+  }
+
+  /** Set the Agent Runs page and persist it in the URL via browser history
+   *  (issue #426).  Invalid page values fall back to page 1.  The URL
+   *  update itself never changes Agent Runs row content — rows only change
+   *  through the normal fetch path (buildAgentRunsUrl → fetchAll). */
+  function setAgentRunPage(page) {
+    var parsed = parseAgentRunPagination('page=' + page + '&page_size=' + agentRunPageSize);
+    agentRunPage = parsed.page;
+    var url = agentRunsUrlWithPagination(agentRunPage, agentRunPageSize);
+    if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
+      history.pushState({}, '', url);
+    }
+  }
+
+  /** Compute the compact page-item window for the pagination control
+   *  (issue #427).  Small page counts (<= 7) render every page; larger
+   *  counts render the first and last pages plus a window around the
+   *  current page, with ellipsis separators filling the gaps.  Pure — no
+   *  DOM access — so the Node test harness exercises it directly.
+   *  @param {number} currentPage the active page (clamped into range)
+   *  @param {number} pageCount   total number of pages (ceil(total/size))
+   *  @returns {Array<{type:'page',page:number}|{type:'ellipsis'}>} */
+  function computePageItems(currentPage, pageCount) {
+    if (!Number.isInteger(pageCount) || pageCount < 1) return [];
+    var current = Number.isInteger(currentPage)
+      ? Math.min(Math.max(currentPage, 1), pageCount)
+      : 1;
+    if (pageCount <= 7) {
+      var all = [];
+      for (var i = 1; i <= pageCount; i++) {
+        all.push({ type: 'page', page: i });
+      }
+      return all;
+    }
+    // First/last pages plus a window around the current page.
+    var wanted = {};
+    [1, pageCount, current - 1, current, current + 1].forEach(function (p) {
+      if (p >= 1 && p <= pageCount) wanted[p] = true;
+    });
+    var sorted = Object.keys(wanted).map(Number).sort(function (a, b) { return a - b; });
+    var items = [];
+    sorted.forEach(function (p, i) {
+      if (i > 0 && p - sorted[i - 1] > 1) {
+        items.push({ type: 'ellipsis' });
+      }
+      items.push({ type: 'page', page: p });
+    });
+    return items;
+  }
+
+  /** Set the Agent Runs page size and reset to page 1 (issue #428).
+   *  Validates the requested size against the page-size selector's choices
+   *  (25/50/100); unsupported values fall back to the default
+   *  (AGENT_RUN_LIMIT = 50).  A page-size change re-scopes the current
+   *  view, so the URL state is REPLACED (history.replaceState) rather than
+   *  pushed — unlike explicit page navigation (setAgentRunPage), which
+   *  keeps using pushState.  The rows themselves only change through the
+   *  normal fetch path (buildAgentRunsUrl → fetchAll / applyFilters). */
+  function setAgentRunPageSize(pageSize) {
+    agentRunPageSize = parseAgentRunPageSize(pageSize);
+    agentRunPage = 1;
+    var url = agentRunsUrlWithPagination(agentRunPage, agentRunPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
+  }
+
+  /** Compute the nearest valid Agent Runs page for a fetched result total
+   *  (issue #429).  When the result set shrinks — runs deleted, or the
+   *  list narrowed elsewhere — the currently selected page may exceed the
+   *  new page count; the UI must land on the nearest valid page instead of
+   *  rendering an empty offset.  An empty result (total=0) resolves to
+   *  page 1: from page 1 the function returns 1 unchanged (no navigation),
+   *  and from a higher page it lands on page 1 — never page 0.  Pure — no
+   *  DOM, location, or fetch access.
+   *  @param {number} total       fetched result total (>= 0)
+   *  @param {number} currentPage currently selected page (>= 1)
+   *  @param {number} pageSize    rows per page (25/50/100)
+   *  @returns {number} the nearest valid page (>= 1) */
+  function nearestValidAgentRunPage(total, currentPage, pageSize) {
+    var pageCount = Math.ceil(total / pageSize);
+    var current = Math.max(currentPage, 1);
+    return Math.min(current, Math.max(1, pageCount));
+  }
+
+  /** Correct the Agent Runs page state after a fetch when the result total
+   *  no longer covers the current page (issue #429).  When the fetched
+   *  total implies fewer pages than the current page (the result set
+   *  shrank), the closure page state moves to the nearest valid page
+   *  (nearestValidAgentRunPage) and the URL is REPLACED
+   *  (history.replaceState, per the #428 precedent) so the fallback does
+   *  not add a browser-history entry.  The caller then refetches the
+   *  corrected page through the normal fetch path — this hook only fixes
+   *  state + URL.  Returns true when a fallback was applied, false
+   *  otherwise (no data, a still-valid page, or an empty result already on
+   *  page 1 — so a refetch can never loop). */
+  function applyAgentRunPageFallback(data) {
+    if (!data) return false;
+    var total = (typeof data.total === 'number')
+      ? data.total
+      : (data.items ? data.items.length : 0);
+    var nearest = nearestValidAgentRunPage(total, agentRunPage, agentRunPageSize);
+    if (nearest === agentRunPage) return false;
+    agentRunPage = nearest;
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', agentRunsUrlWithPagination(agentRunPage, agentRunPageSize));
+    }
+    return true;
+  }
+
+  /** Re-sync Agent Runs pagination state from the URL after a browser
+   *  Back/Forward navigation (PR #431 review finding 4).  Back/Forward
+   *  changes location.search without re-running the load-time URL read,
+   *  so without this listener agentRunPage/agentRunPageSize stay stale and
+   *  the next refresh fetches the wrong offset while the control
+   *  highlights a page that no longer matches the URL.  This handler
+   *  re-reads the URL (which also syncs the page-size selector) and, when
+   *  the effective page or page size changed, refetches through the shared
+   *  path so the address bar, visible rows, and in-memory state stay
+   *  consistent.  The URL read itself never pushes history, so this cannot
+   *  add entries or loop. */
+  function handleAgentRunPopstate() {
+    var prevPage = agentRunPage;
+    var prevSize = agentRunPageSize;
+    readAgentRunPaginationFromUrl();
+    if (agentRunPage !== prevPage || agentRunPageSize !== prevSize) {
+      fetchAgentRunsAndRender();
+    }
+  }
+
   /** Build the agent runs URL from current filter state.
    *  Issue #412: when the user has NOT explicitly set From/To filter dates,
    *  from_date/to_date fall back to the shared dashboard date range
@@ -745,7 +942,10 @@
    *  fetchAll() on every refresh, and date-range changes trigger
    *  refreshDashboard() → fetchAll().  Explicit filter values (set via
    *  Apply) always win — per boundary, so an unset From/To input still
-   *  inherits the dashboard range on that side. */
+   *  inherits the dashboard range on that side.
+   *  Issue #426: page state translates to the existing API pagination
+   *  params — limit=page_size and offset=(page - 1) * page_size — so the
+   *  API contract (limit/offset/total) is unchanged. */
   function buildAgentRunsUrl() {
     var params = [];
     var filters = agentRunFilters;
@@ -767,7 +967,8 @@
     if (filters.status) {
       params.push('status=' + encodeURIComponent(filters.status));
     }
-    params.push('limit=' + AGENT_RUN_LIMIT);
+    params.push('limit=' + agentRunPageSize);
+    params.push('offset=' + ((agentRunPage - 1) * agentRunPageSize));
 
     return '/api/v1/usage/agent-runs?' + params.join('&');
   }
@@ -1691,7 +1892,17 @@
       renderCollectorDistribution(data);
       renderCollectorsTable(data);
       renderAgentsTable(data);
-      renderAgentRunsTable(data.agentRuns);
+      // Issue #429: when the fetched total no longer covers the current
+      // page (the result set shrank), correct the page state + URL and
+      // re-fetch the nearest valid page through the shared agent-runs
+      // path.  The stale-offset response is NOT rendered — the previously
+      // displayed rows stay visible while the corrected page loads.
+      if (applyAgentRunPageFallback(data.agentRuns)) {
+        fetchAgentRunsAndRender();
+      } else {
+        renderAgentRunsTable(data.agentRuns);
+        renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
+      }
       renderClientProjectBreakdown(data);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
@@ -1723,24 +1934,126 @@
     return filters;
   }
 
+  /** Apply the current filter-bar values and re-fetch the Agent Runs list
+   *  (issue #428): applying or changing filters re-scopes the view to page 1,
+   *  REPLACING the URL state (history.replaceState) so filter adjustments do
+   *  not add a browser-history entry per change.  The filter values ride
+   *  along in the request (buildAgentRunsUrl) and in the existing query state
+   *  kept by agentRunsUrlWithPagination.  Explicit page navigation
+   *  (setAgentRunPage, issue #426) keeps using pushState. */
   function applyFilters() {
     agentRunFilters = readFiltersFromUI();
+    agentRunPage = 1;
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', agentRunsUrlWithPagination(agentRunPage, agentRunPageSize));
+    }
+    fetchAgentRunsAndRender();
+  }
+
+  /** Fetch the Agent Runs page described by the current filter + pagination
+   *  state and re-render the table and pagination controls (issues #427 and
+   *  #428).  Shared by the Apply/Clear filter path, the pagination control
+   *  clicks, and the page-size change path, so paging and page-size changes
+   *  always preserve the active filters: buildAgentRunsUrl carries
+   *  from_date/to_date/agent/status alongside the page-derived limit/offset
+   *  (issue #426). */
+  function fetchAgentRunsAndRender() {
     // Track the agent-runs panel freshness for this independent fetch
     var prev = panelStates['agent-runs'];
     setPanelState('agent-runs', 'refreshing', prev ? prev.updatedAt : null);
-    // Re-fetch agent runs with new filters, update table
+    // Re-fetch agent runs with current filters + page state, update table
     var url = buildAgentRunsUrl();
     apiFetch(url).then(function (data) {
       agentRunsData = data;
       agentRunsFetchError = null;
       setPanelState('agent-runs', 'ok', Date.now());
+      // Issue #429: when the fetched total no longer covers the current
+      // page (the result set shrank), correct the page state + URL and
+      // re-fetch the nearest valid page through this same path.  Nothing
+      // renders until the corrected page resolves, so the previously
+      // displayed rows stay visible while the new page loads.
+      if (applyAgentRunPageFallback(data)) {
+        fetchAgentRunsAndRender();
+        return;
+      }
       renderAgentRunsTable(data);
+      renderAgentRunPagination(data);
     }).catch(function (e) {
       agentRunsFetchError = e.message || 'Agent runs query failed';
       var prevState = panelStates['agent-runs'];
       setPanelState('agent-runs', 'stale', prevState ? prevState.updatedAt : null);
       renderAgentRunsTable(null); // keeps previous rows; label shows "Showing previous data"
+      renderAgentRunPagination(agentRunsData); // keeps the last-known page info
       console.error('Agent runs filter fetch error:', e);
+    });
+  }
+
+  /** Render the Agent Runs pagination control block below the panel
+   *  (issue #427): Previous / Next plus the numbered page items computed by
+   *  computePageItems from the API response `total` and the current page
+   *  size.  Previous is disabled on page 1, Next on the final page, and the
+   *  current page carries aria-current="page".  Clicking a control persists
+   *  the page via setAgentRunPage (issue #426) and re-fetches that server-
+   *  side page through fetchAgentRunsAndRender, preserving active filters.
+   *  Agent Runs row content, columns, ordering, and detail interactions are
+   *  untouched — this block only re-requests the same endpoint with a
+   *  different offset. */
+  function renderAgentRunPagination(data) {
+    if (!els.arPagination) return;
+    // Failed fetch → keep the previous control state (mirrors the table's
+    // "keep previous rows" behavior via the same panel guard).
+    if (!shouldRenderPanel(panelStates, 'agent-runs')) return;
+
+    var total = (data && typeof data.total === 'number')
+      ? data.total
+      : (data && data.items ? data.items.length : 0);
+    var pageCount = Math.ceil(total / agentRunPageSize);
+    var items = computePageItems(agentRunPage, pageCount);
+    if (items.length === 0) {
+      els.arPagination.innerHTML = '';
+      return;
+    }
+
+    var html = '';
+    var prevPage = agentRunPage - 1;
+    var nextPage = agentRunPage + 1;
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + prevPage + '"' +
+      (prevPage < 1 ? ' disabled' : '') + ' aria-label="Previous page">\u2190 Previous</button>';
+
+    items.forEach(function (item) {
+      if (item.type === 'ellipsis') {
+        html += '<span class="pagination-ellipsis" aria-hidden="true">\u2026</span>';
+        return;
+      }
+      var isCurrent = item.page === agentRunPage;
+      html += '<button type="button" class="filter-clear pagination-btn' +
+        (isCurrent ? ' pagination-current' : '') + '" data-page="' + item.page + '"' +
+        ' aria-label="' + (isCurrent ? 'Page ' + item.page + ', current page' : 'Page ' + item.page) + '"' +
+        (isCurrent ? ' aria-current="page"' : '') + '>' + item.page + '</button>';
+    });
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + nextPage + '"' +
+      (nextPage > pageCount ? ' disabled' : '') + ' aria-label="Next page">Next \u2192</button>';
+
+    els.arPagination.innerHTML = html;
+
+    // Wire the page controls: selecting a page updates the pagination
+    // state (setAgentRunPage → URL history) and re-fetches that page via
+    // the shared path so the active filters ride along (issue #426).
+    var buttons = els.arPagination.querySelectorAll('button');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return; // disabled buttons never fire in browsers; belt-and-braces
+        var page = Number(btn.getAttribute('data-page'));
+        // PR #431 review (finding 3): clicking the already-current page is a
+        // no-op — no duplicate history entry, no redundant refetch.  The
+        // current page stays focusable (aria-current="page" + "current page"
+        // label unchanged).
+        if (!Number.isInteger(page) || page < 1 || page === agentRunPage) return;
+        setAgentRunPage(page);
+        fetchAgentRunsAndRender();
+      });
     });
   }
 
@@ -1808,6 +2121,19 @@
     // resolveDateRange(dateRangeState), issue #412 — not an unfiltered view.
     if (els.arFilterClear) {
       els.arFilterClear.addEventListener('click', clearArDateFilters);
+    }
+
+    // Page-size selector (issue #428): changing the rows-per-page choice
+    // re-scopes the list to page 1 at the new size — setAgentRunPageSize
+    // updates the closure state and REPLACES the URL state, then the
+    // shared filter path re-fetches immediately so the table reflects the
+    // new limit without waiting for the next auto-refresh.  The current
+    // filter values ride along unchanged.
+    if (els.arPageSize) {
+      els.arPageSize.addEventListener('change', function () {
+        setAgentRunPageSize(els.arPageSize.value);
+        fetchAgentRunsAndRender();
+      });
     }
 
     // Live active styling + Clear enable state: repaint the visual state
@@ -1951,6 +2277,17 @@
     setupAgentRunEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
+    // Issue #426: read ?page / ?page_size from the URL before the initial
+    // fetch so a deep link such as ?page=2&page_size=100 loads the
+    // corresponding Agent Runs page on dashboard load.
+    readAgentRunPaginationFromUrl();
+    // PR #431 review (finding 4): keep Back/Forward navigation in sync with
+    // the in-memory page state.  Guarded so non-browser environments (the
+    // Node sandbox, which never calls startAutoRefresh) can't crash on a
+    // missing window.addEventListener.
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('popstate', handleAgentRunPopstate);
+    }
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();
@@ -1998,6 +2335,36 @@
   window.buildAgentRunsUrl = buildAgentRunsUrl;
   window.setAgentRunFilters = function (filters) { agentRunFilters = filters; };
   window.setDateRangeState = function (state) { dateRangeState = state; };
+  // Agent Runs pagination state + URL persistence (issue #426): the pure
+  // URL-param parser, the on-load URL reader, and the page-change history
+  // hook — page state lives in the closure, so the node harness exercises
+  // it through the builder output and the history stub.
+  window.parseAgentRunPagination = parseAgentRunPagination;
+  window.readAgentRunPaginationFromUrl = readAgentRunPaginationFromUrl;
+  window.setAgentRunPage = setAgentRunPage;
+  // Agent Runs pagination controls (issue #427): the pure page-item window
+  // calculator and the control renderer (wires page-button clicks through
+  // setAgentRunPage + the shared fetch path — filters preserved, row
+  // content untouched).
+  window.computePageItems = computePageItems;
+  window.renderAgentRunPagination = renderAgentRunPagination;
+  // Agent Runs page-size validation + reset semantics (issue #428): the
+  // size validator (25/50/100, fallback 50) and the size-change hook that
+  // resets to page 1 and REPLACES the URL state (history.replaceState) —
+  // filter applies reset through applyFilters, which shares the same
+  // replace semantics instead of pushing a history entry per adjustment.
+  window.parseAgentRunPageSize = parseAgentRunPageSize;
+  window.setAgentRunPageSize = setAgentRunPageSize;
+  // Agent Runs pagination resilience (issue #429): the pure nearest-valid-
+  // page calculator (used when a fetched total no longer covers the current
+  // page) and the shared agent-runs fetch path — the refresh-style refetch
+  // that keeps the selected page/offset, preserves rows during loading and
+  // failures, and re-fetches the corrected page after a fallback.
+  window.nearestValidAgentRunPage = nearestValidAgentRunPage;
+  window.fetchAgentRunsAndRender = fetchAgentRunsAndRender;
+  // PR #431 review (finding 4): the Back/Forward (popstate) re-sync handler
+  // joins the window test seam so the Node harness can drive it directly.
+  window.handleAgentRunPopstate = handleAgentRunPopstate;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

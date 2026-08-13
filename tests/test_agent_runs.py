@@ -589,6 +589,84 @@ class TestAgentRunsList:
         assert item["currentStatus"] == item["status"]
 
     @pytest.mark.asyncio
+    async def test_custom_limit_and_offset(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Custom limit/offset query params shape the response metadata and
+        reach the SQL as the final positional args (issue #426 — the
+        dashboard translates page state to these existing API params)."""
+        row = _mk_session_row(session_id=_SESSION_ID)
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=37)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": 10, "offset": 40},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["limit"] == 10
+        assert data["offset"] == 40
+        # Pagination metadata: total is the full match count, not the page size
+        assert data["total"] == 37
+        assert len(data["items"]) == 1
+
+        # limit/offset are passed to the data query as the trailing args
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        params_list = list(call_args[0][1:])  # skip SQL string
+        assert params_list[-2:] == [10, 40], \
+            "limit/offset not passed as the final positional SQL args"
+
+    @pytest.mark.asyncio
+    async def test_pagination_combines_with_filters(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """limit/offset combine with agent/status/date filters: filter params
+        precede the trailing limit/offset SQL args, and pagination metadata
+        reflects the requested page (issue #426 — paging keeps filters)."""
+        from datetime import timezone
+
+        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            agent="code-editor",
+            last_message_at=recent,
+            message_count=10,
+            computed_status="running",
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=25)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={
+                    "agent": "code-editor",
+                    "status": "running",
+                    "from_date": "2025-07-01T00:00:00Z",
+                    "to_date": "2025-08-01T00:00:00Z",
+                    "limit": 25,
+                    "offset": 50,
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data["items"]) == 1
+        assert data["limit"] == 25
+        assert data["offset"] == 50
+        assert data["total"] == 25
+
+        # The status-filter path wraps the query — limit/offset must still
+        # land as the trailing args after every filter param.
+        call_args = mock_conn.fetch.call_args
+        assert call_args is not None
+        params_list = list(call_args[0][1:])  # skip SQL string
+        assert params_list[-2:] == [25, 50], \
+            "limit/offset not passed after the filter params"
+
+    @pytest.mark.asyncio
     async def test_row_has_required_fields(self, client: AsyncClient, mock_conn: AsyncMock):
         """Each list row includes both internal and external IDs, computed status, etc."""
         row = _mk_session_row(
