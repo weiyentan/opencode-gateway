@@ -498,20 +498,18 @@
     return 'badge-unknown';
   }
 
-  /** Format code changes count */
-  function fmtCodeChanges(n) {
-    if (n == null || n <= 0) return '--';
-    return fmtNum(n);
-  }
-
   /** Format code change additions/deletions as a compact diff.
-   *  Renders `+{additions}/-{deletions}` (e.g. `+15/-3`), or `--` when there
-   *  is no code change data (both additions and deletions null/zero). */
+   *  Renders `+{additions}/-{deletions}` (e.g. `+15/-3`), suppressing the
+   *  zero side (`-42` for pure deletions, `+120` for pure additions), and
+   *  `--` when there is no code change data (both additions and deletions
+   *  null/zero). */
   function fmtCodeChangesDiff(additions, deletions) {
     if (additions == null || deletions == null) return '--';
     var add = Number(additions);
     var del = Number(deletions);
     if (add === 0 && del === 0) return '--';
+    if (add === 0) return '-' + fmtNum(del);
+    if (del === 0) return '+' + fmtNum(add);
     return '+' + fmtNum(add) + '/-' + fmtNum(del);
   }
 

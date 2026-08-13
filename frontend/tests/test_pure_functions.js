@@ -236,19 +236,13 @@ function statusBadgeClass(status) {
   return 'badge-unknown';
 }
 
-function fmtCodeChanges(n) {
-  if (n == null || n <= 0) return '--';
-  return fmtNum(n);
-}
-
-/** Format code change additions/deletions as a compact diff.
- *  Renders `+{additions}/-{deletions}` (e.g. `+15/-3`), or `--` when there
- *  is no code change data (both additions and deletions null/zero). */
 function fmtCodeChangesDiff(additions, deletions) {
   if (additions == null || deletions == null) return '--';
   var add = Number(additions);
   var del = Number(deletions);
   if (add === 0 && del === 0) return '--';
+  if (add === 0) return '-' + fmtNum(del);
+  if (del === 0) return '+' + fmtNum(add);
   return '+' + fmtNum(add) + '/-' + fmtNum(del);
 }
 
@@ -582,18 +576,6 @@ assert(resolveBadgeStatus(undefined) === 'badge-unknown',
 assert(resolveBadgeStatus({ currentStatus: 'running', status: 'running' }) === 'badge-running',
   'currentStatus == status → badge-running');
 
-// ── Tests for fmtCodeChanges ────────────────────────────────────────────
-
-console.log('\u25B6 fmtCodeChanges');
-
-assert(fmtCodeChanges(null) === '--', 'null → --');
-assert(fmtCodeChanges(undefined) === '--', 'undefined → --');
-assert(fmtCodeChanges(0) === '--', '0 → --');
-assert(fmtCodeChanges(1) === '1', '1 → 1');
-assert(fmtCodeChanges(42) === '42', '42 → 42');
-assert(fmtCodeChanges(1000) === '1.0K', '1000 → 1.0K');
-assert(fmtCodeChanges(-1) === '--', '-1 → --');
-
 // ── Tests for fmtCodeChangesDiff ─────────────────────────────────────────
 
 console.log('\u25B6 fmtCodeChangesDiff');
@@ -604,8 +586,10 @@ assert(fmtCodeChangesDiff(null, 3) === '--', 'null additions → --');
 assert(fmtCodeChangesDiff(15, undefined) === '--', 'undefined deletions → --');
 assert(fmtCodeChangesDiff(0, 0) === '--', '0/0 → --');
 assert(fmtCodeChangesDiff(15, 3) === '+15/-3', '15/3 → +15/-3');
-assert(fmtCodeChangesDiff(120, 0) === '+120/-0', '120/0 → +120/-0');
-assert(fmtCodeChangesDiff(0, 42) === '+0/-42', '0/42 → +0/-42');
+assert(fmtCodeChangesDiff(120, 0) === '+120', '120/0 → +120 (zero side suppressed)');
+assert(fmtCodeChangesDiff(0, 42) === '-42', '0/42 → -42 (zero side suppressed)');
+assert(fmtCodeChangesDiff(7, 0) === '+7', '7/0 → +7 (pure additions)');
+assert(fmtCodeChangesDiff(0, 7) === '-7', '0/7 → -7 (pure deletions)');
 assert(fmtCodeChangesDiff(1000, 500) === '+1.0K/-500', '1000/500 → +1.0K/-500');
 
 
