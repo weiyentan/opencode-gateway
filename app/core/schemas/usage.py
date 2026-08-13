@@ -37,6 +37,10 @@ class AggregateRow(BaseModel):
         default=None,
         description="Resolved project label (present when group includes 'project')",
     )
+    agent: str | None = Field(
+        default=None,
+        description="Resolved agent identity (present when group includes 'agent')",
+    )
 
 
 class AggregateQuery(BaseModel):

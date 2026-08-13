@@ -195,6 +195,36 @@ class TestAggregatesQueryCount:
         assert mock_conn.fetchrow.call_count == 0
 
     @pytest.mark.asyncio
+    async def test_aggregates_agent_grouped_uses_one_query(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """With group_by=agent: 1 fetch = 1 query (never routes through the
+        two-query client,project rollup path)."""
+        rows = [_mk_aggregate_row(group_value="researcher", agent="researcher")]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetch.call_count == 1, (
+            f"Expected 1 fetch for agent grouping, got {mock_conn.fetch.call_count}"
+        )
+        assert mock_conn.fetchrow.call_count == 0
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert "FROM client_project_rollup" not in sql, (
+            f"Agent must not route through rollup, got: {sql[:200]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_aggregates_client_project_hits_rollup(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
