@@ -87,12 +87,31 @@ elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
 
+// Agent Runs filter-bar fakes for the apply/reset paths (issue #428): the
+// Apply button, the agent/status inputs (so applyFilters' UI-read sees
+// them), and the page-size <select> (25/50/100, default 50).  Registered
+// before loadRealAppJs so app.js captures them in els like the issue #7
+// fakes; empty initial values keep the existing filter behavior intact.
+var arFilterApplyEl = makeFakeElement('ar-filter-apply');
+var arFilterAgentEl = makeFakeElement('ar-filter-agent');
+var arFilterStatusEl = makeFakeElement('ar-filter-status');
+var arPageSizeEl = makeFakeElement('ar-page-size');
+elementRegistry['ar-filter-apply'] = arFilterApplyEl;
+elementRegistry['ar-filter-agent'] = arFilterAgentEl;
+elementRegistry['ar-filter-status'] = arFilterStatusEl;
+elementRegistry['ar-page-size'] = arPageSizeEl;
+
 // Browser-history stub (issue #426): records pushState URLs so tests can
 // verify that Agent Runs page changes persist to the URL without touching
 // the table DOM (row content changes only through the normal fetch path).
+// Issue #428: replaceState is recorded separately — page-size changes and
+// filter resets must REPLACE the URL state instead of pushing a history
+// entry per adjustment.
 var historyCalls = [];
+var historyReplaceCalls = [];
 var historyStub = {
-  pushState: function (state, title, url) { historyCalls.push(url); }
+  pushState: function (state, title, url) { historyCalls.push(url); },
+  replaceState: function (state, title, url) { historyReplaceCalls.push(url); }
 };
 
 (function loadRealAppJs() {
@@ -170,6 +189,11 @@ var historyStub = {
   window.parseAgentRunPagination = sandboxWindow.parseAgentRunPagination;
   window.readAgentRunPaginationFromUrl = sandboxWindow.readAgentRunPaginationFromUrl;
   window.setAgentRunPage = sandboxWindow.setAgentRunPage;
+  // Issue #428: Agent Runs page-size validation + reset semantics — the
+  // size validator (25/50/100, fallback 50) and the size-change hook
+  // (reset to page 1, history.replaceState URL) join the same window seam.
+  window.parseAgentRunPageSize = sandboxWindow.parseAgentRunPageSize;
+  window.setAgentRunPageSize = sandboxWindow.setAgentRunPageSize;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2508,6 +2532,216 @@ console.log('\u25B6 Agent Runs pagination state (issue #426)');
   window.setAgentRunPage(-2);
   assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=1&page_size=50',
     'history: an invalid page value falls back to page 1 in the pushed URL');
+})();
+
+// ── Agent Runs page-size + filter reset (issue #428) ─────────────────────
+// The page-size selector offers exactly 25/50/100 rows per page (default
+// 50); unsupported values fall back to 50.  Changing the page size or
+// applying filters resets to page 1 and REPLACES the URL state
+// (history.replaceState) so adjustments do not add a history entry per
+// change — explicit page navigation (setAgentRunPage, issue #426) keeps
+// using pushState.
+
+console.log('\u25B6 Agent Runs page-size + filter reset (issue #428)');
+
+// ── Page-size validation: exactly 25/50/100, fallback 50 ────────────────
+// parseAgentRunPageSize() accepts the selector's three choices; any other
+// value (including malformed input) falls back to the default (50).
+
+(function () {
+  if (typeof window.parseAgentRunPageSize !== 'function') {
+    assert(false, 'app.js: parseAgentRunPageSize exposed on the window test seam');
+    return;
+  }
+
+  // The selector's choices pass through.
+  assert(window.parseAgentRunPageSize('25') === 25,
+    'size: 25 rows per page is accepted');
+  assert(window.parseAgentRunPageSize('50') === 50,
+    'size: 50 rows per page is accepted (default)');
+  assert(window.parseAgentRunPageSize('100') === 100,
+    'size: 100 rows per page is accepted');
+
+  // Unsupported values fall back to the default.
+  assert(window.parseAgentRunPageSize('30') === 50,
+    'size: 30 falls back to 50 (only 25/50/100 are offered)');
+  assert(window.parseAgentRunPageSize('200') === 50,
+    'size: 200 falls back to 50');
+  assert(window.parseAgentRunPageSize('abc') === 50,
+    'size: non-numeric value falls back to 50');
+  assert(window.parseAgentRunPageSize('0') === 50,
+    'size: 0 falls back to 50');
+  assert(window.parseAgentRunPageSize('') === 50,
+    'size: empty value falls back to 50');
+
+  // The URL parser clamps page_size through the same rule (a deep link to
+  // an unsupported size still lands on a supported size).
+  var p = window.parseAgentRunPagination('page=2&page_size=200');
+  assert(p.page === 2 && p.pageSize === 50,
+    'parse: unsupported page_size=200 in the URL falls back to 50 (page kept)');
+})();
+
+// ── Page-size changes reset to page 1 and REPLACE URL state ─────────────
+// setAgentRunPageSize() validates the choice (25/50/100), updates the
+// closure page size, resets the page to 1, and persists the new state
+// through history.replaceState — NOT pushState, so adjusting the selector
+// does not create a browser-history entry per change.  Filters ride along
+// unchanged (they live in the request, not the URL, per issue #412).
+
+(function () {
+  if (typeof window.setAgentRunPageSize !== 'function' || !appJsSandbox.history) {
+    assert(false, 'app.js: setAgentRunPageSize exposed + sandbox history stub present');
+    return;
+  }
+
+  // Page 3 of 50 with active filters → switching to 100 rows per page
+  // resets to page 1, replaces the URL, and keeps the filters.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob', status: 'completed' });
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+  window.setAgentRunPageSize(100);
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'size: page-size change REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=100',
+    'size: replaced URL carries page=1 and the new page_size');
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=100') !== -1 && url.indexOf('offset=0') !== -1,
+    'size: after the size change the next request uses limit=100 and offset=0 (page 1)');
+  assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1,
+    'size: filters remain in the request after the page-size reset');
+
+  // Unsupported sizes fall back to 50 (and still replace, page 1).
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+  window.setAgentRunPageSize(200);
+  assert(historyReplaceCalls.length === 1 &&
+         historyReplaceCalls[0] === '/index.html?page=1&page_size=50',
+    'size: an unsupported size falls back to page_size=50 in the replaced URL');
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'size: fallback size requests limit=50 and offset=0');
+})();
+
+// ── Filter applies reset to page 1 and REPLACE URL state ────────────────
+// applyFilters() (wired to the Apply button) re-scopes the list to page 1
+// whenever filters are applied or changed, REPLACING the URL state (no
+// history entry per adjustment) while the chosen filter values ride along
+// in the request.  The Clear path (clearArDateFilters) shares this via
+// applyFilters.
+
+(function () {
+  if (typeof window.setupAgentRunEventHandlers !== 'function') {
+    assert(false, 'app.js: setupAgentRunEventHandlers exposed on the window test seam');
+    return;
+  }
+
+  // Fixture: the user is on page 3 of 50 rows with date/agent/status
+  // filters typed into the filter bar, then hits Apply.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '2026-07-31';
+  arFilterAgentEl.value = 'bob';
+  arFilterStatusEl.value = 'completed';
+  window.setupAgentRunEventHandlers();
+
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  arFilterApplyEl._handlers.click();
+
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'apply: applying filters REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=50',
+    'apply: replaced URL carries page=1 and the current page_size');
+  assert(calls.length === 1 && calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'apply: exactly one agent-runs fetch through the existing filter path');
+  assert(calls[0].indexOf('offset=0') !== -1 && calls[0].indexOf('limit=50') !== -1,
+    'apply: the re-fetch requests page 1 (offset=0) at the current page size');
+  assert(calls[0].indexOf('from_date=2026-07-01T00%3A00%3A00Z') !== -1 &&
+         calls[0].indexOf('to_date=2026-07-31T23%3A59%3A59Z') !== -1 &&
+         calls[0].indexOf('agent=bob') !== -1 && calls[0].indexOf('status=completed') !== -1,
+    'apply: date/agent/status filter values remain in the request after the reset');
+})();
+
+// ── Page-size selector markup (issue #428) ──────────────────────────────
+// Static verification against the real index.html: the selector lives in
+// the Agent Runs filter bar and offers exactly 25/50/100 rows per page
+// with 50 as the default (selected) choice.
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var filterBar = html.slice(html.indexOf('id="agent-runs-filters"'),
+    html.indexOf('id="ar-filter-apply"'));
+  var selectMatch = filterBar.match(/<select[^>]*id="ar-page-size"[^>]*>([\s\S]*?)<\/select>/);
+  assert(selectMatch !== null,
+    'index.html: #ar-page-size select exists inside the Agent Runs filter bar');
+  var options = (selectMatch ? selectMatch[1].match(/<option[^>]*value="(\d+)"[^>]*>/g) : null) || [];
+  assert(options.length === 3 &&
+         options[0].indexOf('value="25"') !== -1 &&
+         options[1].indexOf('value="50"') !== -1 &&
+         options[2].indexOf('value="100"') !== -1,
+    'index.html: page-size select offers exactly 25, 50, and 100');
+  assert(filterBar.indexOf('<option value="50" selected>') !== -1,
+    'index.html: 50 is the default (selected) page size');
+})();
+
+// ── Page-size selector wiring: change → page 1 refetch + replace ────────
+// The selector's change handler validates the choice, resets to page 1
+// (replaceState), and immediately re-fetches through the existing filter
+// path — the table reflects the new limit without waiting for the next
+// auto-refresh, and the current filter values ride along.
+
+(function () {
+  if (typeof window.setupAgentRunEventHandlers !== 'function') {
+    assert(false, 'app.js: setupAgentRunEventHandlers exposed on the window test seam');
+    return;
+  }
+
+  // Fixture: page 3 of 50 rows with an agent filter applied; the user
+  // picks 25 rows per page from the selector.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob' });
+  arPageSizeEl.value = '25';
+  window.setupAgentRunEventHandlers();
+
+  if (typeof arPageSizeEl._handlers.change !== 'function') {
+    assert(false, 'app.js: page-size change handler wired by setupAgentRunEventHandlers');
+    return;
+  }
+
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  arPageSizeEl._handlers.change();
+
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'selector: changing page size REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=25',
+    'selector: replaced URL carries page=1 and the new page_size');
+  assert(calls.length === 1 && calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'selector: exactly one agent-runs fetch triggered by the change');
+  assert(calls[0].indexOf('limit=25') !== -1 && calls[0].indexOf('offset=0') !== -1,
+    'selector: the re-fetch requests limit=25 and offset=0 (page 1)');
+  assert(calls[0].indexOf('agent=bob') !== -1,
+    'selector: the current agent filter rides along after the reset');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
