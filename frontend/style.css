@@ -1072,8 +1072,10 @@ tbody tr:hover td {
 .agent-runs-pagination {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
-  margin-bottom: 14px;
+  margin-top: 16px;
+  margin-bottom: 4px;
   flex-wrap: wrap;
 }
 
