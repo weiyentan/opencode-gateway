@@ -281,6 +281,14 @@
       </div>
     </section>
 
+    <!-- Agent Runs pagination control block (issue #427): Previous / Next +
+         numbered page buttons (ellipses for large page counts), rendered
+         into this container by renderAgentRunPagination() in app.js.  Lives
+         BELOW the panel (outside the panel box).  The .agent-runs-filters
+         class provides the flex layout; the .filter-clear button styling
+         gives the neutral secondary look with a disabled state. -->
+    <nav class="agent-runs-filters agent-runs-pagination" id="agent-runs-pagination" aria-label="Agent Runs pages"></nav>
+
     </div><!-- #tab-agent-runs -->
 
     <!-- ── Tab: Clients / Projects ─────────────────────────────────────── -->

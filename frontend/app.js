@@ -68,6 +68,7 @@
     arDetailTitle:  $('ar-detail-title'),
     arDetailBody:   $('ar-detail-body'),
     arDetailClose:  $('ar-detail-close'),
+    arPagination:   $('agent-runs-pagination'), // control block below the panel (issue #427)
 
     // Client/Project
     cpTbody:         $('cp-tbody'),
@@ -790,6 +791,42 @@
     if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
       history.pushState({}, '', url);
     }
+  }
+
+  /** Compute the compact page-item window for the pagination control
+   *  (issue #427).  Small page counts (<= 7) render every page; larger
+   *  counts render the first and last pages plus a window around the
+   *  current page, with ellipsis separators filling the gaps.  Pure — no
+   *  DOM access — so the Node test harness exercises it directly.
+   *  @param {number} currentPage the active page (clamped into range)
+   *  @param {number} pageCount   total number of pages (ceil(total/size))
+   *  @returns {Array<{type:'page',page:number}|{type:'ellipsis'}>} */
+  function computePageItems(currentPage, pageCount) {
+    if (!Number.isInteger(pageCount) || pageCount < 1) return [];
+    var current = Number.isInteger(currentPage)
+      ? Math.min(Math.max(currentPage, 1), pageCount)
+      : 1;
+    if (pageCount <= 7) {
+      var all = [];
+      for (var i = 1; i <= pageCount; i++) {
+        all.push({ type: 'page', page: i });
+      }
+      return all;
+    }
+    // First/last pages plus a window around the current page.
+    var wanted = {};
+    [1, pageCount, current - 1, current, current + 1].forEach(function (p) {
+      if (p >= 1 && p <= pageCount) wanted[p] = true;
+    });
+    var sorted = Object.keys(wanted).map(Number).sort(function (a, b) { return a - b; });
+    var items = [];
+    sorted.forEach(function (p, i) {
+      if (i > 0 && p - sorted[i - 1] > 1) {
+        items.push({ type: 'ellipsis' });
+      }
+      items.push({ type: 'page', page: p });
+    });
+    return items;
   }
 
   /** Build the agent runs URL from current filter state.
@@ -1752,6 +1789,7 @@
       renderCollectorsTable(data);
       renderAgentsTable(data);
       renderAgentRunsTable(data.agentRuns);
+      renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
       renderClientProjectBreakdown(data);
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
@@ -1785,22 +1823,99 @@
 
   function applyFilters() {
     agentRunFilters = readFiltersFromUI();
+    fetchAgentRunsAndRender();
+  }
+
+  /** Fetch the Agent Runs page described by the current filter + pagination
+   *  state and re-render the table and pagination controls (issue #427).
+   *  Shared by the Apply/Clear filter path and the pagination control
+   *  clicks, so paging always preserves the active filters: buildAgentRunsUrl
+   *  carries from_date/to_date/agent/status alongside the page-derived
+   *  limit/offset (issue #426). */
+  function fetchAgentRunsAndRender() {
     // Track the agent-runs panel freshness for this independent fetch
     var prev = panelStates['agent-runs'];
     setPanelState('agent-runs', 'refreshing', prev ? prev.updatedAt : null);
-    // Re-fetch agent runs with new filters, update table
+    // Re-fetch agent runs with current filters + page state, update table
     var url = buildAgentRunsUrl();
     apiFetch(url).then(function (data) {
       agentRunsData = data;
       agentRunsFetchError = null;
       setPanelState('agent-runs', 'ok', Date.now());
       renderAgentRunsTable(data);
+      renderAgentRunPagination(data);
     }).catch(function (e) {
       agentRunsFetchError = e.message || 'Agent runs query failed';
       var prevState = panelStates['agent-runs'];
       setPanelState('agent-runs', 'stale', prevState ? prevState.updatedAt : null);
       renderAgentRunsTable(null); // keeps previous rows; label shows "Showing previous data"
+      renderAgentRunPagination(agentRunsData); // keeps the last-known page info
       console.error('Agent runs filter fetch error:', e);
+    });
+  }
+
+  /** Render the Agent Runs pagination control block below the panel
+   *  (issue #427): Previous / Next plus the numbered page items computed by
+   *  computePageItems from the API response `total` and the current page
+   *  size.  Previous is disabled on page 1, Next on the final page, and the
+   *  current page carries aria-current="page".  Clicking a control persists
+   *  the page via setAgentRunPage (issue #426) and re-fetches that server-
+   *  side page through fetchAgentRunsAndRender, preserving active filters.
+   *  Agent Runs row content, columns, ordering, and detail interactions are
+   *  untouched — this block only re-requests the same endpoint with a
+   *  different offset. */
+  function renderAgentRunPagination(data) {
+    if (!els.arPagination) return;
+    // Failed fetch → keep the previous control state (mirrors the table's
+    // "keep previous rows" behavior via the same panel guard).
+    if (!shouldRenderPanel(panelStates, 'agent-runs')) return;
+
+    var total = (data && typeof data.total === 'number')
+      ? data.total
+      : (data && data.items ? data.items.length : 0);
+    var pageCount = Math.ceil(total / agentRunPageSize);
+    var items = computePageItems(agentRunPage, pageCount);
+    if (items.length === 0) {
+      els.arPagination.innerHTML = '';
+      return;
+    }
+
+    var html = '';
+    var prevPage = agentRunPage - 1;
+    var nextPage = agentRunPage + 1;
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + prevPage + '"' +
+      (prevPage < 1 ? ' disabled' : '') + ' aria-label="Previous page">\u2190 Previous</button>';
+
+    items.forEach(function (item) {
+      if (item.type === 'ellipsis') {
+        html += '<span class="pagination-ellipsis" aria-hidden="true">\u2026</span>';
+        return;
+      }
+      var isCurrent = item.page === agentRunPage;
+      html += '<button type="button" class="filter-clear pagination-btn' +
+        (isCurrent ? ' pagination-current' : '') + '" data-page="' + item.page + '"' +
+        ' aria-label="' + (isCurrent ? 'Page ' + item.page + ', current page' : 'Page ' + item.page) + '"' +
+        (isCurrent ? ' aria-current="page"' : '') + '>' + item.page + '</button>';
+    });
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + nextPage + '"' +
+      (nextPage > pageCount ? ' disabled' : '') + ' aria-label="Next page">Next \u2192</button>';
+
+    els.arPagination.innerHTML = html;
+
+    // Wire the page controls: selecting a page updates the pagination
+    // state (setAgentRunPage → URL history) and re-fetches that page via
+    // the shared path so the active filters ride along (issue #426).
+    var buttons = els.arPagination.querySelectorAll('button');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return; // disabled buttons never fire in browsers; belt-and-braces
+        var page = Number(btn.getAttribute('data-page'));
+        if (!Number.isInteger(page) || page < 1) return;
+        setAgentRunPage(page);
+        fetchAgentRunsAndRender();
+      });
     });
   }
 
@@ -2069,6 +2184,12 @@
   window.parseAgentRunPagination = parseAgentRunPagination;
   window.readAgentRunPaginationFromUrl = readAgentRunPaginationFromUrl;
   window.setAgentRunPage = setAgentRunPage;
+  // Agent Runs pagination controls (issue #427): the pure page-item window
+  // calculator and the control renderer (wires page-button clicks through
+  // setAgentRunPage + the shared fetch path — filters preserved, row
+  // content untouched).
+  window.computePageItems = computePageItems;
+  window.renderAgentRunPagination = renderAgentRunPagination;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

@@ -70,7 +70,15 @@ function makeFakeElement(id) {
     },
     addEventListener: function (type, fn) { listeners[type] = fn; },
     _handlers: listeners,
-    querySelectorAll: function () { return []; }
+    querySelectorAll: function () { return []; },
+    // Attribute store (issue #427): the pagination control renderer reads
+    // data-page / disabled via getAttribute, so fakes must hold attributes.
+    attributes: {},
+    setAttribute: function (name, value) { this.attributes[name] = String(value); },
+    getAttribute: function (name) {
+      return (name in this.attributes) ? this.attributes[name] : null;
+    },
+    removeAttribute: function (name) { delete this.attributes[name]; }
   };
 }
 
@@ -86,6 +94,37 @@ elementRegistry['ar-filter-from'] = arFilterFromEl;
 elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
+
+// Agent Runs pagination container fake (issue #427): renderAgentRunPagination
+// writes the Previous/Next + numbered-page markup into this element and wires
+// the buttons through querySelectorAll('button') — so the fake parses the
+// rendered innerHTML into fake buttons (each with its data-page attribute and
+// disabled state) that tests can click through the production handler.
+var arPaginationEl = makeFakeElement('agent-runs-pagination');
+arPaginationEl.querySelectorAll = function (selector) {
+  if (selector !== 'button') return [];
+  // Cache the parsed buttons: real DOM querySelectorAll returns the same
+  // live elements (which carry the wired click handlers), so re-parse only
+  // after the renderer replaces innerHTML.
+  if (this._buttonsHtml === this.innerHTML && this._buttonsCache) {
+    return this._buttonsCache;
+  }
+  var buttons = [];
+  var re = /<button\b([^>]*)>[\s\S]*?<\/button>/g;
+  var m;
+  while ((m = re.exec(this.innerHTML)) !== null) {
+    var attrs = m[1];
+    var btn = makeFakeElement('pagination-button');
+    var pageMatch = /data-page="(\d+)"/.exec(attrs);
+    if (pageMatch) btn.setAttribute('data-page', pageMatch[1]);
+    if (/\bdisabled\b/.test(attrs)) btn.disabled = true;
+    buttons.push(btn);
+  }
+  this._buttonsCache = buttons;
+  this._buttonsHtml = this.innerHTML;
+  return buttons;
+};
+elementRegistry['agent-runs-pagination'] = arPaginationEl;
 
 // Browser-history stub (issue #426): records pushState URLs so tests can
 // verify that Agent Runs page changes persist to the URL without touching
@@ -170,6 +209,11 @@ var historyStub = {
   window.parseAgentRunPagination = sandboxWindow.parseAgentRunPagination;
   window.readAgentRunPaginationFromUrl = sandboxWindow.readAgentRunPaginationFromUrl;
   window.setAgentRunPage = sandboxWindow.setAgentRunPage;
+  // Issue #427: Agent Runs pagination controls — the pure page-item window
+  // calculator and the control renderer (which wires the page-button click
+  // path through setAgentRunPage + the shared fetch/render path).
+  window.computePageItems = sandboxWindow.computePageItems;
+  window.renderAgentRunPagination = sandboxWindow.renderAgentRunPagination;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2508,6 +2552,253 @@ console.log('\u25B6 Agent Runs pagination state (issue #426)');
   window.setAgentRunPage(-2);
   assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=1&page_size=50',
     'history: an invalid page value falls back to page 1 in the pushed URL');
+})();
+
+// ── Agent Runs pagination controls (issue #427) ──────────────────────────
+// One compact pagination control block below the Agent Runs panel: Previous,
+// Next, and numbered page buttons with ellipses for large page counts.  The
+// pure page-item window calculator drives the rendered items; the renderer
+// derives the page count from the API response `total` and the current page
+// size, disables Previous on page 1 / Next on the final page, marks the
+// current page with aria-current="page", and wires clicks through
+// setAgentRunPage + the shared fetch path (filters preserved).
+
+console.log('\u25B6 Agent Runs pagination controls — page-item calculation (issue #427)');
+
+// ── Pure calculation: page items (small / boundary / large) ─────────────
+// computePageItems(currentPage, pageCount) returns the compact page-item
+// window: all pages for small counts (<= 7), and for larger counts the
+// first/last pages plus a window around the current page with ellipsis
+// separators filling the gaps.  Zero/invalid page counts render no items.
+
+(function () {
+  if (typeof window.computePageItems !== 'function') {
+    assert(false, 'app.js: computePageItems exposed on the window test seam');
+    return;
+  }
+
+  function pageList(items) {
+    return items.map(function (i) { return i.type === 'page' ? i.page : '\u2026'; }).join(',');
+  }
+
+  // No pages: zero, negative, and non-integer page counts render no items.
+  assert(window.computePageItems(1, 0).length === 0,
+    'items: zero page count renders no items');
+  assert(window.computePageItems(1, -3).length === 0,
+    'items: negative page count renders no items');
+  assert(window.computePageItems(1, 2.5).length === 0,
+    'items: non-integer page count renders no items');
+
+  // Single page: only page 1, as a page item.
+  var one = window.computePageItems(1, 1);
+  assert(one.length === 1 && one[0].type === 'page' && one[0].page === 1,
+    'items: single page renders only page 1');
+
+  // Small counts (<= 7): every page, no ellipsis.
+  assert(pageList(window.computePageItems(4, 7)) === '1,2,3,4,5,6,7',
+    'items: 7 pages render every page with no ellipsis');
+  assert(pageList(window.computePageItems(1, 2)) === '1,2',
+    'items: 2 pages render pages 1 and 2');
+
+  // Boundary (8 pages): first/last always visible, window around the
+  // current page, a single ellipsis fills the gap.
+  assert(pageList(window.computePageItems(1, 8)) === '1,2,\u2026,8',
+    'items: page 1 of 8 renders 1,2,\u2026,8');
+  assert(pageList(window.computePageItems(8, 8)) === '1,\u2026,7,8',
+    'items: page 8 of 8 renders 1,\u2026,7,8');
+
+  // Large counts: compact window with both ellipses.
+  assert(pageList(window.computePageItems(13, 25)) === '1,\u2026,12,13,14,\u2026,25',
+    'items: page 13 of 25 renders 1,\u2026,12,13,14,\u2026,25');
+
+  // Out-of-range current pages clamp into the valid window.
+  assert(pageList(window.computePageItems(99, 25)) === '1,\u2026,24,25',
+    'items: current page beyond the last page clamps to the final-page window');
+  assert(pageList(window.computePageItems(-1, 25)) === '1,2,\u2026,25',
+    'items: current page below 1 clamps to the first-page window');
+})();
+
+// ── Control render (issue #427) ─────────────────────────────────────────
+// renderAgentRunPagination(data) derives the page count from the API
+// response `total` and the current page size, renders Previous/Next plus
+// the numbered page items into the container below the panel, and marks
+// the current page with aria-current="page".
+
+console.log('\u25B6 Agent Runs pagination controls — render (issue #427)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Reset pagination state: page 1 of 50 rows, dashboard range active.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+
+  // 125 runs at 50/page → 3 pages.  Page 1 is current: Previous disabled,
+  // numbered buttons 1/2/3, Next enabled pointing at page 2.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var html = arPaginationEl.innerHTML;
+  assert(/data-page="1"[^>]*aria-current="page"/.test(html),
+    'render: the current page button carries aria-current="page"');
+  assert(html.indexOf('aria-label="Page 1, current page"') !== -1,
+    'render: the current page button carries a "current page" label');
+  assert(/data-page="0"[^>]*disabled/.test(html) &&
+         html.indexOf('aria-label="Previous page"') !== -1,
+    'render: Previous is a labeled button, disabled on page 1');
+  assert(html.indexOf('data-page="2"') !== -1 &&
+         html.indexOf('aria-label="Next page"') !== -1 &&
+         /data-page="2"[^>]*aria-label="Next page"/.test(html),
+    'render: Next is a labeled button pointing at page 2 (enabled)');
+  assert(html.indexOf('data-page="1"') !== -1 && html.indexOf('data-page="2"') !== -1 &&
+         html.indexOf('data-page="3"') !== -1,
+    'render: numbered page buttons 1, 2, and 3 are present');
+  assert(html.indexOf('pagination-ellipsis') === -1,
+    'render: small page counts render no ellipsis');
+
+  // Zero runs: no pages → the control renders nothing.
+  window.renderAgentRunPagination({ items: [], total: 0, limit: 50, offset: 0 });
+  assert(arPaginationEl.innerHTML === '',
+    'render: zero runs hides the pagination control');
+
+  // Large counts: 1250 runs at 50/page → 25 pages; page 13 renders the
+  // compact ellipsis presentation with first/last always present.
+  window.setAgentRunPage(13);
+  window.renderAgentRunPagination({ items: [{}], total: 1250, limit: 50, offset: 600 });
+  html = arPaginationEl.innerHTML;
+  assert(html.indexOf('class="pagination-ellipsis"') !== -1,
+    'render: large page counts render ellipsis separators');
+  assert(html.indexOf('data-page="1"') !== -1 && html.indexOf('data-page="25"') !== -1,
+    'render: first and last page buttons are always present');
+  assert(html.indexOf('aria-label="Page 13, current page"') !== -1,
+    'render: page 13 renders as the current page');
+})();
+
+// ── Page selection wiring (issue #427) ──────────────────────────────────
+// Clicking a page control updates the pagination state (setAgentRunPage →
+// history) and re-fetches that server-side page through the shared fetch
+// path, which preserves the active from_date/to_date/agent/status filters.
+// The click handler's URL/history/fetch effects are all synchronous, and
+// the post-fetch re-render behavior is covered by the direct render calls
+// above — so this block stays synchronous (the issue #5 render block's
+// deferred poll chain shares the fakes and must not interleave with it).
+
+console.log('\u25B6 Agent Runs pagination controls — page selection (issue #427)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Reset: page 1 of 50 rows with explicit filters active.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z', agent: 'bob', status: 'completed' });
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [], total: 125, limit: 50, offset: 0 }); }
+    });
+  };
+
+  // 125 runs / 50 per page → 3 pages; page 1 is current.  Click page 2.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var page2 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '2'; })[0];
+  assert(!!page2, 'click: the page-2 button is rendered');
+  page2._handlers.click();
+
+  // Synchronous effects: URL persists the new page, and the fetch fires
+  // with the page-2 offset while preserving the active filters.
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=2&page_size=50',
+    'click: selecting page 2 persists page=2 into the URL');
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=50') !== -1,
+    'click: the page-2 fetch carries limit=50 and offset=50');
+  assert(fetched[0].indexOf('agent=bob') !== -1 && fetched[0].indexOf('status=completed') !== -1 &&
+         fetched[0].indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1,
+    'click: the page-2 fetch preserves date/agent/status filters');
+  assert(window.buildAgentRunsUrl().indexOf('offset=50') !== -1,
+    'click: subsequent requests use the selected page offset');
+
+  // Re-render from the new page state and advance to the final page (3).
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 50 });
+  assert(/data-page="2"[^>]*aria-current="page"/.test(arPaginationEl.innerHTML),
+    'render: after selection, page 2 carries aria-current="page"');
+  assert(/data-page="1"[^>]*aria-label="Previous page"/.test(arPaginationEl.innerHTML) &&
+         arPaginationEl.innerHTML.indexOf('data-page="0"') === -1,
+    'render: Previous is enabled on page 2');
+  var page3 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+  assert(!!page3, 'click: the page-3 button is rendered on page 2');
+  historyCalls.length = 0;
+  page3._handlers.click();
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=3&page_size=50',
+    'click: selecting page 3 persists page=3 into the URL');
+  assert(fetched.length === 2 && fetched[1].indexOf('limit=50&offset=100') !== -1,
+    'click: the page-3 fetch carries limit=50 and offset=100');
+
+  // The final page renders with Next disabled; clicking it must not
+  // navigate or refetch.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 100 });
+  assert(arPaginationEl.innerHTML.indexOf('data-page="4" disabled') !== -1,
+    'render: Next is disabled on the final page (3 of 3)');
+  assert(/data-page="2"[^>]*aria-label="Previous page"/.test(arPaginationEl.innerHTML),
+    'render: Previous points at page 2 on the final page');
+  var nextBtn = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '4'; })[0];
+  assert(!!nextBtn && nextBtn.disabled === true,
+    'render: the disabled Next button carries the disabled state');
+  historyCalls.length = 0;
+  nextBtn._handlers.click();
+  assert(historyCalls.length === 0 && fetched.length === 2,
+    'click: clicking the disabled Next does not navigate or refetch');
+
+  // Previous is disabled on page 1; clicking it must not navigate either.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl(); // back to page 1
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var prevBtn = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '0'; })[0];
+  assert(!!prevBtn && prevBtn.disabled === true,
+    'render: the disabled Previous button carries the disabled state');
+  historyCalls.length = 0;
+  prevBtn._handlers.click();
+  assert(historyCalls.length === 0 && fetched.length === 2,
+    'click: clicking the disabled Previous does not navigate or refetch');
+})();
+
+// ── Pagination control block markup (issue #427) ─────────────────────────
+// Static verification against the real index.html (the repo's established
+// substitute for browser-level checks): the control container lives BELOW
+// the .panel-agent-runs panel — after its closing </section>, outside the
+// panel box — and inside #tab-agent-runs.
+
+console.log('\u25B6 index.html — Agent Runs pagination control block (issue #427)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  var panelEnd = html.indexOf('</section>', html.indexOf('panel-agent-runs'));
+  var pagIdx = html.indexOf('id="agent-runs-pagination"');
+  assert(pagIdx !== -1, 'index.html: #agent-runs-pagination container exists');
+  assert(panelEnd !== -1 && pagIdx > panelEnd,
+    'index.html: pagination container sits after the panel section (outside the panel box)');
+  var tabEnd = html.indexOf('<!-- #tab-agent-runs -->');
+  assert(tabEnd !== -1 && pagIdx < tabEnd,
+    'index.html: pagination container lives inside #tab-agent-runs, below the panel');
+  assert(html.indexOf('aria-label="Agent Runs pages"') !== -1,
+    'index.html: pagination container carries an accessible navigation label');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
