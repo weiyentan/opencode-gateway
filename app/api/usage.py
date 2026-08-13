@@ -1345,27 +1345,39 @@ async def _fetch_agent_runs(
             total = await conn.fetchval(count_sql, *params)
 
     # ── Data query with CTE for child counts (no N+1) ──────────────
+    # ``base`` is hoisted into a CTE so both the main result and the
+    # ``todo_counts`` aggregation share a single evaluation of the filtered
+    # session universe.  ``todo_counts`` is scoped to that universe via an
+    # INNER JOIN, so the todo aggregation cost tracks the filtered result
+    # set (and any client_id/date/agent/project/status predicate) rather
+    # than the full ``opencode_session_todos`` table.
     data_sql = f"""
-        WITH child_counts AS (
+        WITH base AS (
+            {base_query}
+        ),
+        child_counts AS (
             SELECT parent_session_id, COUNT(*) AS cnt
             FROM sessions
             WHERE parent_session_id IS NOT NULL
             GROUP BY parent_session_id
         ),
         todo_counts AS (
-            SELECT source_database_id, external_session_id,
+            SELECT t.source_database_id, t.external_session_id,
                    COUNT(*) AS todo_total,
-                   COUNT(*) FILTER (WHERE status = 'completed') AS todo_completed,
-                   COUNT(*) FILTER (WHERE status = 'blocked') AS todo_blocked
-            FROM opencode_session_todos
-            GROUP BY source_database_id, external_session_id
+                   COUNT(*) FILTER (WHERE t.status = 'completed') AS todo_completed,
+                   COUNT(*) FILTER (WHERE t.status = 'blocked') AS todo_blocked
+            FROM opencode_session_todos t
+            JOIN base s
+              ON s.source_database_id = t.source_database_id
+             AND s.external_session_id = t.external_session_id
+            GROUP BY t.source_database_id, t.external_session_id
         )
         SELECT s.*,
                COALESCE(cc.cnt, 0) AS child_run_count,
                COALESCE(tc.todo_total, 0) AS todo_total,
                COALESCE(tc.todo_completed, 0) AS todo_completed,
                COALESCE(tc.todo_blocked, 0) AS todo_blocked
-        FROM ({base_query}) s
+        FROM base s
         LEFT JOIN child_counts cc
             ON cc.parent_session_id = s.external_session_id
         LEFT JOIN todo_counts tc

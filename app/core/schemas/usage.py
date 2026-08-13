@@ -11,7 +11,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 T = TypeVar("T")
 
@@ -177,6 +177,16 @@ class TodoRow(BaseModel):
         default=None,
         description="Todo ordering position within the source session",
     )
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated alias for ``content`` retained for backward "
+            "compatibility; prefer ``content``"
+        ),
+    )
+    @property
+    def description(self) -> str:
+        return self.content
 
 
 class ChildRunSummary(BaseModel):
