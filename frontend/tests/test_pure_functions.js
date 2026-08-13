@@ -2349,6 +2349,23 @@ console.log('\u25B6 buildAgentRunsUrl date-range fallback (issue #412)');
     'agent/status: non-date filters are appended alongside the derived range');
 })();
 
+// ── Records view ordering: source-created, not ingest time (issue #401) ──
+// The Records table presents "most recent" as most recently created at the
+// source, so the /api/v1/usage/records fetch must request
+// sort_by=source_created_at (the backend default) — never sort_by=ingested_at.
+// The URL is built inline in fetchAll(), so this pins the production source
+// (same readFileSync pattern used for index.html assertions above) rather
+// than duplicating the URL builder.
+console.log('\u25B6 Records view — sort_by=source_created_at, never ingested_at (issue #401)');
+
+(function () {
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('sort_by=source_created_at') !== -1,
+    'records fetch requests sort_by=source_created_at (most recent = source-created message time, issue #401)');
+  assert(appJsSource.indexOf('sort_by=ingested_at') === -1,
+    'records fetch no longer requests sort_by=ingested_at (ingest time is not "most recent", issue #401)');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
 // completed (deterministic, not a fixed timer).  A safety cap at 5 s
