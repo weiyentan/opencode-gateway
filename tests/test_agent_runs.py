@@ -160,98 +160,13 @@ def _mk_child_row(
 
 
 class TestComputeStatus:
-    """Unit tests for the _compute_status helper."""
+    """Unit tests for the _compute_status helper.
 
-    def test_running_when_recently_active(self):
-        """Session active within quiet threshold → running."""
-        from app.api.usage import _compute_status
-
-        recent = _NOW - timedelta(minutes=5)
-        result = _compute_status(
-            last_message_at=recent,
-            message_count=10,
-            has_parent=False,
-            now=_NOW,
-        )
-        assert result == "running"
-
-    def test_running_at_boundary_of_quiet_threshold(self):
-        """Session exactly at quiet threshold → running (inclusive)."""
-        from app.api.usage import _compute_status
-
-        at_boundary = _NOW - timedelta(minutes=60)
-        result = _compute_status(
-            last_message_at=at_boundary,
-            message_count=10,
-            has_parent=False,
-            now=_NOW,
-        )
-        assert result == "running"
-
-    def test_stale_when_beyond_quiet_no_parent(self):
-        """Session beyond quiet threshold, no parent, within stale window → stale."""
-        from app.api.usage import _compute_status
-
-        old = _NOW - timedelta(hours=2)
-        result = _compute_status(
-            last_message_at=old,
-            message_count=10,
-            has_parent=False,
-            now=_NOW,
-        )
-        assert result == "stale"
-
-    def test_stale_at_stale_threshold_boundary(self):
-        """Session exactly at stale threshold → stale (inclusive)."""
-        from app.api.usage import _compute_status
-
-        at_boundary = _NOW - timedelta(hours=6)
-        result = _compute_status(
-            last_message_at=at_boundary,
-            message_count=10,
-            has_parent=False,
-            now=_NOW,
-        )
-        assert result == "stale"
-
-    def test_completed_when_beyond_stale_no_parent(self):
-        """Session beyond stale threshold, no parent → completed."""
-        from app.api.usage import _compute_status
-
-        old = _NOW - timedelta(hours=10)
-        result = _compute_status(
-            last_message_at=old,
-            message_count=10,
-            has_parent=False,
-            now=_NOW,
-        )
-        assert result == "completed"
-
-    def test_blocked_when_inactive_with_parent(self):
-        """Session beyond quiet threshold with parent → blocked."""
-        from app.api.usage import _compute_status
-
-        old = _NOW - timedelta(hours=2)
-        result = _compute_status(
-            last_message_at=old,
-            message_count=10,
-            has_parent=True,
-            now=_NOW,
-        )
-        assert result == "blocked"
-
-    def test_blocked_has_priority_over_stale(self):
-        """Session with parent is blocked even within stale window."""
-        from app.api.usage import _compute_status
-
-        old = _NOW - timedelta(hours=4)
-        result = _compute_status(
-            last_message_at=old,
-            message_count=10,
-            has_parent=True,
-            now=_NOW,
-        )
-        assert result == "blocked"
+    Pins the refined PRD heuristic (issue #300) at the default thresholds
+    (quiet 15 min / stale 2 h / unknown 48 h) and the new branch order:
+    unknown → running → completed/blocked (within stale window) → stale
+    (stale→unknown window) → unknown-old.
+    """
 
     def test_unknown_when_no_messages(self):
         """Session with zero messages → unknown."""
@@ -277,11 +192,141 @@ class TestComputeStatus:
         )
         assert result == "unknown"
 
-    def test_unknown_when_exceeds_unknown_threshold(self):
-        """Session older than _UNKNOWN_THRESHOLD_HOURS → unknown."""
+    def test_running_when_recently_active(self):
+        """Session active within quiet threshold → running."""
         from app.api.usage import _compute_status
 
-        very_old = _NOW - timedelta(hours=48)
+        recent = _NOW - timedelta(minutes=5)
+        result = _compute_status(
+            last_message_at=recent,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "running"
+
+    def test_running_with_parent_still_running(self):
+        """A recently-active child is running regardless of parent."""
+        from app.api.usage import _compute_status
+
+        recent = _NOW - timedelta(minutes=10)
+        result = _compute_status(
+            last_message_at=recent,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "running"
+
+    def test_completed_at_quiet_boundary_no_parent(self):
+        """Exactly 15 min ago, no parent → completed (running is strict <)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(minutes=15)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "completed"
+
+    def test_completed_within_stale_window_no_parent(self):
+        """Between quiet and stale thresholds, no parent → completed."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=1)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "completed"
+
+    def test_blocked_within_stale_window_with_parent(self):
+        """Between quiet and stale thresholds, has parent → blocked."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=1)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "blocked"
+
+    def test_blocked_at_quiet_boundary_with_parent(self):
+        """Exactly 15 min ago, has parent → blocked (running is strict <)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(minutes=15)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "blocked"
+
+    def test_stale_at_stale_boundary(self):
+        """Exactly 2 h ago, no parent → stale (completed is strict <)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(hours=2)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_stale_with_parent_beyond_stale(self):
+        """A child quiet 2+ hours is stale, not blocked (PRD open Q3)."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=24)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=True,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_stale_within_stale_window(self):
+        """Between stale and unknown thresholds → stale."""
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(hours=24)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "stale"
+
+    def test_unknown_at_unknown_boundary(self):
+        """Exactly 48 h ago → unknown (stale is strict <)."""
+        from app.api.usage import _compute_status
+
+        at_boundary = _NOW - timedelta(hours=48)
+        result = _compute_status(
+            last_message_at=at_boundary,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+        )
+        assert result == "unknown"
+
+    def test_unknown_beyond_unknown_threshold(self):
+        """Older than 48 h → unknown."""
+        from app.api.usage import _compute_status
+
+        very_old = _NOW - timedelta(hours=72)
         result = _compute_status(
             last_message_at=very_old,
             message_count=10,
@@ -289,6 +334,24 @@ class TestComputeStatus:
             now=_NOW,
         )
         assert result == "unknown"
+
+    def test_custom_thresholds_override_defaults(self):
+        """Explicit thresholds are consumed (configurable via settings).
+
+        With a 30-minute quiet threshold, a 20-minute-old session is
+        ``running``; with the 15-minute default it would be ``completed``.
+        """
+        from app.api.usage import _compute_status
+
+        old = _NOW - timedelta(minutes=20)
+        result = _compute_status(
+            last_message_at=old,
+            message_count=10,
+            has_parent=False,
+            now=_NOW,
+            quiet_threshold_minutes=30,
+        )
+        assert result == "running"
 
 
 def _sql_status(
@@ -310,18 +373,18 @@ def _sql_status(
 
     if message_count == 0 or last_message_at is None:
         return "unknown"
-    quiet = timedelta(minutes=usage_module._QUIET_THRESHOLD_MINUTES)
-    unknown = timedelta(hours=usage_module._UNKNOWN_THRESHOLD_HOURS)
-    stale = timedelta(hours=usage_module._STALE_THRESHOLD_HOURS)
-    if last_message_at >= now - quiet:
+    quiet = timedelta(minutes=usage_module.QUIET_THRESHOLD_MINUTES)
+    stale = timedelta(hours=usage_module.STALE_THRESHOLD_HOURS)
+    unknown = timedelta(hours=usage_module.UNKNOWN_THRESHOLD_HOURS)
+    if last_message_at > now - quiet:
         return "running"
-    if last_message_at < now - unknown:
-        return "unknown"
-    if parent_session_id is not None:
-        return "blocked"
-    if last_message_at >= now - stale:
+    if last_message_at > now - stale:
+        if parent_session_id is not None:
+            return "blocked"
+        return "completed"
+    if last_message_at > now - unknown:
         return "stale"
-    return "completed"
+    return "unknown"
 
 
 class TestStatusCaseExpression:
@@ -330,7 +393,7 @@ class TestStatusCaseExpression:
     The SQL CASE expression is generated from the same module-level constants
     and must keep the same branch order and boundary inclusivity as the
     Python implementation. These tests pin both to the canonical status table
-    documented in app/api/usage.py above _QUIET_THRESHOLD_MINUTES, so any
+    documented in app/api/usage.py above QUIET_THRESHOLD_MINUTES, so any
     future drift between the two implementations is caught.
     """
 
@@ -342,14 +405,16 @@ class TestStatusCaseExpression:
         expected = f"""
         CASE
             WHEN s.message_count = 0 OR s.last_message_at IS NULL THEN 'unknown'
-            WHEN s.last_message_at >= now() - interval
-                '{usage_module._QUIET_THRESHOLD_MINUTES} minutes' THEN 'running'
-            WHEN s.last_message_at < now() - interval
-                '{usage_module._UNKNOWN_THRESHOLD_HOURS} hours' THEN 'unknown'
-            WHEN s.parent_session_id IS NOT NULL THEN 'blocked'
-            WHEN s.last_message_at >= now() - interval
-                '{usage_module._STALE_THRESHOLD_HOURS} hours' THEN 'stale'
-            ELSE 'completed'
+            WHEN s.last_message_at > now() - interval
+                '{usage_module.QUIET_THRESHOLD_MINUTES} minutes' THEN 'running'
+            WHEN s.last_message_at > now() - interval
+                '{usage_module.STALE_THRESHOLD_HOURS} hours'
+                AND s.parent_session_id IS NULL THEN 'completed'
+            WHEN s.last_message_at > now() - interval
+                '{usage_module.STALE_THRESHOLD_HOURS} hours' THEN 'blocked'
+            WHEN s.last_message_at > now() - interval
+                '{usage_module.UNKNOWN_THRESHOLD_HOURS} hours' THEN 'stale'
+            ELSE 'unknown'
         END
         """
 
@@ -365,15 +430,29 @@ class TestStatusCaseExpression:
 
         sql = usage_module._status_case_expression()
         assert (
-            f"interval '{usage_module._QUIET_THRESHOLD_MINUTES} minutes'"
+            f"interval '{usage_module.QUIET_THRESHOLD_MINUTES} minutes'"
             in sql
         )
         assert (
-            f"interval '{usage_module._STALE_THRESHOLD_HOURS} hours'" in sql
+            f"interval '{usage_module.STALE_THRESHOLD_HOURS} hours'" in sql
         )
         assert (
-            f"interval '{usage_module._UNKNOWN_THRESHOLD_HOURS} hours'" in sql
+            f"interval '{usage_module.UNKNOWN_THRESHOLD_HOURS} hours'" in sql
         )
+
+    def test_sql_case_expression_consumes_custom_thresholds(self):
+        """_status_case_expression renders interval literals from the
+        thresholds it is passed (configurable), not hardcoded defaults."""
+        from app.api import usage as usage_module
+
+        sql = usage_module._status_case_expression(
+            quiet_threshold_minutes=30,
+            stale_threshold_hours=4,
+            unknown_threshold_hours=72,
+        )
+        assert "interval '30 minutes'" in sql
+        assert "interval '4 hours'" in sql
+        assert "interval '72 hours'" in sql
 
     @pytest.mark.parametrize(
         ("age_minutes", "message_count", "has_parent", "expected"),
@@ -382,24 +461,26 @@ class TestStatusCaseExpression:
             (5, 0, False, "unknown"),
             (5, 0, True, "unknown"),
             (None, 3, False, "unknown"),  # last_message_at IS NULL
-            # Branch 2 — running: inclusive at exactly 60 minutes
+            # Branch 2 — running: age < 15 minutes (strict)
             (0, 1, False, "running"),
-            (59, 1, False, "running"),
-            (60, 1, False, "running"),
-            (60, 1, True, "running"),
-            # Branch 3 — unknown-old: strict at exactly 24 hours
-            (24 * 60 + 1, 1, False, "unknown"),
-            (48 * 60, 1, True, "unknown"),
-            # Branch 4 — blocked: beyond quiet with a parent
-            (61, 1, True, "blocked"),
-            (6 * 60, 1, True, "blocked"),
-            (24 * 60, 1, True, "blocked"),
-            # Branch 5 — stale: inclusive at exactly 6 hours, no parent
-            (61, 1, False, "stale"),
-            (6 * 60, 1, False, "stale"),
-            # Branch 6 — completed: fallback
-            (6 * 60 + 1, 1, False, "completed"),
-            (24 * 60, 1, False, "completed"),
+            (14, 1, False, "running"),
+            (14, 1, True, "running"),
+            # Branch 3/4 — completed/blocked: 15 <= age < 120 minutes
+            (15, 1, False, "completed"),   # exactly quiet boundary
+            (60, 1, False, "completed"),
+            (119, 1, False, "completed"),
+            (15, 1, True, "blocked"),
+            (119, 1, True, "blocked"),
+            # Branch 5 — stale: 120 <= age < 2880 minutes (2h–48h)
+            (120, 1, False, "stale"),      # exactly stale boundary
+            (120, 1, True, "stale"),       # parent does NOT override at 2h
+            (1440, 1, False, "stale"),     # 24h
+            (1440, 1, True, "stale"),      # child quiet 24h → stale, not blocked
+            (2879, 1, False, "stale"),
+            # Branch 6 — unknown-old: age >= 2880 minutes (48h)
+            (2880, 1, False, "unknown"),   # exactly unknown boundary
+            (2880, 1, True, "unknown"),
+            (4320, 1, False, "unknown"),   # 72h
         ],
     )
     def test_python_and_sql_agree_on_status(
@@ -552,7 +633,11 @@ class TestAgentRunsList:
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["todo_blocked"] == 0
+        # Code changes from opencode_session_contexts (0 when no context row)
         assert item["code_changes_total"] == 0
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
 
         # Usage totals
         assert "total_input_tokens" in item
@@ -681,6 +766,53 @@ class TestAgentRunsList:
         assert data["items"][0]["status"] == "running"
 
     @pytest.mark.asyncio
+    async def test_filters_by_stale_status(self, client: AsyncClient, mock_conn: AsyncMock):
+        """status=stale query param filters by computed status (AC #10)."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            message_count=10,
+            computed_status="stale",
+            # Populated code-change fields must survive the status-filter CTE
+            # wrapper (inner subquery projection → SELECT s.*).
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"status": "stale"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data["items"]) == 1
+        item = data["items"][0]
+        assert item["status"] == "stale"
+        # Non-zero code-change values propagate through the status-filter CTE
+        # path — _int_or_zero would silently render 0 for a dropped column, so
+        # assert the exact values, not a zero default.
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+        assert item["code_changes_total"] == 7
+        # Pin the SQL projection: the mock row factory supplies columns
+        # independently of the SQL, so only an SQL assertion catches a
+        # regression that drops the code_change_* columns from the CTE
+        # wrapper's inner subquery select list.
+        sql = mock_conn.fetch.call_args[0][0]
+        assert "WHERE sub._status" in sql  # CTE wrapper path is active
+        for col in (
+            "osc.code_change_count",
+            "osc.code_change_additions",
+            "osc.code_change_deletions",
+        ):
+            assert col in sql, f"{col} missing from status-filter CTE projection"
+
+    @pytest.mark.asyncio
     async def test_filters_by_date_range(self, client: AsyncClient, mock_conn: AsyncMock):
         """from_date and to_date filter by last_message_at range."""
         row = _mk_session_row(session_id=_SESSION_ID)
@@ -768,6 +900,9 @@ class TestAgentRunsList:
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["code_changes_total"] == 0
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
 
     @pytest.mark.asyncio
     async def test_model_present_when_session_has_model(
@@ -819,6 +954,55 @@ class TestAgentRunsList:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["model"] is None
+
+    @pytest.mark.asyncio
+    async def test_code_change_fields_populated_from_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows surface code_change_* fields from opencode_session_contexts."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+        # code_changes_total is derived from code_change_count
+        assert item["code_changes_total"] == 7
+
+    @pytest.mark.asyncio
+    async def test_code_change_fields_zero_without_context(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List rows default code_change_* fields to 0 when no context row exists."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            code_change_count=None,
+            code_change_additions=None,
+            code_change_deletions=None,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["code_change_count"] == 0
+        assert item["code_change_additions"] == 0
+        assert item["code_change_deletions"] == 0
+        assert item["code_changes_total"] == 0
 
 
 def _mk_todo_row(
@@ -1013,6 +1197,9 @@ class TestAgentRunsDetail:
         assert data["todo_completed"] == 0
         assert data["todo_blocked"] == 0
         assert data["code_changes_total"] == 0
+        assert data["code_change_count"] == 0
+        assert data["code_change_additions"] == 0
+        assert data["code_change_deletions"] == 0
         assert data["session_context"] is None
 
     @pytest.mark.asyncio
@@ -1099,10 +1286,11 @@ class TestAgentRunsDetail:
 
     @pytest.mark.asyncio
     async def test_detail_blocked_status_with_parent(self, client: AsyncClient, mock_conn: AsyncMock):
-        """Detail status is blocked when session has parent and is beyond quiet threshold."""
+        """Detail status is blocked when session has parent and is quiet beyond
+        the running threshold but within the stale window (15 min–2 h)."""
         from datetime import timezone
 
-        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=old,
@@ -1120,6 +1308,33 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["status"] == "blocked"
+        assert "currentStatus" in data
+        assert data["currentStatus"] == data["status"]
+
+    @pytest.mark.asyncio
+    async def test_detail_stale_status_beyond_stale_window(self, client: AsyncClient, mock_conn: AsyncMock):
+        """Detail status is stale (not blocked) when a session has a parent
+        but has been quiet 2+ hours (PRD open question #3)."""
+        from datetime import timezone
+
+        old = datetime.now(timezone.utc) - timedelta(hours=24)
+        session_row = _mk_session_row(
+            session_id=_SESSION_ID,
+            last_message_at=old,
+            message_count=5,
+            parent_session_id="ses_parent_001",
+            parent_internal_id=None,
+        )
+
+        mock_conn.fetchrow = AsyncMock(return_value=session_row)
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/usage/agent-runs/{_SESSION_ID}")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["status"] == "stale"
         assert "currentStatus" in data
         assert data["currentStatus"] == data["status"]
 
@@ -1273,6 +1488,10 @@ class TestAgentRunsDetail:
         assert data["code_changes_total"] == 42, (
             f"Expected code_changes_total=42, got {data['code_changes_total']}"
         )
+        # top-level code_change_* fields surface the same context values
+        assert data["code_change_count"] == 42
+        assert data["code_change_additions"] == 200
+        assert data["code_change_deletions"] == 50
 
 
 # ══════════════════════════════════════════════════════════════════════════

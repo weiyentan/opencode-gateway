@@ -87,6 +87,18 @@ class Settings(BaseSettings):
     status_computation_timeout_seconds: int = 2
     total_request_timeout_seconds: int = 20
 
+    # Agent run status derivation thresholds (issue #300).
+    #   quiet_threshold_minutes: last message within this window → "running"
+    #   stale_threshold_hours:   quiet beyond this window (but within
+    #                            unknown_threshold_hours) → "stale"
+    #   unknown_threshold_hours: quiet beyond this window → "unknown"
+    # Consumed by ``_compute_status`` and ``_status_case_expression`` in
+    # ``app/api/usage.py``.  Maps to GATEWAY_QUIET_THRESHOLD_MINUTES,
+    # GATEWAY_STALE_THRESHOLD_HOURS, GATEWAY_UNKNOWN_THRESHOLD_HOURS.
+    quiet_threshold_minutes: int = 15
+    stale_threshold_hours: int = 2
+    unknown_threshold_hours: int = 48
+
     # Grafana/Loki
     grafana_base_url: str = "http://localhost:3000"
 

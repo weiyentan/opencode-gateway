@@ -94,6 +94,9 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_DATABASE_MAX_INACTIVE_CONNECTION_LIFETIME` | `1800` | Max lifetime (seconds) of an inactive connection before asyncpg closes it |
 | `GATEWAY_DATABASE_TIMEOUT_SECONDS` | `5` | Per-query timeout budget in seconds |
 | `GATEWAY_STATUS_COMPUTATION_TIMEOUT_SECONDS` | `2` | `_compute_status` timeout budget in seconds |
+| `GATEWAY_QUIET_THRESHOLD_MINUTES` | `15` | Agent run status: last message within this window → `running` |
+| `GATEWAY_STALE_THRESHOLD_HOURS` | `2` | Agent run status: quiet beyond this (but within the unknown threshold) → `stale` |
+| `GATEWAY_UNKNOWN_THRESHOLD_HOURS` | `48` | Agent run status: quiet beyond this → `unknown` |
 | `GATEWAY_TOTAL_REQUEST_TIMEOUT_SECONDS` | `20` | Endpoint total request timeout budget in seconds |
 | `GATEWAY_OPERATION_TIMEOUT_MS` | `30000` | Default per-operation timeout budget in milliseconds. Read directly by the telemetry module (`app/core/telemetry.py`) and applied when an operation specifies no explicit budget |
 | `GATEWAY_GRAFANA_BASE_URL` | `http://localhost:3000` | Base URL for Grafana (used to build Loki drill-down links in reporting API responses) |
@@ -221,7 +224,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month` — comma-separated). Date-range filterable. |
-| `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Includes `loki_search_url` for Grafana drill-down. |
+| `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Default sorting is by source-created message time (`sort_by=source_created_at`, `COALESCE(source_created_at_tz, reported_at)`), not ingest time. Includes `loki_search_url` for Grafana drill-down. |
 | `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, Loki drill-down URLs, and `session_title` from Session Context. Paginated. |
 | `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` and `model` enrichment from Session Context. |
 | `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including `session_context` (title, model, code changes) and `todo_rows` (latest OpenCode todo snapshot) alongside usage data. |

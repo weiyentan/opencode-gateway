@@ -236,9 +236,14 @@ function statusBadgeClass(status) {
   return 'badge-unknown';
 }
 
-function fmtCodeChanges(n) {
-  if (n == null || n <= 0) return '--';
-  return fmtNum(n);
+function fmtCodeChangesDiff(additions, deletions) {
+  if (additions == null || deletions == null) return '--';
+  var add = Number(additions);
+  var del = Number(deletions);
+  if (add === 0 && del === 0) return '--';
+  if (add === 0) return '-' + fmtNum(del);
+  if (del === 0) return '+' + fmtNum(add);
+  return '+' + fmtNum(add) + '/-' + fmtNum(del);
 }
 
 /** Format a project label for display.
@@ -571,17 +576,22 @@ assert(resolveBadgeStatus(undefined) === 'badge-unknown',
 assert(resolveBadgeStatus({ currentStatus: 'running', status: 'running' }) === 'badge-running',
   'currentStatus == status → badge-running');
 
-// ── Tests for fmtCodeChanges ────────────────────────────────────────────
+// ── Tests for fmtCodeChangesDiff ─────────────────────────────────────────
 
-console.log('\u25B6 fmtCodeChanges');
+console.log('\u25B6 fmtCodeChangesDiff');
 
-assert(fmtCodeChanges(null) === '--', 'null → --');
-assert(fmtCodeChanges(undefined) === '--', 'undefined → --');
-assert(fmtCodeChanges(0) === '--', '0 → --');
-assert(fmtCodeChanges(1) === '1', '1 → 1');
-assert(fmtCodeChanges(42) === '42', '42 → 42');
-assert(fmtCodeChanges(1000) === '1.0K', '1000 → 1.0K');
-assert(fmtCodeChanges(-1) === '--', '-1 → --');
+assert(fmtCodeChangesDiff(null, null) === '--', 'null/null → --');
+assert(fmtCodeChangesDiff(undefined, undefined) === '--', 'undefined/undefined → --');
+assert(fmtCodeChangesDiff(null, 3) === '--', 'null additions → --');
+assert(fmtCodeChangesDiff(15, undefined) === '--', 'undefined deletions → --');
+assert(fmtCodeChangesDiff(0, 0) === '--', '0/0 → --');
+assert(fmtCodeChangesDiff(15, 3) === '+15/-3', '15/3 → +15/-3');
+assert(fmtCodeChangesDiff(120, 0) === '+120', '120/0 → +120 (zero side suppressed)');
+assert(fmtCodeChangesDiff(0, 42) === '-42', '0/42 → -42 (zero side suppressed)');
+assert(fmtCodeChangesDiff(7, 0) === '+7', '7/0 → +7 (pure additions)');
+assert(fmtCodeChangesDiff(0, 7) === '-7', '0/7 → -7 (pure deletions)');
+assert(fmtCodeChangesDiff(1000, 500) === '+1.0K/-500', '1000/500 → +1.0K/-500');
+
 
 // ── Tests for fmtProjectLabel ───────────────────────────────────────
 
@@ -2321,6 +2331,23 @@ console.log('\u25B6 buildAgentRunsUrl date-range fallback (issue #412)');
   assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
          url.indexOf('from_date=') !== -1 && url.indexOf('to_date=') !== -1,
     'agent/status: non-date filters are appended alongside the derived range');
+})();
+
+// ── Records view ordering: source-created, not ingest time (issue #401) ──
+// The Records table presents "most recent" as most recently created at the
+// source, so the /api/v1/usage/records fetch must request
+// sort_by=source_created_at (the backend default) — never sort_by=ingested_at.
+// The URL is built inline in fetchAll(), so this pins the production source
+// (same readFileSync pattern used for index.html assertions above) rather
+// than duplicating the URL builder.
+console.log('\u25B6 Records view — sort_by=source_created_at, never ingested_at (issue #401)');
+
+(function () {
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('sort_by=source_created_at') !== -1,
+    'records fetch requests sort_by=source_created_at (most recent = source-created message time, issue #401)');
+  assert(appJsSource.indexOf('sort_by=ingested_at') === -1,
+    'records fetch no longer requests sort_by=ingested_at (ingest time is not "most recent", issue #401)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
