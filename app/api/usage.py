@@ -86,7 +86,7 @@ async def _request_timeout(
 # ── Valid group-by dimensions ─────────────────────────────────────────────
 
 VALID_GROUP_BY: frozenset[str] = frozenset(
-    {"client", "model", "session", "day", "week", "month", "project"}
+    {"client", "model", "session", "day", "week", "month", "project", "agent"}
 )
 
 
@@ -147,6 +147,8 @@ def _group_expression(parts: list[str]) -> str:
             fragments.append("date_trunc('month', our.reported_at)::text")
         elif part == "project":
             fragments.append(f"({_PROJECT_LABEL_SQL})")
+        elif part == "agent":
+            fragments.append("COALESCE(s.agent, 'unknown')")
 
     if len(fragments) == 1:
         return fragments[0]
@@ -469,12 +471,14 @@ async def _fetch_aggregates(
     # ── All other dimensions: raw usage_events scan ───────────────
     group_expr = _group_expression(group_parts)
     has_project = "project" in group_parts
+    has_agent = "agent" in group_parts
 
-    # Conditionally join sessions and source_projects when the
-    # project dimension is in use
+    # Conditionally join sessions when the project or agent dimension is in
+    # use (both resolve columns from the ``sessions`` table), and join
+    # source_projects when the project dimension is in use.
     sessions_join = (
         "LEFT JOIN sessions s ON s.id = our.session_id"
-        if has_project
+        if has_project or has_agent
         else ""
     )
     project_join = (
@@ -489,14 +493,21 @@ async def _fetch_aggregates(
         if has_project
         else ""
     )
+    agent_col = (
+        ",\n            COALESCE(s.agent, 'unknown') AS agent"
+        if has_agent
+        else ""
+    )
 
     group_by_clause = f"GROUP BY {group_expr}"
     if has_project:
         group_by_clause += f",{_PROJECT_LABEL_SQL}"
+    if has_agent and len(group_parts) > 1:
+        group_by_clause += ",COALESCE(s.agent, 'unknown')"
 
     sql = f"""
         SELECT
-            {group_expr} AS group_value{project_label_col},
+            {group_expr} AS group_value{project_label_col}{agent_col},
             COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
             COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
             COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
@@ -535,6 +546,7 @@ async def _fetch_aggregates(
             session_count=r["session_count"],
             model_count=r["model_count"],
             project_label=r["project_label"] if has_project else None,
+            agent=r["agent"] if has_agent else None,
         )
         for r in rows
     ]
@@ -869,7 +881,7 @@ async def get_aggregates(
     group_by: str | None = Query(
         default=None,
         description="Comma-separated group-by dimensions: "
-        "client,model,session,day,week,month,project",
+        "client,model,session,day,week,month,project,agent",
     ),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> list[AggregateRow]:

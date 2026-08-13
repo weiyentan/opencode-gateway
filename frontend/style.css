@@ -1095,6 +1095,33 @@ tbody tr:hover td {
   color: var(--text-muted);
 }
 
+/* ── Agent Usage panel (issue #440) ──────────────────────────────────────
+   Bottom-left Overview panel.  Follows the sibling table-panel conventions:
+   the shared glass-panel / .table-scroll / table rules apply in every
+   viewport band, with panel-specific rules only where the four-column
+   table (Agent | Token Breakdown | Est. Cost | Requests) needs them —
+   fixed table layout so the columns always fit the panel's column width,
+   the Agent identity column truncating long names with an ellipsis, and
+   the numeric Est. Cost column right-aligned (the .num / .dist-tokens
+   numeric convention).  The tablet band (761–1024px) keeps the content
+   grid, so the base rules carry the panel there; the phone band narrows
+   the Agent identity column proportion below. */
+.panel-agent-usage table {
+  table-layout: fixed;
+}
+
+.panel-agent-usage th:first-child,
+.panel-agent-usage td:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-agent-usage th:nth-child(3),
+.panel-agent-usage td:nth-child(3) {
+  text-align: right;
+}
+
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
 
 /* Full-viewport layout (issue #411): when the Agent Runs tab is active,
@@ -1575,6 +1602,15 @@ td.clickable:hover {
   .glass-panel {
     padding: 14px 14px;
     border-radius: 16px;
+  }
+
+  /* Agent Usage panel (issue #440): the content grid collapses to one
+     column, so the panel goes full-width — the fixed table proportions
+     stay, with the Agent identity column given an explicit larger share
+     (30%) on narrow screens. */
+  .panel-agent-usage th:first-child,
+  .panel-agent-usage td:first-child {
+    width: 30%;
   }
 
   .agent-runs-filters {

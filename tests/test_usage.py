@@ -209,6 +209,7 @@ def _mk_aggregate_row(
     session_count: int = 2,
     model_count: int = 1,
     project_label: str | None = None,
+    agent: str | None = None,
 ) -> MagicMock:
     """Return a MagicMock for an aggregate query result row."""
     row = MagicMock()
@@ -225,6 +226,7 @@ def _mk_aggregate_row(
         "session_count": session_count,
         "model_count": model_count,
         "project_label": project_label,
+        "agent": agent,
     }
     row.__getitem__.side_effect = data.__getitem__
     return row
@@ -471,6 +473,212 @@ class TestAggregates:
         assert data[0]["record_count"] == 0
         assert data[0]["total_input_tokens"] == 0
         assert data[0]["total_output_tokens"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Agent aggregate tests
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestAgentAggregates:
+    """Tests for group_by=agent on GET /api/v1/usage/aggregates."""
+
+    @pytest.mark.asyncio
+    async def test_group_by_agent_returns_one_row_per_agent(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """group_by=agent returns one row per observed agent identity, exposing
+        the agent value alongside the standard aggregate fields."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="researcher", agent="researcher", record_count=3
+            ),
+            _mk_aggregate_row(
+                group_value="builder", agent="builder", record_count=1
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 2
+        # Multiple dynamic agents — no hard-coded agent list
+        assert data[0]["group_value"] == "researcher"
+        assert data[0]["agent"] == "researcher"
+        assert data[0]["record_count"] == 3
+        # Standard aggregate fields present
+        for field in (
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_cached_tokens",
+            "total_reasoning_tokens",
+            "total_cache_read_tokens",
+            "total_cache_write_tokens",
+            "total_estimated_cost_usd",
+            "record_count",
+            "session_count",
+            "model_count",
+        ):
+            assert field in data[0]
+        assert data[1]["group_value"] == "builder"
+        assert data[1]["agent"] == "builder"
+
+    @pytest.mark.asyncio
+    async def test_agent_null_when_not_grouped_by_agent(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """agent is null when group_by does NOT include 'agent' (backward
+        compatible — existing dimensions keep their shape)."""
+        rows = [
+            _mk_aggregate_row(group_value="gpt-4", record_count=5),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["agent"] is None
+        assert data[0]["group_value"] == "gpt-4"
+
+    @pytest.mark.asyncio
+    async def test_total_row_backward_compatible(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The no-group_by total row keeps its shape; agent is additive-null."""
+        total_row = _mk_aggregate_row()
+        mock_conn.fetchrow = AsyncMock(return_value=total_row)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["group_value"] == "total"
+        assert data[0]["agent"] is None
+        assert data[0]["record_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_group_by_agent_sql_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The generated SQL for agent grouping uses COALESCE(s.agent, 'unknown'),
+        joins sessions, and does NOT route through the client,project rollup."""
+        mock_conn.fetch = AsyncMock(return_value=[
+            _mk_aggregate_row(
+                group_value="researcher", agent="researcher", record_count=2
+            )
+        ])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent",
+                },
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetch.call_count == 1
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert "COALESCE(s.agent, 'unknown')" in sql
+        # Single-dimension agent grouping must not duplicate the COALESCE
+        # term in GROUP BY (review fix: group_expr already carries it).
+        assert (
+            "GROUP BY COALESCE(s.agent, 'unknown'),COALESCE(s.agent, 'unknown')"
+            not in sql
+        )
+        assert "LEFT JOIN sessions s ON s.id = our.session_id" in sql
+        # Agent must never route through the rollup path
+        assert "FROM client_project_rollup" not in sql
+        assert "FROM usage_events" in sql
+
+    @pytest.mark.asyncio
+    async def test_group_by_agent_with_filters(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """start_date/end_date/client_id filters apply to agent-grouped results."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="researcher", agent="researcher", record_count=1
+            )
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent",
+                    "client_id": str(_CLIENT_ID),
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert "our.reported_at >= $1" in sql
+        assert "our.reported_at <= $2" in sql
+        assert "our.client_id = $3" in sql
+
+    @pytest.mark.asyncio
+    async def test_invalid_group_by_lists_agent(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """An invalid group_by value returns 400 and lists 'agent' among
+        the valid dimensions."""
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "bogus",
+                },
+            )
+
+        assert response.status_code == 400
+        payload = response.json()
+        assert payload["status"] == "error"
+        message = payload["error"]["message"]
+        assert "agent" in message
+        assert "bogus" in message
 
 
 # ══════════════════════════════════════════════════════════════════════════

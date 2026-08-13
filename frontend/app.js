@@ -55,6 +55,7 @@
     collectorDist:  $('collector-dist-chart'),
     collectorsTbody: $('collectors-tbody'),
     agentsTbody:    $('agents-tbody'),
+    agentUsageTbody: $('agent-usage-tbody'), // Agent Usage panel (issue #438)
 
     // Agent Runs — merged Sessions + Agent Runs table (issue #402)
     arTbody:        $('agent-runs-tbody'),
@@ -133,6 +134,7 @@
     'collector-dist': ['health'],
     collectors:      ['health'],
     agents:          ['aggByModel', 'health'],
+    'agent-usage':   ['aggByAgent'],
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
   };
@@ -1008,7 +1010,7 @@
       // Sessions + Agent Runs view (issue #402): the merged table is driven
       // by the agent-runs endpoint (a superset), and the Sessions KPI reads
       // the aggregates total row's session_count.
-      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult] =
+      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -1017,6 +1019,10 @@
           clientsPromise,
           apiFetch(arUrl),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
+          // Agent Usage panel (issue #438): per-agent aggregate rows from the
+          // group_by=agent query, sharing the dashboard date range and the
+          // parallel-cycle fetchErrors/panelStates handling of the panels above.
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=agent'),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -1026,6 +1032,7 @@
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
       results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
+      results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -1036,6 +1043,7 @@
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
       fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
+      if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
 
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
@@ -1428,6 +1436,74 @@
     });
 
     els.agentsTbody.innerHTML = html;
+  }
+
+  /** Agent Usage panel (issues #438/#439) — row derivation.
+   *  Pure: maps the group_by=agent aggregates rows to display rows carrying
+   *  the full Token Breakdown contract — the four independent counters
+   *  (input/output/cacheRead/cacheWrite), the full total
+   *  (total = input + output + cache read + cache write per CONTEXT.md),
+   *  the estimated cost (total_estimated_cost_usd) and the request count
+   *  (record_count — each usage_events row is one request).  Rows without
+   *  a recorded agent identity display as 'unknown' (the backend COALESCEs
+   *  the same way; the frontend falls back defensively).  Ordered by total
+   *  token usage descending, agent name ascending as the tie-breaker — the
+   *  Agent Usage contract from CONTEXT.md. */
+  function buildAgentUsageRows(aggRows) {
+    if (!aggRows) return [];
+    return aggRows
+      .map(function (r) {
+        var input = (r && r.total_input_tokens) || 0;
+        var output = (r && r.total_output_tokens) || 0;
+        var cacheRead = (r && r.total_cache_read_tokens) || 0;
+        var cacheWrite = (r && r.total_cache_write_tokens) || 0;
+        return {
+          agent: (r && r.agent) || 'unknown',
+          input: input,
+          output: output,
+          cacheRead: cacheRead,
+          cacheWrite: cacheWrite,
+          tokens: input + output + cacheRead + cacheWrite,
+          cost: (r && r.total_estimated_cost_usd),
+          requests: (r && r.record_count) || 0
+        };
+      })
+      .sort(function (a, b) {
+        if (b.tokens !== a.tokens) return b.tokens - a.tokens;
+        return a.agent < b.agent ? -1 : (a.agent > b.agent ? 1 : 0);
+      });
+  }
+
+  /** Agent Usage panel (issues #438/#439) — dynamic per-agent aggregate rows.
+   *  Reads the group_by=agent aggregates (results.aggByAgent) fetched in the
+   *  same parallel refresh cycle as the other panels; renders one row per
+   *  observed agent with the full PRD #436 row contract: agent identity,
+   *  compact Token Breakdown (delegating to the shared
+   *  fmtTokenBreakdownCompact used by Sessions and Agent Run rows),
+   *  estimated cost (fmtCost) and request count (record_count).  Follows
+   *  the same freshness / failure-retention discipline as
+   *  renderAgentsTable. */
+  function renderAgentUsageTable(data) {
+    applyPanelFreshness('agent-usage');
+    if (!shouldRenderPanel(panelStates, 'agent-usage')) return; // failed fetch → keep previous rows
+
+    var rows = data && data.aggByAgent || [];
+    if (rows.length === 0) {
+      els.agentUsageTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No agent usage available' + errorIndicator('aggByAgent') + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    buildAgentUsageRows(rows).forEach(function (row) {
+      html += '<tr>' +
+        '<td>' + escHtml(row.agent) + '</td>' +
+        '<td>' + fmtTokenBreakdownCompact(row.input, row.output, row.cacheRead, row.cacheWrite) + '</td>' +
+        '<td>' + fmtCost(row.cost) + '</td>' +
+        '<td>' + fmtNum(row.requests) + '</td>' +
+        '</tr>';
+    });
+
+    els.agentUsageTbody.innerHTML = html;
   }
 
   /** Agent Runs Table — the merged Sessions + Agent Runs dashboard table
@@ -1901,6 +1977,7 @@
       renderCollectorDistribution(data);
       renderCollectorsTable(data);
       renderAgentsTable(data);
+      renderAgentUsageTable(data); // Agent Usage panel (issue #438)
       // Issue #429: when the fetched total no longer covers the current
       // page (the result set shrank), correct the page state + URL and
       // re-fetch the nearest valid page through the shared agent-runs
@@ -2374,6 +2451,12 @@
   // PR #431 review (finding 4): the Back/Forward (popstate) re-sync handler
   // joins the window test seam so the Node harness can drive it directly.
   window.handleAgentRunPopstate = handleAgentRunPopstate;
+  // Agent Usage panel (issues #438/#439): the pure row-derivation helper
+  // and the render function — the Node harness exercises row derivation
+  // (full Token Breakdown contract fields), full-total ordering, the
+  // 'unknown' fallback, and rendering through the fake tbody.
+  window.buildAgentUsageRows = buildAgentUsageRows;
+  window.renderAgentUsageTable = renderAgentUsageTable;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

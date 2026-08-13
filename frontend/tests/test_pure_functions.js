@@ -95,6 +95,12 @@ elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
 
+// Agent Usage panel tbody fake (issue #438): renderAgentUsageTable writes its
+// dynamic per-agent rows into this element.  Registered before loadRealAppJs
+// so app.js captures the ref in els like the other table fakes.
+var agentUsageTbodyEl = makeFakeElement('agent-usage-tbody');
+elementRegistry['agent-usage-tbody'] = agentUsageTbodyEl;
+
 // Agent Runs pagination container fake (issue #427): renderAgentRunPagination
 // writes the Previous/Next + numbered-page markup into this element and wires
 // the buttons through querySelectorAll('button') — so the fake parses the
@@ -244,6 +250,10 @@ var historyStub = {
   window.nearestValidAgentRunPage = sandboxWindow.nearestValidAgentRunPage;
   window.fetchAgentRunsAndRender = sandboxWindow.fetchAgentRunsAndRender;
   window.handleAgentRunPopstate = sandboxWindow.handleAgentRunPopstate;
+  // Issue #438: Agent Usage panel — the pure row-derivation helper and the
+  // render function (renders through the fake 'agent-usage-tbody' element).
+  window.buildAgentUsageRows = sandboxWindow.buildAgentUsageRows;
+  window.renderAgentUsageTable = sandboxWindow.renderAgentUsageTable;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -1503,7 +1513,7 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
   // No endpoint errors → every panel resolves to 'ok'
   var allOk = window.resolvePanelStatuses({});
   ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
-   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-runs', 'client-project']
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-usage', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
     });
@@ -3648,6 +3658,366 @@ console.log('\u25B6 Records view — sort_by=source_created_at, never ingested_a
     'records fetch requests sort_by=source_created_at (most recent = source-created message time, issue #401)');
   assert(appJsSource.indexOf('sort_by=ingested_at') === -1,
     'records fetch no longer requests sort_by=ingested_at (ingest time is not "most recent", issue #401)');
+})();
+
+// ── Agent Usage panel — group_by=agent fetch wiring (issue #438) ────────
+// The Agent Usage panel reads GET /api/v1/usage/aggregates?group_by=agent in
+// the same parallel refresh cycle as the other aggregate panels, sharing the
+// dashboard date range (aggStart/aggEnd) and the per-cycle fetchErrors /
+// panelStates handling.  The URL is built inline in fetchAll(), so this pins
+// the production source (same readFileSync pattern used for the issue #401
+// records-URL assertions).
+console.log('\u25B6 Agent Usage — group_by=agent aggregate fetch wiring (issue #438)');
+
+(function () {
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('group_by=agent') !== -1,
+    'app.js: the parallel refresh cycle issues a group_by=agent aggregates request');
+  assert(appJsSource.indexOf("'&end_date=' + aggEnd + '&group_by=agent'") !== -1,
+    'app.js: the group_by=agent fetch shares the dashboard date range (aggStart/aggEnd)');
+  assert(appJsSource.indexOf('results.aggByAgent') !== -1,
+    'app.js: the group_by=agent response is retained on the refresh results');
+  assert(appJsSource.indexOf('fetchErrors.aggByAgent') !== -1,
+    'app.js: the group_by=agent endpoint feeds the per-cycle fetchErrors tracking');
+  assert(/'agent-usage':\s*\['aggByAgent'\]/.test(appJsSource),
+    'app.js: the Agent Usage panel resolves stale from the aggByAgent endpoint (panelStates)');
+})();
+
+// ── Agent Usage panel — dynamic agent rows (issues #438/#439) ───────────
+// buildAgentUsageRows derives one row per observed agent from the
+// group_by=agent aggregates response: the agent identity (with the
+// 'unknown' fallback for rows without a recorded agent) and the full
+// Token Breakdown contract fields — the four independent counters
+// (input/output/cacheRead/cacheWrite), the full total (total = input +
+// output + cache read + cache write, NOT Active Tokens), the estimated
+// cost, and the request count.  Rows order by total token usage
+// descending, agent name ascending as the tie-breaker (the Agent Usage
+// contract from CONTEXT.md).  Exercised through the vm-sandbox window seam
+// against the REAL production helper.
+console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#439)');
+
+(function () {
+  if (typeof window.buildAgentUsageRows !== 'function') {
+    assert(false, 'app.js: buildAgentUsageRows exposed on the window test seam');
+    return;
+  }
+
+  // One row per observed agent; tokens = the FULL total per the Token
+  // Breakdown contract (input + output + cache read + cache write).  These
+  // fixtures carry no cache fields, so the totals equal Active Tokens.
+  var rows = window.buildAgentUsageRows([
+    { agent: 'bob',    total_input_tokens: 1000, total_output_tokens: 500 },
+    { agent: 'alice',  total_input_tokens: 3000, total_output_tokens: 2000 },
+    { agent: 'carol',  total_input_tokens: 100,  total_output_tokens: 50 }
+  ]);
+  assert(rows.length === 3, 'one row per observed agent (3 agents \u2192 3 rows)');
+  assert(rows[0].agent === 'alice' && rows[0].tokens === 5000,
+    'alice: tokens = input + output (5000) \u2014 highest total first');
+  assert(rows[1].agent === 'bob' && rows[1].tokens === 1500,
+    'bob: 1500 total tokens, second by total');
+  assert(rows[2].agent === 'carol' && rows[2].tokens === 150,
+    'carol: 150 total tokens, last by total');
+
+  // Issue #439: each row carries the four independent counters, the full
+  // total (Token Breakdown contract), the estimated cost, and the request
+  // count (record_count — each usage_events row is one request).
+  var enriched = window.buildAgentUsageRows([
+    { agent: 'alice', total_input_tokens: 3000, total_output_tokens: 2000,
+      total_cache_read_tokens: 1000, total_cache_write_tokens: 500,
+      total_estimated_cost_usd: 1.25, record_count: 42 }
+  ]);
+  assert(enriched.length === 1 && enriched[0].agent === 'alice',
+    'enriched row derives from the group_by=agent aggregate row');
+  assert(enriched[0].input === 3000 && enriched[0].output === 2000 &&
+         enriched[0].cacheRead === 1000 && enriched[0].cacheWrite === 500,
+    'row carries the four independent counters (input/output/cacheRead/cacheWrite)');
+  assert(enriched[0].tokens === 6500,
+    'tokens = full total: input + output + cache read + cache write (6500)');
+  assert(enriched[0].cost === 1.25 && enriched[0].requests === 42,
+    'row carries estimated cost (1.25) and request count (42, from record_count)');
+
+  // Issue #439: the sort key is the FULL total, not Active Tokens — cache
+  // activity counts toward ordering, so an agent with large cache usage
+  // outranks one with more active tokens but no cache.
+  var cacheHeavy = window.buildAgentUsageRows([
+    { agent: 'bob',   total_input_tokens: 1000, total_output_tokens: 500,
+      total_cache_read_tokens: 0,    total_cache_write_tokens: 0 },
+    { agent: 'alice', total_input_tokens: 500,  total_output_tokens: 250,
+      total_cache_read_tokens: 5000, total_cache_write_tokens: 0 }
+  ]);
+  assert(cacheHeavy.length === 2 && cacheHeavy[0].agent === 'alice' && cacheHeavy[0].tokens === 5750,
+    'sort key is the full total: alice (5750 incl. cache read) outranks bob (1500)');
+  assert(cacheHeavy[1].agent === 'bob' && cacheHeavy[1].tokens === 1500,
+    'bob: 1500 full total, second by total');
+
+  // Tie-breaker: equal totals order by agent name ascending
+  var tie = window.buildAgentUsageRows([
+    { agent: 'zeta',  total_input_tokens: 100, total_output_tokens: 0 },
+    { agent: 'alpha', total_input_tokens: 100, total_output_tokens: 0 }
+  ]);
+  assert(tie.length === 2 && tie[0].agent === 'alpha' && tie[1].agent === 'zeta',
+    'equal totals: agent name ascending breaks the tie (alpha before zeta)');
+
+  // Rows without an agent identity display as 'unknown'
+  var unknown = window.buildAgentUsageRows([
+    { agent: null, total_input_tokens: 10, total_output_tokens: 5 },
+    { agent: '',   total_input_tokens: 20, total_output_tokens: 5 },
+    { total_input_tokens: 30, total_output_tokens: 5 }
+  ]);
+  assert(unknown.length === 3 && unknown.every(function (r) { return r.agent === 'unknown'; }),
+    'missing/null/empty agent identity falls back to \'unknown\'');
+
+  // Empty input \u2192 empty row list
+  assert(window.buildAgentUsageRows([]).length === 0, 'empty response \u2192 no rows');
+  assert(window.buildAgentUsageRows(null).length === 0, 'null response \u2192 no rows');
+})();
+
+// ── Agent Usage panel — rendering + markup (issues #438/#439) ───────────
+// renderAgentUsageTable paints one row per observed agent (name + compact
+// Token Breakdown via the shared fmtTokenBreakdownCompact + Est. Cost via
+// fmtCost + Requests) into the #agent-usage-tbody element, with the
+// 'unknown' fallback for rows without an agent identity and the exact
+// "No agent usage available" empty state.  The panel sits in the
+// bottom-left area of the Overview grid (.col-left) using the existing
+// glass-panel styling; the model-based Agents & LLMs In Use panel is left
+// untouched.
+console.log('\u25B6 Agent Usage — panel rendering + markup (issues #438/#439)');
+
+(function () {
+  if (typeof window.renderAgentUsageTable !== 'function') {
+    assert(false, 'app.js: renderAgentUsageTable exposed on the window test seam');
+    return;
+  }
+
+  // One row per agent: name + compact Token Breakdown + cost + requests
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'bob',   total_input_tokens: 1000, total_output_tokens: 500 },
+      { agent: 'alice', total_input_tokens: 3000, total_output_tokens: 2000 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf('alice') !== -1 &&
+         agentUsageTbodyEl.innerHTML.indexOf('bob') !== -1,
+    'render: one row per observed agent (alice + bob both rendered)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('5.0K') !== -1 &&
+         agentUsageTbodyEl.innerHTML.indexOf('1.5K') !== -1,
+    'render: rows show the full token total (compact-formatted)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('alice') < agentUsageTbodyEl.innerHTML.indexOf('bob'),
+    'render: rows paint in the derived order (alice first — higher total)');
+
+  // Issue #439: the token cell delegates to the shared
+  // fmtTokenBreakdownCompact — the exact formatter output (two-line +
+  // conditional cache line) appears in the row.
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'carol', total_input_tokens: 38800, total_output_tokens: 5200,
+        total_cache_read_tokens: 23400, total_cache_write_tokens: 0,
+        total_estimated_cost_usd: 0.005, record_count: 7 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(38800, 5200, 23400, 0)) !== -1,
+    'render: token cell equals the shared fmtTokenBreakdownCompact output ({total} total / {input} in | {output} out / {cr} cache read)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('$0.0050') !== -1,
+    'render: Est. Cost cell formats via fmtCost ($0.0050 for 0.005)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('>7<') !== -1,
+    'render: Requests cell shows the record_count (7)');
+
+  // Issue #439: the cache line is omitted when BOTH cache counters are zero
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'dave', total_input_tokens: 1000, total_output_tokens: 500,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0,
+        total_estimated_cost_usd: 0.01, record_count: 3 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(1000, 500, 0, 0)) !== -1 &&
+    agentUsageTbodyEl.innerHTML.indexOf('cache') === -1,
+    'render: both cache counters zero \u2192 cache line omitted entirely');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('$0.01') !== -1 &&
+         agentUsageTbodyEl.innerHTML.indexOf('>3<') !== -1,
+    'render: cost + request cells render for a no-cache row');
+
+  // Issue #439: combined cache line when both cache categories are nonzero
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'erin', total_input_tokens: 10000, total_output_tokens: 5000,
+        total_cache_read_tokens: 23400, total_cache_write_tokens: 4200,
+        total_estimated_cost_usd: 0.02, record_count: 11 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(10000, 5000, 23400, 4200)) !== -1,
+    'render: token cell shows the combined "{cr} cache read + {cw} cache write" line');
+
+  // 'unknown' fallback renders for rows without an agent identity
+  window.renderAgentUsageTable({ aggByAgent: [{ total_input_tokens: 10, total_output_tokens: 5 }] });
+  assert(agentUsageTbodyEl.innerHTML.indexOf('unknown') !== -1 &&
+         agentUsageTbodyEl.innerHTML.indexOf('15') !== -1,
+    "render: a row without an agent identity displays as 'unknown' with its token total");
+
+  // Empty / missing response \u2192 the exact #439 empty-state message,
+  // spanning the enriched 4-column row (no crash)
+  window.renderAgentUsageTable({ aggByAgent: [] });
+  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage available') !== -1,
+    'render: empty response \u2192 "No agent usage available" empty-state row');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('colspan="4"') !== -1,
+    'render: empty-state row spans the 4 enriched columns');
+  window.renderAgentUsageTable({});
+  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage available') !== -1,
+    'render: missing aggByAgent field \u2192 "No agent usage available" empty-state row (no crash)');
+
+  // Markup: the panel lives in the bottom-left Overview column as a glass
+  // panel; the existing Agents & LLMs In Use (model-based) panel is unchanged.
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var overviewHtml = html.slice(html.indexOf('id="tab-overview"'));
+  var colLeft = overviewHtml.slice(0, overviewHtml.indexOf('class="col-right"'));
+  assert(colLeft.indexOf('glass-panel panel-agent-usage') !== -1,
+    'index.html: the Agent Usage panel is a glass panel in the Overview left column (bottom-left area)');
+  assert(colLeft.indexOf('id="agent-usage-tbody"') !== -1,
+    'index.html: the Agent Usage panel carries the #agent-usage-tbody rows container');
+  assert(colLeft.indexOf('id="freshness-agent-usage"') !== -1,
+    'index.html: the Agent Usage panel carries a freshness label span');
+  // Issue #439: the Agent Usage table carries the enriched column set
+  // (Agent, Token Breakdown, Est. Cost, Requests) and the loading row
+  // spans all four columns; the minimal #438 header is gone.
+  var agentUsagePanelHtml = colLeft.slice(colLeft.indexOf('panel-agent-usage'));
+  assert(agentUsagePanelHtml.indexOf('<th>Agent</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Token Breakdown</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Est. Cost</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Requests</th>') !== -1,
+    'index.html: the Agent Usage header carries Agent / Token Breakdown / Est. Cost / Requests');
+  assert(agentUsagePanelHtml.indexOf('<th>Active Tokens</th>') === -1,
+    'index.html: the minimal #438 "Active Tokens" header is gone');
+  assert(agentUsagePanelHtml.indexOf('<td colspan="4" class="empty-state">Loading') !== -1,
+    'index.html: the Agent Usage loading row spans the 4 enriched columns');
+  assert(html.indexOf('id="collectors-tbody"') < html.indexOf('panel-agent-usage'),
+    'index.html: the Agent Usage panel sits below the Collectors panel (bottom-left area)');
+  assert(html.indexOf('glass-panel panel-agents') !== -1 && html.indexOf('id="agents-tbody"') !== -1,
+    'index.html: the existing Agents & LLMs In Use (model-based) panel markup is unchanged');
+
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('&group_by=model') !== -1 &&
+         appJsSource.indexOf('renderAgentsTable(data)') !== -1,
+    'app.js: the model-based Agents & LLMs In Use panel fetch + render are untouched');
+})();
+
+// ── Agent Usage panel — resilience + responsive placement (issue #440) ──
+// The Agent Usage panel is independently refreshable: a failed group_by=agent
+// (aggByAgent) request marks ONLY this panel stale (via the PANEL_ENDPOINTS
+// mapping), the panel keeps its last successful rows with the existing
+// stale/error indicator, and its bottom-left Overview placement is backed by
+// responsive CSS following the sibling table-panel conventions.  Exercised
+// through the vm-sandbox window seam (resolvePanelStatuses /
+// shouldRenderPanel / computePanelFreshness) plus the established static
+// source/markup verification pattern for the render wiring and layout.
+console.log('\u25B6 Agent Usage — panel status isolation on aggByAgent failure (issue #440)');
+
+(function () {
+  // aggByAgent failure stales ONLY the Agent Usage panel — every other
+  // dashboard panel (including the model-based Agents & LLMs In Use panel)
+  // stays usable.
+  var agentFail = window.resolvePanelStatuses({ aggByAgent: 'boom' });
+  assert(agentFail['agent-usage'] === 'stale',
+    'aggByAgent failure: the Agent Usage panel resolves to stale (PANEL_ENDPOINTS entry)');
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(agentFail[panelId] === 'ok',
+        'aggByAgent failure: unrelated panel "' + panelId + '" stays ok');
+    });
+
+  // No aggByAgent error \u2192 the panel is ok (freshness resolves normally)
+  var allOk = window.resolvePanelStatuses({});
+  assert(allOk['agent-usage'] === 'ok', 'no errors: the Agent Usage panel resolves to ok');
+
+  // Other single-endpoint failures do NOT stale the Agent Usage panel
+  assert(window.resolvePanelStatuses({ aggByModel: 'boom' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ health: 'down' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ agentRuns: 'boom' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ aggClientProject: 'boom' })['agent-usage'] === 'ok',
+    'model/health/agent-runs/client-project failures leave the Agent Usage panel ok');
+})();
+
+console.log('\u25B6 Agent Usage — last-successful-rows retention + stale indicator (issue #440)');
+
+(function () {
+  // A stale Agent Usage panel with previous data skips the re-render, so the
+  // last successful rows stay on screen (shouldRenderPanel discipline).
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'stale', updatedAt: 500000 } }, 'agent-usage') === false,
+    'stale Agent Usage panel with previous data \u2192 render skipped (last rows retained)');
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'ok', updatedAt: 500000 } }, 'agent-usage') === true,
+    'ok Agent Usage panel still renders');
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'stale', updatedAt: null } }, 'agent-usage') === true,
+    'stale Agent Usage panel with NO previous data renders (empty/error state shown)');
+
+  // The panel title swaps in the existing "Showing previous data" warning.
+  var now = 1000000;
+  var f = window.computePanelFreshness({ 'agent-usage': { status: 'stale', updatedAt: 500000 } }, 'agent-usage', now);
+  assert(f !== null && f.status === 'stale' && f.label === 'Showing previous data',
+    'stale Agent Usage panel shows the "Showing previous data" freshness label');
+
+  // Render wiring: the panel honors the retention guard and paints the
+  // existing error indicator into its empty state on a failed fetch.
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  var renderSrc = appJsSource.slice(appJsSource.indexOf('function renderAgentUsageTable'),
+                                    appJsSource.indexOf('function renderAgentRunsTable'));
+  assert(renderSrc.indexOf("applyPanelFreshness('agent-usage')") !== -1 &&
+         renderSrc.indexOf("shouldRenderPanel(panelStates, 'agent-usage')") !== -1,
+    'app.js: renderAgentUsageTable applies freshness and skips the re-render when stale');
+  assert(renderSrc.indexOf("errorIndicator('aggByAgent')") !== -1,
+    'app.js: renderAgentUsageTable shows the fetch-error indicator (aggByAgent)');
+})();
+
+console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  // The panel has a dedicated rule following the sibling panel conventions
+  // (shared glass-panel/table styling plus panel-specific table proportions).
+  assert(live.indexOf('.panel-agent-usage') !== -1,
+    'style.css: .panel-agent-usage rules exist (base band)');
+
+  // Base band (>1024px): fixed table layout so the four-column table
+  // (Agent | Token Breakdown | Est. Cost | Requests) always fits the
+  // panel's column width — the Agent identity column truncates long names
+  // with an ellipsis and the numeric Est. Cost column right-aligns (the
+  // .num/.dist-tokens numeric convention), so no horizontal overflow at any
+  // viewport width.
+  var auTableRule = live.match(/\.panel-agent-usage table\s*\{[^}]*\}/);
+  assert(auTableRule !== null && auTableRule[0].indexOf('table-layout: fixed') !== -1,
+    'style.css: .panel-agent-usage table uses fixed layout (columns fit the panel)');
+  var auFirstRule = live.match(/\.panel-agent-usage (?:th|td):first-child\s*\{[^}]*\}/);
+  assert(auFirstRule !== null && auFirstRule[0].indexOf('text-overflow: ellipsis') !== -1,
+    'style.css: the Agent identity column truncates long names with an ellipsis');
+  var auCostRule = live.match(/\.panel-agent-usage (?:th|td):nth-child\(3\)\s*\{[^}]*\}/);
+  assert(auCostRule !== null && auCostRule[0].indexOf('text-align: right') !== -1,
+    'style.css: the Est. Cost column is right-aligned (numeric convention)');
+
+  // Tablet band (761–1024px): the content grid stays, so the base
+  // fixed-layout rule carries the panel — no per-band override needed.
+  // Phone band (≤760px): the grid collapses to one column and the panel goes
+  // full-width; the Agent identity column is given an explicit larger share
+  // (30%) so long names stay readable on narrow screens.
+  var phoneBlock = css.slice(css.indexOf('@media (max-width: 760px)'),
+                             css.lastIndexOf('@media (prefers-reduced-motion: reduce)'));
+  assert(phoneBlock.indexOf('.panel-agent-usage') !== -1 &&
+         phoneBlock.indexOf('width: 30%') !== -1,
+    'style.css: the phone band gives the Agent identity column the larger share (.panel-agent-usage)');
+
+  // Markup: the panel is the LAST panel in the Overview left column
+  // (bottom-left placement), below the Collectors table, inside .col-left.
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var overviewHtml = html.slice(html.indexOf('id="tab-overview"'));
+  var colLeft = overviewHtml.slice(0, overviewHtml.indexOf('class="col-right"'));
+  assert(colLeft.indexOf('panel-agent-usage') !== -1 &&
+         colLeft.indexOf('panel-agent-usage') < colLeft.indexOf('</div><!-- .col-left -->'),
+    'index.html: the Agent Usage panel is the last panel in the Overview left column (bottom-left)');
+  assert(colLeft.indexOf('panel-collectors') < colLeft.indexOf('panel-agent-usage'),
+    'index.html: the Agent Usage panel sits below the Collectors panel');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
