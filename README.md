@@ -223,7 +223,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month` — comma-separated). Date-range filterable. |
+| `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month`, `project`, `agent` — comma-separated). Date-range filterable. |
 | `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Default sorting is by source-created message time (`sort_by=source_created_at`, `COALESCE(source_created_at_tz, reported_at)`), not ingest time. Includes `loki_search_url` for Grafana drill-down. |
 | `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, Loki drill-down URLs, and `session_title` from Session Context. Paginated. |
 | `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` and `model` enrichment from Session Context. |
@@ -265,6 +265,7 @@ The dashboard polls the Gateway REST API every 30 seconds (client metadata is ca
 | **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
 | **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
+| **Agent Usage** | `/api/v1/usage/aggregates?group_by=agent` | Dynamic per-agent aggregate rows (token breakdown, estimated cost, request count), grouped by recorded agent identity with missing identities as `unknown`, ordered by total token usage descending |
 | **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status |
 | **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with session title, status, model, costs, and a detail overlay showing session context (title, model, code changes) and todo progress |
 
