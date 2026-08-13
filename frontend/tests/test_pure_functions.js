@@ -3972,9 +3972,10 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
   assert(live.indexOf('.panel-agent-usage') !== -1,
     'style.css: .panel-agent-usage rules exist (base band)');
 
-  // Base band (>1024px): fixed table layout so the two-column table always
-  // fits its column — the Agent identity column truncates long names with an
-  // ellipsis and the numeric Active Tokens column right-aligns (the
+  // Base band (>1024px): fixed table layout so the four-column table
+  // (Agent | Token Breakdown | Est. Cost | Requests) always fits the
+  // panel's column width — the Agent identity column truncates long names
+  // with an ellipsis and the numeric Est. Cost column right-aligns (the
   // .num/.dist-tokens numeric convention), so no horizontal overflow at any
   // viewport width.
   var auTableRule = live.match(/\.panel-agent-usage table\s*\{[^}]*\}/);
@@ -3983,20 +3984,20 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
   var auFirstRule = live.match(/\.panel-agent-usage (?:th|td):first-child\s*\{[^}]*\}/);
   assert(auFirstRule !== null && auFirstRule[0].indexOf('text-overflow: ellipsis') !== -1,
     'style.css: the Agent identity column truncates long names with an ellipsis');
-  var auLastRule = live.match(/\.panel-agent-usage (?:th|td):last-child\s*\{[^}]*\}/);
-  assert(auLastRule !== null && auLastRule[0].indexOf('text-align: right') !== -1,
-    'style.css: the Active Tokens column is right-aligned (numeric convention)');
+  var auCostRule = live.match(/\.panel-agent-usage (?:th|td):nth-child\(3\)\s*\{[^}]*\}/);
+  assert(auCostRule !== null && auCostRule[0].indexOf('text-align: right') !== -1,
+    'style.css: the Est. Cost column is right-aligned (numeric convention)');
 
-  // Tablet band (761–1024px): the content grid keeps two columns, so the
-  // base fixed-layout rule carries the panel — no per-band override needed.
+  // Tablet band (761–1024px): the content grid stays, so the base
+  // fixed-layout rule carries the panel — no per-band override needed.
   // Phone band (≤760px): the grid collapses to one column and the panel goes
-  // full-width; the Active Tokens column narrows so the Agent identity column
-  // keeps the larger share on narrow screens.
+  // full-width; the Agent identity column is given an explicit larger share
+  // (30%) so long names stay readable on narrow screens.
   var phoneBlock = css.slice(css.indexOf('@media (max-width: 760px)'),
                              css.lastIndexOf('@media (prefers-reduced-motion: reduce)'));
   assert(phoneBlock.indexOf('.panel-agent-usage') !== -1 &&
          phoneBlock.indexOf('width: 30%') !== -1,
-    'style.css: the phone band narrows the Active Tokens column (.panel-agent-usage)');
+    'style.css: the phone band gives the Agent identity column the larger share (.panel-agent-usage)');
 
   // Markup: the panel is the LAST panel in the Overview left column
   // (bottom-left placement), below the Collectors table, inside .col-left.

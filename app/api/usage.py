@@ -502,7 +502,7 @@ async def _fetch_aggregates(
     group_by_clause = f"GROUP BY {group_expr}"
     if has_project:
         group_by_clause += f",{_PROJECT_LABEL_SQL}"
-    if has_agent:
+    if has_agent and len(group_parts) > 1:
         group_by_clause += ",COALESCE(s.agent, 'unknown')"
 
     sql = f"""

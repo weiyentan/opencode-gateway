@@ -614,6 +614,12 @@ class TestAgentAggregates:
         assert mock_conn.fetch.call_count == 1
         sql = mock_conn.fetch.call_args_list[0][0][0]
         assert "COALESCE(s.agent, 'unknown')" in sql
+        # Single-dimension agent grouping must not duplicate the COALESCE
+        # term in GROUP BY (review fix: group_expr already carries it).
+        assert (
+            "GROUP BY COALESCE(s.agent, 'unknown'),COALESCE(s.agent, 'unknown')"
+            not in sql
+        )
         assert "LEFT JOIN sessions s ON s.id = our.session_id" in sql
         # Agent must never route through the rollup path
         assert "FROM client_project_rollup" not in sql
