@@ -1,10 +1,21 @@
-"""Add the source-created-time ordering index for the records view.
+"""Add an index on ``usage_events.reported_at``.
 
-The Records view orders by ``COALESCE(source_created_at_tz, reported_at)``
-(source-created message time, issue #401), so the default sort path needs a
-``reported_at`` index on ``usage_events`` — the composite
-``ix_usage_events_session_reported_at`` (0021) does not cover full-table
-ordering scans.
+The Records view always filters by a date range on ``reported_at``
+(``our.reported_at >= $1 AND our.reported_at <= $2``), and the explicit
+``sort_by=reported_at`` opt-in orders by ``usage_events.reported_at`` alone.
+A bare ``reported_at`` index can serve both of those single-table paths.
+The composite ``ix_usage_events_session_reported_at`` (0021) leads with
+``session_id``, so it cannot serve a whole-table ``reported_at`` range scan
+or sort.
+
+This index does **not** cover the Records *default* sort, which is
+``source_created_at`` → ``COALESCE(osc.source_created_at_tz,
+our.reported_at)`` (issue #401).  That ordering key reads a column of the
+*joined* ``opencode_session_contexts`` table, so no ``usage_events``-only
+index can satisfy it; the default sort is therefore intentionally
+unindexed (a full sort over the filtered result set).  Likewise, the
+``sort_by=ingested_at`` opt-in orders by ``first_ingested_at``, not
+``reported_at``, and is not covered here either.
 
 Revision ID: 0025
 Revises:     0024

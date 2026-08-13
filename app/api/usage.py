@@ -1141,6 +1141,7 @@ def _status_case_expression(
     quiet_threshold_minutes: int = QUIET_THRESHOLD_MINUTES,
     stale_threshold_hours: int = STALE_THRESHOLD_HOURS,
     unknown_threshold_hours: int = UNKNOWN_THRESHOLD_HOURS,
+    now_param: str = "now()",
 ) -> str:
     """Return a SQL CASE expression that computes status from session columns.
 
@@ -1149,11 +1150,17 @@ def _status_case_expression(
     source for thresholds, branch priority, and boundary inclusivity.
 
     Mirrors the logic in :func:`_compute_status` but expressed in SQL
-    so the database can filter rows by computed status. Uses ``now()`` as
-    the reference time and renders its intervals from the thresholds it is
-    passed (the same configurable values the Python implementation consumes),
-    keeping the same branch order (unknown → running → completed/blocked →
-    stale → unknown-old) and the same strict boundary inclusivity.
+    so the database can filter rows by computed status. The reference time
+    is rendered from *now_param*, which defaults to SQL ``now()``.  Callers
+    that embed this expression in more than one statement of a single
+    request (the agent-runs list count and data queries) must pass a bound
+    parameter placeholder (e.g. ``"$3"``) instead so every statement derives
+    status against the same reference timestamp rather than two independent
+    ``now()`` calls that could straddle a threshold boundary.  The intervals
+    are rendered from the thresholds it is passed (the same configurable
+    values the Python implementation consumes), keeping the same branch
+    order (unknown → running → completed/blocked → stale → unknown-old) and
+    the same strict boundary inclusivity.
     """
     quiet_interval = f"interval '{quiet_threshold_minutes} minutes'"
     stale_interval = f"interval '{stale_threshold_hours} hours'"
@@ -1161,11 +1168,11 @@ def _status_case_expression(
     return f"""
         CASE
             WHEN s.message_count = 0 OR s.last_message_at IS NULL THEN 'unknown'
-            WHEN s.last_message_at > now() - {quiet_interval} THEN 'running'
-            WHEN s.last_message_at > now() - {stale_interval}
+            WHEN s.last_message_at > {now_param} - {quiet_interval} THEN 'running'
+            WHEN s.last_message_at > {now_param} - {stale_interval}
                  AND s.parent_session_id IS NULL THEN 'completed'
-            WHEN s.last_message_at > now() - {stale_interval} THEN 'blocked'
-            WHEN s.last_message_at > now() - {unknown_interval} THEN 'stale'
+            WHEN s.last_message_at > {now_param} - {stale_interval} THEN 'blocked'
+            WHEN s.last_message_at > {now_param} - {unknown_interval} THEN 'stale'
             ELSE 'unknown'
         END
     """
@@ -1213,14 +1220,29 @@ async def _fetch_agent_runs(
     where_clause, params = _build_agent_run_filters(
         client_id, from_date, to_date, agent, external_project_id
     )
-    status_expr = _status_case_expression(
-        quiet_threshold_minutes=quiet_threshold_minutes,
-        stale_threshold_hours=stale_threshold_hours,
-        unknown_threshold_hours=unknown_threshold_hours,
-    )
 
     # ── Build the status filter as a CTE wrapper ────────────────────
     if status_filter is not None:
+        # Resolve a single reference timestamp for status derivation.  The
+        # count and data queries each embed the status CASE expression;
+        # binding one Python-side instant (rather than two independent SQL
+        # ``now()`` calls) guarantees both derive statuses against the same
+        # clock reading, so ``total`` can never disagree with the rows
+        # actually returned for a session sitting on a threshold boundary.
+        status_now = _utcnow()
+        # The status filter occupies the next param slot and the reference
+        # timestamp the slot after that; both the count and data queries
+        # reference them at the same indices.
+        params.append(status_filter)
+        status_filter_placeholder = f"${len(params)}"
+        params.append(status_now)
+        now_placeholder = f"${len(params)}"
+        status_expr = _status_case_expression(
+            quiet_threshold_minutes=quiet_threshold_minutes,
+            stale_threshold_hours=stale_threshold_hours,
+            unknown_threshold_hours=unknown_threshold_hours,
+            now_param=now_placeholder,
+        )
         # Wrap in a subquery that computes status, then filter
         base_query = f"""
             SELECT * FROM (
@@ -1255,14 +1277,18 @@ async def _fetch_agent_runs(
                     AND osp.external_project_id = s.project_id
                 WHERE {where_clause}
             ) sub
-            WHERE sub._status = ${len(params) + 1}
+            WHERE sub._status = {status_filter_placeholder}
         """
-        params.append(status_filter)
         count_from = f"""
             FROM sessions s
-            WHERE {where_clause} AND ({status_expr}) = ${len(params)}
+            WHERE {where_clause} AND ({status_expr}) = {status_filter_placeholder}
         """
     else:
+        status_expr = _status_case_expression(
+            quiet_threshold_minutes=quiet_threshold_minutes,
+            stale_threshold_hours=stale_threshold_hours,
+            unknown_threshold_hours=unknown_threshold_hours,
+        )
         base_query = f"""
             SELECT
                 s.id,
