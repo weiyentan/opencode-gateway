@@ -772,6 +772,11 @@ class TestAgentRunsList:
             session_id=_SESSION_ID,
             message_count=10,
             computed_status="stale",
+            # Populated code-change fields must survive the status-filter CTE
+            # wrapper (inner subquery projection → SELECT s.*).
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
         )
         mock_conn.fetch = AsyncMock(return_value=[row])
         mock_conn.fetchval = AsyncMock(return_value=1)
@@ -785,7 +790,27 @@ class TestAgentRunsList:
         assert response.status_code == 200
         data = response.json()["data"]
         assert len(data["items"]) == 1
-        assert data["items"][0]["status"] == "stale"
+        item = data["items"][0]
+        assert item["status"] == "stale"
+        # Non-zero code-change values propagate through the status-filter CTE
+        # path — _int_or_zero would silently render 0 for a dropped column, so
+        # assert the exact values, not a zero default.
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+        assert item["code_changes_total"] == 7
+        # Pin the SQL projection: the mock row factory supplies columns
+        # independently of the SQL, so only an SQL assertion catches a
+        # regression that drops the code_change_* columns from the CTE
+        # wrapper's inner subquery select list.
+        sql = mock_conn.fetch.call_args[0][0]
+        assert "WHERE sub._status" in sql  # CTE wrapper path is active
+        for col in (
+            "osc.code_change_count",
+            "osc.code_change_additions",
+            "osc.code_change_deletions",
+        ):
+            assert col in sql, f"{col} missing from status-filter CTE projection"
 
     @pytest.mark.asyncio
     async def test_filters_by_date_range(self, client: AsyncClient, mock_conn: AsyncMock):
