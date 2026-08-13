@@ -251,6 +251,17 @@
             <option value="unknown">Unknown</option>
           </select>
         </div>
+        <!-- Page size (issue #428): 25/50/100 rows per page, 50 default.
+             Changing the choice resets to page 1 and replaces the URL
+             state (no history entry per adjustment). -->
+        <div class="filter-group">
+          <label for="ar-page-size">Page size</label>
+          <select id="ar-page-size" class="filter-input">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
         <button class="filter-apply" id="ar-filter-apply">Apply</button>
         <!-- Clear (issue #7): always visible; disabled while both date inputs
              are empty; empties both inputs and re-applies the filter.  The
