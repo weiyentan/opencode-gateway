@@ -110,12 +110,12 @@ _Avoid_: Pending session, empty run
 A best-effort terminal status derived by the gateway from available
 quiet/activity heuristics. Because OpenCode exposes no authoritative
 terminal success signal, "completed" is not an upstream-proven success
-proof — it means the session has fallen quiet beyond the threshold, has
-no parent dependency, and has recorded messages (see
-``_compute_status``). Inactivity alone must never be confused with
-upstream-proven success; it is a heuristic. Distinct from Blocked
-(intentional wait), Stale (lost liveness), Timed Out (expired budget), and
-terminal failures like Failed or Cancelled.
+proof — it means the session has recently fallen quiet (beyond the running
+threshold but within the stale threshold), has no parent dependency, and
+has recorded messages (see ``_compute_status``). Inactivity alone must
+never be confused with upstream-proven success; it is a heuristic. Distinct
+from Blocked (intentional wait), Stale (lost liveness), Timed Out (expired
+budget), and terminal failures like Failed or Cancelled.
 
 **Run Status — Running**:
 A run that is actively executing with trusted, recent liveness evidence —
@@ -130,9 +130,13 @@ condition resolves.
 **Run Status — Stale**:
 A run whose liveness is no longer trusted without any terminal signal
 (success, error, cancellation, or timeout). The process or response stream
-has gone silent, or its heartbeats cannot be verified. Stale is a valid
+has gone silent, or its heartbeats cannot be verified. It occupies the
+extended-quiet band between the stale threshold and the unknown threshold —
+recent enough to not yet be "unknown", but quiet long enough that the
+"completed"/"blocked" classification is no longer trusted. Stale is a valid
 direct user-facing status label in observability contexts. It represents
-a gap in observability, not a known termination reason. Distinct from
+a gap in observability, not a known termination reason. A stale run may
+transition back to Running if it resumes producing output. Distinct from
 Blocked (intentional tracked wait) and Timed Out (expired budget).
 
 **Run Status — Timed Out**:
