@@ -973,42 +973,45 @@ async def get_sessions(
 #  Canonical agent run status thresholds — SINGLE AUTHORITATIVE SOURCE
 # ────────────────────────────────────────────────────────────────────────────
 #  Both :func:`_compute_status` (Python) and :func:`_status_case_expression`
-#  (SQL) implement exactly the table below. The SQL function renders its
-#  interval literals from the constants beneath this block, so a threshold
-#  change is made here — and only here — and both implementations pick it
-#  up automatically. If you edit either function's branch logic, update
-#  this table to match. Tests in tests/test_agent_runs.py pin both
-#  implementations to this table.
+#  (SQL) implement exactly the table below. The thresholds are configurable
+#  via :class:`app.core.config.Settings` (``quiet_threshold_minutes``,
+#  ``stale_threshold_hours``, ``unknown_threshold_hours``); the module-level
+#  constants beneath this block hold the defaults and are what the pure
+#  helpers fall back to when a caller supplies no explicit thresholds. The
+#  endpoints resolve the runtime values from Settings and pass them down.
+#  If you edit either function's branch logic, update this table to match.
+#  Tests in tests/test_agent_runs.py pin both implementations to this table.
 #
-#  Branch priority (first match wins):
+#  Branch priority (first match wins), with ``age`` = now - last_message_at:
 #    1. unknown    — message_count == 0 OR last_message_at IS NULL
-#    2. running    — last_message_at >= now() - 60 minutes
-#    3. unknown    — last_message_at < now() - 24 hours
-#    4. blocked    — parent_session_id IS NOT NULL AND beyond quiet
-#                    (reached only when branches 2 and 3 missed, so the
-#                    "beyond quiet" part is implied by branch order)
-#    5. stale      — last_message_at >= now() - 6 hours AND no parent
-#    6. completed  — fallback (beyond stale, no parent, has messages)
+#    2. running    — age < quiet threshold (15 minutes)
+#    3. completed  — quiet <= age < stale threshold (2 hours), no parent
+#    4. blocked    — quiet <= age < stale threshold (2 hours), has parent
+#    5. stale      — stale <= age < unknown threshold (48 hours) — an
+#                    observability gap, not a proven terminal state
+#    6. unknown    — age >= unknown threshold (48 hours)
 #
-#  Boundary inclusivity is identical in both implementations:
-#     * exactly 60 minutes old → running  (inclusive: ``<=`` / ``>=``)
-#     * exactly 24 hours old   → NOT unknown (strict: ``>`` / ``<``)
-#     * exactly 6 hours old    → stale    (inclusive: ``<=`` / ``>=``)
+#  Boundary inclusivity is identical in both implementations (strict):
+#     * exactly 15 minutes old → completed/blocked (running is ``<``)
+#     * exactly 2 hours old    → stale           (completed is ``<``)
+#     * exactly 48 hours old   → unknown         (stale is ``<``)
 # ────────────────────────────────────────────────────────────────────────────
 
 # Default quiet threshold in minutes — a session whose last message is
-# within this window is considered "running" rather than "completed".
-# Exposed as a module-level constant so tests can reference it.
-_QUIET_THRESHOLD_MINUTES: int = 60
+# within this window is considered "running". Mirrors the Settings default
+# ``Settings.quiet_threshold_minutes``.
+QUIET_THRESHOLD_MINUTES: int = 15
 
-# Default stale threshold in hours — a session whose last message is
-# older than the quiet threshold but younger than this is considered
-# "stale" (observability gap) rather than "completed".
-_STALE_THRESHOLD_HOURS: int = 6
+# Default stale threshold in hours — a session whose last message is older
+# than this (but younger than the unknown threshold) is considered "stale"
+# (observability gap) rather than "completed"/"blocked". Mirrors the
+# Settings default ``Settings.stale_threshold_hours``.
+STALE_THRESHOLD_HOURS: int = 2
 
 # Default unknown threshold in hours — a session whose last message is
-# older than this is considered "unknown" rather than "completed".
-_UNKNOWN_THRESHOLD_HOURS: int = 24
+# older than this is considered "unknown" rather than "stale". Mirrors the
+# Settings default ``Settings.unknown_threshold_hours``.
+UNKNOWN_THRESHOLD_HOURS: int = 48
 
 
 def _compute_status(
@@ -1017,40 +1020,44 @@ def _compute_status(
     has_parent: bool,
     *,
     now: datetime | None = None,
+    quiet_threshold_minutes: int = QUIET_THRESHOLD_MINUTES,
+    stale_threshold_hours: int = STALE_THRESHOLD_HOURS,
+    unknown_threshold_hours: int = UNKNOWN_THRESHOLD_HOURS,
 ) -> str:
     """Compute agent run status from available session facts.
 
     **Status derivation (in priority order):**
 
-    1. **unknown** — No messages recorded (``message_count == 0``)
-       OR ``last_message_at`` is ``None`` OR the session is so old it
-       exceeds the unknown threshold (``_UNKNOWN_THRESHOLD_HOURS``).
+    1. **unknown** — No messages recorded (``message_count == 0``) OR
+       ``last_message_at`` is ``None``.
 
     2. **running** — ``last_message_at`` is within the quiet threshold
-       (``_QUIET_THRESHOLD_MINUTES``), indicating the session may still
-       be producing telemetry.
+       (``quiet_threshold_minutes``), indicating the session may still be
+       producing telemetry.
 
-    3. **blocked** — The session is beyond the quiet threshold AND has a
-       ``parent_session_id``, suggesting it may be waiting on a parent.
+    3. **completed** — beyond the quiet threshold but within the stale
+       threshold (``stale_threshold_hours``), has messages, no parent. A
+       confidently-recently-quiet, best-effort terminal status.
 
-    4. **stale** — The session is beyond the quiet threshold, has no
-       parent dependency, and is not yet old enough to be considered
-       completed or unknown (between quiet threshold and stale threshold,
-       ``_STALE_THRESHOLD_HOURS``). Represents an observability gap
-       rather than a known termination.
+    4. **blocked** — beyond the quiet threshold but within the stale
+       threshold, has messages, and has a ``parent_session_id``, suggesting
+       it is intentionally waiting on a parent.
 
-    5. **completed** — The session is beyond the stale threshold, has no
-       parent, and has recorded messages. A best-effort terminal status.
+    5. **stale** — beyond the stale threshold but within the unknown
+       threshold (``unknown_threshold_hours``). Liveness is no longer
+       trusted without a terminal signal — an observability gap, not a
+       known termination.
 
-    The quiet, stale, and unknown thresholds are module-level constants
-    (``_QUIET_THRESHOLD_MINUTES``, ``_STALE_THRESHOLD_HOURS``,
-    ``_UNKNOWN_THRESHOLD_HOURS``) that can be adjusted as the system's
-    behaviour is tuned.
+    6. **unknown** — beyond the unknown threshold (too old to classify
+       meaningfully).
 
-    The canonical status table (branch priority, threshold values, boundary
-    inclusivity) is documented once above the constants block; this function
-    and the SQL CASE expression in :func:`_status_case_expression` must
-    implement it identically.
+    The thresholds are configurable via ``app.core.config.Settings`` and
+    default to the module-level constants (``QUIET_THRESHOLD_MINUTES``,
+    ``STALE_THRESHOLD_HOURS``, ``UNKNOWN_THRESHOLD_HOURS``). The canonical
+    status table (branch priority, threshold values, boundary inclusivity)
+    is documented once above the constants block; this function and the SQL
+    CASE expression in :func:`_status_case_expression` implement it
+    identically.
     """
     if now is None:
         now = _utcnow()
@@ -1060,19 +1067,16 @@ def _compute_status(
 
     age_minutes = (now - last_message_at).total_seconds() / 60.0
 
-    if age_minutes <= _QUIET_THRESHOLD_MINUTES:
+    if age_minutes < quiet_threshold_minutes:
         return "running"
 
-    if age_minutes > _UNKNOWN_THRESHOLD_HOURS * 60:
-        return "unknown"
+    if age_minutes < stale_threshold_hours * 60:
+        return "blocked" if has_parent else "completed"
 
-    if has_parent:
-        return "blocked"
-
-    if age_minutes <= _STALE_THRESHOLD_HOURS * 60:
+    if age_minutes < unknown_threshold_hours * 60:
         return "stale"
 
-    return "completed"
+    return "unknown"
 
 
 def _derive_title(
@@ -1131,31 +1135,37 @@ def _build_agent_run_filters(
     return " AND ".join(filters), params
 
 
-def _status_case_expression() -> str:
+def _status_case_expression(
+    *,
+    quiet_threshold_minutes: int = QUIET_THRESHOLD_MINUTES,
+    stale_threshold_hours: int = STALE_THRESHOLD_HOURS,
+    unknown_threshold_hours: int = UNKNOWN_THRESHOLD_HOURS,
+) -> str:
     """Return a SQL CASE expression that computes status from session columns.
 
     Implements the canonical status table documented above the
-    ``_QUIET_THRESHOLD_MINUTES`` constants block — the single authoritative
+    ``QUIET_THRESHOLD_MINUTES`` constants block — the single authoritative
     source for thresholds, branch priority, and boundary inclusivity.
 
     Mirrors the logic in :func:`_compute_status` but expressed in SQL
     so the database can filter rows by computed status. Uses ``now()`` as
-    the reference time and renders its intervals from the same module-level
-    constants as the Python implementation, keeping the same branch order
-    (unknown → running → unknown → blocked → stale → completed) and the
-    same boundary inclusivity (running/stale inclusive, unknown-old strict).
+    the reference time and renders its intervals from the thresholds it is
+    passed (the same configurable values the Python implementation consumes),
+    keeping the same branch order (unknown → running → completed/blocked →
+    stale → unknown-old) and the same strict boundary inclusivity.
     """
-    quiet_interval = f"interval '{_QUIET_THRESHOLD_MINUTES} minutes'"
-    stale_interval = f"interval '{_STALE_THRESHOLD_HOURS} hours'"
-    unknown_interval = f"interval '{_UNKNOWN_THRESHOLD_HOURS} hours'"
+    quiet_interval = f"interval '{quiet_threshold_minutes} minutes'"
+    stale_interval = f"interval '{stale_threshold_hours} hours'"
+    unknown_interval = f"interval '{unknown_threshold_hours} hours'"
     return f"""
         CASE
             WHEN s.message_count = 0 OR s.last_message_at IS NULL THEN 'unknown'
-            WHEN s.last_message_at >= now() - {quiet_interval} THEN 'running'
-            WHEN s.last_message_at < now() - {unknown_interval} THEN 'unknown'
-            WHEN s.parent_session_id IS NOT NULL THEN 'blocked'
-            WHEN s.last_message_at >= now() - {stale_interval} THEN 'stale'
-            ELSE 'completed'
+            WHEN s.last_message_at > now() - {quiet_interval} THEN 'running'
+            WHEN s.last_message_at > now() - {stale_interval}
+                 AND s.parent_session_id IS NULL THEN 'completed'
+            WHEN s.last_message_at > now() - {stale_interval} THEN 'blocked'
+            WHEN s.last_message_at > now() - {unknown_interval} THEN 'stale'
+            ELSE 'unknown'
         END
     """
 
@@ -1176,6 +1186,9 @@ async def _fetch_agent_runs(
     grafana_base_url: str,
     *,
     db_timeout_seconds: int,
+    quiet_threshold_minutes: int,
+    stale_threshold_hours: int,
+    unknown_threshold_hours: int,
 ) -> PaginatedResponse[AgentRunSummary]:
     """Query sessions table, compute status, join child counts, return paginated.
 
@@ -1199,7 +1212,11 @@ async def _fetch_agent_runs(
     where_clause, params = _build_agent_run_filters(
         client_id, from_date, to_date, agent, external_project_id
     )
-    status_expr = _status_case_expression()
+    status_expr = _status_case_expression(
+        quiet_threshold_minutes=quiet_threshold_minutes,
+        stale_threshold_hours=stale_threshold_hours,
+        unknown_threshold_hours=unknown_threshold_hours,
+    )
 
     # ── Build the status filter as a CTE wrapper ────────────────────
     if status_filter is not None:
@@ -1365,6 +1382,9 @@ async def _fetch_agent_run_detail(
     *,
     db_timeout_seconds: int,
     status_timeout_seconds: int,
+    quiet_threshold_minutes: int,
+    stale_threshold_hours: int,
+    unknown_threshold_hours: int,
 ) -> AgentRunDetail:
     """Fetch a single agent run detail by internal session UUID.
 
@@ -1472,6 +1492,9 @@ async def _fetch_agent_run_detail(
                     last_message_at=cr["last_message_at"],
                     message_count=cr["message_count"],
                     has_parent=True,
+                    quiet_threshold_minutes=quiet_threshold_minutes,
+                    stale_threshold_hours=stale_threshold_hours,
+                    unknown_threshold_hours=unknown_threshold_hours,
                 )
         child_summaries.append(
             ChildRunSummary(
@@ -1491,6 +1514,9 @@ async def _fetch_agent_run_detail(
                 last_message_at=session_row["last_message_at"],
                 message_count=session_row["message_count"],
                 has_parent=session_row["parent_session_id"] is not None,
+                quiet_threshold_minutes=quiet_threshold_minutes,
+                stale_threshold_hours=stale_threshold_hours,
+                unknown_threshold_hours=unknown_threshold_hours,
             )
 
     # ── Fetch todo snapshots ──────────────────────────────────────
@@ -1634,11 +1660,11 @@ async def get_agent_runs(
     stored — they are calculated at query time from session facts and
     parent/child relationships.
 
-    **Status derivation** uses a quiet-threshold heuristic (60 min by
-    default) and a stale-threshold heuristic (6 hours by default) to
-    produce one of five values:
-    ``running``, ``stale``, ``completed``, ``blocked``, or ``unknown``.
-    See :func:`_compute_status` for the full derivation rules.
+    **Status derivation** uses a configurable quiet-threshold heuristic
+    (15 min by default), a stale-threshold heuristic (2 h by default), and
+    an unknown-threshold heuristic (48 h by default) to produce one of five
+    values: ``running``, ``completed``, ``blocked``, ``stale``, or
+    ``unknown``. See :func:`_compute_status` for the full derivation rules.
     """
     from app.core.schemas.usage import VALID_AGENT_RUN_STATUSES
 
@@ -1668,6 +1694,9 @@ async def get_agent_runs(
             offset,
             settings.grafana_base_url,
             db_timeout_seconds=settings.database_timeout_seconds,
+            quiet_threshold_minutes=settings.quiet_threshold_minutes,
+            stale_threshold_hours=settings.stale_threshold_hours,
+            unknown_threshold_hours=settings.unknown_threshold_hours,
         )
 
 
@@ -1691,6 +1720,9 @@ async def get_agent_run_detail(
             conn, session_id, settings.grafana_base_url,
             db_timeout_seconds=settings.database_timeout_seconds,
             status_timeout_seconds=settings.status_computation_timeout_seconds,
+            quiet_threshold_minutes=settings.quiet_threshold_minutes,
+            stale_threshold_hours=settings.stale_threshold_hours,
+            unknown_threshold_hours=settings.unknown_threshold_hours,
         )
 
 
