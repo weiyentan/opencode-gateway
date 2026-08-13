@@ -99,6 +99,17 @@ selected `To` date includes the full selected day. It is a summary view, not
 a replay of OpenCode events or message parts.
 _Avoid_: Event Timeline, transcript replay
 
+**Source-Created Ordering**:
+The ordering rule behind "most recent" in Aurora Glass usage views: rows
+are ordered by when the underlying activity happened at the source, not by
+when the Gateway ingested it. The Records view sorts by
+``source_created_at`` (``COALESCE(source_created_at_tz, reported_at)``,
+the backend's default sort option; ``ingested_at`` is an explicit opt-in);
+the Sessions and Agent Runs views order by the source-created
+``last_message_at`` (``DESC``, nulls last for Agent Runs). A message
+delivered late can therefore appear above earlier-ingested but genuinely
+newer activity. _Avoid_: ingest-time ordering, "most recently ingested"
+
 **Queued Agent Run**:
 An Agent Run that is known to the Gateway but has not yet produced its first
 observed message or usage activity. Before observed activity exists, date
@@ -457,6 +468,7 @@ manages.
 - A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
 - **Aurora Glass** uses the same compact **Token Breakdown** vocabulary for Sessions and **Agent Run Summary** rows
+- **Aurora Glass** orders usage views by **Source-Created Ordering** (Records: `sort_by=source_created_at`; Sessions and Agent Runs: `last_message_at DESC`), never by ingest time
 - **Aurora Glass** treats an Agent Run or Session title as the meaningful scope for a **Token Breakdown** row
 - **Aurora Glass** applies the shared dashboard date range to **Agent Run Summary** views unless an Agent Runs-specific date boundary is explicitly selected; each Agent Runs-specific boundary takes precedence for that side of the range, while unset boundaries inherit from the shared dashboard range
 - **Aurora Glass** treats Agent Run status filters as additional narrowing filters on the effective date range; status filters do not define or alter the date range

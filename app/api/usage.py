@@ -893,7 +893,8 @@ async def get_records(
     ``ingested_at``.  When sorting by ``source_created_at``, the query
     uses ``COALESCE(source_created_at_tz, reported_at)`` — preferring
     the timezone-aware source-created timestamp when available, falling
-    back to the collector-reported time.
+    back to the collector-reported time.  "Most recent" therefore means
+    most recently created at the source, not most recently ingested.
     """
     _validate_date_range(start_date, end_date)
     sort_by, sort_dir = _validate_sort(sort_by, sort_dir)

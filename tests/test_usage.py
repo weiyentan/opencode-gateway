@@ -1799,6 +1799,96 @@ class TestSessions:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Source-created ordering semantics (issue #401)
+#
+#  "Most recent" in the usage views means most recently created at the
+#  source, not most recently ingested by the Gateway.  These tests pin the
+#  ORDER BY clauses that deliver that semantics: the records endpoint's
+#  sort_by=ingested_at maps to first_ingested_at (an explicit opt-in), the
+#  default and source_created_at map to COALESCE(source_created_at_tz,
+#  reported_at) (covered by TestRecords above), and the Sessions / Agent
+#  Runs views order by the source-created last_message_at.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestOrderingSemantics:
+    """Regression coverage for source-created ordering across usage views."""
+
+    @pytest.mark.asyncio
+    async def test_records_sort_by_ingested_at_orders_by_first_ingested_at(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """sort_by=ingested_at is an explicit opt-in ordering by ingest time."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/records",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "sort_by": "ingested_at",
+                    "sort_dir": "desc",
+                },
+            )
+
+        assert response.status_code == 200
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        assert "order by our.first_ingested_at desc" in sql.lower(), (
+            f"ingested_at sort must order by first_ingested_at, got: {sql[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sessions_order_by_last_message_at_desc(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Sessions order by source-created activity (last_message_at DESC)."""
+        rows = [_mk_session_row() for _ in range(2)]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchval = AsyncMock(return_value=2)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/sessions",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert response.status_code == 200
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        assert "ORDER BY s.last_message_at DESC" in sql, (
+            f"Sessions must order by source-created last_message_at, got: {sql[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_runs_order_by_last_message_at_desc(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Agent Runs order by source-created activity (last_message_at DESC)."""
+        row = _mk_agent_run_row()
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": 10},
+            )
+
+        assert response.status_code == 200
+        call_args = mock_conn.fetch.call_args
+        sql = call_args[0][0]
+        assert "ORDER BY s.last_message_at DESC NULLS LAST" in sql, (
+            f"Agent Runs must order by source-created last_message_at, got: {sql[:500]}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Session title enrichment tests
 # ══════════════════════════════════════════════════════════════════════════
 
