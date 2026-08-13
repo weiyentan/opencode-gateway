@@ -1429,21 +1429,34 @@
     els.agentsTbody.innerHTML = html;
   }
 
-  /** Agent Usage panel (issue #438) — row derivation.
-   *  Pure: maps the group_by=agent aggregates rows to display rows
-   *  { agent, tokens } where tokens = Active Tokens (input + output), the
-   *  primary token total in Gateway summaries.  Rows without a recorded
-   *  agent identity display as 'unknown' (the backend COALESCEs the same
-   *  way; the frontend falls back defensively).  Ordered by total token
-   *  usage descending, agent name ascending as the tie-breaker — the Agent
-   *  Usage contract from CONTEXT.md. */
+  /** Agent Usage panel (issues #438/#439) — row derivation.
+   *  Pure: maps the group_by=agent aggregates rows to display rows carrying
+   *  the full Token Breakdown contract — the four independent counters
+   *  (input/output/cacheRead/cacheWrite), the full total
+   *  (total = input + output + cache read + cache write per CONTEXT.md),
+   *  the estimated cost (total_estimated_cost_usd) and the request count
+   *  (record_count — each usage_events row is one request).  Rows without
+   *  a recorded agent identity display as 'unknown' (the backend COALESCEs
+   *  the same way; the frontend falls back defensively).  Ordered by total
+   *  token usage descending, agent name ascending as the tie-breaker — the
+   *  Agent Usage contract from CONTEXT.md. */
   function buildAgentUsageRows(aggRows) {
     if (!aggRows) return [];
     return aggRows
       .map(function (r) {
+        var input = (r && r.total_input_tokens) || 0;
+        var output = (r && r.total_output_tokens) || 0;
+        var cacheRead = (r && r.total_cache_read_tokens) || 0;
+        var cacheWrite = (r && r.total_cache_write_tokens) || 0;
         return {
           agent: (r && r.agent) || 'unknown',
-          tokens: ((r && r.total_input_tokens) || 0) + ((r && r.total_output_tokens) || 0)
+          input: input,
+          output: output,
+          cacheRead: cacheRead,
+          cacheWrite: cacheWrite,
+          tokens: input + output + cacheRead + cacheWrite,
+          cost: (r && r.total_estimated_cost_usd),
+          requests: (r && r.record_count) || 0
         };
       })
       .sort(function (a, b) {
@@ -1452,19 +1465,22 @@
       });
   }
 
-  /** Agent Usage panel (issue #438) — dynamic per-agent aggregate rows.
+  /** Agent Usage panel (issues #438/#439) — dynamic per-agent aggregate rows.
    *  Reads the group_by=agent aggregates (results.aggByAgent) fetched in the
    *  same parallel refresh cycle as the other panels; renders one row per
-   *  observed agent with its total token usage (minimal column set — row
-   *  enrichment arrives in later slices).  Follows the same freshness /
-   *  failure-retention discipline as renderAgentsTable. */
+   *  observed agent with the full PRD #436 row contract: agent identity,
+   *  compact Token Breakdown (delegating to the shared
+   *  fmtTokenBreakdownCompact used by Sessions and Agent Run rows),
+   *  estimated cost (fmtCost) and request count (record_count).  Follows
+   *  the same freshness / failure-retention discipline as
+   *  renderAgentsTable. */
   function renderAgentUsageTable(data) {
     applyPanelFreshness('agent-usage');
     if (!shouldRenderPanel(panelStates, 'agent-usage')) return; // failed fetch → keep previous rows
 
     var rows = data && data.aggByAgent || [];
     if (rows.length === 0) {
-      els.agentUsageTbody.innerHTML = '<tr><td colspan="2" class="empty-state">No agent usage' + errorIndicator('aggByAgent') + '</td></tr>';
+      els.agentUsageTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No agent usage available' + errorIndicator('aggByAgent') + '</td></tr>';
       return;
     }
 
@@ -1472,7 +1488,9 @@
     buildAgentUsageRows(rows).forEach(function (row) {
       html += '<tr>' +
         '<td>' + escHtml(row.agent) + '</td>' +
-        '<td>' + fmtNum(row.tokens) + '</td>' +
+        '<td>' + fmtTokenBreakdownCompact(row.input, row.output, row.cacheRead, row.cacheWrite) + '</td>' +
+        '<td>' + fmtCost(row.cost) + '</td>' +
+        '<td>' + fmtNum(row.requests) + '</td>' +
         '</tr>';
     });
 
@@ -2424,9 +2442,10 @@
   // PR #431 review (finding 4): the Back/Forward (popstate) re-sync handler
   // joins the window test seam so the Node harness can drive it directly.
   window.handleAgentRunPopstate = handleAgentRunPopstate;
-  // Agent Usage panel (issue #438): the pure row-derivation helper and the
-  // render function — the Node harness exercises row derivation, ordering,
-  // the 'unknown' fallback, and rendering through the fake tbody.
+  // Agent Usage panel (issues #438/#439): the pure row-derivation helper
+  // and the render function — the Node harness exercises row derivation
+  // (full Token Breakdown contract fields), full-total ordering, the
+  // 'unknown' fallback, and rendering through the fake tbody.
   window.buildAgentUsageRows = buildAgentUsageRows;
   window.renderAgentUsageTable = renderAgentUsageTable;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable

@@ -163,12 +163,15 @@
           </div>
         </section>
 
-        <!-- Agent Usage (issue #438): dynamic per-agent aggregate rows from
-             GET /api/v1/usage/aggregates?group_by=agent, sharing the shared
-             dashboard date range and client filters.  The backend COALESCEs
-             the agent identity to 'unknown' when Session Context is missing.
-             Minimal column set for this tracer-bullet slice (agent + Active
-             Tokens); row enrichment arrives in later slices. -->
+        <!-- Agent Usage (issues #438/#439): dynamic per-agent aggregate rows
+             from GET /api/v1/usage/aggregates?group_by=agent, sharing the
+             shared dashboard date range and client filters.  The backend
+             COALESCEs the agent identity to 'unknown' when Session Context
+             is missing.  Each row shows the compact Token Breakdown
+             (delegating to the shared fmtTokenBreakdownCompact format used
+             by Sessions and Agent Run rows), estimated cost, and request
+             count, ordered by total token usage descending with agent name
+             ascending as the tie-breaker. -->
         <section class="glass-panel panel-agent-usage">
           <h2 class="panel-title">Agent Usage<span class="panel-freshness" id="freshness-agent-usage"></span></h2>
           <div class="table-scroll">
@@ -176,11 +179,13 @@
               <thead>
                 <tr>
                   <th>Agent</th>
-                  <th>Active Tokens</th>
+                  <th>Token Breakdown</th>
+                  <th>Est. Cost</th>
+                  <th>Requests</th>
                 </tr>
               </thead>
               <tbody id="agent-usage-tbody">
-                <tr><td colspan="2" class="empty-state">Loading&hellip;</td></tr>
+                <tr><td colspan="4" class="empty-state">Loading&hellip;</td></tr>
               </tbody>
             </table>
           </div>

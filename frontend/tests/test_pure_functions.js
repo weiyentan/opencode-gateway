@@ -3674,16 +3674,18 @@ console.log('\u25B6 Agent Usage — group_by=agent aggregate fetch wiring (issue
     'app.js: the Agent Usage panel resolves stale from the aggByAgent endpoint (panelStates)');
 })();
 
-// ── Agent Usage panel — dynamic agent rows (issue #438) ─────────────────
+// ── Agent Usage panel — dynamic agent rows (issues #438/#439) ───────────
 // buildAgentUsageRows derives one row per observed agent from the
 // group_by=agent aggregates response: the agent identity (with the
-// 'unknown' fallback for rows without a recorded agent) and its total
-// token usage — Active Tokens = input + output, the primary token total in
-// Gateway summaries.  Rows order by total token usage descending, agent
-// name ascending as the tie-breaker (the Agent Usage contract from
-// CONTEXT.md).  Exercised through the vm-sandbox window seam against the
-// REAL production helper.
-console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issue #438)');
+// 'unknown' fallback for rows without a recorded agent) and the full
+// Token Breakdown contract fields — the four independent counters
+// (input/output/cacheRead/cacheWrite), the full total (total = input +
+// output + cache read + cache write, NOT Active Tokens), the estimated
+// cost, and the request count.  Rows order by total token usage
+// descending, agent name ascending as the tie-breaker (the Agent Usage
+// contract from CONTEXT.md).  Exercised through the vm-sandbox window seam
+// against the REAL production helper.
+console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#439)');
 
 (function () {
   if (typeof window.buildAgentUsageRows !== 'function') {
@@ -3691,7 +3693,9 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issue #438)')
     return;
   }
 
-  // One row per observed agent; tokens = Active Tokens (input + output)
+  // One row per observed agent; tokens = the FULL total per the Token
+  // Breakdown contract (input + output + cache read + cache write).  These
+  // fixtures carry no cache fields, so the totals equal Active Tokens.
   var rows = window.buildAgentUsageRows([
     { agent: 'bob',    total_input_tokens: 1000, total_output_tokens: 500 },
     { agent: 'alice',  total_input_tokens: 3000, total_output_tokens: 2000 },
@@ -3701,9 +3705,41 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issue #438)')
   assert(rows[0].agent === 'alice' && rows[0].tokens === 5000,
     'alice: tokens = input + output (5000) \u2014 highest total first');
   assert(rows[1].agent === 'bob' && rows[1].tokens === 1500,
-    'bob: 1500 active tokens, second by total');
+    'bob: 1500 total tokens, second by total');
   assert(rows[2].agent === 'carol' && rows[2].tokens === 150,
-    'carol: 150 active tokens, last by total');
+    'carol: 150 total tokens, last by total');
+
+  // Issue #439: each row carries the four independent counters, the full
+  // total (Token Breakdown contract), the estimated cost, and the request
+  // count (record_count — each usage_events row is one request).
+  var enriched = window.buildAgentUsageRows([
+    { agent: 'alice', total_input_tokens: 3000, total_output_tokens: 2000,
+      total_cache_read_tokens: 1000, total_cache_write_tokens: 500,
+      total_estimated_cost_usd: 1.25, record_count: 42 }
+  ]);
+  assert(enriched.length === 1 && enriched[0].agent === 'alice',
+    'enriched row derives from the group_by=agent aggregate row');
+  assert(enriched[0].input === 3000 && enriched[0].output === 2000 &&
+         enriched[0].cacheRead === 1000 && enriched[0].cacheWrite === 500,
+    'row carries the four independent counters (input/output/cacheRead/cacheWrite)');
+  assert(enriched[0].tokens === 6500,
+    'tokens = full total: input + output + cache read + cache write (6500)');
+  assert(enriched[0].cost === 1.25 && enriched[0].requests === 42,
+    'row carries estimated cost (1.25) and request count (42, from record_count)');
+
+  // Issue #439: the sort key is the FULL total, not Active Tokens — cache
+  // activity counts toward ordering, so an agent with large cache usage
+  // outranks one with more active tokens but no cache.
+  var cacheHeavy = window.buildAgentUsageRows([
+    { agent: 'bob',   total_input_tokens: 1000, total_output_tokens: 500,
+      total_cache_read_tokens: 0,    total_cache_write_tokens: 0 },
+    { agent: 'alice', total_input_tokens: 500,  total_output_tokens: 250,
+      total_cache_read_tokens: 5000, total_cache_write_tokens: 0 }
+  ]);
+  assert(cacheHeavy.length === 2 && cacheHeavy[0].agent === 'alice' && cacheHeavy[0].tokens === 5750,
+    'sort key is the full total: alice (5750 incl. cache read) outranks bob (1500)');
+  assert(cacheHeavy[1].agent === 'bob' && cacheHeavy[1].tokens === 1500,
+    'bob: 1500 full total, second by total');
 
   // Tie-breaker: equal totals order by agent name ascending
   var tie = window.buildAgentUsageRows([
@@ -3727,14 +3763,16 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issue #438)')
   assert(window.buildAgentUsageRows(null).length === 0, 'null response \u2192 no rows');
 })();
 
-// ── Agent Usage panel — rendering + markup (issue #438) ─────────────────
-// renderAgentUsageTable paints one row per observed agent (name + Active
-// Tokens total) into the #agent-usage-tbody element, with the 'unknown'
-// fallback for rows without an agent identity.  The panel sits in the
+// ── Agent Usage panel — rendering + markup (issues #438/#439) ───────────
+// renderAgentUsageTable paints one row per observed agent (name + compact
+// Token Breakdown via the shared fmtTokenBreakdownCompact + Est. Cost via
+// fmtCost + Requests) into the #agent-usage-tbody element, with the
+// 'unknown' fallback for rows without an agent identity and the exact
+// "No agent usage available" empty state.  The panel sits in the
 // bottom-left area of the Overview grid (.col-left) using the existing
 // glass-panel styling; the model-based Agents & LLMs In Use panel is left
 // untouched.
-console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
+console.log('\u25B6 Agent Usage — panel rendering + markup (issues #438/#439)');
 
 (function () {
   if (typeof window.renderAgentUsageTable !== 'function') {
@@ -3742,7 +3780,7 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
     return;
   }
 
-  // One row per agent: name + total token usage (Active Tokens, formatted)
+  // One row per agent: name + compact Token Breakdown + cost + requests
   window.renderAgentUsageTable({
     aggByAgent: [
       { agent: 'bob',   total_input_tokens: 1000, total_output_tokens: 500 },
@@ -3754,9 +3792,55 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
     'render: one row per observed agent (alice + bob both rendered)');
   assert(agentUsageTbodyEl.innerHTML.indexOf('5.0K') !== -1 &&
          agentUsageTbodyEl.innerHTML.indexOf('1.5K') !== -1,
-    'render: rows show the Active Tokens total (input + output, compact-formatted)');
+    'render: rows show the full token total (compact-formatted)');
   assert(agentUsageTbodyEl.innerHTML.indexOf('alice') < agentUsageTbodyEl.innerHTML.indexOf('bob'),
     'render: rows paint in the derived order (alice first — higher total)');
+
+  // Issue #439: the token cell delegates to the shared
+  // fmtTokenBreakdownCompact — the exact formatter output (two-line +
+  // conditional cache line) appears in the row.
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'carol', total_input_tokens: 38800, total_output_tokens: 5200,
+        total_cache_read_tokens: 23400, total_cache_write_tokens: 0,
+        total_estimated_cost_usd: 0.005, record_count: 7 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(38800, 5200, 23400, 0)) !== -1,
+    'render: token cell equals the shared fmtTokenBreakdownCompact output ({total} total / {input} in | {output} out / {cr} cache read)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('$0.0050') !== -1,
+    'render: Est. Cost cell formats via fmtCost ($0.0050 for 0.005)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('>7<') !== -1,
+    'render: Requests cell shows the record_count (7)');
+
+  // Issue #439: the cache line is omitted when BOTH cache counters are zero
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'dave', total_input_tokens: 1000, total_output_tokens: 500,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0,
+        total_estimated_cost_usd: 0.01, record_count: 3 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(1000, 500, 0, 0)) !== -1 &&
+    agentUsageTbodyEl.innerHTML.indexOf('cache') === -1,
+    'render: both cache counters zero \u2192 cache line omitted entirely');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('$0.01') !== -1 &&
+         agentUsageTbodyEl.innerHTML.indexOf('>3<') !== -1,
+    'render: cost + request cells render for a no-cache row');
+
+  // Issue #439: combined cache line when both cache categories are nonzero
+  window.renderAgentUsageTable({
+    aggByAgent: [
+      { agent: 'erin', total_input_tokens: 10000, total_output_tokens: 5000,
+        total_cache_read_tokens: 23400, total_cache_write_tokens: 4200,
+        total_estimated_cost_usd: 0.02, record_count: 11 }
+    ]
+  });
+  assert(agentUsageTbodyEl.innerHTML.indexOf(
+    fmtTokenBreakdownCompact(10000, 5000, 23400, 4200)) !== -1,
+    'render: token cell shows the combined "{cr} cache read + {cw} cache write" line');
 
   // 'unknown' fallback renders for rows without an agent identity
   window.renderAgentUsageTable({ aggByAgent: [{ total_input_tokens: 10, total_output_tokens: 5 }] });
@@ -3764,13 +3848,16 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
          agentUsageTbodyEl.innerHTML.indexOf('15') !== -1,
     "render: a row without an agent identity displays as 'unknown' with its token total");
 
-  // Empty / missing response \u2192 empty-state message (no crash)
+  // Empty / missing response \u2192 the exact #439 empty-state message,
+  // spanning the enriched 4-column row (no crash)
   window.renderAgentUsageTable({ aggByAgent: [] });
-  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage') !== -1,
-    'render: empty response \u2192 "No agent usage" empty-state row');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage available') !== -1,
+    'render: empty response \u2192 "No agent usage available" empty-state row');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('colspan="4"') !== -1,
+    'render: empty-state row spans the 4 enriched columns');
   window.renderAgentUsageTable({});
-  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage') !== -1,
-    'render: missing aggByAgent field \u2192 empty-state row (no crash)');
+  assert(agentUsageTbodyEl.innerHTML.indexOf('No agent usage available') !== -1,
+    'render: missing aggByAgent field \u2192 "No agent usage available" empty-state row (no crash)');
 
   // Markup: the panel lives in the bottom-left Overview column as a glass
   // panel; the existing Agents & LLMs In Use (model-based) panel is unchanged.
@@ -3783,6 +3870,19 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
     'index.html: the Agent Usage panel carries the #agent-usage-tbody rows container');
   assert(colLeft.indexOf('id="freshness-agent-usage"') !== -1,
     'index.html: the Agent Usage panel carries a freshness label span');
+  // Issue #439: the Agent Usage table carries the enriched column set
+  // (Agent, Token Breakdown, Est. Cost, Requests) and the loading row
+  // spans all four columns; the minimal #438 header is gone.
+  var agentUsagePanelHtml = colLeft.slice(colLeft.indexOf('panel-agent-usage'));
+  assert(agentUsagePanelHtml.indexOf('<th>Agent</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Token Breakdown</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Est. Cost</th>') !== -1 &&
+         agentUsagePanelHtml.indexOf('<th>Requests</th>') !== -1,
+    'index.html: the Agent Usage header carries Agent / Token Breakdown / Est. Cost / Requests');
+  assert(agentUsagePanelHtml.indexOf('<th>Active Tokens</th>') === -1,
+    'index.html: the minimal #438 "Active Tokens" header is gone');
+  assert(agentUsagePanelHtml.indexOf('<td colspan="4" class="empty-state">Loading') !== -1,
+    'index.html: the Agent Usage loading row spans the 4 enriched columns');
   assert(html.indexOf('id="collectors-tbody"') < html.indexOf('panel-agent-usage'),
     'index.html: the Agent Usage panel sits below the Collectors panel (bottom-left area)');
   assert(html.indexOf('glass-panel panel-agents') !== -1 && html.indexOf('id="agents-tbody"') !== -1,
