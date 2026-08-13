@@ -70,7 +70,15 @@ function makeFakeElement(id) {
     },
     addEventListener: function (type, fn) { listeners[type] = fn; },
     _handlers: listeners,
-    querySelectorAll: function () { return []; }
+    querySelectorAll: function () { return []; },
+    // Attribute store (issue #427): the pagination control renderer reads
+    // data-page / disabled via getAttribute, so fakes must hold attributes.
+    attributes: {},
+    setAttribute: function (name, value) { this.attributes[name] = String(value); },
+    getAttribute: function (name) {
+      return (name in this.attributes) ? this.attributes[name] : null;
+    },
+    removeAttribute: function (name) { delete this.attributes[name]; }
   };
 }
 
@@ -86,6 +94,64 @@ elementRegistry['ar-filter-from'] = arFilterFromEl;
 elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
+
+// Agent Runs pagination container fake (issue #427): renderAgentRunPagination
+// writes the Previous/Next + numbered-page markup into this element and wires
+// the buttons through querySelectorAll('button') — so the fake parses the
+// rendered innerHTML into fake buttons (each with its data-page attribute and
+// disabled state) that tests can click through the production handler.
+var arPaginationEl = makeFakeElement('agent-runs-pagination');
+arPaginationEl.querySelectorAll = function (selector) {
+  if (selector !== 'button') return [];
+  // Cache the parsed buttons: real DOM querySelectorAll returns the same
+  // live elements (which carry the wired click handlers), so re-parse only
+  // after the renderer replaces innerHTML.
+  if (this._buttonsHtml === this.innerHTML && this._buttonsCache) {
+    return this._buttonsCache;
+  }
+  var buttons = [];
+  var re = /<button\b([^>]*)>[\s\S]*?<\/button>/g;
+  var m;
+  while ((m = re.exec(this.innerHTML)) !== null) {
+    var attrs = m[1];
+    var btn = makeFakeElement('pagination-button');
+    var pageMatch = /data-page="(\d+)"/.exec(attrs);
+    if (pageMatch) btn.setAttribute('data-page', pageMatch[1]);
+    if (/\bdisabled\b/.test(attrs)) btn.disabled = true;
+    buttons.push(btn);
+  }
+  this._buttonsCache = buttons;
+  this._buttonsHtml = this.innerHTML;
+  return buttons;
+};
+elementRegistry['agent-runs-pagination'] = arPaginationEl;
+
+// Agent Runs filter-bar fakes for the apply/reset paths (issue #428): the
+// Apply button, the agent/status inputs (so applyFilters' UI-read sees
+// them), and the page-size <select> (25/50/100, default 50).  Registered
+// before loadRealAppJs so app.js captures them in els like the issue #7
+// fakes; empty initial values keep the existing filter behavior intact.
+var arFilterApplyEl = makeFakeElement('ar-filter-apply');
+var arFilterAgentEl = makeFakeElement('ar-filter-agent');
+var arFilterStatusEl = makeFakeElement('ar-filter-status');
+var arPageSizeEl = makeFakeElement('ar-page-size');
+elementRegistry['ar-filter-apply'] = arFilterApplyEl;
+elementRegistry['ar-filter-agent'] = arFilterAgentEl;
+elementRegistry['ar-filter-status'] = arFilterStatusEl;
+elementRegistry['ar-page-size'] = arPageSizeEl;
+
+// Browser-history stub (issue #426): records pushState URLs so tests can
+// verify that Agent Runs page changes persist to the URL without touching
+// the table DOM (row content changes only through the normal fetch path).
+// Issue #428: replaceState is recorded separately — page-size changes and
+// filter resets must REPLACE the URL state instead of pushing a history
+// entry per adjustment.
+var historyCalls = [];
+var historyReplaceCalls = [];
+var historyStub = {
+  pushState: function (state, title, url) { historyCalls.push(url); },
+  replaceState: function (state, title, url) { historyReplaceCalls.push(url); }
+};
 
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
@@ -118,7 +184,12 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
     clearInterval: clearInterval,
     clearTimeout: clearTimeout,
     fetch: function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); },
-    location: { href: '' },
+    // issue #426: location gains search/pathname for the URL-pagination
+    // wiring (read on load + history persistence); URLSearchParams is
+    // provided explicitly because vm contexts do not inherit Node globals.
+    location: { href: '', search: '', pathname: '' },
+    history: historyStub,
+    URLSearchParams: URLSearchParams,
     navigator: {}
   };
   sandbox.window = sandboxWindow;
@@ -151,6 +222,28 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
   window.buildAgentRunsUrl = sandboxWindow.buildAgentRunsUrl;
   window.setAgentRunFilters = sandboxWindow.setAgentRunFilters;
   window.setDateRangeState = sandboxWindow.setDateRangeState;
+  // Issue #426: Agent Runs pagination state + URL persistence — the pure
+  // URL-param parser, the on-load URL reader, and the page-change history
+  // hook are exercised through the same window test seam.
+  window.parseAgentRunPagination = sandboxWindow.parseAgentRunPagination;
+  window.readAgentRunPaginationFromUrl = sandboxWindow.readAgentRunPaginationFromUrl;
+  window.setAgentRunPage = sandboxWindow.setAgentRunPage;
+  // Issue #427: Agent Runs pagination controls — the pure page-item window
+  // calculator and the control renderer (which wires the page-button click
+  // path through setAgentRunPage + the shared fetch/render path).
+  window.computePageItems = sandboxWindow.computePageItems;
+  window.renderAgentRunPagination = sandboxWindow.renderAgentRunPagination;
+  // Issue #428: Agent Runs page-size validation + reset semantics — the
+  // size validator (25/50/100, fallback 50) and the size-change hook
+  // (reset to page 1, history.replaceState URL) join the same window seam.
+  window.parseAgentRunPageSize = sandboxWindow.parseAgentRunPageSize;
+  window.setAgentRunPageSize = sandboxWindow.setAgentRunPageSize;
+  // Issue #429: Agent Runs pagination resilience — the pure nearest-valid-
+  // page calculator and the shared agent-runs fetch path (refresh-style
+  // refetch, loading/error row retention, invalid-page fallback).
+  window.nearestValidAgentRunPage = sandboxWindow.nearestValidAgentRunPage;
+  window.fetchAgentRunsAndRender = sandboxWindow.fetchAgentRunsAndRender;
+  window.handleAgentRunPopstate = sandboxWindow.handleAgentRunPopstate;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -236,9 +329,14 @@ function statusBadgeClass(status) {
   return 'badge-unknown';
 }
 
-function fmtCodeChanges(n) {
-  if (n == null || n <= 0) return '--';
-  return fmtNum(n);
+function fmtCodeChangesDiff(additions, deletions) {
+  if (additions == null || deletions == null) return '--';
+  var add = Number(additions);
+  var del = Number(deletions);
+  if (add === 0 && del === 0) return '--';
+  if (add === 0) return '-' + fmtNum(del);
+  if (del === 0) return '+' + fmtNum(add);
+  return '+' + fmtNum(add) + '/-' + fmtNum(del);
 }
 
 /** Format a project label for display.
@@ -571,17 +669,22 @@ assert(resolveBadgeStatus(undefined) === 'badge-unknown',
 assert(resolveBadgeStatus({ currentStatus: 'running', status: 'running' }) === 'badge-running',
   'currentStatus == status → badge-running');
 
-// ── Tests for fmtCodeChanges ────────────────────────────────────────────
+// ── Tests for fmtCodeChangesDiff ─────────────────────────────────────────
 
-console.log('\u25B6 fmtCodeChanges');
+console.log('\u25B6 fmtCodeChangesDiff');
 
-assert(fmtCodeChanges(null) === '--', 'null → --');
-assert(fmtCodeChanges(undefined) === '--', 'undefined → --');
-assert(fmtCodeChanges(0) === '--', '0 → --');
-assert(fmtCodeChanges(1) === '1', '1 → 1');
-assert(fmtCodeChanges(42) === '42', '42 → 42');
-assert(fmtCodeChanges(1000) === '1.0K', '1000 → 1.0K');
-assert(fmtCodeChanges(-1) === '--', '-1 → --');
+assert(fmtCodeChangesDiff(null, null) === '--', 'null/null → --');
+assert(fmtCodeChangesDiff(undefined, undefined) === '--', 'undefined/undefined → --');
+assert(fmtCodeChangesDiff(null, 3) === '--', 'null additions → --');
+assert(fmtCodeChangesDiff(15, undefined) === '--', 'undefined deletions → --');
+assert(fmtCodeChangesDiff(0, 0) === '--', '0/0 → --');
+assert(fmtCodeChangesDiff(15, 3) === '+15/-3', '15/3 → +15/-3');
+assert(fmtCodeChangesDiff(120, 0) === '+120', '120/0 → +120 (zero side suppressed)');
+assert(fmtCodeChangesDiff(0, 42) === '-42', '0/42 → -42 (zero side suppressed)');
+assert(fmtCodeChangesDiff(7, 0) === '+7', '7/0 → +7 (pure additions)');
+assert(fmtCodeChangesDiff(0, 7) === '-7', '0/7 → -7 (pure deletions)');
+assert(fmtCodeChangesDiff(1000, 500) === '+1.0K/-500', '1000/500 → +1.0K/-500');
+
 
 // ── Tests for fmtProjectLabel ───────────────────────────────────────
 
@@ -2321,6 +2424,1221 @@ console.log('\u25B6 buildAgentRunsUrl date-range fallback (issue #412)');
   assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
          url.indexOf('from_date=') !== -1 && url.indexOf('to_date=') !== -1,
     'agent/status: non-date filters are appended alongside the derived range');
+})();
+
+// ── Agent Runs pagination state (issue #426) ─────────────────────────────
+// The dashboard reads `page` and `page_size` from the URL on load, safely
+// defaults missing/malformed/unsupported values to page 1 and 50 rows,
+// translates page state to the existing agent-runs `limit`/`offset` API
+// params, and persists page changes through browser history.  Agent Runs
+// row content, columns, ordering, and filters are untouched, and the API
+// contract is unchanged (the backend already supports limit/offset/total).
+
+console.log('\u25B6 Agent Runs pagination state (issue #426)');
+
+// ── Parser: defaulting and validation ───────────────────────────────────
+// parseAgentRunPagination() reads page/page_size from a query string;
+// missing, malformed, or unsupported values fall back to page 1 and the
+// default page size (50).  The supported page_size range mirrors the API's
+// limit bounds (1–1000); a valid page is a whole number >= 1.
+
+(function () {
+  if (typeof window.parseAgentRunPagination !== 'function') {
+    assert(false, 'app.js: parseAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Missing params → page 1 / page size 50.
+  var p = window.parseAgentRunPagination('');
+  assert(p.page === 1 && p.pageSize === 50,
+    'parse: empty query defaults to page 1 and page size 50');
+
+  // Valid values are read through.
+  p = window.parseAgentRunPagination('page=2&page_size=100');
+  assert(p.page === 2 && p.pageSize === 100,
+    'parse: page=2&page_size=100 is read through');
+
+  // Malformed values fall back per-field.
+  p = window.parseAgentRunPagination('page=abc&page_size=100');
+  assert(p.page === 1 && p.pageSize === 100,
+    'parse: non-numeric page falls back to 1, valid page_size kept');
+  p = window.parseAgentRunPagination('page=2&page_size=abc');
+  assert(p.page === 2 && p.pageSize === 50,
+    'parse: valid page kept, non-numeric page_size falls back to 50');
+
+  // Out-of-range / non-whole values fall back.
+  p = window.parseAgentRunPagination('page=0');
+  assert(p.page === 1,
+    'parse: page=0 falls back to page 1');
+  p = window.parseAgentRunPagination('page=-3');
+  assert(p.page === 1,
+    'parse: negative page falls back to page 1');
+  p = window.parseAgentRunPagination('page=2.5');
+  assert(p.page === 1,
+    'parse: fractional page falls back to page 1');
+  p = window.parseAgentRunPagination('page_size=0');
+  assert(p.pageSize === 50,
+    'parse: page_size=0 falls back to page size 50');
+  p = window.parseAgentRunPagination('page_size=-10');
+  assert(p.pageSize === 50,
+    'parse: negative page_size falls back to page size 50');
+  p = window.parseAgentRunPagination('page_size=5000');
+  assert(p.pageSize === 50,
+    'parse: page_size above the API limit bound (1000) falls back to 50');
+})();
+
+// ── URL read + limit/offset translation ─────────────────────────────────
+// readAgentRunPaginationFromUrl() seeds the pagination state from
+// location.search on dashboard load; buildAgentRunsUrl() then translates
+// page state to the existing API params — limit=page_size and
+// offset=(page - 1) * page_size — while preserving every existing filter.
+
+(function () {
+  if (typeof window.readAgentRunPaginationFromUrl !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: readAgentRunPaginationFromUrl exposed + sandbox location present');
+    return;
+  }
+
+  // Reset: no URL pagination → page 1, size 50 → limit=50&offset=0.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'custom', customStartDate: '2026-06-01', customEndDate: '2026-06-30' });
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'translate: default state requests limit=50 and offset=0');
+
+  // URL ?page=2&page_size=100 on load → limit=100, offset=100.
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=100') !== -1 && url.indexOf('offset=100') !== -1,
+    'translate: page 2 of 100 rows requests limit=100 and offset=100');
+
+  // ?page=3&page_size=25 → offset=(3-1)*25=50.
+  appJsSandbox.location.search = '?page=3&page_size=25';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=25') !== -1 && url.indexOf('offset=50') !== -1,
+    'translate: page 3 of 25 rows requests limit=25 and offset=50');
+
+  // Invalid URL values fall back to page 1 / 50 rows.
+  appJsSandbox.location.search = '?page=oops&page_size=0';
+  window.readAgentRunPaginationFromUrl();
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'translate: invalid URL values fall back to limit=50 and offset=0');
+
+  // Filters are preserved while paging: explicit dates, agent, and status
+  // all ride along with the pagination params.
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z', to_date: '2026-01-31T23:59:59Z', agent: 'bob', status: 'completed' });
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1 &&
+         url.indexOf('to_date=2026-01-31T23%3A59%3A59Z') !== -1 &&
+         url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1 &&
+         url.indexOf('limit=100') !== -1 && url.indexOf('offset=100') !== -1,
+    'translate: date/agent/status filters remain in the URL while paging');
+})();
+
+// ── Page changes persist via browser history ────────────────────────────
+// setAgentRunPage() updates the closure page state and pushes the new URL
+// through history.pushState, preserving any other query params already in
+// the URL.  The URL update alone never changes Agent Runs row content —
+// the table DOM is untouched and the fetch path is not invoked by it.
+
+(function () {
+  if (typeof window.setAgentRunPage !== 'function' || !appJsSandbox.history) {
+    assert(false, 'app.js: setAgentRunPage exposed + sandbox history stub present');
+    return;
+  }
+
+  historyCalls.length = 0;
+
+  // Page change from the default state: URL gains page/page_size, closure
+  // state updates so the next request uses the translated offset.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob', status: 'completed' });
+  window.setAgentRunPage(3);
+  assert(historyCalls.length === 1,
+    'history: setAgentRunPage pushes exactly one history entry');
+  assert(historyCalls[0] === '/index.html?page=3&page_size=50',
+    'history: pushed URL carries page=3 and the current page_size');
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=100') !== -1 &&
+         url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1,
+    'history: after the page change the next request uses offset=100 and keeps filters');
+
+  // Unrelated query params already in the URL survive the page change.
+  appJsSandbox.location.search = '?tab=agent-runs&page=1&page_size=50';
+  window.readAgentRunPaginationFromUrl();
+  historyCalls.length = 0;
+  window.setAgentRunPage(2);
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?tab=agent-runs&page=2&page_size=50',
+    'history: unrelated URL params are preserved when the page changes');
+
+  // The history update never touches the Agent Runs row content.
+  assert(arTbodyEl.innerHTML === '',
+    'history: the URL update leaves the Agent Runs table DOM untouched');
+
+  // Invalid page values fall back to page 1 before persisting.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  historyCalls.length = 0;
+  window.setAgentRunPage(-2);
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=1&page_size=50',
+    'history: an invalid page value falls back to page 1 in the pushed URL');
+})();
+
+// ── Agent Runs pagination controls (issue #427) ──────────────────────────
+// One compact pagination control block below the Agent Runs panel: Previous,
+// Next, and numbered page buttons with ellipses for large page counts.  The
+// pure page-item window calculator drives the rendered items; the renderer
+// derives the page count from the API response `total` and the current page
+// size, disables Previous on page 1 / Next on the final page, marks the
+// current page with aria-current="page", and wires clicks through
+// setAgentRunPage + the shared fetch path (filters preserved).
+
+console.log('\u25B6 Agent Runs pagination controls — page-item calculation (issue #427)');
+
+// ── Pure calculation: page items (small / boundary / large) ─────────────
+// computePageItems(currentPage, pageCount) returns the compact page-item
+// window: all pages for small counts (<= 7), and for larger counts the
+// first/last pages plus a window around the current page with ellipsis
+// separators filling the gaps.  Zero/invalid page counts render no items.
+
+(function () {
+  if (typeof window.computePageItems !== 'function') {
+    assert(false, 'app.js: computePageItems exposed on the window test seam');
+    return;
+  }
+
+  function pageList(items) {
+    return items.map(function (i) { return i.type === 'page' ? i.page : '\u2026'; }).join(',');
+  }
+
+  // No pages: zero, negative, and non-integer page counts render no items.
+  assert(window.computePageItems(1, 0).length === 0,
+    'items: zero page count renders no items');
+  assert(window.computePageItems(1, -3).length === 0,
+    'items: negative page count renders no items');
+  assert(window.computePageItems(1, 2.5).length === 0,
+    'items: non-integer page count renders no items');
+
+  // Single page: only page 1, as a page item.
+  var one = window.computePageItems(1, 1);
+  assert(one.length === 1 && one[0].type === 'page' && one[0].page === 1,
+    'items: single page renders only page 1');
+
+  // Small counts (<= 7): every page, no ellipsis.
+  assert(pageList(window.computePageItems(4, 7)) === '1,2,3,4,5,6,7',
+    'items: 7 pages render every page with no ellipsis');
+  assert(pageList(window.computePageItems(1, 2)) === '1,2',
+    'items: 2 pages render pages 1 and 2');
+
+  // Boundary (8 pages): first/last always visible, window around the
+  // current page, a single ellipsis fills the gap.
+  assert(pageList(window.computePageItems(1, 8)) === '1,2,\u2026,8',
+    'items: page 1 of 8 renders 1,2,\u2026,8');
+  assert(pageList(window.computePageItems(8, 8)) === '1,\u2026,7,8',
+    'items: page 8 of 8 renders 1,\u2026,7,8');
+
+  // Large counts: compact window with both ellipses.
+  assert(pageList(window.computePageItems(13, 25)) === '1,\u2026,12,13,14,\u2026,25',
+    'items: page 13 of 25 renders 1,\u2026,12,13,14,\u2026,25');
+
+  // Out-of-range current pages clamp into the valid window.
+  assert(pageList(window.computePageItems(99, 25)) === '1,\u2026,24,25',
+    'items: current page beyond the last page clamps to the final-page window');
+  assert(pageList(window.computePageItems(-1, 25)) === '1,2,\u2026,25',
+    'items: current page below 1 clamps to the first-page window');
+})();
+
+// ── Control render (issue #427) ─────────────────────────────────────────
+// renderAgentRunPagination(data) derives the page count from the API
+// response `total` and the current page size, renders Previous/Next plus
+// the numbered page items into the container below the panel, and marks
+// the current page with aria-current="page".
+
+console.log('\u25B6 Agent Runs pagination controls — render (issue #427)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Reset pagination state: page 1 of 50 rows, dashboard range active.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+
+  // 125 runs at 50/page → 3 pages.  Page 1 is current: Previous disabled,
+  // numbered buttons 1/2/3, Next enabled pointing at page 2.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var html = arPaginationEl.innerHTML;
+  assert(/data-page="1"[^>]*aria-current="page"/.test(html),
+    'render: the current page button carries aria-current="page"');
+  assert(html.indexOf('aria-label="Page 1, current page"') !== -1,
+    'render: the current page button carries a "current page" label');
+  assert(/data-page="0"[^>]*disabled/.test(html) &&
+         html.indexOf('aria-label="Previous page"') !== -1,
+    'render: Previous is a labeled button, disabled on page 1');
+  assert(html.indexOf('data-page="2"') !== -1 &&
+         html.indexOf('aria-label="Next page"') !== -1 &&
+         /data-page="2"[^>]*aria-label="Next page"/.test(html),
+    'render: Next is a labeled button pointing at page 2 (enabled)');
+  assert(html.indexOf('data-page="1"') !== -1 && html.indexOf('data-page="2"') !== -1 &&
+         html.indexOf('data-page="3"') !== -1,
+    'render: numbered page buttons 1, 2, and 3 are present');
+  assert(html.indexOf('pagination-ellipsis') === -1,
+    'render: small page counts render no ellipsis');
+
+  // Zero runs: no pages → the control renders nothing.
+  window.renderAgentRunPagination({ items: [], total: 0, limit: 50, offset: 0 });
+  assert(arPaginationEl.innerHTML === '',
+    'render: zero runs hides the pagination control');
+
+  // Large counts: 1250 runs at 50/page → 25 pages; page 13 renders the
+  // compact ellipsis presentation with first/last always present.
+  window.setAgentRunPage(13);
+  window.renderAgentRunPagination({ items: [{}], total: 1250, limit: 50, offset: 600 });
+  html = arPaginationEl.innerHTML;
+  assert(html.indexOf('class="pagination-ellipsis"') !== -1,
+    'render: large page counts render ellipsis separators');
+  assert(html.indexOf('data-page="1"') !== -1 && html.indexOf('data-page="25"') !== -1,
+    'render: first and last page buttons are always present');
+  assert(html.indexOf('aria-label="Page 13, current page"') !== -1,
+    'render: page 13 renders as the current page');
+})();
+
+// ── Page selection wiring (issue #427) ──────────────────────────────────
+// Clicking a page control updates the pagination state (setAgentRunPage →
+// history) and re-fetches that server-side page through the shared fetch
+// path, which preserves the active from_date/to_date/agent/status filters.
+// The click handler's URL/history/fetch effects are all synchronous, and
+// the post-fetch re-render behavior is covered by the direct render calls
+// above — so this block stays synchronous (the issue #5 render block's
+// deferred poll chain shares the fakes and must not interleave with it).
+
+console.log('\u25B6 Agent Runs pagination controls — page selection (issue #427)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  // Reset: page 1 of 50 rows with explicit filters active.
+  appJsSandbox.location.search = '';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ from_date: '2026-01-15T00:00:00Z', agent: 'bob', status: 'completed' });
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [], total: 125, limit: 50, offset: 0 }); }
+    });
+  };
+
+  // 125 runs / 50 per page → 3 pages; page 1 is current.  Click page 2.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var page2 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '2'; })[0];
+  assert(!!page2, 'click: the page-2 button is rendered');
+  page2._handlers.click();
+
+  // Synchronous effects: URL persists the new page, and the fetch fires
+  // with the page-2 offset while preserving the active filters.
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=2&page_size=50',
+    'click: selecting page 2 persists page=2 into the URL');
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=50') !== -1,
+    'click: the page-2 fetch carries limit=50 and offset=50');
+  assert(fetched[0].indexOf('agent=bob') !== -1 && fetched[0].indexOf('status=completed') !== -1 &&
+         fetched[0].indexOf('from_date=2026-01-15T00%3A00%3A00Z') !== -1,
+    'click: the page-2 fetch preserves date/agent/status filters');
+  assert(window.buildAgentRunsUrl().indexOf('offset=50') !== -1,
+    'click: subsequent requests use the selected page offset');
+
+  // Re-render from the new page state and advance to the final page (3).
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 50 });
+  assert(/data-page="2"[^>]*aria-current="page"/.test(arPaginationEl.innerHTML),
+    'render: after selection, page 2 carries aria-current="page"');
+  assert(/data-page="1"[^>]*aria-label="Previous page"/.test(arPaginationEl.innerHTML) &&
+         arPaginationEl.innerHTML.indexOf('data-page="0"') === -1,
+    'render: Previous is enabled on page 2');
+  var page3 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+  assert(!!page3, 'click: the page-3 button is rendered on page 2');
+  historyCalls.length = 0;
+  page3._handlers.click();
+  assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=3&page_size=50',
+    'click: selecting page 3 persists page=3 into the URL');
+  assert(fetched.length === 2 && fetched[1].indexOf('limit=50&offset=100') !== -1,
+    'click: the page-3 fetch carries limit=50 and offset=100');
+
+  // The final page renders with Next disabled; clicking it must not
+  // navigate or refetch.
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 100 });
+  assert(arPaginationEl.innerHTML.indexOf('data-page="4" disabled') !== -1,
+    'render: Next is disabled on the final page (3 of 3)');
+  assert(/data-page="2"[^>]*aria-label="Previous page"/.test(arPaginationEl.innerHTML),
+    'render: Previous points at page 2 on the final page');
+  var nextBtn = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '4'; })[0];
+  assert(!!nextBtn && nextBtn.disabled === true,
+    'render: the disabled Next button carries the disabled state');
+  historyCalls.length = 0;
+  nextBtn._handlers.click();
+  assert(historyCalls.length === 0 && fetched.length === 2,
+    'click: clicking the disabled Next does not navigate or refetch');
+
+  // Previous is disabled on page 1; clicking it must not navigate either.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl(); // back to page 1
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 0 });
+  var prevBtn = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '0'; })[0];
+  assert(!!prevBtn && prevBtn.disabled === true,
+    'render: the disabled Previous button carries the disabled state');
+  historyCalls.length = 0;
+  prevBtn._handlers.click();
+  assert(historyCalls.length === 0 && fetched.length === 2,
+    'click: clicking the disabled Previous does not navigate or refetch');
+})();
+
+// ── Pagination control block markup (issue #427) ─────────────────────────
+// Static verification against the real index.html (the repo's established
+// substitute for browser-level checks): the control container lives BELOW
+// the .panel-agent-runs panel — after its closing </section>, outside the
+// panel box — and inside #tab-agent-runs.
+
+console.log('\u25B6 index.html — Agent Runs pagination control block (issue #427)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  var panelEnd = html.indexOf('</section>', html.indexOf('panel-agent-runs'));
+  var pagIdx = html.indexOf('id="agent-runs-pagination"');
+  assert(pagIdx !== -1, 'index.html: #agent-runs-pagination container exists');
+  assert(panelEnd !== -1 && pagIdx > panelEnd,
+    'index.html: pagination container sits after the panel section (outside the panel box)');
+  var tabEnd = html.indexOf('<!-- #tab-agent-runs -->');
+  assert(tabEnd !== -1 && pagIdx < tabEnd,
+    'index.html: pagination container lives inside #tab-agent-runs, below the panel');
+  assert(html.indexOf('aria-label="Agent Runs pages"') !== -1,
+    'index.html: pagination container carries an accessible navigation label');
+  // The nav owns its layout (.agent-runs-pagination) and must stay decoupled
+  // from the filter-bar class it used to share (PR #431 review finding 5).
+  var navClassMatch = html.match(/<nav\b[^>]*class="([^"]*)"/);
+  assert(navClassMatch !== null && navClassMatch[1].indexOf('agent-runs-filters') === -1,
+    'index.html: pagination nav is decoupled from .agent-runs-filters (own layout)');
+})();
+
+// ── Agent Runs page-size + filter reset (issue #428) ─────────────────────
+// The page-size selector offers exactly 25/50/100 rows per page (default
+// 50); unsupported values fall back to 50.  Changing the page size or
+// applying filters resets to page 1 and REPLACES the URL state
+// (history.replaceState) so adjustments do not add a history entry per
+// change — explicit page navigation (setAgentRunPage, issue #426) keeps
+// using pushState.
+
+console.log('\u25B6 Agent Runs page-size + filter reset (issue #428)');
+
+// ── Page-size validation: exactly 25/50/100, fallback 50 ────────────────
+// parseAgentRunPageSize() accepts the selector's three choices; any other
+// value (including malformed input) falls back to the default (50).
+
+(function () {
+  if (typeof window.parseAgentRunPageSize !== 'function') {
+    assert(false, 'app.js: parseAgentRunPageSize exposed on the window test seam');
+    return;
+  }
+
+  // The selector's choices pass through.
+  assert(window.parseAgentRunPageSize('25') === 25,
+    'size: 25 rows per page is accepted');
+  assert(window.parseAgentRunPageSize('50') === 50,
+    'size: 50 rows per page is accepted (default)');
+  assert(window.parseAgentRunPageSize('100') === 100,
+    'size: 100 rows per page is accepted');
+
+  // Unsupported values fall back to the default.
+  assert(window.parseAgentRunPageSize('30') === 50,
+    'size: 30 falls back to 50 (only 25/50/100 are offered)');
+  assert(window.parseAgentRunPageSize('200') === 50,
+    'size: 200 falls back to 50');
+  assert(window.parseAgentRunPageSize('abc') === 50,
+    'size: non-numeric value falls back to 50');
+  assert(window.parseAgentRunPageSize('0') === 50,
+    'size: 0 falls back to 50');
+  assert(window.parseAgentRunPageSize('') === 50,
+    'size: empty value falls back to 50');
+
+  // The URL parser clamps page_size through the same rule (a deep link to
+  // an unsupported size still lands on a supported size).
+  var p = window.parseAgentRunPagination('page=2&page_size=200');
+  assert(p.page === 2 && p.pageSize === 50,
+    'parse: unsupported page_size=200 in the URL falls back to 50 (page kept)');
+})();
+
+// ── Page-size changes reset to page 1 and REPLACE URL state ─────────────
+// setAgentRunPageSize() validates the choice (25/50/100), updates the
+// closure page size, resets the page to 1, and persists the new state
+// through history.replaceState — NOT pushState, so adjusting the selector
+// does not create a browser-history entry per change.  Filters ride along
+// unchanged (they live in the request, not the URL, per issue #412).
+
+(function () {
+  if (typeof window.setAgentRunPageSize !== 'function' || !appJsSandbox.history) {
+    assert(false, 'app.js: setAgentRunPageSize exposed + sandbox history stub present');
+    return;
+  }
+
+  // Page 3 of 50 with active filters → switching to 100 rows per page
+  // resets to page 1, replaces the URL, and keeps the filters.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob', status: 'completed' });
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+  window.setAgentRunPageSize(100);
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'size: page-size change REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=100',
+    'size: replaced URL carries page=1 and the new page_size');
+  var url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=100') !== -1 && url.indexOf('offset=0') !== -1,
+    'size: after the size change the next request uses limit=100 and offset=0 (page 1)');
+  assert(url.indexOf('agent=bob') !== -1 && url.indexOf('status=completed') !== -1,
+    'size: filters remain in the request after the page-size reset');
+
+  // Unsupported sizes fall back to 50 (and still replace, page 1).
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+  window.setAgentRunPageSize(200);
+  assert(historyReplaceCalls.length === 1 &&
+         historyReplaceCalls[0] === '/index.html?page=1&page_size=50',
+    'size: an unsupported size falls back to page_size=50 in the replaced URL');
+  url = window.buildAgentRunsUrl();
+  assert(url.indexOf('limit=50') !== -1 && url.indexOf('offset=0') !== -1,
+    'size: fallback size requests limit=50 and offset=0');
+})();
+
+// ── Filter applies reset to page 1 and REPLACE URL state ────────────────
+// applyFilters() (wired to the Apply button) re-scopes the list to page 1
+// whenever filters are applied or changed, REPLACING the URL state (no
+// history entry per adjustment) while the chosen filter values ride along
+// in the request.  The Clear path (clearArDateFilters) shares this via
+// applyFilters.
+
+(function () {
+  if (typeof window.setupAgentRunEventHandlers !== 'function') {
+    assert(false, 'app.js: setupAgentRunEventHandlers exposed on the window test seam');
+    return;
+  }
+
+  // Fixture: the user is on page 3 of 50 rows with date/agent/status
+  // filters typed into the filter bar, then hits Apply.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  arFilterFromEl.value = '2026-07-01';
+  arFilterToEl.value = '2026-07-31';
+  arFilterAgentEl.value = 'bob';
+  arFilterStatusEl.value = 'completed';
+  window.setupAgentRunEventHandlers();
+
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  arFilterApplyEl._handlers.click();
+
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'apply: applying filters REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=50',
+    'apply: replaced URL carries page=1 and the current page_size');
+  assert(calls.length === 1 && calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'apply: exactly one agent-runs fetch through the existing filter path');
+  assert(calls[0].indexOf('offset=0') !== -1 && calls[0].indexOf('limit=50') !== -1,
+    'apply: the re-fetch requests page 1 (offset=0) at the current page size');
+  assert(calls[0].indexOf('from_date=2026-07-01T00%3A00%3A00Z') !== -1 &&
+         calls[0].indexOf('to_date=2026-07-31T23%3A59%3A59Z') !== -1 &&
+         calls[0].indexOf('agent=bob') !== -1 && calls[0].indexOf('status=completed') !== -1,
+    'apply: date/agent/status filter values remain in the request after the reset');
+})();
+
+// ── Page-size selector markup (issue #428) ──────────────────────────────
+// Static verification against the real index.html: the selector lives in
+// the Agent Runs filter bar and offers exactly 25/50/100 rows per page
+// with 50 as the default (selected) choice.
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var filterBar = html.slice(html.indexOf('id="agent-runs-filters"'),
+    html.indexOf('id="ar-filter-apply"'));
+  var selectMatch = filterBar.match(/<select[^>]*id="ar-page-size"[^>]*>([\s\S]*?)<\/select>/);
+  assert(selectMatch !== null,
+    'index.html: #ar-page-size select exists inside the Agent Runs filter bar');
+  var options = (selectMatch ? selectMatch[1].match(/<option[^>]*value="(\d+)"[^>]*>/g) : null) || [];
+  assert(options.length === 3 &&
+         options[0].indexOf('value="25"') !== -1 &&
+         options[1].indexOf('value="50"') !== -1 &&
+         options[2].indexOf('value="100"') !== -1,
+    'index.html: page-size select offers exactly 25, 50, and 100');
+  assert(filterBar.indexOf('<option value="50" selected>') !== -1,
+    'index.html: 50 is the default (selected) page size');
+})();
+
+// ── Page-size selector wiring: change → page 1 refetch + replace ────────
+// The selector's change handler validates the choice, resets to page 1
+// (replaceState), and immediately re-fetches through the existing filter
+// path — the table reflects the new limit without waiting for the next
+// auto-refresh, and the current filter values ride along.
+
+(function () {
+  if (typeof window.setupAgentRunEventHandlers !== 'function') {
+    assert(false, 'app.js: setupAgentRunEventHandlers exposed on the window test seam');
+    return;
+  }
+
+  // Fixture: page 3 of 50 rows with an agent filter applied; the user
+  // picks 25 rows per page from the selector.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({ agent: 'bob' });
+  arPageSizeEl.value = '25';
+  window.setupAgentRunEventHandlers();
+
+  if (typeof arPageSizeEl._handlers.change !== 'function') {
+    assert(false, 'app.js: page-size change handler wired by setupAgentRunEventHandlers');
+    return;
+  }
+
+  var calls = [];
+  appJsSandbox.fetch = function (url) {
+    calls.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  arPageSizeEl._handlers.change();
+
+  assert(historyReplaceCalls.length === 1 && historyCalls.length === 0,
+    'selector: changing page size REPLACES the URL state (no pushState history entry)');
+  assert(historyReplaceCalls[0] === '/index.html?page=1&page_size=25',
+    'selector: replaced URL carries page=1 and the new page_size');
+  assert(calls.length === 1 && calls[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'selector: exactly one agent-runs fetch triggered by the change');
+  assert(calls[0].indexOf('limit=25') !== -1 && calls[0].indexOf('offset=0') !== -1,
+    'selector: the re-fetch requests limit=25 and offset=0 (page 1)');
+  assert(calls[0].indexOf('agent=bob') !== -1,
+    'selector: the current agent filter rides along after the reset');
+})();
+
+// ── Deep-link page size syncs the page-size selector (PR #431 finding 1) ─
+// A deep link such as ?page_size=100 drives the fetch (limit=100) but the
+// #ar-page-size select kept showing "50" — the selector lied about the
+// active page size.  readAgentRunPaginationFromUrl() now syncs the visible
+// selector to the URL's effective page size as well.
+
+console.log('\u25B6 Agent Runs deep-link page-size selector sync (PR #431)');
+
+(function () {
+  if (typeof window.readAgentRunPaginationFromUrl !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: readAgentRunPaginationFromUrl exposed + sandbox location present');
+    return;
+  }
+
+  arPageSizeEl.value = '50';
+
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '100',
+    'deep link: ?page_size=100 syncs the page-size selector to 100');
+
+  appJsSandbox.location.search = '?page_size=25';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '25',
+    'deep link: ?page_size=25 syncs the page-size selector to 25');
+
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '50',
+    'deep link: no page_size syncs the page-size selector to the default 50');
+})();
+
+// ── Pagination control styling (PR #431 finding 2) ───────────────────────
+// The pagination <nav> now carries its own layout rules (independent of
+// .agent-runs-filters) and visually distinguishes the current page and
+// ellipses via the dedicated classes renderAgentRunPagination() emits.
+
+console.log('\u25B6 style.css — Agent Runs pagination control rules (PR #431)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  assert(live.indexOf('.agent-runs-pagination') !== -1,
+    'style.css: .agent-runs-pagination layout rule exists');
+  assert(live.indexOf('.pagination-btn.pagination-current') !== -1,
+    'style.css: .pagination-btn.pagination-current current-page rule exists');
+  assert(live.indexOf('.pagination-ellipsis') !== -1,
+    'style.css: .pagination-ellipsis rule exists');
+})();
+
+// ── Same-page clicks are a no-op (PR #431 finding 3) ─────────────────────
+// Clicking the already-current page button must not push a duplicate history
+// entry or refetch — the guard makes the click a no-op while keeping the
+// button focusable (its aria-current="page" + "current page" label stay).
+
+console.log('\u25B6 Agent Runs pagination controls — current-page click is a no-op (PR #431)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 50 });
+  var page2 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '2'; })[0];
+  assert(!!page2 && page2.disabled !== true,
+    'current: the page-2 button is rendered and stays focusable (not disabled)');
+  page2._handlers.click();
+  assert(historyCalls.length === 0,
+    'current: clicking the current page pushes no duplicate history entry');
+  assert(fetched.length === 0,
+    'current: clicking the current page triggers no redundant refetch');
+
+  // Restore page state (page 1 / size 50) so the deferred issue #7 Clear
+  // block's fetch .then — which runs after this synchronous block as a
+  // microtask — still sees a page-1 fallback no-op and renders its expected
+  // empty state instead of being diverted into a fallback refetch.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+})();
+
+// ── Back/Forward (popstate) re-sync (PR #431 finding 4) ──────────────────
+// Back/Forward changes location.search without re-running the load-time URL
+// read, so a popstate handler re-reads the URL and refetches only when the
+// effective page or page size changed — never pushing/replacing history.
+
+console.log('\u25B6 Agent Runs Back/Forward popstate re-sync (PR #431)');
+
+// Deferred (60ms) so its fetch/render effects drain AFTER the earlier issue
+// #7/#5 deferred async blocks that assert on the shared arTbodyEl empty-state
+// markup — never clobbering their expected rows (same pattern as the issue
+// #429 resilience chain below).
+pendingAsyncBlocks++;
+setTimeout(function () {
+  if (typeof window.handleAgentRunPopstate !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: handleAgentRunPopstate exposed + sandbox location present');
+    pendingAsyncBlocks--;
+    return;
+  }
+
+  // Fixture: page 2 of 50 rows deep-linked; the handler with an unchanged
+  // URL must be a no-op (no fetch, no history change).
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 0,
+    'popstate: an unchanged URL triggers no fetch');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: an unchanged URL pushes/replaces no history');
+
+  // Back/Forward to page 3: exactly one fetch at offset=100, no history.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=100') !== -1,
+    'popstate: navigating to page 3 refetches offset=100');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: a Back/Forward page change pushes/replaces no history');
+
+  // Page-size-only change: ?page=3&page_size=25 → refetch limit=25&offset=50,
+  // and the selector syncs (Fix 1) through the popstate path.
+  fetched.length = 0;
+  appJsSandbox.location.search = '?page=3&page_size=25';
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=25&offset=50') !== -1,
+    'popstate: a page-size-only change refetches limit=25 at the same page offset');
+  assert(arPageSizeEl.value === '25',
+    'popstate: the page-size selector syncs to 25 through the popstate path');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: a page-size change pushes/replaces no history');
+  pendingAsyncBlocks--;
+}, 60);
+
+// ── Agent Runs pagination resilience (issue #429) ────────────────────────
+// The pagination flow must stay resilient during automatic refreshes, page
+// loads, request failures, and changing result totals: the current page
+// stays selected and refetches the same offset on refresh; rows and the
+// control remain visible during loading and failures (existing stale/error
+// treatment preserved); and when the fetched total no longer covers the
+// current page, the UI moves to the nearest valid page, updates the URL via
+// replaceState, and refetches it.  Empty results stay on page 1 with the
+// control cleared and never loop.
+//
+// These blocks share the same fakes as every earlier block (fetch stub,
+// table, pagination control, history, page state), so they are SERIALIZED
+// as a completion chain that starts on a delayed timer (60ms) — after the
+// client-cache and issue #7/#5 async chains have fully drained — and each
+// block re-establishes its own fixture inside its callback before running
+// the next, following the file's established deferred-async pattern.
+
+// Shared row fixtures (same field shape as the issue #5 render block).
+var arResilRowA = { id: 'res-a', title: 'Resilient alpha', currentStatus: 'running', model: 'gpt-4o', agent: 'alpha',
+  todo_completed: 1, todo_total: 2, code_changes_total: 0, total_estimated_cost_usd: 0.1,
+  total_input_tokens: 10, total_output_tokens: 5, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 0, last_updated_at: '2026-07-01T10:00:00' };
+var arResilRowB = { id: 'res-b', title: 'Resilient beta', currentStatus: 'completed', model: 'claude-sonnet', agent: 'beta',
+  todo_completed: 2, todo_total: 2, code_changes_total: 3, total_estimated_cost_usd: 0.2,
+  total_input_tokens: 20, total_output_tokens: 10, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 1, last_updated_at: '2026-07-01T09:00:00' };
+var arResilRowC = { id: 'res-c', title: 'Resilient gamma', currentStatus: 'running', model: 'gpt-4o', agent: 'gamma',
+  todo_completed: 0, todo_total: 1, code_changes_total: 0, total_estimated_cost_usd: 0,
+  total_input_tokens: 5, total_output_tokens: 2, total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0, child_run_count: 0, last_updated_at: '2026-07-01T08:00:00' };
+
+// ── Pure calculation: nearest valid page from a fetched total ────────────
+// nearestValidAgentRunPage(total, currentPage, pageSize) returns the page
+// the UI must land on: the current page unchanged while it is still covered
+// by the fetched total, otherwise the last valid page.  An empty result
+// (total=0) resolves to page 1 — from page 1 it returns 1 unchanged so a
+// refetch can never loop, and from a higher page it lands on page 1, never
+// page 0.
+
+console.log('\u25B6 Agent Runs pagination resilience — nearest-valid-page calculation (issue #429)');
+
+(function () {
+  if (typeof window.nearestValidAgentRunPage !== 'function') {
+    assert(false, 'app.js: nearestValidAgentRunPage exposed on the window test seam');
+    return;
+  }
+
+  // Current page still covered by the result total → unchanged.
+  assert(window.nearestValidAgentRunPage(125, 3, 50) === 3,
+    'valid: page 3 of 125 rows (3 pages) stays on page 3');
+  assert(window.nearestValidAgentRunPage(125, 3, 25) === 3,
+    'valid: page 3 of 125 rows at 25/page (5 pages) stays on page 3');
+  assert(window.nearestValidAgentRunPage(50, 1, 50) === 1,
+    'valid: page 1 of exactly one full page stays on page 1');
+
+  // Total shrinks below the current page → nearest valid page.
+  assert(window.nearestValidAgentRunPage(60, 3, 50) === 2,
+    'shrink: 60 rows (2 pages) moves page 3 to page 2');
+  assert(window.nearestValidAgentRunPage(200, 5, 50) === 4,
+    'shrink: 200 rows (4 pages) moves page 5 to page 4');
+  assert(window.nearestValidAgentRunPage(10, 5, 50) === 1,
+    'shrink: 10 rows (1 page) moves page 5 to page 1');
+  assert(window.nearestValidAgentRunPage(50, 2, 50) === 1,
+    'shrink: exactly one full page (50 rows) moves page 2 to page 1');
+
+  // Empty result: resolves to page 1, never page 0; page 1 stays put.
+  assert(window.nearestValidAgentRunPage(0, 3, 50) === 1,
+    'empty: total=0 moves page 3 to page 1 (never page 0)');
+  assert(window.nearestValidAgentRunPage(0, 1, 50) === 1,
+    'empty: total=0 on page 1 stays on page 1 (no navigation)');
+  assert(window.nearestValidAgentRunPage(0, 0, 50) === 1,
+    'guard: a current page below 1 clamps to page 1');
+})();
+
+// ── Refresh refetches the currently selected page and offset ─────────────
+// The automatic-refresh path (and every refresh-style refetch) re-requests
+// the selected page through buildAgentRunsUrl — page state translates to
+// the same offset every cycle, so a refresh on page 3 refetches offset=100
+// rather than resetting to page 1.
+
+console.log('\u25B6 Agent Runs pagination resilience — refresh refetches the selected page (issue #429)');
+
+function resilienceBlockRefresh(next) {
+  // Fixture: the user is on page 3 of 50 rows (deep-link state).
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 100 }); }
+    });
+  };
+
+  window.fetchAgentRunsAndRender();
+  // The refresh-style refetch fires synchronously with the selected page's offset.
+  assert(fetched.length === 1 && fetched[0].indexOf('/api/v1/usage/agent-runs?') === 0,
+    'refresh: exactly one agent-runs refetch triggered');
+  assert(fetched[0].indexOf('limit=50&offset=100') !== -1,
+    'refresh: the refetch requests the currently selected page 3 (offset=100)');
+
+  setTimeout(function () {
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 3, current page"') !== -1,
+      'refresh: the refetched page 3 renders as the current page');
+    assert(window.buildAgentRunsUrl().indexOf('offset=100') !== -1,
+      'refresh: subsequent requests keep the selected page offset');
+    next();
+  }, 0);
+}
+
+// ── Rows stay visible while a new page is loading ────────────────────────
+// A page request marks the panel 'refreshing' (which renders) and only
+// repaints the table once the response lands — so the previously displayed
+// rows and the pagination control remain on screen during the in-flight
+// request, with no empty-state flash.
+
+console.log('\u25B6 Agent Runs pagination resilience — rows stay visible during loading (issue #429)');
+
+function resilienceBlockLoading(next) {
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Prime the previously displayed page through the real fetch path: two
+  // rows on page 2 of 125 (also resolves the agent-runs panel to 'ok').
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowA, arResilRowB], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1,
+      'loading: fixture rows rendered before the refetch');
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+      'loading: pagination control rendered (page 2 current)');
+
+    // A slow page request: the fetch stays pending while we assert.
+    var resolveFetch = null;
+    appJsSandbox.fetch = function () {
+      return new Promise(function (resolve) { resolveFetch = resolve; });
+    };
+    window.fetchAgentRunsAndRender();
+
+    // While the new page is loading: previous rows and the control remain.
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-b"') !== -1,
+      'loading: previously displayed rows remain visible while the page request is in flight');
+    assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+      'loading: the pagination control remains visible with the current page while loading');
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') === -1,
+      'loading: no empty-state flash while the page request is in flight');
+
+    // Now the page lands: the new rows replace the previous ones.
+    resolveFetch({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowC], total: 125, limit: 50, offset: 50 }); }
+    });
+    setTimeout(function () {
+      assert(arTbodyEl.innerHTML.indexOf('data-id="res-c"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-a"') === -1,
+        'loading: the newly loaded page replaces the previous rows');
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Page-request failure keeps previous rows + error treatment ───────────
+// A failed page request resolves the panel to 'stale' with the previous
+// updatedAt: the table keeps its previously displayed rows, the pagination
+// control keeps its last-known page info (both gated by shouldRenderPanel),
+// and the freshness label swaps to the existing "Showing previous data"
+// treatment — nothing is cleared or replaced.
+
+console.log('\u25B6 Agent Runs pagination resilience — page-request failure keeps rows + error treatment (issue #429)');
+
+function resilienceBlockFailure(next) {
+  // Freshness-label fake: applyPanelFreshness looks the span up at render
+  // time (document.getElementById), so registering it here is enough for
+  // the stale "Showing previous data" label to be observable.
+  var freshnessEl = makeFakeElement('freshness-agent-runs');
+  elementRegistry['freshness-agent-runs'] = freshnessEl;
+
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Establish the previously displayed page through a successful fetch.
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [arResilRowA, arResilRowB], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1,
+      'failure: previous page rendered before the failing request');
+
+    // Now the page request fails.  The rejection is intentional: suppress
+    // the expected console.error for this block and restore it after
+    // (Nit 3 pattern).
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    appJsSandbox.fetch = function () {
+      return Promise.reject(new Error('network down'));
+    };
+    window.fetchAgentRunsAndRender();
+    setTimeout(function () {
+      assert(arTbodyEl.innerHTML.indexOf('data-id="res-a"') !== -1 && arTbodyEl.innerHTML.indexOf('data-id="res-b"') !== -1,
+        'failure: previously displayed rows are preserved after the failed page request');
+      assert(arTbodyEl.innerHTML.indexOf('No agent runs') === -1,
+        'failure: no empty-state replacement after the failed page request');
+      assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+        'failure: the pagination control keeps the last-known page info');
+      assert(freshnessEl.textContent === 'Showing previous data',
+        'failure: the "Showing previous data" stale label is preserved (existing error treatment)');
+      appJsSandbox.console.error = savedConsoleError;
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Nearest-valid-page fallback when the total shrinks ───────────────────
+// When the fetched total implies fewer pages than the current page (the
+// result set shrank), the fallback hook moves the closure state to the
+// nearest valid page, REPLACES the URL (no history entry), and refetches
+// the corrected page through the shared path — the UI never sits on an
+// empty offset.
+
+console.log('\u25B6 Agent Runs pagination resilience — nearest-valid-page fallback (issue #429)');
+
+function resilienceBlockFallback(next) {
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+
+  // Prime through the real fetch path: page 3 of 125 runs (3 pages)
+  // renders and the agent-runs panel resolves to 'ok'.
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 100 }); }
+    });
+  };
+  window.fetchAgentRunsAndRender();
+  setTimeout(function () {
+    var page3 = arPaginationEl.querySelectorAll('button')
+      .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+    assert(!!page3, 'fallback: the page-3 button is rendered on page 3 of 125');
+
+    // The result set shrank to 60 runs (2 pages): every subsequent fetch
+    // reports the new total, whichever offset was requested.
+    var fetchCount = 0;
+    var fetched = [];
+    appJsSandbox.fetch = function (url) {
+      fetched.push(url);
+      fetchCount++;
+      return Promise.resolve({
+        ok: true,
+        json: function () {
+          return Promise.resolve({
+            items: [{}],
+            total: 60,
+            limit: 50,
+            offset: fetchCount === 1 ? 100 : 50
+          });
+        }
+      });
+    };
+    historyCalls.length = 0;
+    historyReplaceCalls.length = 0;
+    // PR #431 review (finding 3): clicking the current page is now a no-op,
+    // so the shrink-triggering refetch is driven through the shared refresh
+    // path (the same path auto-refresh uses) instead of a current-page click.
+    window.fetchAgentRunsAndRender();
+
+    // Synchronous effects: the refetch requests the stale page 3 (offset=100)
+    // without pushing a history entry.
+    assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=100') !== -1,
+      'fallback: the first fetch requests the stale page 3 (offset=100)');
+    assert(historyCalls.length === 0,
+      'fallback: the current-page refetch pushes no history entry');
+
+    setTimeout(function () {
+      // The stale page's response (total=60 → 2 pages) triggered the
+      // fallback: URL replaced with the nearest valid page and refetched.
+      assert(historyReplaceCalls.length === 1 && historyReplaceCalls[0] === '/index.html?page=2&page_size=50',
+        'fallback: the URL is updated to the nearest valid page via replaceState');
+      assert(historyCalls.length === 0,
+        'fallback: the fallback adds no new browser-history entry');
+      assert(fetched.length === 2 && fetched[1].indexOf('limit=50&offset=50') !== -1,
+        'fallback: the nearest valid page (2, offset=50) is refetched');
+      assert(arPaginationEl.innerHTML.indexOf('aria-label="Page 2, current page"') !== -1,
+        'fallback: the control renders the nearest valid page as current');
+      assert(window.buildAgentRunsUrl().indexOf('offset=50') !== -1,
+        'fallback: subsequent requests use the corrected page offset');
+      next();
+    }, 0);
+  }, 0);
+}
+
+// ── Empty-result guard ───────────────────────────────────────────────────
+// No matching runs (total=0) must stay correct: on page 1 the guard makes
+// no navigation at all (no refetch, no URL change — the control clears and
+// the empty state renders); from a higher page it falls back to page 1
+// exactly once (URL replaced with page=1 — never page 0 — and one refetch),
+// which terminates because page 1 is always valid.
+
+console.log('\u25B6 Agent Runs pagination resilience — empty-result guard (issue #429)');
+
+function resilienceBlockEmpty(next) {
+  // Case 1: already on page 1 when the result set is empty.
+  appJsSandbox.location.search = '?page=1&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [], total: 0, limit: 50, offset: 0 }); } });
+  };
+  window.fetchAgentRunsAndRender();
+  assert(fetched.length === 1,
+    'empty: page 1 fetch fires once');
+  setTimeout(function () {
+    assert(fetched.length === 1,
+      'empty: total=0 on page 1 triggers no refetch (guard prevents a navigation loop)');
+    assert(historyReplaceCalls.length === 0 && historyCalls.length === 0,
+      'empty: total=0 on page 1 changes no URL state');
+    assert(arPaginationEl.innerHTML === '',
+      'empty: the pagination control clears when no runs match');
+    assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+      'empty: the empty-state message renders on page 1');
+
+    // Case 2: on page 3 when the result set becomes empty → fall back to
+    // page 1 exactly once (URL replaced, one refetch, control cleared).
+    appJsSandbox.location.search = '?page=3&page_size=50';
+    window.readAgentRunPaginationFromUrl();
+    historyCalls.length = 0;
+    historyReplaceCalls.length = 0;
+    fetched.length = 0;
+    arTbodyEl.innerHTML = '';
+    window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 100 }); // 3 pages visible
+    var page3 = arPaginationEl.querySelectorAll('button')
+      .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
+    assert(!!page3, 'empty: the page-3 button is rendered');
+    // PR #431 review (finding 3): the current-page click is a no-op, so the
+    // empty-result fallback is driven through the shared refresh path.
+    window.fetchAgentRunsAndRender();
+    setTimeout(function () {
+      assert(historyReplaceCalls.length === 1 &&
+             historyReplaceCalls[0].indexOf('page=1&page_size=50') !== -1,
+        'empty: total=0 from page 3 replaces the URL with page=1 (never page 0)');
+      assert(fetched.length === 2,
+        'empty: total=0 from page 3 refetches exactly once (page 1) — no loop');
+      assert(fetched[1].indexOf('limit=50&offset=0') !== -1,
+        'empty: the refetch requests page 1 (offset=0)');
+      assert(arPaginationEl.innerHTML === '',
+        'empty: the control clears after the empty-result fallback');
+      assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
+        'empty: the empty-state message renders after the fallback');
+      // Restore a benign default fetch stub for any later background work.
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+      };
+      next();
+    }, 0);
+  }, 0);
+}
+
+// The five resilience blocks share the same fakes (fetch stub, table,
+// pagination control, history, page state), so they run SERIALIZED — each
+// block calls the next on completion instead of scheduling in parallel —
+// following the file's deferred-async pattern.  The chain starts on a
+// delayed timer so every earlier async block (client-cache, issue #7/#5
+// render chains) has fully drained.
+pendingAsyncBlocks++;
+setTimeout(function () {
+  resilienceBlockRefresh(function () {
+    resilienceBlockLoading(function () {
+      resilienceBlockFailure(function () {
+        resilienceBlockFallback(function () {
+          resilienceBlockEmpty(function () {
+            pendingAsyncBlocks--;
+          });
+        });
+      });
+    });
+  });
+}, 60);
+
+// ── Records view ordering: source-created, not ingest time (issue #401) ──
+// The Records table presents "most recent" as most recently created at the
+// source, so the /api/v1/usage/records fetch must request
+// sort_by=source_created_at (the backend default) — never sort_by=ingested_at.
+// The URL is built inline in fetchAll(), so this pins the production source
+// (same readFileSync pattern used for index.html assertions above) rather
+// than duplicating the URL builder.
+console.log('\u25B6 Records view — sort_by=source_created_at, never ingested_at (issue #401)');
+
+(function () {
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('sort_by=source_created_at') !== -1,
+    'records fetch requests sort_by=source_created_at (most recent = source-created message time, issue #401)');
+  assert(appJsSource.indexOf('sort_by=ingested_at') === -1,
+    'records fetch no longer requests sort_by=ingested_at (ingest time is not "most recent", issue #401)');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

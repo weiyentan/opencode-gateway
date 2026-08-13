@@ -115,6 +115,17 @@ failure leaves the rest of Aurora Glass usable and may preserve the last
 successful panel data with a stale/error indication.
 _Avoid_: fixed agent categories, Agent Run Summary
 
+**Source-Created Ordering**:
+The ordering rule behind "most recent" in Aurora Glass usage views: rows
+are ordered by when the underlying activity happened at the source, not by
+when the Gateway ingested it. The Records view sorts by
+``source_created_at`` (``COALESCE(source_created_at_tz, reported_at)``,
+the backend's default sort option; ``ingested_at`` is an explicit opt-in);
+the Sessions and Agent Runs views order by the source-created
+``last_message_at`` (``DESC``, nulls last for Agent Runs). A message
+delivered late can therefore appear above earlier-ingested but genuinely
+newer activity. _Avoid_: ingest-time ordering, "most recently ingested"
+
 **Queued Agent Run**:
 An Agent Run that is known to the Gateway but has not yet produced its first
 observed message or usage activity. Before observed activity exists, date
@@ -126,12 +137,12 @@ _Avoid_: Pending session, empty run
 A best-effort terminal status derived by the gateway from available
 quiet/activity heuristics. Because OpenCode exposes no authoritative
 terminal success signal, "completed" is not an upstream-proven success
-proof — it means the session has fallen quiet beyond the threshold, has
-no parent dependency, and has recorded messages (see
-``_compute_status``). Inactivity alone must never be confused with
-upstream-proven success; it is a heuristic. Distinct from Blocked
-(intentional wait), Stale (lost liveness), Timed Out (expired budget), and
-terminal failures like Failed or Cancelled.
+proof — it means the session has recently fallen quiet (beyond the running
+threshold but within the stale threshold), has no parent dependency, and
+has recorded messages (see ``_compute_status``). Inactivity alone must
+never be confused with upstream-proven success; it is a heuristic. Distinct
+from Blocked (intentional wait), Stale (lost liveness), Timed Out (expired
+budget), and terminal failures like Failed or Cancelled.
 
 **Run Status — Running**:
 A run that is actively executing with trusted, recent liveness evidence —
@@ -146,9 +157,13 @@ condition resolves.
 **Run Status — Stale**:
 A run whose liveness is no longer trusted without any terminal signal
 (success, error, cancellation, or timeout). The process or response stream
-has gone silent, or its heartbeats cannot be verified. Stale is a valid
+has gone silent, or its heartbeats cannot be verified. It occupies the
+extended-quiet band between the stale threshold and the unknown threshold —
+recent enough to not yet be "unknown", but quiet long enough that the
+"completed"/"blocked" classification is no longer trusted. Stale is a valid
 direct user-facing status label in observability contexts. It represents
-a gap in observability, not a known termination reason. Distinct from
+a gap in observability, not a known termination reason. A stale run may
+transition back to Running if it resumes producing output. Distinct from
 Blocked (intentional tracked wait) and Timed Out (expired budget).
 
 **Run Status — Timed Out**:
@@ -479,6 +494,7 @@ manages.
 - **Agent Usage** resolves agent grouping at read time from the latest available **Session Context**
 - **Agent Usage** failure is isolated from other dashboard panels and may preserve the last successful data with a stale/error indication
 - **Aurora Glass** uses the same compact **Token Breakdown** vocabulary for Sessions and **Agent Run Summary** rows
+- **Aurora Glass** orders usage views by **Source-Created Ordering** (Records: `sort_by=source_created_at`; Sessions and Agent Runs: `last_message_at DESC`), never by ingest time
 - **Aurora Glass** treats an Agent Run or Session title as the meaningful scope for a **Token Breakdown** row
 - **Aurora Glass** applies the shared dashboard date range to **Agent Run Summary** views unless an Agent Runs-specific date boundary is explicitly selected; each Agent Runs-specific boundary takes precedence for that side of the range, while unset boundaries inherit from the shared dashboard range
 - **Aurora Glass** treats Agent Run status filters as additional narrowing filters on the effective date range; status filters do not define or alter the date range

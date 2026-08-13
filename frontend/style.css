@@ -1062,6 +1062,39 @@ tbody tr:hover td {
   cursor: default;
 }
 
+/* ── Agent Runs Pagination ──────────────────────────────────────────────── */
+
+/* Pagination control block below the Agent Runs panel (issue #427 / PR #431
+   review): its own flex layout — independent of .agent-runs-filters — so
+   the <nav> is fully self-contained.  Buttons reuse the .filter-clear
+   secondary look; the current page and ellipses are visually distinguished
+   below. */
+.agent-runs-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 16px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+/* Current page (PR #431 review): bold white text on the indigo accent so the
+   active page stands out from the neutral secondary buttons. */
+.pagination-btn.pagination-current {
+  font-weight: 700;
+  background: var(--accent-indigo);
+  color: #fff;
+  border-color: var(--accent-indigo);
+}
+
+/* Ellipsis separators between page groups (PR #431 review): muted, with a
+   small horizontal padding so they read as inline separators, not buttons. */
+.pagination-ellipsis {
+  padding: 0 4px;
+  color: var(--text-muted);
+}
+
 /* ── Agent Runs Table ──────────────────────────────────────────────────── */
 
 /* Full-viewport layout (issue #411): when the Agent Runs tab is active,
