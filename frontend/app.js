@@ -1812,7 +1812,7 @@
 
     // ── Todos ──
     html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Todos (' + (d.todo_completed || 0) + '/' + (d.todo_total || 0) + ')</div>';
+      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
     if (d.todo_rows && d.todo_rows.length > 0) {
       html += '<div class="detail-todo-list">';
       d.todo_rows.forEach(function (t) {

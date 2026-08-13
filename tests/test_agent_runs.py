@@ -1516,10 +1516,12 @@ class TestAgentRunsDetail:
         data = response.json()["data"]
         assert len(data["todo_rows"]) == 2
         assert data["todo_rows"][0]["content"] == "Fix login bug"
+        assert data["todo_rows"][0]["description"] == "Fix login bug"
         assert data["todo_rows"][0]["status"] == "pending"
         assert data["todo_rows"][0]["priority"] == "high"
         assert data["todo_rows"][0]["position"] == 1
         assert data["todo_rows"][1]["content"] == "Write tests"
+        assert data["todo_rows"][1]["description"] == "Write tests"
         assert data["todo_rows"][1]["status"] == "completed"
         assert data["todo_rows"][1]["priority"] == "medium"
         assert data["todo_rows"][1]["position"] == 2
