@@ -14,6 +14,12 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Version of the correlation engine that produced a derived link.  Recorded on
+# every Correlation, RunEntityLink, RunSessionLink, and UnresolvedCorrelation so
+# a change in rule semantics can be detected downstream.  Bump when any rule's
+# matching logic changes.
+RESOLVER_VERSION = "1"
+
 
 class Provider(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
     """The source provider that produced the observed engineering data."""
@@ -76,6 +82,14 @@ class EngineeringEntity(BaseModel):
     url: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    description: str | None = Field(
+        default=None,
+        description="Body/description text (e.g. a change-request description)",
+    )
+    branch: str | None = Field(
+        default=None,
+        description="Source branch / head ref (change requests only)",
+    )
 
 
 class EngineeringEvent(BaseModel):
@@ -112,6 +126,10 @@ class Correlation(BaseModel):
     correlation_confidence: float = Field(ge=0.0, le=1.0)
     method: str = Field(description="How the correlation was established")
     evidence: list[CorrelationEvidence] = Field(default_factory=list)
+    resolver_version: str = Field(
+        default=RESOLVER_VERSION,
+        description="Version of the correlation engine that produced this link",
+    )
 
 
 class EngineeringOutcome(BaseModel):
@@ -131,6 +149,10 @@ class RunEntityLink(BaseModel):
     entity_id: str
     role: str = Field(description="resolved | referenced | noise")
     correlation_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    resolver_version: str = Field(
+        default=RESOLVER_VERSION,
+        description="Version of the correlation engine that produced this link",
+    )
 
 
 class RunSessionLink(BaseModel):
@@ -145,6 +167,18 @@ class RunSessionLink(BaseModel):
     )
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    inferred: bool = Field(
+        default=False,
+        description="True when the session attachment is provisional/inferred",
+    )
+    method: str | None = Field(
+        default=None,
+        description="Heuristic that attached the session (e.g. temporal_overlap)",
+    )
+    resolver_version: str = Field(
+        default=RESOLVER_VERSION,
+        description="Version of the correlation engine that produced this link",
+    )
 
 
 class AFKRun(BaseModel):
@@ -169,3 +203,46 @@ class AFKRun(BaseModel):
     outcome: EngineeringOutcome | None = None
     entity_links: list[RunEntityLink] = Field(default_factory=list)
     session_links: list[RunSessionLink] = Field(default_factory=list)
+
+
+class UnresolvedReason(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """Why a correlation could not be deterministically resolved."""
+
+    AMBIGUOUS = "ambiguous"
+    UNMATCHED = "unmatched"
+
+
+class UnresolvedCorrelation(BaseModel):
+    """A correlation the resolver could not deterministically establish.
+
+    Ambiguous outcomes (multiple competing candidate sources with no
+    higher-confidence rule to break the tie) and unmatched outcomes (no rule
+    produced a link) are surfaced here for persistence in
+    ``unresolved_correlations`` (#448).  They are never forced into a
+    :class:`Correlation` or :class:`RunEntityLink`, and never random-tiebroken.
+    """
+
+    unresolved_id: str
+    afk_run_id: str
+    entity_id: str
+    reason: UnresolvedReason
+    candidates: list[str] = Field(
+        default_factory=list,
+        description="Competing source entity IDs (ambiguous) — empty for unmatched",
+    )
+    evidence: list[CorrelationEvidence] = Field(default_factory=list)
+    resolver_version: str = Field(
+        default=RESOLVER_VERSION,
+        description="Version of the correlation engine that produced this result",
+    )
+
+
+class ResolutionResult(BaseModel):
+    """Batch resolver output: the reconstructed run plus unresolved items."""
+
+    run: AFKRun
+    unresolved: list[UnresolvedCorrelation] = Field(default_factory=list)
+    resolver_version: str = Field(
+        default=RESOLVER_VERSION,
+        description="Version of the correlation engine that produced this result",
+    )

@@ -11,8 +11,18 @@ under ``tests/``.
 
 from __future__ import annotations
 
+from afk_outcomes.correlation import (
+    BranchIssueReferenceRule,
+    CommitIssueReferenceRule,
+    CorrelationEngine,
+    ExplicitRunIdRule,
+    IssueReferenceRule,
+    SessionDescriptor,
+    TemporalInferenceRule,
+)
 from afk_outcomes.interfaces import CorrelationRule, OutcomeRepository, ProviderAdapter
 from afk_outcomes.models import (
+    RESOLVER_VERSION,
     AFKRun,
     Correlation,
     CorrelationEvidence,
@@ -22,9 +32,12 @@ from afk_outcomes.models import (
     EngineeringOutcomeStatus,
     EntityType,
     Provider,
+    ResolutionResult,
     RunEntityLink,
     RunSessionLink,
     RunStatus,
+    UnresolvedCorrelation,
+    UnresolvedReason,
 )
 from afk_outcomes.serialization import (
     CANONICAL_SCHEMA_VERSION,
@@ -38,8 +51,11 @@ from afk_outcomes.serialization import (
 
 __all__ = [
     "AFKRun",
+    "BranchIssueReferenceRule",
     "CANONICAL_SCHEMA_VERSION",
+    "CommitIssueReferenceRule",
     "Correlation",
+    "CorrelationEngine",
     "CorrelationEvidence",
     "CorrelationRule",
     "EngineeringEntity",
@@ -47,15 +63,23 @@ __all__ = [
     "EngineeringOutcome",
     "EngineeringOutcomeStatus",
     "EntityType",
+    "ExplicitRunIdRule",
+    "IssueReferenceRule",
     "MonotonicULID",
     "OutcomeRepository",
     "Provider",
     "ProviderAdapter",
+    "RESOLVER_VERSION",
+    "ResolutionResult",
     "RunEntityLink",
     "RunSessionLink",
     "RunStatus",
     "SequenceULID",
+    "SessionDescriptor",
+    "TemporalInferenceRule",
     "ULIDSource",
+    "UnresolvedCorrelation",
+    "UnresolvedReason",
     "dumps_canonical",
     "loads_canonical",
     "make_ulid",

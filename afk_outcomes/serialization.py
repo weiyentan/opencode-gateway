@@ -130,17 +130,17 @@ def _canonicalize(value: object) -> object:
     return value
 
 
-def canonical_payload(run: AFKRun) -> dict[str, object]:
-    """Return the versioned envelope dict for ``run`` (pre-serialization)."""
+def canonical_payload(model: BaseModel) -> dict[str, object]:
+    """Return the versioned envelope dict for ``model`` (pre-serialization)."""
     return {
         "schema_version": CANONICAL_SCHEMA_VERSION,
-        "data": _canonicalize(run),
+        "data": _canonicalize(model),
     }
 
 
-def dumps_canonical(run: AFKRun) -> str:
-    """Serialize ``run`` to stable canonical sorted-key JSON (no whitespace)."""
-    return json.dumps(canonical_payload(run), sort_keys=True, separators=(",", ":"))
+def dumps_canonical(model: BaseModel) -> str:
+    """Serialize ``model`` to stable canonical sorted-key JSON (no whitespace)."""
+    return json.dumps(canonical_payload(model), sort_keys=True, separators=(",", ":"))
 
 
 def loads_canonical(serialized: str) -> AFKRun:
