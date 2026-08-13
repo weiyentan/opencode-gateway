@@ -1504,7 +1504,7 @@ console.log('\u25B6 resolvePanelStatuses + shouldRenderPanel (failure retention)
   // No endpoint errors → every panel resolves to 'ok'
   var allOk = window.resolvePanelStatuses({});
   ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
-   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-runs', 'client-project']
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-usage', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
       assert(allOk[panelId] === 'ok', 'no errors: panel "' + panelId + '" resolves to ok');
     });
@@ -3792,6 +3792,122 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issue #438)');
   assert(appJsSource.indexOf('&group_by=model') !== -1 &&
          appJsSource.indexOf('renderAgentsTable(data)') !== -1,
     'app.js: the model-based Agents & LLMs In Use panel fetch + render are untouched');
+})();
+
+// ── Agent Usage panel — resilience + responsive placement (issue #440) ──
+// The Agent Usage panel is independently refreshable: a failed group_by=agent
+// (aggByAgent) request marks ONLY this panel stale (via the PANEL_ENDPOINTS
+// mapping), the panel keeps its last successful rows with the existing
+// stale/error indicator, and its bottom-left Overview placement is backed by
+// responsive CSS following the sibling table-panel conventions.  Exercised
+// through the vm-sandbox window seam (resolvePanelStatuses /
+// shouldRenderPanel / computePanelFreshness) plus the established static
+// source/markup verification pattern for the render wiring and layout.
+console.log('\u25B6 Agent Usage — panel status isolation on aggByAgent failure (issue #440)');
+
+(function () {
+  // aggByAgent failure stales ONLY the Agent Usage panel — every other
+  // dashboard panel (including the model-based Agents & LLMs In Use panel)
+  // stays usable.
+  var agentFail = window.resolvePanelStatuses({ aggByAgent: 'boom' });
+  assert(agentFail['agent-usage'] === 'stale',
+    'aggByAgent failure: the Agent Usage panel resolves to stale (PANEL_ENDPOINTS entry)');
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(agentFail[panelId] === 'ok',
+        'aggByAgent failure: unrelated panel "' + panelId + '" stays ok');
+    });
+
+  // No aggByAgent error \u2192 the panel is ok (freshness resolves normally)
+  var allOk = window.resolvePanelStatuses({});
+  assert(allOk['agent-usage'] === 'ok', 'no errors: the Agent Usage panel resolves to ok');
+
+  // Other single-endpoint failures do NOT stale the Agent Usage panel
+  assert(window.resolvePanelStatuses({ aggByModel: 'boom' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ health: 'down' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ agentRuns: 'boom' })['agent-usage'] === 'ok' &&
+         window.resolvePanelStatuses({ aggClientProject: 'boom' })['agent-usage'] === 'ok',
+    'model/health/agent-runs/client-project failures leave the Agent Usage panel ok');
+})();
+
+console.log('\u25B6 Agent Usage — last-successful-rows retention + stale indicator (issue #440)');
+
+(function () {
+  // A stale Agent Usage panel with previous data skips the re-render, so the
+  // last successful rows stay on screen (shouldRenderPanel discipline).
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'stale', updatedAt: 500000 } }, 'agent-usage') === false,
+    'stale Agent Usage panel with previous data \u2192 render skipped (last rows retained)');
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'ok', updatedAt: 500000 } }, 'agent-usage') === true,
+    'ok Agent Usage panel still renders');
+  assert(window.shouldRenderPanel({ 'agent-usage': { status: 'stale', updatedAt: null } }, 'agent-usage') === true,
+    'stale Agent Usage panel with NO previous data renders (empty/error state shown)');
+
+  // The panel title swaps in the existing "Showing previous data" warning.
+  var now = 1000000;
+  var f = window.computePanelFreshness({ 'agent-usage': { status: 'stale', updatedAt: 500000 } }, 'agent-usage', now);
+  assert(f !== null && f.status === 'stale' && f.label === 'Showing previous data',
+    'stale Agent Usage panel shows the "Showing previous data" freshness label');
+
+  // Render wiring: the panel honors the retention guard and paints the
+  // existing error indicator into its empty state on a failed fetch.
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  var renderSrc = appJsSource.slice(appJsSource.indexOf('function renderAgentUsageTable'),
+                                    appJsSource.indexOf('function renderAgentRunsTable'));
+  assert(renderSrc.indexOf("applyPanelFreshness('agent-usage')") !== -1 &&
+         renderSrc.indexOf("shouldRenderPanel(panelStates, 'agent-usage')") !== -1,
+    'app.js: renderAgentUsageTable applies freshness and skips the re-render when stale');
+  assert(renderSrc.indexOf("errorIndicator('aggByAgent')") !== -1,
+    'app.js: renderAgentUsageTable shows the fetch-error indicator (aggByAgent)');
+})();
+
+console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  // The panel has a dedicated rule following the sibling panel conventions
+  // (shared glass-panel/table styling plus panel-specific table proportions).
+  assert(live.indexOf('.panel-agent-usage') !== -1,
+    'style.css: .panel-agent-usage rules exist (base band)');
+
+  // Base band (>1024px): fixed table layout so the two-column table always
+  // fits its column — the Agent identity column truncates long names with an
+  // ellipsis and the numeric Active Tokens column right-aligns (the
+  // .num/.dist-tokens numeric convention), so no horizontal overflow at any
+  // viewport width.
+  var auTableRule = live.match(/\.panel-agent-usage table\s*\{[^}]*\}/);
+  assert(auTableRule !== null && auTableRule[0].indexOf('table-layout: fixed') !== -1,
+    'style.css: .panel-agent-usage table uses fixed layout (columns fit the panel)');
+  var auFirstRule = live.match(/\.panel-agent-usage (?:th|td):first-child\s*\{[^}]*\}/);
+  assert(auFirstRule !== null && auFirstRule[0].indexOf('text-overflow: ellipsis') !== -1,
+    'style.css: the Agent identity column truncates long names with an ellipsis');
+  var auLastRule = live.match(/\.panel-agent-usage (?:th|td):last-child\s*\{[^}]*\}/);
+  assert(auLastRule !== null && auLastRule[0].indexOf('text-align: right') !== -1,
+    'style.css: the Active Tokens column is right-aligned (numeric convention)');
+
+  // Tablet band (761–1024px): the content grid keeps two columns, so the
+  // base fixed-layout rule carries the panel — no per-band override needed.
+  // Phone band (≤760px): the grid collapses to one column and the panel goes
+  // full-width; the Active Tokens column narrows so the Agent identity column
+  // keeps the larger share on narrow screens.
+  var phoneBlock = css.slice(css.indexOf('@media (max-width: 760px)'),
+                             css.lastIndexOf('@media (prefers-reduced-motion: reduce)'));
+  assert(phoneBlock.indexOf('.panel-agent-usage') !== -1 &&
+         phoneBlock.indexOf('width: 30%') !== -1,
+    'style.css: the phone band narrows the Active Tokens column (.panel-agent-usage)');
+
+  // Markup: the panel is the LAST panel in the Overview left column
+  // (bottom-left placement), below the Collectors table, inside .col-left.
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var overviewHtml = html.slice(html.indexOf('id="tab-overview"'));
+  var colLeft = overviewHtml.slice(0, overviewHtml.indexOf('class="col-right"'));
+  assert(colLeft.indexOf('panel-agent-usage') !== -1 &&
+         colLeft.indexOf('panel-agent-usage') < colLeft.indexOf('</div><!-- .col-left -->'),
+    'index.html: the Agent Usage panel is the last panel in the Overview left column (bottom-left)');
+  assert(colLeft.indexOf('panel-collectors') < colLeft.indexOf('panel-agent-usage'),
+    'index.html: the Agent Usage panel sits below the Collectors panel');
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────
