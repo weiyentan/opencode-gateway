@@ -29,32 +29,32 @@ Use an inline heuristic (option 2) on the Agent Run Summary view model. The `cur
 | Condition | `currentStatus` |
 |---|---|
 | No messages observed for the session, OR `last_message_at` is null / absent | `unknown` |
-| `last_message_at` is recent (within the quiet threshold, `_QUIET_THRESHOLD_MINUTES`, default 60 min) | `running` |
-| Session exceeds the unknown threshold (`_UNKNOWN_THRESHOLD_HOURS`, default 24 h) — too old to classify meaningfully | `unknown` |
-| Not `running`, not past unknown threshold, has messages, **and** `parent_session_id` is set | `blocked` |
-| Not `running`, not past unknown threshold, has messages, no parent, within the stale threshold (`_STALE_THRESHOLD_HOURS`, default 6 h) | `stale` |
-| Not `running`, not past unknown threshold, has messages, no parent, beyond the stale threshold | `completed` |
+| `last_message_at` is recent (within the quiet threshold, `QUIET_THRESHOLD_MINUTES`, default 15 min) | `running` |
+| Beyond the quiet threshold but within the stale threshold (`STALE_THRESHOLD_HOURS`, default 2 h), has messages, **no** parent | `completed` |
+| Beyond the quiet threshold but within the stale threshold, has messages, **and** `parent_session_id` is set | `blocked` |
+| Beyond the stale threshold but within the unknown threshold (`UNKNOWN_THRESHOLD_HOURS`, default 48 h), has messages | `stale` |
+| Session exceeds the unknown threshold — too old to classify meaningfully | `unknown` |
 
-The derivation priority order (implemented in `_compute_status`) is: **unknown → running → unknown (age) → blocked → stale → completed**. Key rules:
+The derivation priority order (implemented in `_compute_status`) is: **unknown → running → completed/blocked (within the stale window) → stale (within the unknown window) → unknown-old**. Key rules:
 
-- `blocked` has higher priority than `stale` — a session with a parent is always `blocked` even within the stale window.
-- `stale` occupies the band between `_QUIET_THRESHOLD_MINUTES` and `_STALE_THRESHOLD_HOURS` for sessions without a parent. It represents an observability gap rather than a confidently terminated session.
-- `completed` is returned only after the stale threshold has been exceeded, making it a more confident (but still heuristic) terminal status.
+- `completed` and `blocked` occupy the band between the quiet and stale thresholds (15 min–2 h), distinguished by parent dependency: a session with a parent is `blocked`, one without is `completed`.
+- `stale` occupies the band between the stale and unknown thresholds (2–48 h) for sessions with messages. It represents an observability gap rather than a confidently terminated session, and a stale run may transition back to `running` if it resumes producing output.
+- `completed` is a best-effort heuristic terminal status for a confidently-recently-quiet session — it is not an upstream-proven success signal.
 
-The thresholds are module-level constants in `app/api/usage.py`:
+The thresholds default to module-level constants in `app/api/usage.py` and are configurable via `app/core/config.py` `Settings` (env vars `GATEWAY_QUIET_THRESHOLD_MINUTES`, `GATEWAY_STALE_THRESHOLD_HOURS`, `GATEWAY_UNKNOWN_THRESHOLD_HOURS`):
 
-| Constant | Default | Purpose |
+| Constant (Settings default) | Default | Purpose |
 |---|---|---|
-| `_QUIET_THRESHOLD_MINUTES` | 60 min | Below this → `running`; above this the session is potentially inactive |
-| `_STALE_THRESHOLD_HOURS` | 6 h | Observatory gap band — session is inactive but too recent to call `completed` |
-| `_UNKNOWN_THRESHOLD_HOURS` | 24 h | Beyond this → `unknown`; too old to classify reliably |
+| `QUIET_THRESHOLD_MINUTES` | 15 min | Below this → `running`; above this the session is potentially inactive |
+| `STALE_THRESHOLD_HOURS` | 2 h | Start of the observability-gap band — quiet beyond this (but within the unknown threshold) → `stale` |
+| `UNKNOWN_THRESHOLD_HOURS` | 48 h | Beyond this → `unknown`; too old to classify reliably |
 
 ## Rationale
 
 - **No upstream dependency**: The heuristic relies only on data the Gateway already collects — usage records, session context, and `last_message_at`. No new collector queries or schema changes are needed.
 - **Synchronous and cheap**: The computation is a simple set of column checks on data already loaded for the Agent Run Summary. No background jobs, caches, or separate endpoints.
-- **Graceful degradation**: Missing data (no messages, null `last_message_at`) produces `unknown` rather than a misleading status. The upstream `unknown` check (past `_UNKNOWN_THRESHOLD_HOURS`) prevents hard classification of very old sessions.
-- **Stale as observability gap**: The `stale` status fills a middle band between confidently `running` and confidently `completed`. This prevents sessions that have simply gone quiet (e.g. the agent process is alive but not producing output) from being classified as terminal. A `stale` session might resume, making it distinct from `completed`.
+- **Graceful degradation**: Missing data (no messages, null `last_message_at`) produces `unknown` rather than a misleading status. The upstream `unknown` check (past `UNKNOWN_THRESHOLD_HOURS`) prevents hard classification of very old sessions.
+- **Stale as observability gap**: The `stale` status fills the band between the confidently `completed`/`blocked` window and the `unknown` threshold. This prevents sessions that have simply gone quiet for an extended period (e.g. the agent process is alive but not producing output) from being classified as terminal. A `stale` session might resume, making it distinct from `completed` and able to transition back to `running`.
 - **Blocked priority**: `blocked` is checked before `stale` so that child sessions waiting on a parent are never misidentified as a stale observability gap.
 - **Cautious classification**: `blocked` requires both quietness AND a parent session ID — it is deliberately conservative to avoid misclassifying a genuinely stalled root session or a completed child session as blocked.
 - **Easy to iterate**: Because the heuristic is inline, the mapping can be tuned or extended in a single place without schema migrations or job redeployments.

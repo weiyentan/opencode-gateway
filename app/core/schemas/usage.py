@@ -128,6 +128,21 @@ class SessionSummary(BaseModel):
         default=None,
         description="Session title from opencode_session_contexts (null if no context)",
     )
+    code_change_count: int = Field(
+        default=0,
+        ge=0,
+        description="Code change count from opencode_session_contexts (0 if no context)",
+    )
+    code_change_additions: int = Field(
+        default=0,
+        ge=0,
+        description="Code change additions from opencode_session_contexts (0 if no context)",
+    )
+    code_change_deletions: int = Field(
+        default=0,
+        ge=0,
+        description="Code change deletions from opencode_session_contexts (0 if no context)",
+    )
     total_estimated_cost_usd: Decimal | None = None
     loki_search_url: str | None = Field(
         default=None,
@@ -231,6 +246,21 @@ class AgentRunSummary(BaseModel):
         ge=0,
         description="Total code changes (populated from opencode_session_contexts queries)",
     )
+    code_change_count: int = Field(
+        default=0,
+        ge=0,
+        description="Code change count (populated from opencode_session_contexts queries)",
+    )
+    code_change_additions: int = Field(
+        default=0,
+        ge=0,
+        description="Code change additions (populated from opencode_session_contexts queries)",
+    )
+    code_change_deletions: int = Field(
+        default=0,
+        ge=0,
+        description="Code change deletions (populated from opencode_session_contexts queries)",
+    )
     total_input_tokens: int = Field(default=0, ge=0)
     total_output_tokens: int = Field(default=0, ge=0)
     total_cached_tokens: int = Field(default=0, ge=0)
@@ -318,6 +348,15 @@ class AgentRunDetail(BaseModel):
     )
     code_changes_total: int = Field(
         default=0, ge=0, description="Total code changes (populated from opencode_session_contexts queries)"
+    )
+    code_change_count: int = Field(
+        default=0, ge=0, description="Code change count (populated from opencode_session_contexts queries)"
+    )
+    code_change_additions: int = Field(
+        default=0, ge=0, description="Code change additions (populated from opencode_session_contexts queries)"
+    )
+    code_change_deletions: int = Field(
+        default=0, ge=0, description="Code change deletions (populated from opencode_session_contexts queries)"
     )
     session_context: dict[str, object] | None = Field(
         default=None,

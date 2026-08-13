@@ -507,10 +507,19 @@
     return 'badge-unknown';
   }
 
-  /** Format code changes count */
-  function fmtCodeChanges(n) {
-    if (n == null || n <= 0) return '--';
-    return fmtNum(n);
+  /** Format code change additions/deletions as a compact diff.
+   *  Renders `+{additions}/-{deletions}` (e.g. `+15/-3`), suppressing the
+   *  zero side (`-42` for pure deletions, `+120` for pure additions), and
+   *  `--` when there is no code change data (both additions and deletions
+   *  null/zero). */
+  function fmtCodeChangesDiff(additions, deletions) {
+    if (additions == null || deletions == null) return '--';
+    var add = Number(additions);
+    var del = Number(deletions);
+    if (add === 0 && del === 0) return '--';
+    if (add === 0) return '-' + fmtNum(del);
+    if (del === 0) return '+' + fmtNum(add);
+    return '+' + fmtNum(add) + '/-' + fmtNum(del);
   }
 
   /** Format a short UUID for display */
@@ -995,7 +1004,7 @@
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
-          apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=ingested_at&sort_dir=desc'),
+          apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=source_created_at&sort_dir=desc'),
           clientsPromise,
           apiFetch(arUrl),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
@@ -1458,7 +1467,7 @@
         '<td data-label="Model">' + fmtModel(r.model) + '</td>' +
         '<td data-label="Project / Worktree">' + escHtml(projectStr) + '</td>' +
         '<td class="ar-col-low" data-label="Todo">' + todoProgress + '</td>' +
-        '<td class="ar-col-low" data-label="Files">' + fmtCodeChanges(r.code_changes_total) + '</td>' +
+        '<td class="ar-col-low" data-label="Files">' + fmtCodeChangesDiff(r.code_change_additions, r.code_change_deletions) + '</td>' +
         '<td data-label="Cost">' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
         '<td data-label="Tokens">' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
         '<td data-label="Last Updated">' + lastUpdatedCell + '</td>' +
@@ -1749,7 +1758,7 @@
         fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
         fieldHtml('Active Tokens', fmtNum(tokens)) +
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
-        fieldHtml('Code Changes', fmtCodeChanges(d.code_changes_total)) +
+        fieldHtml('Code Changes', fmtCodeChangesDiff(d.code_change_additions, d.code_change_deletions)) +
       '</div></div>';
 
     // ── Drill-down Link ──

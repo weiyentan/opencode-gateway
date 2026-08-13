@@ -125,8 +125,12 @@ Negative:
 - The API response size now includes two status strings per run (`status`
   + `currentStatus`). The cost is negligible for short enum values but
   worth noting for large paginated responses.
-- If a consumer wants status computed with custom thresholds, they must
-  request a backend change rather than adjusting locally.
+- If a consumer wants status computed with custom thresholds, they must request
+  a backend configuration change rather than adjusting locally. The thresholds
+  are operator-tunable via `Settings` (env vars
+  `GATEWAY_QUIET_THRESHOLD_MINUTES`, `GATEWAY_STALE_THRESHOLD_HOURS`,
+  `GATEWAY_UNKNOWN_THRESHOLD_HOURS`), but they are global to the deployment,
+  not per-consumer.
 - Two fields in the response create a risk of consumers using the wrong
   field (`status` instead of `currentStatus`). Mitigated by marking
   `status` as deprecated for UI purposes in API documentation.
