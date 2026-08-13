@@ -26,6 +26,10 @@ from afk_outcomes.models import (
     RunSessionLink,
     RunStatus,
 )
+from afk_outcomes.repository import (
+    RESOLVER_VERSION,
+    AsyncpgOutcomeRepository,
+)
 from afk_outcomes.serialization import (
     CANONICAL_SCHEMA_VERSION,
     MonotonicULID,
@@ -38,6 +42,7 @@ from afk_outcomes.serialization import (
 
 __all__ = [
     "AFKRun",
+    "AsyncpgOutcomeRepository",
     "CANONICAL_SCHEMA_VERSION",
     "Correlation",
     "CorrelationEvidence",
@@ -51,6 +56,7 @@ __all__ = [
     "OutcomeRepository",
     "Provider",
     "ProviderAdapter",
+    "RESOLVER_VERSION",
     "RunEntityLink",
     "RunSessionLink",
     "RunStatus",
