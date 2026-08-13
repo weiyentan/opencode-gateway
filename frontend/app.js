@@ -491,11 +491,20 @@
     return s;
   }
 
-  /** Format todo progress string — completed/total */
+  /** Format todo progress as a visual bar + count, e.g. "███░░ 3/5".
+   *  A null/zero total renders the "no todos" empty state "0/0" (not "--"). */
   function fmtTodoProgress(completed, total) {
-    if (total == null || total <= 0) return '--';
-    var c = completed || 0;
-    return c + '/' + total;
+    if (total == null || total <= 0) return '0/0';
+    var c = Number(completed) || 0;
+    if (c < 0) c = 0;
+    if (c > total) c = total;
+    var width = 5;
+    var filled = Math.round(c / total * width);
+    var bar = '';
+    for (var i = 0; i < width; i++) {
+      bar += i < filled ? '█' : '░';
+    }
+    return bar + ' ' + c + '/' + total;
   }
 
   /** Get a CSS status badge class for agent run status */
@@ -1727,7 +1736,7 @@
 
     // ── Todos ──
     html += '<div class="detail-section">' +
-      '<div class="detail-section-title">Todos (' + fmtTodoProgress(d.todo_completed, d.todo_total) + ')</div>';
+      '<div class="detail-section-title">Todos (' + (d.todo_completed || 0) + '/' + (d.todo_total || 0) + ')</div>';
     if (d.todo_rows && d.todo_rows.length > 0) {
       html += '<div class="detail-todo-list">';
       d.todo_rows.forEach(function (t) {
@@ -1739,7 +1748,7 @@
           : '';
         html += '<div class="detail-todo-item">' +
           '<span class="detail-todo-icon ' + iconCls + '">' + icon + '</span>' +
-          '<span>' + escHtml(t.description) + priorityMark + '</span>' +
+          '<span>' + escHtml(t.content) + priorityMark + '</span>' +
           '</div>';
       });
       html += '</div>';

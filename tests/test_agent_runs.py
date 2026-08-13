@@ -61,6 +61,9 @@ def _mk_session_row(
     cost: Decimal | None = Decimal("0.0100"),
     computed_status: str = "running",
     child_run_count: int = 0,
+    todo_total: int = 0,
+    todo_completed: int = 0,
+    todo_blocked: int = 0,
     session_title: str | None = None,
     session_model: str | None = None,
     project_label: str | None = None,
@@ -108,6 +111,9 @@ def _mk_session_row(
         "total_estimated_cost_usd": cost,
         "_status": computed_status,
         "child_run_count": child_run_count,
+        "todo_total": todo_total,
+        "todo_completed": todo_completed,
+        "todo_blocked": todo_blocked,
         "session_title": session_title,
         "session_model": session_model,
         "project_label": project_label if project_label is not None else project_id,
@@ -707,7 +713,7 @@ class TestAgentRunsList:
         assert item["project_id"] == "proj-1"
         assert item["workspace_id"] == "ws-1"
 
-        # Placeholder counts
+        # Todo counts from opencode_session_todos (0 when no todo rows)
         assert item["todo_total"] == 0
         assert item["todo_completed"] == 0
         assert item["todo_blocked"] == 0
@@ -954,6 +960,28 @@ class TestAgentRunsList:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["child_run_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_todo_counts_in_list(self, client: AsyncClient, mock_conn: AsyncMock):
+        """List rows surface real todo counts from opencode_session_todos (not hardcoded 0)."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            external_session_id=_EXTERNAL_ID_A,
+            todo_total=7,
+            todo_completed=3,
+            todo_blocked=1,
+        )
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            response = await c.get("/api/v1/usage/agent-runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["todo_total"] == 7
+        assert item["todo_completed"] == 3
+        assert item["todo_blocked"] == 1
 
     @pytest.mark.asyncio
     async def test_missing_context_fields_return_zeros(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -1487,12 +1515,14 @@ class TestAgentRunsDetail:
         assert response.status_code == 200
         data = response.json()["data"]
         assert len(data["todo_rows"]) == 2
-        assert data["todo_rows"][0]["description"] == "Fix login bug"
+        assert data["todo_rows"][0]["content"] == "Fix login bug"
         assert data["todo_rows"][0]["status"] == "pending"
         assert data["todo_rows"][0]["priority"] == "high"
-        assert data["todo_rows"][1]["description"] == "Write tests"
+        assert data["todo_rows"][0]["position"] == 1
+        assert data["todo_rows"][1]["content"] == "Write tests"
         assert data["todo_rows"][1]["status"] == "completed"
         assert data["todo_rows"][1]["priority"] == "medium"
+        assert data["todo_rows"][1]["position"] == 2
         assert data["todo_total"] == 2
         assert data["todo_completed"] == 1
         assert data["todo_blocked"] == 0
@@ -1521,7 +1551,8 @@ class TestAgentRunsDetail:
         assert data["session_context"]["title"] == "Refactor API"
         assert data["session_context"]["session_model"] == "gpt-4o"
         assert len(data["todo_rows"]) == 1
-        assert data["todo_rows"][0]["description"] == "Add endpoint"
+        assert data["todo_rows"][0]["content"] == "Add endpoint"
+        assert data["todo_rows"][0]["position"] == 1
         assert data["todo_total"] == 1
 
     @pytest.mark.asyncio
