@@ -452,7 +452,7 @@ def _setup_synthetic_mocks(mock_conn: AsyncMock) -> None:
     def _fetch_fn(*args, **kwargs):
         sql = str(args[0]) if args else ""
 
-        if "opencode_session_todos" in sql:
+        if "opencode_session_todos" in sql and "ORDER BY position" in sql:
             return [
                 _mk_todo_row(
                     content=f"Implement feature {chr(65 + i)}",
@@ -918,7 +918,7 @@ def _setup_production_shaped_mocks(mock_conn: AsyncMock) -> None:
     def _fetch_fn(*args, **kwargs):
         sql = str(args[0]) if args else ""
 
-        if "opencode_session_todos" in sql:
+        if "opencode_session_todos" in sql and "ORDER BY position" in sql:
             return [
                 _mk_todo_row(
                     content=f"Task {i}: description of work item number {i}",

@@ -1339,11 +1339,26 @@ async def _fetch_agent_runs(
             FROM sessions
             WHERE parent_session_id IS NOT NULL
             GROUP BY parent_session_id
+        ),
+        todo_counts AS (
+            SELECT source_database_id, external_session_id,
+                   COUNT(*) AS todo_total,
+                   COUNT(*) FILTER (WHERE status = 'completed') AS todo_completed,
+                   COUNT(*) FILTER (WHERE status = 'blocked') AS todo_blocked
+            FROM opencode_session_todos
+            GROUP BY source_database_id, external_session_id
         )
-        SELECT s.*, COALESCE(cc.cnt, 0) AS child_run_count
+        SELECT s.*,
+               COALESCE(cc.cnt, 0) AS child_run_count,
+               COALESCE(tc.todo_total, 0) AS todo_total,
+               COALESCE(tc.todo_completed, 0) AS todo_completed,
+               COALESCE(tc.todo_blocked, 0) AS todo_blocked
         FROM ({base_query}) s
         LEFT JOIN child_counts cc
             ON cc.parent_session_id = s.external_session_id
+        LEFT JOIN todo_counts tc
+            ON tc.source_database_id = s.source_database_id
+            AND tc.external_session_id = s.external_session_id
         ORDER BY s.last_message_at DESC NULLS LAST
         LIMIT ${len(params) + 1}
         OFFSET ${len(params) + 2}
@@ -1370,9 +1385,9 @@ async def _fetch_agent_runs(
                 project_id=r["project_id"],
                 project_label=r["project_label"],
                 workspace_id=r["workspace_id"],
-                todo_total=0,
-                todo_completed=0,
-                todo_blocked=0,
+                todo_total=_int_or_zero(r, "todo_total"),
+                todo_completed=_int_or_zero(r, "todo_completed"),
+                todo_blocked=_int_or_zero(r, "todo_blocked"),
                 code_changes_total=_int_or_zero(r, "code_change_count"),
                 code_change_count=_int_or_zero(r, "code_change_count"),
                 code_change_additions=_int_or_zero(r, "code_change_additions"),
@@ -1563,9 +1578,10 @@ async def _fetch_agent_run_detail(
     # ── Compute todo aggregates ────────────────────────────────────
     todos: list[TodoRow] = [
         TodoRow(
-            description=tr["content"],
+            content=tr["content"],
             status=tr["status"] or "pending",
             priority=tr["priority"],
+            position=tr["position"],
         )
         for tr in todo_rows_raw
     ]

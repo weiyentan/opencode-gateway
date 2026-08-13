@@ -154,20 +154,24 @@ class SessionSummary(BaseModel):
 
 
 class TodoRow(BaseModel):
-    """A single todo item snapshot within an agent run detail view.
+    """A single Todo Snapshot item within an agent run detail view.
 
-    Note: Todo snapshots are not yet persisted by the ingest pipeline.
-    These fields return empty results until the Todo Snapshot projection
-    table is introduced in a future schema migration.
+    Populated from the ``opencode_session_todos`` projection table, which
+    the ingest pipeline maintains via DELETE+INSERT replace semantics per
+    ``(source_database_id, external_session_id)``.
     """
 
-    description: str = Field(description="Todo description text")
+    content: str = Field(description="Todo content text")
     status: str = Field(
         description="Todo status: pending, in_progress, completed, blocked"
     )
     priority: str | None = Field(
         default=None,
         description="Todo priority (e.g. high, medium, low)",
+    )
+    position: int | None = Field(
+        default=None,
+        description="Todo ordering position within the source session",
     )
 
 

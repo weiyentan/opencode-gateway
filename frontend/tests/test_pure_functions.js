@@ -316,9 +316,17 @@ function escHtml(str) {
 }
 
 function fmtTodoProgress(completed, total) {
-  if (total == null || total <= 0) return '--';
-  var c = completed || 0;
-  return c + '/' + total;
+  if (total == null || total <= 0) return '0/0';
+  var c = Number(completed) || 0;
+  if (c < 0) c = 0;
+  if (c > total) c = total;
+  var width = 5;
+  var filled = Math.round(c / total * width);
+  var bar = '';
+  for (var i = 0; i < width; i++) {
+    bar += i < filled ? '█' : '░';
+  }
+  return bar + ' ' + c + '/' + total;
 }
 
 function statusBadgeClass(status) {
@@ -599,13 +607,14 @@ assert(escHtml('<a href="x">') === '&lt;a href=&quot;x&quot;&gt;', 'combined esc
 
 console.log('\u25B6 fmtTodoProgress');
 
-assert(fmtTodoProgress(null, null) === '--', 'null inputs → --');
-assert(fmtTodoProgress(undefined, undefined) === '--', 'undefined inputs → --');
-assert(fmtTodoProgress(0, 0) === '--', 'zero total → --');
-assert(fmtTodoProgress(3, 5) === '3/5', '3/5 → 3/5');
-assert(fmtTodoProgress(0, 10) === '0/10', '0/10 → 0/10');
-assert(fmtTodoProgress(5, 5) === '5/5', '5/5 → 5/5');
-assert(fmtTodoProgress(2, null) === '--', 'null total → --');
+assert(fmtTodoProgress(null, null) === '0/0', 'null inputs → 0/0');
+assert(fmtTodoProgress(undefined, undefined) === '0/0', 'undefined inputs → 0/0');
+assert(fmtTodoProgress(0, 0) === '0/0', 'zero total → 0/0');
+assert(fmtTodoProgress(3, 5) === '███░░ 3/5', '3/5 → bar + 3/5');
+assert(fmtTodoProgress(0, 10) === '░░░░░ 0/10', '0/10 → empty bar + 0/10');
+assert(fmtTodoProgress(5, 5) === '█████ 5/5', '5/5 → full bar + 5/5');
+assert(fmtTodoProgress(2, 7) === '█░░░░ 2/7', '2/7 → bar + 2/7');
+assert(fmtTodoProgress(2, null) === '0/0', 'null total → 0/0');
 
 // ── Tests for statusBadgeClass ──────────────────────────────────────────
 
