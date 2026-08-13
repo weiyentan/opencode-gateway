@@ -243,6 +243,7 @@ var historyStub = {
   // refetch, loading/error row retention, invalid-page fallback).
   window.nearestValidAgentRunPage = sandboxWindow.nearestValidAgentRunPage;
   window.fetchAgentRunsAndRender = sandboxWindow.fetchAgentRunsAndRender;
+  window.handleAgentRunPopstate = sandboxWindow.handleAgentRunPopstate;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2828,6 +2829,11 @@ console.log('\u25B6 index.html — Agent Runs pagination control block (issue #4
     'index.html: pagination container lives inside #tab-agent-runs, below the panel');
   assert(html.indexOf('aria-label="Agent Runs pages"') !== -1,
     'index.html: pagination container carries an accessible navigation label');
+  // The nav owns its layout (.agent-runs-pagination) and must stay decoupled
+  // from the filter-bar class it used to share (PR #431 review finding 5).
+  var navClassMatch = html.match(/<nav\b[^>]*class="([^"]*)"/);
+  assert(navClassMatch !== null && navClassMatch[1].indexOf('agent-runs-filters') === -1,
+    'index.html: pagination nav is decoupled from .agent-runs-filters (own layout)');
 })();
 
 // ── Agent Runs page-size + filter reset (issue #428) ─────────────────────
@@ -3039,6 +3045,173 @@ console.log('\u25B6 Agent Runs page-size + filter reset (issue #428)');
   assert(calls[0].indexOf('agent=bob') !== -1,
     'selector: the current agent filter rides along after the reset');
 })();
+
+// ── Deep-link page size syncs the page-size selector (PR #431 finding 1) ─
+// A deep link such as ?page_size=100 drives the fetch (limit=100) but the
+// #ar-page-size select kept showing "50" — the selector lied about the
+// active page size.  readAgentRunPaginationFromUrl() now syncs the visible
+// selector to the URL's effective page size as well.
+
+console.log('\u25B6 Agent Runs deep-link page-size selector sync (PR #431)');
+
+(function () {
+  if (typeof window.readAgentRunPaginationFromUrl !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: readAgentRunPaginationFromUrl exposed + sandbox location present');
+    return;
+  }
+
+  arPageSizeEl.value = '50';
+
+  appJsSandbox.location.search = '?page=2&page_size=100';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '100',
+    'deep link: ?page_size=100 syncs the page-size selector to 100');
+
+  appJsSandbox.location.search = '?page_size=25';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '25',
+    'deep link: ?page_size=25 syncs the page-size selector to 25');
+
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+  assert(arPageSizeEl.value === '50',
+    'deep link: no page_size syncs the page-size selector to the default 50');
+})();
+
+// ── Pagination control styling (PR #431 finding 2) ───────────────────────
+// The pagination <nav> now carries its own layout rules (independent of
+// .agent-runs-filters) and visually distinguishes the current page and
+// ellipses via the dedicated classes renderAgentRunPagination() emits.
+
+console.log('\u25B6 style.css — Agent Runs pagination control rules (PR #431)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: assert on real rules only
+
+  assert(live.indexOf('.agent-runs-pagination') !== -1,
+    'style.css: .agent-runs-pagination layout rule exists');
+  assert(live.indexOf('.pagination-btn.pagination-current') !== -1,
+    'style.css: .pagination-btn.pagination-current current-page rule exists');
+  assert(live.indexOf('.pagination-ellipsis') !== -1,
+    'style.css: .pagination-ellipsis rule exists');
+})();
+
+// ── Same-page clicks are a no-op (PR #431 finding 3) ─────────────────────
+// Clicking the already-current page button must not push a duplicate history
+// entry or refetch — the guard makes the click a no-op while keeping the
+// button focusable (its aria-current="page" + "current page" label stay).
+
+console.log('\u25B6 Agent Runs pagination controls — current-page click is a no-op (PR #431)');
+
+(function () {
+  if (typeof window.renderAgentRunPagination !== 'function') {
+    assert(false, 'app.js: renderAgentRunPagination exposed on the window test seam');
+    return;
+  }
+
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+
+  window.renderAgentRunPagination({ items: [{}], total: 125, limit: 50, offset: 50 });
+  var page2 = arPaginationEl.querySelectorAll('button')
+    .filter(function (b) { return b.getAttribute('data-page') === '2'; })[0];
+  assert(!!page2 && page2.disabled !== true,
+    'current: the page-2 button is rendered and stays focusable (not disabled)');
+  page2._handlers.click();
+  assert(historyCalls.length === 0,
+    'current: clicking the current page pushes no duplicate history entry');
+  assert(fetched.length === 0,
+    'current: clicking the current page triggers no redundant refetch');
+
+  // Restore page state (page 1 / size 50) so the deferred issue #7 Clear
+  // block's fetch .then — which runs after this synchronous block as a
+  // microtask — still sees a page-1 fallback no-op and renders its expected
+  // empty state instead of being diverted into a fallback refetch.
+  appJsSandbox.location.search = '';
+  window.readAgentRunPaginationFromUrl();
+})();
+
+// ── Back/Forward (popstate) re-sync (PR #431 finding 4) ──────────────────
+// Back/Forward changes location.search without re-running the load-time URL
+// read, so a popstate handler re-reads the URL and refetches only when the
+// effective page or page size changed — never pushing/replacing history.
+
+console.log('\u25B6 Agent Runs Back/Forward popstate re-sync (PR #431)');
+
+// Deferred (60ms) so its fetch/render effects drain AFTER the earlier issue
+// #7/#5 deferred async blocks that assert on the shared arTbodyEl empty-state
+// markup — never clobbering their expected rows (same pattern as the issue
+// #429 resilience chain below).
+pendingAsyncBlocks++;
+setTimeout(function () {
+  if (typeof window.handleAgentRunPopstate !== 'function' ||
+      !appJsSandbox.location) {
+    assert(false, 'app.js: handleAgentRunPopstate exposed + sandbox location present');
+    pendingAsyncBlocks--;
+    return;
+  }
+
+  // Fixture: page 2 of 50 rows deep-linked; the handler with an unchanged
+  // URL must be a no-op (no fetch, no history change).
+  appJsSandbox.location.search = '?page=2&page_size=50';
+  appJsSandbox.location.pathname = '/index.html';
+  window.readAgentRunPaginationFromUrl();
+  window.setAgentRunFilters({});
+  window.setDateRangeState({ preset: 'this-month' });
+  historyCalls.length = 0;
+  historyReplaceCalls.length = 0;
+
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve({ items: [{}], total: 125, limit: 50, offset: 50 }); }
+    });
+  };
+
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 0,
+    'popstate: an unchanged URL triggers no fetch');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: an unchanged URL pushes/replaces no history');
+
+  // Back/Forward to page 3: exactly one fetch at offset=100, no history.
+  appJsSandbox.location.search = '?page=3&page_size=50';
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=100') !== -1,
+    'popstate: navigating to page 3 refetches offset=100');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: a Back/Forward page change pushes/replaces no history');
+
+  // Page-size-only change: ?page=3&page_size=25 → refetch limit=25&offset=50,
+  // and the selector syncs (Fix 1) through the popstate path.
+  fetched.length = 0;
+  appJsSandbox.location.search = '?page=3&page_size=25';
+  window.handleAgentRunPopstate();
+  assert(fetched.length === 1 && fetched[0].indexOf('limit=25&offset=50') !== -1,
+    'popstate: a page-size-only change refetches limit=25 at the same page offset');
+  assert(arPageSizeEl.value === '25',
+    'popstate: the page-size selector syncs to 25 through the popstate path');
+  assert(historyCalls.length === 0 && historyReplaceCalls.length === 0,
+    'popstate: a page-size change pushes/replaces no history');
+  pendingAsyncBlocks--;
+}, 60);
 
 // ── Agent Runs pagination resilience (issue #429) ────────────────────────
 // The pagination flow must stay resilient during automatic refreshes, page
@@ -3318,20 +3491,24 @@ function resilienceBlockFallback(next) {
     };
     historyCalls.length = 0;
     historyReplaceCalls.length = 0;
-    page3._handlers.click();
+    // PR #431 review (finding 3): clicking the current page is now a no-op,
+    // so the shrink-triggering refetch is driven through the shared refresh
+    // path (the same path auto-refresh uses) instead of a current-page click.
+    window.fetchAgentRunsAndRender();
 
-    // Synchronous effects: the click pushes page=3, then fetches it.
+    // Synchronous effects: the refetch requests the stale page 3 (offset=100)
+    // without pushing a history entry.
     assert(fetched.length === 1 && fetched[0].indexOf('limit=50&offset=100') !== -1,
       'fallback: the first fetch requests the stale page 3 (offset=100)');
-    assert(historyCalls.length === 1 && historyCalls[0] === '/index.html?page=3&page_size=50',
-      'fallback: the page-3 click pushes page=3 into the URL');
+    assert(historyCalls.length === 0,
+      'fallback: the current-page refetch pushes no history entry');
 
     setTimeout(function () {
       // The stale page's response (total=60 → 2 pages) triggered the
       // fallback: URL replaced with the nearest valid page and refetched.
       assert(historyReplaceCalls.length === 1 && historyReplaceCalls[0] === '/index.html?page=2&page_size=50',
         'fallback: the URL is updated to the nearest valid page via replaceState');
-      assert(historyCalls.length === 1,
+      assert(historyCalls.length === 0,
         'fallback: the fallback adds no new browser-history entry');
       assert(fetched.length === 2 && fetched[1].indexOf('limit=50&offset=50') !== -1,
         'fallback: the nearest valid page (2, offset=50) is refetched');
@@ -3392,7 +3569,9 @@ function resilienceBlockEmpty(next) {
     var page3 = arPaginationEl.querySelectorAll('button')
       .filter(function (b) { return b.getAttribute('data-page') === '3'; })[0];
     assert(!!page3, 'empty: the page-3 button is rendered');
-    page3._handlers.click();
+    // PR #431 review (finding 3): the current-page click is a no-op, so the
+    // empty-result fallback is driven through the shared refresh path.
+    window.fetchAgentRunsAndRender();
     setTimeout(function () {
       assert(historyReplaceCalls.length === 1 &&
              historyReplaceCalls[0].indexOf('page=1&page_size=50') !== -1,

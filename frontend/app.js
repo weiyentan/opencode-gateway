@@ -778,6 +778,10 @@
     var pagination = parseAgentRunPagination(query);
     agentRunPage = pagination.page;
     agentRunPageSize = pagination.pageSize;
+    // PR #431 review (finding 1): a deep link (e.g. ?page_size=100) must
+    // also sync the visible #ar-page-size selector, so the control never
+    // shows a stale page size that disagrees with the fetched limit.
+    if (els.arPageSize) els.arPageSize.value = String(pagination.pageSize);
   }
 
   /** Build the dashboard URL carrying the given pagination state, keeping
@@ -898,6 +902,26 @@
       history.replaceState({}, '', agentRunsUrlWithPagination(agentRunPage, agentRunPageSize));
     }
     return true;
+  }
+
+  /** Re-sync Agent Runs pagination state from the URL after a browser
+   *  Back/Forward navigation (PR #431 review finding 4).  Back/Forward
+   *  changes location.search without re-running the load-time URL read,
+   *  so without this listener agentRunPage/agentRunPageSize stay stale and
+   *  the next refresh fetches the wrong offset while the control
+   *  highlights a page that no longer matches the URL.  This handler
+   *  re-reads the URL (which also syncs the page-size selector) and, when
+   *  the effective page or page size changed, refetches through the shared
+   *  path so the address bar, visible rows, and in-memory state stay
+   *  consistent.  The URL read itself never pushes history, so this cannot
+   *  add entries or loop. */
+  function handleAgentRunPopstate() {
+    var prevPage = agentRunPage;
+    var prevSize = agentRunPageSize;
+    readAgentRunPaginationFromUrl();
+    if (agentRunPage !== prevPage || agentRunPageSize !== prevSize) {
+      fetchAgentRunsAndRender();
+    }
   }
 
   /** Build the agent runs URL from current filter state.
@@ -2013,7 +2037,11 @@
       btn.addEventListener('click', function () {
         if (btn.disabled) return; // disabled buttons never fire in browsers; belt-and-braces
         var page = Number(btn.getAttribute('data-page'));
-        if (!Number.isInteger(page) || page < 1) return;
+        // PR #431 review (finding 3): clicking the already-current page is a
+        // no-op — no duplicate history entry, no redundant refetch.  The
+        // current page stays focusable (aria-current="page" + "current page"
+        // label unchanged).
+        if (!Number.isInteger(page) || page < 1 || page === agentRunPage) return;
         setAgentRunPage(page);
         fetchAgentRunsAndRender();
       });
@@ -2244,6 +2272,13 @@
     // fetch so a deep link such as ?page=2&page_size=100 loads the
     // corresponding Agent Runs page on dashboard load.
     readAgentRunPaginationFromUrl();
+    // PR #431 review (finding 4): keep Back/Forward navigation in sync with
+    // the in-memory page state.  Guarded so non-browser environments (the
+    // Node sandbox, which never calls startAutoRefresh) can't crash on a
+    // missing window.addEventListener.
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('popstate', handleAgentRunPopstate);
+    }
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
     updateFooterInterval();
@@ -2318,6 +2353,9 @@
   // failures, and re-fetches the corrected page after a fallback.
   window.nearestValidAgentRunPage = nearestValidAgentRunPage;
   window.fetchAgentRunsAndRender = fetchAgentRunsAndRender;
+  // PR #431 review (finding 4): the Back/Forward (popstate) re-sync handler
+  // joins the window test seam so the Node harness can drive it directly.
+  window.handleAgentRunPopstate = handleAgentRunPopstate;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };
