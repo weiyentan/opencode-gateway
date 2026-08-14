@@ -19,13 +19,13 @@ from aiokafka.structs import ConsumerRecord
 
 from afk_outcomes.models import EntityType, Provider
 from afk_outcomes.providers.github import GitHubAdapter
+from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
     _MAPPED_EVENT_TYPES,
     AFKOutcomeConsumer,
     ProviderEventMessage,
     _build_adapter,
-    _GitHubHttpApi,
     map_provider_event,
 )
 
@@ -619,6 +619,49 @@ async def test_reconcile_once_reuses_backfill_engine_over_bounded_window() -> No
 
 
 @pytest.mark.asyncio
+async def test_reconcile_once_prefetches_provider_before_acquiring_conn() -> None:
+    """Network fetches run *before* the pooled connection is acquired.
+
+    The reconcile loop must not hold a pooled connection open across the slow
+    provider fetches (which would contend with the consume-path ``_persist``
+    acquires on the shared pool).
+    """
+    order: list[str] = []
+    conn = _FakeConn(order)
+
+    class _RecordingAdapter(_FakeAdapter):
+        async def fetch_entities(self, repository, *, since=None, until=None):
+            order.append("fetch_entities")
+            return []
+
+        async def fetch_events(self, repository, *, since=None, until=None):
+            order.append("fetch_events")
+            return []
+
+    class _RecordingPool(_FakePool):
+        def acquire(self) -> _AcquireCtx:
+            order.append("acquire")
+            return _AcquireCtx(self._conn)
+
+    consumer = _make_consumer(
+        pool=_RecordingPool(conn), reconcile_window_seconds=3600.0
+    )
+    consumer._adapter = _RecordingAdapter()  # type: ignore[assignment]
+
+    with patch(
+        "app.consumer.afk_consumer.run_backfill", new_callable=AsyncMock
+    ) as mock_backfill:
+        await consumer._reconcile_once()
+
+    assert order == ["fetch_entities", "fetch_events", "acquire"]
+    mock_backfill.assert_awaited_once()
+    # The fetched window is handed to run_backfill so it does not re-fetch.
+    prefetched = mock_backfill.call_args.kwargs["prefetched"]
+    assert prefetched.entities == []
+    assert prefetched.events == []
+
+
+@pytest.mark.asyncio
 async def test_reconcile_loop_runs_windows_until_stopped() -> None:
     consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
     consumer._running = True
@@ -686,14 +729,14 @@ async def test_build_adapter_github_injects_parsed_json_seam() -> None:
         {"/repos/owner/repo/issues": [{"number": 1}]}
     )
     with patch(
-        "app.consumer.afk_consumer.httpx.AsyncClient",
+        "afk_outcomes.providers.github_http.httpx.AsyncClient",
         return_value=fake_client,
     ) as mock_http:
         adapter, client = _build_adapter(Provider.GITHUB)
 
     assert isinstance(adapter, GitHubAdapter)
     # The injected client is the parsed-JSON seam, not a raw httpx.AsyncClient.
-    assert isinstance(client, _GitHubHttpApi)
+    assert isinstance(client, GitHubHttpApi)
 
     body = await client.get("/repos/owner/repo/issues")
     assert body == [{"number": 1}]  # parsed JSON body, not an httpx.Response
@@ -711,7 +754,7 @@ async def test_build_adapter_github_reconciles_nonempty_via_real_adapter() -> No
     """The real GitHubAdapter fed through ``_build_adapter`` yields entities/events."""
     payloads = _github_rest_payloads()
     with patch(
-        "app.consumer.afk_consumer.httpx.AsyncClient",
+        "afk_outcomes.providers.github_http.httpx.AsyncClient",
         return_value=_PathServingHttpxClient(payloads),
     ):
         adapter, _client = _build_adapter(Provider.GITHUB)

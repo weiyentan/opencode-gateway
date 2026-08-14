@@ -18,6 +18,7 @@ package (``app``), a boundary enforced mechanically by a test under
 from __future__ import annotations
 
 from afk_outcomes.providers.github import GitHubAdapter, GitHubApi
+from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 
-__all__ = ["GitHubAdapter", "GitHubApi", "GitLabAdapter"]
+__all__ = ["GitHubAdapter", "GitHubApi", "GitHubHttpApi", "GitLabAdapter"]

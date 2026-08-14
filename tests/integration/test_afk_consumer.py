@@ -38,7 +38,11 @@ from afk_outcomes.models import (
 )
 from afk_outcomes.providers.github import GitHubAdapter
 from afk_outcomes.repository import AsyncpgOutcomeRepository
-from app.consumer.afk_consumer import AFKOutcomeConsumer
+from app.consumer.afk_consumer import (
+    AFKOutcomeConsumer,
+    ProviderEventMessage,
+    map_provider_event,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
@@ -301,3 +305,128 @@ async def test_reconciliation_window_converges_merged_outcome(db_pool: asyncpg.P
             "SELECT outcome_status FROM afk_runs ORDER BY first_seen_at LIMIT 1"
         )
         assert outcome_status == "merged", f"expected merged outcome, got {outcome_status}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.Pool) -> None:
+    """A live-consumed and backfill-fetched event for the same logical event dedup.
+
+    The ``engineering_events`` identity key is
+    ``(provider, repository, entity_type, external_id, event_type, occurred_at)``.
+    When a live topic delivery (producer-forwarded ``occurred_at``) and a
+    backfill fetch (adapter-derived ``occurred_at``) agree on the timestamp for
+    the same logical merge event, the second write is a conflict-ignored no-op.
+    """
+    now = datetime.now(timezone.utc)  # noqa: UP017 - datetime.UTC is 3.11+
+    merged_at = now - timedelta(hours=12)
+
+    # Live path: a producer-forwarded merge event for change_request:300.
+    message = ProviderEventMessage(
+        provider=Provider.GITHUB,
+        delivery_id="delivery-cross-path-live",
+        type="change_request.merged",
+        repository=REPOSITORY,
+        number=300,
+        occurred_at=merged_at,
+        actor="carol",
+    )
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+
+    async with db_pool.acquire() as conn:
+        await _seed_session(conn, title="Fix caching bug", now=now)
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-cross-path-live",
+            entity=entity,
+            event=event,
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM engineering_events "
+                "WHERE event_type = 'change_request.merged'"
+            )
+            == 1
+        )
+
+    # Backfill path: the adapter derives the same merge event with the same
+    # occurred_at (the pull's merged_at equals the live delivery timestamp).
+    payloads = _merged_payloads(now)
+    payloads["pulls"][0]["merged_at"] = _iso(merged_at)
+    consumer = AFKOutcomeConsumer(
+        kafka_brokers="broker:9092",
+        pool=db_pool,  # type: ignore[arg-type]
+        provider=Provider.GITHUB,
+        repository=REPOSITORY,
+        adapter=GitHubAdapter(FakeGitHubApi(payloads)),
+        reconcile_window_seconds=30 * 86400,
+    )
+    await consumer._reconcile_once()
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events "
+            "WHERE event_type = 'change_request.merged'"
+        )
+        assert count == 1, f"expected cross-path dedup to keep 1 row, got {count}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: asyncpg.Pool) -> None:
+    """A timestamp mismatch between live and backfill yields distinct events.
+
+    Documented behavior (finding B): because ``occurred_at`` is part of the
+    ``engineering_events`` identity, a live event (producer-forwarded
+    timestamp) and a backfill event (adapter-derived timestamp) for the same
+    logical merge event are treated as *distinct* when their timestamps differ
+    — the dedup key does not collapse them.
+    """
+    now = datetime.now(timezone.utc)  # noqa: UP017 - datetime.UTC is 3.11+
+    live_at = now - timedelta(hours=12)
+    backfill_at = now - timedelta(hours=12, seconds=5)  # 5 seconds later
+
+    message = ProviderEventMessage(
+        provider=Provider.GITHUB,
+        delivery_id="delivery-cross-path-live",
+        type="change_request.merged",
+        repository=REPOSITORY,
+        number=300,
+        occurred_at=live_at,
+        actor="carol",
+    )
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+
+    async with db_pool.acquire() as conn:
+        await _seed_session(conn, title="Fix caching bug", now=now)
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-cross-path-live",
+            entity=entity,
+            event=event,
+        )
+
+    payloads = _merged_payloads(now)
+    payloads["pulls"][0]["merged_at"] = _iso(backfill_at)
+    consumer = AFKOutcomeConsumer(
+        kafka_brokers="broker:9092",
+        pool=db_pool,  # type: ignore[arg-type]
+        provider=Provider.GITHUB,
+        repository=REPOSITORY,
+        adapter=GitHubAdapter(FakeGitHubApi(payloads)),
+        reconcile_window_seconds=30 * 86400,
+    )
+    await consumer._reconcile_once()
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events "
+            "WHERE event_type = 'change_request.merged'"
+        )
+        assert count == 2, f"expected distinct events for differing timestamps, got {count}"

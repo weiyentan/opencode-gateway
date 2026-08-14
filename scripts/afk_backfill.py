@@ -80,6 +80,7 @@ from afk_outcomes import (  # noqa: E402
     Correlation,
     CorrelationEngine,
     EngineeringEntity,
+    EngineeringEvent,
     EntityType,
     Provider,
     ProviderAdapter,
@@ -91,6 +92,7 @@ from afk_outcomes import (  # noqa: E402
 )
 from afk_outcomes.correlation import RESOLVED_ROLE_THRESHOLD  # noqa: E402
 from afk_outcomes.providers.github import GitHubAdapter  # noqa: E402
+from afk_outcomes.providers.github_http import GitHubHttpApi  # noqa: E402
 from afk_outcomes.providers.gitlab import GitLabAdapter  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 
@@ -363,6 +365,20 @@ def format_report(report: BackfillReport) -> str:
 # ── The windowed backfill orchestration ─────────────────────────────────────
 
 
+@dataclass
+class PrefetchedWindow:
+    """Provider data fetched before a database connection is acquired.
+
+    Lets callers (the live consumer's reconcile loop) perform the slow
+    provider network fetches *outside* the pooled-connection scope, then hand
+    the already-fetched entities/events to :func:`run_backfill`, which skips
+    re-fetching when ``prefetched`` is supplied.
+    """
+
+    entities: list[EngineeringEntity]
+    events: list[EngineeringEvent]
+
+
 async def run_backfill(
     conn: asyncpg.Connection,
     *,
@@ -372,6 +388,7 @@ async def run_backfill(
     until: datetime,
     dry_run: bool = False,
     show_evidence: bool = False,
+    prefetched: PrefetchedWindow | None = None,
 ) -> BackfillReport:
     """Pull a window from ``adapter``, correlate, persist, and count the report.
 
@@ -380,10 +397,21 @@ async def run_backfill(
     orchestration layer.  In ``dry_run`` mode nothing is written and no
     existing-run lookup is performed; the returned report is identical to
     what a real write would produce for the same window.
+
+    ``prefetched`` (optional) carries entities/events fetched by the caller
+    before a database connection was acquired; when present the adapter is
+    not re-fetched.  This keeps slow provider network calls out of the
+    pooled-connection scope for callers that care about connection contention
+    (the consumer's reconcile loop), while the CLI's simple
+    ``run_backfill(conn, adapter=...)`` shape keeps fetching internally.
     """
     sessions = await _load_sessions(conn, since=since, until=until)
-    entities = await adapter.fetch_entities(repository, since=since, until=until)
-    events = await adapter.fetch_events(repository, since=since, until=until)
+    if prefetched is not None:
+        entities = prefetched.entities
+        events = prefetched.events
+    else:
+        entities = await adapter.fetch_entities(repository, since=since, until=until)
+        events = await adapter.fetch_events(repository, since=since, until=until)
 
     ulid_source = SessionKeyedULID()
     engine = CorrelationEngine(ulid_source=ulid_source)
@@ -525,37 +553,17 @@ class _Closable(Protocol):
     async def aclose(self) -> None: ...
 
 
-class _GitHubHttpApi:
-    """A :class:`afk_outcomes.providers.github.GitHubApi` over httpx."""
-
-    def __init__(self, token: str) -> None:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        self._client = httpx.AsyncClient(
-            base_url="https://api.github.com", headers=headers, timeout=30.0
-        )
-
-    async def get(self, path: str, *, params: dict[str, str] | None = None) -> object:
-        response = await self._client.get(path, params=params or {})
-        response.raise_for_status()
-        return response.json()
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-
 def _build_adapter(provider: str) -> tuple[ProviderAdapter, _Closable]:
     """Build the provider adapter plus its API client (closed by the caller).
 
     Credentials come from the environment via the adapters' injectable
-    API-client seam — no token handling is implemented here.
+    API-client seam — no token handling is implemented here.  The GitHub
+    path uses the shared
+    :class:`afk_outcomes.providers.github_http.GitHubHttpApi` parsed-JSON
+    seam.
     """
     if provider == "github":
-        github_client = _GitHubHttpApi(os.environ.get("GITHUB_TOKEN", ""))
+        github_client = GitHubHttpApi(os.environ.get("GITHUB_TOKEN", ""))
         return GitHubAdapter(github_client), github_client
     headers: dict[str, str] = {}
     token = os.environ.get("GITLAB_TOKEN", "")

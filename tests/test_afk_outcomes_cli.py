@@ -29,6 +29,7 @@ from afk_outcomes.providers.github import GitHubAdapter
 from scripts.afk_backfill import (
     EXPLICIT_METHOD,
     BackfillReport,
+    PrefetchedWindow,
     SessionKeyedULID,
     _match_buckets,
     _parse_args,
@@ -496,6 +497,33 @@ async def test_bounded_window_is_passed_to_provider() -> None:
     pull_params = [params for path, params in client.calls if path.endswith("/pulls")]
     assert pull_params, "provider pull listing was not called"
     assert pull_params[0]["since"] == "2026-08-01T06:00:00Z"
+
+
+async def test_run_backfill_uses_prefetched_window_without_refetching() -> None:
+    """A pre-fetched window skips the adapter fetch (finding C seam)."""
+    conn = _mock_conn([_session_row()])
+    client = FakeGitHubApi(_payloads())
+    adapter = GitHubAdapter(client)
+
+    entities = await adapter.fetch_entities(REPOSITORY, since=SINCE, until=UNTIL)
+    events = await adapter.fetch_events(REPOSITORY, since=SINCE, until=UNTIL)
+    calls_before = len(client.calls)
+
+    report = await run_backfill(
+        conn,
+        adapter=adapter,
+        repository=REPOSITORY,
+        since=SINCE,
+        until=UNTIL,
+        dry_run=True,
+        prefetched=PrefetchedWindow(entities=entities, events=events),
+    )
+
+    assert len(client.calls) == calls_before  # no re-fetch issued
+    assert report.change_requests_scanned == 1
+    assert report.issues_scanned == 2
+    assert report.high_matches == 2
+    assert report.inferred_matches == 1
 
 
 async def test_bounded_window_excluding_activity_reports_unmatched() -> None:
