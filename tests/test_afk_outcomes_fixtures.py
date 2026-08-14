@@ -485,11 +485,11 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
 
 
 def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _load_golden(path: Path) -> str:
-    return path.read_text().rstrip("\n")
+    return path.read_text(encoding="utf-8").rstrip("\n")
 
 
 def _build_github_run() -> AFKRun:

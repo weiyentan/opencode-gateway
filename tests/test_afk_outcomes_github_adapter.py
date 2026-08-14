@@ -37,7 +37,9 @@ LOCKED_EVENT_TYPES = {
 
 
 def _load_payloads() -> dict:
-    return json.loads((FIXTURES_DIR / "github" / "rest_api_payloads.json").read_text())
+    return json.loads(
+        (FIXTURES_DIR / "github" / "rest_api_payloads.json").read_text(encoding="utf-8")
+    )
 
 
 class RecordingGitHubApi:

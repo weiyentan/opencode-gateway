@@ -103,7 +103,7 @@ def _extract_iid(url: str) -> int | None:
 
 
 def _load_fixture() -> dict[str, Any]:
-    return json.loads((FIXTURES_DIR / "payloads.json").read_text())
+    return json.loads((FIXTURES_DIR / "payloads.json").read_text(encoding="utf-8"))
 
 
 @pytest.fixture
