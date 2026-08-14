@@ -148,6 +148,7 @@ def create_app(
     from app.api.admin_reconcile import router as admin_reconcile_router
     from app.api.afk_outcomes import router as afk_outcomes_router
     from app.api.cursor import router as cursor_router
+    from app.api.execution import router as execution_router
     from app.api.health import router as health_router
     from app.api.ingest import router as ingest_router
     from app.api.usage import router as usage_router
@@ -161,5 +162,6 @@ def create_app(
     app.include_router(ingest_router)
     app.include_router(usage_router, prefix="/api/v1/usage")
     app.include_router(afk_outcomes_router, prefix="/api/v1/afk-outcomes")
+    app.include_router(execution_router, prefix="/api/v1/execution")
 
     return app

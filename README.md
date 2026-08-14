@@ -21,7 +21,7 @@ The Gateway is built as layered concerns:
 
 | Layer | Location | Responsibility |
 |-------|----------|----------------|
-| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, reporting (aggregates, records, sessions, agent runs), and the read-only AFK outcomes API (runs, entities, correlations). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
+| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, reporting (aggregates, records, sessions, agent runs), the read-only execution-transcript API (sessions, children, messages, parts, timeline, tool-calls), and the read-only AFK outcomes API (runs, entities, correlations). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
 | **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
 | **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. Also hosts the live AFK outcome consumer (`app/consumer/afk_consumer.py`) that writes provider engineering events to Postgres. |
@@ -113,6 +113,8 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
+| `GATEWAY_TOOL_PAYLOAD_MAX_CHARS` | `4096` | Execution transcript (ADR 0016): per-field character cap for tool input/output payloads stored in `observed_tool_calls` (truncated at ingest; verbatim content stays in `observed_parts`) |
+| `GATEWAY_PART_DATA_MAX_CHARS` | `65536` | Execution transcript (ADR 0016): verbatim character cap for `message`/`part` payloads stored in the `data` JSONB column (truncated at ingest with a `truncated` marker) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -220,7 +222,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. First-delivery records create canonical events in `usage_events`; every delivery processed through the canonical layer is recorded as an ingest attempt (audit trail covering `accepted`, `duplicate`, `updated`, `quarantined`, and `conflict` outcomes). Per-record outcomes: `accepted` (new canonical event), `duplicate` (idempotent replay), `updated` (replay merged — event corrected and session aggregates delta-adjusted), `quarantined` (source identity quarantined or overlapping), `conflict` (canonical event owned by a different unresolved identity), `rejected` (validation failure or internal error). All outcomes are 2xx at batch level so the consumer commits Kafka offsets; invalid payloads and 4xx/5xx responses route to the DLQ. Optional replay metadata fields (`replay_id`, `replay_requested_start`, `replay_delivery_mode`) mark replay deliveries. Empty-batch heartbeats supported. Authenticated via collector bearer token. |
+| `POST` | `/ingest` | Accept a batch of normalized usage records from a collector. First-delivery records create canonical events in `usage_events`; every delivery processed through the canonical layer is recorded as an ingest attempt (audit trail covering `accepted`, `duplicate`, `updated`, `quarantined`, and `conflict` outcomes). Per-record outcomes: `accepted` (new canonical event), `duplicate` (idempotent replay), `updated` (replay merged — event corrected and session aggregates delta-adjusted), `quarantined` (source identity quarantined or overlapping), `conflict` (canonical event owned by a different unresolved identity), `rejected` (validation failure or internal error). All outcomes are 2xx at batch level so the consumer commits Kafka offsets; invalid payloads and 4xx/5xx responses route to the DLQ. Optional replay metadata fields (`replay_id`, `replay_requested_start`, `replay_delivery_mode`) mark replay deliveries. Empty-batch heartbeats supported. Authenticated via collector bearer token. Schema v1.3 adds optional `messages` and `parts` batch collections (execution-transcript projections, ADR 0016); existing collections and per-record outcomes are unchanged. |
 
 ### Collector Cursor
 
@@ -263,6 +265,34 @@ remains CLI-only (`scripts/afk_backfill.py`); these endpoints never write.
 
 All responses use the `{status, data, error}` envelope and are protected by the
 global API-key middleware, like every other non-`/health` route.
+
+### Execution Transcript
+
+Read-only endpoints exposing the execution-transcript observability slice
+(ADR 0016): message- and part-level execution data ingested from the OpenCode
+runtime's `message`/`part` SQLite tables. Transcripts are event timelines
+(what a run did), kept distinct from usage accounting (how much it cost). The
+transcript vocabulary is described in `CONTEXT.md` (Execution Transcript,
+Observed Message, Observed Part, Observed Tool Call, Transcript Event Type,
+Transcript Timeline). All endpoints are protected by the global API-key
+middleware.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/execution/sessions/{session_id}` | Transcript session header: identity, parent/child linkage, counts, and time window. 404 for an unknown internal session ID. |
+| `GET` | `/api/v1/execution/sessions/{session_id}/children` | Direct child subagent sessions (offset/limit paginated). |
+| `GET` | `/api/v1/execution/sessions/{session_id}/messages` | A session's Observed Messages, chronologically, keyset-paginated. Filterable by `agent`, `role`, and `from`/`to` time range. |
+| `GET` | `/api/v1/execution/sessions/{session_id}/parts` | A session's Observed Parts, chronologically, keyset-paginated. Filterable by `part_type` (Transcript Event Type), `tool_name`, and `from`/`to`. |
+| `GET` | `/api/v1/execution/sessions/{session_id}/timeline` | Unified Transcript Timeline across the root session and its descendant subagent sessions, each event annotated with owning session, agent, and generation `depth`. Optional `max_depth` bound. |
+| `GET` | `/api/v1/execution/tool-calls` | Global Observed Tool Call query. Filterable by `session_id`, `agent`, `tool_name`, `tool_status`, and `from`/`to`. |
+
+The messages, parts, timeline, and tool-calls endpoints use keyset (cursor)
+pagination via `after=<cursor>` (append-only `source_created_at` ordering,
+stable under concurrent ingest); `limit` defaults to 100 and is capped at 1000.
+The children endpoint uses offset/limit pagination. Payloads are redacted
+(secret-like keys) and truncated at ingest
+(`GATEWAY_TOOL_PAYLOAD_MAX_CHARS` / `GATEWAY_PART_DATA_MAX_CHARS`), so the API
+serves only the already-redacted, already-truncated store.
 
 ---
 
@@ -340,6 +370,7 @@ opencode-gateway/
 │   │   ├── admin_resolve_source_identity.py  # POST /admin/resolve-source-identity
 │   │   ├── cursor.py             # GET /cursor collector cursor endpoint
 │   │   ├── ingest.py             # POST /ingest telemetry endpoint
+│   │   ├── execution.py          # GET /api/v1/execution (sessions, children, messages, parts, timeline, tool-calls — read-only)
 │   │   ├── usage.py              # GET aggregates, records, sessions
 │   │   └── afk_outcomes.py       # GET /api/v1/afk-outcomes (runs, entities, correlations — read-only)
 │   ├── consumer/
@@ -364,6 +395,7 @@ opencode-gateway/
 │   │       ├── identity.py       # Pydantic schemas for clients, tokens & quarantined identities
 │   │       ├── reconciliation.py # Pydantic schemas for historical reconciliation
 │   │       ├── usage.py          # Pydantic schemas for usage reporting
+│   │       ├── execution.py      # Pydantic schemas for the execution-transcript API
 │   │       └── afk.py            # Pydantic schemas for AFK outcomes API responses
 │   └── db/
 │       ├── session.py            # DatabasePool (asyncpg wrapper)
@@ -416,6 +448,7 @@ opencode-gateway/
 | [0013](docs/adr/0013-session-currentstatus-heuristic.md) | Session currentStatus Heuristic | Accepted |
 | [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 | [0015](docs/adr/0015-client-project-rollup-as-usage-events-read-model.md) | Client Project Rollup as a usage_events read-model | Accepted |
+| [0016](docs/adr/0016-execution-transcript-observability.md) | Execution Transcript Observability | Accepted |
 
 ---
 

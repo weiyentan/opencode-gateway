@@ -19,6 +19,9 @@ from app.db.models.ingest import (
     SourceDatabase,
 )
 from app.db.models.projection import (
+    ObservedMessage,
+    ObservedPart,
+    ObservedToolCall,
     OpenCodeProjectDirectory,
     OpenCodeSessionContext,
     OpenCodeSessionTodo,
@@ -35,7 +38,10 @@ __all__ = [
     "EngineeringEvent",
     "IngestAudit",
     "IngestBatch",
+    "ObservedMessage",
     "ObservedModel",
+    "ObservedPart",
+    "ObservedToolCall",
     "OpenCodeClient",
     "OpenCodeProjectDirectory",
     "OpenCodeSessionContext",

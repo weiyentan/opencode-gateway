@@ -20,6 +20,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import AliasChoices, BaseModel, Field
 
 from app.core.auth import require_collector_token
+from app.core.config import get_settings
+from app.core.secrets import redact_dict
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,7 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 # ── Known schema versions ─────────────────────────────────────────────────
 
-KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2"})
+KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────
@@ -160,6 +162,41 @@ class SessionTodoPayload(BaseModel):
     source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
 
 
+class MessagePayload(BaseModel):
+    """A normalized OpenCode message projection (ADR 0016, schema v1.3)."""
+
+    external_message_id: str = Field(description="External message identifier")
+    external_session_id: str = Field(description="External session ID (e.g. ses_*)")
+    role: str = Field(description="Message role (e.g. assistant, user)")
+    agent: str | None = Field(default=None, description="Agent name used for the message")
+    mode: str | None = Field(default=None, description="Execution mode (e.g. code, chat)")
+    cost_usd: Decimal | None = Field(default=None, description="Message cost in USD")
+    input_tokens: int | None = Field(default=None, description="Message input tokens")
+    output_tokens: int | None = Field(default=None, description="Message output tokens")
+    parent_external_session_id: str | None = Field(
+        default=None, description="Parent session external ID (from message.data.parentID)"
+    )
+    source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
+    source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
+    source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
+    source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
+    data: dict | None = Field(default=None, description="Verbatim message payload (redacted at ingest)")
+
+
+class PartPayload(BaseModel):
+    """A normalized OpenCode part projection (ADR 0016, schema v1.3)."""
+
+    external_part_id: str = Field(description="External part identifier")
+    external_message_id: str = Field(description="Owning message external identifier")
+    external_session_id: str = Field(description="External session ID (e.g. ses_*)")
+    part_type: str = Field(description="Transcript Event Type (text, reasoning, tool, step-start, step-finish)")
+    source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
+    source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
+    source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
+    source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
+    data: dict | None = Field(default=None, description="Verbatim part payload (redacted at ingest)")
+
+
 class IngestRequest(BaseModel):
     """A batch of usage records pushed by a collector."""
 
@@ -187,6 +224,13 @@ class IngestRequest(BaseModel):
     )
     session_todos: list[SessionTodoPayload] = Field(
         default_factory=list, description="Session todo projections"
+    )
+    # ── Execution-transcript collections (v1.3+, optional) ────────────
+    messages: list[MessagePayload] = Field(
+        default_factory=list, description="Normalized message projections"
+    )
+    parts: list[PartPayload] = Field(
+        default_factory=list, description="Normalized part projections"
     )
     # ── Replay metadata (optional, backward-compatible) ──────────────
     replay_id: uuid.UUID | None = Field(
@@ -1269,6 +1313,409 @@ async def _process_session_todos(
     return total_inserted
 
 
+# ── Execution transcript helpers (issue #217, ADR 0016) ─────────────────────
+
+
+def _redact_and_truncate_payload(data: dict | None, max_chars: int) -> dict | None:
+    """Redact then truncate a verbatim payload for storage in a JSONB column.
+
+    Applies :func:`~app.core.secrets.redact_dict` so secret-like keys never
+    reach the durable store, then bounds the result to ``max_chars`` of JSON
+    text.  Returns the redacted dict unchanged when it fits; otherwise
+    returns ``{"truncated": True, "prefix": <truncated JSON text>}`` so
+    readers know content was cut (ADR 0016 — the ``truncated`` marker).
+    """
+    if data is None:
+        return None
+    redacted = redact_dict(data) if isinstance(data, dict) else data
+    serialized = json.dumps(redacted, default=str)
+    if len(serialized) <= max_chars:
+        return redacted
+    return {"truncated": True, "prefix": serialized[:max_chars]}
+
+
+def _truncate_json_field(value: object, max_chars: int) -> object:
+    """Bound an arbitrary JSON value to ``max_chars`` of its JSON text.
+
+    Returns the value unchanged when its JSON serialization fits; otherwise
+    returns the truncated JSON string (a still-valid, bounded JSONB value).
+    """
+    if value is None:
+        return None
+    serialized = json.dumps(value, default=str)
+    if len(serialized) <= max_chars:
+        return value
+    return serialized[:max_chars]
+
+
+def _redact_json_value(value: object) -> object:
+    """Redact secret-like keys in a JSON value before tool-call storage.
+
+    Applies :func:`~app.core.secrets.redact_dict` to dict values (recursing
+    into nested dicts) so secret-like keys never reach the durable tool-call
+    store (ADR 0016 — plaintext secrets are never written).  Non-dict values
+    pass through unchanged, matching the message/part ``data`` redaction
+    depth (``redact_dict`` does not descend into list elements).
+    """
+    if isinstance(value, dict):
+        return redact_dict(value)
+    return value
+
+
+def _serialize_jsonb(value: object) -> str | None:
+    """Serialize a Python value to a JSON string for a JSONB column bind.
+
+    asyncpg's default JSONB codec accepts only ``str`` and returns ``str``
+    (no ``set_type_codec`` is registered); ``None`` passes through untouched
+    because the execution-transcript JSONB columns are nullable.
+    """
+    if value is None:
+        return None
+    return json.dumps(value, default=str)
+
+
+def _extract_tool_call_facts(
+    data: dict | None,
+) -> tuple[str | None, str | None, object, object]:
+    """Extract ``(tool_name, tool_status, tool_input, tool_output)`` from part data.
+
+    Handles the common OpenCode tool-part shape (``data.tool`` for the name
+    and ``data.state`` for status/input/output) with a top-level fallback.
+    Returns ``(None, None, None, None)`` when no tool name can be resolved.
+    """
+    if not isinstance(data, dict):
+        return None, None, None, None
+    tool_name = data.get("tool")
+    state = data.get("state")
+    tool_status = None
+    tool_input = None
+    tool_output = None
+    if isinstance(state, dict):
+        tool_status = state.get("status")
+        tool_input = state.get("input")
+        tool_output = state.get("output")
+    if tool_status is None:
+        tool_status = data.get("status")
+    if tool_input is None:
+        tool_input = data.get("input")
+    if tool_output is None:
+        tool_output = data.get("output")
+    if tool_name is not None and not isinstance(tool_name, str):
+        tool_name = str(tool_name)
+    return tool_name, tool_status, tool_input, tool_output
+
+
+async def _resolve_message_id(
+    conn: asyncpg.Connection,
+    client_id: uuid.UUID,
+    source_database_id: uuid.UUID,
+    external_message_id: str,
+) -> uuid.UUID | None:
+    """Resolve an external message ID to an observed_messages.id UUID."""
+    row = await conn.fetchrow(
+        """SELECT id FROM observed_messages
+           WHERE client_id = $1 AND source_database_id = $2 AND external_message_id = $3""",
+        client_id,
+        source_database_id,
+        external_message_id,
+    )
+    return row["id"] if row else None
+
+
+async def _process_message(
+    conn: asyncpg.Connection,
+    msg: MessagePayload,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+    now: datetime,
+    *,
+    part_data_max_chars: int,
+) -> bool:
+    """Upsert a single normalized message projection into observed_messages.
+
+    Idempotent ``INSERT … ON CONFLICT … DO UPDATE`` on
+    ``(client_id, source_database_id, external_message_id)``, preserving
+    ``first_seen_at`` and updating ``last_seen_at``.  The verbatim payload
+    is redacted and truncated before persistence.
+    """
+    resolved_session_id = await _resolve_internal_session_id(
+        conn, source_db_id, msg.external_session_id,
+    )
+
+    source_created_at_tz = (
+        msg.source_created_at_tz
+        if msg.source_created_at_tz is not None
+        else _normalise_ms_to_datetime(msg.source_created_at)
+    )
+    source_updated_at_tz = (
+        msg.source_updated_at_tz
+        if msg.source_updated_at_tz is not None
+        else _normalise_ms_to_datetime(msg.source_updated_at)
+    )
+
+    data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
+    data = _serialize_jsonb(data)
+
+    new_id = uuid.uuid4()
+    await conn.execute(
+        """INSERT INTO observed_messages
+           (id, client_id, source_database_id, external_message_id,
+            session_id, external_session_id, parent_external_session_id,
+            role, agent, mode, cost_usd, input_tokens, output_tokens,
+            source_created_at, source_updated_at,
+            source_created_at_tz, source_updated_at_tz,
+            first_seen_at, last_seen_at, data)
+           VALUES ($1, $2, $3, $4,
+                   $5, $6, $7,
+                   $8, $9, $10, $11, $12, $13,
+                   $14, $15, $16, $17,
+                   $18, $18, $19)
+           ON CONFLICT (client_id, source_database_id, external_message_id)
+           DO UPDATE SET
+               session_id = COALESCE(EXCLUDED.session_id, observed_messages.session_id),
+               external_session_id = COALESCE(
+                   EXCLUDED.external_session_id, observed_messages.external_session_id
+               ),
+               parent_external_session_id = COALESCE(
+                   EXCLUDED.parent_external_session_id,
+                   observed_messages.parent_external_session_id,
+               ),
+               role = EXCLUDED.role,
+               agent = COALESCE(EXCLUDED.agent, observed_messages.agent),
+               mode = COALESCE(EXCLUDED.mode, observed_messages.mode),
+               cost_usd = COALESCE(EXCLUDED.cost_usd, observed_messages.cost_usd),
+               input_tokens = COALESCE(EXCLUDED.input_tokens, observed_messages.input_tokens),
+               output_tokens = COALESCE(EXCLUDED.output_tokens, observed_messages.output_tokens),
+               source_created_at = COALESCE(
+                   EXCLUDED.source_created_at, observed_messages.source_created_at
+               ),
+               source_updated_at = COALESCE(
+                   EXCLUDED.source_updated_at, observed_messages.source_updated_at
+               ),
+               source_created_at_tz = COALESCE(
+                   EXCLUDED.source_created_at_tz, observed_messages.source_created_at_tz
+               ),
+               source_updated_at_tz = COALESCE(
+                   EXCLUDED.source_updated_at_tz, observed_messages.source_updated_at_tz
+               ),
+               last_seen_at = EXCLUDED.last_seen_at,
+               data = COALESCE(EXCLUDED.data, observed_messages.data)""",
+        new_id,
+        client_id,
+        source_db_id,
+        msg.external_message_id,
+        resolved_session_id,
+        msg.external_session_id,
+        _normalise_optional_text(msg.parent_external_session_id),
+        msg.role,
+        _normalise_optional_text(msg.agent),
+        _normalise_optional_text(msg.mode),
+        msg.cost_usd,
+        msg.input_tokens,
+        msg.output_tokens,
+        msg.source_created_at,
+        msg.source_updated_at,
+        source_created_at_tz,
+        source_updated_at_tz,
+        now,
+        data,
+    )
+    return True
+
+
+async def _process_part(
+    conn: asyncpg.Connection,
+    part: PartPayload,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+    now: datetime,
+    *,
+    part_data_max_chars: int,
+    tool_payload_max_chars: int,
+) -> bool:
+    """Upsert a normalized part projection and its tool-call projection.
+
+    Idempotent upsert on ``(client_id, source_database_id, external_part_id)``.
+    A ``part_type == 'tool'`` part stays embedded in ``observed_parts`` AND
+    produces one ``observed_tool_calls`` row in the same transaction.
+    """
+    resolved_session_id = await _resolve_internal_session_id(
+        conn, source_db_id, part.external_session_id,
+    )
+    resolved_message_id = await _resolve_message_id(
+        conn, client_id, source_db_id, part.external_message_id,
+    )
+
+    source_created_at_tz = (
+        part.source_created_at_tz
+        if part.source_created_at_tz is not None
+        else _normalise_ms_to_datetime(part.source_created_at)
+    )
+    source_updated_at_tz = (
+        part.source_updated_at_tz
+        if part.source_updated_at_tz is not None
+        else _normalise_ms_to_datetime(part.source_updated_at)
+    )
+
+    data = _redact_and_truncate_payload(part.data, part_data_max_chars)
+    data = _serialize_jsonb(data)
+
+    # Reuse the stored row id on replay so the tool-call row's part_id FK stays
+    # valid: the observed_parts upsert does not include `id` in its SET list,
+    # so a fresh UUID here would never exist in observed_parts.
+    existing_part_id = await conn.fetchval(
+        "SELECT id FROM observed_parts "
+        "WHERE client_id = $1 AND source_database_id = $2 AND external_part_id = $3",
+        client_id,
+        source_db_id,
+        part.external_part_id,
+    )
+    part_row_id = existing_part_id if existing_part_id is not None else uuid.uuid4()
+
+    tool_name, tool_status, tool_input, tool_output = _extract_tool_call_facts(part.data)
+
+    async with conn.transaction():
+        await conn.execute(
+            """INSERT INTO observed_parts
+               (id, client_id, source_database_id, external_part_id,
+                message_id, external_message_id, session_id, external_session_id,
+                part_type, source_created_at, source_updated_at,
+                source_created_at_tz, source_updated_at_tz,
+                first_seen_at, last_seen_at, data)
+               VALUES ($1, $2, $3, $4,
+                       $5, $6, $7, $8,
+                       $9, $10, $11, $12, $13,
+                       $14, $14, $15)
+               ON CONFLICT (client_id, source_database_id, external_part_id)
+               DO UPDATE SET
+                   message_id = COALESCE(EXCLUDED.message_id, observed_parts.message_id),
+                   external_message_id = COALESCE(
+                       EXCLUDED.external_message_id, observed_parts.external_message_id
+                   ),
+                   session_id = COALESCE(EXCLUDED.session_id, observed_parts.session_id),
+                   external_session_id = COALESCE(
+                       EXCLUDED.external_session_id, observed_parts.external_session_id
+                   ),
+                   part_type = EXCLUDED.part_type,
+                   source_created_at = COALESCE(
+                       EXCLUDED.source_created_at, observed_parts.source_created_at
+                   ),
+                   source_updated_at = COALESCE(
+                       EXCLUDED.source_updated_at, observed_parts.source_updated_at
+                   ),
+                   source_created_at_tz = COALESCE(
+                       EXCLUDED.source_created_at_tz, observed_parts.source_created_at_tz
+                   ),
+                   source_updated_at_tz = COALESCE(
+                       EXCLUDED.source_updated_at_tz, observed_parts.source_updated_at_tz
+                   ),
+                   last_seen_at = EXCLUDED.last_seen_at,
+                   data = COALESCE(EXCLUDED.data, observed_parts.data)""",
+            part_row_id,
+            client_id,
+            source_db_id,
+            part.external_part_id,
+            resolved_message_id,
+            part.external_message_id,
+            resolved_session_id,
+            part.external_session_id,
+            part.part_type,
+            part.source_created_at,
+            part.source_updated_at,
+            source_created_at_tz,
+            source_updated_at_tz,
+            now,
+            data,
+        )
+
+        if part.part_type == "tool" and tool_name is not None:
+            tool_input_json = _serialize_jsonb(
+                _truncate_json_field(_redact_json_value(tool_input), tool_payload_max_chars)
+            )
+            tool_output_json = _serialize_jsonb(
+                _truncate_json_field(_redact_json_value(tool_output), tool_payload_max_chars)
+            )
+            await conn.execute(
+                """INSERT INTO observed_tool_calls
+                   (id, client_id, source_database_id, external_part_id,
+                    part_id, message_id, session_id, external_session_id,
+                    tool_name, tool_status, tool_input, tool_output,
+                    source_created_at, source_updated_at,
+                    source_created_at_tz, source_updated_at_tz,
+                    first_seen_at, last_seen_at, data)
+                   VALUES ($1, $2, $3, $4,
+                           $5, $6, $7, $8,
+                           $9, $10, $11, $12,
+                           $13, $14, $15, $16,
+                           $17, $17, $18)
+                   ON CONFLICT (client_id, source_database_id, external_part_id)
+                   DO UPDATE SET
+                       part_id = EXCLUDED.part_id,
+                       message_id = COALESCE(
+                           EXCLUDED.message_id, observed_tool_calls.message_id
+                       ),
+                       session_id = COALESCE(
+                           EXCLUDED.session_id, observed_tool_calls.session_id
+                       ),
+                       external_session_id = COALESCE(
+                           EXCLUDED.external_session_id,
+                           observed_tool_calls.external_session_id,
+                       ),
+                       tool_name = EXCLUDED.tool_name,
+                       tool_status = COALESCE(
+                           EXCLUDED.tool_status, observed_tool_calls.tool_status
+                       ),
+                       tool_input = COALESCE(
+                           EXCLUDED.tool_input, observed_tool_calls.tool_input
+                       ),
+                       tool_output = COALESCE(
+                           EXCLUDED.tool_output, observed_tool_calls.tool_output
+                       ),
+                       source_created_at = COALESCE(
+                           EXCLUDED.source_created_at, observed_tool_calls.source_created_at
+                       ),
+                       source_updated_at = COALESCE(
+                           EXCLUDED.source_updated_at, observed_tool_calls.source_updated_at
+                       ),
+                       source_created_at_tz = COALESCE(
+                           EXCLUDED.source_created_at_tz,
+                           observed_tool_calls.source_created_at_tz,
+                       ),
+                       source_updated_at_tz = COALESCE(
+                           EXCLUDED.source_updated_at_tz,
+                           observed_tool_calls.source_updated_at_tz,
+                       ),
+                       last_seen_at = EXCLUDED.last_seen_at,
+                       data = COALESCE(EXCLUDED.data, observed_tool_calls.data)""",
+                uuid.uuid4(),
+                client_id,
+                source_db_id,
+                part.external_part_id,
+                part_row_id,
+                resolved_message_id,
+                resolved_session_id,
+                part.external_session_id,
+                tool_name,
+                tool_status,
+                tool_input_json,
+                tool_output_json,
+                part.source_created_at,
+                part.source_updated_at,
+                source_created_at_tz,
+                source_updated_at_tz,
+                now,
+                data,
+            )
+        elif part.part_type == "tool" and tool_name is None:
+            logger.warning(
+                "Tool part skipped for observed_tool_calls: external_part_id=%s "
+                "has no resolvable tool name",
+                part.external_part_id,
+            )
+
+    return True
+
+
 # ── Canonical event helpers (issue #388) ────────────────────────────────────
 
 
@@ -2016,6 +2463,40 @@ async def ingest_usage(
     except Exception as exc:
         logger.warning("Projection todos rejected: error=%s", exc)
         projection_rejected += len(body.session_todos)
+
+    # ── Execution transcript: messages (upsert) ───────────────────────
+    settings = get_settings()
+    for msg in body.messages:
+        try:
+            await _process_message(
+                conn, msg, client_id, source_db_id, now,
+                part_data_max_chars=settings.part_data_max_chars,
+            )
+            projection_accepted += 1
+        except Exception as exc:
+            logger.warning(
+                "Projection message rejected: external_message_id=%s error=%s",
+                getattr(msg, "external_message_id", "?"),
+                exc,
+            )
+            projection_rejected += 1
+
+    # ── Execution transcript: parts (upsert + tool-call projection) ────
+    for part in body.parts:
+        try:
+            await _process_part(
+                conn, part, client_id, source_db_id, now,
+                part_data_max_chars=settings.part_data_max_chars,
+                tool_payload_max_chars=settings.tool_payload_max_chars,
+            )
+            projection_accepted += 1
+        except Exception as exc:
+            logger.warning(
+                "Projection part rejected: external_part_id=%s error=%s",
+                getattr(part, "external_part_id", "?"),
+                exc,
+            )
+            projection_rejected += 1
 
     return IngestResponse(
         batch_id=batch_id,

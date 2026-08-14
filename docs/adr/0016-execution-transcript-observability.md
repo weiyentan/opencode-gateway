@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -654,7 +654,7 @@ remains for the smaller count-bounded header/children endpoints.
 The proposal is actionable as sequential, independently-shippable
 slices:
 
-1. **Migration** (`alembic/versions/0026_add_execution_transcript_tables.py`):
+1. **Migration** (`alembic/versions/0029_add_execution_transcript_tables.py`):
    create `observed_messages`, `observed_parts`, `observed_tool_calls`
    with the columns, unique keys, and indexes specified above.
 2. **Collector read** (collector change): read `message` and `part`

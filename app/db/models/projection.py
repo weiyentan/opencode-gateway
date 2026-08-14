@@ -22,10 +22,12 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -263,6 +265,224 @@ class OpenCodeProjectDirectory(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     source_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+
+class ObservedMessage(Base):
+    """An observed OpenCode ``message`` row (ADR 0016 execution transcript).
+
+    Projects one OpenCode message's identity, session linkage, and the
+    promoted role/agent/mode/cost/token facts plus parent linkage, with
+    the full ``message.data`` payload preserved verbatim (redacted) in
+    the ``data`` JSONB column.  Keyed by ``(client_id,
+    source_database_id, external_message_id)``.
+    """
+
+    __tablename__ = "observed_messages"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "source_database_id",
+            "external_message_id",
+            name="uq_observed_messages_source_key",
+        ),
+        Index("ix_observed_messages_session_created", "session_id", "source_created_at"),
+        Index("ix_observed_messages_agent", "agent"),
+        Index("ix_observed_messages_role_created", "role", "source_created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("opencode_clients.id"), nullable=False
+    )
+    source_database_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
+    )
+    external_message_id: Mapped[str] = mapped_column(String, nullable=False)
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    external_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    parent_external_session_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    role: Mapped[str] = mapped_column(String, nullable=False)
+    agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    mode: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
+    input_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    output_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    source_created_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_updated_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+
+class ObservedPart(Base):
+    """An observed OpenCode ``part`` row (ADR 0016 execution transcript).
+
+    Projects one OpenCode part's identity, owning message and session, and
+    its explicit Transcript Event Type (``part_type``), with the full
+    ``part.data`` payload preserved verbatim (redacted) in ``data``.
+    Keyed by ``(client_id, source_database_id, external_part_id)``.
+    """
+
+    __tablename__ = "observed_parts"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "source_database_id",
+            "external_part_id",
+            name="uq_observed_parts_source_key",
+        ),
+        Index("ix_observed_parts_session_created", "session_id", "source_created_at"),
+        Index("ix_observed_parts_message_created", "message_id", "source_created_at"),
+        Index(
+            "ix_observed_parts_session_type_created",
+            "session_id",
+            "part_type",
+            "source_created_at",
+        ),
+        Index("ix_observed_parts_type_created", "part_type", "source_created_at"),
+        Index("ix_observed_parts_created", "source_created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("opencode_clients.id"), nullable=False
+    )
+    source_database_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
+    )
+    external_part_id: Mapped[str] = mapped_column(String, nullable=False)
+    message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("observed_messages.id"), nullable=True
+    )
+    external_message_id: Mapped[str] = mapped_column(String, nullable=False)
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    external_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    part_type: Mapped[str] = mapped_column(String, nullable=False)
+    source_created_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_updated_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+
+class ObservedToolCall(Base):
+    """A normalized tool-call projection of an ``observed_parts`` tool part.
+
+    Extracts tool name, status, and truncated input/output from the tool
+    part's ``data``.  It is a derived query surface, not a source of truth —
+    keyed by ``(client_id, source_database_id, external_part_id)`` (one row
+    per tool part).
+    """
+
+    __tablename__ = "observed_tool_calls"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "source_database_id",
+            "external_part_id",
+            name="uq_observed_tool_calls_source_key",
+        ),
+        Index(
+            "ix_observed_tool_calls_session_created",
+            "session_id",
+            "source_created_at",
+        ),
+        Index(
+            "ix_observed_tool_calls_name_created",
+            "tool_name",
+            "source_created_at",
+        ),
+        Index(
+            "ix_observed_tool_calls_status",
+            "tool_status",
+            postgresql_where=text("tool_status IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("opencode_clients.id"), nullable=False
+    )
+    source_database_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
+    )
+    part_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("observed_parts.id"), nullable=False
+    )
+    external_part_id: Mapped[str] = mapped_column(String, nullable=False)
+    message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("observed_messages.id"), nullable=True
+    )
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    external_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String, nullable=False)
+    tool_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    tool_input: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    tool_output: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_created_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_updated_at: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeSessionTodo(Base):
