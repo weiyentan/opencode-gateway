@@ -40,12 +40,12 @@ class TestFrontendFilesExist:
 
     def test_index_html_contains_dashboard_title(self):
         """The index.html page should contain the dashboard title."""
-        content = (FRONTEND_DIR / "index.html").read_text()
+        content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
         assert "Aurora Glass" in content
 
     def test_index_html_contains_correct_subtitle(self):
         """The subtitle should read 'OpenCode Gateway Observability'."""
-        content = (FRONTEND_DIR / "index.html").read_text()
+        content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
         assert "OpenCode Gateway Observability" in content
 
 
@@ -62,7 +62,7 @@ class TestMergedDashboardView:
 
     def test_merged_table_exists_in_markup(self):
         """index.html carries the merged table id and tbody."""
-        content = (FRONTEND_DIR / "index.html").read_text()
+        content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
         assert 'id="agent-runs-table"' in content, (
             "merged table must carry id=\"agent-runs-table\""
         )
@@ -72,7 +72,7 @@ class TestMergedDashboardView:
 
     def test_sessions_panel_removed_from_markup(self):
         """The separate Sessions panel/tab/table is removed from the dashboard."""
-        content = (FRONTEND_DIR / "index.html").read_text()
+        content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
         assert "sessions-table" not in content, (
             "#sessions-table must be removed (merged into #agent-runs-table)"
         )
@@ -88,7 +88,7 @@ class TestMergedDashboardView:
 
     def test_app_js_drops_sessions_fetch_and_session_limit(self):
         """The dashboard no longer fetches /api/v1/usage/sessions."""
-        content = (FRONTEND_DIR / "app.js").read_text()
+        content = (FRONTEND_DIR / "app.js").read_text(encoding="utf-8")
         # The fetch is gone: no apiFetch call targets the sessions endpoint
         # (comments may still reference the URL to document the removal).
         assert "apiFetch('/api/v1/usage/sessions" not in content, (
@@ -106,7 +106,7 @@ class TestMergedDashboardView:
 
     def test_app_js_merged_table_uses_shared_token_breakdown(self):
         """The merged table renders tokens via the shared compact formatter."""
-        content = (FRONTEND_DIR / "app.js").read_text()
+        content = (FRONTEND_DIR / "app.js").read_text(encoding="utf-8")
         assert "fmtTokenBreakdownCompact" in content, (
             "the shared compact Token Breakdown formatter must remain in use"
         )
@@ -116,7 +116,7 @@ class TestMergedDashboardView:
 
     def test_app_js_current_status_semantics(self):
         """The status badge uses currentStatus semantics (active-badge gone)."""
-        content = (FRONTEND_DIR / "app.js").read_text()
+        content = (FRONTEND_DIR / "app.js").read_text(encoding="utf-8")
         assert "currentStatus" in content, (
             "the merged table status column must use currentStatus semantics"
         )
@@ -136,7 +136,7 @@ class TestMergedDashboardView:
         scoped inside #tab-overview, so the Agent Runs tab showed no
         aggregate data; the fix moves them above all tab panels.
         """
-        content = (FRONTEND_DIR / "index.html").read_text()
+        content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
         tab_overview = content.index('id="tab-overview"')
         date_bar = content.index('id="date-range-bar"')
         kpi_row = content.index('id="kpi-row"')
@@ -163,7 +163,7 @@ class TestNginxProxyConfiguration:
 
     @pytest.fixture(autouse=True)
     def _load_nginx_config(self):
-        self.config = self.NGINX_CONF.read_text()
+        self.config = self.NGINX_CONF.read_text(encoding="utf-8")
 
     # ── Proxy location blocks ──────────────────────────────────────────
 
@@ -240,7 +240,7 @@ class TestNginxProxyConfiguration:
         config must contain no localhost upstream.
         """
         import re
-        entrypoint = (FRONTEND_DIR / "docker-entrypoint.sh").read_text()
+        entrypoint = (FRONTEND_DIR / "docker-entrypoint.sh").read_text(encoding="utf-8")
         default_match = re.search(r'DEFAULT_UPSTREAM="([^"]+)"', entrypoint)
         assert default_match, (
             "docker-entrypoint.sh must define DEFAULT_UPSTREAM"
@@ -307,7 +307,7 @@ class TestFrontendEntrypointIPv4Upstream:
 
     @pytest.fixture(autouse=True)
     def _load_entrypoint(self):
-        self.content = self.ENTRYPOINT.read_text()
+        self.content = self.ENTRYPOINT.read_text(encoding="utf-8")
 
     def test_entrypoint_default_upstream_is_ipv4_safe(self):
         """DEFAULT_UPSTREAM must resolve to IPv4 (gateway DNS or 127.0.0.1)."""
@@ -345,7 +345,7 @@ class TestFrontendDockerfileBakesNginxConfig:
 
     @pytest.fixture(autouse=True)
     def _load_dockerfile(self):
-        self.content = self.DOCKERFILE.read_text()
+        self.content = self.DOCKERFILE.read_text(encoding="utf-8")
 
     def test_dockerfile_bakes_nginx_config_template(self):
         """The Dockerfile must COPY frontend/nginx.conf as the nginx config."""

@@ -35,7 +35,7 @@ def test_package_exists_and_is_a_top_level_sibling_of_app() -> None:
 def test_no_application_imports_in_source() -> None:
     offenders: list[str] = []
     for path in _source_files():
-        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             stripped = line.lstrip()
             if stripped.startswith("import app") or stripped.startswith("from app"):
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {stripped}")
@@ -49,7 +49,7 @@ def test_no_application_string_references_in_source() -> None:
     """Guard against sneaky dynamic imports (``importlib.import_module('app...')``)."""
     offenders: list[str] = []
     for path in _source_files():
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         for token in ("import_module", "__import__"):
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if token in line and "app" in line:

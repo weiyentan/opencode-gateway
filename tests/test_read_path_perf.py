@@ -372,7 +372,7 @@ def _load_or_commit_baseline(path: Path, data: dict) -> dict | None:
     """
     _BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     if path.exists() and not _should_regenerate():
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     path.write_text(json.dumps(data, indent=2))
     return None
 
