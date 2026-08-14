@@ -11,6 +11,8 @@ Normalisation rules (the locked vocabulary, shared with the GitHub adapter):
 
 * merge requests normalise to ``change_request`` entities (``entity_id``
   ``change_request:{iid}``) exactly as pull requests do;
+* a merged merge request additionally emits a ``merge_event`` entity
+  (``entity_id`` ``merge_event:{iid}``) when its ``merged_at`` is set;
 * the merge request's ``source_branch`` is carried as the change request's
   ``head_ref`` in the change request event ``payload`` (``EngineeringEntity``
   has no ``head_ref`` field, so the branch rides on the events);
@@ -168,7 +170,7 @@ class GitLabAdapter:
         entities: list[EngineeringEntity] = []
         events: list[EngineeringEvent] = []
 
-        entities.append(self._change_request_entity(repository, mr))
+        entities.extend(self._change_request_entity(repository, mr))
         events.extend(self._change_request_events(mr))
 
         approvals = await self._get_json(self._mr_url(repository, iid, "approvals"))
@@ -206,21 +208,39 @@ class GitLabAdapter:
 
     def _change_request_entity(
         self, repository: str, mr: dict[str, Any]
-    ) -> EngineeringEntity:
+    ) -> list[EngineeringEntity]:
         iid = mr["iid"]
-        return EngineeringEntity(
-            entity_id=f"change_request:{iid}",
-            entity_type=EntityType.CHANGE_REQUEST,
-            provider=Provider.GITLAB,
-            repository=repository,
-            number=iid,
-            title=mr.get("title"),
-            state=_normalize_mr_state(mr.get("state")),
-            author=_username(mr.get("author")),
-            url=mr.get("web_url"),
-            created_at=_parse_dt(mr.get("created_at")),
-            updated_at=_parse_dt(mr.get("updated_at")),
-        )
+        entities: list[EngineeringEntity] = [
+            EngineeringEntity(
+                entity_id=f"change_request:{iid}",
+                entity_type=EntityType.CHANGE_REQUEST,
+                provider=Provider.GITLAB,
+                repository=repository,
+                number=iid,
+                title=mr.get("title"),
+                state=_normalize_mr_state(mr.get("state")),
+                author=_username(mr.get("author")),
+                url=mr.get("web_url"),
+                created_at=_parse_dt(mr.get("created_at")),
+                updated_at=_parse_dt(mr.get("updated_at")),
+            )
+        ]
+        merged_at = _parse_dt(mr.get("merged_at"))
+        if merged_at is not None:
+            entities.append(
+                EngineeringEntity(
+                    entity_id=f"merge_event:{iid}",
+                    entity_type=EntityType.MERGE_EVENT,
+                    provider=Provider.GITLAB,
+                    repository=repository,
+                    number=iid,
+                    title=f"merge {iid}",
+                    state="merged",
+                    author=_username(mr.get("merged_by")) or _username(mr.get("author")),
+                    created_at=merged_at,
+                )
+            )
+        return entities
 
     def _change_request_events(self, mr: dict[str, Any]) -> list[EngineeringEvent]:
         iid = mr["iid"]

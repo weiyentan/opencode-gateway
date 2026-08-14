@@ -20,6 +20,8 @@ from afk_outcomes import (
     CorrelationEngine,
     EngineeringEntity,
     EngineeringEvent,
+    EngineeringOutcome,
+    EngineeringOutcomeStatus,
     EntityType,
     Provider,
     ResolutionResult,
@@ -482,3 +484,86 @@ async def test_rules_satisfy_correlation_rule_protocol() -> None:
         out = await rule.correlate(run, entities=[], events=[])
         assert isinstance(out, list)
         assert all(isinstance(c, Correlation) for c in out)
+
+
+# ── EngineeringOutcome status derivation (PR #458 finding 1) ────────────────
+
+
+async def _resolve_single_cr(
+    state: str, *, merged_at: str | None = None
+) -> EngineeringOutcome | None:
+    """Resolve a one-change-request window and return its outcome."""
+    run = AFKRun(
+        afk_run_id="",
+        provider=Provider.GITHUB,
+        status=RunStatus.COMPLETED,
+        title="Implement issue #100",
+        started_at=_parse_dt("2026-08-13T08:00:00Z"),
+        finished_at=_parse_dt("2026-08-13T10:00:00Z"),
+    )
+    entities: list[EngineeringEntity] = [
+        EngineeringEntity(
+            entity_id="change_request:500",
+            entity_type=EntityType.CHANGE_REQUEST,
+            provider=Provider.GITHUB,
+            repository="repo",
+            number=500,
+            title="Implement issue #100",
+            state=state,
+            author="alice",
+            created_at=_parse_dt("2026-08-13T08:00:00Z"),
+            description="Resolves #100.",
+            branch="ai/feat/issue-100",
+        )
+    ]
+    if merged_at is not None:
+        entities.append(
+            EngineeringEntity(
+                entity_id="merge_event:500",
+                entity_type=EntityType.MERGE_EVENT,
+                provider=Provider.GITHUB,
+                repository="repo",
+                number=500,
+                title="merge 500",
+                state="merged",
+                created_at=_parse_dt(merged_at),
+            )
+        )
+    result = await _engine(1_786_615_829_000).resolve(
+        run, entities=entities, events=[], sessions=[]
+    )
+    return result.run.outcome
+
+
+async def test_outcome_status_is_open_for_open_change_request() -> None:
+    outcome = await _resolve_single_cr("open")
+    assert outcome is not None
+    assert outcome.status is EngineeringOutcomeStatus.OPEN
+    assert outcome.merge_event_id is None
+    assert outcome.merged_at is None
+
+
+async def test_outcome_status_is_closed_for_closed_change_request_without_merge() -> None:
+    outcome = await _resolve_single_cr("closed")
+    assert outcome is not None
+    assert outcome.status is EngineeringOutcomeStatus.CLOSED
+    assert outcome.merge_event_id is None
+    assert outcome.merged_at is None
+
+
+async def test_outcome_status_is_merged_when_merge_event_present() -> None:
+    # A merged GitHub PR reports state "closed" but carries a merge_event entity;
+    # the merge_event must win over the "closed" state.
+    outcome = await _resolve_single_cr("closed", merged_at="2026-08-13T10:10:29Z")
+    assert outcome is not None
+    assert outcome.status is EngineeringOutcomeStatus.MERGED
+    assert outcome.merge_event_id == "merge_event:500"
+    assert outcome.merged_at == _parse_dt("2026-08-13T10:10:29Z")
+
+
+async def test_outcome_status_is_merged_when_state_is_merged() -> None:
+    # GitLab normalises a merged MR's state to "merged"; the state alone must
+    # produce a MERGED outcome even without a merge_event entity.
+    outcome = await _resolve_single_cr("merged")
+    assert outcome is not None
+    assert outcome.status is EngineeringOutcomeStatus.MERGED

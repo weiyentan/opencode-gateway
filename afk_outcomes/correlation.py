@@ -867,7 +867,6 @@ class CorrelationEngine:
             if c.entity_id.startswith("issue:")
             and c.correlation_confidence >= RESOLVED_ROLE_THRESHOLD
         )
-        status = EngineeringOutcomeStatus.MERGED
         merge = next(
             (
                 m
@@ -876,6 +875,13 @@ class CorrelationEngine:
             ),
             None,
         )
+        state = (owning.state or "").lower()
+        if merge is not None or state == "merged":
+            status = EngineeringOutcomeStatus.MERGED
+        elif state == "closed":
+            status = EngineeringOutcomeStatus.CLOSED
+        else:
+            status = EngineeringOutcomeStatus.OPEN
         return EngineeringOutcome(
             status=status,
             change_request_ids=change_request_ids,

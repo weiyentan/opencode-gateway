@@ -20,7 +20,8 @@ network.
 
 Normalization map (locked vocabulary):
 
-* entities — ``issue``, ``change_request``, ``review``, ``commit``;
+* entities — ``issue``, ``change_request``, ``review``, ``commit``, and a
+  ``merge_event`` for change requests with a ``merged_at`` timestamp;
   the change request's source branch is carried as ``head_ref``;
 * events — ``issue.opened``, ``issue.closed``, ``change_request.opened``,
   ``change_request.review_requested``, ``change_request.changes_requested``,
@@ -332,6 +333,21 @@ class GitHubAdapter:
                     updated_at=_parse_dt(pull.get("updated_at")),
                 )
             )
+            merged_at = _parse_dt(pull.get("merged_at"))
+            if merged_at is not None:
+                entities.append(
+                    EngineeringEntity(
+                        entity_id=f"merge_event:{number}",
+                        entity_type=EntityType.MERGE_EVENT,
+                        provider=Provider.GITHUB,
+                        repository=repository,
+                        number=number,
+                        title=f"merge {number}",
+                        state="merged",
+                        author=_str(_dict(pull, "merged_by"), "login") or _login(pull),
+                        created_at=merged_at,
+                    )
+                )
         return entities
 
     def _review_entities(

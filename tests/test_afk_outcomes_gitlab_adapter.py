@@ -47,8 +47,8 @@ LOCKED_EVENT_TYPES = {
     "pipeline.succeeded",
 }
 
-# The four locked entity types (issue #446 / #447 locked vocabulary).
-LOCKED_ENTITY_TYPES = {"issue", "change_request", "review", "commit"}
+# The locked entity vocabulary (issue #446 / #447 locked vocabulary).
+LOCKED_ENTITY_TYPES = {"issue", "change_request", "review", "commit", "merge_event"}
 
 
 def _parse_dt(value: str) -> datetime:
@@ -171,7 +171,20 @@ async def test_entity_types_match_locked_vocabulary(adapter: GitLabAdapter) -> N
     entities, _ = await _fetch_both(adapter)
     emitted = {e.entity_type.value for e in entities}
     assert emitted <= LOCKED_ENTITY_TYPES
-    assert emitted == {"change_request", "review", "commit"}
+    assert emitted == {"change_request", "review", "commit", "merge_event"}
+
+
+async def test_merged_mr_emits_merge_event_entity(adapter: GitLabAdapter) -> None:
+    entities, _ = await _fetch_both(adapter)
+    merge_events = {e.number: e for e in entities if e.entity_type is EntityType.MERGE_EVENT}
+    assert set(merge_events) == {117, 118}
+
+    merged = merge_events[118]
+    assert merged.entity_id == "merge_event:118"
+    assert merged.provider is Provider.GITLAB
+    assert merged.state == "merged"
+    assert merged.author == "wyautomation"
+    assert merged.created_at == _parse_dt("2026-08-07T11:30:00Z")
 
 
 async def test_source_branch_is_carried_as_head_ref(adapter: GitLabAdapter) -> None:

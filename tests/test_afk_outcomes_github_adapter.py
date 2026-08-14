@@ -123,7 +123,24 @@ async def test_entity_types_match_locked_vocabulary() -> None:
         EntityType.CHANGE_REQUEST,
         EntityType.REVIEW,
         EntityType.COMMIT,
+        EntityType.MERGE_EVENT,
     }
+
+
+async def test_merged_change_request_emits_merge_event_entity() -> None:
+    adapter, _ = _adapter()
+    entities = await adapter.fetch_entities(REPOSITORY)
+    by_id = {e.entity_id: e for e in entities}
+
+    merged = by_id["merge_event:200"]
+    assert merged.entity_type is EntityType.MERGE_EVENT
+    assert merged.number == 200
+    assert merged.state == "merged"
+    assert merged.author == "bob"
+    assert merged.created_at == datetime(2026, 8, 12, 10, 0, 0, tzinfo=UTC)
+
+    # The closed (not merged) change request #201 must NOT emit a merge_event.
+    assert "merge_event:201" not in by_id
 
 
 # ── Events ────────────────────────────────────────────────────────────────
