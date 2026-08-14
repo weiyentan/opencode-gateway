@@ -530,6 +530,7 @@ class AFKOutcomeConsumer:
             await self._producer.send_and_wait(self._dlq_topic, dlq_payload)
         except KafkaError:
             logger.exception("Failed to send message to DLQ topic %s", self._dlq_topic)
+            raise
 
     # ── Scheduled reconciliation ───────────────────────────────────────
 

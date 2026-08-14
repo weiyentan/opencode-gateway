@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from afk_outcomes.models import EntityType, Provider
@@ -549,6 +550,93 @@ async def test_failing_then_successful_message_does_not_lose_failed_message() ->
     # Total: one DLQ (the failed message) and two commits (failed + good).
     consumer._producer.send_and_wait.assert_called_once()
     assert consumer._consumer.commit.call_count == 2
+
+
+# ── DLQ publish failure must not swallow the message (no commit) ──────────────
+
+
+def _mk_invalid_json_msg() -> MagicMock:
+    """A ConsumerRecord whose value is not decodable JSON."""
+    msg = MagicMock(spec=ConsumerRecord)
+    msg.value = b"not valid json at all"
+    msg.offset = 101
+    msg.partition = 0
+    msg.topic = "afk.events"
+    msg.key = None
+    msg.headers = ()
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_db_failure_dlq_success_commits_exactly_once() -> None:
+    """DB exhausts retries; DLQ publish succeeds → exactly one offset commit."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    msg = _mk_msg(_valid_payload())
+    with patch(
+        "app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock
+    ) as mock_sleep:
+        await consumer._process_message(msg)
+
+    assert mock_sleep.call_count == 2
+    consumer._consumer.commit.assert_called_once()
+    consumer._producer.send_and_wait.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_db_failure_dlq_failure_does_not_commit() -> None:
+    """DB exhausts retries AND DLQ publish fails → no commit, error propagates."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    msg = _mk_msg(_valid_payload())
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(KafkaError):
+            await consumer._process_message(msg)
+
+    consumer._consumer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_msg",
+    [
+        _mk_invalid_json_msg,
+        lambda: _mk_msg({"not": "valid"}),
+        lambda: _mk_msg(_valid_payload(type="pull_request.assigned")),
+    ],
+    ids=["invalid-json", "invalid-shape", "unmappable-type"],
+)
+async def test_poison_message_dlq_failure_does_not_commit(make_msg) -> None:
+    """A poison message whose DLQ publish fails must not be committed away."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    msg = make_msg()
+    with pytest.raises(KafkaError):
+        await consumer._process_message(msg)
+
+    consumer._consumer.commit.assert_not_called()
+    conn.execute.assert_not_called()
 
 
 # ── Consumer group separation ────────────────────────────────────────────────

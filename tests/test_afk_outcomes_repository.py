@@ -361,6 +361,32 @@ def test_save_unresolved_correlation_raises_confidence(mock_conn: AsyncMock) -> 
     sql = calls[0][0]
     assert "GREATEST(" in sql
     assert "evidence = unresolved_correlations.evidence || EXCLUDED.evidence" in sql
+    assert "afk_run_id = COALESCE" not in sql
+
+
+def test_unresolved_upsert_conflict_target_includes_afk_run_id(
+    mock_conn: AsyncMock,
+) -> None:
+    """The low-confidence path keys on the run id and never rewrites it."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+
+    import asyncio
+
+    asyncio.run(repo.save(run))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO unresolved_correlations")
+    assert len(calls) == 1, "expected one low-confidence unresolved correlation"
+    sql = calls[0][0]
+    assert (
+        "ON CONFLICT (provider, repository, entity_type, external_id, afk_run_id, method)"
+        in sql
+    )
+    assert "afk_run_id = COALESCE" not in sql
+    assert "GREATEST(" in sql
+    assert "evidence = unresolved_correlations.evidence || EXCLUDED.evidence" in sql
+    # afk_run_id is bound as the 5th positional arg (index 4) and is the run id.
+    assert calls[0][1][4] == RUN_ID
 
 
 def test_save_entity_link_afk_run_id_is_not_null(mock_conn: AsyncMock) -> None:
@@ -424,12 +450,13 @@ def test_save_unresolved_persists_ambiguous_with_reason_and_candidates(
     sql = calls[0][0]
     assert "reason" in sql
     assert "candidates" in sql
-    assert "ON CONFLICT (provider, repository, entity_type, external_id, method)" in sql
+    assert "ON CONFLICT (provider, repository, entity_type, external_id, afk_run_id, method)" in sql
     args = calls[0][1]
     assert args[0] == "github"  # provider
     assert args[1] == REPO  # repository
     assert args[2] == "afk_run"  # run-level sentinel entity_type
     assert args[3] == RUN_ID  # external_id == run id
+    assert args[4] == RUN_ID  # afk_run_id == run id
     assert args[5] == "ambiguous"  # method mirrors reason
     assert args[6] == "ambiguous"  # reason
     assert "change_request:300" in args[8]  # candidates JSON
@@ -469,6 +496,7 @@ def test_save_unresolved_is_enrich_only(mock_conn: AsyncMock) -> None:
     assert "COALESCE(EXCLUDED.reason" in set_clause
     assert "COALESCE(EXCLUDED.candidates" in set_clause
     assert "evidence = unresolved_correlations.evidence || EXCLUDED.evidence" in set_clause
+    assert "afk_run_id = COALESCE" not in set_clause
 
 
 def test_save_unresolved_noop_when_empty(mock_conn: AsyncMock) -> None:

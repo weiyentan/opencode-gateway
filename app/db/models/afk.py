@@ -247,9 +247,10 @@ class UnresolvedCorrelation(Base):
 
     Stored only here (never in ``afk_run_entities``) so unresolved
     correlations remain visible for later manual or algorithmic resolution.
-    ``afk_run_id`` is nullable — an unresolved correlation may not yet be
-    attributed.  Keyed by ``UNIQUE (provider, repository, entity_type,
-    external_id, method)`` for replay safety.
+    ``afk_run_id`` is NOT NULL — every unresolved correlation is attributed to
+    the run that produced it.  Keyed by ``UNIQUE (provider, repository,
+    entity_type, external_id, afk_run_id, method)`` so the run is part of the
+    row identity (replay-safe across runs).
 
     Two kinds of row share this table under the enrich-only contract:
 
@@ -272,8 +273,9 @@ class UnresolvedCorrelation(Base):
             "repository",
             "entity_type",
             "external_id",
+            "afk_run_id",
             "method",
-            name="uq_unresolved_correlations_entity_method",
+            name="uq_unresolved_correlations_entity_run_method",
         ),
     )
 
@@ -284,7 +286,7 @@ class UnresolvedCorrelation(Base):
     repository: Mapped[str] = mapped_column(String, nullable=False)
     entity_type: Mapped[str] = mapped_column(String, nullable=False)
     external_id: Mapped[str] = mapped_column(String, nullable=False)
-    afk_run_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
+    afk_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
     method: Mapped[str] = mapped_column(String, nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     correlation_confidence: Mapped[float] = mapped_column(
