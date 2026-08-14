@@ -626,7 +626,10 @@ A companion Kafka consumer (``app/consumer/afk_consumer.py``) that reads the
 external provider-events topic (``afk.events``) in its OWN consumer group
 (``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
 group), maps message types to canonical Engineering Events, writes each
-message in a single DB transaction (offset committed only after success), DLQs
+message in a single DB transaction (offset committed only after success; a
+Kafka offset-commit failure after a successful transaction is non-fatal — the
+message is already durably handled, the frontier retries on the next commit,
+and redelivery stays idempotent via dedup), DLQs
 poison messages, and runs scheduled bounded-window reconciliation reusing the
 backfill engine for terminal states (merged/closed) the topic does not carry.
 _Avoid_: Kafka consumer (generic), outcomes ingestion bridge
@@ -651,9 +654,11 @@ _Avoid_: AFK API (generic), outcomes endpoint
 
 **AFK Outcomes Tab**:
 The Aurora Glass dashboard tab (top-nav "AFK Outcomes") that lists AFK Runs
-and opens the chain detail overlay for one run. Follows the shared panel
-conventions (freshness/stale-on-error retention, Token Breakdown, Active
-Tokens).
+and opens the chain detail overlay for one run. Linked sessions that resolved
+to an internal session id open the Agent Run detail overlay (drill-down);
+unresolved sessions stay non-clickable with their inferred/provisional marker
+preserved. Follows the shared panel conventions (freshness/stale-on-error
+retention, Token Breakdown, Active Tokens).
 _Avoid_: AFK panel (generic)
 
 ## Architecture Note
@@ -737,7 +742,7 @@ manages.
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
-- The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
+- The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary; linked sessions that resolved to an internal session id open the **Agent Run** detail overlay while unresolved sessions stay non-clickable
 
 ## Flagged Ambiguities
 
