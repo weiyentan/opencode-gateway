@@ -39,6 +39,10 @@ from afk_outcomes.models import (
     UnresolvedCorrelation,
     UnresolvedReason,
 )
+from afk_outcomes.repository import (
+    RESOLVER_VERSION,
+    AsyncpgOutcomeRepository,
+)
 from afk_outcomes.serialization import (
     CANONICAL_SCHEMA_VERSION,
     MonotonicULID,
@@ -51,6 +55,7 @@ from afk_outcomes.serialization import (
 
 __all__ = [
     "AFKRun",
+    "AsyncpgOutcomeRepository",
     "BranchIssueReferenceRule",
     "CANONICAL_SCHEMA_VERSION",
     "CommitIssueReferenceRule",

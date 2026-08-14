@@ -1,5 +1,13 @@
 """SQLAlchemy ORM models — observability models added in later slices."""
 
+from app.db.models.afk import (
+    AFKRun,
+    AFKRunEntityLink,
+    AFKRunSessionLink,
+    DeliveryLog,
+    EngineeringEvent,
+    UnresolvedCorrelation,
+)
 from app.db.models.base import Base
 from app.db.models.identity import CollectorCredential, OpenCodeClient
 from app.db.models.ingest import (
@@ -18,8 +26,13 @@ from app.db.models.projection import (
 )
 
 __all__ = [
+    "AFKRun",
+    "AFKRunEntityLink",
+    "AFKRunSessionLink",
     "Base",
     "CollectorCredential",
+    "DeliveryLog",
+    "EngineeringEvent",
     "IngestAudit",
     "IngestBatch",
     "ObservedModel",
@@ -31,4 +44,5 @@ __all__ = [
     "OpenCodeUsageRecord",
     "Session",
     "SourceDatabase",
+    "UnresolvedCorrelation",
 ]
