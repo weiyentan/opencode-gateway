@@ -1,0 +1,136 @@
+{
+  "repository": "weiyentan/opencode-gateway",
+  "issues": [
+    {
+      "number": 100,
+      "title": "Add session context detail panel",
+      "state": "open",
+      "user": {"login": "alice"},
+      "created_at": "2026-08-10T09:00:00Z",
+      "updated_at": "2026-08-10T09:00:00Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/100"
+    },
+    {
+      "number": 101,
+      "title": "Expose code-change counts on the session summary",
+      "state": "closed",
+      "user": {"login": "alice"},
+      "created_at": "2026-08-09T09:00:00Z",
+      "updated_at": "2026-08-12T10:00:00Z",
+      "closed_at": "2026-08-12T10:00:00Z",
+      "closed_by": {"login": "bob"},
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/101"
+    }
+  ],
+  "pulls": [
+    {
+      "number": 200,
+      "title": "Implement GitHub provider adapter for AFK outcomes",
+      "state": "closed",
+      "merged": true,
+      "user": {"login": "alice"},
+      "created_at": "2026-08-10T08:00:00Z",
+      "updated_at": "2026-08-12T10:00:00Z",
+      "closed_at": "2026-08-12T10:00:00Z",
+      "merged_at": "2026-08-12T10:00:00Z",
+      "merge_commit_sha": "merge-sha-200",
+      "merged_by": {"login": "bob"},
+      "head": {"ref": "feature/gateway-adapter", "sha": "sha200"},
+      "base": {"ref": "main"},
+      "requested_reviewers": [{"login": "carol"}],
+      "html_url": "https://github.com/weiyentan/opencode-gateway/pull/200"
+    },
+    {
+      "number": 201,
+      "title": "chore: noise change request",
+      "state": "closed",
+      "merged": false,
+      "user": {"login": "alice"},
+      "created_at": "2026-08-11T08:00:00Z",
+      "updated_at": "2026-08-13T09:00:00Z",
+      "closed_at": "2026-08-13T09:00:00Z",
+      "merged_at": null,
+      "head": {"ref": "feature/noise", "sha": "sha201"},
+      "base": {"ref": "main"},
+      "requested_reviewers": [],
+      "html_url": "https://github.com/weiyentan/opencode-gateway/pull/201"
+    }
+  ],
+  "reviews": {
+    "200": [
+      {
+        "id": 1001,
+        "state": "APPROVED",
+        "user": {"login": "bob"},
+        "submitted_at": "2026-08-11T18:00:00Z",
+        "commit_id": "sha200"
+      },
+      {
+        "id": 1002,
+        "state": "CHANGES_REQUESTED",
+        "user": {"login": "carol"},
+        "submitted_at": "2026-08-11T19:00:00Z",
+        "commit_id": "sha200"
+      }
+    ],
+    "201": []
+  },
+  "commits": {
+    "200": [
+      {
+        "sha": "commit-a",
+        "commit": {
+          "author": {"name": "alice", "email": "alice@example.com", "date": "2026-08-10T10:00:00Z"},
+          "message": "feat: implement GitHub provider adapter"
+        },
+        "author": {"login": "alice"},
+        "html_url": "https://github.com/weiyentan/opencode-gateway/commit/commit-a"
+      },
+      {
+        "sha": "commit-b",
+        "commit": {
+          "author": {"name": "alice", "email": "alice@example.com", "date": "2026-08-11T11:00:00Z"},
+          "message": "test: cover GitHub adapter normalization"
+        },
+        "author": {"login": "alice"},
+        "html_url": "https://github.com/weiyentan/opencode-gateway/commit/commit-b"
+      }
+    ],
+    "201": [
+      {
+        "sha": "commit-c",
+        "commit": {
+          "author": {"name": "alice", "email": "alice@example.com", "date": "2026-08-11T12:00:00Z"},
+          "message": "chore: noise"
+        },
+        "author": {"login": "alice"},
+        "html_url": "https://github.com/weiyentan/opencode-gateway/commit/commit-c"
+      }
+    ]
+  },
+  "check_runs": {
+    "sha200": {
+      "check_runs": [
+        {
+          "id": 2001,
+          "name": "ci",
+          "status": "completed",
+          "conclusion": "success",
+          "completed_at": "2026-08-12T09:00:00Z",
+          "head_sha": "sha200"
+        },
+        {
+          "id": 2002,
+          "name": "lint",
+          "status": "completed",
+          "conclusion": "failure",
+          "completed_at": "2026-08-12T09:05:00Z",
+          "head_sha": "sha200"
+        }
+      ]
+    },
+    "sha201": {
+      "check_runs": []
+    }
+  }
+}

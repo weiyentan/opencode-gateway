@@ -21,10 +21,10 @@ The Gateway is built as layered concerns:
 
 | Layer | Location | Responsibility |
 |-------|----------|----------------|
-| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, and reporting (aggregates, records, sessions, agent runs). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
+| **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, reporting (aggregates, records, sessions, agent runs), and the read-only AFK outcomes API (runs, entities, correlations). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
 | **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
-| **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. |
+| **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. Also hosts the live AFK outcome consumer (`app/consumer/afk_consumer.py`) that writes provider engineering events to Postgres. |
 
 ---
 
@@ -41,7 +41,7 @@ The Gateway is built as layered concerns:
 | **Type Checking** | `mypy` (strict mode) | Full strict checking; Python 3.12 target |
 | **Frontend** | Vanilla HTML/CSS/JS + nginx | Aurora Glass dashboard — no build step, served by a separate nginx container. In Docker Compose, the frontend nginx is the sole browser entrypoint and proxies API requests to the Gateway. |
 | **Testing** | `pytest` + `pytest-asyncio` | `asyncio_mode = auto` |
-| **Streaming** | `aiokafka` | Kafka consumer for usage-record bridge; separate companion container |
+| **Streaming** | `aiokafka` | Kafka consumers for the usage-record bridge and the AFK outcome consumer; separate companion containers |
 
 ---
 
@@ -104,6 +104,13 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |
 | `GATEWAY_KAFKA_DLQ_TOPIC` | `opencode-usage-dlq` | Dead-letter queue topic for unprocessable messages |
 | `GATEWAY_CONSUMER_GROUP_ID` | `opencode-gateway` | Kafka consumer group ID |
+| `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Provider-events topic for the AFK outcome consumer (external; not created here) |
+| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Dead-letter queue topic for poison AFK outcome messages |
+| `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
+| `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
+| `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
 
@@ -168,6 +175,8 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | **frontend**| `opencode-frontend`     | 8080      | 80            | Aurora Glass dashboard + nginx reverse proxy for API   |
 | **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
 | **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
+| **kafka**   | `opencode-gateway-kafka`| —         | 9092          | Local KRaft Kafka broker (single node; internal — no host ports). Backstops both streaming consumers; the provider-events topic is external |
+| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the provider-events topic in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
 
 > **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
@@ -235,6 +244,26 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 > legacy `opencode_usage_records` table is still written at ingest but is no
 > longer the query source.
 
+### AFK Outcomes
+
+Read-only endpoints exposing the AFK outcome read-model — AFK Runs reconstructed
+from provider engineering activity, correlated against Gateway sessions. The
+AFK outcome vocabulary is described in `CONTEXT.md` (AFK Run, `afk_run_id`,
+RunStatus, EngineeringOutcome, EngineeringOutcomeStatus, change_request,
+correlation_confidence, correlation_method, resolver_version, Provisional
+Link). Backfill remains CLI-only (`scripts/afk_backfill.py`); these endpoints
+never write.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/afk-outcomes/runs` | Paginated list of AFK Runs. Filterable by `repository` (EXISTS subquery on `afk_run_entities`), window (`started_from`/`started_to`, `finished_from`/`finished_to`, `seen_from`/`seen_to` ISO-8601 bounds), `status` (RunStatus value), `outcome` (EngineeringOutcomeStatus value), and `origin` (provider). 400 on invalid enum/date values or inverted windows. Ordered by `last_seen_at DESC`. |
+| `GET` | `/api/v1/afk-outcomes/runs/{afk_run_id}` | Full chain for one run: run aggregate, EngineeringOutcome, engineering entities grouped by type (issues, change_requests, reviews, commits, merge_events) each carrying correlation provenance (`correlation_method`, `correlation_confidence`, `evidence`, `resolver_version`) and a `provisional` marker, linked sessions with usage/cost aggregates, distinct agents, and a run-level usage aggregate (Active Tokens = input + output; cache read/write as siblings). 404 for unknown `afk_run_id`. |
+| `GET` | `/api/v1/afk-outcomes/entities` | Paginated engineering entities with their run links, correlation provenance, `superseded_at` (superseded state surfaced, not hidden), and `provisional` marker. |
+| `GET` | `/api/v1/afk-outcomes/correlations` | Paginated unresolved correlations with `method`, `correlation_confidence`, `evidence`, `resolver_version`, and `provisional=true`. `afk_run_id` is nullable (attributed run, or None while unresolved). |
+
+All responses use the `{status, data, error}` envelope and are protected by the
+global API-key middleware, like every other non-`/health` route.
+
 ---
 
 ## Frontend Dashboard (Aurora Glass)
@@ -268,6 +297,7 @@ The dashboard polls the Gateway REST API every 30 seconds (client metadata is ca
 | **Agent Usage** | `/api/v1/usage/aggregates?group_by=agent` | Dynamic per-agent aggregate rows (token breakdown, estimated cost, request count), grouped by recorded agent identity with missing identities as `unknown`, ordered by total token usage descending |
 | **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status |
 | **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with session title, status, model, costs, and a detail overlay showing session context (title, model, code changes) and todo progress |
+| **AFK Outcomes** | `/api/v1/afk-outcomes/runs`, `/api/v1/afk-outcomes/runs/{afk_run_id}` | AFK run list (RunStatus and EngineeringOutcomeStatus badges) whose rows open the chain detail overlay — issue → run → sessions → agents → tokens/cost → change_request → commits → review cycles → outcome — with per-link correlation provenance (method, confidence, evidence, resolver version) and visibly-marked provisional/inferred links |
 
 The dashboard uses the same authentication as the REST API — if the Gateway runs in production mode (`GATEWAY_ENV=production`) with an API key, the dashboard will need one. For local development, use `GATEWAY_ENV=development` to run without authentication.
 
@@ -310,10 +340,12 @@ opencode-gateway/
 │   │   ├── admin_resolve_source_identity.py  # POST /admin/resolve-source-identity
 │   │   ├── cursor.py             # GET /cursor collector cursor endpoint
 │   │   ├── ingest.py             # POST /ingest telemetry endpoint
-│   │   └── usage.py              # GET aggregates, records, sessions
+│   │   ├── usage.py              # GET aggregates, records, sessions
+│   │   └── afk_outcomes.py       # GET /api/v1/afk-outcomes (runs, entities, correlations — read-only)
 │   ├── consumer/
 │   │   ├── __init__.py           # Module init, exports Consumer class
 │   │   ├── consumer.py           # Kafka consumer bridge (separate container)
+│   │   ├── afk_consumer.py       # Live AFK outcome consumer (own consumer group)
 │   │   └── models.py             # Consumer-side Pydantic models for ingest payloads
 │   ├── core/
 │   │   ├── __init__.py
@@ -331,7 +363,8 @@ opencode-gateway/
 │   │       ├── __init__.py
 │   │       ├── identity.py       # Pydantic schemas for clients, tokens & quarantined identities
 │   │       ├── reconciliation.py # Pydantic schemas for historical reconciliation
-│   │       └── usage.py          # Pydantic schemas for usage reporting
+│   │       ├── usage.py          # Pydantic schemas for usage reporting
+│   │       └── afk.py            # Pydantic schemas for AFK outcomes API responses
 │   └── db/
 │       ├── session.py            # DatabasePool (asyncpg wrapper)
 │       ├── schema.py             # Schema management (delegates to Alembic)
@@ -341,15 +374,22 @@ opencode-gateway/
 │           ├── __init__.py
 │           ├── base.py           # SQLAlchemy declarative base
 │           ├── identity.py       # ORM models: OpenCodeClient, CollectorCredential
-│           └── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
+│           ├── ingest.py         # ORM models: SourceDatabase, Session, UsageRecord, IngestBatch, etc.
+│           └── afk.py            # ORM models: AFKRun, EngineeringEntity, delivery log, unresolved correlations
+├── afk_outcomes/                 # Pure-domain AFK outcome package (models, serialization, correlation engine, provider adapters, repository)
+├── scripts/
+│   └── afk_backfill.py           # AFK outcome backfill/reconciliation CLI (--dry-run, --show-evidence)
 ├── frontend/                     # Aurora Glass telemetry dashboard (HTML/CSS/JS SPA)
 ├── tests/                        # Foundation tests (more to be added)
 ├── docs/
-│   └── adr/                      # Architecture Decision Records
+│   ├── adr/                      # Architecture Decision Records
+│   └── afk-outcome-validation.md # AFK reconstruction validation findings (#450)
 ├── alembic/                      # Alembic migrations
 ├── .env.example
 ├── docker-compose.yaml
 ├── Dockerfile
+├── Dockerfile.afk-consumer       # AFK outcome consumer container (separate deployment)
+├── k8s/                          # Kubernetes manifests (gateway + consumers)
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md

@@ -1,0 +1,136 @@
+{
+  "provider": "github",
+  "repository": "weiyentan/opencode-gateway",
+  "run": {
+    "title": "Develop-Loop: Consolidated run — Implemented issues #437, #438, #439, #440",
+    "status": "completed",
+    "started_at": "2026-08-13T08:00:00Z",
+    "finished_at": "2026-08-13T10:10:29Z",
+    "external_session_id": "ses_01J4T2P0000000000000000000",
+    "session_id": "1f9c3a6e-0000-4000-8000-000000000001"
+  },
+  "issues": [
+    {
+      "number": 436,
+      "title": "Refactor dashboard date-range state into a shared hook",
+      "state": "open",
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-12T11:00:00Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/436"
+    },
+    {
+      "number": 437,
+      "title": "Add agent group-by dimension to usage aggregates",
+      "state": "closed",
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-10T09:00:00Z",
+      "closed_at": "2026-08-13T10:10:29Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/437"
+    },
+    {
+      "number": 438,
+      "title": "Expose agent identity on aggregate response rows",
+      "state": "closed",
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-10T09:05:00Z",
+      "closed_at": "2026-08-13T10:10:29Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/438"
+    },
+    {
+      "number": 439,
+      "title": "Render agent aggregates in Aurora Glass with compact token breakdown",
+      "state": "closed",
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-11T09:00:00Z",
+      "closed_at": "2026-08-13T10:10:29Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/439"
+    },
+    {
+      "number": 440,
+      "title": "Cover agent-grouped aggregates with query-count tests",
+      "state": "closed",
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-11T09:05:00Z",
+      "closed_at": "2026-08-13T10:10:29Z",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/issues/440"
+    }
+  ],
+  "change_requests": [
+    {
+      "number": 441,
+      "title": "Implement issue #265: S3: Surface todo items end-to-end",
+      "state": "merged",
+      "merged": true,
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-13T07:30:00Z",
+      "merged_at": "2026-08-13T09:50:00Z",
+      "head": {"ref": "ai/feat/issues-265", "sha": "9d38b6697fbc19d29be119283fda970893b9e129"},
+      "base": {"ref": "master"},
+      "body": "Implements issue #265.",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/pull/441"
+    },
+    {
+      "number": 442,
+      "title": "Develop-Loop: Consolidated run — Implemented issues #437, #438, #439, #440",
+      "state": "merged",
+      "merged": true,
+      "user": {"login": "wyautomation"},
+      "created_at": "2026-08-13T08:00:00Z",
+      "merged_at": "2026-08-13T10:10:29Z",
+      "head": {"ref": "ai/feat/issues-437-438-439-440", "sha": "337c0116775c51abf03d90e73a9afdcee0aef01a"},
+      "base": {"ref": "master"},
+      "body": "Resolves #437, resolves #438, resolves #439, resolves #440.\n\nFollow-up tracked in #436.",
+      "html_url": "https://github.com/weiyentan/opencode-gateway/pull/442"
+    }
+  ],
+  "commits": [
+    {
+      "sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+      "message": "feat: add agent group-by dimension to usage aggregates (#437)",
+      "author": {"name": "wyautomation", "date": "2026-08-13T09:00:00Z"}
+    },
+    {
+      "sha": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a",
+      "message": "test: query-count coverage for agent grouping (#438)",
+      "author": {"name": "wyautomation", "date": "2026-08-13T09:30:00Z"}
+    },
+    {
+      "sha": "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b",
+      "message": "frontend: render agent aggregates with token breakdown (#439, #440)",
+      "author": {"name": "wyautomation", "date": "2026-08-13T10:00:00Z"}
+    },
+    {
+      "sha": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b2c",
+      "message": "chore: apply #441 review feedback to agent grouping",
+      "author": {"name": "wyautomation", "date": "2026-08-13T09:45:00Z"}
+    },
+    {
+      "sha": "337c0116775c51abf03d90e73a9afdcee0aef01a",
+      "message": "Develop-Loop: Consolidated run — Implemented issues #437, #438, #439, #440 (#442)",
+      "author": {"name": "wyautomation", "date": "2026-08-13T10:10:29Z"}
+    }
+  ],
+  "reviews": [
+    {
+      "id": 481234,
+      "state": "approved",
+      "submitted_at": "2026-08-13T10:08:00Z",
+      "user": {"login": "gatekeeper-bot"},
+      "commit_id": "337c0116775c51abf03d90e73a9afdcee0aef01a"
+    }
+  ],
+  "merge_events": [
+    {
+      "change_request_number": 441,
+      "merged_at": "2026-08-13T09:50:00Z",
+      "actor": "wyautomation",
+      "commit_sha": "9d38b6697fbc19d29be119283fda970893b9e129"
+    },
+    {
+      "change_request_number": 442,
+      "merged_at": "2026-08-13T10:10:29Z",
+      "actor": "wyautomation",
+      "commit_sha": "337c0116775c51abf03d90e73a9afdcee0aef01a"
+    }
+  ]
+}

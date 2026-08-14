@@ -1,0 +1,121 @@
+---
+# Kubernetes Deployment for the OpenCode Gateway AFK Outcome Consumer.
+#
+# This consumer reads provider webhook events from the config-driven
+# provider-events topic (``afk.events``) in its OWN consumer group
+# (``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
+# group), maps message types to canonical engineering events, and writes
+# them to Postgres in a single transaction per message.  A scheduled
+# reconciliation loop reuses the backfill engine to converge terminal
+# states (merged/closed) the topic does not carry.
+#
+#   kubectl apply -f k8s/afk-consumer-deployment.yaml
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencode-afk-outcomes-consumer
+  labels:
+    app: opencode-gateway
+    component: afk-outcomes-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode-gateway
+      component: afk-outcomes-consumer
+  template:
+    metadata:
+      labels:
+        app: opencode-gateway
+        component: afk-outcomes-consumer
+    spec:
+      containers:
+        - name: opencode-afk-outcomes-consumer
+          image: ${REGISTRY}/opencode-gateway-afk-consumer:${IMAGE_TAG}
+          command: ["python", "-m", "app.consumer.afk_consumer"]
+          env:
+            - name: GATEWAY_KAFKA_BROKERS
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: kafka-brokers
+            - name: GATEWAY_AFK_OUTCOMES_TOPIC
+              value: "afk.events"
+            - name: GATEWAY_AFK_OUTCOMES_DLQ_TOPIC
+              value: "afk.events-dlq"
+            - name: GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID
+              value: "opencode-outcomes"
+            - name: GATEWAY_AFK_OUTCOMES_PROVIDER
+              value: "github"
+            # The consumer always needs a repository to reconcile — the
+            # Settings validator fires on startup when this flag is on and
+            # the repository is empty (misconfigured deployments fail fast).
+            - name: GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED
+              value: "true"
+            - name: GATEWAY_AFK_OUTCOMES_REPOSITORY
+              value: ""
+            - name: GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS
+              value: "3600"
+            - name: GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS
+              value: "86400"
+            - name: GATEWAY_DATABASE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-host
+            - name: GATEWAY_DATABASE_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-port
+            - name: GATEWAY_DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-name
+            - name: GATEWAY_DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-user
+            - name: GATEWAY_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-password
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: github-token
+                  optional: true
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: gitlab-token
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Liveness probe: verifies PID 1 is alive AND its /proc/1/cmdline
+          # contains "app.consumer.afk_consumer". The exec-form `command`
+          # above makes the consumer PID 1 by construction, so the probe
+          # checks the consumer process itself.
+          #
+          # This probe command MUST stay byte-identical with the
+          # Dockerfile.afk-consumer HEALTHCHECK command.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os,sys; os.kill(1,0); sys.exit(0 if b'app.consumer.afk_consumer' in open('/proc/1/cmdline','rb').read() else 1)"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      restartPolicy: Always

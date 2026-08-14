@@ -5,7 +5,7 @@ description = "OpenCode Gateway — observability service for headless OpenCode"
 requires-python = ">=3.12"
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "afk_outcomes*"]
 exclude = ["alembic*", "frontend*", "tests*"]
 
 [tool.pytest.ini_options]

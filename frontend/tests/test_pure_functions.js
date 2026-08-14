@@ -146,6 +146,23 @@ elementRegistry['ar-filter-agent'] = arFilterAgentEl;
 elementRegistry['ar-filter-status'] = arFilterStatusEl;
 elementRegistry['ar-page-size'] = arPageSizeEl;
 
+// AFK Outcomes fakes (issue #453): the runs-list tbody and the chain detail
+// overlay elements.  Registered before loadRealAppJs so app.js captures them
+// in els (like the agent-runs fakes above); renderAfkOutcomesTable writes its
+// rows into afk-runs-tbody and renderAfkRunDetail writes the chain HTML into
+// afk-detail-body.  The overlay/title/close fakes back the open/close wiring
+// test (openAfkRunDetail flips afk-detail-overlay to visible).
+var afkRunsTbodyEl = makeFakeElement('afk-runs-tbody');
+var afkDetailOverlayEl = makeFakeElement('afk-detail-overlay');
+var afkDetailTitleEl = makeFakeElement('afk-detail-title');
+var afkDetailBodyEl = makeFakeElement('afk-detail-body');
+var afkDetailCloseEl = makeFakeElement('afk-detail-close');
+elementRegistry['afk-runs-tbody'] = afkRunsTbodyEl;
+elementRegistry['afk-detail-overlay'] = afkDetailOverlayEl;
+elementRegistry['afk-detail-title'] = afkDetailTitleEl;
+elementRegistry['afk-detail-body'] = afkDetailBodyEl;
+elementRegistry['afk-detail-close'] = afkDetailCloseEl;
+
 // Browser-history stub (issue #426): records pushState URLs so tests can
 // verify that Agent Runs page changes persist to the URL without touching
 // the table DOM (row content changes only through the normal fetch path).
@@ -254,6 +271,23 @@ var historyStub = {
   // render function (renders through the fake 'agent-usage-tbody' element).
   window.buildAgentUsageRows = sandboxWindow.buildAgentUsageRows;
   window.renderAgentUsageTable = sandboxWindow.renderAgentUsageTable;
+  // Issue #453: AFK Outcomes view — the locked-vocabulary outcome/run badge
+  // mappings, confidence/evidence formatters, provisional-link predicate, the
+  // canonical chain composer, and the render functions (string builders plus
+  // the tbody/detail-body writers), exposed on the same window test seam.
+  window.outcomeStatusBadgeClass = sandboxWindow.outcomeStatusBadgeClass;
+  window.outcomeStatusLabel = sandboxWindow.outcomeStatusLabel;
+  window.afkRunStatusBadgeClass = sandboxWindow.afkRunStatusBadgeClass;
+  window.fmtConfidence = sandboxWindow.fmtConfidence;
+  window.fmtEvidence = sandboxWindow.fmtEvidence;
+  window.isProvisionalLink = sandboxWindow.isProvisionalLink;
+  window.buildAfkChain = sandboxWindow.buildAfkChain;
+  window.renderAfkEntityLink = sandboxWindow.renderAfkEntityLink;
+  window.renderAfkSessionLink = sandboxWindow.renderAfkSessionLink;
+  window.renderAfkChainStep = sandboxWindow.renderAfkChainStep;
+  window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
+  window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
+  window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2055,18 +2089,18 @@ console.log('\u25B6 index.html markup (smoke check)');
   var indexPath = path.join(__dirname, '..', 'index.html');
   var html = fs.readFileSync(indexPath, 'utf8');
 
-  // Three tabs: top-nav item + matching content panel (the Sessions tab was
-  // merged into Agent Runs — issue #402)
-  var tabs = ['overview', 'agent-runs', 'clients-projects'];
+  // Four tabs: top-nav item + matching content panel (the Sessions tab was
+  // merged into Agent Runs — issue #402; AFK Outcomes added — issue #453)
+  var tabs = ['overview', 'agent-runs', 'clients-projects', 'afk-outcomes'];
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '"') !== -1, 'top nav: item for tab "' + tab + '" exists');
     assert(html.indexOf('id="tab-' + tab + '"') !== -1, 'top nav: tab-content panel #tab-' + tab + ' exists');
   });
 
   // Keyboard reachability: every top-nav item is focusable (tabindex="0"),
-  // so tabbing enters Overview → Agent Runs → Clients / Projects.
+  // so tabbing enters Overview → Agent Runs → Clients / Projects → AFK Outcomes.
   var navItemCount = (html.match(/class="top-nav-item/g) || []).length;
-  assert(navItemCount === 3, 'top nav: exactly three top-nav-item elements (' + navItemCount + ' found)');
+  assert(navItemCount === 4, 'top nav: exactly four top-nav-item elements (' + navItemCount + ' found)');
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '" tabindex="0"') !== -1,
       'top nav: tab "' + tab + '" is keyboard-focusable (tabindex="0")');
@@ -4018,6 +4052,368 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
     'index.html: the Agent Usage panel is the last panel in the Overview left column (bottom-left)');
   assert(colLeft.indexOf('panel-collectors') < colLeft.indexOf('panel-agent-usage'),
     'index.html: the Agent Usage panel sits below the Collectors panel');
+})();
+
+// ── AFK Outcomes view (issue #453) ──────────────────────────────────────
+// Pure helpers for the first AFK-outcomes UI: outcome/run badge mapping
+// (locked EngineeringOutcomeStatus + RunStatus vocabulary), confidence and
+// evidence formatting, provisional-link predicate, canonical chain
+// composition, and the render functions (string builders + tbody/detail-body
+// writers exercised through the fakes registered above).
+
+console.log('\u25B6 AFK Outcomes — outcome badge mapping (issue #453)');
+
+(function () {
+  assert(window.outcomeStatusBadgeClass('merged') === 'badge-merged', 'merged \u2192 badge-merged');
+  assert(window.outcomeStatusBadgeClass('closed') === 'badge-closed', 'closed \u2192 badge-closed');
+  assert(window.outcomeStatusBadgeClass('abandoned') === 'badge-abandoned', 'abandoned \u2192 badge-abandoned');
+  assert(window.outcomeStatusBadgeClass('open') === 'badge-open', 'open \u2192 badge-open');
+  assert(window.outcomeStatusBadgeClass(null) === 'badge-unknown', 'null \u2192 badge-unknown');
+  assert(window.outcomeStatusBadgeClass('anything') === 'badge-unknown', 'unknown \u2192 badge-unknown');
+
+  assert(window.outcomeStatusLabel('merged') === 'merged', 'label: merged verbatim');
+  assert(window.outcomeStatusLabel('closed') === 'closed', 'label: closed verbatim');
+  assert(window.outcomeStatusLabel('abandoned') === 'abandoned', 'label: abandoned verbatim');
+  assert(window.outcomeStatusLabel('open') === 'still open', 'label: open \u2192 "still open" (issue\'s still_open)');
+  assert(window.outcomeStatusLabel(null) === '--', 'label: null \u2192 --');
+})();
+
+console.log('\u25B6 AFK Outcomes — run status badge mapping (issue #453)');
+
+(function () {
+  assert(window.afkRunStatusBadgeClass('running') === 'badge-running', 'running \u2192 badge-running');
+  assert(window.afkRunStatusBadgeClass('completed') === 'badge-completed', 'completed \u2192 badge-completed');
+  assert(window.afkRunStatusBadgeClass('blocked') === 'badge-blocked', 'blocked \u2192 badge-blocked');
+  assert(window.afkRunStatusBadgeClass('stale') === 'badge-stale', 'stale \u2192 badge-stale');
+  assert(window.afkRunStatusBadgeClass('failed') === 'badge-failed', 'failed \u2192 badge-failed');
+  assert(window.afkRunStatusBadgeClass('cancelled') === 'badge-unknown', 'cancelled \u2192 badge-unknown');
+  assert(window.afkRunStatusBadgeClass('timed_out') === 'badge-stale', 'timed_out \u2192 badge-stale');
+  assert(window.afkRunStatusBadgeClass('nonsense') === 'badge-unknown', 'unknown \u2192 badge-unknown');
+})();
+
+console.log('\u25B6 AFK Outcomes — confidence + evidence formatting (issue #453)');
+
+(function () {
+  assert(window.fmtConfidence(1.0) === '100%', '1.0 \u2192 100%');
+  assert(window.fmtConfidence(0.1) === '10%', '0.1 \u2192 10%');
+  assert(window.fmtConfidence(0.05) === '5%', '0.05 \u2192 5%');
+  assert(window.fmtConfidence(0) === '0%', '0 \u2192 0%');
+  assert(window.fmtConfidence('0.25') === '25%', '"0.25" \u2192 25%');
+  assert(window.fmtConfidence(null) === '--', 'null \u2192 --');
+  assert(window.fmtConfidence(NaN) === '--', 'NaN \u2192 --');
+
+  assert(window.fmtEvidence(null) === '', 'evidence null \u2192 empty');
+  assert(window.fmtEvidence([]) === '', 'evidence [] \u2192 empty');
+  assert(window.fmtEvidence([{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }]) ===
+    'issue_reference \u2190 change_request:442 (resolves #437)',
+    'single evidence item \u2192 kind \u2190 source (detail)');
+  assert(window.fmtEvidence([
+    { kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' },
+    { kind: 'title_match', source_entity_id: 'change_request:442' }
+  ]) === 'issue_reference \u2190 change_request:442 (resolves #437); title_match \u2190 change_request:442',
+    'multiple evidence items joined by "; " (no detail \u2192 no parens)');
+})();
+
+console.log('\u25B6 AFK Outcomes — provisional/inferred link predicate (issue #453)');
+
+(function () {
+  assert(window.isProvisionalLink({ provisional: true }) === true, 'provisional:true \u2192 provisional');
+  assert(window.isProvisionalLink({ inferred: true }) === true, 'inferred:true \u2192 provisional');
+  assert(window.isProvisionalLink({ provisional: false, inferred: false }) === false, 'both false \u2192 not provisional');
+  assert(window.isProvisionalLink({}) === false, 'empty link \u2192 not provisional');
+  assert(window.isProvisionalLink(null) === false, 'null \u2192 not provisional');
+})();
+
+console.log('\u25B6 AFK Outcomes — canonical chain composition (issue #453)');
+
+(function () {
+  var detail = {
+    issues: [{ entity_id: 'issue:437' }],
+    run: { afk_run_id: 'run-1' },
+    sessions: [{ session_id: 's1' }],
+    agents: ['code-editor-senior'],
+    usage: { active_tokens: 1 },
+    change_requests: [{ entity_id: 'change_request:442' }],
+    commits: [{ entity_id: 'commit:abc1234' }],
+    reviews: [{ entity_id: 'review:1' }],
+    merge_events: [{ entity_id: 'merge_event:442' }],
+    outcome: { status: 'merged' }
+  };
+  var steps = window.buildAfkChain(detail);
+  var keys = steps.map(function (s) { return s.key; });
+  assert(keys.join(',') === 'issues,run,sessions,agents,usage,change_requests,commits,reviews,outcome',
+    'canonical step order: issue \u2192 run \u2192 sessions \u2192 agents \u2192 tokens/cost \u2192 change_request \u2192 commits \u2192 review cycles \u2192 outcome');
+  assert(steps[0].items[0].entity_id === 'issue:437', 'issues step carries the issue links');
+  assert(steps[1].run.afk_run_id === 'run-1', 'run step carries the run aggregate');
+  assert(steps[2].items[0].session_id === 's1', 'sessions step carries the session links');
+  assert(steps[3].items[0] === 'code-editor-senior', 'agents step carries the agent identities');
+  assert(steps[4].usage.active_tokens === 1, 'usage step carries the tokens/cost aggregate');
+  assert(steps[5].items[0].entity_id === 'change_request:442', 'change_request step carries the change request');
+  assert(steps[6].items[0].entity_id === 'commit:abc1234', 'commits step carries the commit links');
+  assert(steps[7].items[0].entity_id === 'review:1', 'reviews step carries the review cycles');
+  assert(steps[8].outcome.status === 'merged' && steps[8].mergeEvents[0].entity_id === 'merge_event:442',
+    'outcome step carries the outcome + merge events');
+  assert(window.buildAfkChain(null).length === 9, 'null detail \u2192 9 empty steps (no throw)');
+})();
+
+console.log('\u25B6 AFK Outcomes — entity/session link rendering (issue #453)');
+
+(function () {
+  var resolved = window.renderAfkEntityLink({
+    entity_id: 'issue:437', entity_type: 'issue', role: 'resolved',
+    correlation_method: 'issue_reference', correlation_confidence: 1.0,
+    resolver_version: '1', provisional: false,
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }]
+  });
+  assert(resolved.indexOf('afk-provisional') === -1, 'resolved link has no provisional marker');
+  assert(resolved.indexOf('badge-completed') !== -1, 'resolved role \u2192 badge-completed');
+  assert(resolved.indexOf('issue_reference') !== -1 && resolved.indexOf('100%') !== -1 &&
+         resolved.indexOf('resolver v1') !== -1,
+    'provenance line carries method + confidence + resolver version');
+  assert(resolved.indexOf('evidence:') !== -1 && resolved.indexOf('change_request:442') !== -1,
+    'evidence line rendered');
+
+  var provisional = window.renderAfkEntityLink({
+    entity_id: 'issue:436', entity_type: 'issue', role: 'referenced',
+    correlation_method: 'issue_reference', correlation_confidence: 0.1,
+    resolver_version: '1', provisional: true, evidence: []
+  });
+  assert(provisional.indexOf('afk-provisional') !== -1 && provisional.indexOf('provisional') !== -1,
+    'referenced (provisional) link is visibly marked');
+  assert(provisional.indexOf('badge-stale') !== -1, 'referenced role \u2192 badge-stale');
+  assert(provisional.indexOf('10%') !== -1, 'provisional link still shows its confidence');
+
+  var session = window.renderAfkSessionLink({
+    external_session_id: 'ses_01', agent: 'code-editor-senior', inferred: true,
+    message_count: 42, total_input_tokens: 5000, total_output_tokens: 3000,
+    total_cache_read_tokens: 1000, total_cache_write_tokens: 0,
+    total_estimated_cost_usd: 1.2345
+  });
+  assert(session.indexOf('afk-provisional') !== -1 && session.indexOf('inferred') !== -1,
+    'session attachment is visibly marked inferred');
+  assert(session.indexOf('5000') !== -1 || session.indexOf('5.0K') !== -1,
+    'session carries the compact Token Breakdown');
+  assert(session.indexOf('cache read') !== -1, 'session token breakdown shows the cache line when cache_read > 0');
+})();
+
+console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #453)');
+
+(function () {
+  var canon = {
+    run: { afk_run_id: '01KZX9M4G80000000000000000', provider: 'github', status: 'completed',
+           title: 'Develop-Loop: Consolidated run', started_at: '2026-08-13T09:00:00Z',
+           finished_at: '2026-08-13T10:10:29Z', outcome_status: 'merged' },
+    outcome: { status: 'merged', change_request_ids: ['change_request:442'],
+               resolved_issue_ids: ['issue:437', 'issue:438', 'issue:439', 'issue:440'],
+               merge_event_id: 'merge_event:442', merged_at: '2026-08-13T10:10:29Z' },
+    issues: [
+      { entity_id: 'issue:437', entity_type: 'issue', external_id: '437', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'issue_reference',
+        correlation_confidence: 1.0, evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+        resolver_version: '1', provisional: false },
+      { entity_id: 'issue:436', entity_type: 'issue', external_id: '436', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'referenced', correlation_method: 'issue_reference',
+        correlation_confidence: 0.1, evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'mentioned #436' }],
+        resolver_version: '1', provisional: true }
+    ],
+    change_requests: [
+      { entity_id: 'change_request:442', entity_type: 'change_request', external_id: '442', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'issue_reference',
+        correlation_confidence: 1.0, evidence: [{ kind: 'title_match', source_entity_id: 'change_request:442', detail: 'exact title' }],
+        resolver_version: '1', provisional: false }
+    ],
+    reviews: [
+      { entity_id: 'review:442', entity_type: 'review', external_id: '442', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'temporal_inference',
+        correlation_confidence: 0.9, evidence: [], resolver_version: '1', provisional: false }
+    ],
+    commits: [
+      { entity_id: 'commit:abc1234', entity_type: 'commit', external_id: 'abc1234', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'commit_issue_reference',
+        correlation_confidence: 1.0, evidence: [], resolver_version: '1', provisional: false }
+    ],
+    merge_events: [
+      { entity_id: 'merge_event:442', entity_type: 'merge_event', external_id: '442', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'issue_reference',
+        correlation_confidence: 1.0, evidence: [], resolver_version: '1', provisional: false }
+    ],
+    sessions: [
+      { session_id: '1f9c3a6e-0000-4000-8000-000000000001', external_session_id: 'ses_01J4T2P0000000000000000000',
+        started_at: '2026-08-13T09:00:00Z', finished_at: '2026-08-13T10:10:29Z', inferred: true,
+        agent: 'code-editor-senior', message_count: 42, total_input_tokens: 5000, total_output_tokens: 3000,
+        total_cache_read_tokens: 1000, total_cache_write_tokens: 500, total_estimated_cost_usd: 1.2345 }
+    ],
+    agents: ['code-editor-senior'],
+    usage: { active_tokens: 8000, input_tokens: 5000, output_tokens: 3000, cache_read_tokens: 1000,
+             cache_write_tokens: 500, estimated_cost_usd: 1.2345, message_count: 42, session_count: 1 }
+  };
+
+  window.renderAfkRunDetail(canon);
+  var html = afkDetailBodyEl.innerHTML;
+
+  // Canonical order is preserved in the rendered chain.
+  var order = ['issues', 'run', 'sessions', 'agents', 'usage', 'change_requests', 'commits', 'reviews', 'outcome'];
+  var lastIdx = -1;
+  var ordered = true;
+  order.forEach(function (key) {
+    var idx = html.indexOf('data-step="' + key + '"');
+    if (idx === -1 || idx <= lastIdx) ordered = false;
+    lastIdx = idx;
+  });
+  assert(ordered, 'rendered chain follows the canonical step order');
+
+  assert(html.indexOf('badge-merged') !== -1 && html.indexOf('merged') !== -1,
+    'outcome renders the merged status badge');
+  assert(html.indexOf('provisional') !== -1 && html.indexOf('afk-provisional') !== -1,
+    'provisional issue link (#436) is visibly marked');
+  assert(html.indexOf('inferred') !== -1, 'inferred session attachment is visibly marked');
+  assert(html.indexOf('100%') !== -1, 'confidence is visible on reconstructed links');
+  assert(html.indexOf('issue_reference') !== -1 && html.indexOf('change_request:442') !== -1,
+    'evidence source identifiers are visible');
+  assert(html.indexOf('Active Tokens') !== -1, 'tokens/cost step shows the Active Tokens aggregate');
+  assert(html.indexOf('data-step="commits"') !== -1 && html.indexOf('commit:abc1234') !== -1 &&
+         html.indexOf('commit_issue_reference') !== -1,
+    'commits step renders the commit links with correlation provenance');
+
+  // Escaping: an entity id with HTML metacharacters must not inject markup.
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'r1', status: 'completed', outcome_status: 'open' },
+    issues: [{ entity_id: '<script>alert(1)</script>', entity_type: 'issue', role: 'resolved',
+               correlation_method: 'issue_reference', correlation_confidence: 1.0, evidence: [], resolver_version: '1', provisional: false }]
+  });
+  assert(afkDetailBodyEl.innerHTML.indexOf('<script>alert') === -1,
+    'entity id is HTML-escaped (no markup injection)');
+
+  // Runs list rendering.
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'run-1', provider: 'github', status: 'completed', title: 'Consolidated run',
+        outcome_status: 'merged', started_at: '2026-08-13T09:00:00Z', last_seen_at: '2026-08-13T10:10:29Z' },
+      { afk_run_id: 'run-2', provider: 'gitlab', status: 'failed', title: null,
+        outcome_status: 'abandoned', started_at: null, last_seen_at: null }
+    ],
+    total: 2
+  });
+  var runsHtml = afkRunsTbodyEl.innerHTML;
+  assert(runsHtml.indexOf('afk-run-row') !== -1 && runsHtml.indexOf('data-id="run-1"') !== -1,
+    'runs list renders clickable rows keyed by afk_run_id');
+  assert(runsHtml.indexOf('badge-completed') !== -1 && runsHtml.indexOf('badge-merged') !== -1,
+    'runs list renders Status (completed) + Outcome (merged) badges');
+  assert(runsHtml.indexOf('badge-failed') !== -1 && runsHtml.indexOf('badge-abandoned') !== -1,
+    'runs list renders the failed run + abandoned outcome distinctly');
+
+  window.renderAfkOutcomesTable({ items: [] });
+  assert(afkRunsTbodyEl.innerHTML.indexOf('No AFK runs') !== -1,
+    'runs list renders the empty state');
+})();
+
+// A failed /afk-outcomes/runs fetch must mark ONLY the AFK Outcomes panel
+// stale (via the PANEL_ENDPOINTS mapping + the afkRunsFetchError channel),
+// so the panel retains its last successful rows with the stale/error
+// indicator — matching the established convention for every other panel
+// (acceptance criterion 4).  Mirrors the Agent Usage panel isolation test.
+console.log('\u25B6 AFK Outcomes — panel status isolation on afkRuns failure (issue #453)');
+
+(function () {
+  var afkFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
+  assert(afkFail['afk-outcomes'] === 'stale',
+    'afkRuns failure: the AFK Outcomes panel resolves to stale (PANEL_ENDPOINTS entry)');
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-usage', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(afkFail[panelId] === 'ok',
+        'afkRuns failure: unrelated panel "' + panelId + '" stays ok');
+    });
+
+  // No afkRuns error \u2192 the panel is ok (freshness resolves normally)
+  var allOk = window.resolvePanelStatuses({});
+  assert(allOk['afk-outcomes'] === 'ok', 'no errors: the AFK Outcomes panel resolves to ok');
+
+  // Other single-endpoint failures do NOT stale the AFK Outcomes panel
+  assert(window.resolvePanelStatuses({ aggByModel: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ health: 'down' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ agentRuns: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ aggClientProject: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ aggByAgent: 'boom' })['afk-outcomes'] === 'ok',
+    'model/health/agent-runs/client-project/agent failures leave the AFK Outcomes panel ok');
+})();
+
+console.log('\u25B6 AFK Outcomes — last-successful-rows retention + stale indicator (issue #453)');
+
+(function () {
+  // A stale AFK Outcomes panel with previous data skips the re-render, so the
+  // last successful rows stay on screen (shouldRenderPanel discipline).
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes') === false,
+    'stale AFK Outcomes panel with previous data \u2192 render skipped (last rows retained)');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'ok', updatedAt: 500000 } }, 'afk-outcomes') === true,
+    'ok AFK Outcomes panel still renders');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: null } }, 'afk-outcomes') === true,
+    'stale AFK Outcomes panel with NO previous data renders (empty/error state shown)');
+
+  // The panel title swaps in the existing "Showing previous data" warning.
+  var now = 1000000;
+  var f = window.computePanelFreshness({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes', now);
+  assert(f !== null && f.status === 'stale' && f.label === 'Showing previous data',
+    'stale AFK Outcomes panel shows the "Showing previous data" freshness label');
+
+  // Render wiring: the panel honors the retention guard and paints the
+  // existing error indicator into its empty state on a failed fetch.
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  var renderSrc = appJsSource.slice(appJsSource.indexOf('function renderAfkOutcomesTable'),
+                                    appJsSource.indexOf('function openAfkRunDetail'));
+  assert(renderSrc.indexOf("applyPanelFreshness('afk-outcomes')") !== -1 &&
+         renderSrc.indexOf("shouldRenderPanel(panelStates, 'afk-outcomes')") !== -1,
+    'app.js: renderAfkOutcomesTable applies freshness and skips the re-render when stale');
+  assert(renderSrc.indexOf('afkRunsFetchError') !== -1,
+    'app.js: renderAfkOutcomesTable shows the fetch-error indicator (afkRunsFetchError)');
+
+  // The critical wiring: resolvePanelStatesAfterFetch must merge the separate
+  // afkRunsFetchError channel into the error map (exactly like agentRuns), so
+  // a failed runs fetch resolves the panel to 'stale' instead of 'ok'.
+  var resolveSrc = appJsSource.slice(appJsSource.indexOf('function resolvePanelStatesAfterFetch'),
+                                     appJsSource.indexOf('function updateLastRefreshed'));
+  assert(resolveSrc.indexOf('afkRuns: afkRunsFetchError') !== -1,
+    'app.js: resolvePanelStatesAfterFetch merges afkRuns: afkRunsFetchError into the error map');
+})();
+
+console.log('\u25B6 AFK Outcomes — openAfkRunDetail fetch + 404 handling (issue #453)');
+
+(function () {
+  pendingAsyncBlocks++;
+  appJsSandbox.fetch = function (url) {
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({ status: 'ok', data: { run: { afk_run_id: 'run-1', status: 'completed', outcome_status: 'merged' } } });
+      }
+    });
+  };
+  window.openAfkRunDetail('run-1').then(function () {
+    assert(afkDetailOverlayEl.classList.contains('visible'), 'openAfkRunDetail shows the overlay');
+    assert(afkDetailBodyEl.innerHTML.indexOf('afk-chain') !== -1, 'openAfkRunDetail renders the chain');
+
+    // 404 → distinct "not found" empty state (no unhandled rejection).
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({ ok: false, status: 404 });
+    };
+    pendingAsyncBlocks++;
+    // The 404 is intentional: the production openAfkRunDetail catch emits an
+    // EXPECTED console.error — suppress it for this block and restore it once
+    // the assertions run (mirrors the stale-while-failure Nit 3 convention).
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    window.openAfkRunDetail('missing').then(function () {
+      assert(afkDetailBodyEl.innerHTML.indexOf('AFK run not found') !== -1,
+        '404 renders the distinct "not found" empty state');
+      appJsSandbox.console.error = savedConsoleError; // restore the real console.error
+      // Restore a benign default fetch stub for later blocks.
+      appJsSandbox.fetch = function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
+      };
+      pendingAsyncBlocks--;
+    });
+    pendingAsyncBlocks--;
+  });
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

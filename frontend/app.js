@@ -23,6 +23,7 @@
    */
   const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
   const AGENT_RUN_LIMIT = 50;
+  const AFK_RUN_LIMIT = 50;
 
   // ── Element refs ───────────────────────────────────────────────────────
 
@@ -76,6 +77,13 @@
     cpTbody:         $('cp-tbody'),
     cpPanelSubtitle: $('cp-panel-subtitle'),
 
+    // AFK Outcomes (issue #453)
+    afkRunsTbody:    $('afk-runs-tbody'),
+    afkDetailOverlay: $('afk-detail-overlay'),
+    afkDetailTitle:  $('afk-detail-title'),
+    afkDetailBody:   $('afk-detail-body'),
+    afkDetailClose:  $('afk-detail-close'),
+
     // Date range bar
     drPreset:       $('dr-preset'),
     drCustomInputs: $('dr-custom-inputs'),
@@ -91,6 +99,8 @@
   let agentRunFilters = {};       // current filter values
   let agentRunDetail = null;      // current detail view data
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
+  let afkRunsData = null;         // latest AFK runs list response
+  let afkRunsFetchError = null;   // per-cycle fetch error for AFK runs
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -137,6 +147,7 @@
     'agent-usage':   ['aggByAgent'],
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
+    'afk-outcomes':  ['afkRuns'],
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -608,6 +619,95 @@
     return '--';
   }
 
+  // ── AFK outcome chain helpers (issue #453) ─────────────────────────────
+  // The locked EngineeringOutcomeStatus vocabulary (afk_outcomes.models) is
+  // merged / closed / abandoned / open.  "still open" is the human rendering
+  // of EngineeringOutcomeStatus.open (the issue's "still_open"); "failed" is a
+  // RunStatus (afkRunStatusBadgeClass), never an outcome status — the two are
+  // rendered from their own enums and never conflated.
+
+  /** Map an EngineeringOutcomeStatus value to a status-badge CSS class.
+   *  merged/closed/abandoned/open → dedicated classes; anything else → unknown.
+   *  @param {string|null} status
+   *  @returns {string} badge class */
+  function outcomeStatusBadgeClass(status) {
+    if (status === 'merged') return 'badge-merged';
+    if (status === 'closed') return 'badge-closed';
+    if (status === 'abandoned') return 'badge-abandoned';
+    if (status === 'open') return 'badge-open';
+    return 'badge-unknown';
+  }
+
+  /** Human label for an EngineeringOutcomeStatus value.  The "open" state
+   *  renders as "still open" (issue #453's "still_open"); all other values
+   *  pass through verbatim; null/absent → '--'. */
+  function outcomeStatusLabel(status) {
+    if (status === 'open') return 'still open';
+    return status || '--';
+  }
+
+  /** Map a RunStatus value (afk_outcomes.models.RunStatus) to a badge class.
+   *  Extends the Agent Runs statusBadgeClass with the AFK-only terminal
+   *  states failed / cancelled / timed_out. */
+  function afkRunStatusBadgeClass(status) {
+    if (status === 'running') return 'badge-running';
+    if (status === 'stale') return 'badge-stale';
+    if (status === 'completed') return 'badge-completed';
+    if (status === 'blocked') return 'badge-blocked';
+    if (status === 'failed') return 'badge-failed';
+    if (status === 'cancelled') return 'badge-unknown';
+    if (status === 'timed_out') return 'badge-stale';
+    return 'badge-unknown';
+  }
+
+  /** Format a correlation confidence (0.0–1.0) as a compact percentage label.
+   *  Null/non-numeric → '--'.  e.g. 1.0 → '100%', 0.1 → '10%'. */
+  function fmtConfidence(value) {
+    if (value == null || isNaN(Number(value))) return '--';
+    return Math.round(Number(value) * 100) + '%';
+  }
+
+  /** Format a correlation evidence list into a compact plain-text string.
+   *  Each item renders as `kind ← source_entity_id (detail)` joined by '; '.
+   *  Empty/missing → ''.  The render layer escapes the result (escHtml). */
+  function fmtEvidence(evidence) {
+    if (!Array.isArray(evidence) || evidence.length === 0) return '';
+    return evidence.map(function (e) {
+      var kind = (e && e.kind) ? e.kind : 'evidence';
+      var src = (e && e.source_entity_id) ? ' \u2190 ' + e.source_entity_id : '';
+      var detail = (e && e.detail) ? ' (' + e.detail + ')' : '';
+      return kind + src + detail;
+    }).join('; ');
+  }
+
+  /** Whether a link is provisional/inferred: an entity link is provisional
+   *  when its `provisional` flag is set (role != 'resolved'); a session link
+   *  is inferred when its `inferred` flag is set.  These low-confidence links
+   *  are marked distinctly in the UI — never rendered like explicit links. */
+  function isProvisionalLink(link) {
+    return !!(link && (link.provisional === true || link.inferred === true));
+  }
+
+  /** Compose the canonical AFK outcome chain from a RunDetail response.
+   *  Pure — returns the ordered steps (issue → run → sessions → agents →
+   *  tokens/cost → change_request → commits → review cycles → outcome) with
+   *  the data each step renders, preserving every link's correlation
+   *  provenance and provisional/inferred markers for the render layer. */
+  function buildAfkChain(detail) {
+    var d = detail || {};
+    return [
+      { key: 'issues', label: 'Issue', items: d.issues || [] },
+      { key: 'run', label: 'Run', run: d.run || null },
+      { key: 'sessions', label: 'Sessions', items: d.sessions || [] },
+      { key: 'agents', label: 'Agents', items: d.agents || [] },
+      { key: 'usage', label: 'Tokens / Cost', usage: d.usage || null },
+      { key: 'change_requests', label: 'Change Request', items: d.change_requests || [] },
+      { key: 'commits', label: 'Commits', items: d.commits || [] },
+      { key: 'reviews', label: 'Review Cycles', items: d.reviews || [] },
+      { key: 'outcome', label: 'Outcome', outcome: d.outcome || null, mergeEvents: d.merge_events || [] }
+    ];
+  }
+
   // ── Panel freshness (pure helpers — no DOM) ───────────────────────────
   // Freshness state model (issue #357): refreshDashboard() maintains a
   // per-panel state map (panelStates: panelId → { status, updatedAt }) and
@@ -1010,7 +1110,7 @@
       // Sessions + Agent Runs view (issue #402): the merged table is driven
       // by the agent-runs endpoint (a superset), and the Sessions KPI reads
       // the aggregates total row's session_count.
-      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent] =
+      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -1023,6 +1123,10 @@
           // group_by=agent query, sharing the dashboard date range and the
           // parallel-cycle fetchErrors/panelStates handling of the panels above.
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=agent'),
+          // AFK Outcomes view (issue #453): the runs list driving the AFK
+          // Outcomes tab.  List-only; the full chain is fetched on demand by
+          // openAfkRunDetail (GET /api/v1/afk-outcomes/runs/{afk_run_id}).
+          apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -1033,6 +1137,7 @@
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
       results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
       results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
+      results.afkRuns   = afkRuns.status   === 'fulfilled' ? afkRuns.value   : null;
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -1044,6 +1149,7 @@
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
       fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
       if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
+      afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
 
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
@@ -1723,6 +1829,269 @@
       }
     });
   }
+  // ── AFK Outcomes view (issue #453) ─────────────────────────────────────
+  // The first UI for the AFK outcomes domain: an "AFK Outcomes" tab whose runs
+  // list (GET /api/v1/afk-outcomes/runs) opens a detail overlay rendering the
+  // full chain (GET /api/v1/afk-outcomes/runs/{afk_run_id}) in the canonical
+  // example order — issue → run → sessions → agents → tokens/cost →
+  // change_request → commits → review cycles → merged.  Every derived link
+  // displays its
+  // correlation provenance (method / confidence / evidence / resolver_version)
+  // and provisional/inferred links are visibly marked (never rendered like
+  // explicit links).  Outcome uses the locked EngineeringOutcomeStatus
+  // vocabulary via outcomeStatusBadgeClass/outcomeStatusLabel.
+
+  /** Render the AFK runs list table: one row per run with Status (RunStatus),
+   *  Outcome (EngineeringOutcomeStatus), provider, started, and last-seen.
+   *  Rows open the /runs/{afk_run_id} detail overlay.  Follows the agent-runs
+   *  panel conventions: freshness guard, empty/error states, escHtml on every
+   *  interpolated value. */
+  function renderAfkOutcomesTable(data) {
+    applyPanelFreshness('afk-outcomes');
+    if (!shouldRenderPanel(panelStates, 'afk-outcomes')) return; // failed fetch → keep previous rows
+
+    var runs = data && data.items;
+    if (!runs || runs.length === 0) {
+      var errSuffix = afkRunsFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkRunsFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      els.afkRunsTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No AFK runs' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    runs.forEach(function (r) {
+      var runStatusCls = afkRunStatusBadgeClass(r.status);
+      var outcomeCls = outcomeStatusBadgeClass(r.outcome_status);
+      var displayTitle = r.title || shortUUID(r.afk_run_id);
+      html += '<tr class="afk-run-row" data-id="' + escHtml(r.afk_run_id) + '" tabindex="0">' +
+        '<td class="clickable afk-run-title" data-label="Run">' + escHtml(displayTitle) + '</td>' +
+        '<td data-label="Status">' + badge(r.status || '--', runStatusCls).outerHTML + '</td>' +
+        '<td data-label="Outcome">' + badge(outcomeStatusLabel(r.outcome_status), outcomeCls).outerHTML + '</td>' +
+        '<td data-label="Provider">' + escHtml(r.provider || '--') + '</td>' +
+        '<td data-label="Started">' + fmtDT(r.started_at) + '</td>' +
+        '<td data-label="Last Seen">' + fmtDT(r.last_seen_at) + '</td>' +
+        '</tr>';
+    });
+
+    els.afkRunsTbody.innerHTML = html;
+
+    var rows = els.afkRunsTbody.querySelectorAll('.afk-run-row');
+    rows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var id = row.getAttribute('data-id');
+        if (id) openAfkRunDetail(id);
+      });
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var id = row.getAttribute('data-id');
+          if (id) openAfkRunDetail(id);
+        }
+      });
+    });
+  }
+
+  /** Open the AFK outcome chain overlay for one run.  A 404 (unknown run)
+   *  renders a distinct "not found" empty state; other failures render the
+   *  generic error empty state — no unhandled exception breaks the dashboard. */
+  async function openAfkRunDetail(afkRunId) {
+    els.afkDetailOverlay.classList.add('visible');
+    els.afkDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    els.afkDetailTitle.textContent = 'AFK Outcome Chain';
+
+    try {
+      var detail = await apiFetch('/api/v1/afk-outcomes/runs/' + encodeURIComponent(afkRunId));
+      renderAfkRunDetail(detail);
+    } catch (e) {
+      var notFound = /404/.test(e && e.message);
+      els.afkDetailBody.innerHTML = '<p class="empty-state">' +
+        (notFound ? 'AFK run not found' : 'Failed to load AFK outcome chain: ' + escHtml(e.message)) +
+        '</p>';
+      console.error('AFK outcome detail fetch error:', e);
+    }
+  }
+
+  /** Render the full AFK outcome chain into the detail overlay body. */
+  function renderAfkRunDetail(detail) {
+    if (!detail || !detail.run) {
+      els.afkDetailBody.innerHTML = '<p class="empty-state">No AFK outcome data available</p>';
+      return;
+    }
+
+    var run = detail.run;
+    els.afkDetailTitle.textContent = escHtml(run.title || run.afk_run_id || 'AFK Outcome Chain');
+
+    var html = '<div class="afk-chain">';
+    buildAfkChain(detail).forEach(function (step) {
+      html += renderAfkChainStep(step);
+    });
+    html += '</div>';
+
+    els.afkDetailBody.innerHTML = html;
+  }
+
+  /** Render one chain step (from buildAfkChain) into HTML. */
+  function renderAfkChainStep(step) {
+    var body = '';
+    if (step.key === 'run') {
+      body = renderAfkRunStep(step.run);
+    } else if (step.key === 'sessions') {
+      var sessions = step.items || [];
+      body = sessions.length
+        ? sessions.map(renderAfkSessionLink).join('')
+        : '<div class="afk-empty">No sessions linked</div>';
+    } else if (step.key === 'agents') {
+      var agents = step.items || [];
+      body = agents.length
+        ? '<div class="afk-agents">' + agents.map(function (a) {
+            return '<span class="afk-agent-chip">' + escHtml(a) + '</span>';
+          }).join('') + '</div>'
+        : '<div class="afk-empty">No agents recorded</div>';
+    } else if (step.key === 'usage') {
+      body = renderAfkUsageStep(step.usage);
+    } else if (step.key === 'outcome') {
+      body = renderAfkOutcomeStep(step.outcome, step.mergeEvents);
+    } else {
+      var items = step.items || [];
+      body = items.length
+        ? items.map(renderAfkEntityLink).join('')
+        : '<div class="afk-empty">None</div>';
+    }
+
+    return '<div class="afk-chain-step" data-step="' + escHtml(step.key) + '">' +
+      '<div class="afk-chain-step-label">' + escHtml(step.label) + '</div>' +
+      '<div class="afk-chain-step-body">' + body + '</div>' +
+      '</div>';
+  }
+
+  /** Render one entity link (issue/change_request/review/commit/merge_event)
+   *  with its role, provisional marker, and correlation provenance. */
+  function renderAfkEntityLink(link) {
+    var provisional = isProvisionalLink(link);
+    var roleCls = link.role === 'resolved' ? 'badge-completed'
+      : link.role === 'noise' ? 'badge-unknown'
+      : 'badge-stale'; // referenced
+    var html = '<div class="afk-chain-item' + (provisional ? ' afk-provisional' : '') + '">' +
+      '<div class="afk-chain-item-head">' +
+        '<span class="afk-entity-id">' + escHtml(link.entity_id || '--') + '</span>' +
+        '<span class="afk-entity-type">' + escHtml(link.entity_type || '') + '</span>' +
+        badge(link.role || '--', roleCls).outerHTML +
+        (provisional ? ' <span class="afk-provisional-mark">\u26A0 provisional</span>' : '') +
+      '</div>' +
+      '<div class="afk-provenance">' + renderAfkProvenance(link) + '</div>';
+    var evidence = renderAfkEvidence(link);
+    if (evidence) {
+      html += '<div class="afk-evidence">evidence: ' + evidence + '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /** Render one session attachment with its inferred marker and compact Token
+   *  Breakdown (delegating to fmtTokenBreakdownCompact per CONTEXT.md).
+   *  Session attachments are always inferred — the marker makes that visible. */
+  function renderAfkSessionLink(session) {
+    var agent = session.agent || '--';
+    var extId = session.external_session_id || session.session_id || '--';
+    var inferred = isProvisionalLink(session);
+    return '<div class="afk-chain-item' + (inferred ? ' afk-provisional' : '') + '">' +
+      '<div class="afk-chain-item-head">' +
+        '<span class="afk-entity-id">' + escHtml(extId) + '</span>' +
+        '<span class="afk-entity-type">session</span>' +
+        (inferred ? ' <span class="afk-provisional-mark">\u26A0 inferred</span>' : '') +
+      '</div>' +
+      '<div class="afk-session-meta">agent: ' + escHtml(agent) +
+        ' &middot; messages: ' + fmtNum(session.message_count) +
+        ' &middot; cost: ' + fmtCost(session.total_estimated_cost_usd) + '</div>' +
+      '<div class="afk-tokens">' +
+        fmtTokenBreakdownCompact(session.total_input_tokens, session.total_output_tokens,
+          session.total_cache_read_tokens, session.total_cache_write_tokens) +
+      '</div>' +
+      '</div>';
+  }
+
+  /** Render the Run step: run status, provider, title, timestamps. */
+  function renderAfkRunStep(run) {
+    if (!run) return '<div class="afk-empty">No run data</div>';
+    return '<div class="afk-chain-item">' +
+      '<div class="afk-chain-item-head">' +
+        '<span class="afk-entity-id">' + escHtml(shortUUID(run.afk_run_id)) + '</span>' +
+        '<span class="afk-entity-type">' + escHtml(run.provider || '') + '</span>' +
+        badge(run.status || '--', afkRunStatusBadgeClass(run.status)).outerHTML +
+      '</div>' +
+      '<div class="afk-run-meta">' + escHtml(run.title || run.afk_run_id || '--') +
+        (run.started_at ? ' &middot; started ' + fmtDT(run.started_at) : '') +
+        (run.finished_at ? ' &middot; finished ' + fmtDT(run.finished_at) : '') +
+      '</div>' +
+      '</div>';
+  }
+
+  /** Render the Tokens/Cost step from the run UsageAggregate.  Active Tokens
+   *  = input + output (cache read/write are siblings, never folded in) and the
+   *  cost renders via fmtCost — per the CONTEXT.md token vocabulary. */
+  function renderAfkUsageStep(usage) {
+    if (!usage) return '<div class="afk-empty">No usage aggregate</div>';
+    return '<div class="afk-chain-item">' +
+      '<div class="afk-tokens">' +
+        fmtTokenBreakdownCompact(usage.input_tokens, usage.output_tokens,
+          usage.cache_read_tokens, usage.cache_write_tokens) +
+      '</div>' +
+      '<div class="afk-usage-meta">Active Tokens: ' + fmtNum(usage.active_tokens) +
+        ' &middot; Est. Cost: ' + fmtCost(usage.estimated_cost_usd) +
+        ' &middot; ' + fmtNum(usage.session_count) + ' sessions &middot; ' +
+        fmtNum(usage.message_count) + ' messages</div>' +
+      '</div>';
+  }
+
+  /** Render the Outcome step: the terminal EngineeringOutcomeStatus badge plus
+   *  the resolved change_request/issue ids and the merge event (merged_at). */
+  function renderAfkOutcomeStep(outcome, mergeEvents) {
+    var statusHtml = outcome
+      ? badge(outcomeStatusLabel(outcome.status), outcomeStatusBadgeClass(outcome.status)).outerHTML
+      : badge('unknown', 'badge-unknown').outerHTML;
+    var html = '<div class="afk-chain-item">' +
+      '<div class="afk-chain-item-head">' +
+        '<span class="afk-entity-id">outcome</span>' + statusHtml +
+      '</div>';
+    if (outcome) {
+      var parts = [];
+      if (outcome.change_request_ids && outcome.change_request_ids.length) {
+        parts.push('change request: ' + escHtml(outcome.change_request_ids.join(', ')));
+      }
+      if (outcome.resolved_issue_ids && outcome.resolved_issue_ids.length) {
+        parts.push('resolved issues: ' + escHtml(outcome.resolved_issue_ids.join(', ')));
+      }
+      if (outcome.merged_at) {
+        parts.push('merged ' + fmtDT(outcome.merged_at));
+      }
+      html += '<div class="afk-outcome-meta">' + (parts.length ? parts.join(' &middot; ') : 'no details') + '</div>';
+    } else {
+      html += '<div class="afk-outcome-meta">No terminal outcome recorded</div>';
+    }
+    if (mergeEvents && mergeEvents.length) {
+      html += mergeEvents.map(renderAfkEntityLink).join('');
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /** Render an entity link's provenance line (method · confidence · resolver). */
+  function renderAfkProvenance(link) {
+    var parts = [];
+    if (link && link.correlation_method) parts.push(escHtml(link.correlation_method));
+    parts.push(fmtConfidence(link && link.correlation_confidence));
+    if (link && link.resolver_version) parts.push('resolver v' + escHtml(link.resolver_version));
+    return parts.join(' \u00B7 ');
+  }
+
+  /** Render an entity link's evidence list as a compact, escaped string. */
+  function renderAfkEvidence(link) {
+    var evidence = (link && link.evidence) || [];
+    if (!evidence.length) return '';
+    return escHtml(fmtEvidence(evidence));
+  }
+
   async function openAgentRunDetail(sessionId) {
     // Show overlay
     els.arDetailOverlay.classList.add('visible');
@@ -1938,7 +2307,7 @@
    *  A failed panel keeps its previous updatedAt (data on screen is the
    *  previous successful render); a successful one records the cycle time. */
   function resolvePanelStatesAfterFetch() {
-    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError });
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError });
     var statuses = resolvePanelStatuses(errors);
     var nowMs = Date.now();
     Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
@@ -1990,6 +2359,7 @@
         renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
       }
       renderClientProjectBreakdown(data);
+      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -2270,6 +2640,30 @@
     }
   }
 
+  /** Wire the AFK Outcomes detail-overlay DOM events (issue #453): the close
+   *  button, backdrop click, and ESC key — mirroring the agent-runs overlay
+   *  wiring (setupAgentRunEventHandlers). */
+  function setupAfkOutcomesEventHandlers() {
+    if (els.afkDetailClose) {
+      els.afkDetailClose.addEventListener('click', function () {
+        els.afkDetailOverlay.classList.remove('visible');
+      });
+    }
+    if (els.afkDetailOverlay) {
+      els.afkDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.afkDetailOverlay) {
+          els.afkDetailOverlay.classList.remove('visible');
+        }
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' &&
+          els.afkDetailOverlay && els.afkDetailOverlay.classList.contains('visible')) {
+        els.afkDetailOverlay.classList.remove('visible');
+      }
+    });
+  }
+
   function setupTabNavigation() {
     var navItems = document.querySelectorAll('.top-nav-item');
     var tabContents = document.querySelectorAll('.tab-content');
@@ -2361,6 +2755,7 @@
 
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
+    setupAfkOutcomesEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
     // Issue #426: read ?page / ?page_size from the URL before the initial
@@ -2457,6 +2852,24 @@
   // 'unknown' fallback, and rendering through the fake tbody.
   window.buildAgentUsageRows = buildAgentUsageRows;
   window.renderAgentUsageTable = renderAgentUsageTable;
+  // AFK Outcomes view (issue #453): the locked-vocabulary outcome/run badge
+  // mappings, confidence/evidence formatters, provisional-link predicate,
+  // canonical chain composer, and the render functions — all pure string
+  // builders except renderAfkOutcomesTable/renderAfkRunDetail (which write to
+  // the fake tbody/detail-body elements) and openAfkRunDetail (fetch-driven).
+  window.outcomeStatusBadgeClass = outcomeStatusBadgeClass;
+  window.outcomeStatusLabel = outcomeStatusLabel;
+  window.afkRunStatusBadgeClass = afkRunStatusBadgeClass;
+  window.fmtConfidence = fmtConfidence;
+  window.fmtEvidence = fmtEvidence;
+  window.isProvisionalLink = isProvisionalLink;
+  window.buildAfkChain = buildAfkChain;
+  window.renderAfkEntityLink = renderAfkEntityLink;
+  window.renderAfkSessionLink = renderAfkSessionLink;
+  window.renderAfkChainStep = renderAfkChainStep;
+  window.renderAfkRunDetail = renderAfkRunDetail;
+  window.renderAfkOutcomesTable = renderAfkOutcomesTable;
+  window.openAfkRunDetail = openAfkRunDetail;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

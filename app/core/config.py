@@ -129,6 +129,48 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:8000"
     collector_token: str = ""
 
+    # AFK outcome consumer (issue #451) — the live ingestion side of AFK
+    # Outcome Observability.  Runs in its OWN Kafka consumer group
+    # (``opencode-outcomes``, never the usage consumer's ``opencode-gateway``
+    # group), consuming the existing provider-events topic (external — the
+    # topic is not created here) and mapping message types to canonical
+    # engineering events.  Terminal states the topic does not carry
+    # (merged/closed) are converged by a scheduled reconciliation loop that
+    # reuses the backfill engine over a bounded window.
+    afk_outcomes_topic: str = "afk.events"
+    afk_outcomes_dlq_topic: str = "afk.events-dlq"
+    afk_outcomes_consumer_group_id: str = "opencode-outcomes"
+    afk_outcomes_provider: str = "github"
+    afk_outcomes_repository: str = ""
+    afk_outcomes_reconcile_cadence_seconds: float = 3600.0
+    afk_outcomes_reconcile_window_seconds: float = 86400.0
+
+    # Whether the AFK outcome consumer/backfill is in use for this process.
+    # The Gateway API is read-only over the AFK read-model, so it does not
+    # require ``afk_outcomes_repository``; the companion consumer/backfill
+    # containers do.  When enabled, the repository (owner/repo to reconcile)
+    # must be configured or the consumer's reconcile loop would retry forever
+    # against an empty repository (adapter error, caught and logged).
+    afk_outcomes_consumer_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _validate_afk_outcomes_requirements(self) -> Settings:
+        """Fail fast when the AFK consumer is enabled without a repository.
+
+        The AFK consumer reconciles a bounded window against
+        ``GATEWAY_AFK_OUTCOMES_REPOSITORY``; an empty repository makes the
+        backfill adapter error inside the silently-logging reconcile loop.
+        The read-only API never needs it, so the check is gated on
+        ``GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED``.
+        """
+        if self.afk_outcomes_consumer_enabled and not self.afk_outcomes_repository.strip():
+            raise ValueError(
+                "GATEWAY_AFK_OUTCOMES_REPOSITORY must be set when the AFK "
+                "outcome consumer is enabled "
+                "(GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED=true)."
+            )
+        return self
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

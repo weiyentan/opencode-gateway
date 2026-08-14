@@ -298,3 +298,53 @@ def test_existing_pool_settings_unchanged(monkeypatch):
     assert settings.database_min_connections == 2
     assert settings.database_max_connections == 10
     assert settings.database_connection_timeout == 30
+
+
+# ── AFK outcome consumer config validation (issue #458) ──────────────────
+
+
+def test_afk_consumer_disabled_allows_empty_repository(monkeypatch):
+    """The read-only API does not require an AFK repository by default."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.delenv("GATEWAY_AFK_OUTCOMES_REPOSITORY", raising=False)
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.afk_outcomes_repository == ""
+    assert settings.afk_outcomes_consumer_enabled is False
+
+
+def test_afk_consumer_enabled_requires_repository(monkeypatch):
+    """Enabling the AFK consumer without a repository must fail fast."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED", "true")
+    monkeypatch.delenv("GATEWAY_AFK_OUTCOMES_REPOSITORY", raising=False)
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValueError, match="GATEWAY_AFK_OUTCOMES_REPOSITORY"):
+        Settings()
+
+
+def test_afk_consumer_enabled_with_whitespace_repository_fails(monkeypatch):
+    """A blank repository string is treated as missing."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED", "true")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_REPOSITORY", "   ")
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValueError, match="GATEWAY_AFK_OUTCOMES_REPOSITORY"):
+        Settings()
+
+
+def test_afk_consumer_enabled_with_repository_succeeds(monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED", "true")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_REPOSITORY", "owner/repo")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.afk_outcomes_consumer_enabled is True
+    assert settings.afk_outcomes_repository == "owner/repo"

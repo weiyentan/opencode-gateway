@@ -58,6 +58,21 @@
           </span>
           <span class="top-nav-label">Clients / Projects</span>
         </li>
+        <!-- AFK Outcomes (issue #453): the first UI for the AFK outcomes domain.
+             A runs list (GET /api/v1/afk-outcomes/runs) whose rows open the
+             chain detail overlay (GET /api/v1/afk-outcomes/runs/{afk_run_id})
+             rendering issue -> run -> sessions -> agents -> tokens/cost ->
+             change_request -> review cycles -> merged, with per-link provenance
+             and visibly-marked provisional/inferred links. -->
+        <li class="top-nav-item" data-tab="afk-outcomes" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M6 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 0v8a2 2 0 0 0 2 2h8"></path>
+              <path d="M18 16a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm0 0v-6a2 2 0 0 0-2-2h-6"></path>
+            </svg>
+          </span>
+          <span class="top-nav-label">AFK Outcomes</span>
+        </li>
       </ul>
     </nav>
 
@@ -356,6 +371,36 @@
 
     </div><!-- #tab-clients-projects -->
 
+    <!-- ── Tab: AFK Outcomes ────────────────────────────────────────────── -->
+    <!-- The first UI for the AFK outcomes domain (issue #453): a runs list
+         driven by GET /api/v1/afk-outcomes/runs (Status = RunStatus badge,
+         Outcome = EngineeringOutcomeStatus badge) whose rows open the
+         #afk-detail-overlay rendering the full chain. -->
+    <div class="tab-content" id="tab-afk-outcomes">
+
+    <section class="glass-panel panel-afk-outcomes">
+      <h2 class="panel-title">AFK Outcomes<span class="panel-freshness" id="freshness-afk-outcomes"></span></h2>
+      <div class="table-scroll">
+        <table id="afk-runs-table">
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th>Status</th>
+              <th>Outcome</th>
+              <th>Provider</th>
+              <th>Started</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="afk-runs-tbody">
+            <tr><td colspan="6" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    </div><!-- #tab-afk-outcomes -->
+
   </main>
 
   <!-- Agent Run Detail Panel -->
@@ -366,6 +411,23 @@
         <button class="detail-close" id="ar-detail-close">&times;</button>
       </div>
       <div class="detail-body" id="ar-detail-body">
+        <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- AFK Outcome Chain Detail Panel (issue #453): renders the full chain for
+       one AFK run — issue -> run -> sessions -> agents -> tokens/cost ->
+       change_request -> review cycles -> merged — with per-link correlation
+       provenance (method/confidence/evidence/resolver_version) and visibly
+       marked provisional/inferred links. -->
+  <div class="detail-overlay" id="afk-detail-overlay">
+    <div class="detail-panel glass-panel" id="afk-detail-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="afk-detail-title">AFK Outcome Chain</h2>
+        <button class="detail-close" id="afk-detail-close">&times;</button>
+      </div>
+      <div class="detail-body" id="afk-detail-body">
         <p class="empty-state">Loading detail&hellip;</p>
       </div>
     </div>
