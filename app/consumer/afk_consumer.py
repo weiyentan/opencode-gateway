@@ -539,6 +539,18 @@ class AFKOutcomeConsumer:
         Only the *consecutive* frontier is committed; a failed message opens a
         gap (see ``_mark_blocked``) that the frontier must not cross, so the
         failed offset stays redeliverable on rebalance.
+
+        A Kafka commit failure is *non-fatal* (issue #473): by the time
+        ``_commit`` runs, the message has already been durably handled —
+        persisted in a single DB transaction, or DLQ'd — so there is nothing
+        to redeliver and no gap to open.  Marking it blocked here would pin
+        the frontier at an already-persisted offset forever (the in-memory
+        position has already advanced past it, so it is never redelivered to
+        clear the gap).  Swallowing the error leaves the frontier where it
+        is: the next successful commit (from a later message) covers this
+        offset, and a dead connection surfaces in the poll loop's
+        ``KafkaError`` path, which recreates the consumer and redelivers from
+        the last committed offset (absorbed by the dedup layers).
         """
         if not self._consumer:
             return
@@ -547,7 +559,15 @@ class AFKOutcomeConsumer:
             for tp in self._committable
         }
         if offsets:
-            await self._consumer.commit(offsets)
+            try:
+                await self._consumer.commit(offsets)
+            except KafkaError:
+                logger.warning(
+                    "Kafka commit failed for offsets %s — message already "
+                    "durably handled; the frontier will retry on the next commit",
+                    {tp.partition: om.offset for tp, om in offsets.items()},
+                    exc_info=True,
+                )
 
     def _mark_committable(self, msg: ConsumerRecord) -> None:
         """Advance a partition's consecutive commit frontier past ``msg``.

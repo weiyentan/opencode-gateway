@@ -1929,6 +1929,9 @@
     html += '</div>';
 
     els.afkDetailBody.innerHTML = html;
+
+    // Resolved sessions open the Agent Run detail overlay (issue #473).
+    wireAfkSessionLinks(els.afkDetailBody);
   }
 
   /** Render one chain step (from buildAfkChain) into HTML. */
@@ -1990,12 +1993,23 @@
 
   /** Render one session attachment with its inferred marker and compact Token
    *  Breakdown (delegating to fmtTokenBreakdownCompact per CONTEXT.md).
-   *  Session attachments are always inferred — the marker makes that visible. */
+   *  Session attachments are always inferred — the marker makes that visible.
+   *  A session that resolved to an internal Gateway session id is drill-down-
+   *  able (issue #473): it carries a data-session-id + role/tabindex so the
+   *  detail view wires it into the Agent Run overlay; an unresolved session
+   *  (no internal id) stays non-interactive. */
   function renderAfkSessionLink(session) {
     var agent = session.agent || '--';
     var extId = session.external_session_id || session.session_id || '--';
     var inferred = isProvisionalLink(session);
-    return '<div class="afk-chain-item' + (inferred ? ' afk-provisional' : '') + '">' +
+    var sessionId = session && session.session_id;
+    var clickable = !!sessionId;
+    var clickAttrs = clickable
+      ? ' data-session-id="' + escHtml(sessionId) + '" role="button" tabindex="0"'
+      : '';
+    return '<div class="afk-chain-item afk-session-link' +
+        (clickable ? ' clickable' : '') +
+        (inferred ? ' afk-provisional' : '') + '"' + clickAttrs + '>' +
       '<div class="afk-chain-item-head">' +
         '<span class="afk-entity-id">' + escHtml(extId) + '</span>' +
         '<span class="afk-entity-type">session</span>' +
@@ -2009,6 +2023,27 @@
           session.total_cache_read_tokens, session.total_cache_write_tokens) +
       '</div>' +
       '</div>';
+  }
+
+  /** Wire resolved AFK session links (those carrying an internal session_id)
+   *  into the existing Agent Run detail overlay.  Unresolved sessions carry no
+   *  data-session-id and stay non-interactive (issue #473). */
+  function wireAfkSessionLinks(root) {
+    if (!root || !root.querySelectorAll) return;
+    var links = root.querySelectorAll('.afk-session-link[data-session-id]');
+    links.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var sid = item.getAttribute('data-session-id');
+        if (sid) openAgentRunDetail(sid);
+      });
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var sid = item.getAttribute('data-session-id');
+          if (sid) openAgentRunDetail(sid);
+        }
+      });
+    });
   }
 
   /** Render the Run step: run status, provider, title, timestamps. */
@@ -2870,6 +2905,11 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  // Issue #473: resolved AFK session drill-down into the Agent Run overlay —
+  // the wiring helper and the target are exposed so the Node harness can drive
+  // the click path behaviorally (session_id → openAgentRunDetail).
+  window.wireAfkSessionLinks = wireAfkSessionLinks;
+  window.openAgentRunDetail = openAgentRunDetail;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

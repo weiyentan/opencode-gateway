@@ -1489,6 +1489,24 @@ td.clickable:hover {
   background: rgba(251, 191, 36, 0.04);
 }
 
+/* Resolved AFK session link → Agent Run detail (issue #473): a session that
+   resolved to an internal session_id is clickable; unresolved attachments
+   stay non-interactive (no pointer, no hover). */
+.afk-chain-item.afk-session-link.clickable {
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.afk-chain-item.afk-session-link.clickable:hover {
+  background: var(--glass-fg-surface-hover);
+  border-left-color: var(--accent-indigo);
+}
+
+.afk-chain-item.afk-session-link.clickable:focus-visible {
+  outline: 2px solid var(--accent-indigo);
+  outline-offset: 2px;
+}
+
 .afk-chain-item-head {
   display: flex;
   align-items: center;

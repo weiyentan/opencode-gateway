@@ -88,6 +88,53 @@ class _FakeAdapter:
         return []
 
 
+class _RunKafkaConsumer:
+    """Fake ``AIOKafkaConsumer`` driving the production ``run()`` poll loop.
+
+    Yields ``messages`` in order; once exhausted it flips the owner's
+    ``_running`` flag off and ends the iteration so ``run()`` returns instead
+    of spinning forever.  ``fail_at`` is an optional index at which
+    ``__anext__`` raises :class:`KafkaError` (simulating a connection loss)
+    so the recreation/rebalance path can be exercised end-to-end.
+    """
+
+    def __init__(
+        self,
+        owner: AFKOutcomeConsumer,
+        messages: list[MagicMock],
+        *,
+        fail_at: int | None = None,
+        commit: AsyncMock | None = None,
+    ) -> None:
+        self._owner = owner
+        self._messages = list(messages)
+        self._fail_at = fail_at
+        self._idx = 0
+        self.commit = commit if commit is not None else AsyncMock()
+        self.started = False
+        self.stopped = False
+
+    def __aiter__(self) -> _RunKafkaConsumer:
+        return self
+
+    async def __anext__(self) -> MagicMock:
+        if self._fail_at is not None and self._idx == self._fail_at:
+            self._idx += 1
+            raise KafkaError("poll connection lost")
+        if self._idx >= len(self._messages):
+            self._owner._running = False
+            raise StopAsyncIteration
+        msg = self._messages[self._idx]
+        self._idx += 1
+        return msg
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
 class _FakeHttpxResponse:
     """A stand-in for ``httpx.Response`` carrying a pre-parsed body."""
 
@@ -854,6 +901,95 @@ async def test_mark_committable_clears_block_on_redelivery() -> None:
     consumer._mark_committable(_mk_msg(_valid_payload(), offset=10))  # redelivered
     assert consumer._committable == {_tp(): 10}
     assert consumer._blocked == {}
+
+
+# ── run() poll loop: commit-failure recovery (issue #473) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_commit_failure_after_persist_does_not_block_frontier() -> None:
+    """Regression (issue #473): a Kafka offset-commit failure after a successful
+    database transaction must not mark the already-persisted message blocked.
+
+    Driving the production ``run()`` poll loop (not the ``_mark_*`` helpers),
+    the first message persists then its commit raises; the second message must
+    then commit *past* the first — no permanent gap, no pinned frontier."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._producer = AsyncMock()
+
+    commit = AsyncMock(side_effect=[KafkaError("commit failed"), None])
+    consumer._consumer = _RunKafkaConsumer(  # type: ignore[assignment]
+        consumer,
+        [
+            _mk_msg(_valid_payload(), offset=10),
+            _mk_msg(_valid_payload(), offset=11),
+        ],
+        commit=commit,
+    )
+    consumer._running = True
+
+    await consumer.run()
+
+    # The commit failure opened no blocked gap (the message was already
+    # persisted — there is nothing to redeliver), and the frontier advanced
+    # past both offsets instead of pinning at 10.
+    assert consumer._blocked == {}
+    assert consumer._committable == {_tp(): 11}
+    # The second message's commit covered both offsets (11 → 12).
+    assert commit.call_count == 2
+    assert _last_commit_offsets(consumer) == {_tp(): 12}
+    # Both messages were persisted (2 messages × delivery_log + event writes).
+    sqls = [call.args[0] for call in conn.execute.call_args_list]
+    assert len([s for s in sqls if "INSERT INTO delivery_log" in s]) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_recreates_consumer_and_redelivery_is_idempotent() -> None:
+    """Regression (issue #473): a commit failure followed by a poll connection
+    error recreates the consumer, redelivers the message from the last committed
+    offset, and the redelivery is absorbed by the dedup layers (idempotent
+    persist) with no blocked gap ever opened."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._producer = AsyncMock()
+
+    msg = _mk_msg(_valid_payload(), offset=10)
+
+    first = _RunKafkaConsumer(
+        consumer,
+        [msg],
+        fail_at=1,  # after yielding offset 10, the poll loop loses the connection
+        commit=AsyncMock(side_effect=KafkaError("commit failed")),
+    )
+    consumer._consumer = first  # type: ignore[assignment]
+    consumer._running = True
+
+    redelivered_commit = AsyncMock()
+    redelivered = _RunKafkaConsumer(consumer, [msg], commit=redelivered_commit)
+
+    with patch(
+        "app.consumer.afk_consumer.AIOKafkaConsumer", return_value=redelivered
+    ) as mock_kafka:
+        await consumer.run()
+
+    # The poll failure triggered recreation and the new consumer was started.
+    mock_kafka.assert_called_once()
+    assert first.stopped is True
+    assert redelivered.started is True
+
+    # No blocked gap was ever opened, and the redelivered message committed.
+    assert consumer._blocked == {}
+    assert redelivered_commit.call_count == 1
+
+    # Redelivery re-issued the idempotent persist (ON CONFLICT DO NOTHING at
+    # the DB layer) rather than being skipped or double-counted.
+    sqls = [call.args[0] for call in conn.execute.call_args_list]
+    delivery_sqls = [s for s in sqls if "INSERT INTO delivery_log" in s]
+    assert len(delivery_sqls) == 2  # first delivery + redelivery
+    assert all(
+        "ON CONFLICT (provider, delivery_id) DO NOTHING" in s for s in delivery_sqls
+    )
 
 
 # ── Consumer group separation ────────────────────────────────────────────────
