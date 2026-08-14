@@ -1149,6 +1149,129 @@ async def test_redelivery_writes_are_conflict_ignored() -> None:
     assert consumer._consumer.commit.call_count == 2
 
 
+# ── Commit-failure recovery (issue #473) ────────────────────────────────────
+# A DB-success/Kafka-commit-failure sequence must never mark the persisted
+# message as a blocked processing gap, nor let a later commit advance past the
+# uncommitted offset.  The production run() path recreates the consumer on a
+# Kafka error (rebalance) so the message is redelivered idempotently — the
+# delivery_log/engineering_events dedup absorbs the replay.
+
+
+class _FakeAsyncIterator:
+    """Async iterator over a fixed message list (drives run()'s __anext__)."""
+
+    def __init__(self, messages: list) -> None:
+        self._messages = list(messages)
+        self._i = 0
+
+    async def __anext__(self) -> object:
+        if self._i >= len(self._messages):
+            raise StopAsyncIteration
+        msg = self._messages[self._i]
+        self._i += 1
+        return msg
+
+
+class _FakeKafkaConsumer:
+    """Stand-in for AIOKafkaConsumer: start/stop/commit/__aiter__ only."""
+
+    def __init__(self, messages: list) -> None:
+        self._messages = messages
+        self.commit = AsyncMock(return_value=None)
+        self.stop = AsyncMock(return_value=None)
+        self.start = AsyncMock(return_value=None)
+
+    def __aiter__(self) -> _FakeAsyncIterator:
+        return _FakeAsyncIterator(self._messages)
+
+
+@pytest.mark.asyncio
+async def test_commit_never_advances_past_blocked_frontier() -> None:
+    """Regression (issue #473): _commit caps the committed offset at the
+    blocked offset even when the in-memory frontier was advanced before the
+    commit failure — the stale state a DB-success/commit-failure used to leave,
+    which a later commit would otherwise use to skip the uncommitted gap."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+
+    # Persist succeeded (frontier advanced to 10), then commit failed and the
+    # offset was marked blocked — exactly the state the old code left behind.
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=10))
+    consumer._mark_blocked(_mk_msg(_valid_payload(), offset=10))
+
+    await consumer._commit()
+
+    # The commit is capped at blocked (10), never advanced to 11 (which would
+    # skip the redelivery of offset 10).
+    assert _last_commit_offsets(consumer) == {_tp(): 10}
+
+
+@pytest.mark.asyncio
+async def test_run_commit_failure_recreates_and_redelivers_idempotently() -> None:
+    """Regression (issue #473): drive the production run() path.
+
+    A DB-success/Kafka-commit-failure sequence must not mark the persisted
+    message as a blocked gap: the first delivery persists, the offset commit
+    fails, the consumer recreates (rebalance) so it re-reads from the last
+    committed offset, and the message is redelivered idempotently — the
+    delivery_log conflict-ignore INSERT is re-issued, never double-counted.
+    """
+    persisted_sqls: list[str] = []
+
+    async def execute(*args: object, **kwargs: object) -> str:
+        if args and "INSERT INTO delivery_log" in str(args[0]):
+            persisted_sqls.append(str(args[0]))
+        return "OK"
+
+    conn = _FakeConn([], execute=execute)
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._running = True
+
+    msg = _mk_msg(_valid_payload(), offset=10)
+    state = {"commit_failures_left": 1}
+    instances: list[_FakeKafkaConsumer] = []
+
+    def factory(*args: object, **kwargs: object) -> _FakeKafkaConsumer:
+        inst = _FakeKafkaConsumer([msg])
+
+        async def commit(offsets: object) -> None:
+            if state["commit_failures_left"] > 0:
+                state["commit_failures_left"] -= 1
+                raise KafkaError("offset commit failed")
+            consumer._running = False  # stop run() after the successful commit
+
+        inst.commit = AsyncMock(side_effect=commit)
+        instances.append(inst)
+        return inst
+
+    # Spy: a persisted message must never be marked as a blocked processing gap.
+    blocked_calls: list[object] = []
+    real_mark_blocked = consumer._mark_blocked
+
+    def spy_mark_blocked(m: object) -> None:
+        blocked_calls.append(m)
+        real_mark_blocked(m)
+
+    consumer._mark_blocked = spy_mark_blocked  # type: ignore[method-assign]
+
+    consumer._consumer = factory()
+    with patch("app.consumer.afk_consumer.AIOKafkaConsumer", side_effect=factory):
+        await consumer.run()
+
+    # The commit failure recreated the consumer (rebalance), not a blocked gap.
+    assert len(instances) == 2
+    assert blocked_calls == []
+    assert consumer._blocked == {}
+    # Redelivery re-persisted idempotently (conflict-ignore, no double-count).
+    assert len(persisted_sqls) == 2
+    for sql in persisted_sqls:
+        assert "ON CONFLICT (provider, delivery_id) DO NOTHING" in sql
+    # The redelivered message's offset was committed.
+    assert _last_commit_offsets(consumer) == {_tp(): 11}
+
+
 def test_import_from_afk_consumer_module() -> None:
     """The consumer class is importable and does not import app into afk_outcomes."""
     import afk_outcomes  # noqa: F401

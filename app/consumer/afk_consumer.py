@@ -331,11 +331,28 @@ class AFKOutcomeConsumer:
                             self._process_message(msg)
                         )
                         await self._in_flight
+                    except KafkaError:
+                        # A Kafka commit or DLQ-publish failure means the broker
+                        # connection is unreliable.  Recreating the consumer
+                        # re-reads from the last committed offset, so an
+                        # already-persisted (or DLQ'd) message is redelivered
+                        # idempotently via the delivery_log/engineering_events
+                        # dedup, and an un-persisted message is retried.  Never
+                        # mark an already-persisted message as a blocked
+                        # processing gap (issue #473).
+                        logger.exception(
+                            "Kafka error processing message at offset %d — "
+                            "recreating consumer for safe redelivery",
+                            msg.offset,
+                        )
+                        if self._running:
+                            await self._recreate_consumer()
+                        break  # re-establish a fresh iterator from the new consumer
                     except Exception:
-                        # A message that failed to be processed (including a
-                        # DLQ publish failure) must not be committed past: open
-                        # a gap so the committed offset never skips it, and it
-                        # is redelivered on the next rebalance/restart.
+                        # A message that failed to be processed for a non-Kafka
+                        # reason must not be committed past: open a gap so the
+                        # committed offset never skips it, and it is redelivered
+                        # on the next rebalance/restart.
                         self._mark_blocked(msg)
                         logger.exception(
                             "Unhandled exception processing message "
@@ -402,6 +419,13 @@ class AFKOutcomeConsumer:
         """Stop and recreate the Kafka consumer after a connection error."""
         if self._consumer:
             await self._consumer.stop()
+
+        # A fresh consumer re-reads from the last committed offset, so reset the
+        # in-memory commit frontier and block set: stale positions must never
+        # leak across a recreation (they would commit past a gap or leave a
+        # block that never clears — issue #473).
+        self._committable = {}
+        self._blocked = {}
 
         delay = self._initial_backoff
         max_attempts = max(1, self._max_retries * 2)
@@ -538,14 +562,24 @@ class AFKOutcomeConsumer:
 
         Only the *consecutive* frontier is committed; a failed message opens a
         gap (see ``_mark_blocked``) that the frontier must not cross, so the
-        failed offset stays redeliverable on rebalance.
+        failed offset stays redeliverable on rebalance.  The blocked offset is
+        itself excluded from the committed range: the commit is capped at
+        ``blocked - 1`` so a later message can never commit past an uncommitted
+        gap, even if the in-memory frontier was advanced before a commit
+        failure (issue #473).
         """
         if not self._consumer:
             return
-        offsets = {
-            tp: OffsetAndMetadata(self._committable[tp] + 1, "")
-            for tp in self._committable
-        }
+        offsets: dict[TopicPartition, OffsetAndMetadata] = {}
+        for tp, committable in self._committable.items():
+            blocked = self._blocked.get(tp)
+            if blocked is not None and committable >= blocked:
+                # Never commit past the blocked offset: cap at blocked - 1 so
+                # the failed message stays redeliverable.
+                committable = blocked - 1
+                if committable < 0:
+                    continue  # the very first offset is blocked — nothing safe
+            offsets[tp] = OffsetAndMetadata(committable + 1, "")
         if offsets:
             await self._consumer.commit(offsets)
 
