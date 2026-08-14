@@ -48,6 +48,12 @@ Use raw SQL profiling (`EXPLAIN ANALYZE BUFFERS`) against actual dashboard queri
 
 ### Migration 0019 Measurement
 
+> **Status (issue #365, 2026-08-15): completed.** Per-index keep/drop
+> decisions with before/after `EXPLAIN` plans and latencies are documented
+> in [ADR 0017](../adr/0017-migration-0019-index-measurement.md): indexes
+> #4–#8 retained, indexes #1–#3 (`opencode_usage_records`) recorded for
+> removal in a follow-up migration.
+
 Evaluate migration 0019 in isolation:
 
 1. Establish a baseline on the current schema.

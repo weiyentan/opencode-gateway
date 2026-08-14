@@ -8,6 +8,21 @@ or writes in PostgreSQL.
 Revision ID: 0019
 Revises:     0018
 Create Date: 2026-08-07
+
+Measurement note (issue #365, see docs/adr/0017-migration-0019-index-measurement.md):
+a live-Postgres benchmark of these 8 indexes against the current (head)
+read path found that the three ``opencode_usage_records`` indexes
+(``ix_opencode_usage_records_reported_at``,
+``ix_opencode_usage_records_client_reported_at``,
+``ix_opencode_usage_records_session_reported_at``) are unused by any
+dashboard endpoint — the usage endpoints read the canonical
+``usage_events`` table (0021), and the legacy table is only read by the
+ingest dedup path (which uses the ``uq_opencode_usage_records_dedup``
+unique constraint) and one-off backfill scripts. They are recorded for
+removal in a follow-up migration. The five ``sessions``/projection-table
+indexes measurably improve client-filtered, parent-lookup, todo-lookup,
+and context-join read paths and are retained. See ADR 0017 for the
+before/after plans and latencies.
 """
 
 from typing import Sequence, Union
