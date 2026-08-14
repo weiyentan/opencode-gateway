@@ -17,8 +17,8 @@ a scheduled reconciliation loop reusing the #449 backfill engine
 window.
 
 Operational pattern mirrors :mod:`app.consumer.consumer`: no auto-commit,
-``earliest`` reset, DLQ for poison messages, exponential backoff with no
-offset commit on exhaustion, graceful shutdown with in-flight drain.
+``earliest`` reset, DLQ for poison messages, exponential backoff with DLQ
+and commit on exhaustion, graceful shutdown with in-flight drain.
 
 This module deliberately imports ``afk_outcomes`` (pure domain) and the
 backfill engine; it never re-implements normalization or correlation logic.
@@ -159,9 +159,10 @@ class AFKOutcomeConsumer:
       offset (commit only after the transaction succeeds).
     * **invalid JSON / invalid shape / unmappable type** — send to DLQ, then
       commit (poison messages must not block the group).
-    * **DB error** — retry with exponential backoff; the offset is NOT
-      committed until a successful transaction (or max retries exhausted,
-      leaving Kafka to re-deliver).
+    * **DB error** — retry with exponential backoff; on success, commit the
+      offset.  On exhaustion (max retries reached), send the message to the
+      DLQ and commit, so it is not silently lost and does not block the
+      group.
     """
 
     def __init__(
@@ -468,9 +469,14 @@ class AFKOutcomeConsumer:
                     continue
                 logger.error(
                     "Max retries (%d) exhausted after DB errors — "
-                    "offset not committed, Kafka will re-deliver",
+                    "sending to DLQ",
                     self._max_retries,
                 )
+                await self._send_to_dlq(
+                    raw_value if isinstance(raw_value, dict) else {},
+                    reason=f"DB persist failed after {self._max_retries} retries",
+                )
+                await self._commit()
                 return
 
             await self._commit()

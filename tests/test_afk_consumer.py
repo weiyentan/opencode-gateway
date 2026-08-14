@@ -2,8 +2,8 @@
 
 Covers the message-type → canonical-event mapping (all ten locked types),
 the single-transaction write path with offset-commit-after-transaction
-ordering, poison-message DLQ handling, DB-error backoff with no commit on
-exhaustion, consumer-group separation, and the scheduled reconciliation
+ordering, poison-message DLQ handling, DB-error backoff with DLQ + commit
+on exhaustion, consumer-group separation, and the scheduled reconciliation
 loop reusing the backfill engine.  Kafka and asyncpg are mocked.
 """
 
@@ -446,7 +446,7 @@ async def test_unmappable_type_sends_to_dlq_and_commits() -> None:
     assert "Unmappable message type" in dlq_payload["reason"]
 
 
-# ── DB error → backoff, no commit on exhaustion ──────────────────────────────
+# ── DB error → backoff, DLQ + commit on exhaustion ───────────────────────────
 
 
 @pytest.mark.asyncio
@@ -479,7 +479,7 @@ async def test_db_error_retries_then_commits_on_recovery() -> None:
 
 
 @pytest.mark.asyncio
-async def test_db_error_max_retries_exhausted_skips_commit() -> None:
+async def test_db_error_max_retries_exhausted_sends_to_dlq_and_commits() -> None:
     conn = _FakeConn(
         [],
         execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
@@ -488,6 +488,7 @@ async def test_db_error_max_retries_exhausted_skips_commit() -> None:
     consumer._consumer = AsyncMock()
     consumer._consumer.commit = AsyncMock()
     consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
 
     msg = _mk_msg(_valid_payload())
     with patch(
@@ -497,8 +498,57 @@ async def test_db_error_max_retries_exhausted_skips_commit() -> None:
 
     assert conn.execute.call_count == 3  # one failing attempt per retry
     assert mock_sleep.call_count == 2
-    consumer._consumer.commit.assert_not_called()
-    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+    consumer._producer.send_and_wait.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "DB persist failed after 3 retries" in dlq_payload["reason"]
+    assert dlq_payload["payload"] == _valid_payload()
+
+
+@pytest.mark.asyncio
+async def test_failing_then_successful_message_does_not_lose_failed_message() -> None:
+    """Regression: a max-retries-exhausted message followed by a successful one
+    must DLQ the failed message, not silently skip it via a later commit."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[
+                RuntimeError("db down"),  # failing message attempt 1
+                RuntimeError("db down"),  # failing message attempt 2
+                RuntimeError("db down"),  # failing message attempt 3
+                "OK",  # delivery_log for the successful message
+                "OK",  # engineering_events for the successful message
+            ]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    failing_payload = _valid_payload(delivery_id="failing-delivery")
+    failing_msg = _mk_msg(failing_payload)
+    with patch(
+        "app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock
+    ):
+        await consumer._process_message(failing_msg)
+
+    # The failed message was DLQ'd and its offset committed — not lost.
+    consumer._producer.send_and_wait.assert_called_once()
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "DB persist failed after 3 retries" in dlq_payload["reason"]
+    assert dlq_payload["payload"] == failing_payload
+    consumer._consumer.commit.assert_called_once()
+
+    # A subsequent successful message commits its own offset without
+    # swallowing the failed message (already DLQ'd + committed above).
+    await consumer._process_message(_mk_msg(_valid_payload()))
+
+    # Total: one DLQ (the failed message) and two commits (failed + good).
+    consumer._producer.send_and_wait.assert_called_once()
+    assert consumer._consumer.commit.call_count == 2
 
 
 # ── Consumer group separation ────────────────────────────────────────────────
