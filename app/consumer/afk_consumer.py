@@ -40,7 +40,7 @@ import asyncpg
 import httpx
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
-from aiokafka.structs import ConsumerRecord
+from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
 from pydantic import BaseModel, Field
 
 from afk_outcomes.models import (
@@ -206,6 +206,16 @@ class AFKOutcomeConsumer:
         self._owns_pool = False
         self._adapter_client: Any = None
 
+        # Per-partition commit frontier (issue #459, PR #458 finding 1).  The
+        # Kafka consumer's in-memory position advances past a fetched message
+        # the moment it is returned, so an argless ``commit()`` would commit
+        # past a message that failed to persist/DLQ and permanently skip it.
+        # We track the highest *consecutive* offset we may safely commit, plus
+        # any offset that failed and must be redelivered before the frontier
+        # may advance (a "gap").  See ``_mark_committable`` / ``_mark_blocked``.
+        self._committable: dict[TopicPartition, int] = {}
+        self._blocked: dict[TopicPartition, int] = {}
+
     # ── Factory ────────────────────────────────────────────────────────
 
     @classmethod
@@ -322,9 +332,15 @@ class AFKOutcomeConsumer:
                         )
                         await self._in_flight
                     except Exception:
+                        # A message that failed to be processed (including a
+                        # DLQ publish failure) must not be committed past: open
+                        # a gap so the committed offset never skips it, and it
+                        # is redelivered on the next rebalance/restart.
+                        self._mark_blocked(msg)
                         logger.exception(
                             "Unhandled exception processing message "
-                            "at offset %d — skipping",
+                            "at offset %d — blocking commit (redeliver after "
+                            "rebalance)",
                             msg.offset,
                         )
                     finally:
@@ -427,6 +443,7 @@ class AFKOutcomeConsumer:
                 {"raw": msg.value.decode("utf-8", errors="replace")},
                 reason=f"JSON decode failure: {exc}",
             )
+            self._mark_committable(msg)
             await self._commit()
             return
 
@@ -443,6 +460,7 @@ class AFKOutcomeConsumer:
                 raw_value if isinstance(raw_value, dict) else {},
                 reason="Invalid message shape — failed Pydantic validation",
             )
+            self._mark_committable(msg)
             await self._commit()
             return
 
@@ -458,6 +476,7 @@ class AFKOutcomeConsumer:
                 raw_value if isinstance(raw_value, dict) else {},
                 reason=f"Unmappable message type: {message.type!r}",
             )
+            self._mark_committable(msg)
             await self._commit()
             return
         entity, event = mapped
@@ -489,9 +508,11 @@ class AFKOutcomeConsumer:
                     raw_value if isinstance(raw_value, dict) else {},
                     reason=f"DB persist failed after {self._max_retries} retries",
                 )
+                self._mark_committable(msg)
                 await self._commit()
                 return
 
+            self._mark_committable(msg)
             await self._commit()
             return
 
@@ -513,9 +534,50 @@ class AFKOutcomeConsumer:
                 )
 
     async def _commit(self) -> None:
-        """Commit the current Kafka offset."""
-        if self._consumer:
-            await self._consumer.commit()
+        """Commit the highest consecutive offset per partition, never past a gap.
+
+        Only the *consecutive* frontier is committed; a failed message opens a
+        gap (see ``_mark_blocked``) that the frontier must not cross, so the
+        failed offset stays redeliverable on rebalance.
+        """
+        if not self._consumer:
+            return
+        offsets = {
+            tp: OffsetAndMetadata(self._committable[tp] + 1, "")
+            for tp in self._committable
+        }
+        if offsets:
+            await self._consumer.commit(offsets)
+
+    def _mark_committable(self, msg: ConsumerRecord) -> None:
+        """Advance a partition's consecutive commit frontier past ``msg``.
+
+        A message that previously failed opens a gap (``_blocked``); the
+        frontier must not advance past that gap until the failed offset is
+        itself redelivered and succeeds.
+        """
+        tp = TopicPartition(msg.topic, msg.partition)
+        prev = self._committable.get(tp)
+        blocked = self._blocked.get(tp)
+        if blocked is not None:
+            if msg.offset < blocked:
+                return  # redelivery of an earlier message — does not clear the block
+            if msg.offset > blocked:
+                return  # still a gap — never advance past the failed offset
+            # msg.offset == blocked: the failed message succeeded on redelivery.
+            del self._blocked[tp]
+        if prev is None or msg.offset == prev + 1:
+            self._committable[tp] = msg.offset
+
+    def _mark_blocked(self, msg: ConsumerRecord) -> None:
+        """Record a failed message offset that must be reprocessed before this
+        partition's commit frontier may advance. Keeps the earliest (lowest)
+        failed offset: the frontier can only advance once the first gap is
+        closed, and later failures cannot move the block forward."""
+        tp = TopicPartition(msg.topic, msg.partition)
+        current = self._blocked.get(tp)
+        if current is None or msg.offset < current:
+            self._blocked[tp] = msg.offset
 
     async def _send_to_dlq(self, payload: dict[str, Any], *, reason: str) -> None:
         """Send a message to the DLQ topic with context about the failure."""
