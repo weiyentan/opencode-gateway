@@ -116,6 +116,14 @@ class Settings(BaseSettings):
     # sensitive information embedded in field values.
     log_validation_detail: bool = False
 
+    # Execution transcript observability (ADR 0016) — ingest-time
+    # redaction/truncation caps.  Tool input/output payloads are truncated
+    # per field; full part payloads are truncated at a larger verbatim cap
+    # with a ``truncated`` marker.  Maps to GATEWAY_TOOL_PAYLOAD_MAX_CHARS
+    # and GATEWAY_PART_DATA_MAX_CHARS.
+    tool_payload_max_chars: int = 4096
+    part_data_max_chars: int = 65536
+
     # Kafka consumer — bridges usage records to the Gateway ingest API.
     # The consumer runs as a separate container alongside the Gateway
     # and reads from the ``opencode-usage`` topic.
