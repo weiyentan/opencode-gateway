@@ -20,6 +20,14 @@ The read path follows the ``app/api/usage.py`` / ``afk_outcomes.py``
 convention: raw asyncpg via ``Depends(get_session)``, explicit-column
 SELECTs, parameterised filters with 400 on invalid values, and the
 ``_db_timeout``/``_request_timeout`` helpers.
+
+.. note:: Hierarchy sources diverge.  The ``/children`` and header child
+   queries resolve parentage from ``sessions.parent_session_id`` (an external
+   session-ID string), while the ``/timeline`` CTE and the header's
+   ``parent_internal_id`` resolve from ``opencode_session_contexts.parent_session_id``
+   (an internal UUID FK to ``sessions.id``).  The two can diverge until
+   reconciled, so ``/children`` and ``/timeline`` may return different
+   descendant sets.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from datetime import datetime
 from uuid import UUID
@@ -56,18 +65,19 @@ _MAX_LIMIT = 1000
 _DEFAULT_MAX_DEPTH = 50
 _MAX_MAX_DEPTH = 100
 
+# Sentinel for NULL ``source_created_at`` in keyset ordering/cursors.  No real
+# millisecond-epoch timestamp can reach 2**62, so NULL timestamps sort last and
+# encode/decode cleanly without a separate NULL branch in the cursor.
+_NULL_CURSOR_SENTINEL = 2**62
+
 
 # ── Timeout helpers (mirror app/api/usage.py) ────────────────────────────────
 
 
 @contextlib.asynccontextmanager
-async def _db_timeout(
-    event_name: str, db_timeout_seconds: int
-) -> AsyncIterator[None]:
+async def _db_timeout(event_name: str, db_timeout_seconds: int) -> AsyncIterator[None]:
     """Wrap a database query with the configured per-query timeout budget."""
-    async with timeout_operation(
-        event_name, "db", budget_ms=db_timeout_seconds * 1000
-    ):
+    async with timeout_operation(event_name, "db", budget_ms=db_timeout_seconds * 1000):
         yield
 
 
@@ -77,7 +87,8 @@ async def _request_timeout(
 ) -> AsyncIterator[None]:
     """Wrap an endpoint handler body with the total request timeout budget."""
     async with timeout_operation(
-        "request.total", "request",
+        "request.total",
+        "request",
         budget_ms=total_request_timeout_seconds * 1000,
     ):
         yield
@@ -88,7 +99,7 @@ async def _request_timeout(
 
 def _encode_cursor(source_created_at: int, row_id: str) -> str:
     """Encode ``(source_created_at, id)`` into an opaque URL-safe cursor."""
-    raw = f"{source_created_at}:{row_id}".encode("utf-8")
+    raw = f"{source_created_at}:{row_id}".encode()
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
@@ -103,6 +114,17 @@ def _decode_cursor(cursor: str) -> tuple[int, UUID]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid cursor: {cursor!r}",
         ) from exc
+
+
+def _next_cursor(source_created_at: int | None, row_id: str) -> str:
+    """Encode the keyset cursor for the last row, NULL-safe on the timestamp.
+
+    A ``None`` timestamp encodes as :data:`_NULL_CURSOR_SENTINEL`, matching the
+    ``COALESCE`` ordering so NULL rows sort last and the cursor can always
+    advance past a full page that ends on a NULL timestamp.
+    """
+    ts = source_created_at if source_created_at is not None else _NULL_CURSOR_SENTINEL
+    return _encode_cursor(ts, row_id)
 
 
 def _parse_datetime(raw: str | None, param_name: str) -> datetime | None:
@@ -155,7 +177,7 @@ def _message_row(row: asyncpg.Record) -> ObservedMessage:
         source_updated_at=row["source_updated_at"],
         source_created_at_tz=row["source_created_at_tz"],
         source_updated_at_tz=row["source_updated_at_tz"],
-        data=row["data"],
+        data=json.loads(row["data"]) if row["data"] is not None else None,
     )
 
 
@@ -172,7 +194,7 @@ def _part_row(row: asyncpg.Record) -> ObservedPart:
         source_updated_at=row["source_updated_at"],
         source_created_at_tz=row["source_created_at_tz"],
         source_updated_at_tz=row["source_updated_at_tz"],
-        data=row["data"],
+        data=json.loads(row["data"]) if row["data"] is not None else None,
     )
 
 
@@ -186,8 +208,8 @@ def _tool_call_row(row: asyncpg.Record) -> ObservedToolCall:
         session_id=row["session_id"],
         tool_name=row["tool_name"],
         tool_status=row["tool_status"],
-        tool_input=row["tool_input"],
-        tool_output=row["tool_output"],
+        tool_input=json.loads(row["tool_input"]) if row["tool_input"] is not None else None,
+        tool_output=json.loads(row["tool_output"]) if row["tool_output"] is not None else None,
         source_created_at=row["source_created_at"],
         source_created_at_tz=row["source_created_at_tz"],
     )
@@ -203,7 +225,7 @@ def _timeline_row(row: asyncpg.Record) -> TimelineEvent:
         part_type=row["part_type"],
         source_created_at=row["source_created_at"],
         source_created_at_tz=row["source_created_at_tz"],
-        data=row["data"],
+        data=json.loads(row["data"]) if row["data"] is not None else None,
     )
 
 
@@ -216,8 +238,7 @@ async def _fetch_session_header(
     """Fetch the transcript session header, or None when the session is absent."""
     async with _db_timeout("execution.header", db_timeout_seconds):
         session = await conn.fetchrow(
-            "SELECT id, external_session_id, agent, parent_session_id "
-            "FROM sessions WHERE id = $1",
+            "SELECT id, external_session_id, agent, parent_session_id FROM sessions WHERE id = $1",
             session_id,
         )
     if session is None:
@@ -227,13 +248,11 @@ async def _fetch_session_header(
 
     async with _db_timeout("execution.header.linkage", db_timeout_seconds):
         parent_row = await conn.fetchrow(
-            "SELECT parent_session_id FROM opencode_session_contexts "
-            "WHERE session_id = $1 LIMIT 1",
+            "SELECT parent_session_id FROM opencode_session_contexts WHERE session_id = $1 LIMIT 1",
             session_id,
         )
         child_rows = await conn.fetch(
-            "SELECT id, external_session_id, agent FROM sessions "
-            "WHERE parent_session_id = $1",
+            "SELECT id, external_session_id, agent FROM sessions WHERE parent_session_id = $1",
             external_session_id,
         )
 
@@ -320,7 +339,8 @@ async def _fetch_messages(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedMessage]:
     """Fetch a keyset-paginated, chronologically-ordered message stream."""
-    params: list[object] = [session_id]
+    params: list[object] = [session_id, _NULL_CURSOR_SENTINEL]
+    null_sentinel_param = 2
     where: list[str] = ["session_id = $1"]
 
     if agent is not None:
@@ -337,7 +357,10 @@ async def _fetch_messages(
         where.append(f"source_created_at <= ${len(params)}")
     if after_ms is not None and after_id is not None:
         params.extend([after_ms, after_id])
-        where.append(f"(source_created_at, id) > (${len(params) - 1}, ${len(params)})")
+        where.append(
+            f"(COALESCE(source_created_at, ${null_sentinel_param}), id) > "
+            f"(${len(params) - 1}, ${len(params)})"
+        )
 
     params.append(limit + 1)
     query = (
@@ -347,7 +370,7 @@ async def _fetch_messages(
         "       source_created_at_tz, source_updated_at_tz, data "
         "FROM observed_messages "
         f"WHERE {' AND '.join(where)} "
-        "ORDER BY source_created_at ASC, id ASC "
+        f"ORDER BY COALESCE(source_created_at, ${null_sentinel_param}) ASC, id ASC "
         f"LIMIT ${len(params)}"
     )
     async with _db_timeout("execution.messages", db_timeout_seconds):
@@ -356,8 +379,8 @@ async def _fetch_messages(
     has_more = len(rows) > limit
     rows = rows[:limit]
     next_cursor = None
-    if has_more and rows and rows[-1]["source_created_at"] is not None:
-        next_cursor = _encode_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+    if has_more and rows:
+        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_message_row(r) for r in rows],
         next_cursor=next_cursor,
@@ -378,7 +401,8 @@ async def _fetch_parts(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedPart]:
     """Fetch a keyset-paginated, chronologically-ordered part event stream."""
-    params: list[object] = [session_id]
+    params: list[object] = [session_id, _NULL_CURSOR_SENTINEL]
+    null_sentinel_param = 2
     where: list[str] = ["session_id = $1"]
 
     if part_type is not None:
@@ -395,7 +419,10 @@ async def _fetch_parts(
         where.append(f"source_created_at <= ${len(params)}")
     if after_ms is not None and after_id is not None:
         params.extend([after_ms, after_id])
-        where.append(f"(source_created_at, id) > (${len(params) - 1}, ${len(params)})")
+        where.append(
+            f"(COALESCE(source_created_at, ${null_sentinel_param}), id) > "
+            f"(${len(params) - 1}, ${len(params)})"
+        )
 
     params.append(limit + 1)
     query = (
@@ -404,7 +431,7 @@ async def _fetch_parts(
         "       source_created_at_tz, source_updated_at_tz, data "
         "FROM observed_parts "
         f"WHERE {' AND '.join(where)} "
-        "ORDER BY source_created_at ASC, id ASC "
+        f"ORDER BY COALESCE(source_created_at, ${null_sentinel_param}) ASC, id ASC "
         f"LIMIT ${len(params)}"
     )
     async with _db_timeout("execution.parts", db_timeout_seconds):
@@ -413,8 +440,8 @@ async def _fetch_parts(
     has_more = len(rows) > limit
     rows = rows[:limit]
     next_cursor = None
-    if has_more and rows and rows[-1]["source_created_at"] is not None:
-        next_cursor = _encode_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+    if has_more and rows:
+        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_part_row(r) for r in rows],
         next_cursor=next_cursor,
@@ -436,7 +463,8 @@ async def _fetch_tool_calls(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedToolCall]:
     """Fetch a keyset-paginated, global tool-call stream."""
-    params: list[object] = []
+    params: list[object] = [_NULL_CURSOR_SENTINEL]
+    null_sentinel_param = 1
     where: list[str] = ["TRUE"]
 
     if session_id is not None:
@@ -460,7 +488,8 @@ async def _fetch_tool_calls(
     if after_ms is not None and after_id is not None:
         params.extend([after_ms, after_id])
         where.append(
-            f"(tc.source_created_at, tc.id) > (${len(params) - 1}, ${len(params)})"
+            f"(COALESCE(tc.source_created_at, ${null_sentinel_param}), tc.id) > "
+            f"(${len(params) - 1}, ${len(params)})"
         )
 
     params.append(limit + 1)
@@ -472,7 +501,7 @@ async def _fetch_tool_calls(
         "FROM observed_tool_calls tc "
         "LEFT JOIN sessions s ON s.id = tc.session_id "
         f"WHERE {' AND '.join(where)} "
-        "ORDER BY tc.source_created_at ASC, tc.id ASC "
+        f"ORDER BY COALESCE(tc.source_created_at, ${null_sentinel_param}) ASC, tc.id ASC "
         f"LIMIT ${len(params)}"
     )
     async with _db_timeout("execution.tool_calls", db_timeout_seconds):
@@ -481,8 +510,8 @@ async def _fetch_tool_calls(
     has_more = len(rows) > limit
     rows = rows[:limit]
     next_cursor = None
-    if has_more and rows and rows[-1]["source_created_at"] is not None:
-        next_cursor = _encode_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+    if has_more and rows:
+        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_tool_call_row(r) for r in rows],
         next_cursor=next_cursor,
@@ -502,41 +531,56 @@ async def _fetch_timeline(
     after_id: UUID | None,
     db_timeout_seconds: int,
 ) -> CursorPage[TimelineEvent]:
-    """Fetch a unified parent+descendant timeline via a recursive CTE."""
-    params: list[object] = [session_id, max_depth]
+    """Fetch a unified parent+descendant timeline via a recursive CTE.
+
+    The recursive step carries a visited ``path`` array so a parent-linkage
+    cycle cannot recurse forever, and the outer query deduplicates each part
+    by id (``DISTINCT ON (p.id)``) preferring the shallowest depth, so a part
+    reachable at multiple depths / via multiple context rows appears once.
+    """
+    params: list[object] = [session_id, max_depth, _NULL_CURSOR_SENTINEL]
+    null_sentinel_param = 3
     where: list[str] = ["TRUE"]
 
     if agent is not None:
         params.append(agent)
-        where.append(f"d.agent = ${len(params)}")
+        where.append(f"agent = ${len(params)}")
     if from_ms is not None:
         params.append(from_ms)
-        where.append(f"p.source_created_at >= ${len(params)}")
+        where.append(f"source_created_at >= ${len(params)}")
     if to_ms is not None:
         params.append(to_ms)
-        where.append(f"p.source_created_at <= ${len(params)}")
+        where.append(f"source_created_at <= ${len(params)}")
     if after_ms is not None and after_id is not None:
         params.extend([after_ms, after_id])
-        where.append(f"(p.source_created_at, p.id) > (${len(params) - 1}, ${len(params)})")
+        where.append(
+            f"(COALESCE(source_created_at, ${null_sentinel_param}), part_id) > "
+            f"(${len(params) - 1}, ${len(params)})"
+        )
 
     params.append(limit + 1)
     query = (
         "WITH RECURSIVE descendants AS ("
-        "  SELECT id AS session_id, agent, 0 AS depth FROM sessions WHERE id = $1"
+        "  SELECT id AS session_id, agent, 0 AS depth, ARRAY[id] AS path "
+        "  FROM sessions WHERE id = $1"
         "  UNION ALL"
-        "  SELECT s.id, s.agent, d.depth + 1"
+        "  SELECT s.id, s.agent, d.depth + 1, d.path || s.id"
         "  FROM sessions s"
         "  JOIN opencode_session_contexts ctx ON ctx.session_id = s.id"
         "  JOIN descendants d ON ctx.parent_session_id = d.session_id"
-        "  WHERE d.depth < $2"
+        "  WHERE d.depth < $2 AND NOT (s.id = ANY(d.path))"
+        "), dedup AS ("
+        "  SELECT DISTINCT ON (p.id) "
+        "         p.id AS part_id, d.session_id, d.agent, d.depth, "
+        "         p.external_session_id, p.part_type, p.source_created_at, "
+        "         p.source_created_at_tz, p.data "
+        "  FROM descendants d "
+        "  JOIN observed_parts p ON p.session_id = d.session_id "
+        "  ORDER BY p.id, d.depth"
         ") "
-        "SELECT p.id AS part_id, d.session_id, d.agent, d.depth, "
-        "       p.external_session_id, p.part_type, p.source_created_at, "
-        "       p.source_created_at_tz, p.data "
-        "FROM descendants d "
-        "JOIN observed_parts p ON p.session_id = d.session_id "
+        "SELECT * FROM dedup "
         f"WHERE {' AND '.join(where)} "
-        "ORDER BY p.source_created_at ASC, p.id ASC "
+        f"ORDER BY COALESCE(source_created_at, ${null_sentinel_param}) ASC, part_id ASC "
         f"LIMIT ${len(params)}"
     )
     async with _db_timeout("execution.timeline", db_timeout_seconds):
@@ -545,8 +589,8 @@ async def _fetch_timeline(
     has_more = len(rows) > limit
     rows = rows[:limit]
     next_cursor = None
-    if has_more and rows and rows[-1]["source_created_at"] is not None:
-        next_cursor = _encode_cursor(rows[-1]["source_created_at"], str(rows[-1]["part_id"]))
+    if has_more and rows:
+        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["part_id"]))
     return CursorPage(
         items=[_timeline_row(r) for r in rows],
         next_cursor=next_cursor,

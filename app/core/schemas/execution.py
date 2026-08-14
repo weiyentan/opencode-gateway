@@ -79,8 +79,8 @@ class ObservedToolCall(BaseModel):
     session_id: uuid.UUID | None = None
     tool_name: str
     tool_status: str | None = None
-    tool_input: dict | None = None
-    tool_output: dict | None = None
+    tool_input: dict | list | str | int | float | bool | None = None
+    tool_output: dict | list | str | int | float | bool | None = None
     source_created_at: int | None = None
     source_created_at_tz: datetime | None = None
 

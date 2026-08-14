@@ -1362,6 +1362,18 @@ def _redact_json_value(value: object) -> object:
     return value
 
 
+def _serialize_jsonb(value: object) -> str | None:
+    """Serialize a Python value to a JSON string for a JSONB column bind.
+
+    asyncpg's default JSONB codec accepts only ``str`` and returns ``str``
+    (no ``set_type_codec`` is registered); ``None`` passes through untouched
+    because the execution-transcript JSONB columns are nullable.
+    """
+    if value is None:
+        return None
+    return json.dumps(value, default=str)
+
+
 def _extract_tool_call_facts(
     data: dict | None,
 ) -> tuple[str | None, str | None, object, object]:
@@ -1442,6 +1454,7 @@ async def _process_message(
     )
 
     data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
+    data = _serialize_jsonb(data)
 
     new_id = uuid.uuid4()
     await conn.execute(
@@ -1460,18 +1473,31 @@ async def _process_message(
            ON CONFLICT (client_id, source_database_id, external_message_id)
            DO UPDATE SET
                session_id = COALESCE(EXCLUDED.session_id, observed_messages.session_id),
-               external_session_id = COALESCE(EXCLUDED.external_session_id, observed_messages.external_session_id),
-               parent_external_session_id = COALESCE(EXCLUDED.parent_external_session_id, observed_messages.parent_external_session_id),
+               external_session_id = COALESCE(
+                   EXCLUDED.external_session_id, observed_messages.external_session_id
+               ),
+               parent_external_session_id = COALESCE(
+                   EXCLUDED.parent_external_session_id,
+                   observed_messages.parent_external_session_id,
+               ),
                role = EXCLUDED.role,
                agent = COALESCE(EXCLUDED.agent, observed_messages.agent),
                mode = COALESCE(EXCLUDED.mode, observed_messages.mode),
                cost_usd = COALESCE(EXCLUDED.cost_usd, observed_messages.cost_usd),
                input_tokens = COALESCE(EXCLUDED.input_tokens, observed_messages.input_tokens),
                output_tokens = COALESCE(EXCLUDED.output_tokens, observed_messages.output_tokens),
-               source_created_at = COALESCE(EXCLUDED.source_created_at, observed_messages.source_created_at),
-               source_updated_at = COALESCE(EXCLUDED.source_updated_at, observed_messages.source_updated_at),
-               source_created_at_tz = COALESCE(EXCLUDED.source_created_at_tz, observed_messages.source_created_at_tz),
-               source_updated_at_tz = COALESCE(EXCLUDED.source_updated_at_tz, observed_messages.source_updated_at_tz),
+               source_created_at = COALESCE(
+                   EXCLUDED.source_created_at, observed_messages.source_created_at
+               ),
+               source_updated_at = COALESCE(
+                   EXCLUDED.source_updated_at, observed_messages.source_updated_at
+               ),
+               source_created_at_tz = COALESCE(
+                   EXCLUDED.source_created_at_tz, observed_messages.source_created_at_tz
+               ),
+               source_updated_at_tz = COALESCE(
+                   EXCLUDED.source_updated_at_tz, observed_messages.source_updated_at_tz
+               ),
                last_seen_at = EXCLUDED.last_seen_at,
                data = COALESCE(EXCLUDED.data, observed_messages.data)""",
         new_id,
@@ -1532,7 +1558,19 @@ async def _process_part(
     )
 
     data = _redact_and_truncate_payload(part.data, part_data_max_chars)
-    new_part_id = uuid.uuid4()
+    data = _serialize_jsonb(data)
+
+    # Reuse the stored row id on replay so the tool-call row's part_id FK stays
+    # valid: the observed_parts upsert does not include `id` in its SET list,
+    # so a fresh UUID here would never exist in observed_parts.
+    existing_part_id = await conn.fetchval(
+        "SELECT id FROM observed_parts "
+        "WHERE client_id = $1 AND source_database_id = $2 AND external_part_id = $3",
+        client_id,
+        source_db_id,
+        part.external_part_id,
+    )
+    part_row_id = existing_part_id if existing_part_id is not None else uuid.uuid4()
 
     tool_name, tool_status, tool_input, tool_output = _extract_tool_call_facts(part.data)
 
@@ -1551,17 +1589,29 @@ async def _process_part(
                ON CONFLICT (client_id, source_database_id, external_part_id)
                DO UPDATE SET
                    message_id = COALESCE(EXCLUDED.message_id, observed_parts.message_id),
-                   external_message_id = COALESCE(EXCLUDED.external_message_id, observed_parts.external_message_id),
+                   external_message_id = COALESCE(
+                       EXCLUDED.external_message_id, observed_parts.external_message_id
+                   ),
                    session_id = COALESCE(EXCLUDED.session_id, observed_parts.session_id),
-                   external_session_id = COALESCE(EXCLUDED.external_session_id, observed_parts.external_session_id),
+                   external_session_id = COALESCE(
+                       EXCLUDED.external_session_id, observed_parts.external_session_id
+                   ),
                    part_type = EXCLUDED.part_type,
-                   source_created_at = COALESCE(EXCLUDED.source_created_at, observed_parts.source_created_at),
-                   source_updated_at = COALESCE(EXCLUDED.source_updated_at, observed_parts.source_updated_at),
-                   source_created_at_tz = COALESCE(EXCLUDED.source_created_at_tz, observed_parts.source_created_at_tz),
-                   source_updated_at_tz = COALESCE(EXCLUDED.source_updated_at_tz, observed_parts.source_updated_at_tz),
+                   source_created_at = COALESCE(
+                       EXCLUDED.source_created_at, observed_parts.source_created_at
+                   ),
+                   source_updated_at = COALESCE(
+                       EXCLUDED.source_updated_at, observed_parts.source_updated_at
+                   ),
+                   source_created_at_tz = COALESCE(
+                       EXCLUDED.source_created_at_tz, observed_parts.source_created_at_tz
+                   ),
+                   source_updated_at_tz = COALESCE(
+                       EXCLUDED.source_updated_at_tz, observed_parts.source_updated_at_tz
+                   ),
                    last_seen_at = EXCLUDED.last_seen_at,
                    data = COALESCE(EXCLUDED.data, observed_parts.data)""",
-            new_part_id,
+            part_row_id,
             client_id,
             source_db_id,
             part.external_part_id,
@@ -1579,6 +1629,12 @@ async def _process_part(
         )
 
         if part.part_type == "tool" and tool_name is not None:
+            tool_input_json = _serialize_jsonb(
+                _truncate_json_field(_redact_json_value(tool_input), tool_payload_max_chars)
+            )
+            tool_output_json = _serialize_jsonb(
+                _truncate_json_field(_redact_json_value(tool_output), tool_payload_max_chars)
+            )
             await conn.execute(
                 """INSERT INTO observed_tool_calls
                    (id, client_id, source_database_id, external_part_id,
@@ -1595,31 +1651,54 @@ async def _process_part(
                    ON CONFLICT (client_id, source_database_id, external_part_id)
                    DO UPDATE SET
                        part_id = EXCLUDED.part_id,
-                       message_id = COALESCE(EXCLUDED.message_id, observed_tool_calls.message_id),
-                       session_id = COALESCE(EXCLUDED.session_id, observed_tool_calls.session_id),
-                       external_session_id = COALESCE(EXCLUDED.external_session_id, observed_tool_calls.external_session_id),
+                       message_id = COALESCE(
+                           EXCLUDED.message_id, observed_tool_calls.message_id
+                       ),
+                       session_id = COALESCE(
+                           EXCLUDED.session_id, observed_tool_calls.session_id
+                       ),
+                       external_session_id = COALESCE(
+                           EXCLUDED.external_session_id,
+                           observed_tool_calls.external_session_id,
+                       ),
                        tool_name = EXCLUDED.tool_name,
-                       tool_status = COALESCE(EXCLUDED.tool_status, observed_tool_calls.tool_status),
-                       tool_input = COALESCE(EXCLUDED.tool_input, observed_tool_calls.tool_input),
-                       tool_output = COALESCE(EXCLUDED.tool_output, observed_tool_calls.tool_output),
-                       source_created_at = COALESCE(EXCLUDED.source_created_at, observed_tool_calls.source_created_at),
-                       source_updated_at = COALESCE(EXCLUDED.source_updated_at, observed_tool_calls.source_updated_at),
-                       source_created_at_tz = COALESCE(EXCLUDED.source_created_at_tz, observed_tool_calls.source_created_at_tz),
-                       source_updated_at_tz = COALESCE(EXCLUDED.source_updated_at_tz, observed_tool_calls.source_updated_at_tz),
+                       tool_status = COALESCE(
+                           EXCLUDED.tool_status, observed_tool_calls.tool_status
+                       ),
+                       tool_input = COALESCE(
+                           EXCLUDED.tool_input, observed_tool_calls.tool_input
+                       ),
+                       tool_output = COALESCE(
+                           EXCLUDED.tool_output, observed_tool_calls.tool_output
+                       ),
+                       source_created_at = COALESCE(
+                           EXCLUDED.source_created_at, observed_tool_calls.source_created_at
+                       ),
+                       source_updated_at = COALESCE(
+                           EXCLUDED.source_updated_at, observed_tool_calls.source_updated_at
+                       ),
+                       source_created_at_tz = COALESCE(
+                           EXCLUDED.source_created_at_tz,
+                           observed_tool_calls.source_created_at_tz,
+                       ),
+                       source_updated_at_tz = COALESCE(
+                           EXCLUDED.source_updated_at_tz,
+                           observed_tool_calls.source_updated_at_tz,
+                       ),
                        last_seen_at = EXCLUDED.last_seen_at,
                        data = COALESCE(EXCLUDED.data, observed_tool_calls.data)""",
                 uuid.uuid4(),
                 client_id,
                 source_db_id,
                 part.external_part_id,
-                new_part_id,
+                part_row_id,
                 resolved_message_id,
                 resolved_session_id,
                 part.external_session_id,
                 tool_name,
                 tool_status,
-                _truncate_json_field(_redact_json_value(tool_input), tool_payload_max_chars),
-                _truncate_json_field(_redact_json_value(tool_output), tool_payload_max_chars),
+                tool_input_json,
+                tool_output_json,
                 part.source_created_at,
                 part.source_updated_at,
                 source_created_at_tz,
