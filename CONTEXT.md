@@ -454,6 +454,139 @@ replay is neither re-appended (double-count) nor blindly overwritten:
 _Avoid_: Overwrite-on-replay, replay append (double-counting), uncached/derived
 merge on base totals
 
+**AFK Run**:
+The aggregate root of the AFK outcome read-model (``afk_runs`` table,
+``afk_outcomes.models.AFKRun``). Represents one reconstructed unit of AFK
+engineering work — the sessions that performed it, the engineering entities it
+touched, the deterministic correlations linking them, and the resulting
+EngineeringOutcome. Reconstructed by the CorrelationEngine from a session seed
+plus a window of Engineering Entities/Events, and keyed by a newly-assigned
+``afk_run_id`` ULID.
+_Avoid_: Outcome record, engineering task (generic)
+
+**afk_run_id**:
+The Gateway-owned ULID primary key of an AFK Run (``afk_runs.afk_run_id``),
+assigned at reconstruction time by the resolver. The run carries no
+pre-existing identifier from the provider.
+_Avoid_: Run ID (ambiguous — collides with agent-run session IDs)
+
+**RunStatus**:
+The lifecycle status of an AFK Run (``afk_outcomes.models.RunStatus``):
+``running``, ``completed``, ``blocked``, ``stale``, ``timed_out``, ``failed``,
+``cancelled``. Mirrors the Agent Run Run Status vocabulary but is a separate
+enum stored on ``afk_runs.status`` — never conflate it with the agent-run
+``_compute_status`` heuristic or with EngineeringOutcomeStatus.
+_Avoid_: Reusing the Agent Run status heuristic, conflating with outcome status
+
+**Engineering Entity**:
+A provider-independent, stable reference to one engineering artifact
+(``afk_outcomes.models.EngineeringEntity``): an issue, change_request, commit,
+review, or merge_event. ``entity_id`` is the provider-scoped stable identifier
+(e.g. ``issue:437``, ``change_request:442``); other fields are descriptive
+metadata, never identity.
+_Avoid_: Provider object, GitHub issue (provider-specific)
+
+**Engineering Event**:
+A timestamped observation about an Engineering Entity
+(``afk_outcomes.models.EngineeringEvent``), e.g. ``opened``, ``closed``,
+``merged``, ``review_submitted``. Consumed from the provider-events topic or
+pulled by the provider adapters.
+_Avoid_: Webhook payload (in the canonical sense), raw provider event
+
+**change_request**:
+The provider's pull/merge request, normalized as an Engineering Entity with
+``entity_type = change_request`` (e.g. ``change_request:442``). The owning
+change request anchors an AFK Run: the CorrelationEngine binds it by exact
+title match and extracts its body's resolved/mentioned issue references into
+the EngineeringOutcome.
+_Avoid_: PR/MR (provider-specific), pull request (in generic sense)
+
+**EngineeringOutcome**:
+The resolved engineering result of an AFK Run (``EngineeringOutcome``):
+``status`` (EngineeringOutcomeStatus: ``merged``/``closed``/``abandoned``/
+``open``), ``change_request_ids``, ``resolved_issue_ids``, ``merge_event_id``,
+``merged_at``. Aurora Glass renders ``open`` as "still open" and treats
+``failed`` as a RunStatus, never an outcome status.
+_Avoid_: Outcome status only, PR state
+
+**Correlation**:
+A deterministic link between an AFK Run and one Engineering Entity
+(``afk_outcomes.models.Correlation``), produced by the CorrelationEngine.
+Every derived link records ``correlation_method`` (the rule that produced it),
+``correlation_confidence``, evidence with source identifiers, and
+``resolver_version``. Persisted on ``afk_run_entities`` /
+``unresolved_correlations``.
+_Avoid_: Match, guess
+
+**correlation_confidence**:
+The 0.0–1.0 confidence of a derived link. Values ≥ 0.5 resolve to a
+``resolved`` role; 0.1 is ``referenced``; 0.0 is ``noise``. Aurora Glass
+renders it as a percentage (e.g. ``100%``, ``10%``).
+_Avoid_: Score, probability
+
+**correlation_method**:
+The deterministic rule that produced a Correlation. The five rules run in
+descending confidence order with first-lock-wins: ``explicit_run_id``,
+``issue_reference``, ``branch_issue_reference``, ``commit_issue_reference``,
+``temporal_inference``.
+_Avoid_: Reason (generic), source
+
+**resolver_version**:
+The version of the CorrelationEngine that produced a derived link (currently
+``"1"``), recorded on every Correlation, link, and UnresolvedCorrelation so
+rule-semantics changes can be detected downstream.
+_Avoid_: Schema version, migration version
+
+**Provisional Link**:
+A derived link marked ``provisional`` — an entity link whose role is not
+``resolved`` (i.e. ``referenced`` or ``noise``), or a session link marked
+``inferred``. Provisional links are visibly distinguished in Aurora Glass and
+never silently conflated with explicit resolved links.
+_Avoid_: Uncertain link, best-effort link (ambiguous)
+
+**Unresolved Correlation**:
+A correlation the resolver could not deterministically establish
+(``unresolved_correlations`` table): ``ambiguous`` (competing candidates with
+no higher-confidence tie-breaker) or ``unmatched`` (no rule produced a link).
+Never random-tiebroken. Exposed via the AFK Outcomes REST API with
+``provisional=true``.
+_Avoid_: Blocked link, pending match
+
+**AFK Outcome Consumer**:
+A companion Kafka consumer (``app/consumer/afk_consumer.py``) that reads the
+external provider-events topic (``afk.events``) in its OWN consumer group
+(``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
+group), maps message types to canonical Engineering Events, writes each
+message in a single DB transaction (offset committed only after success), DLQs
+poison messages, and runs scheduled bounded-window reconciliation reusing the
+backfill engine for terminal states (merged/closed) the topic does not carry.
+_Avoid_: Kafka consumer (generic), outcomes ingestion bridge
+
+**AFK Backfill CLI**:
+The operator CLI ``scripts/afk_backfill.py`` that pulls a bounded window of
+engineering activity from a provider adapter, runs it through the
+CorrelationEngine against Gateway sessions, and persists resolved runs
+idempotently. ``--dry-run`` prints match/unmatched/ambiguous counts and
+optional per-match evidence without writing. Backfill is CLI-only — the AFK
+Outcomes REST API is strictly read-only.
+_Avoid_: Backfill script (generic), reconciliation daemon
+
+**AFK Outcomes REST API**:
+The read-only API surface for the AFK outcome read-model
+(``app/api/afk_outcomes.py``, prefix ``/api/v1/afk-outcomes``):
+``GET /runs`` (filterable by repository, window, status, outcome, origin;
+paginated), ``GET /runs/{afk_run_id}`` (full chain with per-link provenance),
+``GET /entities``, ``GET /correlations``. Uses the ``{status, data, error}``
+envelope and API-key auth. Never writes — backfill remains CLI-only.
+_Avoid_: AFK API (generic), outcomes endpoint
+
+**AFK Outcomes Tab**:
+The Aurora Glass dashboard tab (top-nav "AFK Outcomes") that lists AFK Runs
+and opens the chain detail overlay for one run. Follows the shared panel
+conventions (freshness/stale-on-error retention, Token Breakdown, Active
+Tokens).
+_Avoid_: AFK panel (generic)
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
@@ -461,7 +594,9 @@ The Gateway uses a layered architecture:
 - **app/api/** — REST endpoints
 - **app/core/** — Configuration, auth, logging, factory
 - **app/db/** — Postgres pool, migrations, ORM models
-- **app/consumer/** — Kafka consumer bridge that reads usage records from Kafka and POSTs them to the Gateway ingest API (separate container)
+- **app/consumer/** — Kafka consumer bridge that reads usage records from Kafka and POSTs them to the Gateway ingest API (separate container), plus the AFK Outcome Consumer (separate container)
+- **afk_outcomes/** — pure-domain AFK outcome package (models, serialization, correlation engine, provider adapters, repository Protocol) that imports nothing from `app`
+- **scripts/** — operator CLIs, including the AFK Backfill CLI
 
 Aurora Glass is related to the Gateway, but is not part of the Gateway's
 service layers.
@@ -517,6 +652,17 @@ manages.
 - The **Replay Merge** non-erasing fill-absent principle also applies to **Session Context** and Project projections while preserving their snapshot semantics
 - A **Canonical Event Replay Merge** (ADR 0012) corrects a stored **Canonical Event** toward the collector's latest non-null observation and moves the owning session aggregate by the per-field delta, never re-incrementing it
 - A **Canonical Event Replay Merge** never erases a populated value: null/omitted collector values produce a zero delta, and text enrichment is COALESCE-filled
+- An **AFK Run** is keyed by an **afk_run_id** ULID assigned at reconstruction time and carries one **RunStatus** and one optional **EngineeringOutcome**
+- An **AFK Run** is reconstructed by the **CorrelationEngine** from a session seed plus a window of **Engineering Entities/Events**
+- A **Correlation** links one **AFK Run** to one **Engineering Entity** and records **correlation_method**, **correlation_confidence**, evidence, and **resolver_version**
+- An **Engineering Entity** is referenced by zero or more **Engineering Events** and may carry an entity link on zero or more **AFK Runs**
+- A **change_request** anchors an **AFK Run**; its body's resolved/mentioned issue references become **resolved_issue_ids** / referenced links in the **EngineeringOutcome**
+- An **Unresolved Correlation** belongs to one **AFK Run** (or is unattributed) and is either `ambiguous` or `unmatched`
+- An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
+- An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
+- An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
+- The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
+- The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 
 ## Flagged Ambiguities
 

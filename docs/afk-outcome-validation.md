@@ -25,8 +25,9 @@ The cluster reconstructs correctly as **one AFK Run**:
   ULID (the resolver assigns it at reconstruction time; the run carries no
   pre-existing id).
 - `status` = `completed`; the run is **reconstructed** by the resolver from a
-  session seed plus the window of engineering entities/events (see §6 on
-  "origin=reconstructed").
+  session seed plus the window of engineering entities/events (origin =
+  reconstructed — the run is built by the resolver, not observed as a live
+  provider object).
 - `outcome.status` = `merged`; `change_request_ids` = `["change_request:442"]`;
   `resolved_issue_ids` = `["issue:437", "issue:438", "issue:439", "issue:440"]`;
   `merge_event_id` = `"merge_event:442"`; `merged_at` = `2026-08-13T10:10:29Z`.
