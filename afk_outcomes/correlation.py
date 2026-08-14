@@ -647,6 +647,7 @@ class CorrelationEngine:
                 correlations.append(correlation)
 
         owning = self._owning_change_request(seed, entities)
+        entities = self._dedupe_entities(entities, owning)
         run_agent = owning.author if owning is not None else None
         run_project = (
             owning.repository
@@ -698,6 +699,45 @@ class CorrelationEngine:
     ) -> EngineeringEntity | None:
         matches = [cr for cr in _change_requests(entities) if cr.title == run.title]
         return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _dedupe_entities(
+        entities: Sequence[EngineeringEntity],
+        owning: EngineeringEntity | None,
+    ) -> list[EngineeringEntity]:
+        """Collapse duplicate ``entity_id`` copies before lineage derivation.
+
+        The same commit SHA (or review id) can appear on the branches of
+        several change requests, so ``fetch_entities`` may emit multiple
+        :class:`EngineeringEntity` rows sharing one ``entity_id`` with
+        different ``owning_change_request_id`` values.  ``repository.save``
+        keys its entity map on ``entity_id`` (last-copy-wins), so a surviving
+        copy whose owning id differs from the CR the lineage link was derived
+        from would persist contradictory provenance.
+
+        Prefer the copy whose ``owning_change_request_id`` equals the owning
+        CR's external id; when neither copy matches (or there is no owning
+        CR), keep the first-seen copy so the outcome stays deterministic.
+        The owning CR itself and non-commit/review entity types carry a
+        ``None`` owning id and are therefore never affected by the
+        preference rule.
+        """
+        owning_external_id = (
+            owning.entity_id.partition(":")[2] if owning is not None else None
+        )
+        deduped: dict[str, EngineeringEntity] = {}
+        for entity in entities:
+            existing = deduped.get(entity.entity_id)
+            if existing is None:
+                deduped[entity.entity_id] = entity
+                continue
+            if (
+                owning_external_id is not None
+                and existing.owning_change_request_id != owning_external_id
+                and entity.owning_change_request_id == owning_external_id
+            ):
+                deduped[entity.entity_id] = entity
+        return list(deduped.values())
 
     def _entity_links(
         self,
