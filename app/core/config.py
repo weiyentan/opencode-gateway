@@ -153,6 +153,17 @@ class Settings(BaseSettings):
     # against an empty repository (adapter error, caught and logged).
     afk_outcomes_consumer_enabled: bool = False
 
+    # Execution-transcript truncation caps (issue #465, ADR 0016).
+    # Applied at ingest before any message/part/tool payload reaches the
+    # durable store.  ``tool_payload_max_chars`` bounds each observed
+    # ``tool_input`` / ``tool_output`` field; ``part_data_max_chars`` bounds
+    # the verbatim ``observed_messages.data`` / ``observed_parts.data``
+    # JSONB, tagging the stored value with a ``truncated`` marker when
+    # content was cut.  Maps to GATEWAY_TOOL_PAYLOAD_MAX_CHARS and
+    # GATEWAY_PART_DATA_MAX_CHARS.
+    tool_payload_max_chars: int = 4096
+    part_data_max_chars: int = 65536
+
     @model_validator(mode="after")
     def _validate_afk_outcomes_requirements(self) -> Settings:
         """Fail fast when the AFK consumer is enabled without a repository.
