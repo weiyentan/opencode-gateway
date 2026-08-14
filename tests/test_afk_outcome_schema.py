@@ -60,6 +60,17 @@ def _run_alembic_upgrade_sql(revision: str = "0026") -> str:
     return buf.getvalue()
 
 
+def _run_alembic_upgrade_sql_delta() -> str:
+    """Render only the 0025 → 0026 upgrade delta (not the full 0000 chain)."""
+    from alembic.command import upgrade
+
+    cfg = _alembic_cfg()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        upgrade(cfg, "0025:0026", sql=True)
+    return buf.getvalue()
+
+
 def _run_alembic_downgrade_sql(revision: str = "0025") -> str:
     from alembic.command import downgrade
 
@@ -79,6 +90,20 @@ def _render_upgrade_sql_guarded() -> str:
     """Render 0026 upgrade SQL, skipping on the pre-existing 3.9 migration error."""
     try:
         return _run_alembic_upgrade_sql("0026")
+    except BaseException as exc:  # noqa: BLE001 - we re-raise unless pre-existing
+        if _is_pre_existing_py39_migration_error(exc):
+            pytest.skip(
+                "Pre-existing Python 3.9 migration import failure "
+                "(0024/0025 use `str | None` at module level); "
+                "run on Python >=3.12 to exercise the offline render."
+            )
+        raise
+
+
+def _render_upgrade_sql_delta_guarded() -> str:
+    """Render the 0025 → 0026 delta SQL, skipping on the 3.9 migration error."""
+    try:
+        return _run_alembic_upgrade_sql_delta()
     except BaseException as exc:  # noqa: BLE001 - we re-raise unless pre-existing
         if _is_pre_existing_py39_migration_error(exc):
             pytest.skip(
@@ -193,6 +218,13 @@ def test_unresolved_correlations_unique_key() -> None:
     assert "uq_unresolved_correlations_entity_method" in ddl
 
 
+def test_unresolved_correlations_has_reason_and_candidates_columns() -> None:
+    """Engine unresolved outcomes need reason + candidates columns (issue #458)."""
+    cols = set(UnresolvedCorrelation.__table__.columns.keys())
+    assert "reason" in cols, "unresolved_correlations missing reason column"
+    assert "candidates" in cols, "unresolved_correlations missing candidates column"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Migration module — revision ids + 3.9 import safety
 # ══════════════════════════════════════════════════════════════════════════════
@@ -230,9 +262,11 @@ def test_upgrade_creates_all_six_tables() -> None:
 
 
 def test_upgrade_does_not_touch_existing_usage_tables() -> None:
-    sql = _render_upgrade_sql_guarded()
-    # existing usage tables are created exactly once by earlier migrations and
-    # never altered or dropped by 0026.
+    # Render ONLY the 0025 → 0026 delta.  Rendering the full 0000 → 0026
+    # chain would legitimately include ALTER TABLE on usage tables from
+    # *earlier* migrations (0000→0001); the intent is that 0026 itself must
+    # not alter or drop any existing usage table.
+    sql = _render_upgrade_sql_delta_guarded()
     for table_name in ("usage_events", "opencode_usage_records", "sessions", "source_identities"):
         assert f"DROP TABLE {table_name}" not in sql
         assert f"ALTER TABLE {table_name}" not in sql
@@ -250,6 +284,13 @@ def test_downgrade_drops_all_six_tables_in_reverse_order() -> None:
     sql = _render_downgrade_sql_guarded()
     for table_name in _AFK_TABLE_NAMES:
         assert f"DROP TABLE {table_name}" in sql, f"missing DROP TABLE {table_name}"
-    positions = [sql.find(f"DROP TABLE {name}") for name in _AFK_TABLE_NAMES]
+    # Reverse dependency order: children first (unresolved_correlations,
+    # delivery_log, engineering_events, afk_run_entities, afk_run_sessions),
+    # parent last (afk_runs).  _AFK_TABLE_NAMES is in creation (parent-first)
+    # order, so iterate it reversed and assert the drop positions ascend.
+    positions = [sql.find(f"DROP TABLE {name}") for name in reversed(_AFK_TABLE_NAMES)]
     assert -1 not in positions
-    assert positions == sorted(positions), "downgrade must drop in reverse dependency order"
+    assert positions == sorted(positions), (
+        "downgrade must drop children before their parent (afk_runs last); "
+        f"drop positions: {positions}"
+    )

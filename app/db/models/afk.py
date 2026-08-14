@@ -250,6 +250,18 @@ class UnresolvedCorrelation(Base):
     ``afk_run_id`` is nullable — an unresolved correlation may not yet be
     attributed.  Keyed by ``UNIQUE (provider, repository, entity_type,
     external_id, method)`` for replay safety.
+
+    Two kinds of row share this table under the enrich-only contract:
+
+    * **Low-confidence links** — a ``Correlation`` below the resolved-role
+      threshold (a ``referenced`` link).  ``entity_type``/``external_id``/
+      ``method`` are the real entity identity + correlation method;
+      ``reason`` is NULL and ``candidates`` is the empty array.
+    * **Engine ambiguous/unmatched outcomes** — run-level results from the
+      correlation engine with no single entity or method.  ``entity_type``
+      is the ``afk_run`` sentinel, ``external_id`` is the run id, ``method``
+      mirrors ``reason`` (``ambiguous``/``unmatched``), and ``candidates``
+      holds the competing candidate entity ids (empty for ``unmatched``).
     """
 
     __tablename__ = "unresolved_correlations"
@@ -274,9 +286,11 @@ class UnresolvedCorrelation(Base):
     external_id: Mapped[str] = mapped_column(String, nullable=False)
     afk_run_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
     method: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False
     )
+    candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

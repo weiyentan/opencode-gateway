@@ -159,7 +159,9 @@ def _mk_correlation_row(
     external_id: str = "37",
     afk_run_id: str | None = None,
     method: str = "temporal_inference",
+    reason: str | None = None,
     correlation_confidence: float = 0.4,
+    candidates: list | None = None,
     evidence: list | None = None,
     resolver_version: str | None = "1",
     created_at: datetime | None = _A_TS,
@@ -172,7 +174,9 @@ def _mk_correlation_row(
             "external_id": external_id,
             "afk_run_id": afk_run_id,
             "method": method,
+            "reason": reason,
             "correlation_confidence": correlation_confidence,
+            "candidates": candidates if candidates is not None else [],
             "evidence": evidence or [],
             "resolver_version": resolver_version,
             "created_at": created_at,
@@ -608,6 +612,85 @@ class TestListCorrelations:
         data = response.json()["data"]
         assert data["items"] == []
         assert data["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_returns_ambiguous_entries_with_reason_and_candidates(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="ambiguous",
+                    reason="ambiguous",
+                    correlation_confidence=0.0,
+                    candidates=["change_request:300", "change_request:310"],
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk-outcomes/correlations")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["reason"] == "ambiguous"
+        assert item["candidates"] == ["change_request:300", "change_request:310"]
+        assert item["entity_id"] == f"afk_run:{_RUN_ID}"
+        assert item["provisional"] is True
+
+    @pytest.mark.asyncio
+    async def test_unmatched_entries_have_empty_candidates(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="unmatched",
+                    reason="unmatched",
+                    correlation_confidence=0.0,
+                    candidates=[],
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk-outcomes/correlations")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["reason"] == "unmatched"
+        assert item["candidates"] == []
+
+    @pytest.mark.asyncio
+    async def test_reason_filter_narrows_query(self, client: AsyncClient, mock_conn: AsyncMock):
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/afk-outcomes/correlations", params={"reason": "ambiguous"}
+            )
+
+        assert response.status_code == 200
+        count_sql = mock_conn.fetchval.call_args[0][0]
+        assert "reason = $1" in count_sql
+
+    @pytest.mark.asyncio
+    async def test_invalid_reason_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
+        async with client as c:
+            response = await c.get(
+                "/api/v1/afk-outcomes/correlations", params={"reason": "bogus"}
+            )
+
+        assert response.status_code == 400
 
 
 # ══════════════════════════════════════════════════════════════════════════
