@@ -129,6 +129,22 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:8000"
     collector_token: str = ""
 
+    # AFK outcome consumer (issue #451) — the live ingestion side of AFK
+    # Outcome Observability.  Runs in its OWN Kafka consumer group
+    # (``opencode-outcomes``, never the usage consumer's ``opencode-gateway``
+    # group), consuming the existing provider-events topic (external — the
+    # topic is not created here) and mapping message types to canonical
+    # engineering events.  Terminal states the topic does not carry
+    # (merged/closed) are converged by a scheduled reconciliation loop that
+    # reuses the backfill engine over a bounded window.
+    afk_outcomes_topic: str = "afk.events"
+    afk_outcomes_dlq_topic: str = "afk.events-dlq"
+    afk_outcomes_consumer_group_id: str = "opencode-outcomes"
+    afk_outcomes_provider: str = "github"
+    afk_outcomes_repository: str = ""
+    afk_outcomes_reconcile_cadence_seconds: float = 3600.0
+    afk_outcomes_reconcile_window_seconds: float = 86400.0
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

@@ -78,6 +78,72 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ── Local Kafka (KRaft single node) for the streaming consumers ──────
+  # Provides the broker both the usage consumer and the AFK outcome
+  # consumer read from.  The provider-events topic is external: it is
+  # expected to be produced by the provider webhook relay, not created
+  # here — AUTO_CREATE_TOPICS_ENABLE only backstops local development.
+  # The broker is internal-only (no host ports — the frontend service is
+  # the sole host entrypoint); produce/consume via `docker compose exec`.
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: opencode-gateway-kafka
+    environment:
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - gateway-net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── AFK Outcome Consumer ─────────────────────────────────────────────
+  # Live ingestion for AFK Outcome Observability: consumes the provider-events
+  # topic in its OWN group (``opencode-outcomes``) and writes canonical
+  # engineering events to Postgres, plus a scheduled reconciliation loop.
+  afk-outcomes-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.afk-consumer
+    container_name: opencode-afk-outcomes-consumer
+    environment:
+      GATEWAY_KAFKA_BROKERS: kafka:9092
+      GATEWAY_AFK_OUTCOMES_TOPIC: ${GATEWAY_AFK_OUTCOMES_TOPIC:-afk.events}
+      GATEWAY_AFK_OUTCOMES_DLQ_TOPIC: ${GATEWAY_AFK_OUTCOMES_DLQ_TOPIC:-afk.events-dlq}
+      GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID: ${GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID:-opencode-outcomes}
+      GATEWAY_AFK_OUTCOMES_PROVIDER: ${GATEWAY_AFK_OUTCOMES_PROVIDER:-github}
+      GATEWAY_AFK_OUTCOMES_REPOSITORY: ${GATEWAY_AFK_OUTCOMES_REPOSITORY:-}
+      GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS:-3600}
+      GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS:-86400}
+      GATEWAY_DATABASE_HOST: postgres
+      GATEWAY_DATABASE_PORT: "5432"
+      GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
+      GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
+      GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
 volumes:
   postgres-data:
     driver: local
