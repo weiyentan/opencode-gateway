@@ -216,10 +216,22 @@ class AFKOutcomeConsumer:
         ``GATEWAY_DATABASE_*``), ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` (the
         owner/repo to reconcile), and provider credentials in the adapters'
         standard env vars (``GITHUB_TOKEN`` / ``GITLAB_TOKEN``).
+
+        Fails fast with :class:`ValueError` when
+        ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` is empty/absent: the consumer
+        always reconciles against this repository, so an empty value would
+        otherwise start a reconcile loop that silently retries forever
+        against an adapter error.
         """
         from app.core.config import get_settings
 
         settings = get_settings()
+        if not settings.afk_outcomes_repository.strip():
+            raise ValueError(
+                "GATEWAY_AFK_OUTCOMES_REPOSITORY must be set: the AFK outcome "
+                "consumer reconciles a bounded window against this repository; "
+                "without it the reconcile loop would silently retry forever."
+            )
         provider = Provider(settings.afk_outcomes_provider)
         pool = await asyncpg.create_pool(
             host=settings.database_host,

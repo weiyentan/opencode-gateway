@@ -125,6 +125,10 @@ services:
       GATEWAY_AFK_OUTCOMES_DLQ_TOPIC: ${GATEWAY_AFK_OUTCOMES_DLQ_TOPIC:-afk.events-dlq}
       GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID: ${GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID:-opencode-outcomes}
       GATEWAY_AFK_OUTCOMES_PROVIDER: ${GATEWAY_AFK_OUTCOMES_PROVIDER:-github}
+      # The consumer always needs a repository to reconcile — the Settings
+      # validator fires on startup when the flag is on and the repository is
+      # empty (the default below makes a misconfigured deployment fail fast).
+      GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED: "true"
       GATEWAY_AFK_OUTCOMES_REPOSITORY: ${GATEWAY_AFK_OUTCOMES_REPOSITORY:-}
       GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS:-3600}
       GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS:-86400}

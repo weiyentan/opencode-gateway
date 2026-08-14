@@ -48,6 +48,11 @@ spec:
               value: "opencode-outcomes"
             - name: GATEWAY_AFK_OUTCOMES_PROVIDER
               value: "github"
+            # The consumer always needs a repository to reconcile — the
+            # Settings validator fires on startup when this flag is on and
+            # the repository is empty (misconfigured deployments fail fast).
+            - name: GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED
+              value: "true"
             - name: GATEWAY_AFK_OUTCOMES_REPOSITORY
               value: ""
             - name: GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS

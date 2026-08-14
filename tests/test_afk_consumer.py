@@ -719,6 +719,42 @@ async def test_from_env_reads_afk_settings() -> None:
     assert consumer._reconcile_window_seconds == 3600.0
 
 
+@pytest.mark.asyncio
+async def test_from_env_fails_fast_when_repository_empty() -> None:
+    """``from_env`` fails fast (before any pool/adapter work) on an empty repository.
+
+    Without this guard the consumer would start with an empty
+    ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` and the reconcile loop would retry
+    forever against an adapter error (caught and logged).
+    """
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
+        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
+        "GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS": "3600",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch(
+            "app.consumer.afk_consumer.asyncpg.create_pool",
+            new_callable=AsyncMock,
+        ) as mock_pool,
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        with pytest.raises(ValueError, match="GATEWAY_AFK_OUTCOMES_REPOSITORY"):
+            await AFKOutcomeConsumer.from_env()
+
+    # The guard fires before any DB pool connection is attempted.
+    assert mock_pool.await_count == 0
+
+
 # ── Provider adapter wiring (GitHub parsed-JSON seam) ─────────────────────────
 
 
