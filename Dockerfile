@@ -34,6 +34,11 @@ WORKDIR /app
 # Copy application source (production entry point + all packages).
 COPY app/ /app/app/
 
+# Copy the pure-domain AFK outcome package.  ``app.api.afk_outcomes`` imports
+# ``afk_outcomes.models`` at import time, so the package must be present in the
+# image before the build-time import check below.
+COPY afk_outcomes/ /app/afk_outcomes/
+
 # Copy Alembic migration configuration (needed for startup auto-migration).
 COPY alembic.ini /app/alembic.ini
 COPY alembic/ /app/alembic/
