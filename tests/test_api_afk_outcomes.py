@@ -734,8 +734,15 @@ class TestEnvelopeAndReadOnly:
         from app.core.factory import create_app
 
         app = create_app(configure_logging=False)
-        methods = set()
-        for route in app.routes:
-            if getattr(route, "path", "").startswith("/api/v1/afk-outcomes"):
-                methods |= set(getattr(route, "methods", set()))
+        afk_paths = {
+            path
+            for path in app.openapi()["paths"]
+            if path.startswith("/api/v1/afk-outcomes")
+        }
+        assert afk_paths, "no /api/v1/afk-outcomes paths exposed in the OpenAPI schema"
+        methods = {
+            method.upper()
+            for path in afk_paths
+            for method in app.openapi()["paths"][path]
+        }
         assert methods == {"GET"}
