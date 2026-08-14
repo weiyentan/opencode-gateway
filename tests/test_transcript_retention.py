@@ -19,7 +19,10 @@ The boundary behaviour is exercised through a small in-memory connection
 (:class:`FakeTranscriptConn`) that evaluates the job's two SQL shapes
 (count query + batched ``DELETE ... IN (SELECT ... LIMIT)``) over rows
 keyed by id with a ``source_created_at_tz`` value — so the tests assert
-what the job actually deletes, not just what SQL it sends.
+what the job actually deletes, not just what SQL it sends.  The fake also
+models the transcript FK relationships (parts → messages, tool_calls →
+parts/messages) so the ``NOT EXISTS`` retained-child guards are exercised:
+a parent is only deleted once its children have been removed.
 """
 
 from __future__ import annotations
@@ -60,10 +63,17 @@ class FakeTranscriptConn:
 
     Supports exactly the two statements the retention job issues — the
     per-table count query (``SELECT count(*) ... FROM <table> WHERE
-    source_created_at_tz < $1``) and the batched delete (``DELETE FROM
-    <table> WHERE id IN (SELECT id ... LIMIT $n)``).  Rows with a ``None``
-    source timestamp are never matched (unknown age is retained, never
-    deleted).
+    source_created_at_tz < $1 [AND NOT EXISTS ...]``) and the batched
+    delete (``DELETE FROM <table> WHERE id IN (SELECT id ... LIMIT $n)``).
+    Rows with a ``None`` source timestamp are never matched (unknown age is
+    retained, never deleted).
+
+    The fake also models the transcript FK relationships (parts →
+    messages, tool_calls → parts/messages) so the ``NOT EXISTS``
+    retained-child guards are exercised: when a parent table is processed,
+    rows referenced by any *surviving* child are excluded (children are
+    processed first, so an aged-out child is already gone).  Rows added
+    without FK metadata have no children and behave exactly as before.
     """
 
     def __init__(self) -> None:
@@ -71,35 +81,80 @@ class FakeTranscriptConn:
             table: {} for table in TRANSCRIPT_TABLES
         }
         self.batch_sizes: dict[str, list[int]] = {table: [] for table in TRANSCRIPT_TABLES}
+        # child-row id → parent-row id FK references, mirroring the schema:
+        #   observed_parts.message_id      → observed_messages.id
+        #   observed_tool_calls.part_id    → observed_parts.id
+        #   observed_tool_calls.message_id → observed_messages.id
+        self._message_refs: dict[str, dict[str, str]] = {
+            table: {} for table in TRANSCRIPT_TABLES
+        }
+        self._part_refs: dict[str, dict[str, str]] = {
+            table: {} for table in TRANSCRIPT_TABLES
+        }
 
-    def add_row(self, table: str, source_created_at_tz: datetime | None) -> str:
-        """Insert one row; returns its id."""
+    def add_row(
+        self,
+        table: str,
+        source_created_at_tz: datetime | None,
+        message_id: str | None = None,
+        part_id: str | None = None,
+    ) -> str:
+        """Insert one row; returns its id.
+
+        ``message_id`` / ``part_id`` record child→parent FK references so the
+        ``NOT EXISTS`` guards can be exercised.  Rows added without metadata
+        have no children, so the guards are vacuous for them.
+        """
         row_id = str(uuid.uuid4())
         self.tables[table][row_id] = source_created_at_tz
+        if message_id is not None:
+            self._message_refs[table][row_id] = message_id
+        if part_id is not None:
+            self._part_refs[table][row_id] = part_id
         return row_id
 
     def rows(self, table: str) -> dict[str, datetime | None]:
         """Snapshot of the rows currently stored in ``table``."""
         return dict(self.tables[table])
 
-    async def fetchrow(self, sql: str, cutoff: datetime) -> dict[str, int]:
-        """Evaluate the count query for the table named in ``sql``."""
-        table = re.search(r"FROM (\w+)", sql).group(1)
+    def _surviving_child_parents(
+        self, child_table: str, refs: dict[str, dict[str, str]]
+    ) -> set[str]:
+        """Parent-row ids referenced by any row still present in ``child_table``."""
+        parents: set[str] = set()
+        for child_row_id in self.tables[child_table]:
+            parent = refs[child_table].get(child_row_id)
+            if parent is not None:
+                parents.add(parent)
+        return parents
+
+    def _eligible_rows(self, table: str, cutoff: datetime) -> list[str]:
+        """Row ids in ``table`` eligible for retention: strictly older than the
+        cutoff AND not referenced by any surviving child (the SQL guards)."""
         eligible = [
             row_id
             for row_id, tz in self.tables[table].items()
             if tz is not None and tz < cutoff
         ]
-        return {"cnt": len(eligible)}
+        if table == "observed_parts":
+            blocked = self._surviving_child_parents("observed_tool_calls", self._part_refs)
+        elif table == "observed_messages":
+            blocked = self._surviving_child_parents(
+                "observed_parts", self._message_refs
+            ) | self._surviving_child_parents("observed_tool_calls", self._message_refs)
+        else:
+            blocked = set()
+        return [row_id for row_id in eligible if row_id not in blocked]
+
+    async def fetchrow(self, sql: str, cutoff: datetime) -> dict[str, int]:
+        """Evaluate the count query for the table named in ``sql``."""
+        table = re.search(r"FROM (\w+)", sql).group(1)
+        return {"cnt": len(self._eligible_rows(table, cutoff))}
 
     async def execute(self, sql: str, cutoff: datetime, batch: int) -> str:
         """Evaluate the batched delete for the table named in ``sql``."""
         table = re.search(r"DELETE FROM (\w+)", sql).group(1)
-        eligible = [
-            row_id
-            for row_id, tz in self.tables[table].items()
-            if tz is not None and tz < cutoff
-        ]
+        eligible = self._eligible_rows(table, cutoff)
         selected = eligible[:batch]
         for row_id in selected:
             del self.tables[table][row_id]
@@ -242,6 +297,94 @@ async def test_limit_caps_total_deletions_across_tables() -> None:
     assert report.total == 4
     remaining = sum(len(conn.rows(table)) for table in TRANSCRIPT_TABLES)
     assert remaining == 9 - 4
+
+
+# ── FK guards — parents with retained children are deferred ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_parent_with_retained_child_not_deleted() -> None:
+    """A parent older than its window is NOT deleted while a retained child
+    (young or NULL timestamp) still references it — the ``NOT EXISTS`` guard
+    defers the parent instead of aborting on an ``ON DELETE NO ACTION`` FK
+    violation."""
+    conn = FakeTranscriptConn()
+    message_id = conn.add_row("observed_messages", NOW - timedelta(days=400))
+    part_id = conn.add_row(
+        "observed_parts", NOW - timedelta(days=100), message_id=message_id
+    )
+    conn.add_row(
+        "observed_tool_calls",
+        NOW - timedelta(days=1),  # retained: younger than the 90-day window
+        part_id=part_id,
+        message_id=message_id,
+    )
+
+    report = await run_retention(conn, windows=WINDOWS, now=NOW)
+
+    assert report.deleted["observed_tool_calls"] == 0
+    assert report.deleted["observed_parts"] == 0
+    assert report.deleted["observed_messages"] == 0
+    assert len(conn.rows("observed_tool_calls")) == 1
+    assert len(conn.rows("observed_parts")) == 1
+    assert len(conn.rows("observed_messages")) == 1
+
+
+@pytest.mark.asyncio
+async def test_convergence_when_children_age_out() -> None:
+    """Once children age out (deleted first), the parent guard passes and the
+    whole chain is removed in a single run; re-running is idempotent."""
+    conn = FakeTranscriptConn()
+    message_id = conn.add_row("observed_messages", NOW - timedelta(days=400))
+    part_id = conn.add_row(
+        "observed_parts", NOW - timedelta(days=100), message_id=message_id
+    )
+    conn.add_row(
+        "observed_tool_calls",
+        NOW - timedelta(days=200),
+        part_id=part_id,
+        message_id=message_id,
+    )
+
+    first = await run_retention(conn, windows=WINDOWS, now=NOW)
+
+    assert first.deleted["observed_tool_calls"] == 1
+    assert first.deleted["observed_parts"] == 1
+    assert first.deleted["observed_messages"] == 1
+    assert len(conn.rows("observed_tool_calls")) == 0
+    assert len(conn.rows("observed_parts")) == 0
+    assert len(conn.rows("observed_messages")) == 0
+
+    second = await run_retention(conn, windows=WINDOWS, now=NOW)
+    assert second.total == 0
+
+
+@pytest.mark.asyncio
+async def test_dry_run_applies_same_guards() -> None:
+    """A dry run counts the blocked parent as ineligible (the count query applies
+    the same guards as the delete) and deletes nothing."""
+    conn = FakeTranscriptConn()
+    message_id = conn.add_row("observed_messages", NOW - timedelta(days=400))
+    part_id = conn.add_row(
+        "observed_parts", NOW - timedelta(days=100), message_id=message_id
+    )
+    conn.add_row(
+        "observed_tool_calls",
+        NOW - timedelta(days=1),
+        part_id=part_id,
+        message_id=message_id,
+    )
+
+    report = await run_retention(conn, windows=WINDOWS, now=NOW, dry_run=True)
+
+    assert report.dry_run is True
+    assert report.total == 0
+    assert report.deleted["observed_messages"] == 0
+    assert report.deleted["observed_parts"] == 0
+    assert report.deleted["observed_tool_calls"] == 0
+    assert len(conn.rows("observed_messages")) == 1
+    assert len(conn.rows("observed_parts")) == 1
+    assert len(conn.rows("observed_tool_calls")) == 1
 
 
 # ── Accounting-table isolation ────────────────────────────────────────────────

@@ -22,10 +22,15 @@ Bounded batches, no unbounded single transaction: rows are deleted in
 ``--batch-size`` chunks (default {default_batch}), each batch an
 independent autocommitted statement, so a run never holds one giant
 transaction open.  Tables are processed children-first
-(``observed_tool_calls`` → ``observed_parts`` → ``observed_messages``) so
-the per-table counts reflect the explicit policy; the FK ``ON DELETE
-CASCADE`` chain is only a safety net for rows whose parent was already
-removed.
+(``observed_tool_calls`` → ``observed_parts`` → ``observed_messages``).
+
+The transcript foreign keys do NOT cascade (``ON DELETE NO ACTION``), so a
+parent row cannot be removed while it still has children.  Parent deletes
+are therefore guarded with ``NOT EXISTS`` against retained children: a
+parent is only removed once its children have been removed (children-first)
+or have no surviving children.  Rows whose children still survive are
+deferred to a later run, and the job converges idempotently as children age
+out.
 
 Usage::
 
@@ -68,8 +73,11 @@ logger = logging.getLogger("retention_transcripts")
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
-# Children-first so the per-table counts reflect the explicit policy; the
-# FK cascade (parts → messages, tool_calls → parts) is only a safety net.
+# Children-first so parents are only removed once their children have been
+# removed (or have no surviving children).  The transcript FKs do NOT
+# cascade (ON DELETE NO ACTION); parent deletes are guarded with NOT EXISTS
+# against retained children, so a parent with surviving children is deferred
+# to a later run (idempotent convergence).
 TRANSCRIPT_TABLES = (
     "observed_tool_calls",
     "observed_parts",
@@ -82,12 +90,53 @@ DEFAULT_BATCH_SIZE = 1000
 # ── SQL ──────────────────────────────────────────────────────────────────────
 
 
+def _table_alias(table: str) -> str | None:
+    """The correlation alias used by count/delete SQL (leaf tables are unaliased)."""
+    return {
+        "observed_parts": "p",
+        "observed_messages": "m",
+    }.get(table)
+
+
+def _guard_sql(table: str, alias: str) -> str:
+    """``NOT EXISTS`` guards against retained children for a parent table.
+
+    The transcript foreign keys are ``ON DELETE NO ACTION`` (see 0029), so a
+    parent row cannot be deleted while a child still references it.  Children
+    are processed first in the same run, so any child that survives to the
+    parent's turn is a retained one; the guard defers the parent to a later
+    run rather than aborting on a FK violation.
+    """
+    if table == "observed_parts":
+        return (
+            " AND NOT EXISTS (SELECT 1 FROM observed_tool_calls t"
+            f" WHERE t.part_id = {alias}.id)"
+        )
+    if table == "observed_messages":
+        return (
+            " AND NOT EXISTS (SELECT 1 FROM observed_parts p"
+            f" WHERE p.message_id = {alias}.id)"
+            " AND NOT EXISTS (SELECT 1 FROM observed_tool_calls t"
+            f" WHERE t.message_id = {alias}.id)"
+        )
+    return ""
+
+
 def _count_sql(table: str) -> str:
     """Count rows eligible for retention in ``table`` (strictly older than
-    the cutoff; NULL source timestamps are never eligible)."""
+    the cutoff; NULL source timestamps are never eligible).  Applies the same
+    retained-child guards as ``_delete_sql`` so a dry run reports exactly what
+    a write run would delete."""
+    alias = _table_alias(table)
+    if alias is None:
+        return (
+            f"SELECT count(*) AS cnt FROM {table}"
+            " WHERE source_created_at_tz < $1"
+        )
+    guards = _guard_sql(table, alias)
     return (
-        f"SELECT count(*) AS cnt FROM {table}"
-        " WHERE source_created_at_tz < $1"
+        f"SELECT count(*) AS cnt FROM {table} {alias}"
+        f" WHERE {alias}.source_created_at_tz < $1{guards}"
     )
 
 
@@ -96,12 +145,23 @@ def _delete_sql(table: str) -> str:
 
     The ``LIMIT`` subselect keeps each statement's transaction small; the
     job loops until a batch comes back short.  Only ``source_created_at_tz``
-    is compared — ingest-side timestamps are never used.
+    is compared — ingest-side timestamps are never used.  Parent tables are
+    guarded with ``NOT EXISTS`` against retained children.
     """
+    alias = _table_alias(table)
+    if alias is None:
+        return (
+            f"DELETE FROM {table} WHERE id IN ("
+            f" SELECT id FROM {table}"
+            "  WHERE source_created_at_tz < $1"
+            "  LIMIT $2"
+            ")"
+        )
+    guards = _guard_sql(table, alias)
     return (
-        f"DELETE FROM {table} WHERE id IN ("
-        f" SELECT id FROM {table}"
-        "  WHERE source_created_at_tz < $1"
+        f"DELETE FROM {table} {alias} WHERE id IN ("
+        f" SELECT {alias}.id FROM {table} {alias}"
+        f"  WHERE {alias}.source_created_at_tz < $1{guards}"
         "  LIMIT $2"
         ")"
     )

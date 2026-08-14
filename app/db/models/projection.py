@@ -289,6 +289,11 @@ class ObservedMessage(Base):
         Index("ix_observed_messages_session_created", "session_id", "source_created_at"),
         Index("ix_observed_messages_agent", "agent"),
         Index("ix_observed_messages_role_created", "role", "source_created_at"),
+        Index(
+            "ix_observed_messages_retention",
+            "source_created_at_tz",
+            postgresql_where=text("source_created_at_tz IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -363,6 +368,11 @@ class ObservedPart(Base):
         ),
         Index("ix_observed_parts_type_created", "part_type", "source_created_at"),
         Index("ix_observed_parts_created", "source_created_at"),
+        Index(
+            "ix_observed_parts_retention",
+            "source_created_at_tz",
+            postgresql_where=text("source_created_at_tz IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -437,6 +447,11 @@ class ObservedToolCall(Base):
             "ix_observed_tool_calls_status",
             "tool_status",
             postgresql_where=text("tool_status IS NOT NULL"),
+        ),
+        Index(
+            "ix_observed_tool_calls_retention",
+            "source_created_at_tz",
+            postgresql_where=text("source_created_at_tz IS NOT NULL"),
         ),
     )
 
