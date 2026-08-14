@@ -163,6 +163,19 @@ elementRegistry['afk-detail-title'] = afkDetailTitleEl;
 elementRegistry['afk-detail-body'] = afkDetailBodyEl;
 elementRegistry['afk-detail-close'] = afkDetailCloseEl;
 
+// Agent Run detail overlay fakes (issue #473): the AFK session drill-down
+// opens the existing Agent Run detail overlay via openAgentRunDetail, which
+// reads/writes els.arDetailOverlay / arDetailBody / arDetailTitle.  Registered
+// before loadRealAppJs so app.js captures them in els (like the AFK fakes).
+var arDetailOverlayEl = makeFakeElement('ar-detail-overlay');
+var arDetailTitleEl = makeFakeElement('ar-detail-title');
+var arDetailBodyEl = makeFakeElement('ar-detail-body');
+var arDetailCloseEl = makeFakeElement('ar-detail-close');
+elementRegistry['ar-detail-overlay'] = arDetailOverlayEl;
+elementRegistry['ar-detail-title'] = arDetailTitleEl;
+elementRegistry['ar-detail-body'] = arDetailBodyEl;
+elementRegistry['ar-detail-close'] = arDetailCloseEl;
+
 // Browser-history stub (issue #426): records pushState URLs so tests can
 // verify that Agent Runs page changes persist to the URL without touching
 // the table DOM (row content changes only through the normal fetch path).
@@ -281,6 +294,7 @@ var historyStub = {
   window.fmtConfidence = sandboxWindow.fmtConfidence;
   window.fmtEvidence = sandboxWindow.fmtEvidence;
   window.isProvisionalLink = sandboxWindow.isProvisionalLink;
+  window.resolveAfkSessionDrilldown = sandboxWindow.resolveAfkSessionDrilldown;
   window.buildAfkChain = sandboxWindow.buildAfkChain;
   window.renderAfkEntityLink = sandboxWindow.renderAfkEntityLink;
   window.renderAfkSessionLink = sandboxWindow.renderAfkSessionLink;
@@ -4414,6 +4428,126 @@ console.log('\u25B6 AFK Outcomes — openAfkRunDetail fetch + 404 handling (issu
     });
     pendingAsyncBlocks--;
   });
+})();
+
+// ── AFK Outcomes — session drill-down (issue #473) ─────────────────────
+// The AFK chain's session attachments become actionable: a session with a
+// resolvable internal session_id opens the existing Agent Run detail overlay
+// (openAgentRunDetail), while a session without one stays non-clickable but
+// remains visibly inferred.  The pure target resolver, the render markers,
+// the empty state, and the end-to-end click wiring are each exercised.
+
+console.log('\u25B6 AFK Outcomes — session drill-down target resolution (issue #473)');
+
+(function () {
+  var sid = '1f9c3a6e-0000-4000-8000-000000000001';
+  assert(window.resolveAfkSessionDrilldown({ session_id: sid, external_session_id: 'ses_01' }) === sid,
+    'resolved session: returns the internal session_id');
+  assert(window.resolveAfkSessionDrilldown({ external_session_id: 'ses_01', session_id: null }) === null,
+    'unresolved session (null session_id): returns null');
+  assert(window.resolveAfkSessionDrilldown({ external_session_id: 'ses_01' }) === null,
+    'unresolved session (missing session_id): returns null');
+  assert(window.resolveAfkSessionDrilldown({}) === null, 'empty session: returns null');
+  assert(window.resolveAfkSessionDrilldown(null) === null, 'null session: returns null');
+})();
+
+console.log('\u25B6 AFK Outcomes — session link drill-down rendering (issue #473)');
+
+(function () {
+  var resolved = window.renderAfkSessionLink({
+    session_id: '1f9c3a6e-0000-4000-8000-000000000001', external_session_id: 'ses_01',
+    agent: 'code-editor-senior', inferred: true, message_count: 42,
+    total_input_tokens: 5000, total_output_tokens: 3000,
+    total_cache_read_tokens: 1000, total_cache_write_tokens: 0, total_estimated_cost_usd: 1.2345
+  });
+  assert(resolved.indexOf('afk-session-clickable') !== -1, 'resolved session is clickable');
+  assert(resolved.indexOf('data-session-id="1f9c3a6e-0000-4000-8000-000000000001"') !== -1,
+    'resolved session carries data-session-id (internal id)');
+  assert(resolved.indexOf('open run') !== -1, 'resolved session shows the open-run affordance');
+  assert(resolved.indexOf('afk-provisional') !== -1 && resolved.indexOf('inferred') !== -1,
+    'resolved session is still visibly marked inferred');
+
+  var unresolved = window.renderAfkSessionLink({
+    external_session_id: 'ses_02', agent: 'code-editor-senior', inferred: true,
+    message_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+    total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0
+  });
+  assert(unresolved.indexOf('afk-session-clickable') === -1, 'unresolved session is NOT clickable');
+  assert(unresolved.indexOf('data-session-id=') === -1, 'unresolved session carries no data-session-id');
+  assert(unresolved.indexOf('open run') === -1, 'unresolved session shows no open-run affordance');
+  assert(unresolved.indexOf('afk-provisional') !== -1 && unresolved.indexOf('inferred') !== -1,
+    'unresolved session is still visibly marked inferred');
+})();
+
+console.log('\u25B6 AFK Outcomes — empty session state (issue #473)');
+
+(function () {
+  window.renderAfkRunDetail({ run: { afk_run_id: 'r1', status: 'completed', outcome_status: 'open' } });
+  assert(afkDetailBodyEl.innerHTML.indexOf('No sessions linked') !== -1,
+    'no sessions \u2192 "No sessions linked" empty state');
+})();
+
+console.log('\u25B6 AFK Outcomes — session drill-down click wiring (issue #473)');
+
+(function () {
+  // Parse the rendered session links so a click can be driven through the
+  // production wireAfkSessionDrilldown handler (same pattern as the
+  // agent-runs pagination fake).
+  var clickableLinks = [];
+  afkDetailBodyEl.querySelectorAll = function (selector) {
+    if (selector !== '.afk-session-clickable') return [];
+    clickableLinks = [];
+    var re = /data-session-id="([^"]+)"/g;
+    var m;
+    while ((m = re.exec(this.innerHTML)) !== null) {
+      var el = makeFakeElement('afk-session-link');
+      el.setAttribute('data-session-id', m[1]);
+      clickableLinks.push(el);
+    }
+    return clickableLinks;
+  };
+
+  var sid = '1f9c3a6e-0000-4000-8000-000000000001';
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'r1', status: 'completed', outcome_status: 'merged' },
+    sessions: [
+      { session_id: sid, external_session_id: 'ses_01', inferred: true },
+      { external_session_id: 'ses_02', inferred: true } // unresolved \u2192 non-clickable
+    ]
+  });
+
+  // Only the resolved session is wired as a clickable link.
+  assert(clickableLinks.length === 1,
+    'exactly one resolved session link is clickable (the unresolved one is not)');
+  assert(clickableLinks[0].getAttribute('data-session-id') === sid,
+    'the clickable link targets the internal session_id');
+
+  // Simulate the click: openAgentRunDetail(sid) fetches the Agent Run detail.
+  // The AFK chain overlay starts visible (as openAfkRunDetail left it); the
+  // drill-down must close it so the Agent Run overlay is not stacked behind it.
+  var wasVisible = afkDetailOverlayEl.classList.contains('visible');
+  afkDetailOverlayEl.classList.add('visible');
+  var fetched = [];
+  appJsSandbox.fetch = function (url) {
+    fetched.push(url);
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ status: 'ok', data: {} }); } });
+  };
+  clickableLinks[0]._handlers.click();
+  assert(fetched.length === 1 &&
+         fetched[0] === '/api/v1/usage/agent-runs/' + encodeURIComponent(sid),
+    'clicking a resolved session opens the Agent Run detail for its internal id');
+  assert(afkDetailOverlayEl.classList.contains('visible') === false,
+    'clicking a resolved session closes the AFK chain overlay (removes visible)');
+
+  // Restore the shared AFK overlay state so the deferred openAfkRunDetail
+  // assertion (a microtask that runs after this synchronous block) still sees
+  // the overlay as visible; restore a benign fetch + the generic
+  // querySelectorAll for later blocks.
+  if (wasVisible) afkDetailOverlayEl.classList.add('visible');
+  afkDetailBodyEl.querySelectorAll = function () { return []; };
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
+  };
 })();
 
 // ── Summary ─────────────────────────────────────────────────────────────

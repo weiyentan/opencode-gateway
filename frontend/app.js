@@ -688,6 +688,14 @@
     return !!(link && (link.provisional === true || link.inferred === true));
   }
 
+  /** Resolve the internal session id an AFK-linked session opens in the Agent
+   *  Run detail overlay, or null when the session has no resolvable internal
+   *  id (such a link stays non-clickable but remains visibly inferred).
+   *  Pure — no DOM access (issue #473). */
+  function resolveAfkSessionDrilldown(session) {
+    return (session && session.session_id) ? String(session.session_id) : null;
+  }
+
   /** Compose the canonical AFK outcome chain from a RunDetail response.
    *  Pure — returns the ordered steps (issue → run → sessions → agents →
    *  tokens/cost → change_request → commits → review cycles → outcome) with
@@ -1929,6 +1937,40 @@
     html += '</div>';
 
     els.afkDetailBody.innerHTML = html;
+    wireAfkSessionDrilldown();
+  }
+
+  /** Wire the resolved-session drill-down links (issue #473): clicking (or
+   *  activating via Enter/Space) a session with a resolvable internal id opens
+   *  the Agent Run detail overlay for that session; unresolved sessions render
+   *  no link and stay inert.  The AFK chain overlay is closed first so the
+   *  Agent Run detail is not hidden behind it (both overlays share the same
+   *  z-index, and the AFK overlay paints on top when both are visible). */
+  function wireAfkSessionDrilldown() {
+    var links = els.afkDetailBody.querySelectorAll('.afk-session-clickable');
+    links.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var sid = item.getAttribute('data-session-id');
+        if (sid) openAfkSessionDrilldown(sid);
+      });
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var sid = item.getAttribute('data-session-id');
+          if (sid) openAfkSessionDrilldown(sid);
+        }
+      });
+    });
+  }
+
+  /** Close the AFK chain overlay, then open the Agent Run detail overlay for
+   *  the given internal session id (issue #473).  Uses the same `visible`-class
+   *  convention as the other overlay open/close paths: removing `visible` from
+   *  the AFK overlay surfaces the Agent Run overlay instead of leaving it
+   *  stacked behind the AFK backdrop. */
+  function openAfkSessionDrilldown(sessionId) {
+    els.afkDetailOverlay.classList.remove('visible');
+    openAgentRunDetail(sessionId);
   }
 
   /** Render one chain step (from buildAfkChain) into HTML. */
@@ -1990,16 +2032,22 @@
 
   /** Render one session attachment with its inferred marker and compact Token
    *  Breakdown (delegating to fmtTokenBreakdownCompact per CONTEXT.md).
-   *  Session attachments are always inferred — the marker makes that visible. */
+   *  Session attachments are always inferred — the marker makes that visible.
+   *  A session with a resolvable internal session_id is clickable and opens the
+   *  Agent Run detail overlay; one without stays non-clickable (issue #473). */
   function renderAfkSessionLink(session) {
     var agent = session.agent || '--';
     var extId = session.external_session_id || session.session_id || '--';
     var inferred = isProvisionalLink(session);
-    return '<div class="afk-chain-item' + (inferred ? ' afk-provisional' : '') + '">' +
+    var drillId = resolveAfkSessionDrilldown(session);
+    var clickable = drillId ? ' afk-session-clickable' : '';
+    var dataAttr = drillId ? ' data-session-id="' + escHtml(drillId) + '" tabindex="0"' : '';
+    return '<div class="afk-chain-item' + (inferred ? ' afk-provisional' : '') + clickable + '"' + dataAttr + '>' +
       '<div class="afk-chain-item-head">' +
         '<span class="afk-entity-id">' + escHtml(extId) + '</span>' +
         '<span class="afk-entity-type">session</span>' +
         (inferred ? ' <span class="afk-provisional-mark">\u26A0 inferred</span>' : '') +
+        (drillId ? ' <span class="afk-session-open">\u2197 open run</span>' : '') +
       '</div>' +
       '<div class="afk-session-meta">agent: ' + escHtml(agent) +
         ' &middot; messages: ' + fmtNum(session.message_count) +
@@ -2863,6 +2911,7 @@
   window.fmtConfidence = fmtConfidence;
   window.fmtEvidence = fmtEvidence;
   window.isProvisionalLink = isProvisionalLink;
+  window.resolveAfkSessionDrilldown = resolveAfkSessionDrilldown;
   window.buildAfkChain = buildAfkChain;
   window.renderAfkEntityLink = renderAfkEntityLink;
   window.renderAfkSessionLink = renderAfkSessionLink;
