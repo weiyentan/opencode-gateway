@@ -179,6 +179,24 @@ class Settings(BaseSettings):
             )
         return self
 
+    # Execution-transcript retention (issue #470, ADR 0016 "Redaction and
+    # Privacy").  Per-table retention windows (days) for the append-only
+    # transcript tables (observed_messages / observed_parts /
+    # observed_tool_calls), enforced by ``scripts/retention_transcripts.py``
+    # on a schedule.  Transcript data is higher-volume and lower-longevity
+    # than accounting data: parts and tool calls default to 90 days while
+    # messages (the session reconstruction surface) keep a longer 365-day
+    # window.  Retention is keyed on the transcript timestamps
+    # (``source_created_at_tz``), never ingest time.  Accounting aggregates
+    # (usage events, rollup) keep their existing, longer retention and are
+    # never touched by the job.  Maps to
+    # GATEWAY_TRANSCRIPT_RETENTION_MESSAGES_DAYS,
+    # GATEWAY_TRANSCRIPT_RETENTION_PARTS_DAYS,
+    # GATEWAY_TRANSCRIPT_RETENTION_TOOL_CALLS_DAYS.
+    transcript_retention_messages_days: int = 365
+    transcript_retention_parts_days: int = 90
+    transcript_retention_tool_calls_days: int = 90
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""
