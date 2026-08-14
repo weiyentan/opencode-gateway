@@ -690,9 +690,9 @@
 
   /** Compose the canonical AFK outcome chain from a RunDetail response.
    *  Pure — returns the ordered steps (issue → run → sessions → agents →
-   *  tokens/cost → change_request → review cycles → outcome) with the data
-   *  each step renders, preserving every link's correlation provenance and
-   *  provisional/inferred markers for the render layer. */
+   *  tokens/cost → change_request → commits → review cycles → outcome) with
+   *  the data each step renders, preserving every link's correlation
+   *  provenance and provisional/inferred markers for the render layer. */
   function buildAfkChain(detail) {
     var d = detail || {};
     return [
@@ -702,6 +702,7 @@
       { key: 'agents', label: 'Agents', items: d.agents || [] },
       { key: 'usage', label: 'Tokens / Cost', usage: d.usage || null },
       { key: 'change_requests', label: 'Change Request', items: d.change_requests || [] },
+      { key: 'commits', label: 'Commits', items: d.commits || [] },
       { key: 'reviews', label: 'Review Cycles', items: d.reviews || [] },
       { key: 'outcome', label: 'Outcome', outcome: d.outcome || null, mergeEvents: d.merge_events || [] }
     ];
@@ -1833,7 +1834,8 @@
   // list (GET /api/v1/afk-outcomes/runs) opens a detail overlay rendering the
   // full chain (GET /api/v1/afk-outcomes/runs/{afk_run_id}) in the canonical
   // example order — issue → run → sessions → agents → tokens/cost →
-  // change_request → review cycles → merged.  Every derived link displays its
+  // change_request → commits → review cycles → merged.  Every derived link
+  // displays its
   // correlation provenance (method / confidence / evidence / resolver_version)
   // and provisional/inferred links are visibly marked (never rendered like
   // explicit links).  Outcome uses the locked EngineeringOutcomeStatus

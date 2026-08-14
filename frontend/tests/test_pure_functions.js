@@ -4134,24 +4134,26 @@ console.log('\u25B6 AFK Outcomes — canonical chain composition (issue #453)');
     agents: ['code-editor-senior'],
     usage: { active_tokens: 1 },
     change_requests: [{ entity_id: 'change_request:442' }],
+    commits: [{ entity_id: 'commit:abc1234' }],
     reviews: [{ entity_id: 'review:1' }],
     merge_events: [{ entity_id: 'merge_event:442' }],
     outcome: { status: 'merged' }
   };
   var steps = window.buildAfkChain(detail);
   var keys = steps.map(function (s) { return s.key; });
-  assert(keys.join(',') === 'issues,run,sessions,agents,usage,change_requests,reviews,outcome',
-    'canonical step order: issue \u2192 run \u2192 sessions \u2192 agents \u2192 tokens/cost \u2192 change_request \u2192 review cycles \u2192 outcome');
+  assert(keys.join(',') === 'issues,run,sessions,agents,usage,change_requests,commits,reviews,outcome',
+    'canonical step order: issue \u2192 run \u2192 sessions \u2192 agents \u2192 tokens/cost \u2192 change_request \u2192 commits \u2192 review cycles \u2192 outcome');
   assert(steps[0].items[0].entity_id === 'issue:437', 'issues step carries the issue links');
   assert(steps[1].run.afk_run_id === 'run-1', 'run step carries the run aggregate');
   assert(steps[2].items[0].session_id === 's1', 'sessions step carries the session links');
   assert(steps[3].items[0] === 'code-editor-senior', 'agents step carries the agent identities');
   assert(steps[4].usage.active_tokens === 1, 'usage step carries the tokens/cost aggregate');
   assert(steps[5].items[0].entity_id === 'change_request:442', 'change_request step carries the change request');
-  assert(steps[6].items[0].entity_id === 'review:1', 'reviews step carries the review cycles');
-  assert(steps[7].outcome.status === 'merged' && steps[7].mergeEvents[0].entity_id === 'merge_event:442',
+  assert(steps[6].items[0].entity_id === 'commit:abc1234', 'commits step carries the commit links');
+  assert(steps[7].items[0].entity_id === 'review:1', 'reviews step carries the review cycles');
+  assert(steps[8].outcome.status === 'merged' && steps[8].mergeEvents[0].entity_id === 'merge_event:442',
     'outcome step carries the outcome + merge events');
-  assert(window.buildAfkChain(null).length === 8, 'null detail \u2192 8 empty steps (no throw)');
+  assert(window.buildAfkChain(null).length === 9, 'null detail \u2192 9 empty steps (no throw)');
 })();
 
 console.log('\u25B6 AFK Outcomes — entity/session link rendering (issue #453)');
@@ -4225,7 +4227,11 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
         repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'temporal_inference',
         correlation_confidence: 0.9, evidence: [], resolver_version: '1', provisional: false }
     ],
-    commits: [],
+    commits: [
+      { entity_id: 'commit:abc1234', entity_type: 'commit', external_id: 'abc1234', provider: 'github',
+        repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'commit_issue_reference',
+        correlation_confidence: 1.0, evidence: [], resolver_version: '1', provisional: false }
+    ],
     merge_events: [
       { entity_id: 'merge_event:442', entity_type: 'merge_event', external_id: '442', provider: 'github',
         repository: 'weiyentan/opencode-gateway', role: 'resolved', correlation_method: 'issue_reference',
@@ -4246,7 +4252,7 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
   var html = afkDetailBodyEl.innerHTML;
 
   // Canonical order is preserved in the rendered chain.
-  var order = ['issues', 'run', 'sessions', 'agents', 'usage', 'change_requests', 'reviews', 'outcome'];
+  var order = ['issues', 'run', 'sessions', 'agents', 'usage', 'change_requests', 'commits', 'reviews', 'outcome'];
   var lastIdx = -1;
   var ordered = true;
   order.forEach(function (key) {
@@ -4265,6 +4271,9 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
   assert(html.indexOf('issue_reference') !== -1 && html.indexOf('change_request:442') !== -1,
     'evidence source identifiers are visible');
   assert(html.indexOf('Active Tokens') !== -1, 'tokens/cost step shows the Active Tokens aggregate');
+  assert(html.indexOf('data-step="commits"') !== -1 && html.indexOf('commit:abc1234') !== -1 &&
+         html.indexOf('commit_issue_reference') !== -1,
+    'commits step renders the commit links with correlation provenance');
 
   // Escaping: an entity id with HTML metacharacters must not inject markup.
   window.renderAfkRunDetail({
