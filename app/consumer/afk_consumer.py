@@ -552,6 +552,38 @@ class AFKOutcomeConsumer:
 # ── Provider adapter wiring (env-driven, no token storage) ──────────────────
 
 
+class _GitHubHttpApi:
+    """A :class:`afk_outcomes.providers.github.GitHubApi` over httpx.
+
+    The :class:`GitHubAdapter` seam expects ``get()`` to return the parsed
+    JSON body (a list or dict), not an ``httpx.Response``.  A raw
+    ``httpx.AsyncClient.get()`` returns ``httpx.Response``, so the adapter's
+    ``_items()`` / ``isinstance(body, dict)`` checks would silently yield zero
+    entities/events.  This wraps the httpx client so ``get()`` returns
+    ``response.json()`` — the same seam ``scripts.afk_backfill._GitHubHttpApi``
+    provides.
+    """
+
+    def __init__(self, token: str) -> None:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        self._client = httpx.AsyncClient(
+            base_url="https://api.github.com", headers=headers, timeout=30.0
+        )
+
+    async def get(self, path: str, *, params: dict[str, str] | None = None) -> object:
+        response = await self._client.get(path, params=params or {})
+        response.raise_for_status()
+        return response.json()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
 def _build_adapter(provider: Provider) -> tuple[Any, Any]:
     """Build the provider adapter plus its API client (closed by the caller).
 
@@ -562,17 +594,8 @@ def _build_adapter(provider: Provider) -> tuple[Any, Any]:
     if provider is Provider.GITHUB:
         from afk_outcomes.providers.github import GitHubAdapter
 
-        github_headers: dict[str, str] = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        token = os.environ.get("GITHUB_TOKEN", "")
-        if token:
-            github_headers["Authorization"] = f"Bearer {token}"
-        client = httpx.AsyncClient(
-            base_url="https://api.github.com", headers=github_headers, timeout=30.0
-        )
-        return GitHubAdapter(client), client
+        github_client = _GitHubHttpApi(os.environ.get("GITHUB_TOKEN", ""))
+        return GitHubAdapter(github_client), github_client
 
     from afk_outcomes.providers.gitlab import GitLabAdapter
 

@@ -18,10 +18,14 @@ import pytest
 from aiokafka.structs import ConsumerRecord
 
 from afk_outcomes.models import EntityType, Provider
+from afk_outcomes.providers.github import GitHubAdapter
+from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
     _MAPPED_EVENT_TYPES,
     AFKOutcomeConsumer,
     ProviderEventMessage,
+    _build_adapter,
+    _GitHubHttpApi,
     map_provider_event,
 )
 
@@ -81,6 +85,97 @@ class _FakeAdapter:
 
     async def fetch_events(self, repository, *, since=None, until=None):
         return []
+
+
+class _FakeHttpxResponse:
+    """A stand-in for ``httpx.Response`` carrying a pre-parsed body."""
+
+    def __init__(self, body: object) -> None:
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> object:
+        return self._body
+
+
+class _PathServingHttpxClient:
+    """A fake ``httpx.AsyncClient`` that serves parsed JSON keyed by exact path."""
+
+    def __init__(self, payloads: dict[str, object]) -> None:
+        self._payloads = payloads
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    async def get(
+        self, path: str, *, params: dict[str, str] | None = None
+    ) -> _FakeHttpxResponse:
+        self.calls.append((path, params or {}))
+        return _FakeHttpxResponse(self._payloads[path])
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _github_rest_payloads() -> dict[str, object]:
+    """Realistic GitHub REST-shaped payloads covering issues + a merged PR."""
+    return {
+        "/repos/owner/repo/issues": [
+            {
+                "number": 100,
+                "title": "An issue",
+                "state": "open",
+                "user": {"login": "alice"},
+                "created_at": "2026-08-01T10:00:00Z",
+                "updated_at": "2026-08-01T10:00:00Z",
+                "html_url": "https://github.com/owner/repo/issues/100",
+            }
+        ],
+        "/repos/owner/repo/pulls": [
+            {
+                "number": 200,
+                "title": "A merged pull request",
+                "state": "closed",
+                "user": {"login": "alice"},
+                "created_at": "2026-08-01T10:00:00Z",
+                "updated_at": "2026-08-01T12:00:00Z",
+                "closed_at": "2026-08-01T12:00:00Z",
+                "merged_at": "2026-08-01T12:00:00Z",
+                "merge_commit_sha": "merge-200",
+                "merged_by": {"login": "carol"},
+                "head": {"ref": "feature/x", "sha": "sha200"},
+                "base": {"ref": "main"},
+                "requested_reviewers": [],
+                "html_url": "https://github.com/owner/repo/pulls/200",
+            }
+        ],
+        "/repos/owner/repo/pulls/200/reviews": [
+            {
+                "id": 1001,
+                "state": "approved",
+                "user": {"login": "bob"},
+                "submitted_at": "2026-08-01T11:00:00Z",
+                "commit_id": "sha200",
+            }
+        ],
+        "/repos/owner/repo/pulls/200/commits": [
+            {
+                "sha": "commit-a",
+                "commit": {"author": {"name": "alice"}, "message": "feat: x"},
+                "html_url": "https://github.com/owner/repo/commit/commit-a",
+            }
+        ],
+        "/repos/owner/repo/commits/sha200/check-runs": {
+            "check_runs": [
+                {
+                    "id": 300,
+                    "name": "ci",
+                    "conclusion": "success",
+                    "completed_at": "2026-08-01T12:30:00Z",
+                }
+            ]
+        },
+    }
 
 
 # ── Builders ─────────────────────────────────────────────────────────────────
@@ -529,6 +624,70 @@ async def test_from_env_reads_afk_settings() -> None:
     assert consumer._repository == "owner/repo"
     assert consumer._reconcile_cadence_seconds == 600.0
     assert consumer._reconcile_window_seconds == 3600.0
+
+
+# ── Provider adapter wiring (GitHub parsed-JSON seam) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_adapter_github_injects_parsed_json_seam() -> None:
+    """``_build_adapter(GITHUB)`` wraps httpx so ``get()`` returns parsed JSON."""
+    fake_client = _PathServingHttpxClient(
+        {"/repos/owner/repo/issues": [{"number": 1}]}
+    )
+    with patch(
+        "app.consumer.afk_consumer.httpx.AsyncClient",
+        return_value=fake_client,
+    ) as mock_http:
+        adapter, client = _build_adapter(Provider.GITHUB)
+
+    assert isinstance(adapter, GitHubAdapter)
+    # The injected client is the parsed-JSON seam, not a raw httpx.AsyncClient.
+    assert isinstance(client, _GitHubHttpApi)
+
+    body = await client.get("/repos/owner/repo/issues")
+    assert body == [{"number": 1}]  # parsed JSON body, not an httpx.Response
+
+    # The underlying httpx client was built with the GitHub base URL + headers.
+    assert mock_http.call_args.kwargs["base_url"] == "https://api.github.com"
+    assert (
+        mock_http.call_args.kwargs["headers"]["Accept"]
+        == "application/vnd.github+json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_adapter_github_reconciles_nonempty_via_real_adapter() -> None:
+    """The real GitHubAdapter fed through ``_build_adapter`` yields entities/events."""
+    payloads = _github_rest_payloads()
+    with patch(
+        "app.consumer.afk_consumer.httpx.AsyncClient",
+        return_value=_PathServingHttpxClient(payloads),
+    ):
+        adapter, _client = _build_adapter(Provider.GITHUB)
+
+    entities = await adapter.fetch_entities("owner/repo")
+    events = await adapter.fetch_events("owner/repo")
+
+    assert entities, "expected non-empty entities from the parsed-JSON seam"
+    assert events, "expected non-empty events from the parsed-JSON seam"
+    assert any(e.entity_type is EntityType.CHANGE_REQUEST for e in entities)
+    assert any(e.event_type == "change_request.merged" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_build_adapter_gitlab_passes_raw_httpx_client() -> None:
+    """The GitLab path keeps passing a raw httpx.AsyncClient (unchanged)."""
+    fake_client = _PathServingHttpxClient({})
+    with patch(
+        "app.consumer.afk_consumer.httpx.AsyncClient",
+        return_value=fake_client,
+    ) as mock_http:
+        adapter, client = _build_adapter(Provider.GITLAB)
+
+    assert isinstance(adapter, GitLabAdapter)
+    assert client is fake_client  # raw client, no JSON-parsing wrapper
+    assert "timeout" in mock_http.call_args.kwargs
 
 
 # ── Redelivery produces no duplicate rows (unit-level, mocked asyncpg) ───────
