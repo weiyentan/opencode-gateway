@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -145,9 +145,15 @@ class AFKRunEntityLink(Base):
     repository: Mapped[str] = mapped_column(String, nullable=False)
     entity_type: Mapped[str] = mapped_column(String, nullable=False)
     external_id: Mapped[str] = mapped_column(String, nullable=False)
+    owning_change_request_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
     role: Mapped[str] = mapped_column(String, nullable=False)
     correlation_method: Mapped[Optional[str]] = mapped_column(
         String, nullable=True
+    )
+    correlation_source: Mapped[str] = mapped_column(
+        String, nullable=False, server_default=text("'direct'")
     )
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False

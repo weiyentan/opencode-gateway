@@ -75,18 +75,18 @@ async def test_every_link_is_explainable() -> None:
     for correlation in run.correlations:
         assert correlation.method, "correlation missing method"
         assert correlation.correlation_confidence is not None
-        assert correlation.resolver_version == "1"
+        assert correlation.resolver_version == "2"
         assert correlation.evidence, "correlation missing evidence"
         for evidence in correlation.evidence:
             assert evidence.source_entity_id, "evidence missing source identifier"
 
     for link in run.entity_links:
-        assert link.resolver_version == "1"
+        assert link.resolver_version == "2"
         assert link.correlation_confidence is not None
 
     assert run.session_links, "expected a session link"
     for session_link in run.session_links:
-        assert session_link.resolver_version == "1"
+        assert session_link.resolver_version == "2"
         assert session_link.inferred is True
         assert session_link.method is not None
 
@@ -125,6 +125,6 @@ async def test_reconstruction_is_deterministic_and_matches_golden() -> None:
     second = dumps_canonical((await _resolve_github()).run)
     assert first == second
 
-    golden = (FIXTURES_DIR / "github" / "golden_resolution.json").read_text().rstrip("\n")
+    golden = (FIXTURES_DIR / "github" / "golden_resolution.json").read_text(encoding="utf-8").rstrip("\n")
     golden_run = json.loads(golden)["data"]["run"]
     assert json.loads(first)["data"] == golden_run

@@ -86,26 +86,31 @@
   "commits": [
     {
       "sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+      "owning_change_request_number": 442,
       "message": "feat: add agent group-by dimension to usage aggregates (#437)",
       "author": {"name": "wyautomation", "date": "2026-08-13T09:00:00Z"}
     },
     {
       "sha": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a",
+      "owning_change_request_number": 442,
       "message": "test: query-count coverage for agent grouping (#438)",
       "author": {"name": "wyautomation", "date": "2026-08-13T09:30:00Z"}
     },
     {
       "sha": "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b",
+      "owning_change_request_number": 442,
       "message": "frontend: render agent aggregates with token breakdown (#439, #440)",
       "author": {"name": "wyautomation", "date": "2026-08-13T10:00:00Z"}
     },
     {
       "sha": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b2c",
+      "owning_change_request_number": 441,
       "message": "chore: apply #441 review feedback to agent grouping",
       "author": {"name": "wyautomation", "date": "2026-08-13T09:45:00Z"}
     },
     {
       "sha": "337c0116775c51abf03d90e73a9afdcee0aef01a",
+      "owning_change_request_number": 442,
       "message": "Develop-Loop: Consolidated run — Implemented issues #437, #438, #439, #440 (#442)",
       "author": {"name": "wyautomation", "date": "2026-08-13T10:10:29Z"}
     }
@@ -116,7 +121,8 @@
       "state": "approved",
       "submitted_at": "2026-08-13T10:08:00Z",
       "user": {"login": "gatekeeper-bot"},
-      "commit_id": "337c0116775c51abf03d90e73a9afdcee0aef01a"
+      "commit_id": "337c0116775c51abf03d90e73a9afdcee0aef01a",
+      "owning_change_request_number": 442
     }
   ],
   "merge_events": [

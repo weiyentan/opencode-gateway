@@ -59,7 +59,7 @@ from afk_outcomes.models import (
 
 # Version of the correlation resolver that produces the derived links stored
 # by this repository.  Bumped whenever link-derivation semantics change.
-RESOLVER_VERSION = "1"
+RESOLVER_VERSION = "2"
 
 # Entity links with this role represent a definitive resolution; correlations
 # for any other entity are treated as unresolved.
@@ -305,14 +305,18 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         correlation = correlation_map.get(link.entity_id)
         correlation_method = correlation.method if correlation is not None else None
         evidence = correlation.evidence if correlation is not None else []
+        owning_change_request_id = (
+            entity.owning_change_request_id if entity is not None else None
+        )
 
         await self._conn.execute(
             """
             INSERT INTO afk_run_entities
-                (afk_run_id, provider, repository, entity_type, external_id, role,
-                 correlation_method, correlation_confidence, evidence, resolver_version,
+                (afk_run_id, provider, repository, entity_type, external_id,
+                 owning_change_request_id, role, correlation_method, correlation_source,
+                 correlation_confidence, evidence, resolver_version,
                  superseded_at, first_seen_at, last_seen_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, now(), now())
             ON CONFLICT (provider, repository, entity_type, external_id, afk_run_id)
             DO UPDATE SET
                 correlation_confidence = GREATEST(
@@ -326,6 +330,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     EXCLUDED.resolver_version, afk_run_entities.resolver_version
                 ),
                 role = EXCLUDED.role,
+                correlation_source = EXCLUDED.correlation_source,
+                owning_change_request_id = COALESCE(
+                    EXCLUDED.owning_change_request_id,
+                    afk_run_entities.owning_change_request_id
+                ),
                 last_seen_at = now()
             """,
             link.afk_run_id,
@@ -333,8 +342,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             repository,
             entity_type,
             external_id,
+            owning_change_request_id,
             link.role,
             correlation_method,
+            link.correlation_source,
             link.correlation_confidence,
             _evidence_json(evidence),
             self._resolver_version,
@@ -515,8 +526,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
         entity_rows = await self._conn.fetch(
             """
-            SELECT provider, repository, entity_type, external_id, role,
-                   correlation_method, correlation_confidence, evidence
+            SELECT provider, repository, entity_type, external_id,
+                   owning_change_request_id, role, correlation_method,
+                   correlation_source, correlation_confidence, evidence
             FROM afk_run_entities
             WHERE afk_run_id = $1 AND superseded_at IS NULL
             """,
@@ -558,6 +570,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         entity_type=EntityType(row["entity_type"]),
                         provider=Provider(row["provider"]),
                         repository=row["repository"],
+                        owning_change_request_id=row["owning_change_request_id"],
                     )
                 )
             entity_links.append(
@@ -566,6 +579,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     entity_id=entity_id,
                     role=row["role"],
                     correlation_confidence=row["correlation_confidence"],
+                    correlation_source=row["correlation_source"],
                 )
             )
             if row["correlation_method"] is not None:

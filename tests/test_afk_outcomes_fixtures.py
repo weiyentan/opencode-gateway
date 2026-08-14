@@ -98,6 +98,7 @@ def _normalize_github(raw: dict) -> dict:
                 "message": c["message"],
                 "author": c["author"]["name"],
                 "date": c["author"]["date"],
+                "owning_change_request_number": c.get("owning_change_request_number"),
             }
             for c in raw["commits"]
         ],
@@ -108,6 +109,7 @@ def _normalize_github(raw: dict) -> dict:
                 "submitted_at": r["submitted_at"],
                 "author": r["user"]["login"],
                 "commit_id": r["commit_id"],
+                "owning_change_request_number": r.get("owning_change_request_number"),
             }
             for r in raw["reviews"]
         ],
@@ -162,6 +164,7 @@ def _normalize_gitlab(raw: dict) -> dict:
                 "message": c["title"],
                 "author": c["author_name"],
                 "date": c["created_at"],
+                "owning_change_request_number": c.get("owning_change_request_number"),
             }
             for c in raw["commits"]
         ],
@@ -172,6 +175,7 @@ def _normalize_gitlab(raw: dict) -> dict:
                 "submitted_at": r["submitted_at"],
                 "author": r["author"]["username"],
                 "commit_id": r["commit_id"],
+                "owning_change_request_number": r.get("owning_change_request_number"),
             }
             for r in raw["reviews"]
         ],
@@ -265,6 +269,7 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
     # Commits
     for commit in neutral["commits"]:
         entity_id = f"commit:{commit['sha']}"
+        owning_cr_number = commit.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -274,6 +279,9 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
                 title=commit["message"],
                 author=commit["author"],
                 created_at=_parse_dt(commit["date"]),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(
@@ -287,6 +295,7 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
     # Reviews
     for review in neutral["reviews"]:
         entity_id = f"review:{review['id']}"
+        owning_cr_number = review.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -296,6 +305,9 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
                 title=f"review {review['state']}",
                 author=review["author"],
                 created_at=_parse_dt(review["submitted_at"]),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(
@@ -419,6 +431,31 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
             )
         )
 
+    # Owning-branch commits and reviews — lineage links inheriting the owning
+    # change request's confidence (mirrors the engine's lineage derivation).
+    for commit in neutral["commits"]:
+        if commit.get("owning_change_request_number") == cluster_number:
+            entity_links.append(
+                RunEntityLink(
+                    afk_run_id=afk_run_id,
+                    entity_id=f"commit:{commit['sha']}",
+                    role="resolved",
+                    correlation_confidence=1.0,
+                    correlation_source="owning_change_request",
+                )
+            )
+    for review in neutral["reviews"]:
+        if review.get("owning_change_request_number") == cluster_number:
+            entity_links.append(
+                RunEntityLink(
+                    afk_run_id=afk_run_id,
+                    entity_id=f"review:{review['id']}",
+                    role="resolved",
+                    correlation_confidence=1.0,
+                    correlation_source="owning_change_request",
+                )
+            )
+
     # Unrelated change requests — noise (no correlation, link role "noise").
     for cr in neutral["change_requests"]:
         if cr["number"] != cluster_number:
@@ -433,6 +470,8 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
 
     # Commits referencing a non-cluster number — noise.
     for commit in neutral["commits"]:
+        if commit.get("owning_change_request_number") == cluster_number:
+            continue  # already lineage-linked above
         referenced = _numbers(commit["message"])
         known = resolved_numbers | {cluster_number}
         if referenced and not referenced.issubset(known):
@@ -485,11 +524,11 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
 
 
 def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _load_golden(path: Path) -> str:
-    return path.read_text().rstrip("\n")
+    return path.read_text(encoding="utf-8").rstrip("\n")
 
 
 def _build_github_run() -> AFKRun:

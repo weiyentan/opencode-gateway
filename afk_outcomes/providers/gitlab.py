@@ -179,7 +179,9 @@ class GitLabAdapter:
         events.extend(review_events)
 
         commits = await self._get_json(self._mr_url(repository, iid, "commits"))
-        entities.extend(self._commit_entities(repository, commits))
+        entities.extend(
+            self._commit_entities(repository, commits, owning_change_request_id=str(iid))
+        )
 
         pipelines = await self._get_json(self._mr_url(repository, iid, "pipelines"))
         events.extend(self._pipeline_events(mr, pipelines))
@@ -344,6 +346,7 @@ class GitLabAdapter:
                     title=f"approval by {username}",
                     author=username,
                     created_at=approved_at,
+                    owning_change_request_id=str(iid),
                 )
             )
             if approved_at is not None:
@@ -363,7 +366,11 @@ class GitLabAdapter:
         return entities, events
 
     def _commit_entities(
-        self, repository: str, commits: list[dict[str, Any]]
+        self,
+        repository: str,
+        commits: list[dict[str, Any]],
+        *,
+        owning_change_request_id: str | None = None,
     ) -> list[EngineeringEntity]:
         entities: list[EngineeringEntity] = []
         for commit in commits:
@@ -379,6 +386,7 @@ class GitLabAdapter:
                     created_at=_parse_dt(
                         commit.get("authored_date") or commit.get("created_at")
                     ),
+                    owning_change_request_id=owning_change_request_id,
                 )
             )
         return entities

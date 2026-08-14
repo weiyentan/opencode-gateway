@@ -189,9 +189,13 @@ class GitHubAdapter:
             if number is None:
                 continue
             reviews = await self._list_reviews(repository, number)
-            entities.extend(self._review_entities(reviews, repository))
+            entities.extend(
+                self._review_entities(reviews, repository, owning_change_request_id=str(number))
+            )
             commits = await self._list_commits(repository, number)
-            entities.extend(self._commit_entities(commits, repository))
+            entities.extend(
+                self._commit_entities(commits, repository, owning_change_request_id=str(number))
+            )
         return entities
 
     async def fetch_events(
@@ -351,7 +355,11 @@ class GitHubAdapter:
         return entities
 
     def _review_entities(
-        self, reviews: list[dict[str, object]], repository: str
+        self,
+        reviews: list[dict[str, object]],
+        repository: str,
+        *,
+        owning_change_request_id: str | None = None,
     ) -> list[EngineeringEntity]:
         entities: list[EngineeringEntity] = []
         for review in reviews:
@@ -369,12 +377,17 @@ class GitHubAdapter:
                     state=state or None,
                     author=_login(review),
                     created_at=_parse_dt(review.get("submitted_at")),
+                    owning_change_request_id=owning_change_request_id,
                 )
             )
         return entities
 
     def _commit_entities(
-        self, commits: list[dict[str, object]], repository: str
+        self,
+        commits: list[dict[str, object]],
+        repository: str,
+        *,
+        owning_change_request_id: str | None = None,
     ) -> list[EngineeringEntity]:
         entities: list[EngineeringEntity] = []
         for commit in commits:
@@ -394,6 +407,7 @@ class GitHubAdapter:
                     author=author,
                     url=_str(commit, "html_url"),
                     created_at=_parse_dt(git_author.get("date")),
+                    owning_change_request_id=owning_change_request_id,
                 )
             )
         return entities

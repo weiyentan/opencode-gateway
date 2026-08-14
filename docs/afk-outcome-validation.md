@@ -36,7 +36,7 @@ The cluster reconstructs correctly as **one AFK Run**:
 
 Every derived link carries `correlation_method` (the `method` field),
 `correlation_confidence`, `evidence` with source identifiers, and
-`resolver_version = "1"`.
+`resolver_version = "2"`.
 
 ## 2. Scope & method
 
@@ -81,7 +81,7 @@ same semantic role the committed fixture encodes with a different phrase
 ## 4. Reconstruction results (engine output over the fixture)
 
 Resolved `ResolutionResult` for the #442 cluster (deterministic ULID source
-`SequenceULID(1786615829000)`, `resolver_version = "1"`, `unresolved = []`):
+`SequenceULID(1786615829000)`, `resolver_version = "2"`, `unresolved = []`):
 
 ### 4.1 Correlations (6 — all explainable)
 
@@ -94,7 +94,7 @@ Resolved `ResolutionResult` for the #442 cluster (deterministic ULID source
 | `issue:440` | `issue_reference` | 1.0 | `issue_reference` ← `change_request:442` (`resolves #440`) |
 | `issue:436` | `issue_reference` | 0.1 | `issue_reference` ← `change_request:442` (`mentioned #436`) |
 
-### 4.2 Entity links (8)
+### 4.2 Entity links (13)
 
 `resolved` (confidence ≥ 0.5): `change_request:442`, `issue:437`, `issue:438`,
 `issue:439`, `issue:440`.
@@ -103,11 +103,18 @@ Resolved `ResolutionResult` for the #442 cluster (deterministic ULID source
 message "apply #441 review feedback" references #441, which is outside the run's
 known set `{437,438,439,440,442}`).
 
+Since issue #456, the owning change request's branch commits and reviews are
+also surfaced as links: four commits (`a1b2c3d…`, `b2c3d4e…`, `c3d4e5f…`,
+`337c011…`) and the review (`review:481234`) are lineage links that inherit the
+owning change request's confidence (1.0) and carry
+`correlation_source = "owning_change_request"`. Direct links (the correlations
+and noise above) carry `correlation_source = "direct"`.
+
 ### 4.3 Session link (1)
 
 `session_id = 1f9c3a6e-0000-4000-8000-000000000001`,
 `external_session_id = ses_01J4T2P0000000000000000000`,
-`inferred = true`, `method = temporal_overlap`, `resolver_version = "1"`.
+`inferred = true`, `method = temporal_overlap`, `resolver_version = "2"`.
 
 ### 4.4 Outcome
 
@@ -130,7 +137,7 @@ known set `{437,438,439,440,442}`).
   never forced into the outcome.
 - **Every link is explainable.** All six correlations carry `method`,
   `correlation_confidence`, `evidence` with `source_entity_id`, and
-  `resolver_version = "1"`; all eight entity links and the session link carry
+  `resolver_version = "2"`; all thirteen entity links and the session link carry
   `resolver_version`; the session link additionally carries its `method`.
 - **Determinism.** Two runs over the same fixture produce byte-identical
   canonical JSON (asserted by `test_golden_determinism_byte_identical` and the
@@ -203,7 +210,11 @@ new issues with rationale:
    and its per-issue commits `63af10f`…`7b71342` therefore have no entity link.
    Whether the run should surface its own branch commits and review as links is an
    open design question for the correlation engine (rule-tuning candidate).
-   Filed as **#456**.
+   Filed as **#456**. **Implemented**: commits and reviews on the owning change
+   request's branch now surface as lineage links inheriting the owning change
+   request's confidence, with `correlation_source = "owning_change_request"`;
+   `owning_change_request_id` provenance is populated by the adapters and persisted
+   via migration 0028.
 3. **Live-data backfill follow-up** — complete the validation with a real
    (non-dry-run) backfill over `weiyentan/opencode-gateway`, `--since
    2026-06-01`, using `GITHUB_TOKEN` + the docker-compose Postgres (port 5433);

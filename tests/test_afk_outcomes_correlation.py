@@ -151,6 +151,7 @@ def _build_window(
         author = commit["author_name"] if is_gitlab else commit["author"]["name"]
         date = commit["created_at"] if is_gitlab else commit["author"]["date"]
         entity_id = f"commit:{sha}"
+        owning_cr_number = commit.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -160,6 +161,9 @@ def _build_window(
                 title=message,
                 author=author,
                 created_at=_parse_dt(date),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(entity_id, "committed", date, author, payload={"sha": sha, "message": message})
@@ -168,6 +172,7 @@ def _build_window(
     for review in raw["reviews"]:
         author = review["author"]["username"] if is_gitlab else review["user"]["login"]
         entity_id = f"review:{review['id']}"
+        owning_cr_number = review.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -177,6 +182,9 @@ def _build_window(
                 title=f"review {review['state']}",
                 author=author,
                 created_at=_parse_dt(review["submitted_at"]),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(entity_id, "review_submitted", review["submitted_at"], author,
@@ -205,7 +213,7 @@ def _build_window(
 
 
 def _load_raw(provider: str) -> dict:
-    return json.loads((FIXTURES_DIR / provider / "raw_payload.json").read_text())
+    return json.loads((FIXTURES_DIR / provider / "raw_payload.json").read_text(encoding="utf-8"))
 
 
 def _engine(ulid_ms: int) -> CorrelationEngine:
@@ -231,7 +239,7 @@ async def test_golden_determinism_byte_identical(provider: str) -> None:
     second = dumps_canonical(await _resolve(provider))
     assert first == second
 
-    golden = (FIXTURES_DIR / provider / "golden_resolution.json").read_text().rstrip("\n")
+    golden = (FIXTURES_DIR / provider / "golden_resolution.json").read_text(encoding="utf-8").rstrip("\n")
     assert first == golden, "engine canonical output drifted from golden_resolution.json"
 
 
@@ -253,7 +261,7 @@ async def test_every_link_carries_method_confidence_evidence_and_version() -> No
     for correlation in result.run.correlations:
         assert correlation.method, "missing method"
         assert correlation.correlation_confidence is not None
-        assert correlation.resolver_version == "1"
+        assert correlation.resolver_version == "2"
         assert correlation.evidence, "missing evidence"
         for evidence in correlation.evidence:
             assert evidence.source_entity_id, "evidence missing source identifier"
@@ -265,6 +273,37 @@ async def test_session_links_are_inferred_and_provisional() -> None:
     for link in result.run.session_links:
         assert link.inferred is True
         assert link.method == "temporal_overlap"
+
+
+async def test_owning_branch_commits_and_reviews_are_lineage_linked() -> None:
+    """Commits/reviews on the owning CR's branch inherit the owning CR's
+    confidence via lineage (correlation_source='owning_change_request')."""
+    result = await _resolve("github")
+    run = result.run
+
+    lineage = [
+        link for link in run.entity_links
+        if link.correlation_source == "owning_change_request"
+    ]
+    assert lineage, "expected lineage links for owning-branch commits/reviews"
+
+    lineage_ids = {link.entity_id for link in lineage}
+    # Owning branch (CR #442) commits + the synthetic review are lineage-linked.
+    assert "commit:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" in lineage_ids
+    assert "commit:337c0116775c51abf03d90e73a9afdcee0aef01a" in lineage_ids
+    assert "review:481234" in lineage_ids
+    # The wrong-issue commit (#441) stays noise, not lineage.
+    assert "commit:d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b2c" not in lineage_ids
+
+    for link in lineage:
+        assert link.correlation_confidence == 1.0, "lineage inherits the owning CR confidence"
+        assert link.role == "resolved"
+        assert link.correlation_source == "owning_change_request"
+
+    # Every direct link keeps the default correlation_source='direct'.
+    direct = [link for link in run.entity_links if link.correlation_source == "direct"]
+    assert direct, "expected direct links"
+    assert all(link.correlation_source == "direct" for link in direct)
 
 
 async def test_rule_ordering_lower_confidence_never_overrides() -> None:
