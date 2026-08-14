@@ -207,6 +207,73 @@ class TestProcessPart:
         assert any("INSERT INTO observed_tool_calls" in c for c in calls)
 
     @pytest.mark.asyncio
+    async def test_tool_part_redacts_secret_in_tool_payload(self):
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.transaction = MagicMock(return_value=_async_cm())
+
+        secret = "super-secret-xyz"
+        part = PartPayload(
+            external_part_id="part_1",
+            external_message_id="msg_1",
+            external_session_id="ses_1",
+            part_type="tool",
+            data={
+                "type": "tool",
+                "tool": "bash",
+                "input": {"command": "echo $GITHUB_TOKEN", "env": {"GITHUB_TOKEN": secret}},
+                "output": {"stdout": "done", "API_KEY": secret},
+            },
+        )
+        await _process_part(
+            conn, part, uuid.uuid4(), uuid.uuid4(), datetime.now(timezone.utc),
+            part_data_max_chars=65536,
+            tool_payload_max_chars=4096,
+        )
+        tool_call_calls = [
+            c for c in conn.execute.call_args_list
+            if "INSERT INTO observed_tool_calls" in str(c)
+        ]
+        assert tool_call_calls, "expected an observed_tool_calls INSERT"
+        tool_input = tool_call_calls[0].args[11]
+        tool_output = tool_call_calls[0].args[12]
+        # The durable tool-call store must never receive the plaintext secret.
+        assert secret not in str(tool_input)
+        assert secret not in str(tool_output)
+        assert tool_input == {"command": "echo $GITHUB_TOKEN", "env": {"GITHUB_TOKEN": "***"}}
+        assert tool_output == {"stdout": "done", "API_KEY": "***"}
+
+    @pytest.mark.asyncio
+    async def test_tool_part_truncates_oversized_tool_payload(self):
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.transaction = MagicMock(return_value=_async_cm())
+
+        part = PartPayload(
+            external_part_id="part_1",
+            external_message_id="msg_1",
+            external_session_id="ses_1",
+            part_type="tool",
+            data={"type": "tool", "tool": "bash", "input": {"command": "y" * 500}},
+        )
+        await _process_part(
+            conn, part, uuid.uuid4(), uuid.uuid4(), datetime.now(timezone.utc),
+            part_data_max_chars=65536,
+            tool_payload_max_chars=50,
+        )
+        tool_call_calls = [
+            c for c in conn.execute.call_args_list
+            if "INSERT INTO observed_tool_calls" in str(c)
+        ]
+        assert tool_call_calls, "expected an observed_tool_calls INSERT"
+        tool_input = tool_call_calls[0].args[11]
+        # Oversized tool input is bounded to the configured cap.
+        assert isinstance(tool_input, str)
+        assert len(tool_input) <= 50
+
+    @pytest.mark.asyncio
     async def test_non_tool_part_does_not_project_tool_call(self):
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(return_value=None)

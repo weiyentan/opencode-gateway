@@ -1348,6 +1348,20 @@ def _truncate_json_field(value: object, max_chars: int) -> object:
     return serialized[:max_chars]
 
 
+def _redact_json_value(value: object) -> object:
+    """Redact secret-like keys in a JSON value before tool-call storage.
+
+    Applies :func:`~app.core.secrets.redact_dict` to dict values (recursing
+    into nested dicts) so secret-like keys never reach the durable tool-call
+    store (ADR 0016 — plaintext secrets are never written).  Non-dict values
+    pass through unchanged, matching the message/part ``data`` redaction
+    depth (``redact_dict`` does not descend into list elements).
+    """
+    if isinstance(value, dict):
+        return redact_dict(value)
+    return value
+
+
 def _extract_tool_call_facts(
     data: dict | None,
 ) -> tuple[str | None, str | None, object, object]:
@@ -1604,8 +1618,8 @@ async def _process_part(
                 part.external_session_id,
                 tool_name,
                 tool_status,
-                _truncate_json_field(tool_input, tool_payload_max_chars),
-                _truncate_json_field(tool_output, tool_payload_max_chars),
+                _truncate_json_field(_redact_json_value(tool_input), tool_payload_max_chars),
+                _truncate_json_field(_redact_json_value(tool_output), tool_payload_max_chars),
                 part.source_created_at,
                 part.source_updated_at,
                 source_created_at_tz,
