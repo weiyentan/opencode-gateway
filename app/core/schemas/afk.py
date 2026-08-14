@@ -170,6 +170,17 @@ class UnresolvedCorrelationRow(BaseModel):
     Carries the correlation method/confidence/evidence/resolver_version and a
     ``provisional`` marker that is always ``True`` (an unresolved correlation
     is, by definition, not confidently resolved to an entity link).
+
+    Two kinds of row are surfaced:
+
+    * **Low-confidence links** — ``reason`` is ``None`` and ``candidates`` is
+      empty; ``entity_id``/``entity_type``/``external_id`` are the real
+      entity identity and ``method`` the correlation method.
+    * **Engine ambiguous/unmatched outcomes** — ``reason`` is
+      ``ambiguous``/``unmatched`` and ``candidates`` holds the competing
+      entity ids (empty for ``unmatched``); the row is run-level, so
+      ``entity_type`` is the ``afk_run`` sentinel and ``entity_id`` resolves
+      to ``afk_run:<afk_run_id>``.
     """
 
     entity_id: str
@@ -182,7 +193,15 @@ class UnresolvedCorrelationRow(BaseModel):
         description="Attributed run, or None when not yet attributed (unresolved)",
     )
     method: str
+    reason: str | None = Field(
+        default=None,
+        description="ambiguous | unmatched for engine unresolved outcomes; None for low-confidence links",
+    )
     correlation_confidence: float = 0.0
+    candidates: list[str] = Field(
+        default_factory=list,
+        description="Competing candidate entity ids (ambiguous); empty for unmatched and low-confidence links",
+    )
     evidence: list[CorrelationEvidence] = Field(default_factory=list)
     resolver_version: str | None = None
     created_at: datetime | None = None

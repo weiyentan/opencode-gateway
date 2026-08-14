@@ -38,6 +38,7 @@ from afk_outcomes.models import (
     EngineeringOutcomeStatus,
     Provider,
     RunStatus,
+    UnresolvedReason,
 )
 from app.core.config import get_settings
 from app.core.schemas.afk import (
@@ -60,6 +61,7 @@ router = APIRouter(tags=["afk-outcomes"])
 _VALID_STATUS = frozenset(m.value for m in RunStatus)
 _VALID_OUTCOME = frozenset(m.value for m in EngineeringOutcomeStatus)
 _VALID_ORIGIN = frozenset(m.value for m in Provider)
+_VALID_REASON = frozenset(m.value for m in UnresolvedReason)
 
 # Entity-type → detail response field name grouping.
 _ENTITY_TYPE_FIELDS = {
@@ -478,23 +480,34 @@ async def _fetch_correlations(
     limit: int,
     offset: int,
     *,
+    reason: str | None,
     db_timeout_seconds: int,
 ) -> PaginatedResponse[UnresolvedCorrelationRow]:
     """Execute count + data queries for the list-correlations endpoint."""
+    params: list[object] = []
+    where = "TRUE"
+    if reason is not None:
+        where = f"reason = ${len(params) + 1}"
+        params.append(reason)
+
     async with timed_operation("db.query.afk.correlations.count", "db"):
         async with _db_timeout("db.query.afk.correlations.count", db_timeout_seconds):
-            total = await conn.fetchval("SELECT COUNT(*) FROM unresolved_correlations")
+            total = await conn.fetchval(
+                f"SELECT COUNT(*) FROM unresolved_correlations WHERE {where}", *params
+            )
 
-    data_sql = """
+    data_sql = f"""
         SELECT provider, repository, entity_type, external_id, afk_run_id, method,
-               correlation_confidence, evidence, resolver_version, created_at
+               reason, correlation_confidence, candidates, evidence, resolver_version,
+               created_at
         FROM unresolved_correlations
+        WHERE {where}
         ORDER BY created_at DESC, entity_type, external_id
-        LIMIT $1 OFFSET $2
+        LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
     """
     async with timed_operation("db.query.afk.correlations.data", "db"):
         async with _db_timeout("db.query.afk.correlations.data", db_timeout_seconds):
-            rows = await conn.fetch(data_sql, limit, offset)
+            rows = await conn.fetch(data_sql, *params, limit, offset)
 
     items = [
         UnresolvedCorrelationRow(
@@ -505,7 +518,9 @@ async def _fetch_correlations(
             repository=r["repository"],
             afk_run_id=r["afk_run_id"],
             method=r["method"],
+            reason=r["reason"],
             correlation_confidence=r["correlation_confidence"],
+            candidates=r["candidates"] or [],
             evidence=_parse_evidence(r["evidence"]),
             resolver_version=r["resolver_version"],
             created_at=r["created_at"],
@@ -617,16 +632,19 @@ async def list_entities(
 @router.get("/correlations")
 async def list_correlations(
     request: Request,
+    reason: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[UnresolvedCorrelationRow]:
-    """List unresolved correlations with method, confidence, evidence, resolver_version."""
+    """List unresolved correlations (low-confidence links + ambiguous/unmatched)."""
+    _require_enum_value(reason, _VALID_REASON, "reason")
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_correlations(
             conn,
             limit,
             offset,
+            reason=reason,
             db_timeout_seconds=settings.database_timeout_seconds,
         )

@@ -418,6 +418,46 @@ async def test_real_run_persists_resolved_runs_via_repository() -> None:
     assert any("INSERT INTO afk_run_sessions" in s for s in sqls)
 
 
+def _unresolved_insert_params(conn: AsyncMock) -> list[tuple]:
+    """Return (sql, params) for every unresolved_correlations insert issued."""
+    return [
+        (call.args[0], call.args[1:])
+        for call in conn.execute.call_args_list
+        if "INSERT INTO unresolved_correlations" in call.args[0]
+    ]
+
+
+async def test_real_run_persists_ambiguous_unresolved_entries() -> None:
+    """Ambiguous outcomes are persisted (not just counted) with reason set."""
+    conn = _mock_conn([_session_row()])
+    report = await _run(conn, FakeGitHubApi(_payloads(ambiguous=True)), dry_run=False)
+
+    assert report.ambiguous == 1
+    calls = _unresolved_insert_params(conn)
+    assert calls, "no unresolved_correlations insert issued"
+    args = calls[0][1]
+    assert "ambiguous" in args  # method + reason
+
+
+async def test_real_run_persists_unmatched_unresolved_entries() -> None:
+    conn = _mock_conn([_session_row(title="Nothing to do here")])
+    report = await _run(conn, FakeGitHubApi(_payloads(ambiguous=True)), dry_run=False)
+
+    assert report.unmatched == 1
+    calls = _unresolved_insert_params(conn)
+    assert calls, "no unresolved_correlations insert issued"
+    assert "unmatched" in calls[0][1]
+
+
+async def test_dry_run_persists_no_unresolved_entries() -> None:
+    conn = _mock_conn([_session_row()])
+    report = await _run(conn, FakeGitHubApi(_payloads(ambiguous=True)), dry_run=True)
+
+    assert report.ambiguous == 1
+    assert _unresolved_insert_params(conn) == []
+    conn.execute.assert_not_called()  # nothing written at all
+
+
 async def test_rerun_same_window_converges_to_identical_run_ids() -> None:
     """Re-running the same window resolves the same session to the same run."""
     conn = _mock_conn([_session_row()])

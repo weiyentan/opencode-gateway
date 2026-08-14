@@ -411,6 +411,9 @@ async def run_backfill(
             if existing is not None and existing != result.run.afk_run_id:
                 result = _remap_run(result, existing)
             await repository_impl.save(result.run)
+            await repository_impl.save_unresolved(
+                result.run, result.unresolved, repository=repository
+            )
         results.append(result)
 
     explicit, high, inferred = _match_buckets(

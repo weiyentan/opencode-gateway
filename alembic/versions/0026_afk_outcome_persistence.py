@@ -33,6 +33,16 @@ constraints below):
   confidence silently lowered; superseded entity links are marked via
   ``superseded_at`` rather than removed; unresolved correlations are written
   to ``unresolved_correlations`` only.
+* **Unresolved correlations** — ``unresolved_correlations`` stores two kinds
+  of row under the same enrich-only contract.  Low-confidence ``Correlation``
+  links (a ``referenced``-role link, e.g. an ``issue:436`` mention at 0.1) are
+  keyed by the entity identity ``UNIQUE (provider, repository, entity_type,
+  external_id, method)`` with ``reason`` NULL.  Engine-emitted
+  ambiguous/unmatched outcomes (no single entity, no correlation method) are
+  run-level rows keyed on a ``afk_run`` sentinel ``entity_type`` plus the run
+  id as ``external_id``, with ``method`` mirroring ``reason``
+  (``ambiguous``/``unmatched``) and ``candidates`` (JSONB) holding the
+  competing candidate entity ids (empty for ``unmatched``).
 
 Foreign keys toward ``afk_runs`` use ``ondelete="CASCADE"`` (children are
 cleaned up with their run), mirroring the 0021 convention for FKs within a
@@ -279,7 +289,14 @@ def upgrade() -> None:
         sa.Column("external_id", sa.String(), nullable=False),
         sa.Column("afk_run_id", sa.String(26), nullable=True),
         sa.Column("method", sa.String(), nullable=False),
+        sa.Column("reason", sa.String(), nullable=True),
         sa.Column("correlation_confidence", sa.Float(), nullable=False),
+        sa.Column(
+            "candidates",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'[]'::jsonb"),
+        ),
         sa.Column(
             "evidence",
             postgresql.JSONB(),

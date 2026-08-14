@@ -25,7 +25,11 @@ Write semantics
     ``GREATEST`` (never lowered); ``evidence`` appended (never erased);
     ``last_seen_at`` advanced; a higher-confidence link marks weaker
     links for the same entity as ``superseded_at`` (never deleted).
-  * ``unresolved_correlations`` — enrich-only, same raise/append rules.
+  * ``unresolved_correlations`` — enrich-only, same raise/append rules.  Two
+    kinds of row share the table: low-confidence ``Correlation`` links
+    (entity+method keyed, ``reason`` NULL) and engine-emitted
+    ambiguous/unmatched outcomes persisted via :meth:`save_unresolved`
+    (run-level, ``afk_run`` sentinel entity, ``reason`` + ``candidates``).
 
 Every derived link stores ``correlation_method``, ``correlation_confidence``,
 ``evidence``, and ``resolver_version``.
@@ -50,6 +54,7 @@ from afk_outcomes.models import (
     RunEntityLink,
     RunSessionLink,
     RunStatus,
+    UnresolvedCorrelation,
 )
 
 # Version of the correlation resolver that produces the derived links stored
@@ -59,6 +64,14 @@ RESOLVER_VERSION = "1"
 # Entity links with this role represent a definitive resolution; correlations
 # for any other entity are treated as unresolved.
 _RESOLVED_ROLE = "resolved"
+
+# Sentinel ``entity_type`` used to key run-level engine unresolved outcomes
+# (ambiguous/unmatched) in ``unresolved_correlations``.  These rows have no
+# single engineering entity — the competing candidates live in ``candidates``
+# — so ``external_id`` carries the run id and ``method`` mirrors ``reason``,
+# making the existing UNIQUE(provider, repository, entity_type, external_id,
+# method) a replay-safe (provider, repository, run, reason) identity.
+_RUN_LEVEL_ENTITY_TYPE = "afk_run"
 
 
 def _split_entity_id(entity_id: str) -> tuple[str, str]:
@@ -406,6 +419,76 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             correlation.method,
             correlation.correlation_confidence,
             _evidence_json(correlation.evidence),
+            self._resolver_version,
+        )
+
+    async def save_unresolved(
+        self,
+        run: AFKRun,
+        unresolved: list[UnresolvedCorrelation],
+        *,
+        repository: str,
+    ) -> None:
+        """Persist engine-emitted ambiguous/unmatched outcomes (enrich-only).
+
+        The correlation engine surfaces genuinely unresolved outcomes as
+        :class:`UnresolvedCorrelation` entries on ``ResolutionResult.unresolved``
+        (issue #445); these carry no single engineering entity or correlation
+        method — only ``reason`` (``ambiguous``/``unmatched``), competing
+        ``candidates``, and ``evidence``.  Without this seam they existed only
+        in the CLI report counters and were invisible to ``GET /correlations``.
+
+        Each entry is upserted replay-safely: re-running the same window
+        resolves the same run to the same id (deterministic ULID source), so
+        the same ``(provider, repository, run, reason)`` identity re-converges
+        via the enrich-only conflict update instead of duplicating rows.
+        """
+        for item in unresolved:
+            await self._upsert_engine_unresolved(run, item, repository)
+
+    async def _upsert_engine_unresolved(
+        self,
+        run: AFKRun,
+        unresolved: UnresolvedCorrelation,
+        repository: str,
+    ) -> None:
+        """Enrich-only upsert of one engine ambiguous/unmatched outcome.
+
+        Run-level rows are keyed on a ``afk_run`` sentinel ``entity_type``
+        with the run id as ``external_id`` and ``method`` mirroring ``reason``,
+        so the table's ``UNIQUE (provider, repository, entity_type, external_id,
+        method)`` gives a replay-safe ``(provider, repository, run, reason)``
+        identity.  ``reason``/``candidates`` are COALESCE-filled (never erased)
+        and ``evidence`` is appended, matching the enrich-only contract.
+        """
+        reason = unresolved.reason.value
+        await self._conn.execute(
+            """
+            INSERT INTO unresolved_correlations
+                (provider, repository, entity_type, external_id, afk_run_id, method,
+                 reason, correlation_confidence, candidates, evidence, resolver_version,
+                 created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+            ON CONFLICT (provider, repository, entity_type, external_id, method)
+            DO UPDATE SET
+                reason = COALESCE(EXCLUDED.reason, unresolved_correlations.reason),
+                candidates = COALESCE(EXCLUDED.candidates, unresolved_correlations.candidates),
+                evidence = unresolved_correlations.evidence || EXCLUDED.evidence,
+                resolver_version = COALESCE(
+                    EXCLUDED.resolver_version, unresolved_correlations.resolver_version
+                ),
+                afk_run_id = COALESCE(EXCLUDED.afk_run_id, unresolved_correlations.afk_run_id)
+            """,
+            run.provider.value,
+            repository,
+            _RUN_LEVEL_ENTITY_TYPE,
+            unresolved.afk_run_id,
+            unresolved.afk_run_id,
+            reason,
+            reason,
+            0.0,
+            json.dumps(unresolved.candidates),
+            _evidence_json(unresolved.evidence),
             self._resolver_version,
         )
 

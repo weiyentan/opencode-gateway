@@ -37,6 +37,8 @@ from afk_outcomes import (
     RunEntityLink,
     RunSessionLink,
     RunStatus,
+    UnresolvedCorrelation,
+    UnresolvedReason,
 )
 from tests.conftest import mock_row
 
@@ -374,6 +376,111 @@ def test_save_entity_link_afk_run_id_is_not_null(mock_conn: AsyncMock) -> None:
     assert len(calls) == 2, "expected two entity-link inserts"
     for _, args in calls:
         assert args[0] == RUN_ID, "afk_run_id must be the run's ULID (NOT NULL)"
+
+
+# ── Engine unresolved outcomes — persisted via save_unresolved ────────────────
+
+
+def _build_unresolved(
+    reason: UnresolvedReason = UnresolvedReason.AMBIGUOUS,
+    *,
+    afk_run_id: str = RUN_ID,
+    candidates: list[str] | None = None,
+) -> UnresolvedCorrelation:
+    return UnresolvedCorrelation(
+        unresolved_id="01J0000000000000000000000002",
+        afk_run_id=afk_run_id,
+        entity_id=afk_run_id,
+        reason=reason,
+        candidates=(
+            candidates
+            if candidates is not None
+            else ["change_request:300", "change_request:310"]
+        ),
+        evidence=[
+            CorrelationEvidence(
+                kind="title_match",
+                source_entity_id="change_request:300",
+                detail="title=Fix caching bug",
+                weight=1.0,
+            )
+        ],
+    )
+
+
+def test_save_unresolved_persists_ambiguous_with_reason_and_candidates(
+    mock_conn: AsyncMock,
+) -> None:
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+    unresolved = _build_unresolved(UnresolvedReason.AMBIGUOUS)
+
+    import asyncio
+
+    asyncio.run(repo.save_unresolved(run, [unresolved], repository=REPO))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO unresolved_correlations")
+    assert len(calls) == 1
+    sql = calls[0][0]
+    assert "reason" in sql
+    assert "candidates" in sql
+    assert "ON CONFLICT (provider, repository, entity_type, external_id, method)" in sql
+    args = calls[0][1]
+    assert args[0] == "github"  # provider
+    assert args[1] == REPO  # repository
+    assert args[2] == "afk_run"  # run-level sentinel entity_type
+    assert args[3] == RUN_ID  # external_id == run id
+    assert args[5] == "ambiguous"  # method mirrors reason
+    assert args[6] == "ambiguous"  # reason
+    assert "change_request:300" in args[8]  # candidates JSON
+
+
+def test_save_unresolved_persists_unmatched_with_empty_candidates(
+    mock_conn: AsyncMock,
+) -> None:
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+    unresolved = _build_unresolved(UnresolvedReason.UNMATCHED, candidates=[])
+
+    import asyncio
+
+    asyncio.run(repo.save_unresolved(run, [unresolved], repository=REPO))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO unresolved_correlations")
+    assert len(calls) == 1
+    args = calls[0][1]
+    assert args[5] == "unmatched"  # method
+    assert args[6] == "unmatched"  # reason
+    assert args[8] == "[]"  # empty candidates
+
+
+def test_save_unresolved_is_enrich_only(mock_conn: AsyncMock) -> None:
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+    unresolved = _build_unresolved(UnresolvedReason.AMBIGUOUS)
+
+    import asyncio
+
+    asyncio.run(repo.save_unresolved(run, [unresolved], repository=REPO))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO unresolved_correlations")
+    sql = calls[0][0]
+    set_clause = sql.split("DO UPDATE SET", 1)[1]
+    assert "COALESCE(EXCLUDED.reason" in set_clause
+    assert "COALESCE(EXCLUDED.candidates" in set_clause
+    assert "evidence = unresolved_correlations.evidence || EXCLUDED.evidence" in set_clause
+
+
+def test_save_unresolved_noop_when_empty(mock_conn: AsyncMock) -> None:
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+
+    import asyncio
+
+    asyncio.run(repo.save_unresolved(run, [], repository=REPO))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO unresolved_correlations")
+    assert calls == []
 
 
 # ── read path ───────────────────────────────────────────────────────────────
