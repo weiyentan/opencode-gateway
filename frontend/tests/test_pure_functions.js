@@ -4298,6 +4298,75 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
     'runs list renders the empty state');
 })();
 
+// A failed /afk-outcomes/runs fetch must mark ONLY the AFK Outcomes panel
+// stale (via the PANEL_ENDPOINTS mapping + the afkRunsFetchError channel),
+// so the panel retains its last successful rows with the stale/error
+// indicator — matching the established convention for every other panel
+// (acceptance criterion 4).  Mirrors the Agent Usage panel isolation test.
+console.log('\u25B6 AFK Outcomes — panel status isolation on afkRuns failure (issue #453)');
+
+(function () {
+  var afkFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
+  assert(afkFail['afk-outcomes'] === 'stale',
+    'afkRuns failure: the AFK Outcomes panel resolves to stale (PANEL_ENDPOINTS entry)');
+  ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
+   'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-usage', 'agent-runs', 'client-project']
+    .forEach(function (panelId) {
+      assert(afkFail[panelId] === 'ok',
+        'afkRuns failure: unrelated panel "' + panelId + '" stays ok');
+    });
+
+  // No afkRuns error \u2192 the panel is ok (freshness resolves normally)
+  var allOk = window.resolvePanelStatuses({});
+  assert(allOk['afk-outcomes'] === 'ok', 'no errors: the AFK Outcomes panel resolves to ok');
+
+  // Other single-endpoint failures do NOT stale the AFK Outcomes panel
+  assert(window.resolvePanelStatuses({ aggByModel: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ health: 'down' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ agentRuns: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ aggClientProject: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ aggByAgent: 'boom' })['afk-outcomes'] === 'ok',
+    'model/health/agent-runs/client-project/agent failures leave the AFK Outcomes panel ok');
+})();
+
+console.log('\u25B6 AFK Outcomes — last-successful-rows retention + stale indicator (issue #453)');
+
+(function () {
+  // A stale AFK Outcomes panel with previous data skips the re-render, so the
+  // last successful rows stay on screen (shouldRenderPanel discipline).
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes') === false,
+    'stale AFK Outcomes panel with previous data \u2192 render skipped (last rows retained)');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'ok', updatedAt: 500000 } }, 'afk-outcomes') === true,
+    'ok AFK Outcomes panel still renders');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: null } }, 'afk-outcomes') === true,
+    'stale AFK Outcomes panel with NO previous data renders (empty/error state shown)');
+
+  // The panel title swaps in the existing "Showing previous data" warning.
+  var now = 1000000;
+  var f = window.computePanelFreshness({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes', now);
+  assert(f !== null && f.status === 'stale' && f.label === 'Showing previous data',
+    'stale AFK Outcomes panel shows the "Showing previous data" freshness label');
+
+  // Render wiring: the panel honors the retention guard and paints the
+  // existing error indicator into its empty state on a failed fetch.
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  var renderSrc = appJsSource.slice(appJsSource.indexOf('function renderAfkOutcomesTable'),
+                                    appJsSource.indexOf('function openAfkRunDetail'));
+  assert(renderSrc.indexOf("applyPanelFreshness('afk-outcomes')") !== -1 &&
+         renderSrc.indexOf("shouldRenderPanel(panelStates, 'afk-outcomes')") !== -1,
+    'app.js: renderAfkOutcomesTable applies freshness and skips the re-render when stale');
+  assert(renderSrc.indexOf('afkRunsFetchError') !== -1,
+    'app.js: renderAfkOutcomesTable shows the fetch-error indicator (afkRunsFetchError)');
+
+  // The critical wiring: resolvePanelStatesAfterFetch must merge the separate
+  // afkRunsFetchError channel into the error map (exactly like agentRuns), so
+  // a failed runs fetch resolves the panel to 'stale' instead of 'ok'.
+  var resolveSrc = appJsSource.slice(appJsSource.indexOf('function resolvePanelStatesAfterFetch'),
+                                     appJsSource.indexOf('function updateLastRefreshed'));
+  assert(resolveSrc.indexOf('afkRuns: afkRunsFetchError') !== -1,
+    'app.js: resolvePanelStatesAfterFetch merges afkRuns: afkRunsFetchError into the error map');
+})();
+
 console.log('\u25B6 AFK Outcomes — openAfkRunDetail fetch + 404 handling (issue #453)');
 
 (function () {

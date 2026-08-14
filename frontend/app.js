@@ -2305,7 +2305,7 @@
    *  A failed panel keeps its previous updatedAt (data on screen is the
    *  previous successful render); a successful one records the cycle time. */
   function resolvePanelStatesAfterFetch() {
-    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError });
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError });
     var statuses = resolvePanelStatuses(errors);
     var nowMs = Date.now();
     Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
