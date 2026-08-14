@@ -24,7 +24,7 @@ The Gateway is built as layered concerns:
 | **API Layer** | `app/api/` | REST endpoints: health, admin client CRUD, collector token management, usage ingest, collector cursor recovery, and reporting (aggregates, records, sessions, agent runs). API key authentication from day one. Consistent JSON response envelope for all endpoints. |
 | **Core Engine** | `app/core/` | Pydantic-based settings and config (`GATEWAY_` env prefix), application factory, logging with secret redaction, auth middleware, token generation/hashing, and Loki URL builder. |
 | **Database Layer** | `app/db/` | asyncpg connection pool, SQLAlchemy ORM models for identity, ingest/observability domains, Alembic migrations, and advisory lock utilities. |
-| **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. |
+| **Consumer** | `app/consumer/` | Kafka consumer bridge — reads usage records from the `opencode-usage` topic and POSTs them to the Gateway's `/ingest` endpoint. Runs as a separate container (Kubernetes), not as part of the Gateway API process. Also hosts the live AFK outcome consumer (`app/consumer/afk_consumer.py`) that writes provider engineering events to Postgres. |
 
 ---
 
@@ -104,6 +104,13 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |
 | `GATEWAY_KAFKA_DLQ_TOPIC` | `opencode-usage-dlq` | Dead-letter queue topic for unprocessable messages |
 | `GATEWAY_CONSUMER_GROUP_ID` | `opencode-gateway` | Kafka consumer group ID |
+| `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Provider-events topic for the AFK outcome consumer (external; not created here) |
+| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Dead-letter queue topic for poison AFK outcome messages |
+| `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
+| `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
+| `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
 
@@ -314,6 +321,7 @@ opencode-gateway/
 │   ├── consumer/
 │   │   ├── __init__.py           # Module init, exports Consumer class
 │   │   ├── consumer.py           # Kafka consumer bridge (separate container)
+│   │   ├── afk_consumer.py       # Live AFK outcome consumer (own consumer group)
 │   │   └── models.py             # Consumer-side Pydantic models for ingest payloads
 │   ├── core/
 │   │   ├── __init__.py

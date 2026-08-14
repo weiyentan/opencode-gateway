@@ -142,6 +142,58 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 continue  # resolved correlations enrich afk_run_entities, not here
             await self._upsert_unresolved_correlation(run, correlation, entity_map)
 
+    async def record_event(
+        self,
+        *,
+        provider: Provider,
+        delivery_id: str,
+        entity: EngineeringEntity,
+        event: EngineeringEvent,
+    ) -> None:
+        """Record one live provider delivery: a delivery_log row plus its event.
+
+        Additive live-ingest seam (issue #451).  Unlike :meth:`save`, the
+        owning ``afk_run_id`` is not known at live-ingest time (run identity
+        is resolved later by the backfill/reconciliation engine), so the
+        delivery is keyed on the provider's own delivery UUID
+        (``X-GitHub-Delivery`` / ``X-GitLab-Event-UUID``, PRD decision #8)
+        rather than the run id.  Both writes are conflict-ignore, so a
+        redelivery of the same delivery UUID no-ops against the
+        ``delivery_log`` UNIQUE(provider, delivery_id) and the
+        ``engineering_events`` identity UNIQUE constraints.
+        """
+        await self._conn.execute(
+            """
+            INSERT INTO delivery_log (provider, delivery_id, afk_run_id, status, delivered_at)
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (provider, delivery_id) DO NOTHING
+            """,
+            provider.value,
+            delivery_id,
+            None,
+            event.event_type,
+        )
+        entity_type, external_id = _split_entity_id(event.entity_id)
+        await self._conn.execute(
+            """
+            INSERT INTO engineering_events
+                (provider, repository, entity_type, external_id, event_type,
+                 occurred_at, provider_event_id, actor, payload, first_ingested_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            ON CONFLICT (provider, repository, entity_type, external_id, event_type, occurred_at)
+            DO NOTHING
+            """,
+            event.provider.value,
+            entity.repository,
+            entity_type,
+            external_id,
+            event.event_type,
+            event.occurred_at,
+            _provider_event_id(event),
+            event.actor,
+            json.dumps(event.payload or {}),
+        )
+
     async def _log_delivery(self, run: AFKRun) -> None:
         """Record the delivery idempotently; re-delivery of the same run no-ops."""
         await self._conn.execute(
