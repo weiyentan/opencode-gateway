@@ -354,12 +354,12 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
             afk_run_id=afk_run_id,
             entity_id=f"change_request:{cluster_number}",
             correlation_confidence=1.0,
-            method="change_request_merged",
+            method="issue_reference",
             evidence=[
                 CorrelationEvidence(
-                    kind="branch_name",
+                    kind="title_match",
                     source_entity_id=f"change_request:{cluster_number}",
-                    detail=f"branch={cluster_cr['branch']}",
+                    detail=f"title={run_meta['title']}",
                     weight=1.0,
                 ),
             ],
@@ -382,10 +382,10 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
                 afk_run_id=afk_run_id,
                 entity_id=f"issue:{number}",
                 correlation_confidence=1.0,
-                method="issue_resolved",
+                method="issue_reference",
                 evidence=[
                     CorrelationEvidence(
-                        kind="issue_mention",
+                        kind="issue_reference",
                         source_entity_id=f"change_request:{cluster_number}",
                         detail=f"resolves #{number}",
                         weight=1.0,
@@ -411,10 +411,10 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
                 afk_run_id=afk_run_id,
                 entity_id=f"issue:{number}",
                 correlation_confidence=0.1,
-                method="issue_mention",
+                method="issue_reference",
                 evidence=[
                     CorrelationEvidence(
-                        kind="issue_mention",
+                        kind="issue_reference",
                         source_entity_id=f"change_request:{cluster_number}",
                         detail=f"mentioned #{number}",
                         weight=0.1,
@@ -502,6 +502,8 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
         external_session_id=run_meta.get("external_session_id"),
         started_at=_parse_dt(run_meta["started_at"]),
         finished_at=_parse_dt(run_meta["finished_at"]),
+        inferred=True,
+        method="temporal_overlap",
     )
 
     return AFKRun(
@@ -584,7 +586,7 @@ def test_github_noise_is_present_but_not_resolved() -> None:
     assert "issue:436" not in run.outcome.resolved_issue_ids
     mention = [
         c for c in run.correlations
-        if c.entity_id == "issue:436" and c.method == "issue_mention"
+        if c.entity_id == "issue:436" and c.method == "issue_reference"
     ]
     assert len(mention) == 1
     assert mention[0].correlation_confidence == 0.1
