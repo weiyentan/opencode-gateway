@@ -45,6 +45,8 @@ from afk_outcomes import (
     Provider,
     RunEntityLink,
     RunStatus,
+    UnresolvedCorrelation,
+    UnresolvedReason,
 )
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -399,3 +401,197 @@ async def test_unresolved_correlations_stored_only_in_unresolved_table(
             "WHERE afk_run_id = '01J0000000000000000000000008'"
         )
         assert link_method is not None  # the link still carries the (weak) method
+
+
+# ── Run-scoped unresolved-correlation identity (migration 0027) ───────────────
+
+
+def _build_unresolved_item(
+    afk_run_id: str,
+    reason: UnresolvedReason,
+    *,
+    candidates: list[str] | None = None,
+) -> UnresolvedCorrelation:
+    return UnresolvedCorrelation(
+        unresolved_id=f"unresolved-{afk_run_id}",
+        afk_run_id=afk_run_id,
+        entity_id=afk_run_id,
+        reason=reason,
+        candidates=candidates if candidates is not None else [],
+        evidence=[
+            CorrelationEvidence(
+                kind="title_match",
+                source_entity_id="change_request:300",
+                detail="title=Fix caching bug",
+                weight=1.0,
+            )
+        ],
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unresolved_same_run_upsert_enriches_single_row(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        run_id = "01J0000000000000000000000099"
+
+        await repo.save(
+            _make_run(
+                run_id,
+                entity_id="issue:901",
+                external_id="901",
+                role="referenced",
+                confidence=0.1,
+                method="issue_mention",
+                with_outcome=False,
+            )
+        )
+        await repo.save(
+            _make_run(
+                run_id,
+                entity_id="issue:901",
+                external_id="901",
+                role="referenced",
+                confidence=0.1,
+                method="issue_mention",
+                with_outcome=False,
+            )
+        )
+
+        rows = await conn.fetch(
+            "SELECT afk_run_id, evidence FROM unresolved_correlations "
+            "WHERE external_id = '901' AND method = 'issue_mention'"
+        )
+        assert len(rows) == 1, f"same-run re-save must enrich one row, got {len(rows)}"
+        assert rows[0]["afk_run_id"] == run_id
+        assert len(rows[0]["evidence"]) == 2, "evidence should be appended across re-saves"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unresolved_different_runs_produce_independent_rows(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        run_a = "01J0000000000000000000000100"
+        run_b = "01J0000000000000000000000101"
+
+        await repo.save(
+            _make_run(
+                run_a,
+                entity_id="issue:902",
+                external_id="902",
+                role="referenced",
+                confidence=0.1,
+                method="issue_mention",
+                with_outcome=False,
+            )
+        )
+        await repo.save(
+            _make_run(
+                run_b,
+                entity_id="issue:902",
+                external_id="902",
+                role="referenced",
+                confidence=0.1,
+                method="issue_mention",
+                with_outcome=False,
+            )
+        )
+
+        rows = await conn.fetch(
+            "SELECT afk_run_id, evidence FROM unresolved_correlations "
+            "WHERE external_id = '902' AND method = 'issue_mention' "
+            "ORDER BY afk_run_id"
+        )
+        assert len(rows) == 2, (
+            f"two runs of the same entity must yield independent rows, got {len(rows)}"
+        )
+        assert {r["afk_run_id"] for r in rows} == {run_a, run_b}
+        for row in rows:
+            assert len(row["evidence"]) == 1, "evidence must be isolated per run"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unresolved_ambiguous_rows_across_runs_independent(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        run_a = "01J0000000000000000000000200"
+        run_b = "01J0000000000000000000000201"
+
+        await repo.save_unresolved(
+            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            [_build_unresolved_item(run_a, UnresolvedReason.AMBIGUOUS)],
+            repository=REPO,
+        )
+        await repo.save_unresolved(
+            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            [_build_unresolved_item(run_b, UnresolvedReason.AMBIGUOUS)],
+            repository=REPO,
+        )
+
+        rows = await conn.fetch(
+            "SELECT afk_run_id, external_id FROM unresolved_correlations "
+            "WHERE entity_type = 'afk_run' AND method = 'ambiguous' "
+            "ORDER BY afk_run_id"
+        )
+        assert len(rows) == 2, f"ambiguous rows across runs must be independent, got {len(rows)}"
+        for row in rows:
+            assert row["external_id"] == row["afk_run_id"], (
+                "run-level rows keep external_id == afk_run_id"
+            )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unresolved_unmatched_rows_across_runs_independent(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        run_a = "01J0000000000000000000000300"
+        run_b = "01J0000000000000000000000301"
+
+        await repo.save_unresolved(
+            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            [_build_unresolved_item(run_a, UnresolvedReason.UNMATCHED)],
+            repository=REPO,
+        )
+        await repo.save_unresolved(
+            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            [_build_unresolved_item(run_b, UnresolvedReason.UNMATCHED)],
+            repository=REPO,
+        )
+
+        rows = await conn.fetch(
+            "SELECT afk_run_id, external_id FROM unresolved_correlations "
+            "WHERE entity_type = 'afk_run' AND method = 'unmatched' "
+            "ORDER BY afk_run_id"
+        )
+        assert len(rows) == 2, f"unmatched rows across runs must be independent, got {len(rows)}"
+        for row in rows:
+            assert row["external_id"] == row["afk_run_id"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_run_scoped_unique_constraint_exists_post_upgrade(
+    db_pool: asyncpg.Pool,
+) -> None:
+    async with db_pool.acquire() as conn:
+        present = await conn.fetchval(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM pg_constraint "
+            "  WHERE conname = 'uq_unresolved_correlations_entity_run_method'"
+            ")"
+        )
+        assert present is True, (
+            "uq_unresolved_correlations_entity_run_method must exist after 0027"
+        )

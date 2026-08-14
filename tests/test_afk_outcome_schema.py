@@ -215,7 +215,13 @@ def test_derived_link_columns_present() -> None:
 
 def test_unresolved_correlations_unique_key() -> None:
     ddl = _ddl(UnresolvedCorrelation)
-    assert "uq_unresolved_correlations_entity_method" in ddl
+    assert "uq_unresolved_correlations_entity_run_method" in ddl
+    assert "afk_run_id" in ddl
+
+
+def test_unresolved_correlations_afk_run_id_not_null() -> None:
+    col = UnresolvedCorrelation.__table__.columns["afk_run_id"]
+    assert not col.nullable, "unresolved_correlations.afk_run_id must be NOT NULL"
 
 
 def test_unresolved_correlations_has_reason_and_candidates_columns() -> None:

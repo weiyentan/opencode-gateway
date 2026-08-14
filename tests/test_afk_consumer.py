@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiokafka.structs import ConsumerRecord
+from aiokafka.errors import KafkaError
+from aiokafka.structs import ConsumerRecord, TopicPartition
 
 from afk_outcomes.models import EntityType, Provider
 from afk_outcomes.providers.github import GitHubAdapter
@@ -181,12 +182,14 @@ def _github_rest_payloads() -> dict[str, object]:
 # ── Builders ─────────────────────────────────────────────────────────────────
 
 
-def _mk_msg(value: dict) -> MagicMock:
+def _mk_msg(
+    value: dict, *, offset: int = 42, partition: int = 0
+) -> MagicMock:
     """Build a MagicMock that quacks like an aiokafka ConsumerRecord."""
     msg = MagicMock(spec=ConsumerRecord)
     msg.value = json.dumps(value).encode("utf-8")
-    msg.offset = 42
-    msg.partition = 0
+    msg.offset = offset
+    msg.partition = partition
     msg.topic = "afk.events"
     msg.key = None
     msg.headers = ()
@@ -345,7 +348,9 @@ async def test_valid_message_persists_and_commits_after_transaction() -> None:
     conn = _FakeConn(order)
     consumer = _make_consumer(pool=_FakePool(conn))
     consumer._consumer = AsyncMock()
-    consumer._consumer.commit = AsyncMock(side_effect=lambda: order.append("commit"))
+    consumer._consumer.commit = AsyncMock(
+        side_effect=lambda *args, **kwargs: order.append("commit")
+    )
     consumer._producer = AsyncMock()
 
     msg = _mk_msg(_valid_payload())
@@ -549,6 +554,306 @@ async def test_failing_then_successful_message_does_not_lose_failed_message() ->
     # Total: one DLQ (the failed message) and two commits (failed + good).
     consumer._producer.send_and_wait.assert_called_once()
     assert consumer._consumer.commit.call_count == 2
+
+
+# ── DLQ publish failure must not swallow the message (no commit) ──────────────
+
+
+def _mk_invalid_json_msg() -> MagicMock:
+    """A ConsumerRecord whose value is not decodable JSON."""
+    msg = MagicMock(spec=ConsumerRecord)
+    msg.value = b"not valid json at all"
+    msg.offset = 101
+    msg.partition = 0
+    msg.topic = "afk.events"
+    msg.key = None
+    msg.headers = ()
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_db_failure_dlq_success_commits_exactly_once() -> None:
+    """DB exhausts retries; DLQ publish succeeds → exactly one offset commit."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    msg = _mk_msg(_valid_payload())
+    with patch(
+        "app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock
+    ) as mock_sleep:
+        await consumer._process_message(msg)
+
+    assert mock_sleep.call_count == 2
+    consumer._consumer.commit.assert_called_once()
+    consumer._producer.send_and_wait.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_db_failure_dlq_failure_does_not_commit() -> None:
+    """DB exhausts retries AND DLQ publish fails → no commit, error propagates."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    msg = _mk_msg(_valid_payload())
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(KafkaError):
+            await consumer._process_message(msg)
+
+    consumer._consumer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_msg",
+    [
+        _mk_invalid_json_msg,
+        lambda: _mk_msg({"not": "valid"}),
+        lambda: _mk_msg(_valid_payload(type="pull_request.assigned")),
+    ],
+    ids=["invalid-json", "invalid-shape", "unmappable-type"],
+)
+async def test_poison_message_dlq_failure_does_not_commit(make_msg) -> None:
+    """A poison message whose DLQ publish fails must not be committed away."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    msg = make_msg()
+    with pytest.raises(KafkaError):
+        await consumer._process_message(msg)
+
+    consumer._consumer.commit.assert_not_called()
+    conn.execute.assert_not_called()
+
+
+# ── Commit frontier (no permanent message loss — PR #459 finding 1) ──────────
+
+
+def _tp(partition: int = 0) -> TopicPartition:
+    return TopicPartition("afk.events", partition)
+
+
+def _last_commit_offsets(consumer: AFKOutcomeConsumer) -> dict[TopicPartition, int]:
+    """Extract {TopicPartition: committed_offset} from the last commit call."""
+    offsets = consumer._consumer.commit.call_args.args[0]
+    return {tp: om.offset for tp, om in offsets.items()}
+
+
+@pytest.mark.asyncio
+async def test_dlq_success_commits_explicit_offset_covering_message() -> None:
+    """DLQ publish success → commit carries explicit offsets covering the msg."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    msg = _mk_invalid_json_msg()  # offset 101
+    await consumer._process_message(msg)
+
+    consumer._consumer.commit.assert_called_once()
+    assert _last_commit_offsets(consumer) == {_tp(): 102}
+
+
+@pytest.mark.asyncio
+async def test_consecutive_successes_advance_commit_frontier() -> None:
+    """Two consecutive successful messages advance the committed offset to N+2."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+
+    assert consumer._consumer.commit.call_count == 2
+    assert _last_commit_offsets(consumer) == {_tp(): 12}
+
+
+@pytest.mark.asyncio
+async def test_failed_then_successful_message_does_not_commit_past_failure() -> None:
+    """A later success must not commit past an earlier DLQ-failed offset."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[
+                "OK",  # delivery_log for offset 9
+                "OK",  # engineering_events for offset 9
+                RuntimeError("db down"),  # offset 10, attempt 1
+                RuntimeError("db down"),  # offset 10, attempt 2
+                RuntimeError("db down"),  # offset 10, attempt 3
+                "OK",  # delivery_log for offset 11
+                "OK",  # engineering_events for offset 11
+            ]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    # A prior successful message establishes the frontier at offset 10.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=9))
+    assert _last_commit_offsets(consumer) == {_tp(): 10}
+
+    failing_msg = _mk_msg(_valid_payload(delivery_id="failing"), offset=10)
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(KafkaError):
+            await consumer._process_message(failing_msg)
+    consumer._mark_blocked(failing_msg)  # what run()'s except handler does
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+
+    # The good message is processed, but its commit must not pass offset 10.
+    assert consumer._consumer.commit.call_count == 2
+    assert _last_commit_offsets(consumer) == {_tp(): 10}
+
+
+@pytest.mark.asyncio
+async def test_first_message_failure_does_not_advance_past_it() -> None:
+    """Edge case: the FIRST message for a partition fails → frontier stays put."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    poison = _mk_invalid_json_msg()  # offset 101, the first message for partition 0
+    with pytest.raises(KafkaError):
+        await consumer._process_message(poison)
+    consumer._mark_blocked(poison)
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=102))
+
+    # No commit: the frontier cannot advance past the blocked first offset.
+    consumer._consumer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_failed_message_clears_block_and_advances() -> None:
+    """Redelivery of the failed offset clears the block; the frontier advances."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down")] * 3 + ["OK"] * 6
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    failing_msg = _mk_msg(_valid_payload(delivery_id="failing"), offset=10)
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(KafkaError):
+            await consumer._process_message(failing_msg)
+    consumer._mark_blocked(failing_msg)
+
+    # A later message processed while blocked must not advance the frontier.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+    consumer._consumer.commit.assert_not_called()
+
+    # Redelivery of the failed offset succeeds → block cleared, frontier = N.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+    assert _last_commit_offsets(consumer) == {_tp(): 11}
+
+    # The redelivered N+1 then advances the frontier to N+2.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+    assert _last_commit_offsets(consumer) == {_tp(): 12}
+
+
+@pytest.mark.asyncio
+async def test_multiple_failures_keep_earliest_blocked_offset() -> None:
+    """Consecutive failures must not move the block past the earliest gap.
+
+    Regression: a second failing message on the same partition must not
+    overwrite the first failed offset — otherwise the block would move to a
+    later offset and never clear when the first failed offset is redelivered.
+    """
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down")] * 6 + ["OK"] * 8
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock(side_effect=KafkaError("dlq down"))
+
+    # offset 10 (N) fails, then offset 11 (N+1) also fails.
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(KafkaError):
+            await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+        with pytest.raises(KafkaError):
+            await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+    consumer._mark_blocked(_mk_msg(_valid_payload(), offset=10))
+    consumer._mark_blocked(_mk_msg(_valid_payload(), offset=11))
+
+    # The block must remain at the earliest failed offset (10), not 11.
+    assert consumer._blocked == {_tp(): 10}
+
+    # offset 12 (N+2) succeeds — but its commit must not advance past N=10.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=12))
+    consumer._consumer.commit.assert_not_called()
+
+    # Redelivery: N succeeds → block cleared, frontier = N.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+    assert _last_commit_offsets(consumer) == {_tp(): 11}
+
+    # N+1 redelivered → frontier = N+1.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+    assert _last_commit_offsets(consumer) == {_tp(): 12}
+
+    # N+2 redelivered → frontier = N+2, committed offset = N+3.
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=12))
+    assert _last_commit_offsets(consumer) == {_tp(): 13}
+
+
+@pytest.mark.asyncio
+async def test_mark_committable_does_not_advance_past_blocked_first_offset() -> None:
+    """Edge case: the FIRST message for a partition fails; a later success
+    must not mark itself committable (which would commit past the failure)."""
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    consumer._mark_blocked(_mk_msg(_valid_payload(), offset=10))
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=11))
+    assert consumer._committable == {}
+    assert consumer._blocked == {_tp(): 10}
+
+
+@pytest.mark.asyncio
+async def test_mark_committable_clears_block_on_redelivery() -> None:
+    """Redelivery of the blocked offset clears the block and re-advances."""
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    consumer._mark_blocked(_mk_msg(_valid_payload(), offset=10))
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=11))
+    assert consumer._committable == {}
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=10))  # redelivered
+    assert consumer._committable == {_tp(): 10}
+    assert consumer._blocked == {}
 
 
 # ── Consumer group separation ────────────────────────────────────────────────

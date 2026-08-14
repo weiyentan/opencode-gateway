@@ -400,7 +400,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 (provider, repository, entity_type, external_id, afk_run_id, method,
                  correlation_confidence, evidence, resolver_version, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-            ON CONFLICT (provider, repository, entity_type, external_id, method)
+            ON CONFLICT (provider, repository, entity_type, external_id, afk_run_id, method)
             DO UPDATE SET
                 correlation_confidence = GREATEST(
                     unresolved_correlations.correlation_confidence, EXCLUDED.correlation_confidence
@@ -408,8 +408,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 evidence = unresolved_correlations.evidence || EXCLUDED.evidence,
                 resolver_version = COALESCE(
                     EXCLUDED.resolver_version, unresolved_correlations.resolver_version
-                ),
-                afk_run_id = COALESCE(EXCLUDED.afk_run_id, unresolved_correlations.afk_run_id)
+                )
             """,
             provider,
             repository,
@@ -457,9 +456,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         Run-level rows are keyed on a ``afk_run`` sentinel ``entity_type``
         with the run id as ``external_id`` and ``method`` mirroring ``reason``,
         so the table's ``UNIQUE (provider, repository, entity_type, external_id,
-        method)`` gives a replay-safe ``(provider, repository, run, reason)``
-        identity.  ``reason``/``candidates`` are COALESCE-filled (never erased)
-        and ``evidence`` is appended, matching the enrich-only contract.
+        afk_run_id, method)`` gives a replay-safe ``(provider, repository, run,
+        reason)`` identity (``external_id == afk_run_id`` here).  ``reason``/
+        ``candidates`` are COALESCE-filled (never erased) and ``evidence`` is
+        appended, matching the enrich-only contract.
         """
         reason = unresolved.reason.value
         await self._conn.execute(
@@ -469,15 +469,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                  reason, correlation_confidence, candidates, evidence, resolver_version,
                  created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
-            ON CONFLICT (provider, repository, entity_type, external_id, method)
+            ON CONFLICT (provider, repository, entity_type, external_id, afk_run_id, method)
             DO UPDATE SET
                 reason = COALESCE(EXCLUDED.reason, unresolved_correlations.reason),
                 candidates = COALESCE(EXCLUDED.candidates, unresolved_correlations.candidates),
                 evidence = unresolved_correlations.evidence || EXCLUDED.evidence,
                 resolver_version = COALESCE(
                     EXCLUDED.resolver_version, unresolved_correlations.resolver_version
-                ),
-                afk_run_id = COALESCE(EXCLUDED.afk_run_id, unresolved_correlations.afk_run_id)
+                )
             """,
             run.provider.value,
             repository,
