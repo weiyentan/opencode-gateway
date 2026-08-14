@@ -90,6 +90,8 @@ def _mk_entity_row(
     correlation_confidence: float = 1.0,
     evidence: list | None = None,
     resolver_version: str | None = "1",
+    owning_change_request_id: str | None = None,
+    correlation_source: str = "direct",
     superseded_at: datetime | None = None,
 ):
     return mock_row(
@@ -113,6 +115,8 @@ def _mk_entity_row(
                 }
             ],
             "resolver_version": resolver_version,
+            "owning_change_request_id": owning_change_request_id,
+            "correlation_source": correlation_source,
             "superseded_at": superseded_at,
         }
     )
@@ -448,7 +452,14 @@ class TestRunDetail:
                 correlation_method="issue_reference",
                 correlation_confidence=1.0,
                 resolver_version="1",
-            )
+                owning_change_request_id="442",
+                correlation_source="owning_change_request",
+            ),
+            _mk_entity_row(
+                entity_type="issue",
+                external_id="99",
+                role="resolved",
+            ),
         ]
         mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
         mock_conn.fetch = AsyncMock(side_effect=[entity_rows, []])
@@ -457,13 +468,24 @@ class TestRunDetail:
             response = await c.get(f"/api/v1/afk-outcomes/runs/{_RUN_ID}")
 
         data = response.json()["data"]
-        link = data["issues"][0]
-        assert link["entity_id"] == "issue:37"
-        assert link["correlation_method"] == "issue_reference"
-        assert link["correlation_confidence"] == 1.0
-        assert link["resolver_version"] == "1"
-        assert link["evidence"][0]["kind"] == "issue_reference"
-        assert link["provisional"] is False
+        lineage_link = next(
+            link for link in data["issues"] if link["external_id"] == "37"
+        )
+        assert lineage_link["entity_id"] == "issue:37"
+        assert lineage_link["correlation_method"] == "issue_reference"
+        assert lineage_link["correlation_confidence"] == 1.0
+        assert lineage_link["resolver_version"] == "1"
+        assert lineage_link["evidence"][0]["kind"] == "issue_reference"
+        assert lineage_link["provisional"] is False
+        # Owning-branch lineage provenance surfaces through the read API.
+        assert lineage_link["owning_change_request_id"] == "442"
+        assert lineage_link["correlation_source"] == "owning_change_request"
+        # A link without lineage falls back to the direct-source default.
+        direct_link = next(
+            link for link in data["issues"] if link["external_id"] == "99"
+        )
+        assert direct_link["owning_change_request_id"] is None
+        assert direct_link["correlation_source"] == "direct"
 
     @pytest.mark.asyncio
     async def test_provisional_links_are_marked(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -532,7 +554,12 @@ class TestListEntities:
         mock_conn.fetchval = AsyncMock(return_value=2)
         mock_conn.fetch = AsyncMock(
             return_value=[
-                _mk_entity_row(entity_type="issue", external_id="37"),
+                _mk_entity_row(
+                    entity_type="issue",
+                    external_id="37",
+                    owning_change_request_id="442",
+                    correlation_source="owning_change_request",
+                ),
                 _mk_entity_row(
                     entity_type="issue", external_id="88", superseded_at=_A_TS
                 ),
@@ -550,6 +577,12 @@ class TestListEntities:
         assert items[0]["correlation_method"] == "issue_reference"
         assert items[0]["superseded_at"] is None
         assert items[0]["provisional"] is False
+        # Owning-branch lineage provenance surfaces through the read API.
+        assert items[0]["owning_change_request_id"] == "442"
+        assert items[0]["correlation_source"] == "owning_change_request"
+        # A row without lineage falls back to the direct-source default.
+        assert items[1]["owning_change_request_id"] is None
+        assert items[1]["correlation_source"] == "direct"
         # Superseded state is surfaced, not hidden
         assert items[1]["superseded_at"] is not None
 
