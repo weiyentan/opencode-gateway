@@ -115,6 +115,54 @@ failure leaves the rest of Aurora Glass usable and may preserve the last
 successful panel data with a stale/error indication.
 _Avoid_: fixed agent categories, Agent Run Summary
 
+**Execution Transcript**:
+The reconstructed, chronologically-ordered stream of message and part
+records across a session and its descendant subagent sessions. The
+observability answer to "what did this run actually do". It is an event
+timeline, not an accounting summary. Exposed read-only via the
+`/api/v1/execution` endpoints (ADR 0016).
+_Avoid_: replay blob, transcript (in the usage-aggregate sense)
+
+**Observed Message**:
+A Gateway-owned row (`observed_messages`, migration 0029) projecting one
+OpenCode `message` row: its identity, session linkage, role/agent/mode
+metadata, cost/token facts, and parent linkage, with the full
+`message.data` payload preserved verbatim (redacted) in a JSONB column.
+Keyed by `(client_id, source_database_id, external_message_id)`.
+_Avoid_: Usage Record (those are accounting facts, not transcript rows)
+
+**Observed Part**:
+A Gateway-owned row (`observed_parts`, migration 0029) projecting one
+OpenCode `part` row: its identity, owning message and session, an
+explicit Transcript Event Type, and the full `part.data` payload
+preserved verbatim (redacted) in a JSONB column. A tool part is an
+Observed Part whose event type is `tool`.
+_Avoid_: event (ambiguous with the deferred OpenCode `event` table)
+
+**Observed Tool Call**:
+A normalized, Gateway-owned projection (`observed_tool_calls`, migration
+0029) of the tool-call facts extracted from an Observed Part whose event
+type is `tool`: tool name, status, and truncated input/output. It is a
+derived query surface over `observed_parts`, not an independent source of
+truth.
+_Avoid_: tool call row (when the verbatim part payload is meant)
+
+**Transcript Event Type**:
+The explicit, first-class category of an Observed Part, normalized from
+`part.data.type` (`text`, `reasoning`, `tool`, `step-start`,
+`step-finish`, plus unknown future values). It is the transcript-slice
+counterpart of the usage-slice token categories: a queryable dimension,
+never an opaque blob.
+_Avoid_: part type (when the normalized column is meant)
+
+**Transcript Timeline**:
+A unified, chronologically-ordered stream of Observed Parts across a
+root session and its descendant subagent sessions, each event annotated
+with its owning session and generation depth. It is the API view
+(`GET /api/v1/execution/sessions/{session_id}/timeline`) that
+reconstructs "what happened across the whole run".
+_Avoid_: unified transcript (ambiguous), message timeline (messages only)
+
 **Source-Created Ordering**:
 The ordering rule behind "most recent" in Aurora Glass usage views: rows
 are ordered by when the underlying activity happened at the source, not by
@@ -643,6 +691,11 @@ manages.
 - **Session Context** is sent as a separate batch-level collection, not duplicated onto each **Usage Record**
 - A **Todo Snapshot** belongs to one resolved **Internal Session ID** and is keyed by `(source_database_id, external_session_id, position)`
 - An **Agent Run Summary** is composed by the **Gateway** from stored usage, context, project, todo, and hierarchy data
+- An **Observed Message** belongs to one resolved **Internal Session ID** and is keyed by `(client_id, source_database_id, external_message_id)`
+- An **Observed Part** belongs to one **Observed Message** and one resolved **Internal Session ID** and is keyed by `(client_id, source_database_id, external_part_id)`
+- An **Observed Tool Call** is derived from one **Observed Part** whose event type is `tool` and is keyed by the same `(client_id, source_database_id, external_part_id)` as its source part
+- An **Execution Transcript** is composed by the **Gateway** from **Observed Messages** and **Observed Parts** across a session and its descendant subagent sessions
+- A **Transcript Timeline** unifies the **Observed Parts** of a root session and its descendants into one chronologically-ordered stream annotated with owning session and generation depth
 - **Aurora Glass** presents **Agent Usage** as a dynamic aggregate grouped by recorded agent identity, using the shared dashboard date range and aggregate filters
 - **Agent Usage** is distinct from the per-run **Agent Run Summary** view
 - **Agent Usage** rows are ordered by total token usage descending, then agent name ascending
