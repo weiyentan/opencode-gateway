@@ -348,3 +348,35 @@ def test_afk_consumer_enabled_with_repository_succeeds(monkeypatch):
     settings = Settings()
     assert settings.afk_outcomes_consumer_enabled is True
     assert settings.afk_outcomes_repository == "owner/repo"
+
+
+# ── Issue #470: Execution-transcript retention settings ────────────────────
+
+
+def test_transcript_retention_settings_defaults(monkeypatch):
+    """Retention windows default to the conservative ADR 0016 values:
+    365 days for messages (session reconstruction surface), 90 days for
+    parts and tool calls (higher-volume, lower-longevity)."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.transcript_retention_messages_days == 365
+    assert settings.transcript_retention_parts_days == 90
+    assert settings.transcript_retention_tool_calls_days == 90
+
+
+def test_transcript_retention_settings_override_from_env(monkeypatch):
+    """GATEWAY_TRANSCRIPT_RETENTION_* env vars override the defaults, each
+    per-table window independently."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_TRANSCRIPT_RETENTION_MESSAGES_DAYS", "730")
+    monkeypatch.setenv("GATEWAY_TRANSCRIPT_RETENTION_PARTS_DAYS", "45")
+    monkeypatch.setenv("GATEWAY_TRANSCRIPT_RETENTION_TOOL_CALLS_DAYS", "60")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.transcript_retention_messages_days == 730
+    assert settings.transcript_retention_parts_days == 45
+    assert settings.transcript_retention_tool_calls_days == 60
