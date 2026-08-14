@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # every Correlation, RunEntityLink, RunSessionLink, and UnresolvedCorrelation so
 # a change in rule semantics can be detected downstream.  Bump when any rule's
 # matching logic changes.
-RESOLVER_VERSION = "1"
+RESOLVER_VERSION = "2"
 
 
 class Provider(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
@@ -94,6 +94,13 @@ class EngineeringEntity(BaseModel):
         default=None,
         description="Source branch / head ref (change requests only)",
     )
+    owning_change_request_id: str | None = Field(
+        default=None,
+        description=(
+            "External id of the change request that owns this entity's branch "
+            "(set at fetch time for commits and reviews; None otherwise)"
+        ),
+    )
 
 
 class EngineeringEvent(BaseModel):
@@ -153,6 +160,14 @@ class RunEntityLink(BaseModel):
     entity_id: str
     role: str = Field(description="resolved | referenced | noise")
     correlation_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    correlation_source: str = Field(
+        default="direct",
+        description=(
+            "How the link was established: 'direct' (a correlation rule) or "
+            "'owning_change_request' (inherited via the owning change "
+            "request's branch lineage)"
+        ),
+    )
     resolver_version: str = Field(
         default=RESOLVER_VERSION,
         description="Version of the correlation engine that produced this link",

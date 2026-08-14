@@ -647,6 +647,7 @@ class CorrelationEngine:
                 correlations.append(correlation)
 
         owning = self._owning_change_request(seed, entities)
+        entities = self._dedupe_entities(entities, owning)
         run_agent = owning.author if owning is not None else None
         run_project = (
             owning.repository
@@ -699,6 +700,45 @@ class CorrelationEngine:
         matches = [cr for cr in _change_requests(entities) if cr.title == run.title]
         return matches[0] if len(matches) == 1 else None
 
+    @staticmethod
+    def _dedupe_entities(
+        entities: Sequence[EngineeringEntity],
+        owning: EngineeringEntity | None,
+    ) -> list[EngineeringEntity]:
+        """Collapse duplicate ``entity_id`` copies before lineage derivation.
+
+        The same commit SHA (or review id) can appear on the branches of
+        several change requests, so ``fetch_entities`` may emit multiple
+        :class:`EngineeringEntity` rows sharing one ``entity_id`` with
+        different ``owning_change_request_id`` values.  ``repository.save``
+        keys its entity map on ``entity_id`` (last-copy-wins), so a surviving
+        copy whose owning id differs from the CR the lineage link was derived
+        from would persist contradictory provenance.
+
+        Prefer the copy whose ``owning_change_request_id`` equals the owning
+        CR's external id; when neither copy matches (or there is no owning
+        CR), keep the first-seen copy so the outcome stays deterministic.
+        The owning CR itself and non-commit/review entity types carry a
+        ``None`` owning id and are therefore never affected by the
+        preference rule.
+        """
+        owning_external_id = (
+            owning.entity_id.partition(":")[2] if owning is not None else None
+        )
+        deduped: dict[str, EngineeringEntity] = {}
+        for entity in entities:
+            existing = deduped.get(entity.entity_id)
+            if existing is None:
+                deduped[entity.entity_id] = entity
+                continue
+            if (
+                owning_external_id is not None
+                and existing.owning_change_request_id != owning_external_id
+                and entity.owning_change_request_id == owning_external_id
+            ):
+                deduped[entity.entity_id] = entity
+        return list(deduped.values())
+
     def _entity_links(
         self,
         afk_run_id: str,
@@ -708,7 +748,7 @@ class CorrelationEngine:
         owning: EngineeringEntity | None,
     ) -> list[RunEntityLink]:
         links: list[RunEntityLink] = []
-        # Bound entities (in correlation order).
+        # Bound entities (in correlation order) — direct links.
         for correlation in correlations:
             role = (
                 "resolved"
@@ -721,11 +761,52 @@ class CorrelationEngine:
                     entity_id=correlation.entity_id,
                     role=role,
                     correlation_confidence=correlation.correlation_confidence,
+                    correlation_source="direct",
                     resolver_version=self._resolver_version,
                 )
             )
 
         bound_ids = {c.entity_id for c in correlations}
+        linked_ids: set[str] = set(bound_ids)
+
+        # Lineage: commits and reviews carried on the owning change request's
+        # branch inherit the owning change request's correlation confidence
+        # (no fixed weak inference).  Their role derives from that confidence
+        # against the unchanged resolved-role threshold.
+        if owning is not None:
+            owning_external_id = owning.entity_id.partition(":")[2]
+            owning_correlation = next(
+                (c for c in correlations if c.entity_id == owning.entity_id),
+                None,
+            )
+            owning_confidence = (
+                owning_correlation.correlation_confidence
+                if owning_correlation is not None
+                else CONFIDENCE_ISSUE_RESOLVED
+            )
+            owning_role = (
+                "resolved"
+                if owning_confidence >= RESOLVED_ROLE_THRESHOLD
+                else "referenced"
+            )
+            for entity in sorted(entities, key=lambda e: e.entity_id):
+                if entity.entity_type not in (EntityType.COMMIT, EntityType.REVIEW):
+                    continue
+                if entity.entity_id in linked_ids:
+                    continue
+                if entity.owning_change_request_id != owning_external_id:
+                    continue
+                linked_ids.add(entity.entity_id)
+                links.append(
+                    RunEntityLink(
+                        afk_run_id=afk_run_id,
+                        entity_id=entity.entity_id,
+                        role=owning_role,
+                        correlation_confidence=owning_confidence,
+                        correlation_source="owning_change_request",
+                        resolver_version=self._resolver_version,
+                    )
+                )
 
         # Noise: unrelated change requests.
         for cr in sorted(_change_requests(entities), key=lambda e: e.entity_id):
@@ -736,6 +817,7 @@ class CorrelationEngine:
                         entity_id=cr.entity_id,
                         role="noise",
                         correlation_confidence=0.0,
+                        correlation_source="direct",
                         resolver_version=self._resolver_version,
                     )
                 )
@@ -748,7 +830,7 @@ class CorrelationEngine:
             if owning.number is not None:
                 known_numbers.add(owning.number)
         for commit in sorted(_commits(entities), key=lambda e: e.entity_id):
-            if commit.entity_id in bound_ids:
+            if commit.entity_id in linked_ids:
                 continue
             referenced = _issue_numbers(commit.title)
             if referenced and not referenced.issubset(known_numbers):
@@ -758,6 +840,7 @@ class CorrelationEngine:
                         entity_id=commit.entity_id,
                         role="noise",
                         correlation_confidence=0.0,
+                        correlation_source="direct",
                         resolver_version=self._resolver_version,
                     )
                 )

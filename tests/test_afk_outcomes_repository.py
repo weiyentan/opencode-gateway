@@ -271,6 +271,9 @@ def test_save_entity_link_raises_confidence_and_appends_evidence(
     assert "resolver_version" in sql
     assert "evidence" in sql
     assert "correlation_confidence" in sql
+    # lineage provenance columns (issue #456)
+    assert "owning_change_request_id" in sql
+    assert "correlation_source" in sql
 
 
 def test_save_marks_superseded_links_without_delete(mock_conn: AsyncMock) -> None:
@@ -555,8 +558,10 @@ def test_get_reconstructs_run(mock_conn: AsyncMock) -> None:
                         "repository": REPO,
                         "entity_type": "issue",
                         "external_id": "437",
+                        "owning_change_request_id": None,
                         "role": "resolved",
                         "correlation_method": "issue_resolved",
+                        "correlation_source": "direct",
                         "correlation_confidence": 1.0,
                         "evidence": [],
                     }
@@ -619,6 +624,6 @@ def test_resolver_version_is_recorded(mock_conn: AsyncMock) -> None:
     asyncio.run(repo.save(run))
 
     calls = _calls_matching(mock_conn, r"INSERT INTO afk_run_entities")
-    assert RESOLVER_VERSION == "1"
-    # resolver_version is passed as the 10th positional arg (index 9)
-    assert calls[0][1][9] == RESOLVER_VERSION
+    assert RESOLVER_VERSION == "2"
+    # resolver_version is passed as the 12th positional arg (index 11)
+    assert calls[0][1][11] == RESOLVER_VERSION

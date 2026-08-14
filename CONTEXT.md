@@ -498,7 +498,9 @@ The provider's pull/merge request, normalized as an Engineering Entity with
 ``entity_type = change_request`` (e.g. ``change_request:442``). The owning
 change request anchors an AFK Run: the CorrelationEngine binds it by exact
 title match and extracts its body's resolved/mentioned issue references into
-the EngineeringOutcome.
+the EngineeringOutcome. Its branch commits and reviews surface as lineage
+links inheriting its confidence (see correlation_source /
+owning_change_request_id).
 _Avoid_: PR/MR (provider-specific), pull request (in generic sense)
 
 **EngineeringOutcome**:
@@ -533,9 +535,28 @@ _Avoid_: Reason (generic), source
 
 **resolver_version**:
 The version of the CorrelationEngine that produced a derived link (currently
-``"1"``), recorded on every Correlation, link, and UnresolvedCorrelation so
+``"2"``), recorded on every Correlation, link, and UnresolvedCorrelation so
 rule-semantics changes can be detected downstream.
 _Avoid_: Schema version, migration version
+
+**correlation_source**:
+The provenance of an entity link on an AFK Run (``afk_run_entities.correlation_source``,
+migration 0028): ``direct`` for links produced by the correlation rules
+(Correlations and noise), or ``owning_change_request`` for **lineage links** —
+commits and reviews carried on the owning change request's branch, which
+inherit the owning change request's confidence instead of a fixed weak
+inference. Surfaced on the AFK Outcomes REST API entity links and entity rows.
+_Avoid_: Correlation method (the rule), data origin
+
+**owning_change_request_id**:
+The provider-scoped external id of the change request whose branch carries an
+Engineering Entity (e.g. ``"442"`` for ``change_request:442``), set at fetch
+time by the provider adapters for commits and reviews and persisted via
+migration 0028. An entity whose ``owning_change_request_id`` matches the owning
+change request surfaces as a lineage link inheriting the owning change
+request's confidence. ``None`` for the owning change request itself and for
+non-commit/review entity types.
+_Avoid_: The full provider-scoped entity id (``change_request:442``), branch name
 
 **Provisional Link**:
 A derived link marked ``provisional`` — an entity link whose role is not
@@ -657,6 +678,7 @@ manages.
 - A **Correlation** links one **AFK Run** to one **Engineering Entity** and records **correlation_method**, **correlation_confidence**, evidence, and **resolver_version**
 - An **Engineering Entity** is referenced by zero or more **Engineering Events** and may carry an entity link on zero or more **AFK Runs**
 - A **change_request** anchors an **AFK Run**; its body's resolved/mentioned issue references become **resolved_issue_ids** / referenced links in the **EngineeringOutcome**
+- A **change_request**'s branch commits and reviews surface as **lineage links** on the **AFK Run** (`correlation_source = "owning_change_request"`, `owning_change_request_id` = the owning change request's external id), inheriting the owning change request's correlation confidence
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
 - An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine

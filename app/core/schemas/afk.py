@@ -56,6 +56,14 @@ class EntityLink(BaseModel):
     correlation_confidence: float = 0.0
     evidence: list[CorrelationEvidence] = Field(default_factory=list)
     resolver_version: str | None = None
+    owning_change_request_id: str | None = Field(
+        default=None,
+        description="External id of the owning change request (lineage links)",
+    )
+    correlation_source: str = Field(
+        default="direct",
+        description="direct | owning_change_request",
+    )
     provisional: bool = Field(
         default=False,
         description="True when the link is inferred (role != 'resolved')",
@@ -81,6 +89,14 @@ class EntityRow(BaseModel):
     correlation_confidence: float = 0.0
     evidence: list[CorrelationEvidence] = Field(default_factory=list)
     resolver_version: str | None = None
+    owning_change_request_id: str | None = Field(
+        default=None,
+        description="External id of the owning change request (lineage links)",
+    )
+    correlation_source: str = Field(
+        default="direct",
+        description="direct | owning_change_request",
+    )
     superseded_at: datetime | None = Field(
         default=None,
         description="Set when a higher-confidence link superseded this one",

@@ -143,6 +143,16 @@ def _load_migration_module():
     return module
 
 
+def _load_migration_module_0028():
+    """Load the 0028 migration module by file path (versions/ is not a package)."""
+    path = _ALEMBIC_DIR / "versions" / "0028_owning_change_request_lineage.py"
+    spec = importlib.util.spec_from_file_location("afk_migration_0028", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ORM model registration + column/constraint verification
 # ══════════════════════════════════════════════════════════════════════════════
@@ -213,6 +223,20 @@ def test_derived_link_columns_present() -> None:
     assert "superseded_at" in cols
 
 
+def test_lineage_provenance_columns_present() -> None:
+    """Entity links carry owning-change-request lineage provenance (issue #456)."""
+    cols = set(AFKRunEntityLink.__table__.columns.keys())
+    assert "owning_change_request_id" in cols, "afk_run_entities missing owning_change_request_id"
+    assert "correlation_source" in cols, "afk_run_entities missing correlation_source"
+
+    owning = AFKRunEntityLink.__table__.columns["owning_change_request_id"]
+    assert owning.nullable, "owning_change_request_id must be nullable"
+
+    source = AFKRunEntityLink.__table__.columns["correlation_source"]
+    assert not source.nullable, "correlation_source must be NOT NULL"
+    assert source.server_default is not None, "correlation_source must have a server default"
+
+
 def test_unresolved_correlations_unique_key() -> None:
     ddl = _ddl(UnresolvedCorrelation)
     assert "uq_unresolved_correlations_entity_run_method" in ddl
@@ -245,6 +269,41 @@ def test_migration_module_declares_revision_0026() -> None:
 def test_migration_module_imports_on_py39() -> None:
     """Importing the new migration must not trip the ``str | None`` 3.9 error."""
     _load_migration_module()
+
+
+def test_migration_0028_declares_revision() -> None:
+    module = _load_migration_module_0028()
+    assert module.revision == "0028"
+    assert module.down_revision == "0027"
+
+
+def test_migration_0028_imports_on_py39() -> None:
+    """Importing the 0028 migration must not trip the ``str | None`` 3.9 error."""
+    _load_migration_module_0028()
+
+
+def test_migration_0028_upgrade_is_additive() -> None:
+    """0028 adds owning_change_request_id + correlation_source (no drop/alter)."""
+    from alembic.command import upgrade
+
+    try:
+        cfg = _alembic_cfg()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upgrade(cfg, "0027:0028", sql=True)
+    except BaseException as exc:  # noqa: BLE001 - we re-raise unless pre-existing
+        if _is_pre_existing_py39_migration_error(exc):
+            pytest.skip(
+                "Pre-existing Python 3.9 migration import failure "
+                "(0024/0025 use `str | None` at module level); "
+                "run on Python >=3.12 to exercise the offline render."
+            )
+        raise
+    sql = buf.getvalue()
+    assert "ADD COLUMN owning_change_request_id" in sql
+    assert "ADD COLUMN correlation_source" in sql
+    assert "DROP" not in sql
+    assert "ALTER COLUMN" not in sql
 
 
 # ══════════════════════════════════════════════════════════════════════════════

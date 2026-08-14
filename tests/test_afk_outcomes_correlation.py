@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from afk_outcomes import (
     AFKRun,
+    AsyncpgOutcomeRepository,
     Correlation,
     CorrelationEngine,
     EngineeringEntity,
@@ -151,6 +153,7 @@ def _build_window(
         author = commit["author_name"] if is_gitlab else commit["author"]["name"]
         date = commit["created_at"] if is_gitlab else commit["author"]["date"]
         entity_id = f"commit:{sha}"
+        owning_cr_number = commit.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -160,6 +163,9 @@ def _build_window(
                 title=message,
                 author=author,
                 created_at=_parse_dt(date),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(entity_id, "committed", date, author, payload={"sha": sha, "message": message})
@@ -168,6 +174,7 @@ def _build_window(
     for review in raw["reviews"]:
         author = review["author"]["username"] if is_gitlab else review["user"]["login"]
         entity_id = f"review:{review['id']}"
+        owning_cr_number = review.get("owning_change_request_number")
         entities.append(
             EngineeringEntity(
                 entity_id=entity_id,
@@ -177,6 +184,9 @@ def _build_window(
                 title=f"review {review['state']}",
                 author=author,
                 created_at=_parse_dt(review["submitted_at"]),
+                owning_change_request_id=(
+                    str(owning_cr_number) if owning_cr_number is not None else None
+                ),
             )
         )
         add_event(entity_id, "review_submitted", review["submitted_at"], author,
@@ -205,7 +215,7 @@ def _build_window(
 
 
 def _load_raw(provider: str) -> dict:
-    return json.loads((FIXTURES_DIR / provider / "raw_payload.json").read_text())
+    return json.loads((FIXTURES_DIR / provider / "raw_payload.json").read_text(encoding="utf-8"))
 
 
 def _engine(ulid_ms: int) -> CorrelationEngine:
@@ -231,7 +241,7 @@ async def test_golden_determinism_byte_identical(provider: str) -> None:
     second = dumps_canonical(await _resolve(provider))
     assert first == second
 
-    golden = (FIXTURES_DIR / provider / "golden_resolution.json").read_text().rstrip("\n")
+    golden = (FIXTURES_DIR / provider / "golden_resolution.json").read_text(encoding="utf-8").rstrip("\n")
     assert first == golden, "engine canonical output drifted from golden_resolution.json"
 
 
@@ -253,7 +263,7 @@ async def test_every_link_carries_method_confidence_evidence_and_version() -> No
     for correlation in result.run.correlations:
         assert correlation.method, "missing method"
         assert correlation.correlation_confidence is not None
-        assert correlation.resolver_version == "1"
+        assert correlation.resolver_version == "2"
         assert correlation.evidence, "missing evidence"
         for evidence in correlation.evidence:
             assert evidence.source_entity_id, "evidence missing source identifier"
@@ -265,6 +275,37 @@ async def test_session_links_are_inferred_and_provisional() -> None:
     for link in result.run.session_links:
         assert link.inferred is True
         assert link.method == "temporal_overlap"
+
+
+async def test_owning_branch_commits_and_reviews_are_lineage_linked() -> None:
+    """Commits/reviews on the owning CR's branch inherit the owning CR's
+    confidence via lineage (correlation_source='owning_change_request')."""
+    result = await _resolve("github")
+    run = result.run
+
+    lineage = [
+        link for link in run.entity_links
+        if link.correlation_source == "owning_change_request"
+    ]
+    assert lineage, "expected lineage links for owning-branch commits/reviews"
+
+    lineage_ids = {link.entity_id for link in lineage}
+    # Owning branch (CR #442) commits + the synthetic review are lineage-linked.
+    assert "commit:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" in lineage_ids
+    assert "commit:337c0116775c51abf03d90e73a9afdcee0aef01a" in lineage_ids
+    assert "review:481234" in lineage_ids
+    # The wrong-issue commit (#441) stays noise, not lineage.
+    assert "commit:d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0a1b2c" not in lineage_ids
+
+    for link in lineage:
+        assert link.correlation_confidence == 1.0, "lineage inherits the owning CR confidence"
+        assert link.role == "resolved"
+        assert link.correlation_source == "owning_change_request"
+
+    # Every direct link keeps the default correlation_source='direct'.
+    direct = [link for link in run.entity_links if link.correlation_source == "direct"]
+    assert direct, "expected direct links"
+    assert all(link.correlation_source == "direct" for link in direct)
 
 
 async def test_rule_ordering_lower_confidence_never_overrides() -> None:
@@ -567,3 +608,108 @@ async def test_outcome_status_is_merged_when_state_is_merged() -> None:
     outcome = await _resolve_single_cr("merged")
     assert outcome is not None
     assert outcome.status is EngineeringOutcomeStatus.MERGED
+
+
+# ── Owning-branch lineage dedupe (PR #462 finding: shared-commit mis-attribution) ──
+
+
+def _shared_commit_scenario() -> tuple[AFKRun, list[EngineeringEntity]]:
+    """Two copies of the same commit SHA on different CR branches.
+
+    The owning CR is #442; the duplicate copy carrying the wrong owning id
+    (#999) is emitted LAST so a naive last-wins ``entity_map`` would persist
+    contradictory provenance against the derived lineage link.
+    """
+    run = AFKRun(
+        afk_run_id="",
+        provider=Provider.GITHUB,
+        status=RunStatus.COMPLETED,
+        title="Implement issue #100",
+        started_at=_parse_dt("2026-08-13T08:00:00Z"),
+        finished_at=_parse_dt("2026-08-13T10:00:00Z"),
+    )
+    owning_cr = EngineeringEntity(
+        entity_id="change_request:442",
+        entity_type=EntityType.CHANGE_REQUEST,
+        provider=Provider.GITHUB,
+        repository="repo",
+        number=442,
+        title="Implement issue #100",
+        state="merged",
+        author="alice",
+        created_at=_parse_dt("2026-08-13T08:00:00Z"),
+        branch="ai/feat/issue-100",
+    )
+    commit = EngineeringEntity(
+        entity_id="commit:abc123",
+        entity_type=EntityType.COMMIT,
+        provider=Provider.GITHUB,
+        repository="repo",
+        title="implement the thing",
+        author="alice",
+        created_at=_parse_dt("2026-08-13T09:00:00Z"),
+        owning_change_request_id="442",
+    )
+    # Wrong-owning copy emitted LAST.
+    entities = [owning_cr, commit, commit.model_copy(update={"owning_change_request_id": "999"})]
+    return run, entities
+
+
+def test_dedupe_entities_prefers_owning_cr_copy() -> None:
+    """The dedupe helper keeps the owning-CR copy and drops the wrong copy."""
+    run, entities = _shared_commit_scenario()
+    owning = CorrelationEngine._owning_change_request(run, entities)
+    assert owning is not None and owning.entity_id == "change_request:442"
+
+    deduped = CorrelationEngine._dedupe_entities(entities, owning)
+    commits = [e for e in deduped if e.entity_id == "commit:abc123"]
+    assert len(commits) == 1
+    assert commits[0].owning_change_request_id == "442"
+    # Unique entity_ids (the owning CR) are untouched and ordering is stable.
+    assert [e.entity_id for e in deduped] == ["change_request:442", "commit:abc123"]
+
+
+async def test_shared_commit_across_branches_persists_owning_cr_provenance(
+    mock_conn: AsyncMock,
+) -> None:
+    """A commit SHA on multiple CR branches persists the OWNING CR's id.
+
+    End-to-end: the engine derives a lineage link for the owning-branch copy,
+    and repository.save() must persist ``owning_change_request_id == "442"``
+    (not the last-seen wrong copy's "999").
+    """
+    run, entities = _shared_commit_scenario()
+    engine = _engine(1_786_615_829_000)
+    result = await engine.resolve(run, entities=entities, events=[], sessions=[])
+
+    lineage = [
+        link
+        for link in result.run.entity_links
+        if link.entity_id == "commit:abc123"
+        and link.correlation_source == "owning_change_request"
+    ]
+    assert lineage, "expected an owning_change_request lineage link for the shared commit"
+
+    # The resolved run carries a single copy — the owning-CR copy.
+    commits = [e for e in result.run.entities if e.entity_id == "commit:abc123"]
+    assert len(commits) == 1
+    assert commits[0].owning_change_request_id == "442"
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    await repo.save(result.run)
+
+    # (sql, params) for each afk_run_entities insert; params: afk_run_id,
+    # provider, repository, entity_type, external_id, owning_change_request_id,
+    # role, correlation_method, correlation_source, confidence, evidence, version.
+    inserts = [
+        call.args[1:]
+        for call in mock_conn.execute.call_args_list
+        if "INSERT INTO afk_run_entities" in call.args[0]
+    ]
+    commit_inserts = [params for params in inserts if params[4] == "abc123"]
+    assert commit_inserts, "no afk_run_entities insert for commit:abc123"
+    assert commit_inserts[0][5] == "442", (
+        "persisted owning_change_request_id must be the owning CR (442), "
+        f"got {commit_inserts[0][5]!r}"
+    )
+    assert commit_inserts[0][8] == "owning_change_request"

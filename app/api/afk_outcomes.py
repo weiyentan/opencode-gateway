@@ -219,6 +219,8 @@ def _entity_link(row: asyncpg.Record) -> EntityLink:
         correlation_confidence=row["correlation_confidence"],
         evidence=_parse_evidence(row["evidence"]),
         resolver_version=row["resolver_version"],
+        owning_change_request_id=row["owning_change_request_id"],
+        correlation_source=row["correlation_source"],
         provisional=role != _RESOLVED_ROLE,
     )
 
@@ -319,7 +321,8 @@ async def _fetch_run_detail(
                 """
                 SELECT provider, repository, entity_type, external_id, role,
                        correlation_method, correlation_confidence, evidence,
-                       resolver_version
+                       resolver_version, owning_change_request_id,
+                       correlation_source
                 FROM afk_run_entities
                 WHERE afk_run_id = $1 AND superseded_at IS NULL
                 ORDER BY entity_type, external_id
@@ -445,7 +448,8 @@ async def _fetch_entities(
     data_sql = """
         SELECT afk_run_id, provider, repository, entity_type, external_id, role,
                correlation_method, correlation_confidence, evidence,
-               resolver_version, superseded_at
+               resolver_version, owning_change_request_id, correlation_source,
+               superseded_at
         FROM afk_run_entities
         ORDER BY entity_type, external_id, afk_run_id
         LIMIT $1 OFFSET $2
@@ -467,6 +471,8 @@ async def _fetch_entities(
             correlation_confidence=r["correlation_confidence"],
             evidence=_parse_evidence(r["evidence"]),
             resolver_version=r["resolver_version"],
+            owning_change_request_id=r["owning_change_request_id"],
+            correlation_source=r["correlation_source"],
             superseded_at=r["superseded_at"],
             provisional=r["role"] != _RESOLVED_ROLE,
         )
