@@ -76,6 +76,10 @@ class EngineeringEntity(BaseModel):
     number: int | None = Field(
         default=None, description="Provider issue/change-request number, when applicable"
     )
+    head_ref: str | None = Field(
+        default=None,
+        description="Source branch for a change_request (GitHub head.ref / GitLab source_branch)",
+    )
     title: str | None = None
     state: str | None = None
     author: str | None = None
