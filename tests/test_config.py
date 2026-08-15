@@ -380,3 +380,60 @@ def test_transcript_retention_settings_override_from_env(monkeypatch):
     assert settings.transcript_retention_messages_days == 730
     assert settings.transcript_retention_parts_days == 45
     assert settings.transcript_retention_tool_calls_days == 60
+
+
+# ── Issue #483: Retention defaults + access-control settings ───────────────
+
+
+def test_retention_defaults_match_prd_decision_15(monkeypatch):
+    """Retention defaults match PRD #478 decision #15: aggregates indefinite
+    (0 = never swept), metadata 12 months (365 days), redacted payload 90
+    days, DLQ operational max 30 days."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.retention_afk_aggregates_days == 0
+    assert settings.retention_afk_metadata_days == 365
+    assert settings.retention_afk_payload_days == 90
+    assert settings.retention_dlq_max_age_days == 30
+
+
+def test_retention_settings_override_from_env(monkeypatch):
+    """GATEWAY_RETENTION_* env vars override the retention defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_RETENTION_AFK_AGGREGATES_DAYS", "100")
+    monkeypatch.setenv("GATEWAY_RETENTION_AFK_METADATA_DAYS", "180")
+    monkeypatch.setenv("GATEWAY_RETENTION_AFK_PAYLOAD_DAYS", "45")
+    monkeypatch.setenv("GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS", "14")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.retention_afk_aggregates_days == 100
+    assert settings.retention_afk_metadata_days == 180
+    assert settings.retention_afk_payload_days == 45
+    assert settings.retention_dlq_max_age_days == 14
+
+
+def test_operator_token_defaults_empty(monkeypatch):
+    """GATEWAY_OPERATOR_TOKEN defaults to empty — operator-only read surfaces
+    fail closed (no broad read)."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.operator_token == ""
+
+
+def test_operator_token_override_from_env(monkeypatch):
+    """GATEWAY_OPERATOR_TOKEN is configurable via env (dedicated operator
+    credential, distinct from the Admin API Key)."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-token-123")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.operator_token == "op-token-123"

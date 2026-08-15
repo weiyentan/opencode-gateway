@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import uuid
@@ -31,6 +32,55 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 # ── Known schema versions ─────────────────────────────────────────────────
 
 KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
+
+
+# ── Operator-only access (issue #483, PRD #478 decision #16) ──────────────
+#
+# Delivery payload and DLQ data are restricted to operators: no broad read is
+# possible.  ``require_operator_token`` is the enforcement gate for any
+# operator-only read surface — it validates a DEDICATED operator bearer token
+# (``GATEWAY_OPERATOR_TOKEN``), distinct from the Admin API Key
+# (``GATEWAY_API_KEY``) and from per-client collector credentials.  An empty
+# operator token fails closed (403), so an unprovisioned operator credential
+# means no operator-only surface is reachable.  Today no operator-only read
+# surface is registered — the write-only ingestion surfaces below store
+# delivery payload but never read it back — which is the "no broad read"
+# invariant.
+
+
+async def require_operator_token(request: Request) -> str:
+    """FastAPI dependency — validate the dedicated operator bearer token.
+
+    Raises:
+        HTTPException(403): ``GATEWAY_OPERATOR_TOKEN`` is not configured
+            (operator-only access is disabled — fail closed).
+        HTTPException(401): the request lacks a valid operator token.
+
+    Returns:
+        The validated operator token (the caller may ignore it).
+    """
+    settings = get_settings()
+    if not settings.operator_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator access is not configured",
+        )
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header",
+        )
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not hmac.compare_digest(token, settings.operator_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid operator token",
+        )
+
+    return token
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────

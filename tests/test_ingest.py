@@ -8053,3 +8053,116 @@ class TestBatchOverlapQueryCount:
         assert results[0]["reason"] == "Negative token value"
         assert results[1]["status"] == "quarantined"
         assert "overlap detected" in results[1]["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Issue #483: access-restriction enforcement (operator-only read surfaces)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestOperatorOnlyAccess:
+    """Delivery payload and DLQ access are restricted to operators.
+
+    The operator token (``GATEWAY_OPERATOR_TOKEN``) is a dedicated credential
+    DISTINCT from the Admin API Key (``GATEWAY_API_KEY``) and from per-client
+    collector credentials.  ``require_operator_token`` fails closed: an empty
+    operator token means no operator-only surface is reachable (no broad read).
+    """
+
+    @pytest.mark.asyncio
+    async def test_operator_token_not_configured_fails_closed(self, monkeypatch):
+        """An empty GATEWAY_OPERATOR_TOKEN → 403 (no operator-only access)."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+        request = MagicMock()
+        request.headers = {}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_operator_token_wrong_token_rejected(self, monkeypatch):
+        """A non-operator bearer token is rejected with 401."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer wrong-token"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_operator_token_accepted(self, monkeypatch):
+        """The correct operator token passes and is returned."""
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer op-secret"}
+
+        result = await require_operator_token(request)
+
+        assert result == "op-secret"
+
+    @pytest.mark.asyncio
+    async def test_operator_token_is_distinct_from_admin_key(self, monkeypatch):
+        """The operator token is a dedicated credential — the Admin API Key
+        does NOT satisfy the operator-only gate (no shared tokens)."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer admin-secret"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 401
+
+
+class TestNoBroadRead:
+    """Delivery payload and DLQ data have no broad read surface.
+
+    The reporting-ingestion and /ingest surfaces are write-only: there is no
+    GET route that reads ``reporting_deliveries`` payload, the state trail, the
+    delivery log, or the DLQ back out.  Broad read is therefore impossible.
+    """
+
+    def test_no_get_route_reads_delivery_payload(self):
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        get_paths = {
+            route.path
+            for route in app.routes
+            if hasattr(route, "methods") and "GET" in route.methods
+        }
+
+        assert "/ingest" not in get_paths
+        assert "/api/v1/reporting/ingest/deliveries" not in get_paths
+
+    def test_write_only_routes_expose_no_read(self, monkeypatch):
+        """GET on the write-only ingestion surfaces is not a read path."""
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        post_paths = {
+            route.path
+            for route in app.routes
+            if hasattr(route, "methods") and "POST" in route.methods
+        }
+        assert "/ingest" in post_paths
+        assert "/api/v1/reporting/ingest/deliveries" in post_paths

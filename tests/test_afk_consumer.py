@@ -38,8 +38,14 @@ from app.consumer.afk_consumer import (
     NormalizedProviderEvent,
     ProviderEventMessage,
     _build_adapter,
+    build_dlq_payload,
+    build_escalation_payload,
+    classify_dlq_message,
+    dlq_message_age,
+    is_dlq_expired,
     map_normalized_event,
     map_provider_event,
+    run_dlq_sweep,
 )
 from app.core.metrics import MetricsRegistry
 
@@ -1695,3 +1701,198 @@ async def test_from_env_reads_afk_retry_settings() -> None:
     assert consumer._max_retries == 7
     assert consumer._initial_backoff == 2.0
     assert consumer._max_backoff == 90.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DLQ operational max (issue #483) — stamping, classification, escalation
+# ══════════════════════════════════════════════════════════════════════════
+
+
+DLQ_NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
+MAX_AGE = 30
+
+
+def _dlq_payload(
+    *,
+    dead_lettered_at: str | None = "2026-08-01T12:00:00+00:00",
+    max_age_days: int = MAX_AGE,
+) -> dict:
+    """A DLQ message as produced by ``_send_to_dlq`` (with age metadata)."""
+    return {
+        "original_topic": "afk.events",
+        "reason": "DB persist failed after 3 retries",
+        "payload": {"delivery_id": DELIVERY_ID},
+        "dead_lettered_at": dead_lettered_at,
+        "max_age_days": max_age_days,
+    }
+
+
+def test_build_dlq_payload_stamps_age_metadata() -> None:
+    """Every DLQ message carries dead_lettered_at + max_age_days so its age and
+    the operational max are self-describing (measurable by the sweep)."""
+    payload = build_dlq_payload(
+        "afk.events", "boom", {"x": 1}, now=DLQ_NOW, max_age_days=MAX_AGE
+    )
+
+    assert payload["original_topic"] == "afk.events"
+    assert payload["reason"] == "boom"
+    assert payload["payload"] == {"x": 1}
+    assert payload["dead_lettered_at"] == DLQ_NOW.isoformat()
+    assert payload["max_age_days"] == MAX_AGE
+
+
+def test_build_dlq_payload_defaults_max_age() -> None:
+    """When no max age is given, the default operational max is stamped."""
+    payload = build_dlq_payload("afk.events", "boom", {}, now=DLQ_NOW)
+    assert payload["max_age_days"] == 30
+
+
+def test_dlq_message_age_parses_dead_lettered_at() -> None:
+    payload = _dlq_payload(dead_lettered_at="2026-08-01T12:00:00+00:00")
+    assert dlq_message_age(payload, DLQ_NOW) == timedelta(days=15)
+
+
+def test_dlq_message_age_missing_timestamp_returns_none() -> None:
+    assert dlq_message_age({"reason": "no timestamp"}, DLQ_NOW) is None
+
+
+def test_dlq_message_age_unparseable_timestamp_returns_none() -> None:
+    assert dlq_message_age(_dlq_payload(dead_lettered_at="not-a-time"), DLQ_NOW) is None
+
+
+def test_is_dlq_expired_boundary_strictly_older() -> None:
+    """A message exactly at the max-age edge is retained (strict ``>``); only
+    strictly older messages are expired — the same boundary semantics as the
+    transcript retention job."""
+    at_edge = _dlq_payload(dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE)).isoformat())
+    past_edge = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE) - timedelta(seconds=1)).isoformat()
+    )
+    within = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE - 1)).isoformat()
+    )
+
+    assert is_dlq_expired(at_edge, DLQ_NOW, MAX_AGE) is False
+    assert is_dlq_expired(past_edge, DLQ_NOW, MAX_AGE) is True
+    assert is_dlq_expired(within, DLQ_NOW, MAX_AGE) is False
+
+
+def test_is_dlq_expired_unknown_age_retained() -> None:
+    """A message without a usable dead_lettered_at has unknown age and is
+    retained (never prematurely expired)."""
+    assert is_dlq_expired({"reason": "no timestamp"}, DLQ_NOW, MAX_AGE) is False
+
+
+def test_classify_dlq_message() -> None:
+    past = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 1)).isoformat()
+    )
+    within = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    assert classify_dlq_message(past, DLQ_NOW, MAX_AGE) == "expired"
+    assert classify_dlq_message(within, DLQ_NOW, MAX_AGE) == "retain"
+
+
+def test_build_escalation_payload_preserves_original_and_reason() -> None:
+    """Escalation preserves the original payload + reason and stamps the
+    escalation time + reason, so the operator can resolve it later."""
+    payload = _dlq_payload()
+    escalated = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
+
+    assert escalated["original_topic"] == "afk.events"
+    assert escalated["reason"] == payload["reason"]
+    assert escalated["payload"] == payload["payload"]
+    assert escalated["dead_lettered_at"] == payload["dead_lettered_at"]
+    assert escalated["escalated_at"] == DLQ_NOW.isoformat()
+    assert f"{MAX_AGE}" in escalated["escalation_reason"]
+
+
+def test_run_dlq_sweep_classifies_and_builds_escalations() -> None:
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    retained = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    unknown = {"reason": "no timestamp"}
+
+    report = run_dlq_sweep(
+        [expired, retained, unknown], now=DLQ_NOW, max_age_days=MAX_AGE
+    )
+
+    assert report.scanned == 3
+    assert report.expired == 1
+    assert report.retained == 2
+    assert len(report.escalated) == 1
+    assert report.escalated[0]["payload"] == expired["payload"]
+
+
+def test_run_dlq_sweep_dry_run_reports_without_collecting_escalations() -> None:
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    report = run_dlq_sweep([expired], now=DLQ_NOW, max_age_days=MAX_AGE, dry_run=True)
+
+    assert report.dry_run is True
+    assert report.expired == 1
+    assert report.escalated == []  # nothing is escalated in a dry run
+
+
+def test_run_dlq_sweep_limit_caps_scanned_messages() -> None:
+    messages = [
+        _dlq_payload(dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + i)).isoformat())
+        for i in range(1, 6)
+    ]
+    report = run_dlq_sweep(messages, now=DLQ_NOW, max_age_days=MAX_AGE, limit=2)
+
+    assert report.scanned == 2
+    assert report.expired == 2
+    assert len(report.escalated) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_to_dlq_stamps_operational_max() -> None:
+    """The producer path stamps dead_lettered_at + max_age_days into the DLQ
+    message (the enforcement surface for the operational max)."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    with patch(
+        "app.consumer.afk_consumer.datetime", wraps=datetime
+    ) as mock_dt:
+        mock_dt.now.return_value = DLQ_NOW
+        await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert dlq_payload["dead_lettered_at"] == DLQ_NOW.isoformat()
+    assert dlq_payload["max_age_days"] == 30
+
+
+@pytest.mark.asyncio
+async def test_from_env_reads_dlq_max_age() -> None:
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
+        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+        "GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS": "14",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._dlq_max_age_days == 14

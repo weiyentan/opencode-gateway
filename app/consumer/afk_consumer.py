@@ -26,6 +26,7 @@ backfill engine; it never re-implements normalization or correlation logic.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -33,6 +34,8 @@ import logging
 import os
 import random
 import signal
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -68,6 +71,13 @@ _DEFAULT_RECONCILE_WINDOW_SECONDS = 86400.0
 _MAX_RETRIES = 5
 _INITIAL_BACKOFF_SECONDS = 1.0
 _MAX_BACKOFF_SECONDS = 60.0
+
+# DLQ operational max (issue #483): the afk.events-dlq topic is retained until
+# resolved, but never unbounded — messages older than this many days are
+# escalated/expired by the DLQ sweep.  Mirrors GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS.
+_DEFAULT_DLQ_MAX_AGE_DAYS = 30
+_DEFAULT_DLQ_ESCALATION_TOPIC = "afk.events-dlq-expired"
+_DEFAULT_DLQ_SWEEP_GROUP_ID = "opencode-outcomes-dlq-sweep"
 
 # Backoff jitter multiplier bounds (issue #482).  The retry delay is
 # ``base * uniform(_JITTER_LOW, _JITTER_HIGH)`` so concurrent consumers that
@@ -309,6 +319,7 @@ class AFKOutcomeConsumer:
         max_retries: int = _MAX_RETRIES,
         initial_backoff: float = _INITIAL_BACKOFF_SECONDS,
         max_backoff: float = _MAX_BACKOFF_SECONDS,
+        dlq_max_age_days: int = _DEFAULT_DLQ_MAX_AGE_DAYS,
         metrics: MetricsRegistry | None = None,
     ) -> None:
         self._kafka_brokers = kafka_brokers
@@ -324,6 +335,7 @@ class AFKOutcomeConsumer:
         self._max_retries = max_retries
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
+        self._dlq_max_age_days = dlq_max_age_days
         self._metrics = metrics if metrics is not None else DEFAULT_REGISTRY
 
         self._consumer: AIOKafkaConsumer | None = None
@@ -414,6 +426,7 @@ class AFKOutcomeConsumer:
             max_retries=settings.afk_outcomes_max_retries,
             initial_backoff=settings.afk_outcomes_initial_backoff_seconds,
             max_backoff=settings.afk_outcomes_max_backoff_seconds,
+            dlq_max_age_days=settings.retention_dlq_max_age_days,
         )
         consumer._owns_pool = True
         consumer._adapter_client = client
@@ -836,14 +849,22 @@ class AFKOutcomeConsumer:
             self._blocked[tp] = msg.offset
 
     async def _send_to_dlq(self, payload: dict[str, Any], *, reason: str) -> None:
-        """Send a message to the DLQ topic with context about the failure."""
+        """Send a message to the DLQ topic with context about the failure.
+
+        The DLQ record is stamped with ``dead_lettered_at`` and
+        ``max_age_days`` (the operational max) so its age is measurable by the
+        DLQ sweep (issue #483) — the producer-path enforcement of the
+        operational max.  Shape: ``{"original_topic", "reason", "payload",
+        "dead_lettered_at", "max_age_days"}``.
+        """
         if self._producer is None:
             return
-        dlq_payload: dict[str, Any] = {
-            "original_topic": self._topic,
-            "reason": reason,
-            "payload": payload,
-        }
+        dlq_payload = build_dlq_payload(
+            self._topic,
+            reason,
+            payload,
+            max_age_days=self._dlq_max_age_days,
+        )
         try:
             await self._producer.send_and_wait(self._dlq_topic, dlq_payload)
         except KafkaError:
@@ -906,6 +927,321 @@ class AFKOutcomeConsumer:
             )
 
 
+# ── DLQ operational max (issue #483) ─────────────────────────────────────────
+#
+# The ``afk.events-dlq`` topic is retained until resolved but must never grow
+# unbounded.  Every DLQ record is stamped with ``dead_lettered_at`` and
+# ``max_age_days`` (see ``build_dlq_payload``), and an operator-run sweep
+# (``sweep_dlq`` / ``python -m app.consumer.afk_consumer --dlq-sweep``)
+# escalates messages strictly older than the operational max to an escalation
+# topic, preserving their payload + reason for manual resolution.  Physical
+# removal from the DLQ is enforced by the topic's Kafka retention configured
+# to the same max age (documented in ADR 0019); the escalation topic is the
+# durable operator record, so nothing is ever silently lost.  Mirror
+# ``scripts/retention_transcripts.py``: dry-run + bounded batches + a config
+# driven window.
+
+
+def build_dlq_payload(
+    original_topic: str,
+    reason: str,
+    payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    max_age_days: int | None = None,
+) -> dict[str, Any]:
+    """Build the canonical DLQ record, stamped with its age metadata.
+
+    ``dead_lettered_at`` makes the message age measurable; ``max_age_days``
+    records the operational max in effect at DLQ time.  Both are read by
+    :func:`is_dlq_expired` / :func:`sweep_dlq`.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
+    return {
+        "original_topic": original_topic,
+        "reason": reason,
+        "payload": payload,
+        "dead_lettered_at": now.isoformat(),
+        "max_age_days": (
+            max_age_days if max_age_days is not None else _DEFAULT_DLQ_MAX_AGE_DAYS
+        ),
+    }
+
+
+def dlq_message_age(dlq_payload: dict[str, Any], now: datetime) -> timedelta | None:
+    """Return the age of a DLQ record, or ``None`` when it is unknowable.
+
+    A missing or unparseable ``dead_lettered_at`` yields ``None`` — unknown
+    age is retained, never prematurely expired.
+    """
+    raw = dlq_payload.get("dead_lettered_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dead_lettered_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dead_lettered_at.tzinfo is None:
+        dead_lettered_at = dead_lettered_at.replace(tzinfo=timezone.utc)  # noqa: UP017
+    return now - dead_lettered_at
+
+
+def is_dlq_expired(
+    dlq_payload: dict[str, Any], now: datetime, max_age_days: int
+) -> bool:
+    """True when a DLQ record is strictly older than the operational max.
+
+    Boundary semantics mirror the transcript retention job: a record exactly
+    at the max-age edge is retained (strict ``>``); only strictly older
+    records are expired.  Unknown age is retained.
+    """
+    age = dlq_message_age(dlq_payload, now)
+    if age is None:
+        return False
+    return age > timedelta(days=max_age_days)
+
+
+def classify_dlq_message(
+    dlq_payload: dict[str, Any], now: datetime, max_age_days: int
+) -> str:
+    """Classify one DLQ record: ``"expired"`` (escalate) or ``"retain"``."""
+    return "expired" if is_dlq_expired(dlq_payload, now, max_age_days) else "retain"
+
+
+def build_escalation_payload(
+    dlq_payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    max_age_days: int | None = None,
+) -> dict[str, Any]:
+    """Build the escalation record for an expired DLQ message.
+
+    Preserves the original payload + reason (so the operator can resolve it)
+    and stamps ``escalated_at`` plus a machine-readable ``escalation_reason``.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
+    effective_max = (
+        max_age_days
+        if max_age_days is not None
+        else dlq_payload.get("max_age_days", _DEFAULT_DLQ_MAX_AGE_DAYS)
+    )
+    return {
+        "original_topic": dlq_payload.get("original_topic"),
+        "reason": dlq_payload.get("reason"),
+        "payload": dlq_payload.get("payload"),
+        "dead_lettered_at": dlq_payload.get("dead_lettered_at"),
+        "escalated_at": now.isoformat(),
+        "escalation_reason": (
+            f"exceeded DLQ operational max of {effective_max} day(s)"
+        ),
+    }
+
+
+@dataclass
+class DLQSweepReport:
+    """The result of one DLQ sweep (mirrors the transcript RetentionReport)."""
+
+    now: datetime
+    dry_run: bool
+    max_age_days: int
+    scanned: int = 0
+    expired: int = 0
+    retained: int = 0
+    escalated: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.scanned
+
+
+def run_dlq_sweep(
+    messages: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    max_age_days: int,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> DLQSweepReport:
+    """Classify a list of DLQ records into expired vs retained.
+
+    ``limit`` caps how many records are scanned (bounded runs).  In a dry run
+    the would-be-expired count is reported but no escalation payloads are
+    collected (nothing is escalated).  Strictly-older-than-the-max records are
+    expired; unknown-age records are retained.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
+    report = DLQSweepReport(now=now, dry_run=dry_run, max_age_days=max_age_days)
+    remaining = limit
+    for message in messages:
+        if remaining is not None and remaining <= 0:
+            break
+        report.scanned += 1
+        if remaining is not None:
+            remaining -= 1
+        if classify_dlq_message(message, now, max_age_days) == "expired":
+            report.expired += 1
+            if not dry_run:
+                report.escalated.append(
+                    build_escalation_payload(message, now=now, max_age_days=max_age_days)
+                )
+        else:
+            report.retained += 1
+    return report
+
+
+def format_dlq_report(report: DLQSweepReport) -> str:
+    """Render the DLQ sweep report (dry-run and write runs share the form)."""
+    lines = [
+        "DLQ operational-max sweep report",
+        f"as-of: {report.now.isoformat()}",
+        f"mode: {'dry-run' if report.dry_run else 'write'}",
+        f"max-age: {report.max_age_days} day(s)",
+        f"scanned: {report.scanned} record(s)",
+        f"expired (escalated): {report.expired} record(s)",
+        f"retained: {report.retained} record(s)",
+    ]
+    if report.dry_run:
+        lines.append(
+            "dry-run: no messages were escalated; re-run without --dry-run to apply."
+        )
+    return "\n".join(lines)
+
+
+async def _collect_dlq_batch(
+    consumer: Any, batch_size: int
+) -> list[dict[str, Any]]:
+    """Collect up to ``batch_size`` DLQ records (bounded), decoded to payloads."""
+    messages: list[dict[str, Any]] = []
+    iterator = consumer.__aiter__()
+    for _ in range(batch_size):
+        try:
+            msg = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
+        except (TimeoutError, StopAsyncIteration):
+            break
+        value = msg.value
+        messages.append(value if isinstance(value, dict) else {})
+    return messages
+
+
+async def sweep_dlq(
+    kafka_brokers: str,
+    dlq_topic: str,
+    escalation_topic: str,
+    max_age_days: int,
+    *,
+    now: datetime | None = None,
+    dry_run: bool = False,
+    limit: int | None = None,
+    batch_size: int = 100,
+    consumer_group_id: str = _DEFAULT_DLQ_SWEEP_GROUP_ID,
+) -> DLQSweepReport:
+    """Escalate DLQ records older than the operational max (bounded batches).
+
+    Consumes the DLQ topic in ``batch_size``-bounded chunks (up to ``limit``
+    total), classifies each record, and — in write mode — publishes an
+    escalation record for each expired message to ``escalation_topic`` so the
+    message is never silently lost.  A dry run reports the would-be-expired
+    counts and publishes nothing.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
+    consumer = AIOKafkaConsumer(
+        dlq_topic,
+        bootstrap_servers=kafka_brokers,
+        group_id=consumer_group_id,
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    )
+    producer = AIOKafkaProducer(
+        bootstrap_servers=kafka_brokers,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    )
+    await consumer.start()
+    await producer.start()
+    try:
+        report = DLQSweepReport(now=now, dry_run=dry_run, max_age_days=max_age_days)
+        remaining = limit
+        while remaining is None or remaining > 0:
+            take = batch_size if remaining is None else min(batch_size, remaining)
+            chunk = await _collect_dlq_batch(consumer, take)
+            if not chunk:
+                break
+            chunk_report = run_dlq_sweep(
+                chunk,
+                now=now,
+                max_age_days=max_age_days,
+                limit=remaining,
+                dry_run=dry_run,
+            )
+            report.scanned += chunk_report.scanned
+            report.expired += chunk_report.expired
+            report.retained += chunk_report.retained
+            report.escalated.extend(chunk_report.escalated)
+            if not dry_run:
+                for escalation in chunk_report.escalated:
+                    await producer.send_and_wait(escalation_topic, escalation)
+            if remaining is not None:
+                remaining -= chunk_report.scanned
+            if len(chunk) < take:
+                break
+        return report
+    finally:
+        await consumer.stop()
+        await producer.stop()
+
+
+async def _main_dlq_sweep(argv: list[str] | None = None) -> int:
+    """Entry point for the operator DLQ sweep (``--dlq-sweep``)."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Escalate DLQ records older than the operational max "
+            "(GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS) to the escalation topic."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the would-be-escalated records without publishing anything.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process at most N records (bounded runs).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Records per consume batch (default 100).",
+    )
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be >= 1")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    report = await sweep_dlq(
+        settings.kafka_brokers,
+        settings.afk_outcomes_dlq_topic,
+        _DEFAULT_DLQ_ESCALATION_TOPIC,
+        settings.retention_dlq_max_age_days,
+        dry_run=args.dry_run,
+        limit=args.limit,
+        batch_size=args.batch_size,
+    )
+    print(format_dlq_report(report))
+    return 0
+
+
 # ── Provider adapter wiring (env-driven, no token storage) ──────────────────
 
 
@@ -952,4 +1288,7 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
+    if "--dlq-sweep" in sys.argv:
+        sys.argv.remove("--dlq-sweep")
+        sys.exit(asyncio.run(_main_dlq_sweep()))
     asyncio.run(_main())

@@ -222,6 +222,39 @@ class Settings(BaseSettings):
     reporting_dlq_topic: str = "afk.events-reporting-dlq"
     reporting_consumer_group_id: str = "opencode-reporting"
 
+    # Retention defaults (issue #483, PRD #478 decision #15) — the AFK
+    # outcome / reporting read-model data-lifecycle tiers, configurable via
+    # settings/env with no code change required to adjust:
+    #
+    #   * Aggregates (``afk_runs``, ``afk_run_sessions``) are INDEFINITE:
+    #     ``0`` means "never swept".
+    #   * Metadata (``engineering_events``, ``delivery_log``,
+    #     ``delivery_state_trails``, ``afk_run_entities``,
+    #     ``unresolved_correlations``) default to 12 months (365 days).
+    #   * Redacted payload storage (``reporting_deliveries.payload`` and the
+    #     ``engineering_events.payload`` redacted projection) defaults to
+    #     90 days.
+    #   * DLQ (``afk.events-dlq``) is retained until resolved but never
+    #     unbounded: messages older than the operational max (default 30
+    #     days) are escalated/expired per the policy documented in ADR 0019.
+    #
+    # Maps to GATEWAY_RETENTION_AFK_AGGREGATES_DAYS,
+    # GATEWAY_RETENTION_AFK_METADATA_DAYS, GATEWAY_RETENTION_AFK_PAYLOAD_DAYS,
+    # GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS.
+    retention_afk_aggregates_days: int = 0
+    retention_afk_metadata_days: int = 365
+    retention_afk_payload_days: int = 90
+    retention_dlq_max_age_days: int = 30
+
+    # Operator-only access (issue #483, PRD #478 decision #16) — a dedicated
+    # operator bearer token, DISTINCT from the Admin API Key
+    # (``GATEWAY_API_KEY``) and from per-client collector credentials, that
+    # gates operator-only read surfaces (delivery payload, DLQ).  Empty
+    # (the default) means no operator-only surface is reachable — the
+    # ``require_operator_token`` dependency fails closed.  Maps to
+    # GATEWAY_OPERATOR_TOKEN.
+    operator_token: str = ""
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

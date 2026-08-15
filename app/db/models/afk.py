@@ -8,6 +8,15 @@ Write semantics are documented on the migration (0026): engineering
 events are immutable facts (conflict-ignore); state rows are enrich-only
 (raise confidence, append evidence, update first/last_seen, correct
 derived outcome, mark superseded links, never hard-delete).
+
+Retention tiers (issue #483, ADR 0019 — configurable via ``GATEWAY_RETENTION_*``):
+
+* **Aggregates (indefinite)** — ``afk_runs``, ``afk_run_sessions``: the
+  reconstructed run read-model is never swept by default.
+* **Metadata (12 months)** — ``engineering_events`` (the event rows),
+  ``delivery_log``, ``afk_run_entities``, ``unresolved_correlations``.
+* **Redacted payload (90 days)** — the ``engineering_events.payload``
+  redacted projection (the event row itself is 12-month metadata).
 """
 
 from __future__ import annotations
@@ -178,6 +187,10 @@ class EngineeringEvent(Base):
     event_type, occurred_at)``.  Re-delivery no-ops via
     ``ON CONFLICT DO NOTHING``.  ``provider_event_id`` is stored when a
     provider emits one and is the authority for ``occurred_at`` in that case.
+
+    Retention (issue #483, ADR 0019): the event row is metadata (12 months,
+    ``GATEWAY_RETENTION_AFK_METADATA_DAYS``); the ``payload`` column is the
+    redacted-payload tier (90 days, ``GATEWAY_RETENTION_AFK_PAYLOAD_DAYS``).
     """
 
     __tablename__ = "engineering_events"
@@ -220,6 +233,9 @@ class DeliveryLog(Base):
 
     Keyed by ``UNIQUE (provider, delivery_id)``; written with
     ``ON CONFLICT DO NOTHING`` so a delivery is processed at most once.
+
+    Retention (issue #483, ADR 0019): metadata tier — 12 months
+    (``GATEWAY_RETENTION_AFK_METADATA_DAYS``).
     """
 
     __tablename__ = "delivery_log"

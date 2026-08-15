@@ -403,6 +403,35 @@ must pass BOTH layers — either by using the Admin API Key itself (with
 its hash registered in `collector_credentials`), or by using a
 provisioned collector token that also matches `GATEWAY_API_KEY`.
 
+**Operator Token**:
+The `GATEWAY_OPERATOR_TOKEN` environment variable. A dedicated operator
+bearer token, DISTINCT from the Admin API Key (`GATEWAY_API_KEY`) and from
+per-client Collector Credentials, that gates operator-only read surfaces
+(delivery payload, DLQ) via the `require_operator_token` dependency. An
+empty operator token fails closed — no operator-only surface is reachable
+(no broad read). The Admin API Key does not satisfy the operator gate; the
+three credential types are never shared across pipelines.
+_Avoid_: admin key, collector token (when the operator role is meant)
+
+**Retention Tier**:
+One of the configurable data-lifecycle buckets for the AFK outcome +
+reporting read-model (issue #483, ADR 0019), declared on Settings and
+env-driven via `GATEWAY_RETENTION_*`:
+
+* **Aggregates** (`afk_runs`, `afk_run_sessions`) — indefinite (`0` days =
+  never swept).
+* **Metadata** (`engineering_events`, `delivery_log`,
+  `delivery_state_trails`, `afk_run_entities`, `unresolved_correlations`)
+  — 12 months (365 days).
+* **Redacted payload storage** (`reporting_deliveries.payload` and the
+  `engineering_events.payload` redacted projection) — 90 days.
+* **DLQ operational max** (`afk.events-dlq`) — 30 days, never unbounded.
+
+Retention boundaries use strict ordering: a row/message exactly at the
+cutoff edge is retained; only strictly-older data expires; unknown-age data
+(no timestamp) is never prematurely expired.
+_Avoid_: a single monolithic retention window, retention without a tier
+
 **Usage Record Consumer**:
 A companion container that reads JSON-serialised usage records from the
 ``opencode-usage`` Kafka topic and POSTs each one to the Gateway's
@@ -416,6 +445,19 @@ sends messages that cannot be processed — invalid payloads (Pydantic
 validation failure) or requests that received a 4xx response from the
 Gateway ingest endpoint. DLQ messages include the original payload and a
 reason string describing the failure.
+
+**DLQ Operational Max**:
+The bound that keeps the AFK outcome DLQ topic (`afk.events-dlq`) from
+growing unbounded (issue #483, ADR 0019). Every DLQ record is stamped with
+`dead_lettered_at` and `max_age_days` at producer time; records strictly
+older than `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` (default 30 days) are
+**escalated** by the DLQ sweep (`python -m app.consumer.afk_consumer
+--dlq-sweep`) to `afk.events-dlq-expired`, preserving the original payload
++ reason for operator resolution. Escalation is append-only and idempotent
+by content; physical removal is enforced by the DLQ topic's Kafka retention
+configured to the same max age. A record without a usable
+`dead_lettered_at` has unknown age and is retained.
+_Avoid_: unbounded DLQ growth, silently dropping poison messages
 
 **Canonical Event**:
 A row in the ``usage_events`` table (migration 0021) — the canonical
@@ -810,6 +852,12 @@ manages.
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 - An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
+- A **Retention Tier** groups the AFK/reporting data into aggregates (indefinite), metadata (12 months), redacted payload (90 days), and the **DLQ Operational Max** (30 days), each configurable via `GATEWAY_RETENTION_*` (ADR 0022)
+- The **DLQ Operational Max** stamps every `afk.events-dlq` record with `dead_lettered_at` + `max_age_days` and escalates records strictly older than the max to `afk.events-dlq-expired` — never unbounded, never silently dropped
+- An **Operator Token** gates operator-only read surfaces (delivery payload, DLQ) and is distinct from the **Admin API Key** and **Collector Credential** — no token is shared across pipelines
+- The **Admin API Key** does not satisfy the operator-only gate (`require_operator_token`) — the three credential layers are disjoint
+- Delivery payload and DLQ data have **no broad read surface**: the ingestion endpoints are write-only, and no route reads `reporting_deliveries` / `delivery_state_trails` / `delivery_log` / `engineering_events.payload` back out (ADR 0022)
+- The ingestion endpoint relies on the **Collector Credential** (Two-Layer Auth) — never the **Admin API Key** alone — and is not exposed to the public internet; producer webhook ingress on the EDA gateway side is unchanged
 
 ## Flagged Ambiguities
 
