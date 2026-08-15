@@ -452,17 +452,23 @@ Transcript endpoints therefore use **keyset (cursor) pagination**:
   ```json
   {
     "items": [ … ],
-    "next_cursor": "base64(sort_key=…&id=…)",   // null on last page
+    "next_cursor": "base64(\"<source_created_at_ms>:<row_id>\")",  // null on last page
     "has_more": true
   }
   ```
 
-- The cursor encodes the last row's `(source_created_at, id)`. The next
-  page re-issues the same filter with `after=<cursor>` and orders by
-  `(source_created_at, id)`. This is stable under concurrent ingest
-  (new events append after the cursor, never reshuffling earlier pages)
-  and uses the `(session_id, source_created_at)` / `(source_created_at)`
-  indexes directly.
+- The cursor is an **opaque, URL-safe base64 string** of the colon-joined
+  form `base64("<source_created_at_ms>:<row_id>")` — the last row's
+  millisecond-epoch `source_created_at` and its `id`. Clients pass it back
+  verbatim as `after=<cursor>` and never parse it. The next page re-issues
+  the same filter and orders by `(source_created_at, id)`. This is stable
+  under concurrent ingest (new events append after the cursor, never
+  reshuffling earlier pages) and uses the `(session_id, source_created_at)`
+  / `(source_created_at)` indexes directly. The earlier
+  `base64(sort_key=…&id=…)` key=value sketch was superseded by this
+  colon-joined encoding; the concrete helpers (`encode_cursor`,
+  `decode_cursor`, `next_cursor`, `NULL_CURSOR_SENTINEL`) now live in
+  `app/api/pagination.py`.
 - `limit` is bounded (default 100, max 1000) as today.
 
 ### Unified timeline

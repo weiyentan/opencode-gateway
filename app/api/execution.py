@@ -32,8 +32,6 @@ SELECTs, parameterised filters with 400 on invalid values, and the
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import json
 from collections.abc import AsyncIterator
@@ -43,6 +41,7 @@ from uuid import UUID
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.api.pagination import NULL_CURSOR_SENTINEL, decode_cursor, next_cursor
 from app.core.config import get_settings
 from app.core.schemas.execution import (
     ChildSession,
@@ -64,11 +63,6 @@ _DEFAULT_LIMIT = 100
 _MAX_LIMIT = 1000
 _DEFAULT_MAX_DEPTH = 50
 _MAX_MAX_DEPTH = 100
-
-# Sentinel for NULL ``source_created_at`` in keyset ordering/cursors.  No real
-# millisecond-epoch timestamp can reach 2**62, so NULL timestamps sort last and
-# encode/decode cleanly without a separate NULL branch in the cursor.
-_NULL_CURSOR_SENTINEL = 2**62
 
 
 # ── Timeout helpers (mirror app/api/usage.py) ────────────────────────────────
@@ -96,35 +90,8 @@ async def _request_timeout(
 
 # ── Keyset cursor helpers ─────────────────────────────────────────────────────
 
-
-def _encode_cursor(source_created_at: int, row_id: str) -> str:
-    """Encode ``(source_created_at, id)`` into an opaque URL-safe cursor."""
-    raw = f"{source_created_at}:{row_id}".encode()
-    return base64.urlsafe_b64encode(raw).decode("ascii")
-
-
-def _decode_cursor(cursor: str) -> tuple[int, UUID]:
-    """Decode a cursor into ``(source_created_at_ms, row_id)``, 400 on garbage."""
-    try:
-        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
-        ms_s, row_id = raw.split(":", 1)
-        return int(ms_s), UUID(row_id)
-    except (ValueError, TypeError, binascii.Error) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid cursor: {cursor!r}",
-        ) from exc
-
-
-def _next_cursor(source_created_at: int | None, row_id: str) -> str:
-    """Encode the keyset cursor for the last row, NULL-safe on the timestamp.
-
-    A ``None`` timestamp encodes as :data:`_NULL_CURSOR_SENTINEL`, matching the
-    ``COALESCE`` ordering so NULL rows sort last and the cursor can always
-    advance past a full page that ends on a NULL timestamp.
-    """
-    ts = source_created_at if source_created_at is not None else _NULL_CURSOR_SENTINEL
-    return _encode_cursor(ts, row_id)
+# (Moved to app.api.pagination — see NULL_CURSOR_SENTINEL, encode_cursor,
+#  decode_cursor, next_cursor there. Imported at the top of this module.)
 
 
 def _parse_datetime(raw: str | None, param_name: str) -> datetime | None:
@@ -339,7 +306,7 @@ async def _fetch_messages(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedMessage]:
     """Fetch a keyset-paginated, chronologically-ordered message stream."""
-    params: list[object] = [session_id, _NULL_CURSOR_SENTINEL]
+    params: list[object] = [session_id, NULL_CURSOR_SENTINEL]
     null_sentinel_param = 2
     where: list[str] = ["session_id = $1"]
 
@@ -378,12 +345,12 @@ async def _fetch_messages(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    next_cursor = None
+    cursor = None
     if has_more and rows:
-        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+        cursor = next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_message_row(r) for r in rows],
-        next_cursor=next_cursor,
+        next_cursor=cursor,
         has_more=has_more,
     )
 
@@ -401,7 +368,7 @@ async def _fetch_parts(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedPart]:
     """Fetch a keyset-paginated, chronologically-ordered part event stream."""
-    params: list[object] = [session_id, _NULL_CURSOR_SENTINEL]
+    params: list[object] = [session_id, NULL_CURSOR_SENTINEL]
     null_sentinel_param = 2
     where: list[str] = ["session_id = $1"]
 
@@ -439,12 +406,12 @@ async def _fetch_parts(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    next_cursor = None
+    cursor = None
     if has_more and rows:
-        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+        cursor = next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_part_row(r) for r in rows],
-        next_cursor=next_cursor,
+        next_cursor=cursor,
         has_more=has_more,
     )
 
@@ -463,7 +430,7 @@ async def _fetch_tool_calls(
     db_timeout_seconds: int,
 ) -> CursorPage[ObservedToolCall]:
     """Fetch a keyset-paginated, global tool-call stream."""
-    params: list[object] = [_NULL_CURSOR_SENTINEL]
+    params: list[object] = [NULL_CURSOR_SENTINEL]
     null_sentinel_param = 1
     where: list[str] = ["TRUE"]
 
@@ -509,12 +476,12 @@ async def _fetch_tool_calls(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    next_cursor = None
+    cursor = None
     if has_more and rows:
-        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
+        cursor = next_cursor(rows[-1]["source_created_at"], str(rows[-1]["id"]))
     return CursorPage(
         items=[_tool_call_row(r) for r in rows],
-        next_cursor=next_cursor,
+        next_cursor=cursor,
         has_more=has_more,
     )
 
@@ -538,7 +505,7 @@ async def _fetch_timeline(
     by id (``DISTINCT ON (p.id)``) preferring the shallowest depth, so a part
     reachable at multiple depths / via multiple context rows appears once.
     """
-    params: list[object] = [session_id, max_depth, _NULL_CURSOR_SENTINEL]
+    params: list[object] = [session_id, max_depth, NULL_CURSOR_SENTINEL]
     null_sentinel_param = 3
     where: list[str] = ["TRUE"]
 
@@ -588,12 +555,12 @@ async def _fetch_timeline(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    next_cursor = None
+    cursor = None
     if has_more and rows:
-        next_cursor = _next_cursor(rows[-1]["source_created_at"], str(rows[-1]["part_id"]))
+        cursor = next_cursor(rows[-1]["source_created_at"], str(rows[-1]["part_id"]))
     return CursorPage(
         items=[_timeline_row(r) for r in rows],
-        next_cursor=next_cursor,
+        next_cursor=cursor,
         has_more=has_more,
     )
 
@@ -661,7 +628,7 @@ async def get_session_messages(
     _validate_window(from_dt, to_dt)
     after_ms, after_id = (None, None)
     if after is not None:
-        after_ms, after_id = _decode_cursor(after)
+        after_ms, after_id = decode_cursor(after)
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -697,7 +664,7 @@ async def get_session_parts(
     _validate_window(from_dt, to_dt)
     after_ms, after_id = (None, None)
     if after is not None:
-        after_ms, after_id = _decode_cursor(after)
+        after_ms, after_id = decode_cursor(after)
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -733,7 +700,7 @@ async def get_session_timeline(
     _validate_window(from_dt, to_dt)
     after_ms, after_id = (None, None)
     if after is not None:
-        after_ms, after_id = _decode_cursor(after)
+        after_ms, after_id = decode_cursor(after)
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -770,7 +737,7 @@ async def get_tool_calls(
     _validate_window(from_dt, to_dt)
     after_ms, after_id = (None, None)
     if after is not None:
-        after_ms, after_id = _decode_cursor(after)
+        after_ms, after_id = decode_cursor(after)
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
