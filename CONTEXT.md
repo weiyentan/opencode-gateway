@@ -471,7 +471,10 @@ do **not** re-escalate already-escalated records, while retained records are
 re-examined on later runs until they age past the operational max; dry-run
 never commits. Physical removal is enforced by the DLQ topic's Kafka
 retention configured to the same max age. A record without a usable
-`dead_lettered_at` has unknown age and is retained.
+`dead_lettered_at` has unknown age and is retained. "Never unbounded" is
+enforced per-DLQ: the operational-max sweep covers only `afk.events-dlq`; the
+reporting DLQ (`afk.events-reporting-dlq`, issue #479) has no operational-max
+sweep and is out of #483's scope.
 _Avoid_: unbounded DLQ growth, silently dropping poison messages
 
 **Canonical Event**:

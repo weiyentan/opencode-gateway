@@ -79,6 +79,11 @@ exactly at the max-age edge is retained (strict `>`); only strictly older
 records expire; a record without a usable `dead_lettered_at` has unknown age
 and is retained (never prematurely expired).
 
+The operational-max sweep currently covers ONLY the AFK outcome DLQ
+(`afk.events-dlq`); the reporting DLQ (`afk.events-reporting-dlq`, issue #479)
+has no operational-max sweep and is out of #483's scope — "never unbounded" is
+enforced per-DLQ.
+
 ### Access controls (operator-only delivery-payload / DLQ access)
 
 Three distinct credentials replace the previously ambiguous "one master
@@ -98,7 +103,8 @@ token":
   write-only, and no other route reads `reporting_deliveries` /
   `delivery_state_trails` / `delivery_log` / `engineering_events.payload`
   back out.  Broad read is therefore impossible.
-* **Operator-only gate** — `require_operator_token` (`app/api/ingest.py`)
+* **Operator-only gate** — `require_operator_token` (`app/core/auth.py`,
+  re-exported from `app/api/ingest.py` for backward compatibility)
   validates `GATEWAY_OPERATOR_TOKEN`, read from the dedicated
   `X-Operator-Token` header (never `Authorization`, which carries the Admin
   API Key, so the two credentials are distinct and both gates are
@@ -123,6 +129,9 @@ token":
   sweep or tightening the DLQ max) via environment variables only.
 * The DLQ can no longer grow unbounded: expired records are escalated to a
   durable operator queue and the active DLQ is bounded by Kafka retention.
+* "Never unbounded" is enforced per-DLQ: the operational-max sweep covers only
+  `afk.events-dlq`; the reporting DLQ (`afk.events-reporting-dlq`, issue #479)
+  has no operational-max sweep and is out of #483's scope.
 * Delivery payload and the state trail are readable only through the
   operator-gated reporting read API (ADR 0019); DLQ records and the delivery
   log still have no API read path.  Operator access is gated by a dedicated
