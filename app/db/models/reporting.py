@@ -169,7 +169,14 @@ class ReportingResourceAggregate(Base):
 
     ``last_delivery_id`` is the tie-break for equal ``occurred_at``
     (lowest ``delivery_id`` wins, compared as strings).  ``payload`` holds
-    the merged (redacted) current resource state.
+    the merged (redacted) current resource state.  ``key_provenance`` holds
+    the per-key provenance map — for each payload key, the
+    ``(occurred_at, delivery_id)`` of the event that last wrote it — so a
+    key is overwritten only when an incoming event is newer than that key's
+    writer, never merely newer than the aggregate's global last event.
+    Legacy rows written before per-key provenance existed have no entries
+    and fall back to the aggregate's global last event (``last_occurred_at``
+    / ``last_delivery_id``) during a merge.
     """
 
     __tablename__ = "reporting_resource_aggregates"
@@ -205,6 +212,12 @@ class ReportingResourceAggregate(Base):
         nullable=False,
     )
     payload: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa_text("'{}'::jsonb"),
+    )
+    key_provenance: Mapped[dict] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,

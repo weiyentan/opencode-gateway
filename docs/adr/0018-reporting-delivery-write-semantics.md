@@ -70,18 +70,31 @@ The aggregate for identity `A`, upon receiving event `E`, after acquiring a
 per-resource advisory lock and re-reading `A`:
 
 - `A` absent → insert an aggregate with `E`'s redacted payload,
-  `last_occurred_at = E.occurred_at`, `last_delivery_id = E.delivery_id`.
-- `A` present → per-key fill-absent merge: each non-null key of `E.payload`
-  is applied only where the key is absent in `A.payload`, **or** `E` is
-  newer than `A` (`E.occurred_at > A.last_occurred_at`, or equal
-  `occurred_at` with `E.delivery_id < A.last_delivery_id`).  Null/omitted
-  incoming values never erase a populated value (ADR 0011 non-erasure;
-  numeric zero is a valid observation).
+  `last_occurred_at = E.occurred_at`, `last_delivery_id = E.delivery_id`,
+  and a per-key provenance map recording `E` as the writer of every
+  non-null payload key.
+- `A` present → per-key merge driven by provenance.  The aggregate stores,
+  alongside the merged payload, a per-key provenance map recording which
+  event (`occurred_at`, `delivery_id`) last wrote each key.  Each non-null
+  key `k` of `E.payload` is applied when:
+  - `k` is absent from `A.payload` (fill-absent-enrich forward); or
+  - `E` is newer than the *writer of `k`* — i.e.
+    `E.occurred_at > writer.occurred_at`, or equal `occurred_at` with
+    `E.delivery_id < writer.delivery_id`.  The writer is read from the
+    per-key provenance map, falling back to `A`'s global last event for
+    legacy rows written before provenance existed.
+
+  Null/omitted incoming values never erase a populated value (ADR 0011
+  non-erasure; numeric zero is a valid observation).  Comparing per key —
+  never against a single global "newer than the aggregate" flag — makes
+  the merge order-independent when 3+ events write disjoint keys: a
+  globally-stale event can still upgrade a key it is newer than that key's
+  current writer of.
 
 Then `last_occurred_at = max(...)`, with `last_delivery_id = min(...)` on a
-tie, and `last_ingested_at = now()`.  This satisfies both halves of the
-contract: a late event may fill-absent-enrich forward, but never regresses
-state already set by a newer event.
+tie, `last_ingested_at = now()`, and `updated_at = now()` on update.  This
+satisfies both halves of the contract: a late event may fill-absent-enrich
+forward, but never regresses state already set by a newer event.
 
 ### Equal-`occurred_at` tie-break
 
@@ -115,6 +128,10 @@ untouched.
 
 - The aggregate is a denormalized read model: it trades storage and a
   serialised write for O(1) current-state reads.  It is derived data and
+  can be rebuilt from the immutable delivery facts if ever needed.
+- Per-key provenance is a second JSONB map stored alongside the payload,
+  so the aggregate carries additional storage proportional to the number of
+  distinct payload keys written by distinct events; it is derived data and
   can be rebuilt from the immutable delivery facts if ever needed.
 - Equal-`occurred_at` ordering depends on string comparison of
   `delivery_id`, which is deterministic but not chronological.

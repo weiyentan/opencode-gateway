@@ -181,6 +181,7 @@ def test_aggregate_model_has_expected_columns() -> None:
         "last_delivery_id",
         "last_ingested_at",
         "payload",
+        "key_provenance",
         "updated_at",
     } <= cols
 
@@ -194,3 +195,14 @@ def test_aggregate_model_mirrors_migration_server_defaults() -> None:
     assert str(cols["last_ingested_at"].server_default.arg) == "now()"
     assert str(cols["updated_at"].server_default.arg) == "now()"
     assert str(cols["payload"].server_default.arg) == "'{}'::jsonb"
+    assert str(cols["key_provenance"].server_default.arg) == "'{}'::jsonb"
+
+
+def test_upgrade_and_downgrade_handle_key_provenance() -> None:
+    """The upgrade creates ``key_provenance``; the downgrade drops it."""
+    upgrade_sql = _render_upgrade_delta_guarded()
+    assert "key_provenance" in upgrade_sql
+
+    downgrade_sql = _render_downgrade_delta_guarded()
+    assert "key_provenance" in downgrade_sql
+    assert "DROP COLUMN key_provenance" in downgrade_sql

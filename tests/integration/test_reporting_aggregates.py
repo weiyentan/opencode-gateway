@@ -26,6 +26,7 @@ The test skips gracefully when the database is not reachable.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import uuid
 from datetime import datetime, timezone
@@ -55,6 +56,7 @@ UTC = timezone.utc
 _API_KEY = "test-api-key"
 
 _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)
+_T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
 _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
 
@@ -313,6 +315,11 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         "occurred_at": _T1,
         "payload": {"status": "open", "title": "in progress", "labels": ["bug"]},
     }
+    # Order 2 needs its own fresh delivery_ids: reporting_deliveries dedups on
+    # (provider, delivery_id), so reusing Order 1's ids would make conv-b's
+    # deliveries duplicate no-ops instead of genuinely exercising the ingest path.
+    live2 = {**live, "delivery_id": f"live-{uuid.uuid4()}"}
+    replay2 = {**replay, "delivery_id": f"replay-{uuid.uuid4()}"}
 
     def _resource_for(number: str) -> dict:
         return _resource(
@@ -349,19 +356,19 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
-                delivery_id=replay["delivery_id"],
-                occurred_at=replay["occurred_at"],
+                delivery_id=replay2["delivery_id"],
+                occurred_at=replay2["occurred_at"],
                 resource=_resource_for("conv-b"),
-                extra=replay["payload"],
+                extra=replay2["payload"],
             ),
         )
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
-                delivery_id=live["delivery_id"],
-                occurred_at=live["occurred_at"],
+                delivery_id=live2["delivery_id"],
+                occurred_at=live2["occurred_at"],
                 resource=_resource_for("conv-b"),
-                extra=live["payload"],
+                extra=live2["payload"],
             ),
         )
 
@@ -388,6 +395,67 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         "labels": ["bug"],
     }
     assert row_a["last_delivery_id"] == live["delivery_id"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_three_event_merge_converges_across_arrival_orders(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """3-event counterexample (review finding #1): per-key provenance converges.
+
+    Three events with distinct ``occurred_at`` times write disjoint keys:
+    ``e1`` (newest) writes ``x``, ``e2`` (oldest) writes ``y=2``, ``e3``
+    (mid-stale) writes ``y=3``.  Without per-key provenance the arrival order
+    ``e1,e2,e3`` yielded ``y=2`` while ``e1,e3,e2`` yielded ``y=3``.  With
+    per-key provenance every order converges to ``{x: 1, y: 3}``.
+    """
+    async with db_pool.acquire() as conn:
+        await _seed_client(conn)
+
+    e1 = {"occurred_at": _T2, "extra": {"x": 1}}
+    e2 = {"occurred_at": _T1, "extra": {"y": 2}}
+    e3 = {"occurred_at": _T1_5, "extra": {"y": 3}}
+
+    def _resource_for(number: str) -> dict:
+        return _resource(
+            repository_url="https://github.com/acme/backend",
+            resource_type="pull_request",
+            resource_number=number,
+        )
+
+    client = _build_app(db_pool)
+    async with client as c:
+        for i, order in enumerate(itertools.permutations([e1, e2, e3])):
+            number = f"conv-3ev-{i}"
+            for ev in order:
+                await c.post(
+                    "/api/v1/reporting/ingest/deliveries",
+                    json=_make_payload(
+                        # Unique delivery_id per posting: the delivery table is
+                        # keyed by (provider, delivery_id), so each order needs
+                        # its own ids to actually enrich its own resource.
+                        delivery_id=f"d-{i}-{uuid.uuid4()}",
+                        occurred_at=ev["occurred_at"],
+                        resource=_resource_for(number),
+                        extra=ev["extra"],
+                    ),
+                )
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT payload FROM reporting_resource_aggregates "
+            "WHERE resource_number LIKE 'conv-3ev-%' ORDER BY resource_number"
+        )
+
+    assert len(rows) == 6
+    first = rows[0]["payload"]
+    for row in rows:
+        assert row["payload"] == first
+    # The converged state takes the newest value per key: y written by e3
+    # (newer than e2), x written by e1 — independent of arrival order.
+    assert first["x"] == 1
+    assert first["y"] == 3
 
 
 @pytest.mark.integration

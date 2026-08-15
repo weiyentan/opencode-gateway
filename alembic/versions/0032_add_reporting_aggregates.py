@@ -121,6 +121,12 @@ def upgrade() -> None:
             server_default=sa.text("'{}'::jsonb"),
         ),
         sa.Column(
+            "key_provenance",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
+        sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
@@ -147,6 +153,7 @@ def downgrade() -> None:
         "ix_reporting_resource_aggregates_provider_url",
         table_name="reporting_resource_aggregates",
     )
+    op.drop_column("reporting_resource_aggregates", "key_provenance")
     op.drop_table("reporting_resource_aggregates")
     op.drop_column("delivery_state_trails", "ingested_at")
     op.drop_column("reporting_deliveries", "ingested_at")
