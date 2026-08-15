@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
+from httpx import AsyncClient
 
 from app.api.execution import (
-    _decode_cursor,
-    _encode_cursor,
     _fetch_messages,
     _fetch_parts,
     _fetch_timeline,
@@ -35,7 +35,14 @@ from app.api.ingest import (
     _redact_and_truncate_payload,
     _truncate_json_field,
 )
+from app.api.pagination import (
+    NULL_CURSOR_SENTINEL,
+    decode_cursor,
+    encode_cursor,
+    next_cursor,
+)
 from app.core.schemas.execution import ObservedToolCall
+from tests.conftest import create_client
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
@@ -182,21 +189,31 @@ class TestToolCallExtraction:
         assert _extract_tool_call_facts(None) == (None, None, None, None)
 
 
-# ── Keyset cursor round-trip ──────────────────────────────────────────────────
+# ── Keyset cursor helper unit tests (app.api.pagination) ─────────────────────
 
 
-class TestCursor:
+class TestPaginationHelpers:
     def test_round_trip(self):
-        cursor = _encode_cursor(12345, str(uuid.uuid4()))
-        ms, row_id = _decode_cursor(cursor)
+        row_id = uuid.uuid4()
+        cursor = encode_cursor(12345, str(row_id))
+        ms, decoded_id = decode_cursor(cursor)
         assert ms == 12345
+        assert decoded_id == row_id
 
     def test_invalid_cursor_raises_400(self):
-        from fastapi import HTTPException
-
         with pytest.raises(HTTPException) as exc:
-            _decode_cursor("not-a-valid-cursor!!!")
+            decode_cursor("not-a-valid-cursor!!!")
         assert exc.value.status_code == 400
+
+    def test_null_timestamp_advances_via_sentinel(self):
+        row_id = uuid.uuid4()
+        cursor = next_cursor(None, str(row_id))
+        ms, decoded_id = decode_cursor(cursor)
+        assert ms == NULL_CURSOR_SENTINEL
+        assert decoded_id == row_id
+
+    def test_sentinel_value(self):
+        assert NULL_CURSOR_SENTINEL == 2**62
 
 
 # ── Ingest handlers ───────────────────────────────────────────────────────────
@@ -748,3 +765,140 @@ class TestToolCallSchema:
             tool_input=42,
         )
         assert model.tool_input == 42
+
+
+# ── HTTP-level tests for /api/v1/execution ────────────────────────────────────
+
+_SESSION_ID = uuid.uuid4()
+
+
+class TestExecutionAuth:
+    """All six execution endpoints require API-key auth (401 without it)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path",
+        [
+            f"/api/v1/execution/sessions/{_SESSION_ID}",
+            f"/api/v1/execution/sessions/{_SESSION_ID}/children",
+            f"/api/v1/execution/sessions/{_SESSION_ID}/messages",
+            f"/api/v1/execution/sessions/{_SESSION_ID}/parts",
+            f"/api/v1/execution/sessions/{_SESSION_ID}/timeline",
+            "/api/v1/execution/tool-calls",
+        ],
+    )
+    async def test_requires_auth(self, mock_conn: AsyncMock, path: str):
+        async with create_client(mock_conn, api_key=None) as c:
+            response = await c.get(path)
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+
+
+class TestExecutionSessionHeader:
+    """The session-header endpoint 404s on an unknown session."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_returns_404(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        async with client as c:
+            response = await c.get(f"/api/v1/execution/sessions/{_SESSION_ID}")
+        assert response.status_code == 404
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "NOT_FOUND"
+
+
+class TestExecutionEnvelope:
+    """List endpoints return the ``{status, data}`` envelope with a CursorPage."""
+
+    @pytest.mark.asyncio
+    async def test_messages_envelope_shape(self, client: AsyncClient, mock_conn: AsyncMock):
+        mock_conn.fetch = AsyncMock(return_value=[])
+        async with client as c:
+            response = await c.get(f"/api/v1/execution/sessions/{_SESSION_ID}/messages")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "ok"
+        data = payload["data"]
+        assert data["items"] == []
+        assert data["next_cursor"] is None
+        assert data["has_more"] is False
+
+
+class TestExecutionPagination:
+    """``after``/``limit`` handling and pagination stability through the HTTP layer."""
+
+    @pytest.mark.asyncio
+    async def test_after_and_limit_bound_params(self, client: AsyncClient, mock_conn: AsyncMock):
+        mock_conn.fetch = AsyncMock(return_value=[])
+        after_id = uuid.uuid4()
+        cursor = encode_cursor(1000, str(after_id))
+        async with client as c:
+            response = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/messages",
+                params={"after": cursor, "limit": 5},
+            )
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args.args[0]
+        args = mock_conn.fetch.call_args.args[1:]
+        # LIMIT limit+1 is the has_more probe.
+        assert "LIMIT $" in sql
+        assert args[-1] == 6
+        # The decoded cursor's (source_created_at, id) are bound as params.
+        assert 1000 in args
+        assert after_id in args
+
+    @pytest.mark.asyncio
+    async def test_malformed_after_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
+        async with client as c:
+            response = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/messages",
+                params={"after": "not-a-valid-cursor!!!"},
+            )
+        assert response.status_code == 400
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "BAD_REQUEST"
+
+    @pytest.mark.asyncio
+    async def test_two_page_walk_disjoint_ids(self, client: AsyncClient, mock_conn: AsyncMock):
+        page1_ids = [uuid.uuid4() for _ in range(3)]
+        page2_ids = [uuid.uuid4() for _ in range(2)]
+        page1_rows = [
+            _row(_message_row_data(source_created_at=i, id=pid))
+            for i, pid in enumerate(page1_ids)
+        ]
+        page2_rows = [
+            _row(_message_row_data(source_created_at=100 + i, id=pid))
+            for i, pid in enumerate(page2_ids)
+        ]
+        mock_conn.fetch = AsyncMock(side_effect=[page1_rows, page2_rows])
+
+        async with client as c:
+            r1 = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/messages", params={"limit": 2}
+            )
+            p1 = r1.json()
+            assert r1.status_code == 200
+            assert p1["data"]["has_more"] is True
+            next_cursor_value = p1["data"]["next_cursor"]
+            assert next_cursor_value is not None
+            page1_ids_returned = {item["id"] for item in p1["data"]["items"]}
+
+            r2 = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/messages",
+                params={"limit": 2, "after": next_cursor_value},
+            )
+            p2 = r2.json()
+            assert r2.status_code == 200
+            page2_ids_returned = {item["id"] for item in p2["data"]["items"]}
+
+        # Page 1 returns limit rows (the extra fetch row is the has_more probe),
+        # and the two pages never overlap — stable under append-only ingest.
+        assert len(page1_ids_returned) == 2
+        assert page1_ids_returned.isdisjoint(page2_ids_returned)
+        assert page2_ids_returned == {str(pid) for pid in page2_ids}
