@@ -273,9 +273,13 @@ current payload and its delivery lifecycle states (`received`, `normalized`,
 | `GET` | `/api/v1/reporting/session-links` | Paginated session links (`afk_run_sessions`), each surfaced as **provisional** (`provisional=True`) with an empty `source_references` list until exact resource↔session correlation (issue #481) lands. |
 
 All responses use the `{status, data, error}` envelope and are protected by
-the global API-key middleware, like every other non-`/health` route. The
-reporting write path remains `app/api/reporting_ingest.py`; the read router
-never writes.
+the global API-key middleware, like every other non-`/health` route. These
+endpoints additionally require the dedicated operator token
+(`GATEWAY_OPERATOR_TOKEN`, via `require_operator_token`) **on top of** the
+Admin API Key — delivery payload and state trails are an operator-only read
+surface, and the gate fails closed when the operator token is unprovisioned.
+The reporting write path remains `app/api/reporting_ingest.py`; the read
+router never writes.
 
 ### AFK Outcomes
 
@@ -368,10 +372,14 @@ DLQ) via the `require_operator_token` dependency. It is a dedicated operator
 bearer token, **distinct** from the Admin API Key (`GATEWAY_API_KEY`) and
 from per-client Collector Credentials — the Admin API Key does not satisfy
 the operator gate. An empty operator token **fails closed**: no operator-only
-surface is reachable (no broad read). Delivery payload and DLQ data currently
-have no broad read surface at all — the ingestion endpoints are write-only
-and no route reads `reporting_deliveries` / `delivery_state_trails` /
-`delivery_log` / `engineering_events.payload` back out (ADR 0020).
+surface is reachable (no broad read). Delivery payload and state trails are
+readable **only** through the operator-gated reporting read API (ADR 0019,
+issue #484): `require_operator_token` is registered on
+`GET /api/v1/reporting/resources`, `/resources/detail`, and
+`/session-links`, and no other route reads `reporting_deliveries` /
+`delivery_state_trails` back out. The delivery log,
+`engineering_events.payload`, and DLQ records remain readable by no API
+route (ADR 0020).
 
 ---
 

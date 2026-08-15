@@ -82,14 +82,20 @@ token":
 | Collector Credential| `collector_credentials`   | ingestion path (`/ingest`, reporting)   |
 | Operator Token      | `GATEWAY_OPERATOR_TOKEN`  | operator-only read surfaces             |
 
-* **No broad read** — delivery payload and DLQ data have **no** read surface:
-  the `/ingest` and reporting-ingestion endpoints are write-only, and no route
-  reads `reporting_deliveries` / `delivery_state_trails` / `delivery_log` /
-  `engineering_events.payload` back out.  Broad read is therefore impossible.
-* **Operator-only gate** — `require_operator_token` (`app/api/ingest.py`) is
-  the enforcement primitive for any future operator-only read surface.  It
+* **No broad read** — delivery payload and the state trail are readable
+  **only** through the operator-gated reporting read API (ADR 0019, issue
+  #484): `require_operator_token` is registered on
+  `GET /api/v1/reporting/resources`, `/resources/detail`, and
+  `/session-links`.  The `/ingest` and reporting-ingestion endpoints are
+  write-only, and no other route reads `reporting_deliveries` /
+  `delivery_state_trails` / `delivery_log` / `engineering_events.payload`
+  back out.  Broad read is therefore impossible.
+* **Operator-only gate** — `require_operator_token` (`app/api/ingest.py`)
   validates `GATEWAY_OPERATOR_TOKEN` and **fails closed** (403) when no
-  operator token is configured.
+  operator token is configured.  It is registered on the three reporting
+  read routes (ADR 0019) — the single sanctioned read path for delivery
+  payload and the state trail — and remains the enforcement primitive for
+  any future operator-only read surface.
 * **No shared tokens** — the operator token is distinct from the Admin API Key
   and from collector credentials; the Admin API Key does not satisfy the
   operator gate.  The ingestion path continues to rely on the dedicated
@@ -106,8 +112,10 @@ token":
   sweep or tightening the DLQ max) via environment variables only.
 * The DLQ can no longer grow unbounded: expired records are escalated to a
   durable operator queue and the active DLQ is bounded by Kafka retention.
-* Delivery payload and DLQ data have no broad read path; operator access is
-  gated by a dedicated token that fails closed when unprovisioned.
+* Delivery payload and the state trail are readable only through the
+  operator-gated reporting read API (ADR 0019); DLQ records and the delivery
+  log still have no API read path.  Operator access is gated by a dedicated
+  token that fails closed when unprovisioned.
 * The existing Two-Layer Auth semantics (ADR 0007) and the
   `afk.events-dlq` producer path (#482) are preserved — the DLQ record shape
   gains two additive fields (`dead_lettered_at`, `max_age_days`) and is

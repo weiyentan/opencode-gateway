@@ -8134,22 +8134,51 @@ class TestOperatorOnlyAccess:
 
 
 class TestNoBroadRead:
-    """Delivery payload and DLQ data have no broad read surface.
+    """Delivery payload and state trails have no BROAD read surface.
 
-    The reporting-ingestion and /ingest surfaces are write-only: there is no
-    GET route that reads ``reporting_deliveries`` payload, the state trail, the
-    delivery log, or the DLQ back out.  Broad read is therefore impossible.
+    The only sanctioned read path is the operator-gated reporting read API
+    (ADR 0019, issue #484): ``require_operator_token``
+    (``GATEWAY_OPERATOR_TOKEN``, fails closed) is registered on
+    ``GET /api/v1/reporting/resources``, ``/resources/detail``, and
+    ``/session-links``, so delivery payload and the state trail are readable
+    ONLY through that operator-gated surface.  Every other route touching
+    ``reporting_deliveries`` / ``delivery_state_trails`` is write-only — the
+    reporting-ingestion and /ingest surfaces expose no GET route, and no
+    other GET route reads those tables back out.
     """
 
-    def test_no_get_route_reads_delivery_payload(self):
+    # The sanctioned operator-gated read surface (ADR 0019, issue #484).
+    _REPORTING_READ_PATHS = {
+        "/api/v1/reporting/resources",
+        "/api/v1/reporting/resources/detail",
+        "/api/v1/reporting/session-links",
+    }
+
+    @staticmethod
+    def _dependency_call_names(route) -> set[str]:
+        """Collect the resolved dependency callable names for a route."""
+
+        def walk(dependant, acc: set[str]) -> set[str]:
+            for dep in dependant.dependencies:
+                acc.add(getattr(dep.call, "__name__", repr(dep.call)))
+                walk(dep, acc)
+            return acc
+
+        return walk(route.dependant, set())
+
+    def _app_routes(self):
         from app.core.factory import create_app
 
         app = create_app(configure_logging=False)
-        get_paths = {
-            route.path
+        return [
+            route
             for route in app.routes
             if hasattr(route, "methods") and "GET" in route.methods
-        }
+        ]
+
+    def test_no_get_route_reads_delivery_payload(self):
+        """The write-only ingestion surfaces expose no GET route."""
+        get_paths = {route.path for route in self._app_routes()}
 
         assert "/ingest" not in get_paths
         assert "/api/v1/reporting/ingest/deliveries" not in get_paths
@@ -8166,3 +8195,37 @@ class TestNoBroadRead:
         }
         assert "/ingest" in post_paths
         assert "/api/v1/reporting/ingest/deliveries" in post_paths
+
+    def test_reporting_read_api_is_the_only_reporting_get_surface(self):
+        """The only reporting GET routes are the three sanctioned read routes.
+
+        No other GET route under ``/api/v1/reporting`` reads
+        ``reporting_deliveries`` / ``delivery_state_trails`` back out.
+        """
+        reporting_get_paths = {
+            route.path
+            for route in self._app_routes()
+            if route.path.startswith("/api/v1/reporting")
+        }
+
+        assert reporting_get_paths == self._REPORTING_READ_PATHS
+
+    def test_reporting_read_routes_are_operator_gated(self):
+        """Every sanctioned reporting read route requires the operator token.
+
+        ``require_operator_token`` is registered on all three reporting read
+        routes — delivery payload and the state trail are readable ONLY
+        through the operator-gated reporting read API, and no other route
+        reads those tables back out.
+        """
+        from app.api.ingest import require_operator_token
+
+        reporting_read_routes = [
+            route for route in self._app_routes() if route.path in self._REPORTING_READ_PATHS
+        ]
+
+        assert len(reporting_read_routes) == len(self._REPORTING_READ_PATHS)
+        for route in reporting_read_routes:
+            assert require_operator_token.__name__ in self._dependency_call_names(route), (
+                f"{route.path} is not operator-gated"
+            )

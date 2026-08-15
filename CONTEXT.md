@@ -409,13 +409,16 @@ bearer token, DISTINCT from the Admin API Key (`GATEWAY_API_KEY`) and from
 per-client Collector Credentials, that gates operator-only read surfaces
 (delivery payload, DLQ) via the `require_operator_token` dependency. An
 empty operator token fails closed — no operator-only surface is reachable
-(no broad read). The Admin API Key does not satisfy the operator gate; the
-three credential types are never shared across pipelines.
+(no broad read). Delivery payload and state trails are readable **only**
+through the operator-gated Reporting Read API (issue #484, ADR 0021), which
+is the sanctioned read path for those tables; every other route touching
+them is write-only. The Admin API Key does not satisfy the operator gate;
+the three credential types are never shared across pipelines.
 _Avoid_: admin key, collector token (when the operator role is meant)
 
 **Retention Tier**:
 One of the configurable data-lifecycle buckets for the AFK outcome +
-reporting read-model (issue #483, ADR 0020), declared on Settings and
+reporting read-model (issue #483, ADR 0022), declared on Settings and
 env-driven via `GATEWAY_RETENTION_*`:
 
 * **Aggregates** (`afk_runs`, `afk_run_sessions`) — indefinite (`0` days =
@@ -448,7 +451,7 @@ reason string describing the failure.
 
 **DLQ Operational Max**:
 The bound that keeps the AFK outcome DLQ topic (`afk.events-dlq`) from
-growing unbounded (issue #483, ADR 0020). Every DLQ record is stamped with
+growing unbounded (issue #483, ADR 0022). Every DLQ record is stamped with
 `dead_lettered_at` and `max_age_days` at producer time; records strictly
 older than `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` (default 30 days) are
 **escalated** by the DLQ sweep (`python -m app.consumer.afk_consumer
@@ -721,7 +724,6 @@ conventions (freshness/stale-on-error retention, Token Breakdown, Active
 Tokens).
 _Avoid_: AFK panel (generic)
 
-<<<<<<< HEAD
 **Session Resource Reference**:
 An explicit stable resource reference carried by one session's metadata
 (``afk_outcomes.models.SessionResourceReference``): the full stable resource
@@ -770,7 +772,7 @@ _Avoid_: resource number as an integer, entity_id string, project label
 
 **Reporting Read API**:
 The read-only API surface for the reporting read-model
-(``app/api/reporting.py``, prefix ``/api/v1/reporting``, ADR 0019, issue
+(``app/api/reporting.py``, prefix ``/api/v1/reporting``, ADR 0021, issue
 #484): ``GET /resources`` (paginated ingested resources filterable by any
 subset of the stable resource identity — ``provider`` + ``repository_url`` +
 ``resource_type`` + ``resource_number``), ``GET /resources/detail`` (the
@@ -778,7 +780,11 @@ current aggregate plus the per-delivery State Trail plus session links for
 one resource), and ``GET /session-links`` (provisional Reporting Session
 Links). It is strictly read-only — the write path remains
 ``app/api/reporting_ingest.py`` (issue #479) — uses the ``{status, data,
-error}`` envelope and API-key auth, and makes **no completion claims**: it
+error}`` envelope and API-key auth, and — because delivery payload and the
+state trail are operator-only (ADR 0022) — additionally requires the
+dedicated Operator Token (``GATEWAY_OPERATOR_TOKEN`` via
+``require_operator_token``) on every route, on top of the Admin API Key
+(fails closed when unprovisioned). It makes **no completion claims**: it
 surfaces the resource's verbatim current payload and pipeline lifecycle
 states and never derives or asserts a "completed"/"finished"/outcome state.
 _Avoid_: Reporting endpoint (generic), completion/outcome report
@@ -810,7 +816,6 @@ never fabricates a resource↔session link it cannot prove. When #481 lands,
 exact links populate ``source_references`` and flip ``provisional=False``;
 the response shape is forward-compatible.
 _Avoid_: Exact link, proven session association
->>>>>>> eb52311 (docs: update documentation for consolidated changes (issues #482-#485))
 
 ## Architecture Note
 
@@ -901,9 +906,9 @@ manages.
 - The **DLQ Operational Max** stamps every `afk.events-dlq` record with `dead_lettered_at` + `max_age_days` and escalates records strictly older than the max to `afk.events-dlq-expired` — never unbounded, never silently dropped
 - An **Operator Token** gates operator-only read surfaces (delivery payload, DLQ) and is distinct from the **Admin API Key** and **Collector Credential** — no token is shared across pipelines
 - The **Admin API Key** does not satisfy the operator-only gate (`require_operator_token`) — the three credential layers are disjoint
-- Delivery payload and DLQ data have **no broad read surface**: the ingestion endpoints are write-only, and no route reads `reporting_deliveries` / `delivery_state_trails` / `delivery_log` / `engineering_events.payload` back out (ADR 0022)
+- Delivery payload and state trails are readable **only** through the operator-gated Reporting Read API (`require_operator_token` on `GET /api/v1/reporting/resources`, `/resources/detail`, `/session-links`); no other route reads `reporting_deliveries` / `delivery_state_trails` back out, and `delivery_log` / `engineering_events.payload` remain readable by no API route (ADR 0021, ADR 0022)
 - The ingestion endpoint relies on the **Collector Credential** (Two-Layer Auth) — never the **Admin API Key** alone — and is not exposed to the public internet; producer webhook ingress on the EDA gateway side is unchanged
-- The **Reporting Read API** exposes the reporting read-model — ingested resources with their current aggregates (`reporting_deliveries`), per-delivery **State Trails** (`delivery_state_trails`), and **provisional Reporting Session Links** — and is strictly read-only: the write path remains the reporting ingestion endpoint (`app/api/reporting_ingest.py`, issue #479)
+- The **Reporting Read API** exposes the reporting read-model — ingested resources with their current aggregates (`reporting_deliveries`), per-delivery **State Trails** (`delivery_state_trails`), and **provisional Reporting Session Links** — and is strictly read-only: the write path remains the reporting ingestion endpoint (`app/api/reporting_ingest.py`, issue #479). It is the **sanctioned read path** for delivery payload and the state trail: every route is additionally gated by the **Operator Token** (`require_operator_token`) on top of the **Admin API Key**, and no other route reads those tables back out (ADR 0021, ADR 0022)
 - The **Reporting Read API** makes **no completion claims**: a **Resource Summary** carries the verbatim current payload and pipeline lifecycle states, never a derived "completed"/"finished"/outcome state
 - A **Resource Summary** is keyed by the composite `resource_id` (`provider + repository_url + resource_type + resource_number`), the stable resource identity distinct from any human-readable label
 - A **Reporting Session Link** is marked `provisional=True` with an empty `source_references` list until exact resource↔session correlation (#481) lands — the Gateway never fabricates a link it cannot prove
