@@ -1896,3 +1896,169 @@ async def test_from_env_reads_dlq_max_age() -> None:
         consumer = await AFKOutcomeConsumer.from_env()
 
     assert consumer._dlq_max_age_days == 14
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Producer→consumer contract pinning (#485)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The producer (fast-api-eda-gateway #97–#102, PRD #478) emits a normalized,
+# schema-versioned event on ``afk.events``.  These tests pin the exact
+# producer→consumer contract: a fixture event matching the producer contract
+# must map through ``map_provider_event`` to the canonical outcome-layer
+# vocabulary WITHOUT DLQ routing, and every contract field must be carried
+# through (never dropped).  A payload that violates the contract routes to
+# the DLQ with the original payload plus a reason (documented in
+# ``docs/afk-outcome-contract-validation.md``).
+
+# The pinned producer contract: provider, forwarded ``delivery_id``, stable
+# ``resource_id``, ``resource_type``, ``action``, ``occurred_at``,
+# ``ingested_at``, ``actor``, redacted ``payload_ref``, and ``schema_version``.
+PRODUCER_CONTRACT_EVENT: dict[str, object] = {
+    "schema_version": "1.0",
+    "provider": "github",
+    "delivery_id": "22222222-3333-4444-5555-666666666666",
+    "resource_type": "pull_request",
+    "resource_id": "442",
+    "repository": "owner/repo",
+    "action": "merged",
+    "occurred_at": "2026-08-13T10:10:29Z",
+    "ingested_at": "2026-08-13T10:10:30Z",
+    "actor": "carol",
+    "payload_ref": "redacted-payload-ref-442",
+}
+
+
+def test_producer_contract_event_has_exact_fields() -> None:
+    """The pinned producer contract carries exactly the agreed field set.
+
+    Adding or removing a field here is a contract change and must fail this
+    test (and be reconciled with ADR 0018 / PRD #478) rather than drift
+    silently against the producer.
+    """
+    assert set(PRODUCER_CONTRACT_EVENT) == {
+        "schema_version",
+        "provider",
+        "delivery_id",
+        "resource_type",
+        "resource_id",
+        "repository",
+        "action",
+        "occurred_at",
+        "ingested_at",
+        "actor",
+        "payload_ref",
+    }
+
+
+def test_producer_contract_maps_to_canonical_change_request() -> None:
+    """The contract fixture maps to the canonical change_request vocabulary.
+
+    Every contract field is carried through the bridge: ``resource_type``
+    selects the canonical entity type, ``resource_id`` becomes the stable
+    identity, ``action`` the event suffix, and ``payload_ref`` the redacted
+    reference (never the payload itself).
+    """
+    message = NormalizedProviderEvent.model_validate(PRODUCER_CONTRACT_EVENT)
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.entity_id == "change_request:442"
+    assert entity.provider is Provider.GITHUB
+    assert entity.repository == "owner/repo"
+    assert entity.number == 442
+
+    assert event.event_type == "change_request.merged"
+    assert event.entity_id == "change_request:442"
+    assert event.provider is Provider.GITHUB
+    assert event.occurred_at == datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
+    assert event.actor == "carol"
+    assert event.payload == {"payload_ref": "redacted-payload-ref-442"}
+
+
+@pytest.mark.asyncio
+async def test_producer_contract_event_is_not_routed_to_dlq() -> None:
+    """The contract-conforming event persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(PRODUCER_CONTRACT_EVENT))
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+
+
+def test_producer_contract_gitlab_merge_request_maps_to_change_request() -> None:
+    """The same contract holds cross-provider: GitLab ``merge_request`` → change_request."""
+    message = NormalizedProviderEvent.model_validate(
+        {**PRODUCER_CONTRACT_EVENT, "provider": "gitlab", "resource_type": "merge_request"}
+    )
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.provider is Provider.GITLAB
+    assert event.event_type == "change_request.merged"
+
+
+@pytest.mark.asyncio
+async def test_contract_violation_routes_to_dlq_with_payload_and_reason() -> None:
+    """A normalized event violating the contract (unmappable action) → DLQ.
+
+    The documented contract-violation behavior: the full original payload is
+    forwarded to ``afk.events-dlq`` with ``original_topic`` and a ``reason``
+    string, and nothing is persisted.
+    """
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    violating = {**PRODUCER_CONTRACT_EVENT, "action": "synchronize"}  # not canonical
+    await consumer._process_message(_mk_msg(violating))
+
+    conn.execute.assert_not_called()  # nothing persisted
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert topic == "afk.events-dlq"
+    assert dlq_payload["original_topic"] == "afk.events"
+    assert "Unmappable message type" in dlq_payload["reason"]
+    assert "pull_request.synchronize" in dlq_payload["reason"]
+    assert dlq_payload["payload"] == violating  # original payload preserved verbatim
+
+
+@pytest.mark.asyncio
+async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> None:
+    """A non-JSON body is DLQ'd carrying the raw bytes plus a reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_invalid_json_msg())
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert dlq_payload["reason"]
+    assert dlq_payload["payload"] == {"raw": "not valid json at all"}

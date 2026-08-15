@@ -21,11 +21,13 @@ Start the standalone test Postgres container before running::
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
 import pytest
@@ -490,3 +492,197 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
             "WHERE event_type = 'change_request.merged'"
         )
         assert count == 2, f"expected distinct events for differing timestamps, got {count}"
+
+
+# ── Replay convergence / redelivery through the full consumer path (#485) ────
+#
+# These tests drive the live consumer's ``_process_message`` (transport record
+# → parse → map → transactional write → offset commit) against the real
+# Postgres, asserting that re-delivering the same producer event converges on
+# identical delivery/event rows regardless of order (live-then-replay and
+# replay-then-live), with no duplicate rows.
+
+
+def _kafka_record(value: dict[str, object], *, offset: int = 0, partition: int = 0) -> MagicMock:
+    """A realistic Kafka ``ConsumerRecord`` stand-in (mirrors the unit-test shape)."""
+    msg = MagicMock()
+    msg.value = json.dumps(value).encode("utf-8")
+    msg.offset = offset
+    msg.partition = partition
+    msg.topic = "afk.events"
+    msg.key = None
+    msg.headers = ()
+    return msg
+
+
+def _consumer_over_pool(db_pool: asyncpg.Pool) -> AFKOutcomeConsumer:
+    """A consumer wired to the real pool with mocked Kafka commit/produce seams."""
+    consumer = AFKOutcomeConsumer(
+        kafka_brokers="broker:9092",
+        pool=db_pool,
+        provider=Provider.GITHUB,
+        repository=REPOSITORY,
+        adapter=GitHubAdapter(
+            FakeGitHubApi(_merged_payloads(datetime.now(timezone.utc)))  # noqa: UP017
+        ),
+    )
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    return consumer
+
+
+def _normalized_contract_event(delivery_id: str, resource_id: str) -> dict[str, object]:
+    """A producer-contract-conforming normalized ``pull_request.merged`` event."""
+    return {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": delivery_id,
+        "resource_type": "pull_request",
+        "resource_id": resource_id,
+        "repository": REPOSITORY,
+        "action": "merged",
+        "occurred_at": "2026-08-13T10:10:29Z",
+        "ingested_at": "2026-08-13T10:10:30Z",
+        "actor": "carol",
+        "payload_ref": f"redacted-payload-ref-{resource_id}",
+    }
+
+
+def _converged_event(resource_id: str) -> tuple[str, str, str, str, str]:
+    """The canonical engineering_events row every ordering must converge on."""
+    return (
+        "change_request",
+        resource_id,
+        "change_request.merged",
+        "carol",
+        f"redacted-payload-ref-{resource_id}",
+    )
+
+
+async def _event_snapshot(
+    conn: asyncpg.Connection, external_id: str
+) -> tuple[str, str, str, str, str] | None:
+    """The canonical (non-volatile) event row for ``external_id``, or None."""
+    row = await conn.fetchrow(
+        "SELECT entity_type, external_id, event_type, actor, "
+        "payload->>'payload_ref' AS payload_ref "
+        "FROM engineering_events WHERE external_id = $1",
+        external_id,
+    )
+    if row is None:
+        return None
+    return (
+        row["entity_type"],
+        row["external_id"],
+        row["event_type"],
+        row["actor"],
+        row["payload_ref"],
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_replay_convergence_live_then_replay(db_pool: asyncpg.Pool) -> None:
+    """Live delivery then a replay of the same event converge on identical rows.
+
+    The full consumer path is driven twice with the same producer contract
+    event; the replay must leave ``delivery_log`` and ``engineering_events``
+    byte-identical to the post-live state (one delivery row + one event row).
+    """
+    delivery_id = "delivery-live-then-replay"
+    resource_id = "900"
+    event = _normalized_contract_event(delivery_id, resource_id)
+    consumer = _consumer_over_pool(db_pool)
+
+    await consumer._process_message(_kafka_record(event))  # live
+    async with db_pool.acquire() as conn:
+        after_live = await _event_snapshot(conn, resource_id)
+        delivery_after_live = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = $1", delivery_id
+        )
+    assert after_live == _converged_event(resource_id)
+    assert delivery_after_live == 1
+
+    await consumer._process_message(_kafka_record(event))  # replay
+    async with db_pool.acquire() as conn:
+        after_replay = await _event_snapshot(conn, resource_id)
+        delivery_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = $1", delivery_id
+        )
+        event_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events WHERE external_id = $1", resource_id
+        )
+
+    # Convergence: replay leaves the rows identical to the live state.
+    assert after_replay == after_live == _converged_event(resource_id)
+    assert delivery_count == 1
+    assert event_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_replay_convergence_replay_then_live(db_pool: asyncpg.Pool) -> None:
+    """A duplicate delivery arriving before the "live" copy still converges.
+
+    Whether the replay precedes or follows the live delivery, the final
+    delivery/event rows are identical (one delivery row + one event row).
+    """
+    delivery_id = "delivery-replay-then-live"
+    resource_id = "901"
+    event = _normalized_contract_event(delivery_id, resource_id)
+    consumer = _consumer_over_pool(db_pool)
+
+    await consumer._process_message(_kafka_record(event))  # replay arrives first
+    async with db_pool.acquire() as conn:
+        after_replay = await _event_snapshot(conn, resource_id)
+    assert after_replay == _converged_event(resource_id)
+
+    await consumer._process_message(_kafka_record(event))  # then the live copy
+    async with db_pool.acquire() as conn:
+        after_live = await _event_snapshot(conn, resource_id)
+        delivery_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = $1", delivery_id
+        )
+        event_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events WHERE external_id = $1", resource_id
+        )
+
+    assert after_live == after_replay == _converged_event(resource_id)
+    assert delivery_count == 1
+    assert event_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_redelivery_creates_no_duplicate_rows_across_full_path(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Two deliveries of the same provider + delivery_id create no duplicate rows.
+
+    Dedup is enforced end to end: the ``delivery_log`` UNIQUE(provider,
+    delivery_id) constraint absorbs the second delivery row, and the
+    ``engineering_events`` identity UNIQUE absorbs the second event row.
+    """
+    delivery_id = "delivery-dedup-full-path"
+    resource_id = "902"
+    event = _normalized_contract_event(delivery_id, resource_id)
+    consumer = _consumer_over_pool(db_pool)
+
+    await consumer._process_message(_kafka_record(event, offset=10))
+    await consumer._process_message(_kafka_record(event, offset=10))  # redelivery
+
+    async with db_pool.acquire() as conn:
+        delivery_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = $1", delivery_id
+        )
+        delivery_provider = await conn.fetchval(
+            "SELECT provider FROM delivery_log WHERE delivery_id = $1", delivery_id
+        )
+        event_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events WHERE external_id = $1", resource_id
+        )
+
+    assert delivery_count == 1
+    assert delivery_provider == "github"
+    assert event_count == 1
