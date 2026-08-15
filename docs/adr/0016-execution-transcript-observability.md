@@ -475,13 +475,25 @@ Transcript endpoints therefore use **keyset (cursor) pagination**:
 
 Yes — `GET …/sessions/{session_id}/timeline` is the unified endpoint. It
 walks the parent/child tree rooted at `session_id`, collects the part
-events of every descendant (bounded by an optional `max_depth`, default
-all generations), and returns a single chronologically-ordered stream
-annotated with `session_id`, `agent`, and `depth`. Implementation is a
-recursive CTE over the parent linkage (`opencode_session_contexts`
+events of every descendant, and returns a single chronologically-ordered
+stream annotated with `session_id`, `agent`, and `depth`. Implementation
+is a recursive CTE over the parent linkage (`opencode_session_contexts`
 `parent_session_id`, falling back to `observed_messages`
 `parent_external_session_id`) joined to `observed_parts`, ordered by
 `source_created_at`, paginated by the same keyset cursor.
+
+**`max_depth` default (RESOLVED — Option A).** `max_depth` is an optional
+query parameter whose default is *all generations* (`None`): the recursive
+walk is bounded only by the cycle guard (`NOT (s.id = ANY(d.path))`),
+which remains the safety bound in unbounded mode. Client-supplied values
+are validated `ge=0, le=200` — the hard cap of 200 is a documented upper
+bound for explicit bounds, not a default cutoff. The two link sources are
+normalized into a single `edges` CTE (context `parent_session_id` ∪
+message `parent_external_session_id`, the latter resolved against
+`sessions.external_session_id` with a `source_database_id` guard) and
+collapsed with `UNION`, so a session linked via both sources is traversed
+once and never double-counted; the outer `DISTINCT ON (p.id)` dedup still
+keeps each part at its shallowest depth.
 
 ### Truncation and redaction at the API boundary
 
@@ -616,8 +628,10 @@ can contain source code, environment snippets, and credentials. Handling:
 - Three new tables plus a projection increase migration and maintenance
   surface.
 - Parent/child tree walking for the unified timeline is a recursive
-  query; it needs the `max_depth` bound and index discipline to stay
-  cheap on deeply nested runs.
+  query; in the default all-generations mode it is bounded by the
+  recursion cycle guard (not a depth cutoff), and explicit `max_depth`
+  values (hard-capped at 200) plus index discipline keep it cheap on
+  deeply nested runs.
 - Redaction is heuristic (key-name based); a secret stored under a
   non-matching key name would not be caught by `redact_dict` alone.
 
