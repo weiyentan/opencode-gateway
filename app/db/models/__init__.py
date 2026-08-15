@@ -27,7 +27,11 @@ from app.db.models.projection import (
     OpenCodeSessionTodo,
     OpenCodeSourceProject,
 )
-from app.db.models.reporting import DeliveryStateTrail, ReportingDelivery
+from app.db.models.reporting import (
+    DeliveryStateTrail,
+    ReportingDelivery,
+    ReportingResourceAggregate,
+)
 
 __all__ = [
     "AFKRun",
@@ -51,6 +55,7 @@ __all__ = [
     "OpenCodeSourceProject",
     "OpenCodeUsageRecord",
     "ReportingDelivery",
+    "ReportingResourceAggregate",
     "Session",
     "SourceDatabase",
     "UnresolvedCorrelation",

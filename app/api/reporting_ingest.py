@@ -35,6 +35,10 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.auth import require_collector_token
+from app.core.reporting_aggregates import (
+    enrich_aggregate,
+    resource_identity_from_payload,
+)
 from app.core.secrets import redact_dict
 from app.core.schemas.reporting import (
     ReportingDeliveryIn,
@@ -56,8 +60,9 @@ KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
 
 _INSERT_DELIVERY_SQL = """
     INSERT INTO reporting_deliveries
-        (provider, delivery_id, event_type, client_id, received_at, payload)
-    VALUES ($1, $2, $3, $4, now(), $5::jsonb)
+        (provider, delivery_id, event_type, client_id, received_at, payload,
+         occurred_at, ingested_at)
+    VALUES ($1, $2, $3, $4, now(), $5::jsonb, $6, now())
     ON CONFLICT (provider, delivery_id) DO NOTHING
     RETURNING id
 """
@@ -84,16 +89,21 @@ async def _persist_delivery(
     and returns the row ``id`` only when a fresh row was created — that
     discriminates ``accepted`` from ``duplicate``.  On the accepted path a
     ``delivery_state_trails`` row (state ``persisted``) is written in the
-    same transaction and conflict-ignored on the message-timestamp anchor.
+    same transaction and conflict-ignored on the message-timestamp anchor,
+    and the current aggregate is enriched forward-only (issue #480).
+    A missing/malformed ``resource`` skips enrichment without rejecting the
+    delivery.
     """
     async with conn.transaction():
+        redacted_payload = redact_dict(d.payload)
         row = await conn.fetchrow(
             _INSERT_DELIVERY_SQL,
             d.provider,
             d.delivery_id,
             d.event_type,
             client_id,
-            json.dumps(redact_dict(d.payload)),
+            json.dumps(redacted_payload),
+            d.occurred_at,
         )
         if row is None:
             return ReportingDeliveryResult(
@@ -107,6 +117,11 @@ async def _persist_delivery(
             d.occurred_at,
             None,
         )
+        identity = resource_identity_from_payload(
+            redacted_payload, provider=d.provider
+        )
+        if identity is not None:
+            await enrich_aggregate(conn, identity, d)
         return ReportingDeliveryResult(
             index=idx,
             delivery_id=d.delivery_id,
