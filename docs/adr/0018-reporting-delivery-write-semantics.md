@@ -72,12 +72,17 @@ per-resource advisory lock and re-reading `A`:
 - `A` absent → insert an aggregate with `E`'s redacted payload,
   `last_occurred_at = E.occurred_at`, `last_delivery_id = E.delivery_id`,
   and a per-key provenance map recording `E` as the writer of every
-  non-null payload key.
+  non-null payload key.  Only non-`None` payload keys are persisted on
+  INSERT: a `None`-valued key is stored as *absent* (filled forward by the
+  first real value) so the payload and the per-key provenance map stay
+  symmetric — a `None` value never records a writer.
 - `A` present → per-key merge driven by provenance.  The aggregate stores,
   alongside the merged payload, a per-key provenance map recording which
   event (`occurred_at`, `delivery_id`) last wrote each key.  Each non-null
   key `k` of `E.payload` is applied when:
-  - `k` is absent from `A.payload` (fill-absent-enrich forward); or
+  - `k` is absent from `A.payload`, or present with a `None` value (a
+    legacy row written before the INSERT filtering) — fill-absent-enrich
+    forward; or
   - `E` is newer than the *writer of `k`* — i.e.
     `E.occurred_at > writer.occurred_at`, or equal `occurred_at` with
     `E.delivery_id < writer.delivery_id`.  The writer is read from the

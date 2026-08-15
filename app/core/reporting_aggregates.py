@@ -22,6 +22,14 @@ Semantics (ADR 0018):
   makes the merge order-independent when 3+ events write disjoint keys.
   Null/omitted incoming values never erase (ADR 0011 non-erasure).
   Numeric zero is a valid value, never treated as missing.
+- **``None``-valued keys are stored as absent** — the INSERT path persists
+  only non-``None`` keys, so a ``None``-valued key is stored as absent
+  (fill-forward on the next real value) and never gets a per-key writer.
+  ``forward_merge`` likewise treats a stored ``None`` value as absent, so a
+  real incoming value fills it regardless of provenance state (covering
+  legacy rows written before the INSERT filtering).  This keeps the payload
+  and the per-key provenance map symmetric, so final state never depends on
+  arrival order.
 - **Equal-``occurred_at`` tie-break** — the lowest ``delivery_id`` wins
   (compared as strings), so the merge is deterministic.
 - **Serialised read-modify-write** — a transaction-scoped advisory lock
@@ -229,8 +237,10 @@ def forward_merge(
 
     - A null/omitted incoming value is skipped and never erases a
       populated value; provenance is unchanged.
-    - A key absent from the stored payload is set and its provenance
-      recorded as ``(incoming_occurred_at, incoming_delivery_id)``.
+    - A key absent from the stored payload — or present with a ``None``
+      value (e.g. a legacy row written before the INSERT path filtered
+      ``None`` keys) — is set and its provenance recorded as
+      ``(incoming_occurred_at, incoming_delivery_id)``.
     - A key present in the stored payload is overwritten only when the
       incoming event is newer than that key's *writer* — read from
       ``stored_provenance``, falling back to ``fallback_writer`` (the
@@ -249,7 +259,7 @@ def forward_merge(
     for key, value in incoming_payload.items():
         if value is None:
             continue
-        if key not in merged:
+        if key not in merged or merged.get(key) is None:
             merged[key] = value
             provenance[key] = (incoming_occurred_at, incoming_delivery_id)
             continue
@@ -413,7 +423,9 @@ async def enrich_aggregate(
             identity.resource_number,
             delivery.occurred_at,
             delivery.delivery_id,
-            json.dumps(incoming_payload),
+            json.dumps(
+                {k: v for k, v in incoming_payload.items() if v is not None}
+            ),
             json.dumps(_serialize_provenance(initial_provenance)),
         )
         return

@@ -335,6 +335,29 @@ def test_forward_merge_legacy_no_provenance_falls_back_to_global_last() -> None:
     assert merged == {"x": 1, "y": 2}
 
 
+def test_forward_merge_fills_stored_none_key_regardless_of_fallback() -> None:
+    """A stored ``None`` value is treated as absent (fill-forward).
+
+    F1-residual: a legacy row may hold ``{"a": None}`` (written before the
+    INSERT path filtered ``None`` keys).  An incoming real value must fill
+    the key even when the aggregate's global last event (``fallback_writer``)
+    is newer than the incoming event — the stored value is ``None``, not a
+    real observation, so there is no state to regress.
+    """
+    stored = {"a": None}
+    incoming = {"a": 7}
+    merged, provenance = forward_merge(
+        stored,
+        incoming,
+        stored_provenance={},  # no per-key writer for "a"
+        incoming_occurred_at=_T1,
+        incoming_delivery_id="d1",
+        fallback_writer=(_T2, "d-newer"),  # newer than the incoming event
+    )
+    assert merged == {"a": 7}
+    assert provenance["a"] == (_T1, "d1")
+
+
 def test_provenance_serialization_round_trips() -> None:
     provenance = {"x": (_T2, "e1"), "y": (_T1_5, "e3")}
     raw = agg._serialize_provenance(provenance)
@@ -428,6 +451,33 @@ async def test_enrich_inserts_when_aggregate_absent(mock_conn: AsyncMock) -> Non
     assert json.loads(args[7]) == {"status": "open"}
     assert json.loads(args[8]) == {
         "status": {"occurred_at": _T1.isoformat(), "delivery_id": "d1"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_enrich_insert_persists_only_non_null_keys(mock_conn: AsyncMock) -> None:
+    """The INSERT path persists only non-``None`` keys (F1-residual).
+
+    A first event carrying ``{"a": None, "b": 1}`` must store ``a`` as
+    absent (fill-forward on the next real value), keeping payload and
+    per-key provenance symmetric — ``a`` has no writer recorded.
+    """
+    mock_conn.fetchval = AsyncMock(return_value=True)
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+    await enrich_aggregate(
+        mock_conn,
+        _identity(),
+        _delivery(delivery_id="d1", occurred_at=_T1, payload={"a": None, "b": 1}),
+    )
+
+    insert_sql = mock_conn.execute.call_args.args[0]
+    assert "INSERT INTO reporting_resource_aggregates" in insert_sql
+    args = mock_conn.execute.call_args.args
+    assert json.loads(args[7]) == {"b": 1}  # key "a" excluded from the payload
+    assert json.loads(args[8]) == {
+        "b": {"occurred_at": _T1.isoformat(), "delivery_id": "d1"}
     }
 
 
@@ -526,6 +576,88 @@ async def test_update_sql_refreshes_updated_at(mock_conn: AsyncMock) -> None:
     update_sql = mock_conn.execute.call_args.args[0]
     assert "updated_at = now()" in update_sql
     assert "last_ingested_at = now()" in update_sql
+
+
+class _AggregateStore:
+    """Stateful fake asyncpg conn modelling ``enrich_aggregate``'s round-trip.
+
+    Maintains a single in-memory aggregate row, parsing the INSERT/UPDATE
+    ``execute`` args the same way ``enrich_aggregate`` emits them, so a
+    sequence of deliveries drives the real merge logic end-to-end.
+    """
+
+    def __init__(self) -> None:
+        self.row: dict | None = None
+
+    async def fetchval(self, sql, *args):  # advisory lock — always acquired
+        return True
+
+    async def fetchrow(self, sql, *args):
+        return None if self.row is None else mock_row(self.row)
+
+    async def execute(self, sql, *args):
+        if "INSERT INTO reporting_resource_aggregates" in sql:
+            # $1 provider, $2 url, $3 type, $4 number, $5 occurred_at,
+            # $6 delivery_id, $7 payload, $8 key_provenance
+            self.row = {
+                "last_occurred_at": args[4],
+                "last_delivery_id": args[5],
+                "payload": json.loads(args[6]),
+                "key_provenance": json.loads(args[7]),
+            }
+        elif "UPDATE reporting_resource_aggregates" in sql:
+            # $1 provider, $2 url, $3 type, $4 number, $5 payload,
+            # $6 key_provenance, $7 occurred_at, $8 delivery_id
+            self.row = {
+                "last_occurred_at": args[6],
+                "last_delivery_id": args[7],
+                "payload": json.loads(args[4]),
+                "key_provenance": json.loads(args[5]),
+            }
+        return "OK"
+
+
+_NONE_KEY_EVENTS = [
+    {"occurred_at": _T1, "delivery_id": "e1", "payload": {"a": None}},
+    {"occurred_at": _T2, "delivery_id": "e2", "payload": {"b": 1}},
+    {"occurred_at": _T1_5, "delivery_id": "e3", "payload": {"a": 7}},
+]
+
+
+@pytest.mark.asyncio
+async def test_none_key_counterexample_converges_across_all_arrival_orders() -> None:
+    """F1-residual counterexample: a ``None``-valued key must not depend on arrival order.
+
+    ``e1`` (oldest) carries ``{a: None}``, ``e2`` (newest) carries
+    ``{b: 1}``, ``e3`` (mid) carries ``{a: 7}``.  Before the fix, the order
+    ``e1,e2,e3`` persisted ``a`` as ``None`` and then rejected ``e3``'s real
+    ``a=7`` (the global last event had advanced to ``e2``), yielding
+    ``{a: None, b: 1}`` while other orders yielded ``{a: 7, b: 1}``.  After
+    the fix every order must converge to ``{a: 7, b: 1}`` with ``a`` written
+    by ``e3`` and ``b`` written by ``e2``.
+    """
+    expected_payload = {"a": 7, "b": 1}
+    expected_provenance = {"a": (_T1_5, "e3"), "b": (_T2, "e2")}
+    for order in itertools.permutations(_NONE_KEY_EVENTS):
+        store = _AggregateStore()
+        for event in order:
+            await enrich_aggregate(
+                store,  # type: ignore[arg-type]
+                _identity(),
+                _delivery(
+                    delivery_id=event["delivery_id"],
+                    occurred_at=event["occurred_at"],
+                    payload=event["payload"],
+                ),
+            )
+        assert store.row is not None, f"order {[e['delivery_id'] for e in order]}"
+        assert store.row["payload"] == expected_payload, (
+            f"order {[e['delivery_id'] for e in order]}"
+        )
+        assert (
+            agg._deserialize_provenance(store.row["key_provenance"])
+            == expected_provenance
+        ), f"order {[e['delivery_id'] for e in order]}"
 
 
 # ── Duplicate delivery skips enrichment (ingest path) ────────────────────────
