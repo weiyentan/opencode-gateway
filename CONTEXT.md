@@ -631,6 +631,29 @@ poison messages, and runs scheduled bounded-window reconciliation reusing the
 backfill engine for terminal states (merged/closed) the topic does not carry.
 _Avoid_: Kafka consumer (generic), outcomes ingestion bridge
 
+**Normalized Provider Event**:
+A schema-versioned, provider-agnostic event on the provider-events topic
+emitted by the producer (`fast-api-eda-gateway`, issues #97–#102). It carries
+the producer's native resource vocabulary (`issue`, `pull_request`,
+`merge_request`) — never the outcome layer's canonical `change_request`
+vocabulary — plus a forwarded `delivery_id`, a stable `resource_id`,
+`resource_type`, `action`, `occurred_at`, `ingested_at`, `actor`, and a
+`payload_ref` (a *reference* to the redacted payload, never the payload
+itself). Distinct from the legacy ten-type message shape
+(`ProviderEventMessage`, discriminated by its `type`/`number` fields).
+_Avoid_: Legacy provider event (when the normalized shape is meant)
+
+**Mapping Bridge**:
+The Stage-2 addition to the AFK Outcome Consumer's `map_provider_event` that
+bridges a **Normalized Provider Event** into the outcome layer's canonical
+vocabulary (ADR 0018): `issue` → `issue`; `pull_request` and `merge_request`
+→ `change_request`. `action` becomes the canonical event-type suffix, and the
+result is validated against the locked canonical vocabulary — an unknown
+resource type or action returns unmappable and is DLQ'd, never persisted and
+never conflated with a legacy type. The legacy ten-type mapping is preserved
+unchanged.
+_Avoid_: Conflating `pull_request`/`merge_request` with `change_request`
+
 **AFK Backfill CLI**:
 The operator CLI ``scripts/afk_backfill.py`` that pulls a bounded window of
 engineering activity from a provider adapter, runs it through the
@@ -781,6 +804,7 @@ manages.
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
 - An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
+- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0018)
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary

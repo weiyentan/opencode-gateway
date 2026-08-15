@@ -40,7 +40,9 @@ from afk_outcomes.providers.github import GitHubAdapter
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.consumer.afk_consumer import (
     AFKOutcomeConsumer,
+    NormalizedProviderEvent,
     ProviderEventMessage,
+    map_normalized_event,
     map_provider_event,
 )
 
@@ -227,6 +229,64 @@ async def _seed_session(
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_normalized_bridge_persists_canonical_change_request(db_pool: asyncpg.Pool) -> None:
+    """A normalized ``pull_request.merged`` bridges to ``change_request.merged``.
+
+    The Stage-2 mapping bridge maps the producer's ``pull_request``
+    ``resource_type`` into the outcome layer's canonical ``change_request``
+    vocabulary, and the resulting event persists through ``record_event``
+    with the canonical ``change_request`` entity type — never the
+    producer-specific resource type.
+    """
+    now = datetime.now(timezone.utc)  # noqa: UP017 - datetime.UTC is 3.11+
+    merged_at = now - timedelta(hours=12)
+
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-normalized-bridge",
+            "resource_type": "pull_request",
+            "resource_id": "441",
+            "repository": REPOSITORY,
+            "action": "merged",
+            "occurred_at": _iso(merged_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-441",
+        }
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.merged"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-normalized-bridge",
+            entity=entity,
+            event=event,
+        )
+
+        entity_type = await conn.fetchval(
+            "SELECT entity_type FROM engineering_events "
+            "WHERE event_type = 'change_request.merged' AND external_id = '441'"
+        )
+        assert entity_type == "change_request", (
+            f"expected canonical change_request entity_type, got {entity_type!r}"
+        )
+        payload_ref = await conn.fetchval(
+            "SELECT payload->>'payload_ref' FROM engineering_events "
+            "WHERE event_type = 'change_request.merged' AND external_id = '441'"
+        )
+        assert payload_ref == "redacted-payload-ref-441"
 
 
 @pytest.mark.integration

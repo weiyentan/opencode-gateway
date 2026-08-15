@@ -153,6 +153,18 @@ class Settings(BaseSettings):
     afk_outcomes_reconcile_cadence_seconds: float = 3600.0
     afk_outcomes_reconcile_window_seconds: float = 86400.0
 
+    # AFK outcome consumer reliability (issue #482) — bounded exponential
+    # backoff with jitter for transient/DB failures.  ``max_retries`` is the
+    # total number of persistence attempts before a message is DLQ'd (default
+    # 5); the inter-attempt delay is
+    # ``initial_backoff * 2^attempt`` (capped at ``max_backoff``), scaled by a
+    # uniform jitter factor.  Maps to GATEWAY_AFK_OUTCOMES_MAX_RETRIES,
+    # GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS,
+    # GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS.
+    afk_outcomes_max_retries: int = 5
+    afk_outcomes_initial_backoff_seconds: float = 1.0
+    afk_outcomes_max_backoff_seconds: float = 60.0
+
     # Whether the AFK outcome consumer/backfill is in use for this process.
     # The Gateway API is read-only over the AFK read-model, so it does not
     # require ``afk_outcomes_repository``; the companion consumer/backfill

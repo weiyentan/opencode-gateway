@@ -24,11 +24,24 @@ from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
     _MAPPED_EVENT_TYPES,
+    METRIC_COMMITTED_OFFSET,
+    METRIC_DB_ERRORS,
+    METRIC_DLQ_DEPTH,
+    METRIC_LAG,
+    METRIC_MESSAGES_ACCEPTED,
+    METRIC_MESSAGES_DLQ,
+    METRIC_MESSAGES_POISON,
+    METRIC_MESSAGES_TOTAL,
+    METRIC_RETRIES,
+    METRIC_RETRIES_PER_MESSAGE,
     AFKOutcomeConsumer,
+    NormalizedProviderEvent,
     ProviderEventMessage,
     _build_adapter,
+    map_normalized_event,
     map_provider_event,
 )
+from app.core.metrics import MetricsRegistry
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"
@@ -218,6 +231,9 @@ def _make_consumer(
     consumer_group_id: str = "opencode-outcomes",
     reconcile_window_seconds: float = 3600.0,
     max_retries: int = 3,
+    initial_backoff: float = 1.0,
+    max_backoff: float = 60.0,
+    metrics: MetricsRegistry | None = None,
 ) -> AFKOutcomeConsumer:
     return AFKOutcomeConsumer(
         kafka_brokers="broker:9092",
@@ -228,6 +244,9 @@ def _make_consumer(
         consumer_group_id=consumer_group_id,
         reconcile_window_seconds=reconcile_window_seconds,
         max_retries=max_retries,
+        initial_backoff=initial_backoff,
+        max_backoff=max_backoff,
+        metrics=metrics,
     )
 
 
@@ -1277,3 +1296,402 @@ def test_import_from_afk_consumer_module() -> None:
     import afk_outcomes  # noqa: F401
 
     assert AFKOutcomeConsumer.__name__ == "AFKOutcomeConsumer"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Stage-2 mapping bridge (normalized contract → canonical vocabulary) #482
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _normalized_payload(**overrides: object) -> dict:
+    payload = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": DELIVERY_ID,
+        "resource_type": "pull_request",
+        "resource_id": "442",
+        "repository": "owner/repo",
+        "action": "merged",
+        "occurred_at": "2026-08-01T10:30:00Z",
+        "ingested_at": "2026-08-01T10:31:00Z",
+        "actor": "carol",
+        "payload_ref": "redacted-payload-ref-123",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action", "expected_entity_type", "expected_event_type"),
+    [
+        ("pull_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
+        ("merge_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
+        ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
+        ("merge_request", "approved", EntityType.CHANGE_REQUEST, "change_request.approved"),
+        (
+            "merge_request",
+            "review_requested",
+            EntityType.CHANGE_REQUEST,
+            "change_request.review_requested",
+        ),
+        ("issue", "opened", EntityType.ISSUE, "issue.opened"),
+        ("issue", "closed", EntityType.ISSUE, "issue.closed"),
+    ],
+)
+def test_map_normalized_event_bridges_resource_type_to_canonical(
+    resource_type: str,
+    action: str,
+    expected_entity_type: EntityType,
+    expected_event_type: str,
+) -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type=resource_type, action=action)
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is expected_entity_type
+    assert entity.entity_id == f"{expected_entity_type.value}:442"
+    assert event.event_type == expected_event_type
+    assert event.entity_id == entity.entity_id
+
+
+def test_map_provider_event_dispatches_normalized_shape() -> None:
+    """map_provider_event routes the normalized shape through the bridge."""
+    message = NormalizedProviderEvent.model_validate(_normalized_payload())
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.merged"
+
+
+def test_map_normalized_event_carries_payload_ref() -> None:
+    """The redacted payload reference is forwarded, never the payload itself."""
+    message = NormalizedProviderEvent.model_validate(_normalized_payload())
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+    assert event.payload == {"payload_ref": "redacted-payload-ref-123"}
+
+
+def test_map_normalized_event_unknown_resource_type_returns_none() -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type="commit")
+    )
+    assert map_normalized_event(message) is None
+
+
+def test_map_normalized_event_unmappable_action_returns_none() -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(action="assigned")
+    )
+    assert map_normalized_event(message) is None
+
+
+def test_legacy_mapping_is_unchanged_by_bridge() -> None:
+    """The legacy ten-type mapping still maps through the dispatcher unchanged."""
+    message = ProviderEventMessage(
+        provider=Provider.GITHUB,
+        delivery_id=DELIVERY_ID,
+        type="change_request.merged",
+        repository="owner/repo",
+        number=442,
+        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
+        actor="carol",
+    )
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.merged"
+    assert event.entity_id == "change_request:442"
+
+
+@pytest.mark.asyncio
+async def test_normalized_message_persists_as_canonical_event() -> None:
+    """A normalized ``pull_request.merged`` persists as ``change_request.merged``."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_normalized_payload()))
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+    consumer._consumer.commit.assert_called_once()
+    consumer._producer.send_and_wait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unmappable_normalized_action_routes_to_dlq() -> None:
+    """A normalized event with an unmappable action is poison → DLQ, no DB write."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_normalized_payload(action="assigned")))
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Unmappable message type" in dlq_payload["reason"]
+    assert "pull_request.assigned" in dlq_payload["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Bounded exponential retry with jitter (#482)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_applies_jitter_bounds() -> None:
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=0.5):
+        assert consumer._retry_delay(0) == pytest.approx(0.5)  # 1.0 * 0.5
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=1.5):
+        assert consumer._retry_delay(1) == pytest.approx(3.0)  # 1.0*2 * 1.5
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_respects_max_backoff_cap() -> None:
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])), max_backoff=10.0)
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=1.5):
+        # 2**50 far exceeds the cap; the jitter applies to the capped 10.0.
+        assert consumer._retry_delay(50) == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_path_sleeps_with_jittered_delay() -> None:
+    """The DB-retry loop sleeps a jittered (bounded) delay between attempts."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down"), RuntimeError("db down"), "OK", "OK"]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    delays: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    msg = _mk_msg(_valid_payload())
+    with (
+        patch("app.consumer.afk_consumer.random.uniform", return_value=1.0),
+        patch("app.consumer.afk_consumer.asyncio.sleep", side_effect=_fake_sleep),
+    ):
+        await consumer._process_message(msg)
+
+    # Two retries happened: 1.0*2^0 and 1.0*2^1 (jitter pinned to 1.0).
+    assert delays == [1.0, 2.0]
+    assert consumer._consumer.commit.call_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer metrics: per-state counters, retry histogram, DLQ depth, lag (#482)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _snap(metrics: MetricsRegistry) -> dict:
+    return metrics.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_metrics_accepted_and_total_counters() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_TOTAL] == 1
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 1
+    assert snap[METRIC_MESSAGES_DLQ] == 0
+    assert snap[METRIC_MESSAGES_POISON] == 0
+
+
+@pytest.mark.asyncio
+async def test_metrics_poison_dlq_and_depth() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_POISON] == 1
+    assert snap[METRIC_MESSAGES_DLQ] == 1
+    assert snap[METRIC_DLQ_DEPTH] == 1
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 0
+
+
+@pytest.mark.asyncio
+async def test_metrics_retry_distribution_and_db_errors() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down"), RuntimeError("db down"), "OK", "OK"]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        await consumer._process_message(_mk_msg(_valid_payload()))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_DB_ERRORS] == 2
+    assert snap[METRIC_RETRIES] == 2
+    hist = snap[METRIC_RETRIES_PER_MESSAGE]
+    assert hist["count"] == 1
+    assert hist["buckets"]["2"] == 1  # the message needed 2 retries before success
+
+
+@pytest.mark.asyncio
+async def test_metrics_retries_exhausted_records_max_bucket() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        await consumer._process_message(_mk_msg(_valid_payload()))
+
+    snap = _snap(metrics)
+    hist = snap[METRIC_RETRIES_PER_MESSAGE]
+    assert hist["buckets"]["3"] == 1  # max retries recorded on exhaustion
+
+
+@pytest.mark.asyncio
+async def test_metrics_committed_offset_and_lag() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+
+    snap = _snap(metrics)
+    assert snap[f"{METRIC_COMMITTED_OFFSET}.0"] == 11
+    assert snap[f"{METRIC_LAG}.0"] == 0  # every seen offset has been committed
+
+
+@pytest.mark.asyncio
+async def test_metrics_lag_reflects_uncommitted_backlog() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    # Observe offsets 10 and 11, but commit only through 10.
+    consumer._record_last_seen(_mk_msg(_valid_payload(), offset=10))
+    consumer._record_last_seen(_mk_msg(_valid_payload(), offset=11))
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=10))
+    await consumer._commit()
+
+    snap = _snap(metrics)
+    assert snap[f"{METRIC_COMMITTED_OFFSET}.0"] == 10
+    assert snap[f"{METRIC_LAG}.0"] == 1  # offset 11 seen but not yet committed
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MetricsRegistry basics (app.core.metrics) — histogram, snapshot, reset
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_registry_counter_gauge_histogram_and_snapshot() -> None:
+    registry = MetricsRegistry()
+    registry.counter("c").inc()
+    registry.counter("c").inc(2)
+    registry.gauge("g").set(1.5)
+    registry.gauge("g").inc(0.5)
+    registry.histogram("h").observe(2)
+
+    snap = registry.snapshot()
+    assert snap["c"] == 3
+    assert snap["g"] == 2.0
+    assert snap["h"]["count"] == 1
+    assert snap["h"]["sum"] == 2.0
+    assert snap["h"]["buckets"]["2"] == 1
+
+
+def test_registry_rejects_type_conflict() -> None:
+    registry = MetricsRegistry()
+    registry.counter("x")
+    with pytest.raises(ValueError):
+        registry.gauge("x")
+
+
+def test_registry_reset_clears_all_metrics() -> None:
+    registry = MetricsRegistry()
+    registry.counter("c").inc()
+    registry.reset()
+    assert registry.snapshot() == {}
+
+
+@pytest.mark.asyncio
+async def test_from_env_reads_afk_retry_settings() -> None:
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
+        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+        "GATEWAY_AFK_OUTCOMES_MAX_RETRIES": "7",
+        "GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS": "2.0",
+        "GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS": "90",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._max_retries == 7
+    assert consumer._initial_backoff == 2.0
+    assert consumer._max_backoff == 90.0
