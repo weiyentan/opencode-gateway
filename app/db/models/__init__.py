@@ -27,6 +27,7 @@ from app.db.models.projection import (
     OpenCodeSessionTodo,
     OpenCodeSourceProject,
 )
+from app.db.models.reporting import DeliveryStateTrail, ReportingDelivery
 
 __all__ = [
     "AFKRun",
@@ -35,6 +36,7 @@ __all__ = [
     "Base",
     "CollectorCredential",
     "DeliveryLog",
+    "DeliveryStateTrail",
     "EngineeringEvent",
     "IngestAudit",
     "IngestBatch",
@@ -48,6 +50,7 @@ __all__ = [
     "OpenCodeSessionTodo",
     "OpenCodeSourceProject",
     "OpenCodeUsageRecord",
+    "ReportingDelivery",
     "Session",
     "SourceDatabase",
     "UnresolvedCorrelation",
