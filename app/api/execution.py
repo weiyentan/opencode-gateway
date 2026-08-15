@@ -63,9 +63,12 @@ router = APIRouter(tags=["execution"])
 # Default/max keyset page size and default timeline depth bound.
 _DEFAULT_LIMIT = 100
 _MAX_LIMIT = 1000
-# None = all generations (no depth cutoff); the recursion cycle guard is the
-# safety bound in unbounded mode. Client-supplied values are capped at 200.
-_DEFAULT_MAX_DEPTH: int | None = None
+# Default = 50 generations (a conservative bound so a single request cannot
+# traverse an entire unbounded tree). Client-supplied values are validated
+# 0..200 (hard cap). The SQL's explicit-NULL branch (all generations) remains
+# reachable only by explicit internal callers passing ``max_depth=None``, since
+# HTTP clients cannot supply NULL.
+_DEFAULT_MAX_DEPTH: int = 50
 _MAX_MAX_DEPTH = 200
 
 
@@ -512,8 +515,9 @@ async def _fetch_timeline(
     carries a visited ``path`` array so a parent-linkage cycle cannot recurse
     forever, and the outer query deduplicates each part by id
     (``DISTINCT ON (p.id)``) preferring the shallowest depth.  ``max_depth``
-    of ``None`` walks all generations (bounded only by the cycle guard); an
-    explicit value bounds recursion at that depth.
+    defaults to a conservative 50-generation bound; an explicit value bounds
+    recursion at that depth; an explicit ``None`` (internal callers only)
+    walks all generations, bounded only by the cycle guard.
     """
     params: list[object] = [session_id, max_depth, NULL_CURSOR_SENTINEL]
     null_sentinel_param = 3
