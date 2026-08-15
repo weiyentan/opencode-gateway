@@ -88,6 +88,16 @@ class ReportingDelivery(Base):
         server_default=sa_text("now()"),
         nullable=False,
     )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
+    )
     payload: Mapped[dict] = mapped_column(
         JSONB,
         nullable=False,
@@ -132,8 +142,75 @@ class DeliveryStateTrail(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
+    )
     detail: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
+    )
+
+
+class ReportingResourceAggregate(Base):
+    """The current aggregate for one stable reporting resource identity.
+
+    Keyed by ``UNIQUE (provider, repository_url, resource_type,
+    resource_number)`` — the composite identity derived from a delivery's
+    ``resource`` object (normalized: lowercase ``repository_url``, trailing
+    slash stripped).  Enriched forward-only by ``occurred_at`` ordering so
+    a late event fills absent keys but never regresses state set by a newer
+    event (see ``app/core/reporting_aggregates.py`` and ADR 0018).
+
+    ``last_delivery_id`` is the tie-break for equal ``occurred_at``
+    (lowest ``delivery_id`` wins, compared as strings).  ``payload`` holds
+    the merged (redacted) current resource state.
+    """
+
+    __tablename__ = "reporting_resource_aggregates"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "repository_url",
+            "resource_type",
+            "resource_number",
+            name="uq_reporting_resource_aggregates_identity",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=sa_text("gen_random_uuid()"),
+    )
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    repository_url: Mapped[str] = mapped_column(String, nullable=False)
+    resource_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource_number: Mapped[str] = mapped_column(String, nullable=False)
+    last_occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_delivery_id: Mapped[str] = mapped_column(String, nullable=False)
+    last_ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
+    )
+    payload: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa_text("'{}'::jsonb"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,
         server_default=sa_text("now()"),

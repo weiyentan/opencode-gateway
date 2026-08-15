@@ -251,25 +251,28 @@ async def test_same_delivery_twice_persists_one_row(db_pool: asyncpg.Pool) -> No
 async def test_unique_constraint_enforced_at_sql_level(db_pool: asyncpg.Pool) -> None:
     """A second direct INSERT of the same (provider, delivery_id) is rejected."""
     delivery_id = f"delivery-{uuid.uuid4()}"
+    occurred_at = _utcnow()
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO reporting_deliveries"
-            " (provider, delivery_id, event_type, payload)"
-            " VALUES ($1, $2, $3, $4::jsonb)",
+            " (provider, delivery_id, event_type, occurred_at, payload)"
+            " VALUES ($1, $2, $3, $4, $5::jsonb)",
             "github",
             delivery_id,
             "normalized",
+            occurred_at,
             '{"repository": "acme/backend"}',
         )
 
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
                 "INSERT INTO reporting_deliveries"
-                " (provider, delivery_id, event_type, payload)"
-                " VALUES ($1, $2, $3, $4::jsonb)",
+                " (provider, delivery_id, event_type, occurred_at, payload)"
+                " VALUES ($1, $2, $3, $4, $5::jsonb)",
                 "github",
                 delivery_id,
                 "normalized",
+                occurred_at,
                 '{"repository": "acme/backend"}',
             )
 
