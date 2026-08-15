@@ -43,7 +43,9 @@ and the ``_db_timeout`` / ``_request_timeout`` helpers.
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -143,6 +145,21 @@ def _resource_id(
     return f"{provider}:{repository_url}:{resource_type}:{resource_number}"
 
 
+def _decode_jsonb(value: Any) -> Any:
+    """Decode a JSONB column value into a Python object.
+
+    asyncpg returns JSONB columns as JSON-encoded ``str`` (no type codec is
+    registered anywhere in this codebase — see ``app/api/execution.py`` and
+    ``app/api/ingest.py``); the unit-test mock rows instead provide
+    already-decoded dicts.  Both shapes are accepted: a ``str`` is parsed
+    with :func:`json.loads`, any other value (including ``None``) passes
+    through unchanged.
+    """
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
 def _summary_from_row(row: asyncpg.Record) -> ResourceSummary:
     """Build a :class:`ResourceSummary` from a delivery-derived row."""
     provider = row["provider"]
@@ -160,7 +177,7 @@ def _summary_from_row(row: asyncpg.Record) -> ResourceSummary:
         delivery_count=row["delivery_count"],
         last_delivery_id=row["last_delivery_id"],
         last_ingested_at=row["last_ingested_at"],
-        payload=row["payload"] or {},
+        payload=_decode_jsonb(row["payload"]) or {},
     )
 
 
@@ -299,7 +316,7 @@ async def _fetch_resource_detail(
             delivery_id=r["delivery_id"],
             state=r["state"],
             occurred_at=r["occurred_at"],
-            detail=r["detail"],
+            detail=_decode_jsonb(r["detail"]),
             created_at=r["created_at"],
         )
         for r in trail_rows

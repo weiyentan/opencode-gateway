@@ -419,6 +419,83 @@ class TestSessionLinks:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  JSONB decoding (asyncpg returns JSONB columns as JSON strings)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestJsonbDecoding:
+    """The read path must parse asyncpg's string-encoded JSONB columns.
+
+    asyncpg returns JSONB columns as JSON-encoded ``str`` (no type codec is
+    registered in this codebase).  The unit-test mock rows elsewhere return
+    already-decoded dicts; these tests feed the *string* shape and assert
+    the endpoint returns parsed objects rather than a 500.
+    """
+
+    _STR_PAYLOAD = (
+        '{"resource": {"repository_url": "https://github.com/acme/backend", '
+        '"resource_type": "issue", "resource_number": "42"}, '
+        '"title": "Fix login bug"}'
+    )
+
+    @pytest.mark.asyncio
+    async def test_list_resources_parses_string_payload(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[_mk_resource_row(payload=self._STR_PAYLOAD)]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["payload"]["title"] == "Fix login bug"
+        _assert_no_completion_claims(item)
+
+    @pytest.mark.asyncio
+    async def test_resource_detail_parses_string_payload_and_detail(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_mk_resource_row(payload=self._STR_PAYLOAD)
+        )
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_trail_row(state="rejected", detail='{"reason": "boom"}')
+            ]
+        )
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/reporting/resources/detail", params=_identity_params()
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["resource"]["payload"]["title"] == "Fix login bug"
+        assert data["state_trail"][0]["detail"]["reason"] == "boom"
+
+    @pytest.mark.asyncio
+    async def test_null_detail_passes_through(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_resource_row())
+        mock_conn.fetch = AsyncMock(return_value=[_mk_trail_row(detail=None)])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/reporting/resources/detail", params=_identity_params()
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["state_trail"][0]["detail"] is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Envelope + read-only shape
 # ══════════════════════════════════════════════════════════════════════════
 
