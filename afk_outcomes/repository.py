@@ -51,6 +51,8 @@ from afk_outcomes.models import (
     EngineeringOutcome,
     EntityType,
     Provider,
+    ReferenceSource,
+    ResourceSessionAssociation,
     RunEntityLink,
     RunSessionLink,
     RunStatus,
@@ -104,6 +106,11 @@ def _evidence_json(evidence: list[CorrelationEvidence]) -> str:
     return json.dumps([item.model_dump(mode="json") for item in evidence])
 
 
+def _source_reference_json(sources: list[ReferenceSource]) -> str:
+    """Serialize a list of :class:`ReferenceSource` to a JSONB-ready string."""
+    return json.dumps([item.model_dump(mode="json") for item in sources])
+
+
 class AsyncpgOutcomeRepository(OutcomeRepository):
     """Persist and retrieve AFK runs via a raw asyncpg connection.
 
@@ -154,6 +161,47 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             if correlation.entity_id in resolved_entity_ids:
                 continue  # resolved correlations enrich afk_run_entities, not here
             await self._upsert_unresolved_correlation(run, correlation, entity_map)
+
+    async def save_associations(
+        self, associations: list[ResourceSessionAssociation]
+    ) -> None:
+        """Persist exact resource<->session associations (issue #481).
+
+        Each association is an explicit, deterministic link derived only from
+        a stable resource reference carried in session metadata.  Writes are
+        conflict-ignore — keyed on the resource identity + session identity
+        ``UNIQUE (provider, repository, resource_type, resource_number,
+        external_session_id)`` — so the same explicit reference converging on
+        the same association never duplicates a row.  There is no
+        read-modify-write and therefore no advisory lock; the ``source_reference``
+        provenance is written once with the first insert and never re-merged.
+        """
+        for association in associations:
+            await self._insert_association(association)
+
+    async def _insert_association(
+        self, association: ResourceSessionAssociation
+    ) -> None:
+        """Insert one association with ``ON CONFLICT DO NOTHING`` (idempotent)."""
+        await self._conn.execute(
+            """
+            INSERT INTO resource_session_associations
+                (session_id, external_session_id, provider, repository,
+                 resource_type, resource_number, source_reference,
+                 resolver_version, first_seen_at, last_seen_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now())
+            ON CONFLICT (provider, repository, resource_type, resource_number, external_session_id)
+            DO NOTHING
+            """,
+            association.session_id,
+            association.external_session_id,
+            association.provider.value,
+            association.repository,
+            association.resource_type.value,
+            association.resource_number,
+            _source_reference_json(association.source_reference),
+            association.resolver_version,
+        )
 
     async def record_event(
         self,

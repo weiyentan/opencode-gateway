@@ -304,3 +304,58 @@ class UnresolvedCorrelation(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+
+
+class ResourceSessionAssociation(Base):
+    """A deterministic many-to-many association between a resource and a session.
+
+    One resource may link to many sessions and one session may link to many
+    resources (migration 0032).  Each association derives only from an
+    explicit stable resource reference carried in session metadata — never
+    temporal/heuristic inference — and records ``source_reference`` (JSONB
+    array of ``ReferenceSource``) so each link is provable and reproducible.
+
+    Keyed by ``UNIQUE (provider, repository, resource_type, resource_number,
+    external_session_id)`` — the stable resource identity plus the session's
+    external identity — and written with ``ON CONFLICT DO NOTHING`` so the
+    same explicit reference converging on the same association never
+    duplicates a row.  ``session_id`` (internal Gateway session UUID) is a
+    nullable enrichment (no FK, mirroring ``afk_run_sessions``); the external
+    session id is the deterministic anchor.  No completion/finished claim is
+    carried (PRD Implementation Decision 13).
+    """
+
+    __tablename__ = "resource_session_associations"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "repository",
+            "resource_type",
+            "resource_number",
+            "external_session_id",
+            name="uq_resource_session_associations_resource_session",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    external_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    repository: Mapped[str] = mapped_column(String, nullable=False)
+    resource_type: Mapped[str] = mapped_column(String, nullable=False)
+    resource_number: Mapped[str] = mapped_column(String, nullable=False)
+    source_reference: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )

@@ -656,6 +656,50 @@ conventions (freshness/stale-on-error retention, Token Breakdown, Active
 Tokens).
 _Avoid_: AFK panel (generic)
 
+**Session Resource Reference**:
+An explicit stable resource reference carried by one session's metadata
+(``afk_outcomes.models.SessionResourceReference``): the full stable resource
+identity (``provider``, ``repository``, ``resource_type``, ``resource_number``)
+plus the session identity and the ``source_field`` that carried it. It is the
+ONLY input to the exact association resolver. It carries no timestamps,
+windows, or scores, so the resolver structurally cannot temporally or
+heuristically infer a link from it.
+_Avoid_: Usage record, heuristic hint, temporal window
+
+**Exact Resource↔Session Association**:
+A deterministic many-to-many link between one engineering resource and one
+OpenCode session (``ResourceSessionAssociation``, migration 0032). One
+resource may link to many sessions and one session may link to many
+resources. Associations derive ONLY from explicit **Session Resource
+Reference**s — never from temporal or heuristic inference — and every
+association records its **Reference Source** (which session field carried the
+link), so each link is provable and reproducible. Repeated identical
+references converge to a single association (idempotent, no duplicates).
+Associations deliberately carry no completion/finished claim (PRD
+Implementation Decision 13).
+_Avoid_: correlation, resolved/referenced link, run↔session link (that is the
+AFK Run's provisional inferred attachment)
+
+**Reference Source**:
+The provenance recorded on every **Exact Resource↔Session Association**
+(``afk_outcomes.models.ReferenceSource``): the name of the session metadata
+field that carried the stable resource reference (``field``) and the value
+found there (``detail``). Together they make a link reproducible — re-reading
+that field yields the same resource. It is the association-path counterpart of
+the correlation engine's ``correlation_method``/``evidence``, but records
+*where the link came from in the session*, not a scoring rule.
+_Avoid_: correlation_method, evidence (those belong to the correlation engine)
+
+**Stable Resource Identity**:
+The four-field identity of an engineering resource used to key exact
+associations: ``(provider, repository, resource_type, resource_number)``.
+``resource_type`` is the ``EntityType`` (issue, change_request, commit,
+review, merge_event); ``resource_number`` is the provider-scoped external id
+as an opaque string (issue/MR number, commit SHA, review id). It mirrors the
+``EngineeringEntity`` identity (``entity_id = "<resource_type>:<resource_number>"``)
+without collapsing onto the display metadata.
+_Avoid_: resource number as an integer, entity_id string, project label
+
 ## Architecture Note
 
 The Gateway uses a layered architecture:
@@ -738,6 +782,8 @@ manages.
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
+- An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT DO NOTHING` so the same explicit reference never duplicates a link
+- An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
 
 ## Flagged Ambiguities
 
