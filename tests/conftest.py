@@ -27,10 +27,13 @@ from app.db.session import get_session
 _TEST_API_KEY = "test-api-key"
 os.environ.setdefault("GATEWAY_API_KEY", _TEST_API_KEY)
 
-# The operator token gates operator-only read surfaces (issue #483).  In the
-# test harness both the Admin API Key and the operator token default to the
-# same value so a single ``Authorization: Bearer test-api-key`` header passes
-# both gates; distinctness is asserted separately in the operator-gate tests.
+# The operator token gates operator-only read surfaces (issue #483) and is
+# transported on the dedicated ``X-Operator-Token`` header (never
+# ``Authorization``).  Both the Admin API Key and the operator token default
+# to the same value here, and the default test client sends that value on
+# BOTH the ``Authorization`` and ``X-Operator-Token`` headers, so generic
+# tests pass both gates; distinctness is exercised explicitly by the
+# operator-gate tests.
 os.environ.setdefault("GATEWAY_OPERATOR_TOKEN", _TEST_API_KEY)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -46,17 +49,26 @@ def mock_row(data: dict) -> MagicMock:
     return row
 
 
+# Sentinel distinguishing "operator token defaults to the api_key" from an
+# explicit ``operator_token=None`` (omit the header).
+_UNSET = object()
+
+
 def create_client(
     mock_conn: AsyncMock,
     *,
     api_key: str | None = _TEST_API_KEY,
+    operator_token: str | None | object = _UNSET,
 ) -> AsyncClient:
     """Build app with overridden dependencies, return httpx AsyncClient.
 
-    By default adds an ``Authorization: Bearer <api_key>`` header so
-    existing tests pass through the API-key middleware.  Pass
-    ``api_key=None`` to create an unauthenticated client (for auth
-    failure tests).
+    By default adds an ``Authorization: Bearer <api_key>`` header AND an
+    ``X-Operator-Token: <api_key>`` header (the operator token mirrors the
+    Admin API Key) so generic tests pass both the API-key middleware and the
+    operator gate.  Pass ``operator_token`` to set a distinct operator-token
+    value, or ``operator_token=None`` to omit the ``X-Operator-Token`` header
+    (for operator-gate failure tests).  Pass ``api_key=None`` to create an
+    unauthenticated client (for auth failure tests).
     """
     app = create_app(configure_logging=False)
     mock_pool = AsyncMock()
@@ -68,9 +80,17 @@ def create_client(
 
     app.dependency_overrides[get_session] = _override_get_session
 
+    resolved_operator_token: str | None
+    if operator_token is _UNSET:
+        resolved_operator_token = api_key
+    else:
+        resolved_operator_token = operator_token  # type: ignore[assignment]
+
     headers: dict[str, str] = {}
     if api_key is not None:
         headers["Authorization"] = f"Bearer {api_key}"
+    if resolved_operator_token is not None:
+        headers["X-Operator-Token"] = resolved_operator_token
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     return AsyncClient(transport=transport, base_url="http://test", headers=headers)

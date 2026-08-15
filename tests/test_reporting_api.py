@@ -263,22 +263,47 @@ class TestOperatorGate:
     async def test_valid_operator_token_accepted(
         self, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
     ):
-        """A request carrying the operator token passes the operator gate.
+        """The correct operator token on its dedicated header passes the gate.
 
-        The single-header test harness sets both credentials to the same
-        test value here; distinctness is asserted by the dependency-level
-        test below and by ``test_admin_api_key_does_not_satisfy_operator_gate``.
+        The Admin API Key (``Authorization: Bearer admin-secret``) and the
+        operator token (``X-Operator-Token: op-secret``) are DISTINCT — the
+        operator token rides its own header, never the shared ``Authorization``
+        header, so the three-credential model is satisfiable end-to-end.
         """
-        monkeypatch.setenv("GATEWAY_API_KEY", self._OPERATOR_TOKEN)
+        monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
         mock_conn.fetchval = AsyncMock(return_value=0)
         mock_conn.fetch = AsyncMock(return_value=[])
 
-        client = create_client(mock_conn, api_key=self._OPERATOR_TOKEN)
+        client = create_client(
+            mock_conn, api_key="admin-secret", operator_token=self._OPERATOR_TOKEN
+        )
         async with client as c:
             response = await c.get("/api/v1/reporting/resources")
 
         assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_missing_operator_token_returns_401(
+        self, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Distinct operator token configured but no ``X-Operator-Token`` header.
+
+        The request carries ONLY the Admin API Key (``Authorization``) — the
+        Admin API Key alone never satisfies the operator gate.
+        """
+        monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        # Authorization: Bearer admin-secret, with NO X-Operator-Token header.
+        client = create_client(mock_conn, api_key="admin-secret", operator_token=None)
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -329,14 +354,14 @@ class TestOperatorGate:
     async def test_require_operator_token_wrong_token_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """A non-operator bearer token is rejected with 401."""
+        """A wrong token on the ``X-Operator-Token`` header is rejected with 401."""
         from fastapi import HTTPException
 
         from app.api.ingest import require_operator_token
 
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
         request = MagicMock()
-        request.headers = {"Authorization": "Bearer wrong-token"}
+        request.headers = {"X-Operator-Token": "wrong-token"}
 
         with pytest.raises(HTTPException) as exc:
             await require_operator_token(request)
@@ -347,7 +372,8 @@ class TestOperatorGate:
         self, monkeypatch: pytest.MonkeyPatch
     ):
         """The operator token is a dedicated credential — the Admin API Key
-        does NOT satisfy the operator-only gate (no shared tokens)."""
+        value presented on the operator header does NOT satisfy the gate
+        (no shared tokens)."""
         from fastapi import HTTPException
 
         from app.api.ingest import require_operator_token
@@ -355,7 +381,7 @@ class TestOperatorGate:
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
         monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
         request = MagicMock()
-        request.headers = {"Authorization": "Bearer admin-secret"}
+        request.headers = {"X-Operator-Token": "admin-secret"}
 
         with pytest.raises(HTTPException) as exc:
             await require_operator_token(request)
@@ -397,6 +423,80 @@ class TestListResources:
         assert item["last_ingested_at"] is not None
         assert item["payload"]["title"] == "Fix login bug"
         _assert_no_completion_claims(item)
+
+    @pytest.mark.asyncio
+    async def test_list_resources_orders_by_resource_identity_then_received_at(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        # Multiple resource identities, interleaved ``received_at``.  The
+        # SQL orders by (provider, repository_url, resource_type,
+        # resource_number, received_at DESC) — not a global received_at
+        # sort — and the window-function ``delivery_count`` is per identity,
+        # so both deliveries of the same identity carry the same count.
+        t1 = datetime(2026, 8, 1, tzinfo=timezone.utc)  # noqa: UP017
+        t2 = datetime(2026, 8, 2, tzinfo=timezone.utc)  # noqa: UP017
+        t3 = datetime(2026, 8, 3, tzinfo=timezone.utc)  # noqa: UP017
+        t4 = datetime(2026, 8, 4, tzinfo=timezone.utc)  # noqa: UP017
+
+        github_repo = "https://github.com/acme/backend"
+        rows = [
+            # Identity github/backend/issue/42 — two deliveries (count == 2
+            # on both), newest first within the identity.
+            _mk_resource_row(
+                repository_url=github_repo,
+                resource_number="42",
+                delivery_count=2,
+                last_delivery_id="delivery-042-b",
+                last_ingested_at=t4,
+            ),
+            _mk_resource_row(
+                repository_url=github_repo,
+                resource_number="42",
+                delivery_count=2,
+                last_delivery_id="delivery-042-a",
+                last_ingested_at=t1,
+            ),
+            # Identity github/backend/issue/99 — one delivery.
+            _mk_resource_row(
+                repository_url=github_repo,
+                resource_number="99",
+                delivery_count=1,
+                last_delivery_id="delivery-099",
+                last_ingested_at=t3,
+            ),
+            # A different provider sorts after all github rows regardless of
+            # its (newer) received_at.
+            _mk_resource_row(
+                provider="gitlab",
+                repository_url="https://gitlab.com/acme/frontend",
+                resource_type="merge_request",
+                resource_number="7",
+                delivery_count=1,
+                last_delivery_id="delivery-007",
+                last_ingested_at=t2,
+            ),
+        ]
+        mock_conn.fetchval = AsyncMock(return_value=len(rows))
+        mock_conn.fetch = AsyncMock(return_value=rows)
+
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 200
+        items = response.json()["data"]["items"]
+        assert [it["resource_id"] for it in items] == [
+            "github:https://github.com/acme/backend:issue:42",
+            "github:https://github.com/acme/backend:issue:42",
+            "github:https://github.com/acme/backend:issue:99",
+            "gitlab:https://gitlab.com/acme/frontend:merge_request:7",
+        ]
+        assert [it["delivery_count"] for it in items] == [2, 2, 1, 1]
+        assert [it["last_delivery_id"] for it in items] == [
+            "delivery-042-b",
+            "delivery-042-a",
+            "delivery-099",
+            "delivery-007",
+        ]
 
     @pytest.mark.asyncio
     async def test_filters_by_stable_identity(

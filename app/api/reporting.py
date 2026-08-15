@@ -42,9 +42,7 @@ and the ``_db_timeout`` / ``_request_timeout`` helpers.
 
 from __future__ import annotations
 
-import contextlib
 import json
-from collections.abc import AsyncIterator
 from typing import Any
 
 import asyncpg
@@ -59,7 +57,9 @@ from app.core.schemas.reporting import (
     StateTrailEntry,
 )
 from app.core.schemas.usage import PaginatedResponse
-from app.core.telemetry import timed_operation, timeout_operation
+from app.core.telemetry import timed_operation
+from app.core.timeouts import db_timeout as _db_timeout
+from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
 
 router = APIRouter(prefix="/api/v1/reporting", tags=["reporting"])
@@ -78,31 +78,15 @@ _BASE_RESOURCE_CONDITION = (
     f" AND {_RES_NUM} IS NOT NULL"
 )
 
-
-# ── Timeout helpers (mirror app/api/afk_outcomes.py) ─────────────────────────
-
-
-@contextlib.asynccontextmanager
-async def _db_timeout(
-    event_name: str, db_timeout_seconds: int
-) -> AsyncIterator[None]:
-    """Wrap a database query with the configured per-query timeout budget."""
-    async with timeout_operation(
-        event_name, "db", budget_ms=db_timeout_seconds * 1000
-    ):
-        yield
-
-
-@contextlib.asynccontextmanager
-async def _request_timeout(
-    total_request_timeout_seconds: int,
-) -> AsyncIterator[None]:
-    """Wrap an endpoint handler body with the total request timeout budget."""
-    async with timeout_operation(
-        "request.total", "request",
-        budget_ms=total_request_timeout_seconds * 1000,
-    ):
-        yield
+# Per-resource delivery count, computed once as a set-based window function.
+# A window function is evaluated before ``DISTINCT ON`` in Postgres, so the
+# surviving row per resource identity already carries the full per-resource
+# count (the same value on every delivery of that identity) without a
+# correlated subquery re-scan of ``reporting_deliveries``.
+_DELIVERY_COUNT_SELECT = (
+    "COUNT(*) OVER (PARTITION BY d.provider, "
+    f"{_RES_REPO}, {_RES_TYPE}, {_RES_NUM}) AS delivery_count"
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -223,15 +207,7 @@ async def _fetch_resources(
                d.delivery_id AS last_delivery_id,
                d.received_at AS last_ingested_at,
                d.payload,
-               (SELECT COUNT(*) FROM reporting_deliveries d2
-                 WHERE d2.provider = d.provider
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'repository_url')
-                       = {_RES_REPO}
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'resource_type')
-                       = {_RES_TYPE}
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'resource_number')
-                       = {_RES_NUM}
-               ) AS delivery_count
+               {_DELIVERY_COUNT_SELECT}
         FROM reporting_deliveries d
         WHERE {where_clause}
         ORDER BY d.provider, {_RES_REPO}, {_RES_TYPE}, {_RES_NUM}, d.received_at DESC
@@ -268,15 +244,7 @@ async def _fetch_resource_detail(
                d.delivery_id AS last_delivery_id,
                d.received_at AS last_ingested_at,
                d.payload,
-               (SELECT COUNT(*) FROM reporting_deliveries d2
-                 WHERE d2.provider = d.provider
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'repository_url')
-                       = {_RES_REPO}
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'resource_type')
-                       = {_RES_TYPE}
-                   AND jsonb_extract_path_text(d2.payload, 'resource', 'resource_number')
-                       = {_RES_NUM}
-               ) AS delivery_count
+               {_DELIVERY_COUNT_SELECT}
         FROM reporting_deliveries d
         WHERE {where_clause}
         ORDER BY d.received_at DESC
@@ -396,9 +364,10 @@ async def list_resources(
 ) -> PaginatedResponse[ResourceSummary]:
     """List ingested resources, filterable by stable resource identity.
 
-    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
-    top of the global ``ApiKeyMiddleware`` — delivery payload is an
-    operator-only read surface (no broad read).
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``,
+    presented in the dedicated ``X-Operator-Token`` header) on top of the
+    global ``ApiKeyMiddleware`` — delivery payload is an operator-only read
+    surface (no broad read).
     """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -426,9 +395,10 @@ async def get_resource_detail(
 ) -> ResourceDetail:
     """Return the full detail for one resource addressed by stable identity.
 
-    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
-    top of the global ``ApiKeyMiddleware`` — delivery payload is an
-    operator-only read surface (no broad read).
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``,
+    presented in the dedicated ``X-Operator-Token`` header) on top of the
+    global ``ApiKeyMiddleware`` — delivery payload is an operator-only read
+    surface (no broad read).
     """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -461,9 +431,10 @@ async def list_session_links(
 ) -> PaginatedResponse[ReportingSessionLink]:
     """List session links (provisional until exact correlation #481 lands).
 
-    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
-    top of the global ``ApiKeyMiddleware`` — delivery payload is an
-    operator-only read surface (no broad read).
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``,
+    presented in the dedicated ``X-Operator-Token`` header) on top of the
+    global ``ApiKeyMiddleware`` — delivery payload is an operator-only read
+    surface (no broad read).
     """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):

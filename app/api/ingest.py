@@ -40,15 +40,24 @@ KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
 # possible.  ``require_operator_token`` is the enforcement gate for any
 # operator-only read surface — it validates a DEDICATED operator bearer token
 # (``GATEWAY_OPERATOR_TOKEN``), distinct from the Admin API Key
-# (``GATEWAY_API_KEY``) and from per-client collector credentials.  An empty
-# operator token fails closed (403), so an unprovisioned operator credential
-# means no operator-only surface is reachable.  The operator-gated reporting
-# read API (issue #484) is the sanctioned read path for delivery payload and
-# the state trail — every other route stays write-only.
+# (``GATEWAY_API_KEY``) and from per-client collector credentials.  The token
+# is transported on the dedicated ``X-Operator-Token`` header (NOT
+# ``Authorization``), precisely so it cannot collide with the Admin API Key
+# consumed by ``ApiKeyMiddleware`` — a single HTTP request can carry only one
+# ``Authorization: Bearer <token>`` header, so the operator credential must
+# ride a separate channel.  An empty operator token fails closed (403), so an
+# unprovisioned operator credential means no operator-only surface is
+# reachable.  The operator-gated reporting read API (issue #484) is the
+# sanctioned read path for delivery payload and the state trail — every other
+# route stays write-only.
 
 
 async def require_operator_token(request: Request) -> str:
     """FastAPI dependency — validate the dedicated operator bearer token.
+
+    The token is read from the dedicated ``X-Operator-Token`` header (never
+    ``Authorization``), so it cannot collide with the Admin API Key consumed
+    by ``ApiKeyMiddleware``.
 
     Raises:
         HTTPException(403): ``GATEWAY_OPERATOR_TOKEN`` is not configured
@@ -65,14 +74,13 @@ async def require_operator_token(request: Request) -> str:
             detail="Operator access is not configured",
         )
 
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    token = request.headers.get("X-Operator-Token", "").strip()
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid Authorization header",
+            detail="Missing or invalid X-Operator-Token header",
         )
 
-    token = auth_header.removeprefix("Bearer ").strip()
     if not hmac.compare_digest(token, settings.operator_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

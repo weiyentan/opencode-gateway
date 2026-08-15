@@ -8087,14 +8087,14 @@ class TestOperatorOnlyAccess:
 
     @pytest.mark.asyncio
     async def test_operator_token_wrong_token_rejected(self, monkeypatch):
-        """A non-operator bearer token is rejected with 401."""
+        """A wrong token on the ``X-Operator-Token`` header is rejected with 401."""
         from fastapi import HTTPException
 
         from app.api.ingest import require_operator_token
 
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
         request = MagicMock()
-        request.headers = {"Authorization": "Bearer wrong-token"}
+        request.headers = {"X-Operator-Token": "wrong-token"}
 
         with pytest.raises(HTTPException) as exc:
             await require_operator_token(request)
@@ -8103,12 +8103,12 @@ class TestOperatorOnlyAccess:
 
     @pytest.mark.asyncio
     async def test_operator_token_accepted(self, monkeypatch):
-        """The correct operator token passes and is returned."""
+        """The correct operator token on its dedicated header passes and is returned."""
         from app.api.ingest import require_operator_token
 
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
         request = MagicMock()
-        request.headers = {"Authorization": "Bearer op-secret"}
+        request.headers = {"X-Operator-Token": "op-secret"}
 
         result = await require_operator_token(request)
 
@@ -8117,7 +8117,8 @@ class TestOperatorOnlyAccess:
     @pytest.mark.asyncio
     async def test_operator_token_is_distinct_from_admin_key(self, monkeypatch):
         """The operator token is a dedicated credential — the Admin API Key
-        does NOT satisfy the operator-only gate (no shared tokens)."""
+        value presented on the operator header does NOT satisfy the
+        operator-only gate (no shared tokens)."""
         from fastapi import HTTPException
 
         from app.api.ingest import require_operator_token
@@ -8125,7 +8126,7 @@ class TestOperatorOnlyAccess:
         monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
         monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
         request = MagicMock()
-        request.headers = {"Authorization": "Bearer admin-secret"}
+        request.headers = {"X-Operator-Token": "admin-secret"}
 
         with pytest.raises(HTTPException) as exc:
             await require_operator_token(request)
