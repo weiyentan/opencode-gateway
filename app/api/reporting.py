@@ -50,6 +50,7 @@ from typing import Any
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.api.ingest import require_operator_token
 from app.core.config import get_settings
 from app.core.schemas.reporting import (
     ReportingSessionLink,
@@ -384,6 +385,7 @@ async def _fetch_session_links(
 @router.get("/resources")
 async def list_resources(
     request: Request,
+    _operator_token: str = Depends(require_operator_token),
     provider: str | None = Query(default=None),
     repository_url: str | None = Query(default=None),
     resource_type: str | None = Query(default=None),
@@ -392,7 +394,12 @@ async def list_resources(
     offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[ResourceSummary]:
-    """List ingested resources, filterable by stable resource identity."""
+    """List ingested resources, filterable by stable resource identity.
+
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
+    top of the global ``ApiKeyMiddleware`` — delivery payload is an
+    operator-only read surface (no broad read).
+    """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_resources(
@@ -410,13 +417,19 @@ async def list_resources(
 @router.get("/resources/detail")
 async def get_resource_detail(
     request: Request,
+    _operator_token: str = Depends(require_operator_token),
     provider: str = Query(...),
     repository_url: str = Query(...),
     resource_type: str = Query(...),
     resource_number: str = Query(...),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ResourceDetail:
-    """Return the full detail for one resource addressed by stable identity."""
+    """Return the full detail for one resource addressed by stable identity.
+
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
+    top of the global ``ApiKeyMiddleware`` — delivery payload is an
+    operator-only read surface (no broad read).
+    """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         detail = await _fetch_resource_detail(
@@ -441,11 +454,17 @@ async def get_resource_detail(
 @router.get("/session-links")
 async def list_session_links(
     request: Request,
+    _operator_token: str = Depends(require_operator_token),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[ReportingSessionLink]:
-    """List session links (provisional until exact correlation #481 lands)."""
+    """List session links (provisional until exact correlation #481 lands).
+
+    Requires the dedicated operator token (``GATEWAY_OPERATOR_TOKEN``) on
+    top of the global ``ApiKeyMiddleware`` — delivery payload is an
+    operator-only read surface (no broad read).
+    """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_session_links(

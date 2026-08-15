@@ -49,9 +49,19 @@ prefix `/api/v1/reporting`) with three `GET` endpoints:
    with an empty `source_references` list.
 
 The surface follows the `app/api/afk_outcomes.py` conventions: raw asyncpg
-via `Depends(get_session)`, the `{status, data, error}` envelope, global
-`ApiKeyMiddleware` auth, and the `_db_timeout` / `_request_timeout`
-helpers.
+via `Depends(get_session)`, the `{status, data, error}` envelope, and the
+`_db_timeout` / `_request_timeout` helpers.
+
+### Operator-token gating (no broad read)
+
+Delivery payload and the state trail are **operator-only** data (issue
+#483, ADR 0020). All three reporting `GET` endpoints therefore require the
+dedicated operator token (`GATEWAY_OPERATOR_TOKEN`) via the
+`require_operator_token` dependency — an **additional** gate on top of the
+global `ApiKeyMiddleware` (`GATEWAY_API_KEY`). An empty operator token
+fails closed (403), and the Admin API Key never satisfies the operator
+gate. The reporting read API is the *sanctioned* read path for delivery
+payload and the state trail; no other route reads those tables back out.
 
 ### Stable resource identity
 
@@ -93,8 +103,12 @@ write path remains `app/api/reporting_ingest.py` (issue #479).
 
 ## Consequences
 
-- Aurora Glass consumes the new `GET /api/v1/reporting/*` endpoints (frontend
-  views are a later phase — out of scope for this slice).
+- Aurora Glass consumes the new `GET /api/v1/reporting/*` endpoints
+  (frontend views are a later phase — out of scope for this slice) and must
+  present the operator token (`GATEWAY_OPERATOR_TOKEN`) on those requests.
+- Delivery payload and the state trail are readable **only** through this
+  operator-gated surface; every other route that touches
+  `reporting_deliveries` / `delivery_state_trails` is write-only.
 - When #480 merges, the resource list/detail read queries can switch from
   delivery-derived aggregation to `reporting_resource_aggregates` without
   changing the `ResourceSummary` shape (`payload`, `last_delivery_id`,

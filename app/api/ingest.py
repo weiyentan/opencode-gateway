@@ -42,10 +42,9 @@ KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
 # (``GATEWAY_OPERATOR_TOKEN``), distinct from the Admin API Key
 # (``GATEWAY_API_KEY``) and from per-client collector credentials.  An empty
 # operator token fails closed (403), so an unprovisioned operator credential
-# means no operator-only surface is reachable.  Today no operator-only read
-# surface is registered — the write-only ingestion surfaces below store
-# delivery payload but never read it back — which is the "no broad read"
-# invariant.
+# means no operator-only surface is reachable.  The operator-gated reporting
+# read API (issue #484) is the sanctioned read path for delivery payload and
+# the state trail — every other route stays write-only.
 
 
 async def require_operator_token(request: Request) -> str:

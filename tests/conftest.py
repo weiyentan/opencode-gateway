@@ -27,6 +27,12 @@ from app.db.session import get_session
 _TEST_API_KEY = "test-api-key"
 os.environ.setdefault("GATEWAY_API_KEY", _TEST_API_KEY)
 
+# The operator token gates operator-only read surfaces (issue #483).  In the
+# test harness both the Admin API Key and the operator token default to the
+# same value so a single ``Authorization: Bearer test-api-key`` header passes
+# both gates; distinctness is asserted separately in the operator-gate tests.
+os.environ.setdefault("GATEWAY_OPERATOR_TOKEN", _TEST_API_KEY)
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Core helpers
 # ══════════════════════════════════════════════════════════════════════════

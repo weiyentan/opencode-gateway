@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import AsyncClient
 
-from tests.conftest import mock_row
+from tests.conftest import create_client, mock_row
 
 # ── Shared test data ────────────────────────────────────────────────────────
 
@@ -209,6 +209,157 @@ class TestAuth:
 
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Operator gate (delivery payload is an operator-only read surface, #483)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestOperatorGate:
+    """The reporting read surface requires the dedicated operator token.
+
+    Delivery payload and the state trail are operator-only (issue #483):
+    ``require_operator_token`` is an ADDITIONAL gate on top of the global
+    ``ApiKeyMiddleware``.  The operator token is distinct from the Admin
+    API Key — the Admin API Key alone never satisfies the operator gate.
+    """
+
+    _OPERATOR_TOKEN = "op-secret"
+
+    @pytest.mark.asyncio
+    async def test_operator_token_unset_fails_closed(
+        self, client: AsyncClient, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An empty GATEWAY_OPERATOR_TOKEN → 403 (no operator-only access)."""
+        monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "FORBIDDEN"
+
+    @pytest.mark.asyncio
+    async def test_admin_api_key_does_not_satisfy_operator_gate(
+        self, client: AsyncClient, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The Admin API Key alone (distinct operator token) → 401."""
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        # `client` carries ``Authorization: Bearer test-api-key`` (the Admin
+        # API Key), which passes ApiKeyMiddleware but NOT the operator gate.
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.asyncio
+    async def test_valid_operator_token_accepted(
+        self, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A request carrying the operator token passes the operator gate.
+
+        The single-header test harness sets both credentials to the same
+        test value here; distinctness is asserted by the dependency-level
+        test below and by ``test_admin_api_key_does_not_satisfy_operator_gate``.
+        """
+        monkeypatch.setenv("GATEWAY_API_KEY", self._OPERATOR_TOKEN)
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        client = create_client(mock_conn, api_key=self._OPERATOR_TOKEN)
+        async with client as c:
+            response = await c.get("/api/v1/reporting/resources")
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path,params",
+        [
+            ("/api/v1/reporting/resources", None),
+            ("/api/v1/reporting/resources/detail", _identity_params()),
+            ("/api/v1/reporting/session-links", None),
+        ],
+    )
+    async def test_no_reporting_route_reachable_without_operator_token(
+        self,
+        client: AsyncClient,
+        mock_conn: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        params: dict | None,
+    ):
+        """Guard: no reporting read route is reachable without the operator token."""
+        monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+        mock_conn.fetchval = AsyncMock(return_value=0)
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(path, params=params)
+
+        # Fail-closed: an unprovisioned operator token means no read surface.
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_all_three_routes_require_operator_token(
+        self, mock_conn: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ):
+        """No reporting read route is reachable without the operator token."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+        request = MagicMock()
+        request.headers = {}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_require_operator_token_wrong_token_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A non-operator bearer token is rejected with 401."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer wrong-token"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_require_operator_token_distinct_from_admin_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The operator token is a dedicated credential — the Admin API Key
+        does NOT satisfy the operator-only gate (no shared tokens)."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", self._OPERATOR_TOKEN)
+        monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+        request = MagicMock()
+        request.headers = {"Authorization": "Bearer admin-secret"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+        assert exc.value.status_code == 401
 
 
 # ══════════════════════════════════════════════════════════════════════════
