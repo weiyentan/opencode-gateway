@@ -48,7 +48,7 @@ from typing import Any
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from app.api.ingest import require_operator_token
+from app.core.auth import require_operator_token
 from app.core.config import get_settings
 from app.core.schemas.reporting import (
     ReportingSessionLink,

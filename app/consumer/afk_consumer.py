@@ -1397,8 +1397,58 @@ async def _main() -> None:
         await consumer.stop()
 
 
+# Known no-value (boolean) flags.  A ``--dlq-sweep`` token immediately
+# following one of these is a genuine mode switch, never a value.
+_NO_VALUE_FLAGS = frozenset({"--dry-run"})
+
+
+def _looks_like_value_taking_flag(token: str) -> bool:
+    """True when ``token`` is plausibly a flag that consumes a following value.
+
+    Used to avoid mistaking a literal ``--dlq-sweep`` that is actually the
+    *value* of some other option (``--future-option --dlq-sweep``) for the mode
+    switch.  Any token that starts with ``-`` and is not a known no-value flag
+    is assumed to take a value.
+    """
+    return token.startswith("-") and token not in _NO_VALUE_FLAGS
+
+
+def _parse_cli(argv: list[str]) -> tuple[bool, list[str]]:
+    """Dispatch the CLI between consumer mode and ``--dlq-sweep`` mode.
+
+    Returns ``(is_sweep, remaining)``: ``is_sweep`` is True when the
+    ``--dlq-sweep`` flag was given, and ``remaining`` is the argument list the
+    chosen mode handler should see — the original ``argv`` minus ``--dlq-sweep``
+    itself, with every other argument (including the sweep's own
+    ``--batch-size`` / ``--limit`` / ``--dry-run`` flags) preserved verbatim for
+    the handler to re-parse.
+
+    ``--dlq-sweep`` is parsed as a genuine argparse flag (``allow_abbrev=False``)
+    so it can never be silently consumed as the value of another option.
+    Because ``parse_known_args`` cannot know an *unknown* option's arity, a
+    literal ``--dlq-sweep`` that is actually the value of a preceding option
+    (``["--future-option", "--dlq-sweep"]``) is still recognized as a flag.  We
+    therefore honor it as the mode switch only when it is NOT plausibly a value:
+    i.e. it is the first argument, or it is preceded by a known no-value flag
+    (``--dry-run``) or by a plain value.  Otherwise the whole ``argv`` is
+    treated as consumer-mode arguments, unchanged.
+    """
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--dlq-sweep", action="store_true", dest="dlq_sweep")
+    args, remaining = parser.parse_known_args(argv)
+    if not args.dlq_sweep:
+        return False, remaining
+    for i, token in enumerate(argv):
+        if token == "--dlq-sweep":
+            if i == 0 or not _looks_like_value_taking_flag(argv[i - 1]):
+                return True, remaining
+            break
+    return False, argv
+
+
 if __name__ == "__main__":
-    if "--dlq-sweep" in sys.argv:
-        sys.argv.remove("--dlq-sweep")
+    is_sweep, remaining = _parse_cli(sys.argv[1:])
+    sys.argv = [sys.argv[0], *remaining]
+    if is_sweep:
         sys.exit(asyncio.run(_main_dlq_sweep()))
     asyncio.run(_main())

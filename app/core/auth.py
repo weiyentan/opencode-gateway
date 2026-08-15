@@ -210,3 +210,59 @@ async def require_collector_token(
         "credential_id": str(row["credential_id"]),
         "client_name": row["client_name"],
     }
+
+
+# ── Operator token auth dependency ─────────────────────────────────────────
+#
+# Delivery payload and DLQ data are restricted to operators: no broad read is
+# possible.  ``require_operator_token`` is the enforcement gate for any
+# operator-only read surface — it validates a DEDICATED operator bearer token
+# (``GATEWAY_OPERATOR_TOKEN``), distinct from the Admin API Key
+# (``GATEWAY_API_KEY``) and from per-client collector credentials.  The token
+# is transported on the dedicated ``X-Operator-Token`` header (NOT
+# ``Authorization``), precisely so it cannot collide with the Admin API Key
+# consumed by ``ApiKeyMiddleware`` — a single HTTP request can carry only one
+# ``Authorization: Bearer <token>`` header, so the operator credential must
+# ride a separate channel.  An empty operator token fails closed (403), so an
+# unprovisioned operator credential means no operator-only surface is
+# reachable.  The operator-gated reporting read API (issue #484) is the
+# sanctioned read path for delivery payload and the state trail — every other
+# route stays write-only.
+
+
+async def require_operator_token(request: Request) -> str:
+    """FastAPI dependency — validate the dedicated operator bearer token.
+
+    The token is read from the dedicated ``X-Operator-Token`` header (never
+    ``Authorization``), so it cannot collide with the Admin API Key consumed
+    by ``ApiKeyMiddleware``.
+
+    Raises:
+        HTTPException(403): ``GATEWAY_OPERATOR_TOKEN`` is not configured
+            (operator-only access is disabled — fail closed).
+        HTTPException(401): the request lacks a valid operator token.
+
+    Returns:
+        The validated operator token (the caller may ignore it).
+    """
+    settings = get_settings()
+    if not settings.operator_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator access is not configured",
+        )
+
+    token = request.headers.get("X-Operator-Token", "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-Operator-Token header",
+        )
+
+    if not hmac.compare_digest(token, settings.operator_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid operator token",
+        )
+
+    return token

@@ -39,6 +39,7 @@ from app.consumer.afk_consumer import (
     ProviderEventMessage,
     _build_adapter,
     _lenient_dlq_deserializer,
+    _parse_cli,
     build_dlq_payload,
     build_escalation_payload,
     classify_dlq_message,
@@ -2282,3 +2283,34 @@ async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> N
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert dlq_payload["reason"]
     assert dlq_payload["payload"] == {"raw": "not valid json at all"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CLI dispatch (PR #492 review) — _parse_cli
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--dlq-sweep"], (True, [])),
+        (["--dlq-sweep", "--batch-size", "50"], (True, ["--batch-size", "50"])),
+        (["--batch-size", "50", "--dlq-sweep"], (True, ["--batch-size", "50"])),
+        (["--dlq-sweep", "--dry-run", "--limit", "5"], (True, ["--dry-run", "--limit", "5"])),
+        ([], (False, [])),
+        (["--some-future-flag", "x"], (False, ["--some-future-flag", "x"])),
+        # A literal "--dlq-sweep" that is the VALUE of another option must not
+        # trigger sweep mode (the reviewer's fragility scenario).
+        (
+            ["--future-option", "--dlq-sweep"],
+            (False, ["--future-option", "--dlq-sweep"]),
+        ),
+    ],
+)
+def test_parse_cli(argv: list[str], expected: tuple[bool, list[str]]) -> None:
+    """``_parse_cli`` detects ``--dlq-sweep`` as a flag, never as a value.
+
+    The sweep's own flags flow through ``remaining`` unchanged; a literal
+    ``--dlq-sweep`` positioned as another option's value does not switch mode.
+    """
+    assert _parse_cli(argv) == expected
