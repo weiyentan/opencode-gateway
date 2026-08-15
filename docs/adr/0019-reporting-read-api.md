@@ -58,7 +58,10 @@ Delivery payload and the state trail are **operator-only** data (issue
 #483, ADR 0020). All three reporting `GET` endpoints therefore require the
 dedicated operator token (`GATEWAY_OPERATOR_TOKEN`) via the
 `require_operator_token` dependency — an **additional** gate on top of the
-global `ApiKeyMiddleware` (`GATEWAY_API_KEY`). An empty operator token
+global `ApiKeyMiddleware` (`GATEWAY_API_KEY`). The operator token is read
+from the dedicated `X-Operator-Token` header (never `Authorization`, which
+carries the Admin API Key), so a client presents both credentials on the
+same request and both gates are satisfiable. An empty operator token
 fails closed (403), and the Admin API Key never satisfies the operator
 gate. The reporting read API is the *sanctioned* read path for delivery
 payload and the state trail; no other route reads those tables back out.
@@ -105,7 +108,8 @@ write path remains `app/api/reporting_ingest.py` (issue #479).
 
 - Aurora Glass consumes the new `GET /api/v1/reporting/*` endpoints
   (frontend views are a later phase — out of scope for this slice) and must
-  present the operator token (`GATEWAY_OPERATOR_TOKEN`) on those requests.
+  present the operator token (`GATEWAY_OPERATOR_TOKEN`) on those requests,
+  via the dedicated `X-Operator-Token` header.
 - Delivery payload and the state trail are readable **only** through this
   operator-gated surface; every other route that touches
   `reporting_deliveries` / `delivery_state_trails` is write-only.

@@ -111,16 +111,16 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
-| `GATEWAY_AFK_OUTCOMES_MAX_RETRIES` | `5` | AFK outcome consumer reliability (issue #482): total persistence attempts before a message is DLQ'd |
+| `GATEWAY_AFK_OUTCOMES_MAX_RETRIES` | `5` | AFK outcome consumer reliability (issue #482): total persistence attempts before a message is DLQ'd (min 1 — 0 or negative is rejected) |
 | `GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS` | `1.0` | Initial inter-attempt delay (seconds) for the bounded exponential backoff with jitter |
 | `GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS` | `60.0` | Upper cap (seconds) on the exponential backoff delay |
-| `GATEWAY_RETENTION_AFK_AGGREGATES_DAYS` | `0` | Retention tier (ADR 0020): aggregates (`afk_runs`, `afk_run_sessions`) — `0` = never swept (indefinite) |
-| `GATEWAY_RETENTION_AFK_METADATA_DAYS` | `365` | Retention tier (ADR 0020): metadata — 12 months |
-| `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0020): redacted payload storage |
-| `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0020): DLQ operational max — strictly older records are escalated to `afk.events-dlq-expired` |
+| `GATEWAY_RETENTION_AFK_AGGREGATES_DAYS` | `0` | Retention tier (ADR 0020): aggregates (`afk_runs`, `afk_run_sessions`) — `0` = never swept (indefinite); min 0 — negatives are rejected |
+| `GATEWAY_RETENTION_AFK_METADATA_DAYS` | `365` | Retention tier (ADR 0020): metadata — 12 months; min 0 (`0` = never swept) |
+| `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0020): redacted payload storage; min 0 (`0` = never swept) |
+| `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0020): DLQ operational max — strictly older records are escalated to `afk.events-dlq-expired`; min 0 (`0` = never swept) |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
-| `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0020). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed when unset — no operator-only surface (delivery payload, DLQ) is reachable |
+| `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0020). Presented in the dedicated `X-Operator-Token` header (never `Authorization`, which carries the Admin API Key). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed (403) when unset — no operator-only surface (delivery payload, DLQ) is reachable |
 | `GATEWAY_TOOL_PAYLOAD_MAX_CHARS` | `4096` | Execution transcript (ADR 0016): per-field character cap for tool input/output payloads stored in `observed_tool_calls` (truncated at ingest; verbatim content stays in `observed_parts`) |
 | `GATEWAY_PART_DATA_MAX_CHARS` | `65536` | Execution transcript (ADR 0016): verbatim character cap for `message`/`part` payloads stored in the `data` JSONB column (truncated at ingest with a `truncated` marker) |
 
@@ -278,8 +278,11 @@ endpoints additionally require the dedicated operator token
 (`GATEWAY_OPERATOR_TOKEN`, via `require_operator_token`) **on top of** the
 Admin API Key — delivery payload and state trails are an operator-only read
 surface, and the gate fails closed when the operator token is unprovisioned.
-The reporting write path remains `app/api/reporting_ingest.py`; the read
-router never writes.
+The operator token is presented in the dedicated `X-Operator-Token` header
+(never `Authorization`, which carries the Admin API Key), so the two
+credentials can be distinct and both gates are satisfiable on the same
+request. The reporting write path remains `app/api/reporting_ingest.py`; the
+read router never writes.
 
 ### AFK Outcomes
 
@@ -340,7 +343,16 @@ The AFK outcome DLQ (`afk.events-dlq`) is bounded by an **operational max**
 stamped with `dead_lettered_at` and `max_age_days` at producer time; the DLQ
 sweep escalates records **strictly older** than the max to the durable
 `afk.events-dlq-expired` escalation topic (original payload + reason +
-`escalated_at`), so expired records are never silently lost. Physical removal
+`dead_lettered_at` + deterministic `escalation_key` + `escalation_reason`),
+so expired records are never silently lost. Escalation content is
+content-stable: the `escalation_key` is a deterministic SHA-256 over the DLQ
+record's own identity, so re-escalating the same record produces an
+identical record (deduplicable by natural key). In write mode the sweep
+commits consumed Kafka offsets after each chunk — for each partition at its
+first retained (not-yet-expired) record's offset, or past the last consumed
+record when the partition has no retained records — so re-runs do **not**
+re-escalate already-escalated records, while retained records are re-examined
+on later runs until they expire. Dry-run never commits. Physical removal
 from the active DLQ is enforced by the topic's Kafka retention configured to
 the same max age.
 
@@ -371,7 +383,10 @@ age and is retained (never prematurely expired).
 DLQ) via the `require_operator_token` dependency. It is a dedicated operator
 bearer token, **distinct** from the Admin API Key (`GATEWAY_API_KEY`) and
 from per-client Collector Credentials — the Admin API Key does not satisfy
-the operator gate. An empty operator token **fails closed**: no operator-only
+the operator gate. It is transported in the dedicated `X-Operator-Token`
+header (never `Authorization`, which carries the Admin API Key), so a client
+presents the operator token alongside the Admin API Key and both gates are
+satisfiable. An empty operator token **fails closed** (403): no operator-only
 surface is reachable (no broad read). Delivery payload and state trails are
 readable **only** through the operator-gated reporting read API (ADR 0019,
 issue #484): `require_operator_token` is registered on

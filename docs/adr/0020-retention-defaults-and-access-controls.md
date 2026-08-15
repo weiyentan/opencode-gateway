@@ -59,9 +59,17 @@ cooperating parts:
    `python -m app.consumer.afk_consumer --dlq-sweep`) consumes the DLQ in
    bounded batches (`--batch-size`, `--limit`), classifies each record, and
    **escalates** records strictly older than the operational max by publishing
-   an escalation record (original payload + reason + `escalated_at` +
-   `escalation_reason`) to `afk.events-dlq-expired`.  A `--dry-run` reports
-   the would-be-escalated records without publishing.  Physical removal from
+   an escalation record (original payload + reason + `dead_lettered_at` +
+   deterministic `escalation_key` + `escalation_reason`) to
+   `afk.events-dlq-expired`.  The `escalation_key` is a SHA-256 natural key
+   over the DLQ record's own identity, so escalation content is stable and
+   deduplicable.  In write mode the sweep commits consumed Kafka offsets after
+   each chunk — for each partition at its first retained (not-yet-expired)
+   record's offset, or past the last consumed record when the partition has no
+   retained records — so re-runs do **not** re-escalate already-escalated
+   records, while retained records are re-examined on subsequent runs until
+   they age past the operational max.  A `--dry-run` reports the would-be-escalated
+   records without publishing and never commits.  Physical removal from
    the DLQ is enforced by the topic's Kafka retention configured to the same
    max age; the escalation topic is the durable operator record, so nothing is
    ever silently lost.
@@ -91,8 +99,11 @@ token":
   `delivery_state_trails` / `delivery_log` / `engineering_events.payload`
   back out.  Broad read is therefore impossible.
 * **Operator-only gate** — `require_operator_token` (`app/api/ingest.py`)
-  validates `GATEWAY_OPERATOR_TOKEN` and **fails closed** (403) when no
-  operator token is configured.  It is registered on the three reporting
+  validates `GATEWAY_OPERATOR_TOKEN`, read from the dedicated
+  `X-Operator-Token` header (never `Authorization`, which carries the Admin
+  API Key, so the two credentials are distinct and both gates are
+  satisfiable), and **fails closed** (403) when no operator token is
+  configured.  It is registered on the three reporting
   read routes (ADR 0019) — the single sanctioned read path for delivery
   payload and the state trail — and remains the enforcement primitive for
   any future operator-only read surface.

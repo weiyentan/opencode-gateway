@@ -407,10 +407,14 @@ provisioned collector token that also matches `GATEWAY_API_KEY`.
 The `GATEWAY_OPERATOR_TOKEN` environment variable. A dedicated operator
 bearer token, DISTINCT from the Admin API Key (`GATEWAY_API_KEY`) and from
 per-client Collector Credentials, that gates operator-only read surfaces
-(delivery payload, DLQ) via the `require_operator_token` dependency. An
-empty operator token fails closed — no operator-only surface is reachable
-(no broad read). Delivery payload and state trails are readable **only**
-through the operator-gated Reporting Read API (issue #484, ADR 0021), which
+<<<<<<< HEAD
+(delivery payload, DLQ) via the `require_operator_token` dependency. It is
+transported in the dedicated `X-Operator-Token` header on operator-only read
+requests — never `Authorization`, which carries the Admin API Key — so the
+two credentials are distinct and both gates are satisfiable on the same
+request. An empty operator token fails closed — no operator-only surface is
+reachable (no broad read). Delivery payload and state trails are readable
+**only** through the operator-gated Reporting Read API (issue #484, ADR 0021), which
 is the sanctioned read path for those tables; every other route touching
 them is write-only. The Admin API Key does not satisfy the operator gate;
 the three credential types are never shared across pipelines.
@@ -456,9 +460,17 @@ growing unbounded (issue #483, ADR 0022). Every DLQ record is stamped with
 older than `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` (default 30 days) are
 **escalated** by the DLQ sweep (`python -m app.consumer.afk_consumer
 --dlq-sweep`) to `afk.events-dlq-expired`, preserving the original payload
-+ reason for operator resolution. Escalation is append-only and idempotent
-by content; physical removal is enforced by the DLQ topic's Kafka retention
-configured to the same max age. A record without a usable
++ reason + `dead_lettered_at` + a deterministic `escalation_key` +
+`escalation_reason` for operator resolution. Escalation records are
+content-stable: the `escalation_key` is a SHA-256 natural key over the DLQ
+record's own identity, so the same record always escalates to an identical
+record (deduplicable by content). The sweep commits consumed offsets in
+write mode — per partition at its first retained (not-yet-expired) record's
+offset, or past the last consumed record when none are retained — so re-runs
+do **not** re-escalate already-escalated records, while retained records are
+re-examined on later runs until they age past the operational max; dry-run
+never commits. Physical removal is enforced by the DLQ topic's Kafka
+retention configured to the same max age. A record without a usable
 `dead_lettered_at` has unknown age and is retained.
 _Avoid_: unbounded DLQ growth, silently dropping poison messages
 
@@ -691,7 +703,7 @@ _Avoid_: Legacy provider event (when the normalized shape is meant)
 **Mapping Bridge**:
 The Stage-2 addition to the AFK Outcome Consumer's `map_provider_event` that
 bridges a **Normalized Provider Event** into the outcome layer's canonical
-vocabulary (ADR 0018): `issue` → `issue`; `pull_request` and `merge_request`
+vocabulary (ADR 0020): `issue` → `issue`; `pull_request` and `merge_request`
 → `change_request`. `action` becomes the canonical event-type suffix, and the
 result is validated against the locked canonical vocabulary — an unknown
 resource type or action returns unmappable and is DLQ'd, never persisted and
@@ -896,7 +908,7 @@ manages.
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
 - An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
-- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0018)
+- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0020)
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary

@@ -11,7 +11,10 @@ pinning and replay convergence
 routing; re-delivery of the same `provider + delivery_id` converges on
 identical `delivery_log`/`engineering_events` rows regardless of order; and a
 contract-violating payload routes to `afk.events-dlq` with the original payload
-plus a reason. Real-history validation is limited to a read-only cross-check in
+plus a reason. Contract pinning is exercised with fixture normalized events and
+mock records driving the consumer `_process_message` path — not live producer
+emission (the cross-repo producer is GitLab-hosted and unreachable in this
+environment). Real-history validation is limited to a read-only cross-check in
 this environment (no docker/Postgres, no `GITHUB_TOKEN`) — the full live-run
 harness is provided in §6.
 
@@ -68,8 +71,14 @@ or an `action` that does not resolve to a canonical event type is unmappable.
 
 - `test_producer_contract_event_has_exact_fields` — the field set is exact; a
   contract change must fail this test rather than drift silently.
-- `test_producer_contract_maps_to_canonical_change_request` — every field is
-  carried through to the canonical `change_request` entity/event.
+- `test_producer_contract_maps_to_canonical_change_request` — the mapped
+  canonical `change_request` retains the normalized event's key identity and
+  payload fields: `provider`, `repository`, the resource identity
+  (`entity_type` from `resource_type`, `entity_id`/`number` from
+  `resource_id`), the canonical `event_type` (from `action`), `occurred_at`,
+  `actor`, and a `payload_ref` payload reference (never the payload itself).
+  Producer-internal fields (`delivery_id`, `ingested_at`, `schema_version`)
+  are not carried onto the canonical entity/event.
 - `test_producer_contract_event_is_not_routed_to_dlq` — the full consumer path
   persists the contract event and **never** calls `send_and_wait` (no DLQ).
 - `test_producer_contract_gitlab_merge_request_maps_to_change_request` —
@@ -166,11 +175,14 @@ here for three reasons, each outside the slice's control:
 3. No `GITHUB_TOKEN`/`GITLAB_TOKEN` — the provider adapters' live fetches cannot
    run.
 
-The replay/redelivery logic was nonetheless validated against a real Postgres in
-this environment via a standalone harness that drives the same consumer
-`_process_message` path against the real `delivery_log`/`engineering_events`
-dedup constraints — live-then-replay, replay-then-live, and redelivery all
-converged to one delivery row + one event row (see §3).
+The replay/redelivery convergence logic is validated by the replay-convergence
+integration tests in `tests/integration/test_afk_consumer.py` (§3), which drive
+the real consumer `_process_message` path against the real
+`delivery_log`/`engineering_events` dedup constraints — live-then-replay,
+replay-then-live, and redelivery all converge to one delivery row + one event
+row. Those tests require the `docker-compose.test.yml` Postgres and therefore
+skip in this environment; no standalone real-Postgres validation was performed
+here.
 
 ## 6. Live-run harness (for environments with docker + credentials)
 
