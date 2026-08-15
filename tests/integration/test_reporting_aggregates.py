@@ -460,6 +460,75 @@ async def test_three_event_merge_converges_across_arrival_orders(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_none_key_merge_converges_across_arrival_orders(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """F1-residual: a ``None``-valued key never makes the merge arrival-order dependent.
+
+    ``e1`` (oldest) carries ``{a: None}``, ``e2`` (newest) carries
+    ``{b: 1}``, ``e3`` (mid) carries ``{a: 7}``.  Before the fix, the order
+    ``e1,e2,e3`` persisted ``a`` as ``None`` and then rejected ``e3``'s real
+    ``a=7`` (the aggregate's global last event had advanced to ``e2``),
+    yielding ``{a: None, b: 1}`` while other orders yielded ``{a: 7, b: 1}``.
+    After the fix every order converges to ``{a: 7, b: 1}`` (``a`` written by
+    ``e3``, ``b`` by ``e2``).
+    """
+    async with db_pool.acquire() as conn:
+        await _seed_client(conn)
+
+    e1 = {"occurred_at": _T1, "extra": {"a": None}}
+    e2 = {"occurred_at": _T2, "extra": {"b": 1}}
+    e3 = {"occurred_at": _T1_5, "extra": {"a": 7}}
+
+    def _resource_for(number: str) -> dict:
+        return _resource(
+            repository_url="https://github.com/acme/backend",
+            resource_type="pull_request",
+            resource_number=number,
+        )
+
+    client = _build_app(db_pool)
+    async with client as c:
+        for i, order in enumerate(itertools.permutations([e1, e2, e3])):
+            number = f"conv-none-{i}"
+            for ev in order:
+                # ``_make_payload`` merges ``extra`` verbatim, so ``a: None``
+                # round-trips as JSON null into ``ReportingDeliveryIn.payload``
+                # (a genuinely-present ``None``-valued key, not an omitted key).
+                await c.post(
+                    "/api/v1/reporting/ingest/deliveries",
+                    json=_make_payload(
+                        delivery_id=f"d-{i}-{uuid.uuid4()}",
+                        occurred_at=ev["occurred_at"],
+                        resource=_resource_for(number),
+                        extra=ev["extra"],
+                    ),
+                )
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT payload, last_occurred_at FROM reporting_resource_aggregates "
+            "WHERE resource_number LIKE 'conv-none-%' ORDER BY resource_number"
+        )
+
+    assert len(rows) == 6
+
+    # The ``resource`` object is the aggregate identity and therefore carries
+    # a different ``resource_number`` per permutation; strip it so the *state*
+    # portion of each row can be compared for convergence.
+    def _without_resource(payload: dict) -> dict:
+        return {k: v for k, v in payload.items() if k != "resource"}
+
+    first = _without_resource(rows[0]["payload"])
+    first_last_occurred_at = rows[0]["last_occurred_at"]
+    assert first == {"a": 7, "b": 1}
+    for row in rows:
+        assert _without_resource(row["payload"]) == first
+        assert row["last_occurred_at"] == first_last_occurred_at
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_unique_identity_constraint_enforced(db_pool: asyncpg.Pool) -> None:
     """A second direct INSERT of the same identity key is rejected."""
     async with db_pool.acquire() as conn:
