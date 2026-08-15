@@ -40,7 +40,8 @@ Two properties drive the design:
    must produce identical associations regardless of delivery order, and the
    same explicit reference converging on the same association must never
    duplicate a row. The association path therefore keys on the stable resource
-   identity plus the session identity, and writes with pure conflict-ignore.
+   identity plus the session identity, and writes with a conflict update that
+   advances `last_seen_at` (recency) without re-merging `source_reference`.
 
 ## Decision
 
@@ -97,15 +98,16 @@ the named field yields the same resource — and is the association-path
 counterpart of the correlation engine's `correlation_method`/`evidence`,
 recording *where the link came from in the session* rather than a scoring rule.
 
-### 4. Idempotency via `UNIQUE` + `ON CONFLICT DO NOTHING`
+### 4. Idempotency via `UNIQUE` + conflict-update recency
 
 `AsyncpgOutcomeRepository.save_associations` inserts with
 `ON CONFLICT (provider, repository, resource_type, resource_number,
-external_session_id) DO NOTHING`. The same explicit reference converging on the
-same association never duplicates a row, and `source_reference` provenance is
-written once with the first insert and never re-merged. Pure conflict-ignore
-inserts need no advisory lock (there is no read-modify-write), unlike the AFK
-enrich-only upsert paths.
+external_session_id) DO UPDATE SET last_seen_at = now()`. The same explicit
+reference converging on the same association never duplicates a row, but
+re-observation advances `last_seen_at` to track recency (consistent with the
+AFK enrich-only upsert convention). `source_reference` provenance is written
+once with the first insert and never re-merged. The single-statement write
+needs no advisory lock (there is still no read-modify-write).
 
 ### 5. Independent resolver version
 
@@ -157,8 +159,8 @@ engine, which must fall through to `temporal_inference`).
   session field carried the reference, and re-reading that field reproduces the
   link.
 - Deterministic and idempotent: identical metadata → identical associations,
-  replay converges to a single row (`UNIQUE` + `ON CONFLICT DO NOTHING`), no
-  double-counting.
+  replay converges to a single row (`UNIQUE` + conflict update advancing
+  `last_seen_at`), no double-counting.
 - The exact path structurally cannot produce a heuristic link — the input
   model excludes timestamps/windows/scores, so inference is impossible by
   construction, not by discipline.
@@ -178,4 +180,6 @@ engine, which must fall through to `temporal_inference`).
 - `source_reference` provenance is written once (first insert wins) and is not
   re-merged on later references; a session that gains a new reference field
   after the row exists will not update the stored provenance until a
-  re-derivation/re-write path is added.
+  re-derivation/re-write path is added. `last_seen_at`, by contrast, *is*
+  advanced on re-observation, so activity recency is tracked even though
+  provenance is not re-merged.

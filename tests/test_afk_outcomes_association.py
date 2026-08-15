@@ -13,8 +13,10 @@ Proves the acceptance criteria:
 * determinism: same session metadata -> same associations; no link is created
   without an explicit reference.
 
-Also verifies the repository write path persists associations idempotently
-(``INSERT ... ON CONFLICT DO NOTHING`` keyed on the resource+session identity).
+Also verifies the repository write path persists associations idempotently —
+``INSERT ... ON CONFLICT ... DO UPDATE SET last_seen_at = now()`` keyed on the
+resource+session identity — so a repeated reference never duplicates a row but
+advances ``last_seen_at`` on re-observation.
 """
 
 from __future__ import annotations
@@ -239,7 +241,11 @@ def _association_calls(conn: AsyncMock) -> list[tuple]:
     ]
 
 
-def test_save_associations_uses_conflict_ignore(mock_conn: AsyncMock) -> None:
+def test_save_associations_uses_conflict_update_advancing_last_seen_at(
+    mock_conn: AsyncMock,
+) -> None:
+    """The association insert is idempotent — never duplicates a row — but
+    advances ``last_seen_at`` on re-observation via a conflict update."""
     repo = AsyncpgOutcomeRepository(mock_conn)
     associations = [_assoc()]
 
@@ -254,8 +260,8 @@ def test_save_associations_uses_conflict_ignore(mock_conn: AsyncMock) -> None:
         "ON CONFLICT (provider, repository, resource_type, resource_number, external_session_id)"
         in sql
     )
-    assert "DO NOTHING" in sql
-    assert "DO UPDATE" not in sql
+    assert "DO UPDATE SET last_seen_at = now()" in sql
+    assert "DO NOTHING" not in sql
 
 
 def test_save_associations_persists_source_reference(mock_conn: AsyncMock) -> None:

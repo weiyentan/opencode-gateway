@@ -43,6 +43,8 @@ from afk_outcomes import (
     EngineeringOutcomeStatus,
     EntityType,
     Provider,
+    ReferenceSource,
+    ResourceSessionAssociation,
     RunEntityLink,
     RunStatus,
     UnresolvedCorrelation,
@@ -595,3 +597,120 @@ async def test_run_scoped_unique_constraint_exists_post_upgrade(
         assert present is True, (
             "uq_unresolved_correlations_entity_run_method must exist after 0027"
         )
+
+
+# ── Exact resource↔session associations (migration 0032) ─────────────────────
+
+
+def _make_association(
+    *,
+    external_session_id: str,
+    resource_type: EntityType,
+    resource_number: str,
+    source_reference: list[ReferenceSource] | None = None,
+) -> ResourceSessionAssociation:
+    return ResourceSessionAssociation(
+        external_session_id=external_session_id,
+        provider=Provider.GITHUB,
+        repository=REPO,
+        resource_type=resource_type,
+        resource_number=resource_number,
+        source_reference=source_reference or [],
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) -> None:
+    """Saving the same (resource, session) pair twice persists exactly one row.
+
+    The second save is an idempotent conflict update: it must not duplicate
+    the row, ``source_reference`` stays write-once (first insert wins), and
+    ``last_seen_at`` is advanced to track re-observation recency.
+    """
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+
+        first = _make_association(
+            external_session_id="ses_assoc_001",
+            resource_type=EntityType.ISSUE,
+            resource_number="9001",
+            source_reference=[ReferenceSource(field="title", detail="9001")],
+        )
+        second = _make_association(
+            external_session_id="ses_assoc_001",
+            resource_type=EntityType.ISSUE,
+            resource_number="9001",
+            source_reference=[ReferenceSource(field="project", detail="9001")],
+        )
+
+        await repo.save_associations([first])
+
+        # Backdate last_seen_at so a re-observation that advances it is
+        # observably later than first_seen_at.
+        await conn.execute(
+            "UPDATE resource_session_associations SET last_seen_at = now() - interval '1 hour' "
+            "WHERE provider = 'github' AND repository = $1 "
+            "AND resource_type = 'issue' AND resource_number = '9001' "
+            "AND external_session_id = 'ses_assoc_001'",
+            REPO,
+        )
+
+        await repo.save_associations([second])  # re-observation
+
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM resource_session_associations "
+            "WHERE provider = 'github' AND repository = $1 "
+            "AND resource_type = 'issue' AND resource_number = '9001' "
+            "AND external_session_id = 'ses_assoc_001'",
+            REPO,
+        )
+        assert count == 1, f"expected 1 association row, got {count}"
+
+        row = await conn.fetchrow(
+            "SELECT source_reference, first_seen_at, last_seen_at "
+            "FROM resource_session_associations "
+            "WHERE provider = 'github' AND repository = $1 "
+            "AND resource_type = 'issue' AND resource_number = '9001' "
+            "AND external_session_id = 'ses_assoc_001'",
+            REPO,
+        )
+        # write-once provenance: the first insert's source_reference wins
+        assert row["source_reference"] == [{"field": "title", "detail": "9001"}]
+        # recency: the conflict update advanced last_seen_at past first_seen_at
+        assert row["last_seen_at"] > row["first_seen_at"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_association_unique_constraint_enforced_at_sql_level(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A second direct INSERT of the same association key is rejected.
+
+    Proves the ``UNIQUE (provider, repository, resource_type, resource_number,
+    external_session_id)`` constraint exists at the raw-SQL level.
+    """
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.save_associations(
+            [
+                _make_association(
+                    external_session_id="ses_assoc_002",
+                    resource_type=EntityType.CHANGE_REQUEST,
+                    resource_number="9002",
+                )
+            ]
+        )
+
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                "INSERT INTO resource_session_associations"
+                " (external_session_id, provider, repository, resource_type, resource_number)"
+                " VALUES ($1, $2, $3, $4, $5)",
+                "ses_assoc_002",
+                "github",
+                REPO,
+                "change_request",
+                "9002",
+            )

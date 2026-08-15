@@ -317,9 +317,12 @@ class ResourceSessionAssociation(Base):
 
     Keyed by ``UNIQUE (provider, repository, resource_type, resource_number,
     external_session_id)`` — the stable resource identity plus the session's
-    external identity — and written with ``ON CONFLICT DO NOTHING`` so the
-    same explicit reference converging on the same association never
-    duplicates a row.  ``session_id`` (internal Gateway session UUID) is a
+    external identity — and written with
+    ``ON CONFLICT (...) DO UPDATE SET last_seen_at = now()`` so the same
+    explicit reference converging on the same association never duplicates a
+    row, while re-observation advances ``last_seen_at`` (consistent with the
+    AFK enrich-only upsert convention).  ``session_id`` (internal Gateway
+    session UUID) is a
     nullable enrichment (no FK, mirroring ``afk_run_sessions``); the external
     session id is the deterministic anchor.  No completion/finished claim is
     carried (PRD Implementation Decision 13).

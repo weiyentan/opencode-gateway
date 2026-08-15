@@ -674,7 +674,9 @@ resources. Associations derive ONLY from explicit **Session Resource
 Reference**s — never from temporal or heuristic inference — and every
 association records its **Reference Source** (which session field carried the
 link), so each link is provable and reproducible. Repeated identical
-references converge to a single association (idempotent, no duplicates).
+references converge to a single association (idempotent, no duplicates);
+re-observation advances ``last_seen_at`` while the ``source_reference``
+provenance stays write-once.
 Associations deliberately carry no completion/finished claim (PRD
 Implementation Decision 13).
 _Avoid_: correlation, resolved/referenced link, run↔session link (that is the
@@ -782,7 +784,7 @@ manages.
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
-- An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT DO NOTHING` so the same explicit reference never duplicates a link
+- An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
 
 ## Flagged Ambiguities

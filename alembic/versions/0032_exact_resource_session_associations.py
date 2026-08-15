@@ -25,9 +25,11 @@ constraints below):
 * **Idempotent link creation** — keyed by
   ``UNIQUE (provider, repository, resource_type, resource_number,
   external_session_id)`` and written with
-  ``ON CONFLICT DO NOTHING`` so the same explicit reference converging on the
-  same association never duplicates a row.  There is no read-modify-write
-  and therefore no advisory lock.
+  ``ON CONFLICT (...) DO UPDATE SET last_seen_at = now()`` so the same
+  explicit reference converging on the same association never duplicates a
+  row, while ``last_seen_at`` tracks recency of observation.  There is no
+  read-modify-write and therefore no advisory lock (a ``DO UPDATE SET`` is
+  still a single atomic statement).
 * **Session anchor** — ``external_session_id`` is ``NOT NULL`` (the
   deterministic session identity); ``session_id`` (internal Gateway session
   UUID) is a nullable enrichment carrying no FK, mirroring
