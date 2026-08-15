@@ -197,6 +197,19 @@ class Settings(BaseSettings):
     transcript_retention_parts_days: int = 90
     transcript_retention_tool_calls_days: int = 90
 
+    # Reporting ingestion (issue #479) — the normalized-event stream from
+    # the producer (``fast-api-eda-gateway``) rides the existing external
+    # topic (``afk.events``).  The future normalized-event consumer runs in
+    # its OWN group (``opencode-reporting``, never ``opencode-gateway`` or
+    # ``opencode-outcomes``) and POSTs to the reporting ingestion endpoint.
+    # These settings are declared here so ``extra="forbid"`` cannot break
+    # startup later; the consumer container is out of scope for #479.  Maps
+    # to GATEWAY_REPORTING_TOPIC, GATEWAY_REPORTING_DLQ_TOPIC,
+    # GATEWAY_REPORTING_CONSUMER_GROUP_ID.
+    reporting_topic: str = "afk.events"
+    reporting_dlq_topic: str = "afk.events-reporting-dlq"
+    reporting_consumer_group_id: str = "opencode-reporting"
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

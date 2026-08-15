@@ -151,6 +151,7 @@ def create_app(
     from app.api.execution import router as execution_router
     from app.api.health import router as health_router
     from app.api.ingest import router as ingest_router
+    from app.api.reporting_ingest import router as reporting_ingest_router
     from app.api.usage import router as usage_router
 
     app.include_router(health_router)
@@ -163,5 +164,6 @@ def create_app(
     app.include_router(usage_router, prefix="/api/v1/usage")
     app.include_router(afk_outcomes_router, prefix="/api/v1/afk-outcomes")
     app.include_router(execution_router, prefix="/api/v1/execution")
+    app.include_router(reporting_ingest_router)
 
     return app
