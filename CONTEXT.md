@@ -415,7 +415,7 @@ _Avoid_: admin key, collector token (when the operator role is meant)
 
 **Retention Tier**:
 One of the configurable data-lifecycle buckets for the AFK outcome +
-reporting read-model (issue #483, ADR 0019), declared on Settings and
+reporting read-model (issue #483, ADR 0020), declared on Settings and
 env-driven via `GATEWAY_RETENTION_*`:
 
 * **Aggregates** (`afk_runs`, `afk_run_sessions`) — indefinite (`0` days =
@@ -448,7 +448,7 @@ reason string describing the failure.
 
 **DLQ Operational Max**:
 The bound that keeps the AFK outcome DLQ topic (`afk.events-dlq`) from
-growing unbounded (issue #483, ADR 0019). Every DLQ record is stamped with
+growing unbounded (issue #483, ADR 0020). Every DLQ record is stamped with
 `dead_lettered_at` and `max_age_days` at producer time; records strictly
 older than `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` (default 30 days) are
 **escalated** by the DLQ sweep (`python -m app.consumer.afk_consumer
@@ -721,6 +721,7 @@ conventions (freshness/stale-on-error retention, Token Breakdown, Active
 Tokens).
 _Avoid_: AFK panel (generic)
 
+<<<<<<< HEAD
 **Session Resource Reference**:
 An explicit stable resource reference carried by one session's metadata
 (``afk_outcomes.models.SessionResourceReference``): the full stable resource
@@ -766,6 +767,50 @@ as an opaque string (issue/MR number, commit SHA, review id). It mirrors the
 ``EngineeringEntity`` identity (``entity_id = "<resource_type>:<resource_number>"``)
 without collapsing onto the display metadata.
 _Avoid_: resource number as an integer, entity_id string, project label
+
+**Reporting Read API**:
+The read-only API surface for the reporting read-model
+(``app/api/reporting.py``, prefix ``/api/v1/reporting``, ADR 0019, issue
+#484): ``GET /resources`` (paginated ingested resources filterable by any
+subset of the stable resource identity — ``provider`` + ``repository_url`` +
+``resource_type`` + ``resource_number``), ``GET /resources/detail`` (the
+current aggregate plus the per-delivery State Trail plus session links for
+one resource), and ``GET /session-links`` (provisional Reporting Session
+Links). It is strictly read-only — the write path remains
+``app/api/reporting_ingest.py`` (issue #479) — uses the ``{status, data,
+error}`` envelope and API-key auth, and makes **no completion claims**: it
+surfaces the resource's verbatim current payload and pipeline lifecycle
+states and never derives or asserts a "completed"/"finished"/outcome state.
+_Avoid_: Reporting endpoint (generic), completion/outcome report
+
+**Resource Summary**:
+The current aggregate for one stable reporting resource as surfaced by the
+Reporting Read API: the verbatim current ``payload``, ``delivery_count``,
+``last_delivery_id``, ``last_ingested_at``, and the composite ``resource_id``
+key (``provider:repository_url:resource_type:resource_number``). Derived at
+read time from the immutable ``reporting_deliveries`` rows until the
+current-aggregate layer (#480) lands; the shape carries no completion/outcome
+field.
+_Avoid_: Resource report (generic), finished/outcome summary
+
+**State Trail**:
+The per-delivery lifecycle observations for one reporting resource
+(``delivery_state_trails`` rows), surfaced chronologically by the Reporting
+Read API as pipeline observations — ``received``, ``normalized``,
+``published``, ``persisted``, ``rejected``, ``failed``. States describe the
+delivery pipeline, never resource completion.
+_Avoid_: Resource status, completion state
+
+**Reporting Session Link**:
+A session link surfaced by the Reporting Read API (``GET
+/api/v1/reporting/session-links``; rows from ``afk_run_sessions``). Until
+exact resource↔session correlation (#481) lands, every link is marked
+``provisional=True`` with an empty ``source_references`` list — the Gateway
+never fabricates a resource↔session link it cannot prove. When #481 lands,
+exact links populate ``source_references`` and flip ``provisional=False``;
+the response shape is forward-compatible.
+_Avoid_: Exact link, proven session association
+>>>>>>> eb52311 (docs: update documentation for consolidated changes (issues #482-#485))
 
 ## Architecture Note
 
@@ -858,6 +903,10 @@ manages.
 - The **Admin API Key** does not satisfy the operator-only gate (`require_operator_token`) — the three credential layers are disjoint
 - Delivery payload and DLQ data have **no broad read surface**: the ingestion endpoints are write-only, and no route reads `reporting_deliveries` / `delivery_state_trails` / `delivery_log` / `engineering_events.payload` back out (ADR 0022)
 - The ingestion endpoint relies on the **Collector Credential** (Two-Layer Auth) — never the **Admin API Key** alone — and is not exposed to the public internet; producer webhook ingress on the EDA gateway side is unchanged
+- The **Reporting Read API** exposes the reporting read-model — ingested resources with their current aggregates (`reporting_deliveries`), per-delivery **State Trails** (`delivery_state_trails`), and **provisional Reporting Session Links** — and is strictly read-only: the write path remains the reporting ingestion endpoint (`app/api/reporting_ingest.py`, issue #479)
+- The **Reporting Read API** makes **no completion claims**: a **Resource Summary** carries the verbatim current payload and pipeline lifecycle states, never a derived "completed"/"finished"/outcome state
+- A **Resource Summary** is keyed by the composite `resource_id` (`provider + repository_url + resource_type + resource_number`), the stable resource identity distinct from any human-readable label
+- A **Reporting Session Link** is marked `provisional=True` with an empty `source_references` list until exact resource↔session correlation (#481) lands — the Gateway never fabricates a link it cannot prove
 
 ## Flagged Ambiguities
 

@@ -111,8 +111,16 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
+| `GATEWAY_AFK_OUTCOMES_MAX_RETRIES` | `5` | AFK outcome consumer reliability (issue #482): total persistence attempts before a message is DLQ'd |
+| `GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS` | `1.0` | Initial inter-attempt delay (seconds) for the bounded exponential backoff with jitter |
+| `GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS` | `60.0` | Upper cap (seconds) on the exponential backoff delay |
+| `GATEWAY_RETENTION_AFK_AGGREGATES_DAYS` | `0` | Retention tier (ADR 0020): aggregates (`afk_runs`, `afk_run_sessions`) — `0` = never swept (indefinite) |
+| `GATEWAY_RETENTION_AFK_METADATA_DAYS` | `365` | Retention tier (ADR 0020): metadata — 12 months |
+| `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0020): redacted payload storage |
+| `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0020): DLQ operational max — strictly older records are escalated to `afk.events-dlq-expired` |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
+| `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0020). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed when unset — no operator-only surface (delivery payload, DLQ) is reachable |
 | `GATEWAY_TOOL_PAYLOAD_MAX_CHARS` | `4096` | Execution transcript (ADR 0016): per-field character cap for tool input/output payloads stored in `observed_tool_calls` (truncated at ingest; verbatim content stays in `observed_parts`) |
 | `GATEWAY_PART_DATA_MAX_CHARS` | `65536` | Execution transcript (ADR 0016): verbatim character cap for `message`/`part` payloads stored in the `data` JSONB column (truncated at ingest with a `truncated` marker) |
 
@@ -246,6 +254,29 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 > legacy `opencode_usage_records` table is still written at ingest but is no
 > longer the query source.
 
+### Reporting
+
+Read-only endpoints exposing the reporting read-model (ADR 0019, issue #484)
+— the first report of what the Gateway has ingested from the normalized-event
+stream (write path: `app/api/reporting_ingest.py`, issue #479): ingested
+resources with their current aggregate, the per-delivery state trail, and the
+session links that can be provably linked to them. The surface is strictly
+read-only and never derives a "completed"/"finished"/outcome state for a
+resource (**no completion claims**) — it surfaces the resource's verbatim
+current payload and its delivery lifecycle states (`received`, `normalized`,
+`published`, `persisted`, `rejected`, `failed`) as pipeline observations.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/reporting/resources` | Paginated list of ingested resources. Filterable by any subset of the stable resource identity (`provider`, `repository_url`, `resource_type`, `resource_number`). Each item is a current aggregate: verbatim `payload`, `delivery_count`, `last_delivery_id`, `last_ingested_at`, plus the composite `resource_id` key. |
+| `GET` | `/api/v1/reporting/resources/detail` | Full detail for one resource addressed by all four identity components (required query params): the current aggregate plus the per-delivery state trail (`delivery_state_trails`, chronological) plus `session_links`. 404 for an unknown resource identity. |
+| `GET` | `/api/v1/reporting/session-links` | Paginated session links (`afk_run_sessions`), each surfaced as **provisional** (`provisional=True`) with an empty `source_references` list until exact resource↔session correlation (issue #481) lands. |
+
+All responses use the `{status, data, error}` envelope and are protected by
+the global API-key middleware, like every other non-`/health` route. The
+reporting write path remains `app/api/reporting_ingest.py`; the read router
+never writes.
+
 ### AFK Outcomes
 
 Read-only endpoints exposing the AFK outcome read-model — AFK Runs reconstructed
@@ -293,6 +324,54 @@ The children endpoint uses offset/limit pagination. Payloads are redacted
 (secret-like keys) and truncated at ingest
 (`GATEWAY_TOOL_PAYLOAD_MAX_CHARS` / `GATEWAY_PART_DATA_MAX_CHARS`), so the API
 serves only the already-redacted, already-truncated store.
+
+---
+
+## Consumer Operations
+
+### DLQ Sweep (issue #483)
+
+The AFK outcome DLQ (`afk.events-dlq`) is bounded by an **operational max**
+(`GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS`, default 30 days). Every DLQ record is
+stamped with `dead_lettered_at` and `max_age_days` at producer time; the DLQ
+sweep escalates records **strictly older** than the max to the durable
+`afk.events-dlq-expired` escalation topic (original payload + reason +
+`escalated_at`), so expired records are never silently lost. Physical removal
+from the active DLQ is enforced by the topic's Kafka retention configured to
+the same max age.
+
+```bash
+# Report the would-be-escalated records without publishing anything
+python -m app.consumer.afk_consumer --dlq-sweep --dry-run
+
+# Escalate expired records to afk.events-dlq-expired
+python -m app.consumer.afk_consumer --dlq-sweep
+```
+
+Flags:
+
+| Flag | Description |
+|------|-------------|
+| `--batch-size N` | Records per consume batch (default 100) |
+| `--limit N` | Process at most N records (bounded runs) |
+| `--dry-run` | Report the would-be-escalated records without publishing anything |
+
+Boundary semantics mirror the transcript retention job (ADR 0016): a record
+exactly at the max-age edge is retained (strict `>`); only strictly older
+records escalate; a record without a usable `dead_lettered_at` has unknown
+age and is retained (never prematurely expired).
+
+### Operator Token (issue #483)
+
+`GATEWAY_OPERATOR_TOKEN` gates operator-only read surfaces (delivery payload,
+DLQ) via the `require_operator_token` dependency. It is a dedicated operator
+bearer token, **distinct** from the Admin API Key (`GATEWAY_API_KEY`) and
+from per-client Collector Credentials — the Admin API Key does not satisfy
+the operator gate. An empty operator token **fails closed**: no operator-only
+surface is reachable (no broad read). Delivery payload and DLQ data currently
+have no broad read surface at all — the ingestion endpoints are write-only
+and no route reads `reporting_deliveries` / `delivery_state_trails` /
+`delivery_log` / `engineering_events.payload` back out (ADR 0020).
 
 ---
 
@@ -449,6 +528,9 @@ opencode-gateway/
 | [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 | [0015](docs/adr/0015-client-project-rollup-as-usage-events-read-model.md) | Client Project Rollup as a usage_events read-model | Accepted |
 | [0016](docs/adr/0016-execution-transcript-observability.md) | Execution Transcript Observability | Accepted |
+| [0018](docs/adr/0018-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Accepted |
+| [0019](docs/adr/0019-reporting-read-api.md) | Reporting Read API | Accepted |
+| [0020](docs/adr/0020-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
 
 ---
 

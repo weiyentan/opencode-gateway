@@ -236,7 +236,7 @@ class Settings(BaseSettings):
     #     90 days.
     #   * DLQ (``afk.events-dlq``) is retained until resolved but never
     #     unbounded: messages older than the operational max (default 30
-    #     days) are escalated/expired per the policy documented in ADR 0019.
+    #     days) are escalated/expired per the policy documented in ADR 0020.
     #
     # Maps to GATEWAY_RETENTION_AFK_AGGREGATES_DAYS,
     # GATEWAY_RETENTION_AFK_METADATA_DAYS, GATEWAY_RETENTION_AFK_PAYLOAD_DAYS,

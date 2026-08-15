@@ -1,4 +1,4 @@
-# ADR 0019: Retention defaults + access controls (PRD #478 decisions 15–16)
+# ADR 0020: Retention defaults + access controls (PRD #478 decisions 15–16)
 
 ## Status
 
