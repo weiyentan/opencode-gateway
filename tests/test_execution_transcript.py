@@ -1008,7 +1008,11 @@ class TestFetchToolCallsFilters:
 
 
 class TestTimelineDepthAnnotation:
-    """Depth annotation (0 = root, monotonic per branch) over a parent/child tree."""
+    """Depth annotation (0 = root, monotonic per branch) over a parent/child tree.
+
+    Uses explicit ``max_depth=None`` (the internal all-generations branch) —
+    the HTTP default of 50 is covered separately in ``TestTimelineMaxDepth``.
+    """
 
     @pytest.mark.asyncio
     async def test_depth_annotation_over_parent_child_tree(self):
@@ -1153,10 +1157,15 @@ class TestTimelineExternalParentFallback:
 
 
 class TestTimelineMaxDepth:
-    """max_depth default = all generations (None); explicit values bounded."""
+    """max_depth default = 50 (conservative bound); explicit values bounded (0-200)."""
 
     @pytest.mark.asyncio
     async def test_none_means_all_generations(self):
+        """Explicit ``max_depth=None`` (internal-only) walks all generations.
+
+        HTTP clients cannot supply NULL, so this exercises the internal
+        all-generations branch, not the HTTP default (which is 50).
+        """
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
         await _fetch_timeline(
@@ -1198,7 +1207,7 @@ class TestTimelineMaxDepth:
         assert 3 in args
 
     @pytest.mark.asyncio
-    async def test_http_default_binds_none(self, mock_conn: AsyncMock):
+    async def test_http_default_binds_50(self, mock_conn: AsyncMock):
         mock_conn.fetch = AsyncMock(return_value=[])
         async with create_client(mock_conn) as c:
             response = await c.get(
@@ -1207,8 +1216,10 @@ class TestTimelineMaxDepth:
         assert response.status_code == 200
         sql = mock_conn.fetch.call_args.args[0]
         args = mock_conn.fetch.call_args.args[1:]
-        assert "$2 IS NULL" in sql
-        assert None in args
+        # The HTTP default is a conservative 50-generation bound, not NULL.
+        assert "d.depth < $" in sql
+        assert 50 in args
+        assert None not in args
 
     @pytest.mark.asyncio
     async def test_http_max_depth_above_cap_returns_422(self, mock_conn: AsyncMock):
