@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -608,7 +609,7 @@ class AFKOutcomeConsumer:
                 return
             except KafkaError:
                 if attempt < max_attempts - 1 and self._running:
-                    jitter = random.uniform(0.5, 1.5)
+                    jitter = random.uniform(_JITTER_LOW, _JITTER_HIGH)
                     await asyncio.sleep(min(delay * jitter, self._max_backoff))
                     delay = min(delay * 2, self._max_backoff)
                     continue
@@ -675,8 +676,11 @@ class AFKOutcomeConsumer:
         entity, event = mapped
 
         # ── Persist in a single transaction, then commit ────────────
+        # ``max(1, ...)`` is defense-in-depth: programmatic construction with
+        # ``max_retries=0`` must never produce an empty loop that silently
+        # drops the message without persisting, DLQ'ing, or committing.
         retries = 0
-        for attempt in range(self._max_retries):
+        for attempt in range(max(1, self._max_retries)):
             try:
                 await self._persist(message, entity, event)
             except Exception:
@@ -698,9 +702,7 @@ class AFKOutcomeConsumer:
                     "sending to DLQ",
                     self._max_retries,
                 )
-                self._metrics.histogram(METRIC_RETRIES_PER_MESSAGE).observe(
-                    self._max_retries
-                )
+                self._metrics.histogram(METRIC_RETRIES_PER_MESSAGE).observe(retries)
                 await self._send_to_dlq(
                     raw_value if isinstance(raw_value, dict) else {},
                     reason=f"DB persist failed after {self._max_retries} retries",
@@ -1017,20 +1019,36 @@ def build_escalation_payload(
     """Build the escalation record for an expired DLQ message.
 
     Preserves the original payload + reason (so the operator can resolve it)
-    and stamps ``escalated_at`` plus a machine-readable ``escalation_reason``.
+    and stamps a machine-readable ``escalation_reason``.  The record is
+    **content-stable**: it carries no volatile ``now``-derived timestamp, and
+    ``escalation_key`` is a deterministic SHA-256 over the DLQ record's own
+    stable identity (``original_topic``, ``dead_lettered_at``, ``reason``,
+    ``payload``), so re-escalating the same record on a later sweep produces
+    an identical record (idempotent by content / natural key).
     """
-    now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
     effective_max = (
         max_age_days
         if max_age_days is not None
         else dlq_payload.get("max_age_days", _DEFAULT_DLQ_MAX_AGE_DAYS)
     )
+    escalation_key = hashlib.sha256(
+        json.dumps(
+            {
+                "original_topic": dlq_payload.get("original_topic"),
+                "dead_lettered_at": dlq_payload.get("dead_lettered_at"),
+                "reason": dlq_payload.get("reason"),
+                "payload": dlq_payload.get("payload"),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
     return {
         "original_topic": dlq_payload.get("original_topic"),
         "reason": dlq_payload.get("reason"),
         "payload": dlq_payload.get("payload"),
         "dead_lettered_at": dlq_payload.get("dead_lettered_at"),
-        "escalated_at": now.isoformat(),
+        "escalation_key": escalation_key,
         "escalation_reason": (
             f"exceeded DLQ operational max of {effective_max} day(s)"
         ),
@@ -1107,20 +1125,95 @@ def format_dlq_report(report: DLQSweepReport) -> str:
     return "\n".join(lines)
 
 
+def _lenient_dlq_deserializer(raw: bytes) -> Any:
+    """Decode one DLQ record value; corrupt values decode to ``None``.
+
+    A malformed JSON body or undecodable bytes must not crash the sweep
+    consumer: the value is dropped to a ``None`` sentinel so
+    :func:`_collect_dlq_batch` can skip it with a warning instead of raising
+    inside the consumer.
+    """
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
 async def _collect_dlq_batch(
     consumer: Any, batch_size: int
-) -> list[dict[str, Any]]:
-    """Collect up to ``batch_size`` DLQ records (bounded), decoded to payloads."""
-    messages: list[dict[str, Any]] = []
+) -> tuple[list[tuple[dict[str, Any], TopicPartition, int]], dict[TopicPartition, int], int]:
+    """Collect up to ``batch_size`` DLQ records (bounded).
+
+    Returns a ``(records, max_consumed_offsets, consumed)`` triple:
+
+      * ``records`` — well-formed ``(payload, topic_partition, offset)``
+        tuples.  Corrupt (non-object) records are skipped with a warning.
+      * ``max_consumed_offsets`` — ``{topic_partition: highest offset}`` over
+        *every* consumed message, corrupt included, so the sweep's commit
+        position never advances past a dropped record.
+      * ``consumed`` — the total number of messages consumed this batch
+        (well-formed + corrupt), so the caller can detect stream exhaustion.
+    """
+    records: list[tuple[dict[str, Any], TopicPartition, int]] = []
+    max_consumed: dict[TopicPartition, int] = {}
+    consumed = 0
     iterator = consumer.__aiter__()
     for _ in range(batch_size):
         try:
             msg = await asyncio.wait_for(iterator.__anext__(), timeout=1.0)
         except (TimeoutError, StopAsyncIteration):
             break
+        consumed += 1
         value = msg.value
-        messages.append(value if isinstance(value, dict) else {})
-    return messages
+        tp = TopicPartition(msg.topic, msg.partition)
+        prev = max_consumed.get(tp)
+        if prev is None or msg.offset > prev:
+            max_consumed[tp] = msg.offset
+        if not isinstance(value, dict):
+            logger.warning(
+                "Skipping corrupt DLQ record (partition=%d offset=%d): "
+                "deserialized value is not a JSON object",
+                msg.partition,
+                msg.offset,
+            )
+            continue
+        records.append((value, tp, msg.offset))
+    return records, max_consumed, consumed
+
+
+def _compute_dlq_commit_offsets(
+    scanned_records: list[tuple[dict[str, Any], TopicPartition, int]],
+    max_consumed_offsets: dict[TopicPartition, int],
+    *,
+    now: datetime,
+    max_age_days: int,
+) -> dict[TopicPartition, int]:
+    """Compute the per-partition offsets to commit after one sweep chunk.
+
+    For each partition, if any scanned record is retained (not yet expired),
+    the commit offset is that partition's FIRST retained offset so the next
+    run re-reads from there and re-examines it once it ages past the max.
+    Otherwise every consumed record in that partition is done, so the commit
+    offset is ``max_consumed + 1`` (already-escalated records are never
+    re-read).  Returns a ``{TopicPartition: offset}`` mapping (empty when
+    there is nothing to commit).
+    """
+    first_retained: dict[TopicPartition, int] = {}
+    for payload, tp, offset in scanned_records:
+        if is_dlq_expired(payload, now, max_age_days):
+            continue
+        prev = first_retained.get(tp)
+        if prev is None or offset < prev:
+            first_retained[tp] = offset
+
+    offsets: dict[TopicPartition, int] = {}
+    for tp, max_offset in max_consumed_offsets.items():
+        retained = first_retained.get(tp)
+        if retained is not None:
+            offsets[tp] = retained
+        else:
+            offsets[tp] = max_offset + 1
+    return offsets
 
 
 async def sweep_dlq(
@@ -1142,6 +1235,14 @@ async def sweep_dlq(
     escalation record for each expired message to ``escalation_topic`` so the
     message is never silently lost.  A dry run reports the would-be-expired
     counts and publishes nothing.
+
+    Offsets are committed per chunk in write mode: a partition with a
+    retained (not-yet-expired) record commits at its first retained offset so
+    the next run re-reads from there and re-examines it once it ages past the
+    max, while a partition whose scanned records are all expired commits at
+    ``max consumed + 1`` (already-escalated records are never re-read).
+    Corrupt (non-object) records are skipped with a warning but still counted
+    in the per-partition commit position.  Dry runs never commit.
     """
     now = now if now is not None else datetime.now(timezone.utc)  # noqa: UP017
     consumer = AIOKafkaConsumer(
@@ -1150,7 +1251,7 @@ async def sweep_dlq(
         group_id=consumer_group_id,
         enable_auto_commit=False,
         auto_offset_reset="earliest",
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        value_deserializer=_lenient_dlq_deserializer,
     )
     producer = AIOKafkaProducer(
         bootstrap_servers=kafka_brokers,
@@ -1163,9 +1264,10 @@ async def sweep_dlq(
         remaining = limit
         while remaining is None or remaining > 0:
             take = batch_size if remaining is None else min(batch_size, remaining)
-            chunk = await _collect_dlq_batch(consumer, take)
-            if not chunk:
+            records, max_consumed, consumed = await _collect_dlq_batch(consumer, take)
+            if not records and consumed == 0:
                 break
+            chunk = [payload for payload, _, _ in records]
             chunk_report = run_dlq_sweep(
                 chunk,
                 now=now,
@@ -1180,9 +1282,17 @@ async def sweep_dlq(
             if not dry_run:
                 for escalation in chunk_report.escalated:
                     await producer.send_and_wait(escalation_topic, escalation)
+                commit_offsets = _compute_dlq_commit_offsets(
+                    records[: chunk_report.scanned],
+                    max_consumed,
+                    now=now,
+                    max_age_days=max_age_days,
+                )
+                if commit_offsets:
+                    await consumer.commit(commit_offsets)
             if remaining is not None:
                 remaining -= chunk_report.scanned
-            if len(chunk) < take:
+            if consumed < take:
                 break
         return report
     finally:

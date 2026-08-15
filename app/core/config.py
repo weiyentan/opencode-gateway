@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -158,10 +158,13 @@ class Settings(BaseSettings):
     # total number of persistence attempts before a message is DLQ'd (default
     # 5); the inter-attempt delay is
     # ``initial_backoff * 2^attempt`` (capped at ``max_backoff``), scaled by a
-    # uniform jitter factor.  Maps to GATEWAY_AFK_OUTCOMES_MAX_RETRIES,
+    # uniform jitter factor.  A value of 0 is rejected (``ge=1``) because the
+    # total number of attempts must be at least 1 — otherwise the retry loop
+    # would never run and every message would be silently dropped.  Maps to
+    # GATEWAY_AFK_OUTCOMES_MAX_RETRIES,
     # GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS,
     # GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS.
-    afk_outcomes_max_retries: int = 5
+    afk_outcomes_max_retries: int = Field(default=5, ge=1)
     afk_outcomes_initial_backoff_seconds: float = 1.0
     afk_outcomes_max_backoff_seconds: float = 60.0
 
@@ -239,13 +242,16 @@ class Settings(BaseSettings):
     #     unbounded: messages older than the operational max (default 30
     #     days) are escalated/expired per the policy documented in ADR 0020.
     #
+    # All four tiers are validated ``ge=0``: negative retention values are
+    # rejected at startup, while ``0`` preserves its "never/disabled" meaning.
+    #
     # Maps to GATEWAY_RETENTION_AFK_AGGREGATES_DAYS,
     # GATEWAY_RETENTION_AFK_METADATA_DAYS, GATEWAY_RETENTION_AFK_PAYLOAD_DAYS,
     # GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS.
-    retention_afk_aggregates_days: int = 0
-    retention_afk_metadata_days: int = 365
-    retention_afk_payload_days: int = 90
-    retention_dlq_max_age_days: int = 30
+    retention_afk_aggregates_days: int = Field(default=0, ge=0)
+    retention_afk_metadata_days: int = Field(default=365, ge=0)
+    retention_afk_payload_days: int = Field(default=90, ge=0)
+    retention_dlq_max_age_days: int = Field(default=30, ge=0)
 
     # Operator-only access (issue #483, PRD #478 decision #16) — a dedicated
     # operator bearer token, DISTINCT from the Admin API Key

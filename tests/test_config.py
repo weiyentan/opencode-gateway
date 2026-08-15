@@ -350,6 +350,22 @@ def test_afk_consumer_enabled_with_repository_succeeds(monkeypatch):
     assert settings.afk_outcomes_repository == "owner/repo"
 
 
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_afk_outcomes_max_retries_must_be_positive(monkeypatch, value):
+    """GATEWAY_AFK_OUTCOMES_MAX_RETRIES must be >= 1: 0 would make the retry
+    loop never run (silently dropping every message), and negatives are
+    nonsensical — both must fail pydantic validation."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AFK_OUTCOMES_MAX_RETRIES", value)
+
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
 # ── Issue #470: Execution-transcript retention settings ────────────────────
 
 
@@ -414,6 +430,21 @@ def test_retention_settings_override_from_env(monkeypatch):
     assert settings.retention_afk_metadata_days == 180
     assert settings.retention_afk_payload_days == 45
     assert settings.retention_dlq_max_age_days == 14
+
+
+def test_negative_retention_value_rejected(monkeypatch):
+    """A negative GATEWAY_RETENTION_* value must fail pydantic validation
+    (``ge=0``): ``0`` preserves its "never/disabled" meaning, but negatives
+    are nonsensical for a retention window."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_RETENTION_AFK_METADATA_DAYS", "-1")
+
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
 
 
 def test_operator_token_defaults_empty(monkeypatch):

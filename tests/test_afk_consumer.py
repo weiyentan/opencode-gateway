@@ -38,6 +38,7 @@ from app.consumer.afk_consumer import (
     NormalizedProviderEvent,
     ProviderEventMessage,
     _build_adapter,
+    _lenient_dlq_deserializer,
     build_dlq_payload,
     build_escalation_payload,
     classify_dlq_message,
@@ -46,6 +47,7 @@ from app.consumer.afk_consumer import (
     map_normalized_event,
     map_provider_event,
     run_dlq_sweep,
+    sweep_dlq,
 )
 from app.core.metrics import MetricsRegistry
 
@@ -534,6 +536,36 @@ async def test_db_error_max_retries_exhausted_sends_to_dlq_and_commits() -> None
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert "DB persist failed after 3 retries" in dlq_payload["reason"]
     assert dlq_payload["payload"] == _valid_payload()
+
+
+@pytest.mark.asyncio
+async def test_zero_max_retries_does_not_silently_drop_message() -> None:
+    """Defense-in-depth: a consumer programmatically built with
+    ``max_retries=0`` must still attempt persistence and, on a persistent DB
+    failure, DLQ the message — never silently return without persisting,
+    DLQ'ing, or committing (which would drop the message forever)."""
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")]),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=0, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload()))
+
+    # One persistence attempt, then the DLQ path (not silently dropped).
+    assert conn.execute.call_count == 1
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 0
+    assert snap[METRIC_MESSAGES_DLQ] == 1
+    assert snap[METRIC_DB_ERRORS] == 1
 
 
 @pytest.mark.asyncio
@@ -1582,7 +1614,14 @@ async def test_metrics_retry_distribution_and_db_errors() -> None:
 
 
 @pytest.mark.asyncio
-async def test_metrics_retries_exhausted_records_max_bucket() -> None:
+async def test_metrics_retries_exhausted_records_actual_retry_count() -> None:
+    """On exhaustion the histogram records the actual retry count.
+
+    ``retries`` counts only non-final failed attempts, so for ``max_retries=3``
+    the message actually retried 2 times (attempts 1 and 2) before the final
+    attempt failed and was DLQ'd — consistent with the success path, which
+    observes ``retries`` rather than ``max_retries``.
+    """
     metrics = MetricsRegistry()
     conn = _FakeConn(
         [],
@@ -1599,7 +1638,7 @@ async def test_metrics_retries_exhausted_records_max_bucket() -> None:
 
     snap = _snap(metrics)
     hist = snap[METRIC_RETRIES_PER_MESSAGE]
-    assert hist["buckets"]["3"] == 1  # max retries recorded on exhaustion
+    assert hist["buckets"]["2"] == 1  # actual retries = 2 for max_retries=3
 
 
 @pytest.mark.asyncio
@@ -1795,8 +1834,9 @@ def test_classify_dlq_message() -> None:
 
 
 def test_build_escalation_payload_preserves_original_and_reason() -> None:
-    """Escalation preserves the original payload + reason and stamps the
-    escalation time + reason, so the operator can resolve it later."""
+    """Escalation preserves the original payload + reason and stamps a
+    deterministic ``escalation_key`` + ``escalation_reason``, so the operator
+    can resolve it later and re-escalations are content-stable."""
     payload = _dlq_payload()
     escalated = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
 
@@ -1804,8 +1844,29 @@ def test_build_escalation_payload_preserves_original_and_reason() -> None:
     assert escalated["reason"] == payload["reason"]
     assert escalated["payload"] == payload["payload"]
     assert escalated["dead_lettered_at"] == payload["dead_lettered_at"]
-    assert escalated["escalated_at"] == DLQ_NOW.isoformat()
+    assert "escalation_key" in escalated
+    assert "escalated_at" not in escalated
     assert f"{MAX_AGE}" in escalated["escalation_reason"]
+
+
+def test_build_escalation_payload_is_content_stable() -> None:
+    """Same inputs → byte-identical output (no volatile ``now``-derived field).
+
+    Two escalations of the same DLQ record (even at different ``now``) must be
+    identical, so a later sweep re-escalating the same record is idempotent by
+    content (``escalation_key`` is a deterministic natural key over the DLQ
+    record's own stable identity).
+    """
+    payload = _dlq_payload()
+    first = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
+    later = build_escalation_payload(
+        payload, now=DLQ_NOW + timedelta(days=10), max_age_days=MAX_AGE
+    )
+
+    assert first == later
+    assert "escalation_key" in first
+    assert "escalated_at" not in first
+    assert len(first["escalation_key"]) == 64  # sha256 hex digest
 
 
 def test_run_dlq_sweep_classifies_and_builds_escalations() -> None:
@@ -1896,6 +1957,165 @@ async def test_from_env_reads_dlq_max_age() -> None:
         consumer = await AFKOutcomeConsumer.from_env()
 
     assert consumer._dlq_max_age_days == 14
+
+
+# ── DLQ sweep offset commits + lenient deserialization (PR #492 findings) ──
+
+
+class _DLQRecord:
+    """A minimal record quacking like an aiokafka ConsumerRecord for the sweep."""
+
+    def __init__(self, topic: str, partition: int, offset: int, value: object) -> None:
+        self.topic = topic
+        self.partition = partition
+        self.offset = offset
+        self.value = value
+
+
+class _FakeSweepConsumer:
+    """Stand-in for AIOKafkaConsumer in the sweep: __aiter__/start/stop/commit."""
+
+    def __init__(self, messages: list[_DLQRecord]) -> None:
+        self._messages = messages
+        self.commit = AsyncMock(return_value=None)
+        self.start = AsyncMock(return_value=None)
+        self.stop = AsyncMock(return_value=None)
+
+    def __aiter__(self) -> _FakeAsyncIterator:
+        return _FakeAsyncIterator(self._messages)
+
+
+class _FakeSweepProducer:
+    """Stand-in for AIOKafkaProducer in the sweep: start/stop/send_and_wait."""
+
+    def __init__(self) -> None:
+        self.start = AsyncMock(return_value=None)
+        self.stop = AsyncMock(return_value=None)
+        self.send_and_wait = AsyncMock(return_value=None)
+
+
+def test_lenient_dlq_deserializer_returns_none_on_corrupt() -> None:
+    """Corrupt bytes decode to ``None`` instead of raising inside the consumer."""
+    assert _lenient_dlq_deserializer(b"not json") is None
+    assert _lenient_dlq_deserializer(b"\xff\xfe invalid utf8") is None
+    assert _lenient_dlq_deserializer(json.dumps({"a": 1}).encode("utf-8")) == {"a": 1}
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_commits_offsets_in_write_mode() -> None:
+    """Write-mode sweep commits per-partition offsets: a partition with a
+    retained record commits at its first retained offset (re-examined later);
+    an all-expired partition commits at max-consumed + 1 (never re-read)."""
+    dlq_topic = "afk.events-dlq"
+    escalation_topic = "afk.events-dlq-expired"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    retained = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    messages = [
+        _DLQRecord(dlq_topic, 0, 5, expired),
+        _DLQRecord(dlq_topic, 0, 6, retained),
+        _DLQRecord(dlq_topic, 1, 10, expired),
+    ]
+    consumer = _FakeSweepConsumer(messages)
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+    ):
+        report = await sweep_dlq(
+            "broker:9092",
+            dlq_topic,
+            escalation_topic,
+            MAX_AGE,
+            now=DLQ_NOW,
+        )
+
+    assert report.scanned == 3
+    assert report.expired == 2
+    assert report.retained == 1
+
+    # Two escalations published, both to the escalation topic.
+    assert producer.send_and_wait.call_count == 2
+    assert [c.args[0] for c in producer.send_and_wait.call_args_list] == [
+        escalation_topic,
+        escalation_topic,
+    ]
+
+    # Commit: partition 0 → first retained (6); partition 1 → max+1 (11).
+    consumer.commit.assert_called_once()
+    assert consumer.commit.call_args.args[0] == {
+        TopicPartition(dlq_topic, 0): 6,
+        TopicPartition(dlq_topic, 1): 11,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_dry_run_does_not_commit_or_publish() -> None:
+    """Dry-run sweep publishes nothing and commits nothing."""
+    dlq_topic = "afk.events-dlq"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    consumer = _FakeSweepConsumer([_DLQRecord(dlq_topic, 0, 5, expired)])
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+    ):
+        report = await sweep_dlq(
+            "broker:9092",
+            dlq_topic,
+            "afk.events-dlq-expired",
+            MAX_AGE,
+            now=DLQ_NOW,
+            dry_run=True,
+        )
+
+    assert report.expired == 1
+    assert report.escalated == []
+    producer.send_and_wait.assert_not_called()
+    consumer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_skips_corrupt_record_with_warning() -> None:
+    """A corrupt (non-object) record is skipped with a warning, does not crash
+    the sweep, and its offset is still committed past so the commit position
+    is not wrong; the well-formed records are still processed."""
+    dlq_topic = "afk.events-dlq"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    messages = [
+        _DLQRecord(dlq_topic, 0, 3, None),  # corrupt (lenient deserializer sentinel)
+        _DLQRecord(dlq_topic, 0, 4, expired),
+    ]
+    consumer = _FakeSweepConsumer(messages)
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+        patch("app.consumer.afk_consumer.logger") as mock_logger,
+    ):
+        report = await sweep_dlq(
+            "broker:9092", dlq_topic, "afk.events-dlq-expired", MAX_AGE, now=DLQ_NOW
+        )
+
+    assert report.scanned == 1  # only the well-formed record is scanned
+    assert report.expired == 1
+    mock_logger.warning.assert_called_once()
+
+    # The corrupt offset (3) is committed past together with the expired
+    # record (4) — commit at max-consumed+1 = 5.
+    consumer.commit.assert_called_once()
+    assert consumer.commit.call_args.args[0] == {TopicPartition(dlq_topic, 0): 5}
+    assert producer.send_and_wait.call_count == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
