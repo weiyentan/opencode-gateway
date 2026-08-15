@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, String, UniqueConstraint
+from sqlalchemy import DateTime, String, UniqueConstraint, text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -71,7 +71,10 @@ class ReportingDelivery(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=sa_text("gen_random_uuid()"),
     )
     provider: Mapped[str] = mapped_column(String, nullable=False)
     delivery_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -80,9 +83,17 @@ class ReportingDelivery(Base):
         UUID(as_uuid=True), nullable=True
     )
     received_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
     )
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa_text("'{}'::jsonb"),
+    )
 
 
 class DeliveryStateTrail(Base):
@@ -110,7 +121,10 @@ class DeliveryStateTrail(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=sa_text("gen_random_uuid()"),
     )
     provider: Mapped[str] = mapped_column(String, nullable=False)
     delivery_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -120,5 +134,8 @@ class DeliveryStateTrail(Base):
     )
     detail: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=sa_text("now()"),
+        nullable=False,
     )

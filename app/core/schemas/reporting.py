@@ -15,9 +15,9 @@ missing/invalid collector tokens (401) fail the whole request.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ReportingDeliveryIn(BaseModel):
@@ -41,6 +41,13 @@ class ReportingDeliveryIn(BaseModel):
     payload: dict = Field(
         default_factory=dict, description="Verbatim delivery payload"
     )
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _require_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("occurred_at must include a timezone offset")
+        return v.astimezone(timezone.utc)
 
 
 class ReportingIngestRequest(BaseModel):

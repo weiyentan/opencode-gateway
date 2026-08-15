@@ -16,6 +16,7 @@ asyncpg connection (no real database):
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -226,6 +227,65 @@ async def test_db_error_returns_rejected(mock_conn: AsyncMock) -> None:
     assert data["rejected_count"] == 1
     assert data["results"][0]["status"] == "rejected"
     assert "boom" in data["results"][0]["reason"]
+
+
+# ── Payload redaction + tz-aware occurred_at ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_payload_is_redacted_before_persist(mock_conn: AsyncMock) -> None:
+    mock_conn.fetchrow = AsyncMock(side_effect=[_auth_row(), _delivery_row()])
+    mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+    payload = _payload()
+    payload["deliveries"][0]["payload"] = {
+        "repository": "acme/backend",
+        "api_key": "ghp_abc123",
+        "nested": {"token": "supersecret"},
+    }
+
+    client = create_client(mock_conn)
+    async with client as c:
+        response = await c.post("/api/v1/reporting/ingest/deliveries", json=payload)
+    assert response.status_code == 200
+
+    # fetchrow call[0] is the auth lookup; call[1] is the delivery insert.
+    # Positional args: 0=SQL, 1=provider, 2=delivery_id, 3=event_type,
+    # 4=client_id, 5=redacted payload JSON.
+    delivery_call = mock_conn.fetchrow.call_args_list[1]
+    assert json.loads(delivery_call.args[5]) == {
+        "repository": "acme/backend",
+        "api_key": "***",
+        "nested": {"token": "***"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_occurred_at_requires_timezone_offset(mock_conn: AsyncMock) -> None:
+    # A timezone-naive occurred_at fails validation before any write.
+    naive = _payload()
+    naive["deliveries"][0]["occurred_at"] = "2026-08-15T10:00:00"
+    mock_conn.fetchrow = AsyncMock(side_effect=[_auth_row()])
+    mock_conn.execute = AsyncMock()
+
+    client = create_client(mock_conn)
+    async with client as c:
+        response = await c.post("/api/v1/reporting/ingest/deliveries", json=naive)
+    assert response.status_code == 422
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "VALIDATION_ERROR"
+    # only the auth lookup consumed a fetchrow slot; no delivery insert ran
+    assert mock_conn.fetchrow.await_count == 1
+
+    # A tz-aware occurred_at is accepted.
+    mock_conn.fetchrow = AsyncMock(side_effect=[_auth_row(), _delivery_row()])
+    mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+    client = create_client(mock_conn)
+    async with client as c:
+        response = await c.post("/api/v1/reporting/ingest/deliveries", json=_payload())
+    assert response.status_code == 200
+    assert response.json()["data"]["results"][0]["status"] == "accepted"
 
 
 # ── Error paths ──────────────────────────────────────────────────────────────

@@ -35,6 +35,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.auth import require_collector_token
+from app.core.secrets import redact_dict
 from app.core.schemas.reporting import (
     ReportingDeliveryIn,
     ReportingDeliveryResult,
@@ -72,7 +73,10 @@ _INSERT_TRAIL_SQL = """
 
 
 async def _persist_delivery(
-    conn: asyncpg.Connection, client_id: uuid.UUID | None, d: ReportingDeliveryIn
+    conn: asyncpg.Connection,
+    client_id: uuid.UUID | None,
+    idx: int,
+    d: ReportingDeliveryIn,
 ) -> ReportingDeliveryResult:
     """Persist one delivery transactionally; return its outcome.
 
@@ -89,11 +93,11 @@ async def _persist_delivery(
             d.delivery_id,
             d.event_type,
             client_id,
-            json.dumps(d.payload),
+            json.dumps(redact_dict(d.payload)),
         )
         if row is None:
             return ReportingDeliveryResult(
-                index=-1, delivery_id=d.delivery_id, status="duplicate"
+                index=idx, delivery_id=d.delivery_id, status="duplicate"
             )
         await conn.execute(
             _INSERT_TRAIL_SQL,
@@ -104,7 +108,7 @@ async def _persist_delivery(
             None,
         )
         return ReportingDeliveryResult(
-            index=-1,
+            index=idx,
             delivery_id=d.delivery_id,
             status="accepted",
             delivery_record_id=row["id"],
@@ -148,7 +152,7 @@ async def ingest_deliveries(
 
     for idx, delivery in enumerate(body.deliveries):
         try:
-            result = await _persist_delivery(conn, client_id, delivery)
+            result = await _persist_delivery(conn, client_id, idx, delivery)
         except Exception as exc:  # noqa: BLE001 - per-delivery partial success
             logger.warning("Reporting delivery rejected: %s", exc, exc_info=True)
             result = ReportingDeliveryResult(
@@ -157,8 +161,6 @@ async def ingest_deliveries(
                 status="rejected",
                 reason=str(exc),
             )
-        else:
-            result.index = idx
         results.append(result)
         if result.status == "accepted":
             accepted += 1

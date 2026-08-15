@@ -181,3 +181,17 @@ def test_reporting_models_have_expected_columns() -> None:
         "detail",
         "created_at",
     } <= trail_cols
+
+
+def test_reporting_models_mirror_migration_server_defaults() -> None:
+    """ORM server_defaults must match migration 0031 (autogenerate parity)."""
+    from app.db.models import DeliveryStateTrail, ReportingDelivery
+
+    delivery_cols = ReportingDelivery.__table__.columns
+    assert str(delivery_cols["id"].server_default.arg) == "gen_random_uuid()"
+    assert str(delivery_cols["received_at"].server_default.arg) == "now()"
+    assert str(delivery_cols["payload"].server_default.arg) == "'{}'::jsonb"
+
+    trail_cols = DeliveryStateTrail.__table__.columns
+    assert str(trail_cols["id"].server_default.arg) == "gen_random_uuid()"
+    assert str(trail_cols["created_at"].server_default.arg) == "now()"
