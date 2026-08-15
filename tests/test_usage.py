@@ -3325,9 +3325,15 @@ class TestTimeoutBudgets:
 
         from app.api.usage import _db_timeout, _request_timeout, _status_timeout
 
+        # _db_timeout / _request_timeout now live in the shared
+        # app.core.timeouts module (PR #492 review refactor), so their
+        # timeout_operation lookup must be patched there; _status_timeout
+        # remains defined in app.api.usage.
         with patch(
+            "app.core.timeouts.timeout_operation"
+        ) as mock_timeout_op, patch(
             "app.api.usage.timeout_operation"
-        ) as mock_timeout_op:
+        ) as mock_status_timeout_op:
             import contextlib
 
             @contextlib.asynccontextmanager
@@ -3335,6 +3341,7 @@ class TestTimeoutBudgets:
                 yield
 
             mock_timeout_op.side_effect = _fake_timeout
+            mock_status_timeout_op.side_effect = _fake_timeout
 
             # _db_timeout with explicit seconds → budget_ms = seconds * 1000
             async with _db_timeout("test.db", db_timeout_seconds=10):
@@ -3359,7 +3366,7 @@ class TestTimeoutBudgets:
             # _status_timeout with explicit seconds
             async with _status_timeout(status_timeout_seconds=7):
                 pass
-            status_call_kw = mock_timeout_op.call_args.kwargs
+            status_call_kw = mock_status_timeout_op.call_args.kwargs
             assert status_call_kw["budget_ms"] == 7000, (
                 f"Expected 7000, got {status_call_kw}"
             )
@@ -3385,7 +3392,7 @@ class TestTimeoutBudgets:
         mock_conn.fetch = AsyncMock(return_value=[])
 
         with patch(
-            "app.api.usage.timeout_operation"
+            "app.core.timeouts.timeout_operation"
         ) as mock_timeout_op:
             import contextlib
 
