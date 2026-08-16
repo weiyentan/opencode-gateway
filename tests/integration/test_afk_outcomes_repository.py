@@ -599,7 +599,7 @@ async def test_run_scoped_unique_constraint_exists_post_upgrade(
         )
 
 
-# ── Exact resource↔session associations (migration 0032) ─────────────────────
+# ── Exact resource↔session associations (migration 0033) ─────────────────────
 
 
 def _make_association(
