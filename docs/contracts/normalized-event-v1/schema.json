@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fast-api-eda-gateway/contracts/normalized-event-v1/schema.json",
+  "title": "Normalized Provider Event v1",
+  "description": "The executable producer-owned contract for the normalized, schema-versioned event emitted by fast-api-eda-gateway on the afk.events topic. Every consumer validates incoming messages against this schema.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "provider",
+    "delivery_id",
+    "resource_type",
+    "resource_id",
+    "repository",
+    "action",
+    "occurred_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Producer schema version — always \"1.0\" for v1 messages.",
+      "const": "1.0"
+    },
+    "provider": {
+      "type": "string",
+      "description": "Source provider identity.",
+      "enum": ["github", "gitlab"]
+    },
+    "delivery_id": {
+      "type": "string",
+      "description": "Forwarded provider delivery UUID (X-GitHub-Delivery / X-GitLab-Event-UUID). The delivery_log dedup key on the consumer side."
+    },
+    "resource_type": {
+      "type": "string",
+      "description": "Producer-native resource vocabulary: issue, pull_request (GitHub), or merge_request (GitLab). Never the outcome layer's canonical change_request.",
+      "enum": ["issue", "pull_request", "merge_request"]
+    },
+    "resource_id": {
+      "type": "string",
+      "description": "Stable provider-scoped resource identity — the value behind the canonical entity_id (e.g. \"442\" for change_request:442)."
+    },
+    "repository": {
+      "type": "string",
+      "description": "Full owner/repo (or group/project) name."
+    },
+    "action": {
+      "type": "string",
+      "description": "Canonical event-type suffix: opened, closed, merged, review_requested, changes_requested, or approved.",
+      "enum": [
+        "opened",
+        "closed",
+        "merged",
+        "review_requested",
+        "changes_requested",
+        "approved"
+      ]
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the activity happened at the source (ISO 8601)."
+    },
+    "ingested_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Producer's ingest timestamp (ISO 8601). Optional — may be null when the producer has not yet recorded it."
+    },
+    "actor": {
+      "type": ["string", "null"],
+      "description": "Acting principal login. Optional — may be null for automated events."
+    },
+    "payload_ref": {
+      "type": ["string", "null"],
+      "description": "Reference to the redacted payload — never the payload itself. Optional — may be null when no payload reference is available."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "resource_type": { "const": "issue" }
+        }
+      },
+      "then": {
+        "properties": {
+          "action": {
+            "enum": ["opened", "closed"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resource_type": { "const": "pull_request" }
+        }
+      },
+      "then": {
+        "properties": {
+          "action": {
+            "enum": [
+              "opened",
+              "closed",
+              "merged",
+              "review_requested",
+              "changes_requested",
+              "approved"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "resource_type": { "const": "merge_request" }
+        }
+      },
+      "then": {
+        "properties": {
+          "action": {
+            "enum": [
+              "opened",
+              "closed",
+              "merged",
+              "review_requested",
+              "changes_requested",
+              "approved"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

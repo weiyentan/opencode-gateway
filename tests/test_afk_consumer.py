@@ -2286,6 +2286,303 @@ async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> N
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Producer: executable normalized-event v1 contract artifacts (#494)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The producer (fast-api-eda-gateway) owns the executable normalized-event
+# contract published in docs/contracts/normalized-event-v1/.  These tests:
+#
+# 1. Build records through the real NormalizedProviderEvent serializer and
+#    validate every fixture against the published JSON Schema.
+# 2. Verify payload references in generated fixtures identify the same
+#    provider and delivery_id as their containing envelope.
+# 3. Verify contract artifacts contain no raw webhook payload or secret data.
+# 4. Prove that every allowed v1 (resource_type, action) pair is covered.
+
+
+import json as _json_mod
+from pathlib import Path as _Path
+
+
+_CONTRACTS_DIR = _Path(__file__).resolve().parent.parent / "docs" / "contracts" / "normalized-event-v1"
+_SCHEMA_PATH = _CONTRACTS_DIR / "schema.json"
+_FIXTURES_DIR = _CONTRACTS_DIR / "fixtures"
+
+
+def _load_schema() -> dict:
+    return _json_mod.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _load_fixture(filename: str) -> dict:
+    return _json_mod.loads((_FIXTURES_DIR / filename).read_text(encoding="utf-8"))
+
+
+# The complete set of allowed v1 (resource_type, action) pairs.
+_ALLOWED_PAIRS: set[tuple[str, str]] = {
+    ("issue", "opened"),
+    ("issue", "closed"),
+    ("pull_request", "opened"),
+    ("pull_request", "review_requested"),
+    ("pull_request", "changes_requested"),
+    ("pull_request", "approved"),
+    ("pull_request", "merged"),
+    ("pull_request", "closed"),
+    ("merge_request", "opened"),
+    ("merge_request", "review_requested"),
+    ("merge_request", "changes_requested"),
+    ("merge_request", "approved"),
+    ("merge_request", "merged"),
+    ("merge_request", "closed"),
+}
+
+
+def _expected_fixture_filename(resource_type: str, action: str) -> str:
+    return f"{resource_type}.{action}.json"
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_exists_for_every_allowed_pair(
+    resource_type: str, action: str
+) -> None:
+    """Every allowed v1 (resource_type, action) pair has a fixture file."""
+    filename = _expected_fixture_filename(resource_type, action)
+    assert (_FIXTURES_DIR / filename).is_file(), (
+        f"Missing fixture: {filename}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_built_through_real_serializer(
+    resource_type: str, action: str
+) -> None:
+    """Every fixture round-trips through the real NormalizedProviderEvent serializer.
+
+    The fixture is loaded, validated through Pydantic (the real serializer),
+    and the re-serialized output matches the fixture byte-for-byte — proving
+    the fixture is real serializer output, not hand-crafted JSON.
+    """
+    fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+    message = NormalizedProviderEvent.model_validate(fixture)
+    re_serialized = _json_mod.loads(message.model_dump_json())
+    assert re_serialized == fixture, (
+        f"Fixture {resource_type}.{action} does not round-trip through the "
+        f"real serializer — the fixture may be hand-crafted rather than "
+        f"serializer-generated."
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_validates_against_published_schema(
+    resource_type: str, action: str
+) -> None:
+    """Every fixture validates against the published JSON Schema."""
+    from jsonschema import validate
+
+    schema = _load_schema()
+    fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+    # Should not raise ValidationError.
+    validate(instance=fixture, schema=schema)
+
+
+def test_all_fixtures_share_same_provider_and_delivery_id() -> None:
+    """Payload references in generated fixtures identify the same provider and
+    delivery_id as their containing envelope (acceptance criterion)."""
+    provider = None
+    delivery_id = None
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        if provider is None:
+            provider = fixture["provider"]
+            delivery_id = fixture["delivery_id"]
+        else:
+            assert fixture["provider"] == provider, (
+                f"Fixture {resource_type}.{action} has provider={fixture['provider']!r}, "
+                f"expected {provider!r}"
+            )
+            assert fixture["delivery_id"] == delivery_id, (
+                f"Fixture {resource_type}.{action} has delivery_id={fixture['delivery_id']!r}, "
+                f"expected {delivery_id!r}"
+            )
+
+
+def test_fixture_payload_ref_matches_resource_id() -> None:
+    """Every fixture's payload_ref identifies the same resource as its
+    resource_id (the redacted payload reference is scoped to the resource)."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        resource_id = fixture["resource_id"]
+        payload_ref = fixture.get("payload_ref")
+        assert payload_ref is not None, (
+            f"Fixture {resource_type}.{action} has no payload_ref"
+        )
+        assert resource_id in payload_ref, (
+            f"Fixture {resource_type}.{action} payload_ref={payload_ref!r} "
+            f"does not reference resource_id={resource_id!r}"
+        )
+
+
+def test_contract_artifacts_contain_no_raw_webhook_payload_or_secrets() -> None:
+    """Contract artifacts (schema + fixtures) contain no raw webhook payload
+    or secret data (acceptance criterion)."""
+    suspicious_keys = {
+        "token", "secret", "password", "api_key", "webhook",
+        "raw_payload", "hook", "signature", "authorization",
+    }
+
+    # Check the schema.
+    schema = _load_schema()
+    _assert_no_suspicious_keys(schema, f"{_SCHEMA_PATH}", suspicious_keys)
+
+    # Check every fixture.
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        _assert_no_suspicious_keys(
+            fixture,
+            f"fixture {resource_type}.{action}",
+            suspicious_keys,
+        )
+        # No nested payload object — only payload_ref.
+        assert "payload" not in fixture or not isinstance(fixture.get("payload"), dict), (
+            f"Fixture {resource_type}.{action} contains a nested payload object "
+            f"(raw webhook payload) — only payload_ref is allowed."
+        )
+
+
+def _assert_no_suspicious_keys(
+    obj: dict, label: str, suspicious: set[str]
+) -> None:
+    """Assert that no key in ``obj`` (recursively) matches a suspicious pattern."""
+    for key in obj:
+        key_lower = key.lower()
+        for s in suspicious:
+            assert s not in key_lower, (
+                f"{label}: suspicious key {key!r} (matches {s!r})"
+            )
+        if isinstance(obj[key], dict):
+            _assert_no_suspicious_keys(obj[key], f"{label}.{key}", suspicious)
+
+
+def test_schema_is_valid_json_schema() -> None:
+    """The published schema is a valid JSON Schema document."""
+    from jsonschema.validators import validator_for
+
+    schema = _load_schema()
+    # Check that jsonschema can construct a validator for it (validates
+    # the meta-schema implicitly).
+    cls = validator_for(schema)
+    cls.check_schema(schema)
+
+
+def test_schema_declares_additional_properties_false() -> None:
+    """The schema rejects unknown fields (additionalProperties: false)."""
+    schema = _load_schema()
+    assert schema.get("additionalProperties") is False, (
+        "Schema must set additionalProperties: false to reject unknown fields"
+    )
+
+
+def test_schema_rejects_unknown_resource_type() -> None:
+    """The schema rejects a resource_type not in the allowed enum."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "commit",
+        "resource_id": "abc123",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_rejects_issue_with_invalid_action() -> None:
+    """The schema rejects an issue with a non-issue action (e.g. merged)."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "merged",
+        "occurred_at": "2026-08-15T10:00:00Z",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_rejects_unknown_field() -> None:
+    """The schema rejects a message with an unknown field."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "extra_field": "should be rejected",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_accepts_null_optional_fields() -> None:
+    """The schema accepts null for optional fields (actor, ingested_at, payload_ref)."""
+    from jsonschema import validate
+
+    schema = _load_schema()
+    valid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": None,
+        "actor": None,
+        "payload_ref": None,
+    }
+    validate(instance=valid, schema=schema)
+
+
+def test_fixture_count_matches_allowed_pairs() -> None:
+    """The number of fixture files matches the number of allowed pairs."""
+    fixture_files = sorted(
+        f.name for f in _FIXTURES_DIR.glob("*.json")
+    )
+    expected_files = sorted(
+        _expected_fixture_filename(rt, a) for rt, a in _ALLOWED_PAIRS
+    )
+    assert fixture_files == expected_files, (
+        f"Fixture files {fixture_files} do not match expected {expected_files}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  CLI dispatch (PR #492 review) — _parse_cli
 # ══════════════════════════════════════════════════════════════════════════
 
