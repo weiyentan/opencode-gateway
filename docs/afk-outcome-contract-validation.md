@@ -4,7 +4,7 @@
 **Parent**: PRD #478 — PR/MR/Issue Ingestion and Reporting Capability (cross-repository)
 **Slice layer**: validation (builds on #482's mapping bridge + DLQ path)
 **Validator**: `code-editor-senior` (T3)
-**Date**: 2026-08-16 (updated 2026-08-17 for #495)
+**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497)
 **Verdict**: **PASS** — the pinned producer contract maps cleanly through
 `map_provider_event` to the canonical outcome-layer vocabulary without DLQ
 routing; re-delivery of the same `provider + delivery_id` converges on
@@ -96,7 +96,7 @@ payload reference in a `redacted_payload` object:
 The bridge maps `resource_type` → canonical `entity_type`
 (`issue` → `issue`; `pull_request`/`merge_request` → `change_request`) and
 `action` → the canonical event-type suffix, validating the result against the
-locked ten-type vocabulary (`_MAPPED_EVENT_TYPES`). An unknown `resource_type`
+locked canonical vocabulary (`_CANONICAL_EVENT_TYPES`). An unknown `resource_type`
 or an `action` that does not resolve to a canonical event type is unmappable.
 
 ### Pinned by tests
@@ -156,7 +156,7 @@ violation classes and their DLQ handling:
 | Violation | Detection | DLQ payload | Reason |
 |---|---|---|---|
 | Bad JSON | `json.loads` fails | `{"raw": <bytes>}` | `JSON decode failure: <error>` |
-| Bad shape | Pydantic `model_validate` fails (neither legacy nor normalized shape) | original dict | `Invalid message shape — failed Pydantic validation` |
+| Bad shape | Pydantic `model_validate` fails (not a valid normalized event shape) | original dict | `Invalid message shape — failed Pydantic validation` |
 | Unmappable | `map_provider_event` returns `None` (unknown `resource_type` or non-canonical `action`) | original dict | `Unmappable message type: '<resource_type>.<action>'` |
 | Unsupported schema version | `schema_version` not in `{"1.0"}` | original dict | `Unsupported schema version: '<version>' (supported: ['1.0'])` |
 | Invalid repository identity | `normalize_repository_url` returns `None` (nested shape only) | original dict | `Invalid repository identity: '<url>' — must be an absolute HTTP(S) URL with a valid hostname and path` |

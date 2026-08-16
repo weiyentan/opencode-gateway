@@ -45,7 +45,7 @@ import httpx
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from afk_outcomes.models import (
     EngineeringEntity,
@@ -104,17 +104,14 @@ METRIC_DLQ_DEPTH = "afk_consumer.dlq.depth"
 METRIC_COMMITTED_OFFSET = "afk_consumer.committed_offset"
 METRIC_LAG = "afk_consumer.lag"
 
-# ── Message-type → canonical-event mapping ──────────────────────────────────
+# ── Canonical event type vocabulary ──────────────────────────────────────────
 #
-# The provider-events topic is external and its payload contract is defined
-# here.  ``type`` carries one of the ten locked canonical event types (PRD
-# decision #7), shared with the provider adapters' normalization vocabulary.
-# The entity a message maps onto is derived from the event-type prefix:
-# ``issue.*`` maps to an ``issue`` entity; ``change_request.*`` and
-# ``pipeline.*`` map to a ``change_request`` entity (pipeline events attach
-# to the owning change request, matching the provider adapters).
+# The locked set of canonical event types the outcome layer recognises.
+# ``map_normalized_event`` validates its bridged ``event_type`` against this
+# vocabulary; an unknown resource type or action that does not resolve to a
+# canonical event type returns ``None`` (unmappable → DLQ, never persisted).
 
-_MAPPED_EVENT_TYPES = frozenset(
+_CANONICAL_EVENT_TYPES = frozenset(
     {
         "issue.opened",
         "issue.closed",
@@ -134,24 +131,6 @@ _MAPPED_EVENT_TYPES = frozenset(
         "pipeline.succeeded",
     }
 )
-
-
-class ProviderEventMessage(BaseModel):
-    """One legacy message on the provider-events topic.
-
-    ``delivery_id`` is the provider's delivery UUID (``X-GitHub-Delivery`` /
-    ``X-GitLab-Event-UUID``) forwarded in the payload (PRD decision #8); it
-    is the key ``delivery_log`` dedups on, so a redelivered message no-ops.
-    """
-
-    provider: Provider
-    delivery_id: str
-    type: str
-    repository: str
-    number: int
-    occurred_at: datetime
-    actor: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class _NormalizedResource(BaseModel):
@@ -194,8 +173,7 @@ class NormalizedProviderEvent(BaseModel):
 
     The v1 nested envelope (issue #495) wraps resource fields in a
     ``resource`` object and the payload reference in a ``redacted_payload``
-    object.  The flat shape (issue #482) is still accepted for backward
-    compatibility during the transition.
+    object.  The flat shape (issue #482) is also accepted.
     """
 
     model_config = {"ser_json_exclude_none": True}
@@ -255,8 +233,7 @@ class NormalizedProviderEvent(BaseModel):
 # The producer's resource types are provider-specific: ``pull_request``
 # (GitHub) and ``merge_request`` (GitLab) are the *same* outcome-layer
 # concept, ``change_request`` (CONTEXT.md / ADR 0020).  ``issue`` is
-# unchanged.  The bridge is explicit and additive: it never reinterprets the
-# legacy ten-type mapping above.
+# unchanged.
 
 _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
     "issue": EntityType.ISSUE,
@@ -265,47 +242,12 @@ _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
 }
 
 
-def _entity_type_for(event_type: str) -> EntityType:
-    """Derive the canonical entity type a message type maps onto."""
-    if event_type.startswith("issue."):
-        return EntityType.ISSUE
-    return EntityType.CHANGE_REQUEST
-
-
 def _coerce_resource_number(resource_id: str) -> int | None:
     """Return ``resource_id`` as an int when it is a plain number, else None."""
     try:
         return int(resource_id)
     except (TypeError, ValueError):
         return None
-
-
-def _map_legacy_event(
-    message: ProviderEventMessage,
-) -> tuple[EngineeringEntity, EngineeringEvent] | None:
-    """Map a legacy provider message to the canonical entity + event (or None)."""
-    if message.type not in _MAPPED_EVENT_TYPES:
-        return None
-    entity_type = _entity_type_for(message.type)
-    entity_id = f"{entity_type.value}:{message.number}"
-    suffix = message.type.split(".", 1)[1]
-    entity = EngineeringEntity(
-        entity_id=entity_id,
-        entity_type=entity_type,
-        provider=message.provider,
-        repository=message.repository,
-        number=message.number,
-    )
-    event = EngineeringEvent(
-        event_id=f"{entity_id}:{suffix}",
-        event_type=message.type,
-        provider=message.provider,
-        entity_id=entity_id,
-        occurred_at=message.occurred_at,
-        actor=message.actor,
-        payload=message.payload,
-    )
-    return entity, event
 
 
 # ── Repository URL normalization (issue #495) ────────────────────────────────
@@ -427,8 +369,8 @@ def validate_normalized_event(message: NormalizedProviderEvent) -> None:
 
     # ── Repository identity ─────────────────────────────────────────
     # Only validate repository identity for the nested v1 shape (where
-    # the repository is always a URL).  The flat shape (backward compat)
-    # uses plain owner/repo strings that are not URLs.
+    # the repository is always a URL).  The flat shape uses plain
+    # owner/repo strings that are not URLs.
     repo = message.effective_repository
     if message.resource is not None:
         normalized = normalize_repository_url(repo)
@@ -483,15 +425,8 @@ def map_normalized_event(
     entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource_type)
     if entity_type is None:
         return None
-
-    # Canonical event-type suffix: ``edited`` and ``updated`` both converge on
-    # ``updated``; every other action maps directly.
-    canonical_action = action
-    if action in ("edited", "updated"):
-        canonical_action = "updated"
-
-    event_type = f"{entity_type.value}.{canonical_action}"
-    if event_type not in _MAPPED_EVENT_TYPES:
+    event_type = f"{entity_type.value}.{action}"
+    if event_type not in _CANONICAL_EVENT_TYPES:
         return None
     entity_id = f"{entity_type.value}:{resource_id}"
     entity = EngineeringEntity(
@@ -508,7 +443,7 @@ def map_normalized_event(
     payload["source_resource_type"] = resource_type
     payload["source_action"] = action
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{canonical_action}",
+        event_id=f"{entity_id}:{action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
@@ -520,17 +455,16 @@ def map_normalized_event(
 
 
 def map_provider_event(
-    message: ProviderEventMessage | NormalizedProviderEvent,
+    message: NormalizedProviderEvent,
 ) -> tuple[EngineeringEntity, EngineeringEvent] | None:
-    """Map a provider message to the canonical entity + event (or None).
+    """Map a normalized provider event to the canonical entity + event (or None).
 
-    Dispatches on the message shape: legacy ten-type messages (unchanged) or
-    normalized bridge messages.  Returns ``None`` when the message cannot be
-    mapped — the caller treats that as a poison message (DLQ, no DB write).
+    Bridges the producer's native resource vocabulary into the outcome layer's
+    canonical vocabulary via :func:`map_normalized_event`.  Returns ``None``
+    when the message cannot be mapped — the caller treats that as a poison
+    message (DLQ, no DB write).
     """
-    if isinstance(message, NormalizedProviderEvent):
-        return map_normalized_event(message)
-    return _map_legacy_event(message)
+    return map_normalized_event(message)
 
 
 class AFKOutcomeConsumer:
@@ -902,25 +836,24 @@ class AFKOutcomeConsumer:
             return
 
         # ── Validate normalized events (issue #495) ─────────────────
-        if isinstance(message, NormalizedProviderEvent):
-            try:
-                validate_normalized_event(message)
-            except NormalizedEventValidationError as exc:
-                logger.warning(
-                    "Normalized event validation failed — sending to DLQ "
-                    "(key=%s offset=%d): %s",
-                    msg.key,
-                    msg.offset,
-                    exc.reason,
-                )
-                await self._send_to_dlq(
-                    raw_value if isinstance(raw_value, dict) else {},
-                    reason=exc.reason,
-                )
-                self._metrics.counter(METRIC_MESSAGES_POISON).inc()
-                self._mark_committable(msg)
-                await self._commit()
-                return
+        try:
+            validate_normalized_event(message)
+        except NormalizedEventValidationError as exc:
+            logger.warning(
+                "Normalized event validation failed — sending to DLQ "
+                "(key=%s offset=%d): %s",
+                msg.key,
+                msg.offset,
+                exc.reason,
+            )
+            await self._send_to_dlq(
+                raw_value if isinstance(raw_value, dict) else {},
+                reason=exc.reason,
+            )
+            self._metrics.counter(METRIC_MESSAGES_POISON).inc()
+            self._mark_committable(msg)
+            await self._commit()
+            return
 
         # ── Map message type → canonical entity/event ───────────────
         mapped = map_provider_event(message)
@@ -985,28 +918,23 @@ class AFKOutcomeConsumer:
     @staticmethod
     def _parse_message(
         raw_value: Any,
-    ) -> ProviderEventMessage | NormalizedProviderEvent:
-        """Parse a raw payload into a legacy or normalized message model.
+    ) -> NormalizedProviderEvent:
+        """Parse a raw payload into a normalized provider event model.
 
-        The normalized shape is identified by its ``resource_type`` field
-        (absent from the legacy shape); the nested v1 shape is identified by
-        its ``resource`` object.  Everything else is validated as a legacy
-        message.  Raises :class:`pydantic.ValidationError` when the payload
-        matches neither shape.
+        Only producer-owned normalized-event versions are accepted.  The
+        nested v1 shape is identified by its ``resource`` object; the flat
+        shape is identified by its ``resource_type`` field.  Raises
+        :class:`pydantic.ValidationError` when the payload matches neither
+        shape.
         """
-        if isinstance(raw_value, dict):
-            if "resource" in raw_value or "resource_type" in raw_value:
-                return NormalizedProviderEvent.model_validate(raw_value)
-        return ProviderEventMessage.model_validate(raw_value)
+        return NormalizedProviderEvent.model_validate(raw_value)
 
     @staticmethod
     def _message_type_label(
-        message: ProviderEventMessage | NormalizedProviderEvent,
+        message: NormalizedProviderEvent,
     ) -> str:
         """Return the human-readable message type for logs/DLQ reasons."""
-        if isinstance(message, NormalizedProviderEvent):
-            return f"{message.effective_resource_type}.{message.effective_action}"
-        return message.type
+        return f"{message.effective_resource_type}.{message.effective_action}"
 
     def _retry_delay(self, attempt: int) -> float:
         """Bounded exponential backoff with jitter (issue #482).
@@ -1027,7 +955,7 @@ class AFKOutcomeConsumer:
 
     async def _persist(
         self,
-        message: ProviderEventMessage | NormalizedProviderEvent,
+        message: NormalizedProviderEvent,
         entity: EngineeringEntity,
         event: EngineeringEvent,
     ) -> None:

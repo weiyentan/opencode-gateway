@@ -2,7 +2,13 @@
 
 ## Status
 
-Accepted (2026-08-16)
+Superseded by FastAPI EDA Gateway ADR 0005 (2026-08-17)
+
+*Historical context: Accepted 2026-08-16.  The producer now owns the
+normalized-event contract; the consumer-authored flat ``ProviderEventMessage``
+shape and its legacy ten-type mapping have been removed (issue #497).  The
+mapping bridge vocabulary (``pull_request``/``merge_request`` → ``change_request``)
+remains the canonical outcome-layer vocabulary.*
 
 ## Context
 

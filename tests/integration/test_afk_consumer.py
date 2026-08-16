@@ -43,7 +43,6 @@ from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.consumer.afk_consumer import (
     AFKOutcomeConsumer,
     NormalizedProviderEvent,
-    ProviderEventMessage,
     map_normalized_event,
     map_provider_event,
 )
@@ -384,14 +383,20 @@ async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.P
     merged_at = now - timedelta(hours=12)
 
     # Live path: a producer-forwarded merge event for change_request:300.
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id="delivery-cross-path-live",
-        type="change_request.merged",
-        repository=REPOSITORY,
-        number=300,
-        occurred_at=merged_at,
-        actor="carol",
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-cross-path-live",
+            "resource_type": "pull_request",
+            "resource_id": "300",
+            "repository": REPOSITORY,
+            "action": "merged",
+            "occurred_at": _iso(merged_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-300",
+        }
     )
     mapped = map_provider_event(message)
     assert mapped is not None
@@ -451,14 +456,20 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
     live_at = now - timedelta(hours=12)
     backfill_at = now - timedelta(hours=12, seconds=5)  # 5 seconds later
 
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id="delivery-cross-path-live",
-        type="change_request.merged",
-        repository=REPOSITORY,
-        number=300,
-        occurred_at=live_at,
-        actor="carol",
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-cross-path-live",
+            "resource_type": "pull_request",
+            "resource_id": "300",
+            "repository": REPOSITORY,
+            "action": "merged",
+            "occurred_at": _iso(live_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-300",
+        }
     )
     mapped = map_provider_event(message)
     assert mapped is not None
