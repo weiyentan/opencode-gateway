@@ -10,7 +10,9 @@ Semantics (ADR 0018):
 - **Stable identity** — an aggregate is keyed by the composite
   ``provider:repository_url:resource_type:resource_number``, sourced from a
   delivery's ``resource`` object.  ``repository_url`` is normalized
-  (lowercased, trailing slash stripped) so the insert and query paths agree.
+  (lowercased hostname, trailing slash stripped, ``.git`` suffix removed)
+  so the insert and query paths agree, and the reporting and outcome
+  pipelines produce the same normalized repository identity.
 - **Forward-only merge (per-key provenance)** — a newer event's non-null
   values overwrite; a stale (late) event fills only keys absent from the
   stored payload and never regresses state already set by a newer event.
@@ -48,10 +50,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re as _re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse as _urlparse
 
 import asyncpg
 
@@ -61,18 +65,81 @@ from app.core.secrets import redact_dict
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Canonical resource-type mapping (mirrors app/consumer/afk_consumer.py)
+# ---------------------------------------------------------------------------
+# The producer's resource types are provider-specific: ``pull_request``
+# (GitHub) and ``merge_request`` (GitLab) are the *same* reporting-layer
+# concept, ``change_request``.  ``issue`` is unchanged.  The mapping is
+# explicit and additive — it never reinterprets unknown types.
+
+_RESOURCE_TYPE_TO_CANONICAL: dict[str, str] = {
+    "issue": "issue",
+    "pull_request": "change_request",
+    "merge_request": "change_request",
+}
+
+# ---------------------------------------------------------------------------
 # Stable resource identity
 # ---------------------------------------------------------------------------
 
+_REPO_URL_RE = _re.compile(r"^https?://", _re.IGNORECASE)
 
-def normalize_repository_url(repository_url: str) -> str:
-    """Normalize a repository URL: lowercase and strip trailing slashes.
 
-    Applied identically on both insert and query paths so a URL written as
-    ``https://github.com/Acme/Backend/`` and queried as
-    ``https://github.com/acme/backend`` resolve to the same aggregate.
+def normalize_repository_url(raw: str) -> str | None:
+    """Normalize a repository URL into a deterministic identity string.
+
+    Returns the normalized identity, or ``None`` when the URL is invalid
+    (not an absolute HTTP(S) URL, empty, or unparseable).
+
+    Mirrors :func:`app.consumer.afk_consumer.normalize_repository_url` so
+    the reporting and outcome pipelines produce the same normalized
+    repository identity for the same URL.
     """
-    return repository_url.strip().lower().rstrip("/")
+    if not raw or not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if not _REPO_URL_RE.match(raw):
+        return None
+
+    try:
+        parsed = _urlparse(raw)
+    except Exception:
+        return None
+
+    if not parsed.hostname:
+        return None
+
+    # Lowercase the hostname.
+    host = parsed.hostname.lower()
+
+    # Strip default ports; preserve non-default ports.
+    port = ""
+    if parsed.port is not None:
+        is_default = (parsed.scheme == "http" and parsed.port == 80) or (
+            parsed.scheme == "https" and parsed.port == 443
+        )
+        if not is_default:
+            port = f":{parsed.port}"
+
+    # Build the normalized URL: scheme + host + optional non-default port + path.
+    path = parsed.path or ""
+
+    # Strip trailing slash.
+    path = path.rstrip("/")
+
+    # Strip terminal .git suffix.
+    if path.endswith(".git"):
+        path = path[:-4]
+
+    # Remove leading slash for the canonical owner/repo form.
+    path = path.lstrip("/")
+
+    if not path:
+        return None
+
+    return f"{host}{port}/{path}"
 
 
 @dataclass(frozen=True)
@@ -111,6 +178,10 @@ def resource_identity_from_payload(
     raises — when the payload is malformed or the ``resource`` object is
     absent/incomplete, so the caller can skip enrichment without rejecting
     the delivery (immutable fact).
+
+    Producer resource types (``pull_request``, ``merge_request``) are
+    mapped to the canonical ``change_request`` type, mirroring the outcome
+    consumer's ``_RESOURCE_TYPE_TO_ENTITY_TYPE`` mapping.
     """
     if not isinstance(payload, Mapping) or not provider:
         return None
@@ -128,6 +199,12 @@ def resource_identity_from_payload(
     resource_type = resource.get("resource_type")
     if not isinstance(resource_type, str) or not resource_type.strip():
         return None
+    resource_type = resource_type.strip()
+
+    # Map producer resource types to canonical reporting types.
+    canonical_type = _RESOURCE_TYPE_TO_CANONICAL.get(resource_type)
+    if canonical_type is None:
+        return None
 
     resource_number = resource.get("resource_number")
     if resource_number is None or isinstance(resource_number, bool):
@@ -140,7 +217,7 @@ def resource_identity_from_payload(
     return ResourceIdentity(
         provider=str(provider),
         repository_url=repository_url,
-        resource_type=resource_type.strip(),
+        resource_type=canonical_type,
         resource_number=resource_number.strip(),
     )
 
