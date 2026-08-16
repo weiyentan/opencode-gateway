@@ -173,7 +173,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         ``UNIQUE (provider, repository, resource_type, resource_number,
         external_session_id)`` — so the same explicit reference converging on
         the same association never duplicates a row; on conflict
-        ``last_seen_at`` is advanced with ``now()`` (recency tracking).  There
+        ``last_seen_at`` is advanced with ``now()`` (recency tracking) and
+        ``session_id`` is enriched via ``COALESCE`` so a previously-NULL
+        session identity can be filled from a later observation.  There
         is no read-modify-write and therefore no advisory lock (a
         ``DO UPDATE SET`` is still a single atomic statement); the
         ``source_reference`` provenance is written once with the first insert
@@ -188,7 +190,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """Insert one association idempotently.
 
         On conflict (same resource+session identity) the row is never
-        duplicated, but ``last_seen_at`` is advanced with ``now()``.
+        duplicated, but ``last_seen_at`` is advanced with ``now()`` and
+        ``session_id`` is enriched via ``COALESCE`` so a previously-NULL
+        session identity can be filled from a later observation.
         """
         await self._conn.execute(
             """
@@ -198,7 +202,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                  resolver_version, first_seen_at, last_seen_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now())
             ON CONFLICT (provider, repository, resource_type, resource_number, external_session_id)
-            DO UPDATE SET last_seen_at = now()
+            DO UPDATE SET
+                last_seen_at = now(),
+                session_id = COALESCE(resource_session_associations.session_id, EXCLUDED.session_id)
             """,
             association.session_id,
             association.external_session_id,

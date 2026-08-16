@@ -260,7 +260,10 @@ def test_save_associations_uses_conflict_update_advancing_last_seen_at(
         "ON CONFLICT (provider, repository, resource_type, resource_number, external_session_id)"
         in sql
     )
-    assert "DO UPDATE SET last_seen_at = now()" in sql
+    assert "DO UPDATE SET" in sql
+    assert "last_seen_at = now()" in sql
+    assert "session_id = COALESCE" in sql
+    assert "EXCLUDED.session_id" in sql
     assert "DO NOTHING" not in sql
 
 
