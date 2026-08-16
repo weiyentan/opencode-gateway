@@ -608,8 +608,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             SELECT provider, repository, entity_type, external_id, event_type,
                    occurred_at, provider_event_id, actor, payload
             FROM engineering_events
-            WHERE (entity_type, external_id) IN (
-                SELECT entity_type, external_id FROM afk_run_entities
+            WHERE (provider, repository, entity_type, external_id) IN (
+                SELECT provider, repository, entity_type, external_id FROM afk_run_entities
                 WHERE afk_run_id = $1 AND superseded_at IS NULL
             )
             """,
@@ -619,12 +619,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         entities: list[EngineeringEntity] = []
         entity_links: list[RunEntityLink] = []
         correlations: list[Correlation] = []
-        seen_entities: set[str] = set()
+        seen_entities: set[tuple[str, str, str, str]] = set()
 
         for row in entity_rows:
             entity_id = f"{row['entity_type']}:{row['external_id']}"
-            if entity_id not in seen_entities:
-                seen_entities.add(entity_id)
+            entity_key = (row["provider"], row["repository"], row["entity_type"], row["external_id"])
+            if entity_key not in seen_entities:
+                seen_entities.add(entity_key)
                 entities.append(
                     EngineeringEntity(
                         entity_id=entity_id,
