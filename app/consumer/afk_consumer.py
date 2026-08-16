@@ -443,7 +443,7 @@ def map_normalized_event(
     payload["source_resource_type"] = resource_type
     payload["source_action"] = action
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{canonical_action}",
+        event_id=f"{entity_id}:{action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
