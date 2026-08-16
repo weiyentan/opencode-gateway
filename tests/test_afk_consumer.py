@@ -35,6 +35,7 @@ from app.consumer.afk_consumer import (
     METRIC_RETRIES,
     METRIC_RETRIES_PER_MESSAGE,
     AFKOutcomeConsumer,
+    NormalizedEventValidationError,
     NormalizedProviderEvent,
     ProviderEventMessage,
     _build_adapter,
@@ -47,8 +48,10 @@ from app.consumer.afk_consumer import (
     is_dlq_expired,
     map_normalized_event,
     map_provider_event,
+    normalize_repository_url,
     run_dlq_sweep,
     sweep_dlq,
+    validate_normalized_event,
 )
 from app.core.metrics import MetricsRegistry
 
@@ -2369,7 +2372,7 @@ def test_fixture_built_through_real_serializer(
     """
     fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
     message = NormalizedProviderEvent.model_validate(fixture)
-    re_serialized = _json_mod.loads(message.model_dump_json())
+    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=True))
     assert re_serialized == fixture, (
         f"Fixture {resource_type}.{action} does not round-trip through the "
         f"real serializer — the fixture may be hand-crafted rather than "
@@ -2611,3 +2614,538 @@ def test_parse_cli(argv: list[str], expected: tuple[bool, list[str]]) -> None:
     ``--dlq-sweep`` positioned as another option's value does not switch mode.
     """
     assert _parse_cli(argv) == expected
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer: pin v1 contract and validate nested normalized events (#495)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The consumer pins the producer-owned normalized-event v1 schema and
+# fixture artifacts with immutable source provenance, then validates the
+# shipped nested envelope.  The validation boundary distinguishes valid v1
+# lifecycle observations from malformed data and unsupported versions before
+# mapping or persistence.  Repository identity is derived strictly from the
+# producer repository URL.
+
+
+# ── Nested v1 envelope shape ────────────────────────────────────────────────
+
+
+def _nested_v1_payload(**overrides: object) -> dict:
+    """A v1 nested-envelope normalized event (resource + redacted_payload objects)."""
+    payload: dict[str, object] = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "33333333-4444-5555-6666-777777777777",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "resource": {
+            "resource_type": "pull_request",
+            "resource_id": "200",
+            "repository": "https://github.com/owner/repo",
+            "action": "merged",
+        },
+        "redacted_payload": {
+            "reference": "redacted-payload-ref-200",
+            "provider": "github",
+            "delivery_id": "33333333-4444-5555-6666-777777777777",
+        },
+    }
+    payload.update(overrides)  # type: ignore[arg-type]
+    return payload
+
+
+def test_nested_v1_envelope_parses_through_normalized_provider_event() -> None:
+    """The nested v1 shape (resource + redacted_payload objects) parses through
+    the real NormalizedProviderEvent serializer."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+
+    assert message.schema_version == "1.0"
+    assert message.provider is Provider.GITHUB
+    assert message.delivery_id == "33333333-4444-5555-6666-777777777777"
+    assert message.resource is not None
+    assert message.resource.resource_type == "pull_request"
+    assert message.resource.resource_id == "200"
+    assert message.resource.repository == "https://github.com/owner/repo"
+    assert message.resource.action == "merged"
+    assert message.redacted_payload is not None
+    assert message.redacted_payload.reference == "redacted-payload-ref-200"
+    assert message.redacted_payload.provider == "github"
+    assert message.redacted_payload.delivery_id == "33333333-4444-5555-6666-777777777777"
+
+
+def test_nested_v1_envelope_effective_properties() -> None:
+    """Effective properties resolve from the nested objects when present."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+
+    assert message.effective_resource_type == "pull_request"
+    assert message.effective_resource_id == "200"
+    assert message.effective_repository == "https://github.com/owner/repo"
+    assert message.effective_action == "merged"
+    assert message.effective_payload_ref == "redacted-payload-ref-200"
+
+
+def test_nested_v1_envelope_maps_to_canonical() -> None:
+    """The nested v1 envelope maps through map_normalized_event to the canonical
+    outcome-layer vocabulary."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.entity_id == "change_request:200"
+    assert entity.repository == "https://github.com/owner/repo"
+    assert event.event_type == "change_request.merged"
+    assert event.payload == {"payload_ref": "redacted-payload-ref-200"}
+
+
+# ── Validation: schema version ──────────────────────────────────────────────
+
+
+def test_validate_accepts_v1_schema_version() -> None:
+    """Schema version "1.0" passes validation."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+    validate_normalized_event(message)  # does not raise
+
+
+def test_validate_rejects_unsupported_schema_version() -> None:
+    """An unsupported schema version raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="2.0")
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported schema version"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_unknown_schema_version() -> None:
+    """An unknown schema version (e.g. "0.9") raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="0.9")
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported schema version"):
+        validate_normalized_event(message)
+
+
+# ── Validation: reference mismatch ──────────────────────────────────────────
+
+
+def test_validate_rejects_provider_mismatch() -> None:
+    """redacted_payload.provider != envelope.provider → DLQ."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "gitlab",
+                "delivery_id": "33333333-4444-5555-6666-777777777777",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Reference mismatch.*provider"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_delivery_id_mismatch() -> None:
+    """redacted_payload.delivery_id != envelope.delivery_id → DLQ."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "github",
+                "delivery_id": "wrong-delivery-id",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Reference mismatch.*delivery_id"):
+        validate_normalized_event(message)
+
+
+def test_validate_accepts_null_redacted_payload_fields() -> None:
+    """Null provider/delivery_id in redacted_payload are not checked (no mismatch)."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": None,
+                "delivery_id": None,
+            }
+        )
+    )
+    validate_normalized_event(message)  # does not raise
+
+
+# ── Validation: repository identity ─────────────────────────────────────────
+
+
+def test_validate_rejects_invalid_repository_identity() -> None:
+    """A non-HTTP(S) repository URL raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "ftp://github.com/owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Invalid repository identity"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_empty_repository() -> None:
+    """An empty repository URL raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "https:///owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Invalid repository identity"):
+        validate_normalized_event(message)
+
+
+# ── Repository URL normalization ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Basic normalization.
+        ("https://github.com/owner/repo", "github.com/owner/repo"),
+        ("https://github.com/Owner/Repo", "github.com/Owner/Repo"),  # path case preserved
+        ("https://GITHUB.COM/owner/repo", "github.com/owner/repo"),  # hostname lowercased
+        # Trailing slash.
+        ("https://github.com/owner/repo/", "github.com/owner/repo"),
+        # Terminal .git.
+        ("https://github.com/owner/repo.git", "github.com/owner/repo"),
+        ("https://github.com/owner/repo.git/", "github.com/owner/repo"),
+        # Default ports stripped.
+        ("https://github.com:443/owner/repo", "github.com/owner/repo"),
+        ("http://github.com:80/owner/repo", "github.com/owner/repo"),
+        # Non-default ports preserved.
+        ("https://github.com:8443/owner/repo", "github.com:8443/owner/repo"),
+        ("http://github.com:8080/owner/repo", "github.com:8080/owner/repo"),
+        # Credentials removed.
+        ("https://user:pass@github.com/owner/repo", "github.com/owner/repo"),
+        # Query string removed.
+        ("https://github.com/owner/repo?ref=main", "github.com/owner/repo"),
+        # Fragment removed.
+        ("https://github.com/owner/repo#readme", "github.com/owner/repo"),
+        # GitLab-style.
+        ("https://gitlab.com/group/subgroup/project", "gitlab.com/group/subgroup/project"),
+        # Self-hosted.
+        ("https://git.example.com/org/repo", "git.example.com/org/repo"),
+    ],
+)
+def test_normalize_repository_url(raw: str, expected: str) -> None:
+    assert normalize_repository_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "not-a-url",
+        "ftp://github.com/owner/repo",
+        "file:///etc/passwd",
+        "github.com/owner/repo",  # no scheme
+        "//github.com/owner/repo",  # protocol-relative
+        "/owner/repo",  # relative path
+        "https:///owner/repo",  # empty hostname
+        "https:///",  # no path
+    ],
+)
+def test_normalize_repository_url_rejects_invalid(raw: str) -> None:
+    assert normalize_repository_url(raw) is None
+
+
+def test_normalize_repository_url_credentials_not_in_identity() -> None:
+    """Credentials, query strings, and fragments cannot become part of repository identity."""
+    result = normalize_repository_url(
+        "https://admin:secret@github.com/owner/repo.git?ref=main#section"
+    )
+    assert result == "github.com/owner/repo"
+    assert "admin" not in result
+    assert "secret" not in result
+    assert "ref=main" not in result
+    assert "section" not in result
+
+
+# ── Validation: distinct DLQ reasons per violation class ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("payload_builder", "expected_reason_substring"),
+    [
+        (
+            lambda: _nested_v1_payload(schema_version="2.0"),
+            "Unsupported schema version",
+        ),
+        (
+            lambda: _nested_v1_payload(
+                resource={
+                    "resource_type": "pull_request",
+                    "resource_id": "200",
+                    "repository": "ftp://github.com/owner/repo",
+                    "action": "merged",
+                }
+            ),
+            "Invalid repository identity",
+        ),
+        (
+            lambda: _nested_v1_payload(
+                redacted_payload={
+                    "reference": "ref-200",
+                    "provider": "gitlab",
+                    "delivery_id": "33333333-4444-5555-6666-777777777777",
+                }
+            ),
+            "Reference mismatch",
+        ),
+    ],
+    ids=["unsupported-version", "invalid-repo-identity", "reference-mismatch"],
+)
+def test_each_violation_class_produces_distinct_dlq_reason(
+    payload_builder, expected_reason_substring: str
+) -> None:
+    """Each violation class produces a distinct DLQ reason string."""
+    message = NormalizedProviderEvent.model_validate(payload_builder())
+    with pytest.raises(NormalizedEventValidationError) as exc_info:
+        validate_normalized_event(message)
+    assert expected_reason_substring in exc_info.value.reason
+
+
+# ── Validation: consumer path integration ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nested_v1_event_passes_validation_and_persists() -> None:
+    """A valid nested v1 event passes validation and persists — never DLQ'd."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_nested_v1_payload()))
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "200"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+
+
+@pytest.mark.asyncio
+async def test_unsupported_schema_version_routes_to_dlq() -> None:
+    """An unsupported schema version is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_nested_v1_payload(schema_version="2.0")))
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Unsupported schema version" in dlq_payload["reason"]
+    assert "2.0" in dlq_payload["reason"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_repository_identity_routes_to_dlq() -> None:
+    """An invalid repository identity is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _nested_v1_payload(
+                resource={
+                    "resource_type": "pull_request",
+                    "resource_id": "200",
+                    "repository": "ftp://github.com/owner/repo",
+                    "action": "merged",
+                }
+            )
+        )
+    )
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Invalid repository identity" in dlq_payload["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reference_mismatch_routes_to_dlq() -> None:
+    """A reference mismatch is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _nested_v1_payload(
+                redacted_payload={
+                    "reference": "ref-200",
+                    "provider": "gitlab",
+                    "delivery_id": "33333333-4444-5555-6666-777777777777",
+                }
+            )
+        )
+    )
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Reference mismatch" in dlq_payload["reason"]
+
+
+# ── Contract pinning: fixtures with source provenance ───────────────────────
+
+
+def test_pinned_schema_has_source_provenance() -> None:
+    """The pinned schema file exists and is valid JSON Schema."""
+    assert _SCHEMA_PATH.is_file(), f"Schema not found at {_SCHEMA_PATH}"
+    schema = _load_schema()
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert schema["title"] == "Normalized Provider Event v1"
+
+
+def test_pinned_fixtures_cover_all_allowed_pairs() -> None:
+    """Every allowed v1 (resource_type, action) pair has a pinned fixture."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        filename = _expected_fixture_filename(resource_type, action)
+        assert (_FIXTURES_DIR / filename).is_file(), f"Missing fixture: {filename}"
+
+
+def test_every_pinned_fixture_passes_validation() -> None:
+    """Every pinned valid v1 fixture passes validate_normalized_event and is
+    not classified as poison."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        message = NormalizedProviderEvent.model_validate(fixture)
+        # Must not raise.
+        validate_normalized_event(message)
+
+
+def test_every_pinned_fixture_maps_without_dlq() -> None:
+    """Every pinned valid v1 fixture maps through map_normalized_event without
+    returning None (would be DLQ'd)."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        message = NormalizedProviderEvent.model_validate(fixture)
+        mapped = map_normalized_event(message)
+        assert mapped is not None, (
+            f"Fixture {resource_type}.{action} returned None from "
+            f"map_normalized_event — would be DLQ'd"
+        )
+
+
+def test_flat_shape_still_accepted_for_backward_compat() -> None:
+    """The flat shape (issue #482) is still accepted during the transition."""
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "22222222-3333-4444-5555-666666666666",
+            "resource_type": "pull_request",
+            "resource_id": "442",
+            "repository": "owner/repo",
+            "action": "merged",
+            "occurred_at": "2026-08-13T10:10:29Z",
+            "ingested_at": "2026-08-13T10:10:30Z",
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-442",
+        }
+    )
+    # Effective properties fall back to flat fields.
+    assert message.effective_resource_type == "pull_request"
+    assert message.effective_resource_id == "442"
+    assert message.effective_repository == "owner/repo"
+    assert message.effective_action == "merged"
+    assert message.effective_payload_ref == "redacted-payload-ref-442"
+
+    # Flat shape with a non-URL repository still validates (no URL normalization
+    # applied to flat-shape repositories during transition — only URL-shaped
+    # repositories are validated).
+    validate_normalized_event(message)  # does not raise
+
+
+# ── Validation: distinct DLQ reasons across all violation classes ───────────
+
+
+def test_all_violation_classes_have_distinct_reason_prefixes() -> None:
+    """Every violation class produces a reason with a distinct prefix so
+    operators can triage without inspecting the payload."""
+    reasons: set[str] = set()
+
+    # Unsupported version.
+    msg_v = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="2.0")
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_v)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # Invalid repository identity.
+    msg_r = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "ftp://github.com/owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_r)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # Reference mismatch (provider).
+    msg_p = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "gitlab",
+                "delivery_id": "33333333-4444-5555-6666-777777777777",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_p)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # All three violation classes produce distinct reason prefixes.
+    assert len(reasons) == 3, (
+        f"Expected 3 distinct reason prefixes, got {len(reasons)}: {reasons}"
+    )

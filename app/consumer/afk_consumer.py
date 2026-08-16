@@ -148,6 +148,33 @@ class ProviderEventMessage(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class _NormalizedResource(BaseModel):
+    """The nested ``resource`` object in a v1 normalized event.
+
+    Carries the producer's native resource vocabulary (``pull_request`` /
+    ``merge_request`` / ``issue``) — never the outcome layer's canonical
+    ``change_request`` vocabulary.
+    """
+
+    resource_type: str
+    resource_id: str
+    repository: str
+    action: str
+
+
+class _RedactedPayload(BaseModel):
+    """The nested ``redacted_payload`` object in a v1 normalized event.
+
+    ``reference`` is a *reference* to the redacted payload, never the
+    payload itself.  ``provider`` and ``delivery_id`` must equal the
+    envelope's ``provider`` and ``delivery_id`` (reference mismatch → DLQ).
+    """
+
+    reference: str | None = None
+    provider: str | None = None
+    delivery_id: str | None = None
+
+
 class NormalizedProviderEvent(BaseModel):
     """One normalized provider event (fast-api-eda-gateway #97-#102).
 
@@ -158,19 +185,63 @@ class NormalizedProviderEvent(BaseModel):
     provider-scoped resource identity (the value behind ``entity_id``);
     ``payload_ref`` is a *reference* to the redacted payload, never the
     payload itself; ``ingested_at`` is the producer's ingest timestamp.
+
+    The v1 nested envelope (issue #495) wraps resource fields in a
+    ``resource`` object and the payload reference in a ``redacted_payload``
+    object.  The flat shape (issue #482) is still accepted for backward
+    compatibility during the transition.
     """
+
+    model_config = {"ser_json_exclude_none": True}
 
     schema_version: str
     provider: Provider
     delivery_id: str
-    resource_type: str
-    resource_id: str
-    repository: str
-    action: str
+    resource_type: str = ""
+    resource_id: str = ""
+    repository: str = ""
+    action: str = ""
     occurred_at: datetime
     ingested_at: datetime | None = None
     actor: str | None = None
     payload_ref: str | None = None
+    resource: _NormalizedResource | None = None
+    redacted_payload: _RedactedPayload | None = None
+
+    @property
+    def effective_resource_type(self) -> str:
+        """Return ``resource_type`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.resource_type
+        return self.resource_type
+
+    @property
+    def effective_resource_id(self) -> str:
+        """Return ``resource_id`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.resource_id
+        return self.resource_id
+
+    @property
+    def effective_repository(self) -> str:
+        """Return ``repository`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.repository
+        return self.repository
+
+    @property
+    def effective_action(self) -> str:
+        """Return ``action`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.action
+        return self.action
+
+    @property
+    def effective_payload_ref(self) -> str | None:
+        """Return ``payload_ref`` from the nested redacted_payload when present."""
+        if self.redacted_payload is not None:
+            return self.redacted_payload.reference
+        return self.payload_ref
 
 
 # ── Normalized resource-type → canonical entity-type bridge (issue #482) ────
@@ -231,6 +302,151 @@ def _map_legacy_event(
     return entity, event
 
 
+# ── Repository URL normalization (issue #495) ────────────────────────────────
+#
+# Repository identity is derived strictly from the producer repository URL.
+# The normalization rules are deterministic and reject invalid identity rather
+# than falling back to a display label:
+#
+# 1. Require absolute HTTP(S) — reject non-HTTP schemes and relative URLs.
+# 2. Lowercase the hostname.
+# 3. Remove credentials (userinfo), query strings, and fragments.
+# 4. Strip default ports (80 for http, 443 for https).
+# 5. Strip a trailing slash.
+# 6. Strip a terminal ``.git`` suffix.
+# 7. Preserve path spelling (case-sensitive).
+# 8. Reject empty or invalid identity.
+
+import re as _re
+from urllib.parse import urlparse as _urlparse
+
+_REPO_URL_RE = _re.compile(r"^https?://", _re.IGNORECASE)
+
+
+def normalize_repository_url(raw: str) -> str | None:
+    """Normalize a repository URL into a deterministic identity string.
+
+    Returns the normalized identity, or ``None`` when the URL is invalid
+    (not an absolute HTTP(S) URL, empty, or unparseable).
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if not _REPO_URL_RE.match(raw):
+        return None
+
+    try:
+        parsed = _urlparse(raw)
+    except Exception:
+        return None
+
+    if not parsed.hostname:
+        return None
+
+    # Lowercase the hostname.
+    host = parsed.hostname.lower()
+
+    # Strip default ports; preserve non-default ports.
+    port = ""
+    if parsed.port is not None:
+        is_default = (parsed.scheme == "http" and parsed.port == 80) or (
+            parsed.scheme == "https" and parsed.port == 443
+        )
+        if not is_default:
+            port = f":{parsed.port}"
+
+    # Build the normalized URL: scheme + host + optional non-default port + path.
+    path = parsed.path or ""
+
+    # Strip trailing slash.
+    path = path.rstrip("/")
+
+    # Strip terminal .git suffix.
+    if path.endswith(".git"):
+        path = path[:-4]
+
+    # Remove leading slash for the canonical owner/repo form.
+    path = path.lstrip("/")
+
+    if not path:
+        return None
+
+    return f"{host}{port}/{path}"
+
+
+# ── Normalized event validation (issue #495) ─────────────────────────────────
+#
+# The validation boundary distinguishes valid v1 lifecycle observations from
+# malformed data and unsupported versions before mapping or persistence.
+# Each violation class produces a distinct DLQ reason string.
+
+_VALID_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
+
+
+class NormalizedEventValidationError(ValueError):
+    """A normalized event failed validation with a distinct reason.
+
+    The ``reason`` is a stable string suitable for DLQ routing; it is
+    distinct per violation class so operators can triage without inspecting
+    the payload.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def validate_normalized_event(message: NormalizedProviderEvent) -> None:
+    """Validate a normalized event before mapping or persistence.
+
+    Raises :class:`NormalizedEventValidationError` with a distinct reason
+    for each violation class:
+
+    * **Unsupported schema version** — ``schema_version`` is not ``"1.0"``.
+    * **Invalid repository identity** — the repository URL cannot be
+      normalized to a valid identity.
+    * **Reference mismatch** — the ``redacted_payload`` provider or
+      delivery_id does not equal the envelope's provider or delivery_id.
+
+    The caller routes the message to the DLQ with the reason string.
+    """
+    # ── Schema version ──────────────────────────────────────────────
+    if message.schema_version not in _VALID_SCHEMA_VERSIONS:
+        raise NormalizedEventValidationError(
+            f"Unsupported schema version: {message.schema_version!r} "
+            f"(supported: {sorted(_VALID_SCHEMA_VERSIONS)})"
+        )
+
+    # ── Repository identity ─────────────────────────────────────────
+    # Only validate repository identity for the nested v1 shape (where
+    # the repository is always a URL).  The flat shape (backward compat)
+    # uses plain owner/repo strings that are not URLs.
+    repo = message.effective_repository
+    if message.resource is not None:
+        normalized = normalize_repository_url(repo)
+        if normalized is None:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be an absolute HTTP(S) URL with a valid hostname and path"
+            )
+
+    # ── Reference mismatch (nested redacted_payload only) ───────────
+    if message.redacted_payload is not None:
+        rp = message.redacted_payload
+        if rp.provider is not None and rp.provider != message.provider.value:
+            raise NormalizedEventValidationError(
+                f"Reference mismatch: redacted_payload.provider={rp.provider!r} "
+                f"!= envelope.provider={message.provider.value!r}"
+            )
+        if rp.delivery_id is not None and rp.delivery_id != message.delivery_id:
+            raise NormalizedEventValidationError(
+                f"Reference mismatch: redacted_payload.delivery_id={rp.delivery_id!r} "
+                f"!= envelope.delivery_id={message.delivery_id!r}"
+            )
+
+
 def map_normalized_event(
     message: NormalizedProviderEvent,
 ) -> tuple[EngineeringEntity, EngineeringEvent] | None:
@@ -246,25 +462,31 @@ def map_normalized_event(
     Returns ``None`` when ``resource_type`` is unknown or ``action`` does not
     resolve to a locked canonical event type.
     """
-    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(message.resource_type)
+    resource_type = message.effective_resource_type
+    resource_id = message.effective_resource_id
+    repository = message.effective_repository
+    action = message.effective_action
+    payload_ref = message.effective_payload_ref
+
+    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource_type)
     if entity_type is None:
         return None
-    event_type = f"{entity_type.value}.{message.action}"
+    event_type = f"{entity_type.value}.{action}"
     if event_type not in _MAPPED_EVENT_TYPES:
         return None
-    entity_id = f"{entity_type.value}:{message.resource_id}"
+    entity_id = f"{entity_type.value}:{resource_id}"
     entity = EngineeringEntity(
         entity_id=entity_id,
         entity_type=entity_type,
         provider=message.provider,
-        repository=message.repository,
-        number=_coerce_resource_number(message.resource_id),
+        repository=repository,
+        number=_coerce_resource_number(resource_id),
     )
     payload: dict[str, Any] = {}
-    if message.payload_ref is not None:
-        payload["payload_ref"] = message.payload_ref
+    if payload_ref is not None:
+        payload["payload_ref"] = payload_ref
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{message.action}",
+        event_id=f"{entity_id}:{action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
@@ -657,6 +879,27 @@ class AFKOutcomeConsumer:
             await self._commit()
             return
 
+        # ── Validate normalized events (issue #495) ─────────────────
+        if isinstance(message, NormalizedProviderEvent):
+            try:
+                validate_normalized_event(message)
+            except NormalizedEventValidationError as exc:
+                logger.warning(
+                    "Normalized event validation failed — sending to DLQ "
+                    "(key=%s offset=%d): %s",
+                    msg.key,
+                    msg.offset,
+                    exc.reason,
+                )
+                await self._send_to_dlq(
+                    raw_value if isinstance(raw_value, dict) else {},
+                    reason=exc.reason,
+                )
+                self._metrics.counter(METRIC_MESSAGES_POISON).inc()
+                self._mark_committable(msg)
+                await self._commit()
+                return
+
         # ── Map message type → canonical entity/event ───────────────
         mapped = map_provider_event(message)
         if mapped is None:
@@ -724,12 +967,14 @@ class AFKOutcomeConsumer:
         """Parse a raw payload into a legacy or normalized message model.
 
         The normalized shape is identified by its ``resource_type`` field
-        (absent from the legacy shape); everything else is validated as a
-        legacy message.  Raises :class:`pydantic.ValidationError` when the
-        payload matches neither shape.
+        (absent from the legacy shape); the nested v1 shape is identified by
+        its ``resource`` object.  Everything else is validated as a legacy
+        message.  Raises :class:`pydantic.ValidationError` when the payload
+        matches neither shape.
         """
-        if isinstance(raw_value, dict) and "resource_type" in raw_value:
-            return NormalizedProviderEvent.model_validate(raw_value)
+        if isinstance(raw_value, dict):
+            if "resource" in raw_value or "resource_type" in raw_value:
+                return NormalizedProviderEvent.model_validate(raw_value)
         return ProviderEventMessage.model_validate(raw_value)
 
     @staticmethod
@@ -738,7 +983,7 @@ class AFKOutcomeConsumer:
     ) -> str:
         """Return the human-readable message type for logs/DLQ reasons."""
         if isinstance(message, NormalizedProviderEvent):
-            return f"{message.resource_type}.{message.action}"
+            return f"{message.effective_resource_type}.{message.effective_action}"
         return message.type
 
     def _retry_delay(self, attempt: int) -> float:
