@@ -294,6 +294,14 @@ class ObservedMessage(Base):
             "source_created_at_tz",
             postgresql_where=text("source_created_at_tz IS NOT NULL"),
         ),
+        Index(
+            "ix_observed_messages_parent_ext",
+            "parent_external_session_id",
+            "session_id",
+            postgresql_where=text(
+                "parent_external_session_id IS NOT NULL AND session_id IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

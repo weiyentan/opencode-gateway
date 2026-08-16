@@ -25,7 +25,9 @@ SELECTs, parameterised filters with 400 on invalid values, and the
    queries resolve parentage from ``sessions.parent_session_id`` (an external
    session-ID string), while the ``/timeline`` CTE and the header's
    ``parent_internal_id`` resolve from ``opencode_session_contexts.parent_session_id``
-   (an internal UUID FK to ``sessions.id``).  The two can diverge until
+   (an internal UUID FK to ``sessions.id``), falling back to
+   ``observed_messages.parent_external_session_id`` when the context
+   projection is missing (ADR 0016 §1).  The two can diverge until
    reconciled, so ``/children`` and ``/timeline`` may return different
    descendant sets.
 """
@@ -61,8 +63,13 @@ router = APIRouter(tags=["execution"])
 # Default/max keyset page size and default timeline depth bound.
 _DEFAULT_LIMIT = 100
 _MAX_LIMIT = 1000
-_DEFAULT_MAX_DEPTH = 50
-_MAX_MAX_DEPTH = 100
+# Default = 50 generations (a conservative bound so a single request cannot
+# traverse an entire unbounded tree). Client-supplied values are validated
+# 0..200 (hard cap). The SQL's explicit-NULL branch (all generations) remains
+# reachable only by explicit internal callers passing ``max_depth=None``, since
+# HTTP clients cannot supply NULL.
+_DEFAULT_MAX_DEPTH: int = 50
+_MAX_MAX_DEPTH = 200
 
 
 # ── Timeout helpers (mirror app/api/usage.py) ────────────────────────────────
@@ -490,7 +497,7 @@ async def _fetch_timeline(
     conn: asyncpg.Connection,
     session_id: UUID,
     agent: str | None,
-    max_depth: int,
+    max_depth: int | None,
     from_ms: int | None,
     to_ms: int | None,
     limit: int,
@@ -500,10 +507,17 @@ async def _fetch_timeline(
 ) -> CursorPage[TimelineEvent]:
     """Fetch a unified parent+descendant timeline via a recursive CTE.
 
-    The recursive step carries a visited ``path`` array so a parent-linkage
-    cycle cannot recurse forever, and the outer query deduplicates each part
-    by id (``DISTINCT ON (p.id)``) preferring the shallowest depth, so a part
-    reachable at multiple depths / via multiple context rows appears once.
+    Parentage is resolved from ``opencode_session_contexts.parent_session_id``
+    with a fallback to ``observed_messages.parent_external_session_id`` (the
+    out-of-order context-projection case, ADR 0016 §1), normalized into a
+    single ``edges`` CTE so sessions linked via both sources are traversed
+    once (the ``UNION`` collapses the duplicate edge).  The recursive step
+    carries a visited ``path`` array so a parent-linkage cycle cannot recurse
+    forever, and the outer query deduplicates each part by id
+    (``DISTINCT ON (p.id)``) preferring the shallowest depth.  ``max_depth``
+    defaults to a conservative 50-generation bound; an explicit value bounds
+    recursion at that depth; an explicit ``None`` (internal callers only)
+    walks all generations, bounded only by the cycle guard.
     """
     params: list[object] = [session_id, max_depth, NULL_CURSOR_SENTINEL]
     null_sentinel_param = 3
@@ -527,15 +541,26 @@ async def _fetch_timeline(
 
     params.append(limit + 1)
     query = (
-        "WITH RECURSIVE descendants AS ("
-        "  SELECT id AS session_id, agent, 0 AS depth, ARRAY[id] AS path "
+        "WITH RECURSIVE edges AS ("
+        "  SELECT ctx.session_id AS child_id, ctx.parent_session_id AS parent_id"
+        "  FROM opencode_session_contexts ctx"
+        "  WHERE ctx.parent_session_id IS NOT NULL"
+        "  UNION"
+        "  SELECT m.session_id AS child_id, s2.id AS parent_id"
+        "  FROM observed_messages m"
+        "  JOIN sessions s2"
+        "    ON s2.external_session_id = m.parent_external_session_id"
+        "   AND s2.source_database_id = m.source_database_id"
+        "  WHERE m.parent_external_session_id IS NOT NULL AND m.session_id IS NOT NULL"
+        "), descendants AS ("
+        "  SELECT id AS session_id, external_session_id, agent, 0 AS depth, ARRAY[id] AS path"
         "  FROM sessions WHERE id = $1"
         "  UNION ALL"
-        "  SELECT s.id, s.agent, d.depth + 1, d.path || s.id"
-        "  FROM sessions s"
-        "  JOIN opencode_session_contexts ctx ON ctx.session_id = s.id"
-        "  JOIN descendants d ON ctx.parent_session_id = d.session_id"
-        "  WHERE d.depth < $2 AND NOT (s.id = ANY(d.path))"
+        "  SELECT s.id, s.external_session_id, s.agent, d.depth + 1, d.path || s.id"
+        "  FROM edges e"
+        "  JOIN descendants d ON e.parent_id = d.session_id"
+        "  JOIN sessions s ON s.id = e.child_id"
+        "  WHERE (d.depth < $2 OR $2 IS NULL) AND NOT (s.id = ANY(d.path))"
         "), dedup AS ("
         "  SELECT DISTINCT ON (p.id) "
         "         p.id AS part_id, d.session_id, d.agent, d.depth, "
@@ -687,7 +712,7 @@ async def get_session_timeline(
     request: Request,
     session_id: UUID,
     agent: str | None = Query(default=None),
-    max_depth: int = Query(default=_DEFAULT_MAX_DEPTH, ge=0, le=_MAX_MAX_DEPTH),
+    max_depth: int | None = Query(default=_DEFAULT_MAX_DEPTH, ge=0, le=_MAX_MAX_DEPTH),
     from_ts: str | None = Query(default=None, alias="from"),
     to_ts: str | None = Query(default=None, alias="to"),
     after: str | None = Query(default=None),

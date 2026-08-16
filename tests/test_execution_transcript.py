@@ -902,3 +902,345 @@ class TestExecutionPagination:
         assert len(page1_ids_returned) == 2
         assert page1_ids_returned.isdisjoint(page2_ids_returned)
         assert page2_ids_returned == {str(pid) for pid in page2_ids}
+
+
+# ── Issue #467 gap-fill: tool-call filters, depth annotation, fallback ────────
+
+
+class TestFetchToolCallsFilters:
+    """Per-filter WHERE fragments and bound args for GET /tool-calls."""
+
+    async def _call(self, conn: AsyncMock, **kwargs):
+        defaults: dict = dict(
+            session_id=None,
+            agent=None,
+            tool_name=None,
+            tool_status=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        defaults.update(kwargs)
+        return await _fetch_tool_calls(conn, **defaults)
+
+    @pytest.mark.asyncio
+    async def test_session_id_filter(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        sid = uuid.uuid4()
+        await self._call(conn, session_id=sid)
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "tc.session_id = $" in sql
+        assert sid in args
+
+    @pytest.mark.asyncio
+    async def test_agent_filter_uses_left_join(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await self._call(conn, agent="git-workspace")
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "LEFT JOIN sessions s ON s.id = tc.session_id" in sql
+        assert "s.agent = $" in sql
+        assert "git-workspace" in args
+
+    @pytest.mark.asyncio
+    async def test_tool_name_filter(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await self._call(conn, tool_name="bash")
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "tc.tool_name = $" in sql
+        assert "bash" in args
+
+    @pytest.mark.asyncio
+    async def test_tool_status_filter(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await self._call(conn, tool_status="completed")
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "tc.tool_status = $" in sql
+        assert "completed" in args
+
+    @pytest.mark.asyncio
+    async def test_from_to_window_filters(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await self._call(conn, from_ms=1000, to_ms=2000)
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "tc.source_created_at >= $" in sql
+        assert "tc.source_created_at <= $" in sql
+        assert 1000 in args
+        assert 2000 in args
+
+    @pytest.mark.asyncio
+    async def test_inverted_window_returns_400(self, mock_conn: AsyncMock):
+        mock_conn.fetch = AsyncMock(return_value=[])
+        async with create_client(mock_conn) as c:
+            response = await c.get(
+                "/api/v1/execution/tool-calls",
+                params={"from": "2026-08-15T00:00:02Z", "to": "2026-08-15T00:00:01Z"},
+            )
+        assert response.status_code == 400
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "BAD_REQUEST"
+
+    @pytest.mark.asyncio
+    async def test_filter_param_reaches_fetch_args(self, mock_conn: AsyncMock):
+        mock_conn.fetch = AsyncMock(return_value=[])
+        async with create_client(mock_conn) as c:
+            response = await c.get(
+                "/api/v1/execution/tool-calls", params={"tool_name": "bash"}
+            )
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args.args[0]
+        args = mock_conn.fetch.call_args.args[1:]
+        assert "tc.tool_name = $" in sql
+        assert "bash" in args
+
+
+class TestTimelineDepthAnnotation:
+    """Depth annotation (0 = root, monotonic per branch) over a parent/child tree.
+
+    Uses explicit ``max_depth=None`` (the internal all-generations branch) —
+    the HTTP default of 50 is covered separately in ``TestTimelineMaxDepth``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_depth_annotation_over_parent_child_tree(self):
+        conn = AsyncMock()
+        root_id = uuid.uuid4()
+        child_id = uuid.uuid4()
+        grandchild_id = uuid.uuid4()
+        rows = [
+            _row(_timeline_row_data(session_id=root_id, depth=0, source_created_at=100)),
+            _row(_timeline_row_data(session_id=child_id, depth=1, source_created_at=150)),
+            _row(_timeline_row_data(session_id=root_id, depth=0, source_created_at=200)),
+            _row(
+                _timeline_row_data(
+                    session_id=grandchild_id, depth=2, source_created_at=250
+                )
+            ),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+
+        page = await _fetch_timeline(
+            conn,
+            root_id,
+            agent=None,
+            max_depth=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        items = page.items
+        assert {item.depth for item in items} == {0, 1, 2}
+        # depth 0 = the requested root; every root-owned part is depth 0.
+        root_items = [i for i in items if i.session_id == root_id]
+        assert root_items and all(i.depth == 0 for i in root_items)
+        # Per-branch depth is monotonic: child=1, grandchild=2.
+        child = next(i for i in items if i.session_id == child_id)
+        grandchild = next(i for i in items if i.session_id == grandchild_id)
+        assert child.depth == 1
+        assert grandchild.depth == 2
+        # Stream is chronological (non-decreasing source_created_at).
+        times = [i.source_created_at for i in items]
+        assert times == sorted(times)
+
+        sql = conn.fetch.call_args.args[0]
+        assert "0 AS depth" in sql
+        assert "depth + 1" in sql
+        assert "ANY(d.path)" in sql
+        assert "DISTINCT ON" in sql
+
+
+class TestTimelineExternalParentFallback:
+    """Reconstruction via observed_messages.parent_external_session_id (ADR 0016 §1)."""
+
+    @pytest.mark.asyncio
+    async def test_cte_wires_observed_messages_fallback(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await _fetch_timeline(
+            conn,
+            uuid.uuid4(),
+            agent=None,
+            max_depth=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        sql = conn.fetch.call_args.args[0]
+        assert "observed_messages" in sql
+        assert "parent_external_session_id" in sql
+        assert "external_session_id" in sql
+        assert "UNION" in sql
+        # Cross-database external-id guard on the msg-edge resolution.
+        assert "s2.source_database_id = m.source_database_id" in sql
+
+    @pytest.mark.asyncio
+    async def test_reconstructs_external_parent_only_session_at_depth_1(self):
+        conn = AsyncMock()
+        root_id = uuid.uuid4()
+        orphan_child_id = uuid.uuid4()  # linked ONLY via observed_messages
+        rows = [
+            _row(_timeline_row_data(session_id=root_id, depth=0, source_created_at=100)),
+            _row(
+                _timeline_row_data(
+                    session_id=orphan_child_id, depth=1, source_created_at=200
+                )
+            ),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+        page = await _fetch_timeline(
+            conn,
+            root_id,
+            agent=None,
+            max_depth=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        orphan = next(i for i in page.items if i.session_id == orphan_child_id)
+        assert orphan.depth == 1
+
+    @pytest.mark.asyncio
+    async def test_dual_link_collapses_to_single_event(self):
+        conn = AsyncMock()
+        root_id = uuid.uuid4()
+        dual_linked_id = uuid.uuid4()
+        rows = [
+            _row(_timeline_row_data(session_id=root_id, depth=0, source_created_at=100)),
+            _row(
+                _timeline_row_data(
+                    session_id=dual_linked_id, depth=1, source_created_at=200
+                )
+            ),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+        page = await _fetch_timeline(
+            conn,
+            root_id,
+            agent=None,
+            max_depth=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        sql = conn.fetch.call_args.args[0]
+        # UNION collapses duplicate (child, parent) edges; DISTINCT ON (p.id)
+        # collapses duplicate part projections.
+        assert "UNION" in sql
+        assert "DISTINCT ON" in sql
+        part_ids = [str(i.part_id) for i in page.items]
+        assert len(part_ids) == len(set(part_ids))
+
+
+class TestTimelineMaxDepth:
+    """max_depth default = 50 (conservative bound); explicit values bounded (0-200)."""
+
+    @pytest.mark.asyncio
+    async def test_none_means_all_generations(self):
+        """Explicit ``max_depth=None`` (internal-only) walks all generations.
+
+        HTTP clients cannot supply NULL, so this exercises the internal
+        all-generations branch, not the HTTP default (which is 50).
+        """
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await _fetch_timeline(
+            conn,
+            uuid.uuid4(),
+            agent=None,
+            max_depth=None,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "$2 IS NULL" in sql
+        assert None in args
+
+    @pytest.mark.asyncio
+    async def test_explicit_depth_bounds_recursion(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        await _fetch_timeline(
+            conn,
+            uuid.uuid4(),
+            agent=None,
+            max_depth=3,
+            from_ms=None,
+            to_ms=None,
+            limit=10,
+            after_ms=None,
+            after_id=None,
+            db_timeout_seconds=5,
+        )
+        sql = conn.fetch.call_args.args[0]
+        args = conn.fetch.call_args.args[1:]
+        assert "d.depth < $" in sql
+        assert 3 in args
+
+    @pytest.mark.asyncio
+    async def test_http_default_binds_50(self, mock_conn: AsyncMock):
+        mock_conn.fetch = AsyncMock(return_value=[])
+        async with create_client(mock_conn) as c:
+            response = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/timeline"
+            )
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args.args[0]
+        args = mock_conn.fetch.call_args.args[1:]
+        # The HTTP default is a conservative 50-generation bound, not NULL.
+        assert "d.depth < $" in sql
+        assert 50 in args
+        assert None not in args
+
+    @pytest.mark.asyncio
+    async def test_http_max_depth_above_cap_returns_422(self, mock_conn: AsyncMock):
+        async with create_client(mock_conn) as c:
+            response = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/timeline",
+                params={"max_depth": 201},
+            )
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_http_negative_max_depth_returns_422(self, mock_conn: AsyncMock):
+        async with create_client(mock_conn) as c:
+            response = await c.get(
+                f"/api/v1/execution/sessions/{_SESSION_ID}/timeline",
+                params={"max_depth": -1},
+            )
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "VALIDATION_ERROR"
