@@ -681,6 +681,140 @@ async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) ->
         assert row["last_seen_at"] > row["first_seen_at"]
 
 
+# ── Multi-repo event isolation (issue #499) ─────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -> None:
+    """Two repositories with the same entity_id (issue:437) must produce
+    isolated event sets when retrieved via get().
+
+    Writes events for both repos, saves two runs, and verifies each run's
+    get() returns only its own repository's events.
+    """
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        repo_a_id = "01J0000000000000000000000R1"
+        repo_b_id = "01J0000000000000000000000R2"
+        repo_a = "org/repo-a"
+        repo_b = "org/repo-b"
+        started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
+        finished = datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
+
+        # Run A — repo-a, issue:437
+        run_a = AFKRun(
+            afk_run_id=repo_a_id,
+            provider=Provider.GITHUB,
+            status=RunStatus.COMPLETED,
+            title="Run A",
+            started_at=started,
+            finished_at=finished,
+            entities=[
+                EngineeringEntity(
+                    entity_id="issue:437",
+                    entity_type=EntityType.ISSUE,
+                    provider=Provider.GITHUB,
+                    repository=repo_a,
+                    number=437,
+                ),
+            ],
+            events=[
+                EngineeringEvent(
+                    event_id="issue:437:opened",
+                    event_type="opened",
+                    provider=Provider.GITHUB,
+                    entity_id="issue:437",
+                    occurred_at=started,
+                    actor="wyautomation",
+                    payload={},
+                ),
+            ],
+            correlations=[],
+            entity_links=[
+                RunEntityLink(
+                    afk_run_id=repo_a_id,
+                    entity_id="issue:437",
+                    role="resolved",
+                    correlation_confidence=1.0,
+                ),
+            ],
+            session_links=[],
+        )
+
+        # Run B — repo-b, issue:437 (same entity_id, different repo)
+        run_b = AFKRun(
+            afk_run_id=repo_b_id,
+            provider=Provider.GITHUB,
+            status=RunStatus.COMPLETED,
+            title="Run B",
+            started_at=started,
+            finished_at=finished,
+            entities=[
+                EngineeringEntity(
+                    entity_id="issue:437",
+                    entity_type=EntityType.ISSUE,
+                    provider=Provider.GITHUB,
+                    repository=repo_b,
+                    number=437,
+                ),
+            ],
+            events=[
+                EngineeringEvent(
+                    event_id="issue:437:closed",
+                    event_type="closed",
+                    provider=Provider.GITHUB,
+                    entity_id="issue:437",
+                    occurred_at=finished,
+                    actor="wyautomation",
+                    payload={},
+                ),
+            ],
+            correlations=[],
+            entity_links=[
+                RunEntityLink(
+                    afk_run_id=repo_b_id,
+                    entity_id="issue:437",
+                    role="resolved",
+                    correlation_confidence=1.0,
+                ),
+            ],
+            session_links=[],
+        )
+
+        await repo.save(run_a)
+        await repo.save(run_b)
+
+        # Verify raw storage: both events exist in engineering_events
+        all_events = await conn.fetch(
+            "SELECT repository, event_type FROM engineering_events "
+            "WHERE entity_type = 'issue' AND external_id = '437' "
+            "ORDER BY repository"
+        )
+        assert len(all_events) == 2, (
+            f"expected 2 events total (one per repo), got {len(all_events)}"
+        )
+        assert {r["repository"] for r in all_events} == {repo_a, repo_b}
+
+        # Verify get() isolation: Run A sees only repo-a's event
+        fetched_a = await repo.get(repo_a_id)
+        assert fetched_a is not None
+        assert len(fetched_a.events) == 1, (
+            f"Run A expected 1 event, got {len(fetched_a.events)}"
+        )
+        assert fetched_a.events[0].repository == repo_a
+        assert fetched_a.events[0].event_type == "opened"
+
+        # Verify get() isolation: Run B sees only repo-b's event
+        fetched_b = await repo.get(repo_b_id)
+        assert fetched_b is not None
+        assert len(fetched_b.events) == 1, (
+            f"Run B expected 1 event, got {len(fetched_b.events)}"
+        )
+        assert fetched_b.events[0].repository == repo_b
+        assert fetched_b.events[0].event_type == "closed"
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_association_unique_constraint_enforced_at_sql_level(

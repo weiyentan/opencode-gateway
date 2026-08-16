@@ -615,6 +615,294 @@ def test_repository_satisfies_protocol_signature() -> None:
     assert OutcomeRepository in AsyncpgOutcomeRepository.__mro__
 
 
+# ── Multi-repo event isolation (issue #499) ────────────────────────────────
+
+
+def test_get_events_scoped_by_provider_repository_entity_type_external_id(
+    mock_conn: AsyncMock,
+) -> None:
+    """The event retrieval subquery must scope by (provider, repository, entity_type, external_id).
+
+    Verifies the SQL text contains the full 4-column tuple in the subquery.
+    """
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run_id = "01J0000000000000000000000001"
+
+    # Mock the run row
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "afk_run_id": run_id,
+                "provider": "github",
+                "status": "completed",
+                "title": "Multi-repo run",
+                "started_at": STARTED,
+                "finished_at": FINISHED,
+                "outcome_status": "merged",
+                "outcome": {
+                    "status": "merged",
+                    "change_request_ids": ["change_request:442"],
+                    "resolved_issue_ids": ["issue:437"],
+                    "merge_event_id": "merge_event:442",
+                    "merged_at": FINISHED.isoformat(),
+                },
+            }
+        )
+    )
+
+    # Mock entity_rows, session_rows, event_rows
+    mock_conn.fetch = AsyncMock(
+        side_effect=[
+            # entity_rows — one entity in REPO
+            [
+                mock_row(
+                    {
+                        "provider": "github",
+                        "repository": REPO,
+                        "entity_type": "issue",
+                        "external_id": "437",
+                        "owning_change_request_id": None,
+                        "role": "resolved",
+                        "correlation_method": "issue_resolved",
+                        "correlation_source": "direct",
+                        "correlation_confidence": 1.0,
+                        "evidence": [],
+                    }
+                ),
+            ],
+            # session_rows
+            [],
+            # event_rows
+            [
+                mock_row(
+                    {
+                        "provider": "github",
+                        "repository": REPO,
+                        "entity_type": "issue",
+                        "external_id": "437",
+                        "event_type": "opened",
+                        "occurred_at": STARTED,
+                        "provider_event_id": "evt-001",
+                        "actor": "wyautomation",
+                        "payload": {},
+                    }
+                ),
+            ],
+        ]
+    )
+
+    import asyncio
+
+    run = asyncio.run(repo.get(run_id))
+    assert run is not None
+    assert len(run.events) == 1
+    assert run.events[0].entity_id == "issue:437"
+
+    # Verify the SQL subquery uses the full 4-column tuple
+    event_sql = mock_conn.fetch.call_args_list[2].args[0]
+    assert "(provider, repository, entity_type, external_id) IN (" in event_sql, (
+        "event query must scope by (provider, repository, entity_type, external_id)"
+    )
+    assert "SELECT provider, repository, entity_type, external_id FROM afk_run_entities" in event_sql
+
+
+def test_get_events_does_not_mix_repositories(mock_conn: AsyncMock) -> None:
+    """Two repos with the same short entity_id must produce isolated event sets.
+
+    Run A (repo-a, issue:437) must NOT see events from repo-b's issue:437.
+    This test verifies the SQL subquery scopes by the full 4-column tuple by
+    inspecting the SQL text — the mock returns all rows, so we verify the
+    query structure, not the mock output.
+    """
+    repo_a_id = "01J0000000000000000000000A1"
+    repo_b_id = "01J0000000000000000000000B1"
+    repo_a = "org/repo-a"
+    repo_b = "org/repo-b"
+
+    def _mock_get(run_id: str, run_repo: str) -> AsyncMock:
+        m = AsyncMock()
+        m.fetchrow = AsyncMock(
+            return_value=mock_row(
+                {
+                    "afk_run_id": run_id,
+                    "provider": "github",
+                    "status": "completed",
+                    "title": f"Run in {run_repo}",
+                    "started_at": STARTED,
+                    "finished_at": FINISHED,
+                    "outcome_status": "merged",
+                    "outcome": {
+                        "status": "merged",
+                        "change_request_ids": ["change_request:442"],
+                        "resolved_issue_ids": ["issue:437"],
+                        "merge_event_id": "merge_event:442",
+                        "merged_at": FINISHED.isoformat(),
+                    },
+                }
+            )
+        )
+        m.fetch = AsyncMock(
+            side_effect=[
+                # entity_rows
+                [
+                    mock_row(
+                        {
+                            "provider": "github",
+                            "repository": run_repo,
+                            "entity_type": "issue",
+                            "external_id": "437",
+                            "owning_change_request_id": None,
+                            "role": "resolved",
+                            "correlation_method": "issue_resolved",
+                            "correlation_source": "direct",
+                            "correlation_confidence": 1.0,
+                            "evidence": [],
+                        }
+                    ),
+                ],
+                # session_rows
+                [],
+                # event_rows — includes events from BOTH repos to test isolation
+                [
+                    mock_row(
+                        {
+                            "provider": "github",
+                            "repository": run_repo,
+                            "entity_type": "issue",
+                            "external_id": "437",
+                            "event_type": "opened",
+                            "occurred_at": STARTED,
+                            "provider_event_id": f"evt-{run_id}",
+                            "actor": "wyautomation",
+                            "payload": {},
+                        }
+                    ),
+                    mock_row(
+                        {
+                            "provider": "github",
+                            "repository": "org/repo-b" if run_repo == repo_a else repo_a,
+                            "entity_type": "issue",
+                            "external_id": "437",
+                            "event_type": "opened",
+                            "occurred_at": STARTED,
+                            "provider_event_id": "evt-other",
+                            "actor": "wyautomation",
+                            "payload": {},
+                        }
+                    ),
+                ],
+            ]
+        )
+        return m
+
+    import asyncio
+
+    # Run A — verify the SQL subquery uses the full 4-column tuple
+    conn_a = _mock_get(repo_a_id, repo_a)
+    repo_a_impl = AsyncpgOutcomeRepository(conn_a)
+    run_a = asyncio.run(repo_a_impl.get(repo_a_id))
+    assert run_a is not None
+
+    # Verify the SQL subquery structure (the mock returns all rows, so we
+    # check the query text instead of the result count)
+    event_sql = conn_a.fetch.call_args_list[2].args[0]
+    assert "(provider, repository, entity_type, external_id) IN (" in event_sql, (
+        "event query must scope by (provider, repository, entity_type, external_id)"
+    )
+    assert "SELECT provider, repository, entity_type, external_id FROM afk_run_entities" in event_sql
+
+    # Run B — same SQL verification
+    conn_b = _mock_get(repo_b_id, repo_b)
+    repo_b_impl = AsyncpgOutcomeRepository(conn_b)
+    run_b = asyncio.run(repo_b_impl.get(repo_b_id))
+    assert run_b is not None
+
+    event_sql_b = conn_b.fetch.call_args_list[2].args[0]
+    assert "(provider, repository, entity_type, external_id) IN (" in event_sql_b
+
+
+def test_get_entities_dedup_scoped_by_full_tuple(mock_conn: AsyncMock) -> None:
+    """The seen_entities dedup set must use (provider, repository, entity_type, external_id).
+
+    If the same entity_id appears in two different repositories, both must be
+    included in the reconstructed run's entities list.
+    """
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run_id = "01J0000000000000000000000001"
+
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "afk_run_id": run_id,
+                "provider": "github",
+                "status": "completed",
+                "title": "Cross-repo dedup test",
+                "started_at": STARTED,
+                "finished_at": FINISHED,
+                "outcome_status": "merged",
+                "outcome": {
+                    "status": "merged",
+                    "change_request_ids": ["change_request:442"],
+                    "resolved_issue_ids": ["issue:437"],
+                    "merge_event_id": "merge_event:442",
+                    "merged_at": FINISHED.isoformat(),
+                },
+            }
+        )
+    )
+
+    mock_conn.fetch = AsyncMock(
+        side_effect=[
+            # entity_rows — same entity_id in two repos
+            [
+                mock_row(
+                    {
+                        "provider": "github",
+                        "repository": "org/repo-a",
+                        "entity_type": "issue",
+                        "external_id": "437",
+                        "owning_change_request_id": None,
+                        "role": "resolved",
+                        "correlation_method": "issue_resolved",
+                        "correlation_source": "direct",
+                        "correlation_confidence": 1.0,
+                        "evidence": [],
+                    }
+                ),
+                mock_row(
+                    {
+                        "provider": "github",
+                        "repository": "org/repo-b",
+                        "entity_type": "issue",
+                        "external_id": "437",
+                        "owning_change_request_id": None,
+                        "role": "resolved",
+                        "correlation_method": "issue_resolved",
+                        "correlation_source": "direct",
+                        "correlation_confidence": 1.0,
+                        "evidence": [],
+                    }
+                ),
+            ],
+            # session_rows
+            [],
+            # event_rows
+            [],
+        ]
+    )
+
+    import asyncio
+
+    run = asyncio.run(repo.get(run_id))
+    assert run is not None
+    # Both entities should be present (same entity_id, different repos)
+    assert len(run.entities) == 2, (
+        f"expected 2 entities (same entity_id in 2 repos), got {len(run.entities)}"
+    )
+    repos = {e.repository for e in run.entities}
+    assert repos == {"org/repo-a", "org/repo-b"}
+
+
 def test_resolver_version_is_recorded(mock_conn: AsyncMock) -> None:
     repo = AsyncpgOutcomeRepository(mock_conn)
     run = _build_run()
