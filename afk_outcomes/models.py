@@ -20,6 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field
 # matching logic changes.
 RESOLVER_VERSION = "2"
 
+# Version of the exact resource<->session association resolver.  Independent of
+# ``RESOLVER_VERSION`` (the correlation engine): the association path derives
+# links only from explicit stable resource references and shares no rule
+# semantics with the correlation engine (it never runs temporal/heuristic
+# inference).  Recorded on every :class:`ResourceSessionAssociation`.  Bump when
+# the reference-extraction or dedup logic changes.
+ASSOCIATION_RESOLVER_VERSION = "1"
+
 
 class Provider(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
     """The source provider that produced the observed engineering data."""
@@ -264,4 +272,88 @@ class ResolutionResult(BaseModel):
     resolver_version: str = Field(
         default=RESOLVER_VERSION,
         description="Version of the correlation engine that produced this result",
+    )
+
+
+class ReferenceSource(BaseModel):
+    """Provenance of one source reference that produced an association.
+
+    ``field`` names the session metadata field that carried the stable
+    resource reference (e.g. ``"title"``, ``"project"``, ``"resource_refs"``);
+    ``detail`` records the value found there.  Together they make a link
+    provable and reproducible: re-reading that field yields the same resource.
+    """
+
+    field: str = Field(
+        description="Name of the session metadata field that carried the reference"
+    )
+    detail: str | None = Field(
+        default=None,
+        description="The resource value found in that field (e.g. the resource number)",
+    )
+
+
+class SessionResourceReference(BaseModel):
+    """An explicit stable resource reference carried by one session's metadata.
+
+    This is the ONLY input the association resolver accepts.  It carries the
+    full stable resource identity (``provider``, ``repository``,
+    ``resource_type``, ``resource_number``) plus the session identity and the
+    ``source_field`` that carried it.  It carries no timestamps, no windows,
+    and no scores — the resolver structurally cannot temporally or
+    heuristically infer a link from it.
+    """
+
+    session_id: str | None = Field(
+        default=None, description="Internal Gateway session UUID"
+    )
+    external_session_id: str = Field(
+        description=(
+            "External OpenCode session ID (e.g. ses_* id) — the deterministic "
+            "session anchor"
+        )
+    )
+    source_field: str = Field(
+        description="Name of the session metadata field that carried the reference"
+    )
+    provider: Provider
+    repository: str = Field(description="Full owner/repo (or group/project) name")
+    resource_type: EntityType
+    resource_number: str = Field(
+        description=(
+            "Provider-scoped external resource id (issue/MR number as string, "
+            "commit SHA, review id, ...) — the 'resource_number' half of the "
+            "stable resource identity"
+        )
+    )
+
+
+class ResourceSessionAssociation(BaseModel):
+    """A deterministic many-to-many association between a resource and a session.
+
+    One resource may link to many sessions and one session may link to many
+    resources.  Each association records ``source_reference`` — the set of
+    session fields that carried the explicit stable reference producing the
+    link — so every link is provable and reproducible.  Associations are never
+    derived from temporal or heuristic inference, and deliberately carry no
+    completion/finished claim (PRD Implementation Decision 13).
+    """
+
+    session_id: str | None = Field(
+        default=None, description="Internal Gateway session UUID"
+    )
+    external_session_id: str = Field(
+        description="External OpenCode session ID — the deterministic session anchor"
+    )
+    provider: Provider
+    repository: str
+    resource_type: EntityType
+    resource_number: str
+    source_reference: list[ReferenceSource] = Field(
+        default_factory=list,
+        description="Which session fields carried the link (source-reference provenance)",
+    )
+    resolver_version: str = Field(
+        default=ASSOCIATION_RESOLVER_VERSION,
+        description="Version of the association resolver that produced this link",
     )

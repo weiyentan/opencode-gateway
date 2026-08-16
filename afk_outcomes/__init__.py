@@ -11,6 +11,7 @@ under ``tests/``.
 
 from __future__ import annotations
 
+from afk_outcomes.associations import derive_exact_associations
 from afk_outcomes.correlation import (
     BranchIssueReferenceRule,
     CommitIssueReferenceRule,
@@ -22,6 +23,7 @@ from afk_outcomes.correlation import (
 )
 from afk_outcomes.interfaces import CorrelationRule, OutcomeRepository, ProviderAdapter
 from afk_outcomes.models import (
+    ASSOCIATION_RESOLVER_VERSION,
     RESOLVER_VERSION,
     AFKRun,
     Correlation,
@@ -32,10 +34,13 @@ from afk_outcomes.models import (
     EngineeringOutcomeStatus,
     EntityType,
     Provider,
+    ReferenceSource,
     ResolutionResult,
+    ResourceSessionAssociation,
     RunEntityLink,
     RunSessionLink,
     RunStatus,
+    SessionResourceReference,
     UnresolvedCorrelation,
     UnresolvedReason,
 )
@@ -55,6 +60,7 @@ from afk_outcomes.serialization import (
 
 __all__ = [
     "AFKRun",
+    "ASSOCIATION_RESOLVER_VERSION",
     "AsyncpgOutcomeRepository",
     "BranchIssueReferenceRule",
     "CANONICAL_SCHEMA_VERSION",
@@ -75,16 +81,20 @@ __all__ = [
     "Provider",
     "ProviderAdapter",
     "RESOLVER_VERSION",
+    "ReferenceSource",
     "ResolutionResult",
+    "ResourceSessionAssociation",
     "RunEntityLink",
     "RunSessionLink",
     "RunStatus",
     "SequenceULID",
     "SessionDescriptor",
+    "SessionResourceReference",
     "TemporalInferenceRule",
     "ULIDSource",
     "UnresolvedCorrelation",
     "UnresolvedReason",
+    "derive_exact_associations",
     "dumps_canonical",
     "loads_canonical",
     "make_ulid",

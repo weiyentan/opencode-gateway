@@ -17,6 +17,7 @@ from afk_outcomes.models import (
     EngineeringEntity,
     EngineeringEvent,
     Provider,
+    ResourceSessionAssociation,
 )
 
 
@@ -65,3 +66,7 @@ class OutcomeRepository(Protocol):
     async def save(self, run: AFKRun) -> None: ...
 
     async def get(self, afk_run_id: str) -> AFKRun | None: ...
+
+    async def save_associations(
+        self, associations: list[ResourceSessionAssociation]
+    ) -> None: ...

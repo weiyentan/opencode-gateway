@@ -6,6 +6,7 @@ from app.db.models.afk import (
     AFKRunSessionLink,
     DeliveryLog,
     EngineeringEvent,
+    ResourceSessionAssociation,
     UnresolvedCorrelation,
 )
 from app.db.models.base import Base
@@ -56,6 +57,7 @@ __all__ = [
     "OpenCodeUsageRecord",
     "ReportingDelivery",
     "ReportingResourceAggregate",
+    "ResourceSessionAssociation",
     "Session",
     "SourceDatabase",
     "UnresolvedCorrelation",
