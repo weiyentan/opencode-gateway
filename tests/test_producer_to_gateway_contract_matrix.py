@@ -325,10 +325,10 @@ def test_nested_v1_envelope_passes_validation_and_maps_correctly() -> None:
     result = map_provider_event(message)
     assert result is not None
     entity, event = result
-    assert entity.entity_type == EntityType.issue
-    assert entity.external_id == "999"
+    assert entity.entity_type == EntityType.ISSUE
+    assert entity.entity_id == "issue:999"
     assert entity.repository == "https://github.com/owner/repo"
-    assert event.event_type == "opened"
+    assert event.event_type == "issue.opened"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
