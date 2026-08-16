@@ -1,4 +1,4 @@
-# ADR 0018: Exact resource↔session associations — deterministic links from explicit stable resource references
+# ADR 0019: Exact resource↔session associations — deterministic links from explicit stable resource references
 
 ## Status
 
@@ -45,7 +45,7 @@ Two properties drive the design:
 
 ## Decision
 
-### 1. A new read-model table, `resource_session_associations` (migration 0032)
+### 1. A new read-model table, `resource_session_associations` (migration 0033)
 
 A many-to-many table between one engineering resource and one OpenCode
 session. One resource may link to many sessions and one session may link to

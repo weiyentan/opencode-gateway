@@ -668,7 +668,7 @@ _Avoid_: Usage record, heuristic hint, temporal window
 
 **Exact Resource↔Session Association**:
 A deterministic many-to-many link between one engineering resource and one
-OpenCode session (``ResourceSessionAssociation``, migration 0032). One
+OpenCode session (``ResourceSessionAssociation``, migration 0033). One
 resource may link to many sessions and one session may link to many
 resources. Associations derive ONLY from explicit **Session Resource
 Reference**s — never from temporal or heuristic inference — and every

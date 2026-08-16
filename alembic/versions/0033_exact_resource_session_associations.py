@@ -38,8 +38,8 @@ constraints below):
 * **No completion/finished claim** — the table carries no status/outcome
   columns (PRD Implementation Decision 13).
 
-Revision ID: 0032
-Revises:     0031
+Revision ID: 0033
+Revises:     0032
 Create Date: 2026-08-16
 """
 
@@ -50,8 +50,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "0032"
-down_revision: Union[str, None] = "0031"
+revision: str = "0033"
+down_revision: Union[str, None] = "0032"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
