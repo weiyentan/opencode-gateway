@@ -551,9 +551,12 @@ opencode-gateway/
 | [0014](docs/adr/0014-canonical-client-name-and-rollup.md) | Canonical Client Name and Client-Project Rollup | Accepted |
 | [0015](docs/adr/0015-client-project-rollup-as-usage-events-read-model.md) | Client Project Rollup as a usage_events read-model | Accepted |
 | [0016](docs/adr/0016-execution-transcript-observability.md) | Execution Transcript Observability | Accepted |
-| [0018](docs/adr/0018-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Accepted |
-| [0019](docs/adr/0019-reporting-read-api.md) | Reporting Read API | Accepted |
-| [0020](docs/adr/0020-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
+| [0017](docs/adr/0017-migration-0019-index-measurement.md) | Migration 0019 Index Keep/Drop Decisions (Measured) | Accepted |
+| [0018](docs/adr/0018-reporting-delivery-write-semantics.md) | Reporting-Delivery Write Semantics | Accepted |
+| [0019](docs/adr/0019-exact-resource-session-associations.md) | Exact Resource↔Session Associations | Accepted |
+| [0020](docs/adr/0020-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Superseded |
+| [0021](docs/adr/0021-reporting-read-api.md) | Reporting Read API | Accepted |
+| [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
 
 ---
 

@@ -692,26 +692,35 @@ _Avoid_: Kafka consumer (generic), outcomes ingestion bridge
 
 **Normalized Provider Event**:
 A schema-versioned, provider-agnostic event on the provider-events topic
-emitted by the producer (`fast-api-eda-gateway`, issues #97–#102). It carries
-the producer's native resource vocabulary (`issue`, `pull_request`,
-`merge_request`) — never the outcome layer's canonical `change_request`
-vocabulary — plus a forwarded `delivery_id`, a stable `resource_id`,
-`resource_type`, `action`, `occurred_at`, `ingested_at`, `actor`, and a
-`payload_ref` (a *reference* to the redacted payload, never the payload
-itself). Distinct from the legacy ten-type message shape
-(`ProviderEventMessage`, discriminated by its `type`/`number` fields).
-_Avoid_: Legacy provider event (when the normalized shape is meant)
+emitted by the producer (`fast-api-eda-gateway`, issues #97–#102). It is the
+**only** accepted wire contract for the AFK Outcome Consumer (issue #497).
+The v1 nested envelope wraps resource fields in a ``resource`` object
+(``resource_type``, ``resource_id``, ``repository``, ``action``) and the
+payload reference in a ``redacted_payload`` object (``reference``,
+``provider``, ``delivery_id``).  The flat shape (issue #482) is also
+accepted.  The event carries the producer's native resource vocabulary
+(``issue``, ``pull_request``, ``merge_request``) — never the outcome layer's
+canonical ``change_request`` vocabulary — plus a forwarded ``delivery_id``,
+a stable ``resource_id`` (the provider-scoped resource identity),
+``resource_type``, ``action``, ``occurred_at``, ``ingested_at``, ``actor``,
+and a ``payload_ref`` (a *reference* to the redacted payload, never the
+payload itself).  Only canonical actions are persisted; unknown actions route
+to the DLQ.  Repository identity is scoped to the producer repository URL
+(normalized via ``normalize_repository_url``).
+_Avoid_: Legacy provider event (the flat ``ProviderEventMessage`` shape has been removed)
 
 **Mapping Bridge**:
-The Stage-2 addition to the AFK Outcome Consumer's `map_provider_event` that
-bridges a **Normalized Provider Event** into the outcome layer's canonical
-vocabulary (ADR 0020): `issue` → `issue`; `pull_request` and `merge_request`
-→ `change_request`. `action` becomes the canonical event-type suffix, and the
-result is validated against the locked canonical vocabulary — an unknown
-resource type or action returns unmappable and is DLQ'd, never persisted and
-never conflated with a legacy type. The legacy ten-type mapping is preserved
-unchanged.
-_Avoid_: Conflating `pull_request`/`merge_request` with `change_request`
+The AFK Outcome Consumer's ``map_provider_event`` / ``map_normalized_event``
+that bridges a **Normalized Provider Event** into the outcome layer's
+canonical vocabulary (ADR 0020, superseded by FastAPI EDA Gateway ADR 0005):
+``issue`` → ``issue``; ``pull_request`` and ``merge_request`` →
+``change_request``.  ``action`` becomes the canonical event-type suffix, and
+the result is validated against the locked canonical vocabulary
+(``_CANONICAL_EVENT_TYPES``) — an unknown resource type or action returns
+unmappable and is DLQ'd, never persisted.  The producer owns the
+normalized-event contract; the consumer-authored flat ``ProviderEventMessage``
+shape has been removed (issue #497).
+_Avoid_: Conflating ``pull_request``/``merge_request`` with ``change_request``
 
 **AFK Backfill CLI**:
 The operator CLI ``scripts/afk_backfill.py`` that pulls a bounded window of

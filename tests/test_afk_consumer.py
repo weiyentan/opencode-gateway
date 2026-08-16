@@ -23,7 +23,7 @@ from afk_outcomes.providers.github import GitHubAdapter
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
-    _MAPPED_EVENT_TYPES,
+    _CANONICAL_EVENT_TYPES,
     METRIC_COMMITTED_OFFSET,
     METRIC_DB_ERRORS,
     METRIC_DLQ_DEPTH,
@@ -37,7 +37,6 @@ from app.consumer.afk_consumer import (
     AFKOutcomeConsumer,
     NormalizedEventValidationError,
     NormalizedProviderEvent,
-    ProviderEventMessage,
     _build_adapter,
     _lenient_dlq_deserializer,
     _parse_cli,
@@ -223,14 +222,16 @@ def _mk_msg(
 
 def _valid_payload(**overrides: object) -> dict:
     payload = {
+        "schema_version": "1.0",
         "provider": "github",
         "delivery_id": DELIVERY_ID,
-        "type": "change_request.merged",
+        "resource_type": "pull_request",
+        "resource_id": "442",
         "repository": "owner/repo",
-        "number": 442,
+        "action": "merged",
         "occurred_at": "2026-08-01T10:30:00Z",
         "actor": "carol",
-        "payload": {"merge_commit_sha": "abc123"},
+        "payload_ref": "redacted-payload-ref-442",
     }
     payload.update(overrides)
     return payload
@@ -265,115 +266,19 @@ def _make_consumer(
 # ── Message-type → canonical-event mapping ───────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("event_type", "expected_entity_type"),
-    [
-        ("issue.opened", EntityType.ISSUE),
-        ("issue.closed", EntityType.ISSUE),
-        ("change_request.opened", EntityType.CHANGE_REQUEST),
-        ("change_request.review_requested", EntityType.CHANGE_REQUEST),
-        ("change_request.changes_requested", EntityType.CHANGE_REQUEST),
-        ("change_request.approved", EntityType.CHANGE_REQUEST),
-        ("change_request.merged", EntityType.CHANGE_REQUEST),
-        ("change_request.closed", EntityType.CHANGE_REQUEST),
-        ("pipeline.failed", EntityType.CHANGE_REQUEST),
-        ("pipeline.succeeded", EntityType.CHANGE_REQUEST),
-    ],
-)
-def test_map_each_event_type_to_canonical_event(
-    event_type: str, expected_entity_type: EntityType
-) -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type=event_type,
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-        actor="carol",
-    )
-    mapped = map_provider_event(message)
-
-    assert mapped is not None
-    entity, event = mapped
-
-    assert event.event_type == event_type
-    assert event.provider is Provider.GITHUB
-    assert event.occurred_at == datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC)
-    assert event.actor == "carol"
-
-    assert entity.entity_type is expected_entity_type
-    assert entity.entity_id == f"{expected_entity_type.value}:442"
-    assert event.entity_id == entity.entity_id
-    assert entity.repository == "owner/repo"
-    assert entity.number == 442
-
-
-def test_mapping_derives_entity_id_from_number_and_type() -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITLAB,
-        delivery_id=DELIVERY_ID,
-        type="issue.closed",
-        repository="group/project",
-        number=99,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-    )
-    mapped = map_provider_event(message)
-    assert mapped is not None
-    entity, event = mapped
-
-    assert entity.entity_id == "issue:99"
-    assert entity.entity_type is EntityType.ISSUE
-    assert event.entity_id == "issue:99"
-    assert event.event_id == "issue:99:closed"
-    assert event.provider is Provider.GITLAB
-
-
-def test_unmappable_type_returns_none() -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type="pull_request.assigned",  # not in the locked vocabulary
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-    )
-    assert map_provider_event(message) is None
-
-
-def test_mapped_event_types_is_the_locked_set() -> None:
-    assert _MAPPED_EVENT_TYPES == {
+def test_canonical_event_types_is_the_locked_ten() -> None:
+    assert _CANONICAL_EVENT_TYPES == {
         "issue.opened",
         "issue.closed",
-        "issue.edited",
-        "issue.updated",
-        "issue.reopened",
         "change_request.opened",
         "change_request.review_requested",
         "change_request.changes_requested",
         "change_request.approved",
         "change_request.merged",
         "change_request.closed",
-        "change_request.edited",
-        "change_request.updated",
-        "change_request.reopened",
         "pipeline.failed",
         "pipeline.succeeded",
     }
-
-
-def test_provider_event_message_rejects_unknown_provider() -> None:
-    with pytest.raises(Exception):
-        ProviderEventMessage.model_validate(
-            {
-                "provider": "bitbucket",
-                "delivery_id": DELIVERY_ID,
-                "type": "issue.opened",
-                "repository": "owner/repo",
-                "number": 1,
-                "occurred_at": "2026-08-01T10:30:00Z",
-            }
-        )
 
 
 # ── Valid message → single transaction → commit after commit ────────────────
@@ -477,7 +382,7 @@ async def test_unmappable_type_sends_to_dlq_and_commits() -> None:
     consumer._producer = AsyncMock()
     consumer._producer.send_and_wait = AsyncMock()
 
-    msg = _mk_msg(_valid_payload(type="pull_request.assigned"))
+    msg = _mk_msg(_valid_payload(action="assigned"))
     await consumer._process_message(msg)
 
     conn.execute.assert_not_called()  # unmappable → no DB write
@@ -689,7 +594,7 @@ async def test_db_failure_dlq_failure_does_not_commit() -> None:
     [
         _mk_invalid_json_msg,
         lambda: _mk_msg({"not": "valid"}),
-        lambda: _mk_msg(_valid_payload(type="pull_request.assigned")),
+            lambda: _mk_msg(_valid_payload(action="assigned")),
     ],
     ids=["invalid-json", "invalid-shape", "unmappable-type"],
 )
@@ -1442,25 +1347,6 @@ def test_map_normalized_event_unmappable_action_returns_none() -> None:
     assert map_normalized_event(message) is None
 
 
-def test_legacy_mapping_is_unchanged_by_bridge() -> None:
-    """The legacy ten-type mapping still maps through the dispatcher unchanged."""
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type="change_request.merged",
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-        actor="carol",
-    )
-    mapped = map_provider_event(message)
-    assert mapped is not None
-    entity, event = mapped
-    assert entity.entity_type is EntityType.CHANGE_REQUEST
-    assert event.event_type == "change_request.merged"
-    assert event.entity_id == "change_request:442"
-
-
 @pytest.mark.asyncio
 async def test_normalized_message_persists_as_canonical_event() -> None:
     """A normalized ``pull_request.merged`` persists as ``change_request.merged``."""
@@ -1747,7 +1633,7 @@ async def test_metrics_poison_dlq_and_depth() -> None:
     consumer._producer = AsyncMock()
     consumer._producer.send_and_wait = AsyncMock()
 
-    await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+    await consumer._process_message(_mk_msg(_valid_payload(action="assigned")))
 
     snap = _snap(metrics)
     assert snap[METRIC_MESSAGES_POISON] == 1
@@ -2095,7 +1981,7 @@ async def test_send_to_dlq_stamps_operational_max() -> None:
         "app.consumer.afk_consumer.datetime", wraps=datetime
     ) as mock_dt:
         mock_dt.now.return_value = DLQ_NOW
-        await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+        await consumer._process_message(_mk_msg(_valid_payload(action="assigned")))
 
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert dlq_payload["dead_lettered_at"] == DLQ_NOW.isoformat()
@@ -3236,36 +3122,6 @@ def test_every_pinned_fixture_maps_without_dlq() -> None:
             f"Fixture {resource_type}.{action} returned None from "
             f"map_normalized_event — would be DLQ'd"
         )
-
-
-def test_flat_shape_still_accepted_for_backward_compat() -> None:
-    """The flat shape (issue #482) is still accepted during the transition."""
-    message = NormalizedProviderEvent.model_validate(
-        {
-            "schema_version": "1.0",
-            "provider": "github",
-            "delivery_id": "22222222-3333-4444-5555-666666666666",
-            "resource_type": "pull_request",
-            "resource_id": "442",
-            "repository": "owner/repo",
-            "action": "merged",
-            "occurred_at": "2026-08-13T10:10:29Z",
-            "ingested_at": "2026-08-13T10:10:30Z",
-            "actor": "carol",
-            "payload_ref": "redacted-payload-ref-442",
-        }
-    )
-    # Effective properties fall back to flat fields.
-    assert message.effective_resource_type == "pull_request"
-    assert message.effective_resource_id == "442"
-    assert message.effective_repository == "owner/repo"
-    assert message.effective_action == "merged"
-    assert message.effective_payload_ref == "redacted-payload-ref-442"
-
-    # Flat shape with a non-URL repository still validates (no URL normalization
-    # applied to flat-shape repositories during transition — only URL-shaped
-    # repositories are validated).
-    validate_normalized_event(message)  # does not raise
 
 
 # ── Validation: distinct DLQ reasons across all violation classes ───────────
