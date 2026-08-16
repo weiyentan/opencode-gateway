@@ -225,7 +225,6 @@ class Settings(BaseSettings):
     reporting_dlq_topic: str = "afk.events-reporting-dlq"
     reporting_consumer_group_id: str = "opencode-reporting"
 
-<<<<<<< HEAD
     # Retention defaults (issue #483, PRD #478 decision #15) — the AFK
     # outcome / reporting read-model data-lifecycle tiers, configurable via
     # settings/env with no code change required to adjust:
