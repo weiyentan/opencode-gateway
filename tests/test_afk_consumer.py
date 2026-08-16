@@ -341,16 +341,22 @@ def test_unmappable_type_returns_none() -> None:
     assert map_provider_event(message) is None
 
 
-def test_mapped_event_types_is_the_locked_ten() -> None:
+def test_mapped_event_types_is_the_locked_set() -> None:
     assert _MAPPED_EVENT_TYPES == {
         "issue.opened",
         "issue.closed",
+        "issue.edited",
+        "issue.updated",
+        "issue.reopened",
         "change_request.opened",
         "change_request.review_requested",
         "change_request.changes_requested",
         "change_request.approved",
         "change_request.merged",
         "change_request.closed",
+        "change_request.edited",
+        "change_request.updated",
+        "change_request.reopened",
         "pipeline.failed",
         "pipeline.succeeded",
     }
@@ -1416,7 +1422,10 @@ def test_map_normalized_event_carries_payload_ref() -> None:
     mapped = map_normalized_event(message)
     assert mapped is not None
     _entity, event = mapped
-    assert event.payload == {"payload_ref": "redacted-payload-ref-123"}
+    assert event.payload["payload_ref"] == "redacted-payload-ref-123"
+    # Source provenance is also retained.
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
 
 
 def test_map_normalized_event_unknown_resource_type_returns_none() -> None:
@@ -1491,6 +1500,161 @@ async def test_unmappable_normalized_action_routes_to_dlq() -> None:
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert "Unmappable message type" in dlq_payload["reason"]
     assert "pull_request.assigned" in dlq_payload["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer: map and persist every valid normalized lifecycle event (#496)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Producer ``edited`` and ``updated`` both converge on canonical ``updated``
+# with source action retained as provenance.  Producer ``reopened`` maps
+# directly to canonical ``reopened``.  Source ``resource_type`` is also
+# retained as provenance.  Every valid action is persisted — never routed to
+# the DLQ.
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action", "expected_entity_type", "expected_canonical_action"),
+    [
+        # edited → updated convergence
+        ("pull_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
+        ("merge_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "edited", EntityType.ISSUE, "updated"),
+        # updated → updated convergence
+        ("pull_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("merge_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "updated", EntityType.ISSUE, "updated"),
+        # reopened → reopened (direct)
+        ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
+        ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
+        ("issue", "reopened", EntityType.ISSUE, "reopened"),
+    ],
+)
+def test_map_normalized_event_edited_updated_reopened(
+    resource_type: str,
+    action: str,
+    expected_entity_type: EntityType,
+    expected_canonical_action: str,
+) -> None:
+    """Producer ``edited``/``updated`` → canonical ``updated``; ``reopened`` → ``reopened``."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type=resource_type, action=action)
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None, (
+        f"map_normalized_event returned None for {resource_type}.{action} — "
+        f"would be DLQ'd"
+    )
+    entity, event = mapped
+    expected_event_type = f"{expected_entity_type.value}.{expected_canonical_action}"
+    assert entity.entity_type is expected_entity_type
+    assert entity.entity_id == f"{expected_entity_type.value}:442"
+    assert event.event_type == expected_event_type
+    assert event.entity_id == entity.entity_id
+
+
+def test_map_normalized_event_retains_source_provenance() -> None:
+    """Source resource_type and action are retained as provenance in the event payload."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type="pull_request", action="edited")
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload.get("source_resource_type") == "pull_request"
+    assert event.payload.get("source_action") == "edited"
+    # payload_ref is still forwarded.
+    assert event.payload.get("payload_ref") == "redacted-payload-ref-123"
+
+
+def test_map_normalized_event_merge_request_provenance() -> None:
+    """GitLab merge_request.edited retains merge_request as source_resource_type."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="merge_request", action="updated", provider="gitlab"
+        )
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload.get("source_resource_type") == "merge_request"
+    assert event.payload.get("source_action") == "updated"
+    assert event.event_type == "change_request.updated"
+
+
+@pytest.mark.asyncio
+async def test_edited_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``pull_request.edited`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="pull_request", action="edited"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.updated"  # canonical event_type
+
+
+@pytest.mark.asyncio
+async def test_updated_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``issue.updated`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="issue", action="updated"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "issue"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+@pytest.mark.asyncio
+async def test_reopened_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``pull_request.reopened`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="pull_request", action="reopened"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.reopened"  # canonical event_type
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2200,7 +2364,9 @@ def test_producer_contract_maps_to_canonical_change_request() -> None:
     assert event.provider is Provider.GITHUB
     assert event.occurred_at == datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
     assert event.actor == "carol"
-    assert event.payload == {"payload_ref": "redacted-payload-ref-442"}
+    assert event.payload["payload_ref"] == "redacted-payload-ref-442"
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
 
 
 @pytest.mark.asyncio
@@ -2698,7 +2864,9 @@ def test_nested_v1_envelope_maps_to_canonical() -> None:
     assert entity.entity_id == "change_request:200"
     assert entity.repository == "https://github.com/owner/repo"
     assert event.event_type == "change_request.merged"
-    assert event.payload == {"payload_ref": "redacted-payload-ref-200"}
+    assert event.payload["payload_ref"] == "redacted-payload-ref-200"
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
 
 
 # ── Validation: schema version ──────────────────────────────────────────────

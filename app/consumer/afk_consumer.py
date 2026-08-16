@@ -118,12 +118,18 @@ _MAPPED_EVENT_TYPES = frozenset(
     {
         "issue.opened",
         "issue.closed",
+        "issue.edited",
+        "issue.updated",
+        "issue.reopened",
         "change_request.opened",
         "change_request.review_requested",
         "change_request.changes_requested",
         "change_request.approved",
         "change_request.merged",
         "change_request.closed",
+        "change_request.edited",
+        "change_request.updated",
+        "change_request.reopened",
         "pipeline.failed",
         "pipeline.succeeded",
     }
@@ -459,6 +465,12 @@ def map_normalized_event(
     caller routes it to the DLQ as unmappable — never persisted, never
     conflated with the legacy types).
 
+    Producer ``edited`` and ``updated`` actions both converge on the canonical
+    ``updated`` event type, with the source action retained as provenance in
+    the event payload.  Producer ``reopened`` maps directly to canonical
+    ``reopened``.  Source ``resource_type`` (e.g. ``pull_request`` vs
+    ``merge_request``) is also retained as provenance.
+
     Returns ``None`` when ``resource_type`` is unknown or ``action`` does not
     resolve to a locked canonical event type.
     """
@@ -471,7 +483,14 @@ def map_normalized_event(
     entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource_type)
     if entity_type is None:
         return None
-    event_type = f"{entity_type.value}.{action}"
+
+    # Canonical event-type suffix: ``edited`` and ``updated`` both converge on
+    # ``updated``; every other action maps directly.
+    canonical_action = action
+    if action in ("edited", "updated"):
+        canonical_action = "updated"
+
+    event_type = f"{entity_type.value}.{canonical_action}"
     if event_type not in _MAPPED_EVENT_TYPES:
         return None
     entity_id = f"{entity_type.value}:{resource_id}"
@@ -485,8 +504,11 @@ def map_normalized_event(
     payload: dict[str, Any] = {}
     if payload_ref is not None:
         payload["payload_ref"] = payload_ref
+    # Retain source resource_type and action as provenance metadata.
+    payload["source_resource_type"] = resource_type
+    payload["source_action"] = action
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{action}",
+        event_id=f"{entity_id}:{canonical_action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
