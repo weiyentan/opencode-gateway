@@ -1,4 +1,4 @@
-# ADR 0020: Retention defaults + access controls (PRD #478 decisions 15–16)
+# ADR 0022: Retention defaults + access controls (PRD #478 decisions 15–16)
 
 ## Status
 
@@ -96,7 +96,7 @@ token":
 | Operator Token      | `GATEWAY_OPERATOR_TOKEN`  | operator-only read surfaces             |
 
 * **No broad read** — delivery payload and the state trail are readable
-  **only** through the operator-gated reporting read API (ADR 0019, issue
+  **only** through the operator-gated reporting read API (ADR 0021, issue
   #484): `require_operator_token` is registered on
   `GET /api/v1/reporting/resources`, `/resources/detail`, and
   `/session-links`.  The `/ingest` and reporting-ingestion endpoints are
@@ -110,7 +110,7 @@ token":
   API Key, so the two credentials are distinct and both gates are
   satisfiable), and **fails closed** (403) when no operator token is
   configured.  It is registered on the three reporting
-  read routes (ADR 0019) — the single sanctioned read path for delivery
+  read routes (ADR 0021) — the single sanctioned read path for delivery
   payload and the state trail — and remains the enforcement primitive for
   any future operator-only read surface.
 * **No shared tokens** — the operator token is distinct from the Admin API Key
@@ -133,7 +133,7 @@ token":
   `afk.events-dlq`; the reporting DLQ (`afk.events-reporting-dlq`, issue #479)
   has no operational-max sweep and is out of #483's scope.
 * Delivery payload and the state trail are readable only through the
-  operator-gated reporting read API (ADR 0019); DLQ records and the delivery
+  operator-gated reporting read API (ADR 0021); DLQ records and the delivery
   log still have no API read path.  Operator access is gated by a dedicated
   token that fails closed when unprovisioned.
 * The existing Two-Layer Auth semantics (ADR 0007) and the

@@ -8138,7 +8138,7 @@ class TestNoBroadRead:
     """Delivery payload and state trails have no BROAD read surface.
 
     The only sanctioned read path is the operator-gated reporting read API
-    (ADR 0019, issue #484): ``require_operator_token``
+    (ADR 0021, issue #484): ``require_operator_token``
     (``GATEWAY_OPERATOR_TOKEN``, fails closed) is registered on
     ``GET /api/v1/reporting/resources``, ``/resources/detail``, and
     ``/session-links``, so delivery payload and the state trail are readable
@@ -8148,7 +8148,7 @@ class TestNoBroadRead:
     other GET route reads those tables back out.
     """
 
-    # The sanctioned operator-gated read surface (ADR 0019, issue #484).
+    # The sanctioned operator-gated read surface (ADR 0021, issue #484).
     _REPORTING_READ_PATHS = {
         "/api/v1/reporting/resources",
         "/api/v1/reporting/resources/detail",

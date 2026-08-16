@@ -1,4 +1,4 @@
-# ADR 0018: Normalized provider-event mapping bridge (Stage 2)
+# ADR 0020: Normalized provider-event mapping bridge (Stage 2)
 
 ## Status
 

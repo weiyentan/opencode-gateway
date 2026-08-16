@@ -2154,7 +2154,7 @@ def test_producer_contract_event_has_exact_fields() -> None:
     """The pinned producer contract carries exactly the agreed field set.
 
     Adding or removing a field here is a contract change and must fail this
-    test (and be reconciled with ADR 0018 / PRD #478) rather than drift
+    test (and be reconciled with ADR 0020 / PRD #478) rather than drift
     silently against the producer.
     """
     assert set(PRODUCER_CONTRACT_EVENT) == {

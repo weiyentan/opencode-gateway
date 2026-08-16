@@ -1,4 +1,4 @@
-# ADR 0019: Reporting Read API — ingested resources, state trails, session links (no completion claims)
+# ADR 0021: Reporting Read API — ingested resources, state trails, session links (no completion claims)
 
 ## Status
 
@@ -55,7 +55,7 @@ via `Depends(get_session)`, the `{status, data, error}` envelope, and the
 ### Operator-token gating (no broad read)
 
 Delivery payload and the state trail are **operator-only** data (issue
-#483, ADR 0020). All three reporting `GET` endpoints therefore require the
+#483, ADR 0022). All three reporting `GET` endpoints therefore require the
 dedicated operator token (`GATEWAY_OPERATOR_TOKEN`) via the
 `require_operator_token` dependency — an **additional** gate on top of the
 global `ApiKeyMiddleware` (`GATEWAY_API_KEY`). The operator token is read

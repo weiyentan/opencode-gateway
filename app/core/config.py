@@ -239,7 +239,7 @@ class Settings(BaseSettings):
     #     90 days.
     #   * DLQ (``afk.events-dlq``) is retained until resolved but never
     #     unbounded: messages older than the operational max (default 30
-    #     days) are escalated/expired per the policy documented in ADR 0020.
+    #     days) are escalated/expired per the policy documented in ADR 0022.
     #
     # All four tiers are validated ``ge=0``: negative retention values are
     # rejected at startup, while ``0`` preserves its "never/disabled" meaning.

@@ -177,7 +177,7 @@ class NormalizedProviderEvent(BaseModel):
 #
 # The producer's resource types are provider-specific: ``pull_request``
 # (GitHub) and ``merge_request`` (GitLab) are the *same* outcome-layer
-# concept, ``change_request`` (CONTEXT.md / ADR 0018).  ``issue`` is
+# concept, ``change_request`` (CONTEXT.md / ADR 0020).  ``issue`` is
 # unchanged.  The bridge is explicit and additive: it never reinterprets the
 # legacy ten-type mapping above.
 
@@ -938,7 +938,7 @@ class AFKOutcomeConsumer:
 # escalates messages strictly older than the operational max to an escalation
 # topic, preserving their payload + reason for manual resolution.  Physical
 # removal from the DLQ is enforced by the topic's Kafka retention configured
-# to the same max age (documented in ADR 0020); the escalation topic is the
+# to the same max age (documented in ADR 0022); the escalation topic is the
 # durable operator record, so nothing is ever silently lost.  Mirror
 # ``scripts/retention_transcripts.py``: dry-run + bounded batches + a config
 # driven window.

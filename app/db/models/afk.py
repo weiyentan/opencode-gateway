@@ -9,7 +9,7 @@ events are immutable facts (conflict-ignore); state rows are enrich-only
 (raise confidence, append evidence, update first/last_seen, correct
 derived outcome, mark superseded links, never hard-delete).
 
-Retention tiers (issue #483, ADR 0020 — configurable via ``GATEWAY_RETENTION_*``):
+Retention tiers (issue #483, ADR 0022 — configurable via ``GATEWAY_RETENTION_*``):
 
 * **Aggregates (indefinite)** — ``afk_runs``, ``afk_run_sessions``: the
   reconstructed run read-model is never swept by default.
@@ -188,7 +188,7 @@ class EngineeringEvent(Base):
     ``ON CONFLICT DO NOTHING``.  ``provider_event_id`` is stored when a
     provider emits one and is the authority for ``occurred_at`` in that case.
 
-    Retention (issue #483, ADR 0020): the event row is metadata (12 months,
+    Retention (issue #483, ADR 0022): the event row is metadata (12 months,
     ``GATEWAY_RETENTION_AFK_METADATA_DAYS``); the ``payload`` column is the
     redacted-payload tier (90 days, ``GATEWAY_RETENTION_AFK_PAYLOAD_DAYS``).
     """
@@ -234,7 +234,7 @@ class DeliveryLog(Base):
     Keyed by ``UNIQUE (provider, delivery_id)``; written with
     ``ON CONFLICT DO NOTHING`` so a delivery is processed at most once.
 
-    Retention (issue #483, ADR 0020): metadata tier — 12 months
+    Retention (issue #483, ADR 0022): metadata tier — 12 months
     (``GATEWAY_RETENTION_AFK_METADATA_DAYS``).
     """
 

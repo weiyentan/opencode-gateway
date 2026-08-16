@@ -114,13 +114,13 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_AFK_OUTCOMES_MAX_RETRIES` | `5` | AFK outcome consumer reliability (issue #482): total persistence attempts before a message is DLQ'd (min 1 — 0 or negative is rejected) |
 | `GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS` | `1.0` | Initial inter-attempt delay (seconds) for the bounded exponential backoff with jitter |
 | `GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS` | `60.0` | Upper cap (seconds) on the exponential backoff delay |
-| `GATEWAY_RETENTION_AFK_AGGREGATES_DAYS` | `0` | Retention tier (ADR 0020): aggregates (`afk_runs`, `afk_run_sessions`) — `0` = never swept (indefinite); min 0 — negatives are rejected |
-| `GATEWAY_RETENTION_AFK_METADATA_DAYS` | `365` | Retention tier (ADR 0020): metadata — 12 months; min 0 (`0` = never swept) |
-| `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0020): redacted payload storage; min 0 (`0` = never swept) |
-| `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0020): DLQ operational max — strictly older records are escalated to `afk.events-dlq-expired`; min 0 (`0` = never swept) |
+| `GATEWAY_RETENTION_AFK_AGGREGATES_DAYS` | `0` | Retention tier (ADR 0022): aggregates (`afk_runs`, `afk_run_sessions`) — `0` = never swept (indefinite); min 0 — negatives are rejected |
+| `GATEWAY_RETENTION_AFK_METADATA_DAYS` | `365` | Retention tier (ADR 0022): metadata — 12 months; min 0 (`0` = never swept) |
+| `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0022): redacted payload storage; min 0 (`0` = never swept) |
+| `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0022): DLQ operational max — strictly older records are escalated to `afk.events-dlq-expired`; min 0 (`0` = never swept) |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
-| `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0020). Presented in the dedicated `X-Operator-Token` header (never `Authorization`, which carries the Admin API Key). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed (403) when unset — no operator-only surface (delivery payload, DLQ) is reachable |
+| `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0022). Presented in the dedicated `X-Operator-Token` header (never `Authorization`, which carries the Admin API Key). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed (403) when unset — no operator-only surface (delivery payload, DLQ) is reachable |
 | `GATEWAY_TOOL_PAYLOAD_MAX_CHARS` | `4096` | Execution transcript (ADR 0016): per-field character cap for tool input/output payloads stored in `observed_tool_calls` (truncated at ingest; verbatim content stays in `observed_parts`) |
 | `GATEWAY_PART_DATA_MAX_CHARS` | `65536` | Execution transcript (ADR 0016): verbatim character cap for `message`/`part` payloads stored in the `data` JSONB column (truncated at ingest with a `truncated` marker) |
 
@@ -256,7 +256,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 ### Reporting
 
-Read-only endpoints exposing the reporting read-model (ADR 0019, issue #484)
+Read-only endpoints exposing the reporting read-model (ADR 0021, issue #484)
 — the first report of what the Gateway has ingested from the normalized-event
 stream (write path: `app/api/reporting_ingest.py`, issue #479): ingested
 resources with their current aggregate, the per-delivery state trail, and the
@@ -388,13 +388,13 @@ header (never `Authorization`, which carries the Admin API Key), so a client
 presents the operator token alongside the Admin API Key and both gates are
 satisfiable. An empty operator token **fails closed** (403): no operator-only
 surface is reachable (no broad read). Delivery payload and state trails are
-readable **only** through the operator-gated reporting read API (ADR 0019,
+readable **only** through the operator-gated reporting read API (ADR 0021,
 issue #484): `require_operator_token` is registered on
 `GET /api/v1/reporting/resources`, `/resources/detail`, and
 `/session-links`, and no other route reads `reporting_deliveries` /
 `delivery_state_trails` back out. The delivery log,
 `engineering_events.payload`, and DLQ records remain readable by no API
-route (ADR 0020).
+route (ADR 0022).
 
 ---
 

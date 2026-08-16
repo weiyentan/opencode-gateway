@@ -22,7 +22,7 @@ harness is provided in §6.
 
 ## 1. Summary
 
-The Stage-2 mapping bridge (issue #482, ADR 0018) introduced
+The Stage-2 mapping bridge (issue #482, ADR 0020) introduced
 `NormalizedProviderEvent` and `map_normalized_event`/`map_provider_event`, but
 the producer→consumer contract was not yet *pinned by tests* — nothing asserted
 that a producer-emitted event maps through without DLQ routing, nor that
@@ -45,7 +45,7 @@ re-delivery converges without duplicates. This slice locks that contract down:
 The producer (`fast-api-eda-gateway` #97–#102) emits a normalized,
 schema-versioned event on the `afk.events` topic. The contract is pinned by
 `PRODUCER_CONTRACT_EVENT` in `tests/test_afk_consumer.py` and enforced by
-`NormalizedProviderEvent` (ADR 0018):
+`NormalizedProviderEvent` (ADR 0020):
 
 | Field | Type | Meaning |
 |---|---|---|
