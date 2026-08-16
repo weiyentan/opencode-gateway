@@ -8167,13 +8167,39 @@ class TestNoBroadRead:
 
         return walk(route.dependant, set())
 
+    @staticmethod
+    def _effective_routes(app) -> list:
+        """Flatten the app's routes across FastAPI versions.
+
+        FastAPI >= 0.141 registers included routers lazily as
+        ``_IncludedRouter`` objects; older versions flatten routes directly
+        onto ``app.routes``.  Walk either shape and return the effective
+        route contexts (with resolved ``path``/``methods``/``dependant``).
+        """
+        routes: list = []
+
+        def walk(route) -> None:
+            route_type = type(route).__name__
+            if route_type == "_IncludedRouter":
+                for candidate in route.effective_candidates():
+                    if type(candidate).__name__ == "_IncludedRouter":
+                        walk(candidate)
+                    else:
+                        routes.append(candidate)
+            elif hasattr(route, "methods"):
+                routes.append(route)
+
+        for route in app.routes:
+            walk(route)
+        return routes
+
     def _app_routes(self):
         from app.core.factory import create_app
 
         app = create_app(configure_logging=False)
         return [
             route
-            for route in app.routes
+            for route in self._effective_routes(app)
             if hasattr(route, "methods") and "GET" in route.methods
         ]
 
@@ -8191,7 +8217,7 @@ class TestNoBroadRead:
         app = create_app(configure_logging=False)
         post_paths = {
             route.path
-            for route in app.routes
+            for route in self._effective_routes(app)
             if hasattr(route, "methods") and "POST" in route.methods
         }
         assert "/ingest" in post_paths
