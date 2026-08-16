@@ -310,7 +310,7 @@ class ResourceSessionAssociation(Base):
     """A deterministic many-to-many association between a resource and a session.
 
     One resource may link to many sessions and one session may link to many
-    resources (migration 0033).  Each association derives only from an
+    resources (migration 0034).  Each association derives only from an
     explicit stable resource reference carried in session metadata — never
     temporal/heuristic inference — and records ``source_reference`` (JSONB
     array of ``ReferenceSource``) so each link is provable and reproducible.

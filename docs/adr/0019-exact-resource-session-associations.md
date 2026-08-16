@@ -45,7 +45,7 @@ Two properties drive the design:
 
 ## Decision
 
-### 1. A new read-model table, `resource_session_associations` (migration 0033)
+### 1. A new read-model table, `resource_session_associations` (migration 0034)
 
 A many-to-many table between one engineering resource and one OpenCode
 session. One resource may link to many sessions and one session may link to
