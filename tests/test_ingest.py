@@ -8053,3 +8053,206 @@ class TestBatchOverlapQueryCount:
         assert results[0]["reason"] == "Negative token value"
         assert results[1]["status"] == "quarantined"
         assert "overlap detected" in results[1]["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Issue #483: access-restriction enforcement (operator-only read surfaces)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestOperatorOnlyAccess:
+    """Delivery payload and DLQ access are restricted to operators.
+
+    The operator token (``GATEWAY_OPERATOR_TOKEN``) is a dedicated credential
+    DISTINCT from the Admin API Key (``GATEWAY_API_KEY``) and from per-client
+    collector credentials.  ``require_operator_token`` fails closed: an empty
+    operator token means no operator-only surface is reachable (no broad read).
+    """
+
+    @pytest.mark.asyncio
+    async def test_operator_token_not_configured_fails_closed(self, monkeypatch):
+        """An empty GATEWAY_OPERATOR_TOKEN → 403 (no operator-only access)."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.delenv("GATEWAY_OPERATOR_TOKEN", raising=False)
+        request = MagicMock()
+        request.headers = {}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_operator_token_wrong_token_rejected(self, monkeypatch):
+        """A wrong token on the ``X-Operator-Token`` header is rejected with 401."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        request = MagicMock()
+        request.headers = {"X-Operator-Token": "wrong-token"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_operator_token_accepted(self, monkeypatch):
+        """The correct operator token on its dedicated header passes and is returned."""
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        request = MagicMock()
+        request.headers = {"X-Operator-Token": "op-secret"}
+
+        result = await require_operator_token(request)
+
+        assert result == "op-secret"
+
+    @pytest.mark.asyncio
+    async def test_operator_token_is_distinct_from_admin_key(self, monkeypatch):
+        """The operator token is a dedicated credential — the Admin API Key
+        value presented on the operator header does NOT satisfy the
+        operator-only gate (no shared tokens)."""
+        from fastapi import HTTPException
+
+        from app.api.ingest import require_operator_token
+
+        monkeypatch.setenv("GATEWAY_OPERATOR_TOKEN", "op-secret")
+        monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+        request = MagicMock()
+        request.headers = {"X-Operator-Token": "admin-secret"}
+
+        with pytest.raises(HTTPException) as exc:
+            await require_operator_token(request)
+
+        assert exc.value.status_code == 401
+
+
+class TestNoBroadRead:
+    """Delivery payload and state trails have no BROAD read surface.
+
+    The only sanctioned read path is the operator-gated reporting read API
+    (ADR 0021, issue #484): ``require_operator_token``
+    (``GATEWAY_OPERATOR_TOKEN``, fails closed) is registered on
+    ``GET /api/v1/reporting/resources``, ``/resources/detail``, and
+    ``/session-links``, so delivery payload and the state trail are readable
+    ONLY through that operator-gated surface.  Every other route touching
+    ``reporting_deliveries`` / ``delivery_state_trails`` is write-only — the
+    reporting-ingestion and /ingest surfaces expose no GET route, and no
+    other GET route reads those tables back out.
+    """
+
+    # The sanctioned operator-gated read surface (ADR 0021, issue #484).
+    _REPORTING_READ_PATHS = {
+        "/api/v1/reporting/resources",
+        "/api/v1/reporting/resources/detail",
+        "/api/v1/reporting/session-links",
+    }
+
+    @staticmethod
+    def _dependency_call_names(route) -> set[str]:
+        """Collect the resolved dependency callable names for a route."""
+
+        def walk(dependant, acc: set[str]) -> set[str]:
+            for dep in dependant.dependencies:
+                acc.add(getattr(dep.call, "__name__", repr(dep.call)))
+                walk(dep, acc)
+            return acc
+
+        return walk(route.dependant, set())
+
+    @staticmethod
+    def _effective_routes(app) -> list:
+        """Flatten the app's routes across FastAPI versions.
+
+        FastAPI >= 0.141 registers included routers lazily as
+        ``_IncludedRouter`` objects; older versions flatten routes directly
+        onto ``app.routes``.  Walk either shape and return the effective
+        route contexts (with resolved ``path``/``methods``/``dependant``).
+        """
+        routes: list = []
+
+        def walk(route) -> None:
+            route_type = type(route).__name__
+            if route_type == "_IncludedRouter":
+                for candidate in route.effective_candidates():
+                    if type(candidate).__name__ == "_IncludedRouter":
+                        walk(candidate)
+                    else:
+                        routes.append(candidate)
+            elif hasattr(route, "methods"):
+                routes.append(route)
+
+        for route in app.routes:
+            walk(route)
+        return routes
+
+    def _app_routes(self):
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        return [
+            route
+            for route in self._effective_routes(app)
+            if hasattr(route, "methods") and "GET" in route.methods
+        ]
+
+    def test_no_get_route_reads_delivery_payload(self):
+        """The write-only ingestion surfaces expose no GET route."""
+        get_paths = {route.path for route in self._app_routes()}
+
+        assert "/ingest" not in get_paths
+        assert "/api/v1/reporting/ingest/deliveries" not in get_paths
+
+    def test_write_only_routes_expose_no_read(self, monkeypatch):
+        """GET on the write-only ingestion surfaces is not a read path."""
+        from app.core.factory import create_app
+
+        app = create_app(configure_logging=False)
+        post_paths = {
+            route.path
+            for route in self._effective_routes(app)
+            if hasattr(route, "methods") and "POST" in route.methods
+        }
+        assert "/ingest" in post_paths
+        assert "/api/v1/reporting/ingest/deliveries" in post_paths
+
+    def test_reporting_read_api_is_the_only_reporting_get_surface(self):
+        """The only reporting GET routes are the three sanctioned read routes.
+
+        No other GET route under ``/api/v1/reporting`` reads
+        ``reporting_deliveries`` / ``delivery_state_trails`` back out.
+        """
+        reporting_get_paths = {
+            route.path
+            for route in self._app_routes()
+            if route.path.startswith("/api/v1/reporting")
+        }
+
+        assert reporting_get_paths == self._REPORTING_READ_PATHS
+
+    def test_reporting_read_routes_are_operator_gated(self):
+        """Every sanctioned reporting read route requires the operator token.
+
+        ``require_operator_token`` is registered on all three reporting read
+        routes — delivery payload and the state trail are readable ONLY
+        through the operator-gated reporting read API, and no other route
+        reads those tables back out.
+        """
+        from app.api.ingest import require_operator_token
+
+        reporting_read_routes = [
+            route for route in self._app_routes() if route.path in self._REPORTING_READ_PATHS
+        ]
+
+        assert len(reporting_read_routes) == len(self._REPORTING_READ_PATHS)
+        for route in reporting_read_routes:
+            assert require_operator_token.__name__ in self._dependency_call_names(route), (
+                f"{route.path} is not operator-gated"
+            )

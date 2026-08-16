@@ -30,6 +30,8 @@ from app.core.schemas.usage import (
     SessionSummary,
 )
 from app.core.telemetry import timed_operation, timeout_operation
+from app.core.timeouts import db_timeout as _db_timeout
+from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -37,18 +39,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["usage"])
 
 # ── Timeout helpers ────────────────────────────────────────────────────────
-
-
-@contextlib.asynccontextmanager
-async def _db_timeout(
-    event_name: str,
-    db_timeout_seconds: int,
-) -> contextlib.AbstractAsyncContextManager[None]:
-    """Wrap a database query with the configured per-query timeout budget."""
-    async with timeout_operation(
-        event_name, "db", budget_ms=db_timeout_seconds * 1000
-    ):
-        yield
 
 
 @contextlib.asynccontextmanager
@@ -67,18 +57,6 @@ async def _status_timeout(
     """
     async with timeout_operation(
         "status.compute", "compute", budget_ms=status_timeout_seconds * 1000
-    ):
-        yield
-
-
-@contextlib.asynccontextmanager
-async def _request_timeout(
-    total_request_timeout_seconds: int,
-) -> contextlib.AbstractAsyncContextManager[None]:
-    """Wrap an endpoint handler body with the total request timeout budget."""
-    async with timeout_operation(
-        "request.total", "request",
-        budget_ms=total_request_timeout_seconds * 1000,
     ):
         yield
 

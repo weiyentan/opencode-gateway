@@ -34,9 +34,7 @@ SELECTs, parameterised filters with 400 on invalid values, and the
 
 from __future__ import annotations
 
-import contextlib
 import json
-from collections.abc import AsyncIterator
 from datetime import datetime
 from uuid import UUID
 
@@ -55,7 +53,8 @@ from app.core.schemas.execution import (
     TimelineEvent,
 )
 from app.core.schemas.usage import PaginatedResponse
-from app.core.telemetry import timeout_operation
+from app.core.timeouts import db_timeout as _db_timeout
+from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
 
 router = APIRouter(tags=["execution"])
@@ -70,29 +69,6 @@ _MAX_LIMIT = 1000
 # HTTP clients cannot supply NULL.
 _DEFAULT_MAX_DEPTH: int = 50
 _MAX_MAX_DEPTH = 200
-
-
-# ── Timeout helpers (mirror app/api/usage.py) ────────────────────────────────
-
-
-@contextlib.asynccontextmanager
-async def _db_timeout(event_name: str, db_timeout_seconds: int) -> AsyncIterator[None]:
-    """Wrap a database query with the configured per-query timeout budget."""
-    async with timeout_operation(event_name, "db", budget_ms=db_timeout_seconds * 1000):
-        yield
-
-
-@contextlib.asynccontextmanager
-async def _request_timeout(
-    total_request_timeout_seconds: int,
-) -> AsyncIterator[None]:
-    """Wrap an endpoint handler body with the total request timeout budget."""
-    async with timeout_operation(
-        "request.total",
-        "request",
-        budget_ms=total_request_timeout_seconds * 1000,
-    ):
-        yield
 
 
 # ── Keyset cursor helpers ─────────────────────────────────────────────────────

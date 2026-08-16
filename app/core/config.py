@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -153,6 +153,21 @@ class Settings(BaseSettings):
     afk_outcomes_reconcile_cadence_seconds: float = 3600.0
     afk_outcomes_reconcile_window_seconds: float = 86400.0
 
+    # AFK outcome consumer reliability (issue #482) — bounded exponential
+    # backoff with jitter for transient/DB failures.  ``max_retries`` is the
+    # total number of persistence attempts before a message is DLQ'd (default
+    # 5); the inter-attempt delay is
+    # ``initial_backoff * 2^attempt`` (capped at ``max_backoff``), scaled by a
+    # uniform jitter factor.  A value of 0 is rejected (``ge=1``) because the
+    # total number of attempts must be at least 1 — otherwise the retry loop
+    # would never run and every message would be silently dropped.  Maps to
+    # GATEWAY_AFK_OUTCOMES_MAX_RETRIES,
+    # GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS,
+    # GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS.
+    afk_outcomes_max_retries: int = Field(default=5, ge=1)
+    afk_outcomes_initial_backoff_seconds: float = 1.0
+    afk_outcomes_max_backoff_seconds: float = 60.0
+
     # Whether the AFK outcome consumer/backfill is in use for this process.
     # The Gateway API is read-only over the AFK read-model, so it does not
     # require ``afk_outcomes_repository``; the companion consumer/backfill
@@ -209,6 +224,42 @@ class Settings(BaseSettings):
     reporting_topic: str = "afk.events"
     reporting_dlq_topic: str = "afk.events-reporting-dlq"
     reporting_consumer_group_id: str = "opencode-reporting"
+
+    # Retention defaults (issue #483, PRD #478 decision #15) — the AFK
+    # outcome / reporting read-model data-lifecycle tiers, configurable via
+    # settings/env with no code change required to adjust:
+    #
+    #   * Aggregates (``afk_runs``, ``afk_run_sessions``) are INDEFINITE:
+    #     ``0`` means "never swept".
+    #   * Metadata (``engineering_events``, ``delivery_log``,
+    #     ``delivery_state_trails``, ``afk_run_entities``,
+    #     ``unresolved_correlations``) default to 12 months (365 days).
+    #   * Redacted payload storage (``reporting_deliveries.payload`` and the
+    #     ``engineering_events.payload`` redacted projection) defaults to
+    #     90 days.
+    #   * DLQ (``afk.events-dlq``) is retained until resolved but never
+    #     unbounded: messages older than the operational max (default 30
+    #     days) are escalated/expired per the policy documented in ADR 0022.
+    #
+    # All four tiers are validated ``ge=0``: negative retention values are
+    # rejected at startup, while ``0`` preserves its "never/disabled" meaning.
+    #
+    # Maps to GATEWAY_RETENTION_AFK_AGGREGATES_DAYS,
+    # GATEWAY_RETENTION_AFK_METADATA_DAYS, GATEWAY_RETENTION_AFK_PAYLOAD_DAYS,
+    # GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS.
+    retention_afk_aggregates_days: int = Field(default=0, ge=0)
+    retention_afk_metadata_days: int = Field(default=365, ge=0)
+    retention_afk_payload_days: int = Field(default=90, ge=0)
+    retention_dlq_max_age_days: int = Field(default=30, ge=0)
+
+    # Operator-only access (issue #483, PRD #478 decision #16) — a dedicated
+    # operator bearer token, DISTINCT from the Admin API Key
+    # (``GATEWAY_API_KEY``) and from per-client collector credentials, that
+    # gates operator-only read surfaces (delivery payload, DLQ).  Empty
+    # (the default) means no operator-only surface is reachable — the
+    # ``require_operator_token`` dependency fails closed.  Maps to
+    # GATEWAY_OPERATOR_TOKEN.
+    operator_token: str = ""
 
 
 def get_settings() -> Settings:

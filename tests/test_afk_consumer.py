@@ -24,11 +24,33 @@ from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
     _MAPPED_EVENT_TYPES,
+    METRIC_COMMITTED_OFFSET,
+    METRIC_DB_ERRORS,
+    METRIC_DLQ_DEPTH,
+    METRIC_LAG,
+    METRIC_MESSAGES_ACCEPTED,
+    METRIC_MESSAGES_DLQ,
+    METRIC_MESSAGES_POISON,
+    METRIC_MESSAGES_TOTAL,
+    METRIC_RETRIES,
+    METRIC_RETRIES_PER_MESSAGE,
     AFKOutcomeConsumer,
+    NormalizedProviderEvent,
     ProviderEventMessage,
     _build_adapter,
+    _lenient_dlq_deserializer,
+    _parse_cli,
+    build_dlq_payload,
+    build_escalation_payload,
+    classify_dlq_message,
+    dlq_message_age,
+    is_dlq_expired,
+    map_normalized_event,
     map_provider_event,
+    run_dlq_sweep,
+    sweep_dlq,
 )
+from app.core.metrics import MetricsRegistry
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"
@@ -218,6 +240,9 @@ def _make_consumer(
     consumer_group_id: str = "opencode-outcomes",
     reconcile_window_seconds: float = 3600.0,
     max_retries: int = 3,
+    initial_backoff: float = 1.0,
+    max_backoff: float = 60.0,
+    metrics: MetricsRegistry | None = None,
 ) -> AFKOutcomeConsumer:
     return AFKOutcomeConsumer(
         kafka_brokers="broker:9092",
@@ -228,6 +253,9 @@ def _make_consumer(
         consumer_group_id=consumer_group_id,
         reconcile_window_seconds=reconcile_window_seconds,
         max_retries=max_retries,
+        initial_backoff=initial_backoff,
+        max_backoff=max_backoff,
+        metrics=metrics,
     )
 
 
@@ -509,6 +537,36 @@ async def test_db_error_max_retries_exhausted_sends_to_dlq_and_commits() -> None
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert "DB persist failed after 3 retries" in dlq_payload["reason"]
     assert dlq_payload["payload"] == _valid_payload()
+
+
+@pytest.mark.asyncio
+async def test_zero_max_retries_does_not_silently_drop_message() -> None:
+    """Defense-in-depth: a consumer programmatically built with
+    ``max_retries=0`` must still attempt persistence and, on a persistent DB
+    failure, DLQ the message — never silently return without persisting,
+    DLQ'ing, or committing (which would drop the message forever)."""
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")]),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=0, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload()))
+
+    # One persistence attempt, then the DLQ path (not silently dropped).
+    assert conn.execute.call_count == 1
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 0
+    assert snap[METRIC_MESSAGES_DLQ] == 1
+    assert snap[METRIC_DB_ERRORS] == 1
 
 
 @pytest.mark.asyncio
@@ -1277,3 +1335,982 @@ def test_import_from_afk_consumer_module() -> None:
     import afk_outcomes  # noqa: F401
 
     assert AFKOutcomeConsumer.__name__ == "AFKOutcomeConsumer"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Stage-2 mapping bridge (normalized contract → canonical vocabulary) #482
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _normalized_payload(**overrides: object) -> dict:
+    payload = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": DELIVERY_ID,
+        "resource_type": "pull_request",
+        "resource_id": "442",
+        "repository": "owner/repo",
+        "action": "merged",
+        "occurred_at": "2026-08-01T10:30:00Z",
+        "ingested_at": "2026-08-01T10:31:00Z",
+        "actor": "carol",
+        "payload_ref": "redacted-payload-ref-123",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action", "expected_entity_type", "expected_event_type"),
+    [
+        ("pull_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
+        ("merge_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
+        ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
+        ("merge_request", "approved", EntityType.CHANGE_REQUEST, "change_request.approved"),
+        (
+            "merge_request",
+            "review_requested",
+            EntityType.CHANGE_REQUEST,
+            "change_request.review_requested",
+        ),
+        ("issue", "opened", EntityType.ISSUE, "issue.opened"),
+        ("issue", "closed", EntityType.ISSUE, "issue.closed"),
+    ],
+)
+def test_map_normalized_event_bridges_resource_type_to_canonical(
+    resource_type: str,
+    action: str,
+    expected_entity_type: EntityType,
+    expected_event_type: str,
+) -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type=resource_type, action=action)
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is expected_entity_type
+    assert entity.entity_id == f"{expected_entity_type.value}:442"
+    assert event.event_type == expected_event_type
+    assert event.entity_id == entity.entity_id
+
+
+def test_map_provider_event_dispatches_normalized_shape() -> None:
+    """map_provider_event routes the normalized shape through the bridge."""
+    message = NormalizedProviderEvent.model_validate(_normalized_payload())
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.merged"
+
+
+def test_map_normalized_event_carries_payload_ref() -> None:
+    """The redacted payload reference is forwarded, never the payload itself."""
+    message = NormalizedProviderEvent.model_validate(_normalized_payload())
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+    assert event.payload == {"payload_ref": "redacted-payload-ref-123"}
+
+
+def test_map_normalized_event_unknown_resource_type_returns_none() -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type="commit")
+    )
+    assert map_normalized_event(message) is None
+
+
+def test_map_normalized_event_unmappable_action_returns_none() -> None:
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(action="assigned")
+    )
+    assert map_normalized_event(message) is None
+
+
+def test_legacy_mapping_is_unchanged_by_bridge() -> None:
+    """The legacy ten-type mapping still maps through the dispatcher unchanged."""
+    message = ProviderEventMessage(
+        provider=Provider.GITHUB,
+        delivery_id=DELIVERY_ID,
+        type="change_request.merged",
+        repository="owner/repo",
+        number=442,
+        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
+        actor="carol",
+    )
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.merged"
+    assert event.entity_id == "change_request:442"
+
+
+@pytest.mark.asyncio
+async def test_normalized_message_persists_as_canonical_event() -> None:
+    """A normalized ``pull_request.merged`` persists as ``change_request.merged``."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_normalized_payload()))
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+    consumer._consumer.commit.assert_called_once()
+    consumer._producer.send_and_wait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unmappable_normalized_action_routes_to_dlq() -> None:
+    """A normalized event with an unmappable action is poison → DLQ, no DB write."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_normalized_payload(action="assigned")))
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Unmappable message type" in dlq_payload["reason"]
+    assert "pull_request.assigned" in dlq_payload["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Bounded exponential retry with jitter (#482)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_applies_jitter_bounds() -> None:
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=0.5):
+        assert consumer._retry_delay(0) == pytest.approx(0.5)  # 1.0 * 0.5
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=1.5):
+        assert consumer._retry_delay(1) == pytest.approx(3.0)  # 1.0*2 * 1.5
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_respects_max_backoff_cap() -> None:
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])), max_backoff=10.0)
+    with patch("app.consumer.afk_consumer.random.uniform", return_value=1.5):
+        # 2**50 far exceeds the cap; the jitter applies to the capped 10.0.
+        assert consumer._retry_delay(50) == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_path_sleeps_with_jittered_delay() -> None:
+    """The DB-retry loop sleeps a jittered (bounded) delay between attempts."""
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down"), RuntimeError("db down"), "OK", "OK"]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    delays: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    msg = _mk_msg(_valid_payload())
+    with (
+        patch("app.consumer.afk_consumer.random.uniform", return_value=1.0),
+        patch("app.consumer.afk_consumer.asyncio.sleep", side_effect=_fake_sleep),
+    ):
+        await consumer._process_message(msg)
+
+    # Two retries happened: 1.0*2^0 and 1.0*2^1 (jitter pinned to 1.0).
+    assert delays == [1.0, 2.0]
+    assert consumer._consumer.commit.call_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer metrics: per-state counters, retry histogram, DLQ depth, lag (#482)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _snap(metrics: MetricsRegistry) -> dict:
+    return metrics.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_metrics_accepted_and_total_counters() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_TOTAL] == 1
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 1
+    assert snap[METRIC_MESSAGES_DLQ] == 0
+    assert snap[METRIC_MESSAGES_POISON] == 0
+
+
+@pytest.mark.asyncio
+async def test_metrics_poison_dlq_and_depth() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_MESSAGES_POISON] == 1
+    assert snap[METRIC_MESSAGES_DLQ] == 1
+    assert snap[METRIC_DLQ_DEPTH] == 1
+    assert snap[METRIC_MESSAGES_ACCEPTED] == 0
+
+
+@pytest.mark.asyncio
+async def test_metrics_retry_distribution_and_db_errors() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(
+            side_effect=[RuntimeError("db down"), RuntimeError("db down"), "OK", "OK"]
+        ),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        await consumer._process_message(_mk_msg(_valid_payload()))
+
+    snap = _snap(metrics)
+    assert snap[METRIC_DB_ERRORS] == 2
+    assert snap[METRIC_RETRIES] == 2
+    hist = snap[METRIC_RETRIES_PER_MESSAGE]
+    assert hist["count"] == 1
+    assert hist["buckets"]["2"] == 1  # the message needed 2 retries before success
+
+
+@pytest.mark.asyncio
+async def test_metrics_retries_exhausted_records_actual_retry_count() -> None:
+    """On exhaustion the histogram records the actual retry count.
+
+    ``retries`` counts only non-final failed attempts, so for ``max_retries=3``
+    the message actually retried 2 times (attempts 1 and 2) before the final
+    attempt failed and was DLQ'd — consistent with the success path, which
+    observes ``retries`` rather than ``max_retries``.
+    """
+    metrics = MetricsRegistry()
+    conn = _FakeConn(
+        [],
+        execute=AsyncMock(side_effect=[RuntimeError("db down")] * 3),
+    )
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3, metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    with patch("app.consumer.afk_consumer.asyncio.sleep", new_callable=AsyncMock):
+        await consumer._process_message(_mk_msg(_valid_payload()))
+
+    snap = _snap(metrics)
+    hist = snap[METRIC_RETRIES_PER_MESSAGE]
+    assert hist["buckets"]["2"] == 1  # actual retries = 2 for max_retries=3
+
+
+@pytest.mark.asyncio
+async def test_metrics_committed_offset_and_lag() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=10))
+    await consumer._process_message(_mk_msg(_valid_payload(), offset=11))
+
+    snap = _snap(metrics)
+    assert snap[f"{METRIC_COMMITTED_OFFSET}.0"] == 11
+    assert snap[f"{METRIC_LAG}.0"] == 0  # every seen offset has been committed
+
+
+@pytest.mark.asyncio
+async def test_metrics_lag_reflects_uncommitted_backlog() -> None:
+    metrics = MetricsRegistry()
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), metrics=metrics)
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    # Observe offsets 10 and 11, but commit only through 10.
+    consumer._record_last_seen(_mk_msg(_valid_payload(), offset=10))
+    consumer._record_last_seen(_mk_msg(_valid_payload(), offset=11))
+    consumer._mark_committable(_mk_msg(_valid_payload(), offset=10))
+    await consumer._commit()
+
+    snap = _snap(metrics)
+    assert snap[f"{METRIC_COMMITTED_OFFSET}.0"] == 10
+    assert snap[f"{METRIC_LAG}.0"] == 1  # offset 11 seen but not yet committed
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MetricsRegistry basics (app.core.metrics) — histogram, snapshot, reset
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_registry_counter_gauge_histogram_and_snapshot() -> None:
+    registry = MetricsRegistry()
+    registry.counter("c").inc()
+    registry.counter("c").inc(2)
+    registry.gauge("g").set(1.5)
+    registry.gauge("g").inc(0.5)
+    registry.histogram("h").observe(2)
+
+    snap = registry.snapshot()
+    assert snap["c"] == 3
+    assert snap["g"] == 2.0
+    assert snap["h"]["count"] == 1
+    assert snap["h"]["sum"] == 2.0
+    assert snap["h"]["buckets"]["2"] == 1
+
+
+def test_registry_rejects_type_conflict() -> None:
+    registry = MetricsRegistry()
+    registry.counter("x")
+    with pytest.raises(ValueError):
+        registry.gauge("x")
+
+
+def test_registry_reset_clears_all_metrics() -> None:
+    registry = MetricsRegistry()
+    registry.counter("c").inc()
+    registry.reset()
+    assert registry.snapshot() == {}
+
+
+@pytest.mark.asyncio
+async def test_from_env_reads_afk_retry_settings() -> None:
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
+        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+        "GATEWAY_AFK_OUTCOMES_MAX_RETRIES": "7",
+        "GATEWAY_AFK_OUTCOMES_INITIAL_BACKOFF_SECONDS": "2.0",
+        "GATEWAY_AFK_OUTCOMES_MAX_BACKOFF_SECONDS": "90",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._max_retries == 7
+    assert consumer._initial_backoff == 2.0
+    assert consumer._max_backoff == 90.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DLQ operational max (issue #483) — stamping, classification, escalation
+# ══════════════════════════════════════════════════════════════════════════
+
+
+DLQ_NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=UTC)
+MAX_AGE = 30
+
+
+def _dlq_payload(
+    *,
+    dead_lettered_at: str | None = "2026-08-01T12:00:00+00:00",
+    max_age_days: int = MAX_AGE,
+) -> dict:
+    """A DLQ message as produced by ``_send_to_dlq`` (with age metadata)."""
+    return {
+        "original_topic": "afk.events",
+        "reason": "DB persist failed after 3 retries",
+        "payload": {"delivery_id": DELIVERY_ID},
+        "dead_lettered_at": dead_lettered_at,
+        "max_age_days": max_age_days,
+    }
+
+
+def test_build_dlq_payload_stamps_age_metadata() -> None:
+    """Every DLQ message carries dead_lettered_at + max_age_days so its age and
+    the operational max are self-describing (measurable by the sweep)."""
+    payload = build_dlq_payload(
+        "afk.events", "boom", {"x": 1}, now=DLQ_NOW, max_age_days=MAX_AGE
+    )
+
+    assert payload["original_topic"] == "afk.events"
+    assert payload["reason"] == "boom"
+    assert payload["payload"] == {"x": 1}
+    assert payload["dead_lettered_at"] == DLQ_NOW.isoformat()
+    assert payload["max_age_days"] == MAX_AGE
+
+
+def test_build_dlq_payload_defaults_max_age() -> None:
+    """When no max age is given, the default operational max is stamped."""
+    payload = build_dlq_payload("afk.events", "boom", {}, now=DLQ_NOW)
+    assert payload["max_age_days"] == 30
+
+
+def test_dlq_message_age_parses_dead_lettered_at() -> None:
+    payload = _dlq_payload(dead_lettered_at="2026-08-01T12:00:00+00:00")
+    assert dlq_message_age(payload, DLQ_NOW) == timedelta(days=15)
+
+
+def test_dlq_message_age_missing_timestamp_returns_none() -> None:
+    assert dlq_message_age({"reason": "no timestamp"}, DLQ_NOW) is None
+
+
+def test_dlq_message_age_unparseable_timestamp_returns_none() -> None:
+    assert dlq_message_age(_dlq_payload(dead_lettered_at="not-a-time"), DLQ_NOW) is None
+
+
+def test_is_dlq_expired_boundary_strictly_older() -> None:
+    """A message exactly at the max-age edge is retained (strict ``>``); only
+    strictly older messages are expired — the same boundary semantics as the
+    transcript retention job."""
+    at_edge = _dlq_payload(dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE)).isoformat())
+    past_edge = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE) - timedelta(seconds=1)).isoformat()
+    )
+    within = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE - 1)).isoformat()
+    )
+
+    assert is_dlq_expired(at_edge, DLQ_NOW, MAX_AGE) is False
+    assert is_dlq_expired(past_edge, DLQ_NOW, MAX_AGE) is True
+    assert is_dlq_expired(within, DLQ_NOW, MAX_AGE) is False
+
+
+def test_is_dlq_expired_unknown_age_retained() -> None:
+    """A message without a usable dead_lettered_at has unknown age and is
+    retained (never prematurely expired)."""
+    assert is_dlq_expired({"reason": "no timestamp"}, DLQ_NOW, MAX_AGE) is False
+
+
+def test_classify_dlq_message() -> None:
+    past = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 1)).isoformat()
+    )
+    within = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    assert classify_dlq_message(past, DLQ_NOW, MAX_AGE) == "expired"
+    assert classify_dlq_message(within, DLQ_NOW, MAX_AGE) == "retain"
+
+
+def test_build_escalation_payload_preserves_original_and_reason() -> None:
+    """Escalation preserves the original payload + reason and stamps a
+    deterministic ``escalation_key`` + ``escalation_reason``, so the operator
+    can resolve it later and re-escalations are content-stable."""
+    payload = _dlq_payload()
+    escalated = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
+
+    assert escalated["original_topic"] == "afk.events"
+    assert escalated["reason"] == payload["reason"]
+    assert escalated["payload"] == payload["payload"]
+    assert escalated["dead_lettered_at"] == payload["dead_lettered_at"]
+    assert "escalation_key" in escalated
+    assert "escalated_at" not in escalated
+    assert f"{MAX_AGE}" in escalated["escalation_reason"]
+
+
+def test_build_escalation_payload_is_content_stable() -> None:
+    """Same inputs → byte-identical output (no volatile ``now``-derived field).
+
+    Two escalations of the same DLQ record (even at different ``now``) must be
+    identical, so a later sweep re-escalating the same record is idempotent by
+    content (``escalation_key`` is a deterministic natural key over the DLQ
+    record's own stable identity).
+    """
+    payload = _dlq_payload()
+    first = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
+    later = build_escalation_payload(
+        payload, now=DLQ_NOW + timedelta(days=10), max_age_days=MAX_AGE
+    )
+
+    assert first == later
+    assert "escalation_key" in first
+    assert "escalated_at" not in first
+    assert len(first["escalation_key"]) == 64  # sha256 hex digest
+
+
+def test_run_dlq_sweep_classifies_and_builds_escalations() -> None:
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    retained = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    unknown = {"reason": "no timestamp"}
+
+    report = run_dlq_sweep(
+        [expired, retained, unknown], now=DLQ_NOW, max_age_days=MAX_AGE
+    )
+
+    assert report.scanned == 3
+    assert report.expired == 1
+    assert report.retained == 2
+    assert len(report.escalated) == 1
+    assert report.escalated[0]["payload"] == expired["payload"]
+
+
+def test_run_dlq_sweep_dry_run_reports_without_collecting_escalations() -> None:
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    report = run_dlq_sweep([expired], now=DLQ_NOW, max_age_days=MAX_AGE, dry_run=True)
+
+    assert report.dry_run is True
+    assert report.expired == 1
+    assert report.escalated == []  # nothing is escalated in a dry run
+
+
+def test_run_dlq_sweep_limit_caps_scanned_messages() -> None:
+    messages = [
+        _dlq_payload(dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + i)).isoformat())
+        for i in range(1, 6)
+    ]
+    report = run_dlq_sweep(messages, now=DLQ_NOW, max_age_days=MAX_AGE, limit=2)
+
+    assert report.scanned == 2
+    assert report.expired == 2
+    assert len(report.escalated) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_to_dlq_stamps_operational_max() -> None:
+    """The producer path stamps dead_lettered_at + max_age_days into the DLQ
+    message (the enforcement surface for the operational max)."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    with patch(
+        "app.consumer.afk_consumer.datetime", wraps=datetime
+    ) as mock_dt:
+        mock_dt.now.return_value = DLQ_NOW
+        await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert dlq_payload["dead_lettered_at"] == DLQ_NOW.isoformat()
+    assert dlq_payload["max_age_days"] == 30
+
+
+@pytest.mark.asyncio
+async def test_from_env_reads_dlq_max_age() -> None:
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
+        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+        "GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS": "14",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._dlq_max_age_days == 14
+
+
+# ── DLQ sweep offset commits + lenient deserialization (PR #492 findings) ──
+
+
+class _DLQRecord:
+    """A minimal record quacking like an aiokafka ConsumerRecord for the sweep."""
+
+    def __init__(self, topic: str, partition: int, offset: int, value: object) -> None:
+        self.topic = topic
+        self.partition = partition
+        self.offset = offset
+        self.value = value
+
+
+class _FakeSweepConsumer:
+    """Stand-in for AIOKafkaConsumer in the sweep: __aiter__/start/stop/commit."""
+
+    def __init__(self, messages: list[_DLQRecord]) -> None:
+        self._messages = messages
+        self.commit = AsyncMock(return_value=None)
+        self.start = AsyncMock(return_value=None)
+        self.stop = AsyncMock(return_value=None)
+
+    def __aiter__(self) -> _FakeAsyncIterator:
+        return _FakeAsyncIterator(self._messages)
+
+
+class _FakeSweepProducer:
+    """Stand-in for AIOKafkaProducer in the sweep: start/stop/send_and_wait."""
+
+    def __init__(self) -> None:
+        self.start = AsyncMock(return_value=None)
+        self.stop = AsyncMock(return_value=None)
+        self.send_and_wait = AsyncMock(return_value=None)
+
+
+def test_lenient_dlq_deserializer_returns_none_on_corrupt() -> None:
+    """Corrupt bytes decode to ``None`` instead of raising inside the consumer."""
+    assert _lenient_dlq_deserializer(b"not json") is None
+    assert _lenient_dlq_deserializer(b"\xff\xfe invalid utf8") is None
+    assert _lenient_dlq_deserializer(json.dumps({"a": 1}).encode("utf-8")) == {"a": 1}
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_commits_offsets_in_write_mode() -> None:
+    """Write-mode sweep commits per-partition offsets: a partition with a
+    retained record commits at its first retained offset (re-examined later);
+    an all-expired partition commits at max-consumed + 1 (never re-read)."""
+    dlq_topic = "afk.events-dlq"
+    escalation_topic = "afk.events-dlq-expired"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    retained = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=1)).isoformat()
+    )
+    messages = [
+        _DLQRecord(dlq_topic, 0, 5, expired),
+        _DLQRecord(dlq_topic, 0, 6, retained),
+        _DLQRecord(dlq_topic, 1, 10, expired),
+    ]
+    consumer = _FakeSweepConsumer(messages)
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+    ):
+        report = await sweep_dlq(
+            "broker:9092",
+            dlq_topic,
+            escalation_topic,
+            MAX_AGE,
+            now=DLQ_NOW,
+        )
+
+    assert report.scanned == 3
+    assert report.expired == 2
+    assert report.retained == 1
+
+    # Two escalations published, both to the escalation topic.
+    assert producer.send_and_wait.call_count == 2
+    assert [c.args[0] for c in producer.send_and_wait.call_args_list] == [
+        escalation_topic,
+        escalation_topic,
+    ]
+
+    # Commit: partition 0 → first retained (6); partition 1 → max+1 (11).
+    consumer.commit.assert_called_once()
+    assert consumer.commit.call_args.args[0] == {
+        TopicPartition(dlq_topic, 0): 6,
+        TopicPartition(dlq_topic, 1): 11,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_dry_run_does_not_commit_or_publish() -> None:
+    """Dry-run sweep publishes nothing and commits nothing."""
+    dlq_topic = "afk.events-dlq"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    consumer = _FakeSweepConsumer([_DLQRecord(dlq_topic, 0, 5, expired)])
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+    ):
+        report = await sweep_dlq(
+            "broker:9092",
+            dlq_topic,
+            "afk.events-dlq-expired",
+            MAX_AGE,
+            now=DLQ_NOW,
+            dry_run=True,
+        )
+
+    assert report.expired == 1
+    assert report.escalated == []
+    producer.send_and_wait.assert_not_called()
+    consumer.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sweep_dlq_skips_corrupt_record_with_warning() -> None:
+    """A corrupt (non-object) record is skipped with a warning, does not crash
+    the sweep, and its offset is still committed past so the commit position
+    is not wrong; the well-formed records are still processed."""
+    dlq_topic = "afk.events-dlq"
+    expired = _dlq_payload(
+        dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
+    )
+    messages = [
+        _DLQRecord(dlq_topic, 0, 3, None),  # corrupt (lenient deserializer sentinel)
+        _DLQRecord(dlq_topic, 0, 4, expired),
+    ]
+    consumer = _FakeSweepConsumer(messages)
+    producer = _FakeSweepProducer()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+        patch("app.consumer.afk_consumer.logger") as mock_logger,
+    ):
+        report = await sweep_dlq(
+            "broker:9092", dlq_topic, "afk.events-dlq-expired", MAX_AGE, now=DLQ_NOW
+        )
+
+    assert report.scanned == 1  # only the well-formed record is scanned
+    assert report.expired == 1
+    mock_logger.warning.assert_called_once()
+
+    # The corrupt offset (3) is committed past together with the expired
+    # record (4) — commit at max-consumed+1 = 5.
+    consumer.commit.assert_called_once()
+    assert consumer.commit.call_args.args[0] == {TopicPartition(dlq_topic, 0): 5}
+    assert producer.send_and_wait.call_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Producer→consumer contract pinning (#485)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The producer (fast-api-eda-gateway #97–#102, PRD #478) emits a normalized,
+# schema-versioned event on ``afk.events``.  These tests pin the exact
+# producer→consumer contract: a fixture event matching the producer contract
+# must map through ``map_provider_event`` to the canonical outcome-layer
+# vocabulary WITHOUT DLQ routing, and every contract field must be carried
+# through (never dropped).  A payload that violates the contract routes to
+# the DLQ with the original payload plus a reason (documented in
+# ``docs/afk-outcome-contract-validation.md``).
+
+# The pinned producer contract: provider, forwarded ``delivery_id``, stable
+# ``resource_id``, ``resource_type``, ``action``, ``occurred_at``,
+# ``ingested_at``, ``actor``, redacted ``payload_ref``, and ``schema_version``.
+PRODUCER_CONTRACT_EVENT: dict[str, object] = {
+    "schema_version": "1.0",
+    "provider": "github",
+    "delivery_id": "22222222-3333-4444-5555-666666666666",
+    "resource_type": "pull_request",
+    "resource_id": "442",
+    "repository": "owner/repo",
+    "action": "merged",
+    "occurred_at": "2026-08-13T10:10:29Z",
+    "ingested_at": "2026-08-13T10:10:30Z",
+    "actor": "carol",
+    "payload_ref": "redacted-payload-ref-442",
+}
+
+
+def test_producer_contract_event_has_exact_fields() -> None:
+    """The pinned producer contract carries exactly the agreed field set.
+
+    Adding or removing a field here is a contract change and must fail this
+    test (and be reconciled with ADR 0020 / PRD #478) rather than drift
+    silently against the producer.
+    """
+    assert set(PRODUCER_CONTRACT_EVENT) == {
+        "schema_version",
+        "provider",
+        "delivery_id",
+        "resource_type",
+        "resource_id",
+        "repository",
+        "action",
+        "occurred_at",
+        "ingested_at",
+        "actor",
+        "payload_ref",
+    }
+
+
+def test_producer_contract_maps_to_canonical_change_request() -> None:
+    """The contract fixture maps to the canonical change_request vocabulary.
+
+    Every contract field is carried through the bridge: ``resource_type``
+    selects the canonical entity type, ``resource_id`` becomes the stable
+    identity, ``action`` the event suffix, and ``payload_ref`` the redacted
+    reference (never the payload itself).
+    """
+    message = NormalizedProviderEvent.model_validate(PRODUCER_CONTRACT_EVENT)
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.entity_id == "change_request:442"
+    assert entity.provider is Provider.GITHUB
+    assert entity.repository == "owner/repo"
+    assert entity.number == 442
+
+    assert event.event_type == "change_request.merged"
+    assert event.entity_id == "change_request:442"
+    assert event.provider is Provider.GITHUB
+    assert event.occurred_at == datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
+    assert event.actor == "carol"
+    assert event.payload == {"payload_ref": "redacted-payload-ref-442"}
+
+
+@pytest.mark.asyncio
+async def test_producer_contract_event_is_not_routed_to_dlq() -> None:
+    """The contract-conforming event persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(PRODUCER_CONTRACT_EVENT))
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+
+
+def test_producer_contract_gitlab_merge_request_maps_to_change_request() -> None:
+    """The same contract holds cross-provider: GitLab ``merge_request`` → change_request."""
+    message = NormalizedProviderEvent.model_validate(
+        {**PRODUCER_CONTRACT_EVENT, "provider": "gitlab", "resource_type": "merge_request"}
+    )
+    mapped = map_provider_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.provider is Provider.GITLAB
+    assert event.event_type == "change_request.merged"
+
+
+@pytest.mark.asyncio
+async def test_contract_violation_routes_to_dlq_with_payload_and_reason() -> None:
+    """A normalized event violating the contract (unmappable action) → DLQ.
+
+    The documented contract-violation behavior: the full original payload is
+    forwarded to ``afk.events-dlq`` with ``original_topic`` and a ``reason``
+    string, and nothing is persisted.
+    """
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    violating = {**PRODUCER_CONTRACT_EVENT, "action": "synchronize"}  # not canonical
+    await consumer._process_message(_mk_msg(violating))
+
+    conn.execute.assert_not_called()  # nothing persisted
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert topic == "afk.events-dlq"
+    assert dlq_payload["original_topic"] == "afk.events"
+    assert "Unmappable message type" in dlq_payload["reason"]
+    assert "pull_request.synchronize" in dlq_payload["reason"]
+    assert dlq_payload["payload"] == violating  # original payload preserved verbatim
+
+
+@pytest.mark.asyncio
+async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> None:
+    """A non-JSON body is DLQ'd carrying the raw bytes plus a reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_invalid_json_msg())
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert dlq_payload["reason"]
+    assert dlq_payload["payload"] == {"raw": "not valid json at all"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CLI dispatch (PR #492 review) — _parse_cli
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--dlq-sweep"], (True, [])),
+        (["--dlq-sweep", "--batch-size", "50"], (True, ["--batch-size", "50"])),
+        (["--batch-size", "50", "--dlq-sweep"], (True, ["--batch-size", "50"])),
+        (["--dlq-sweep", "--dry-run", "--limit", "5"], (True, ["--dry-run", "--limit", "5"])),
+        ([], (False, [])),
+        (["--some-future-flag", "x"], (False, ["--some-future-flag", "x"])),
+        # A literal "--dlq-sweep" that is the VALUE of another option must not
+        # trigger sweep mode (the reviewer's fragility scenario).
+        (
+            ["--future-option", "--dlq-sweep"],
+            (False, ["--future-option", "--dlq-sweep"]),
+        ),
+    ],
+)
+def test_parse_cli(argv: list[str], expected: tuple[bool, list[str]]) -> None:
+    """``_parse_cli`` detects ``--dlq-sweep`` as a flag, never as a value.
+
+    The sweep's own flags flow through ``remaining`` unchanged; a literal
+    ``--dlq-sweep`` positioned as another option's value does not switch mode.
+    """
+    assert _parse_cli(argv) == expected

@@ -19,7 +19,10 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import AliasChoices, BaseModel, Field
 
-from app.core.auth import require_collector_token
+from app.core.auth import (
+    require_collector_token,
+    require_operator_token,  # noqa: F401 (re-exported for backward compatibility)
+)
 from app.core.config import get_settings
 from app.core.secrets import redact_dict
 from app.db.session import get_session
@@ -31,6 +34,16 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 # ── Known schema versions ─────────────────────────────────────────────────
 
 KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
+
+
+# ── Operator-only access (issue #483, PRD #478 decision #16) ──────────────
+#
+# Delivery payload and DLQ data are restricted to operators: no broad read is
+# possible.  ``require_operator_token`` is the enforcement gate for any
+# operator-only read surface; its canonical home is ``app.core.auth`` (next to
+# ``ApiKeyMiddleware``).  It is re-exported from this module's imports (above)
+# for backward compatibility — existing importers (tests, historically
+# ``app/api/reporting.py``) resolve it from ``app.api.ingest``.
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────

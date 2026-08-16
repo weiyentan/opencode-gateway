@@ -24,8 +24,6 @@ parameterised filters with 400 on invalid enum/date values, and the
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import AsyncIterator
 from datetime import datetime
 from decimal import Decimal
 
@@ -51,7 +49,9 @@ from app.core.schemas.afk import (
     UsageAggregate,
 )
 from app.core.schemas.usage import PaginatedResponse
-from app.core.telemetry import timed_operation, timeout_operation
+from app.core.telemetry import timed_operation
+from app.core.timeouts import db_timeout as _db_timeout
+from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
 
 router = APIRouter(tags=["afk-outcomes"])
@@ -75,32 +75,6 @@ _ENTITY_TYPE_FIELDS = {
 # A derived link is provisional (inferred) when its role is not a definitive
 # "resolved" — i.e. "referenced" (sub-threshold confidence) or "noise".
 _RESOLVED_ROLE = "resolved"
-
-
-# ── Timeout helpers (mirror app/api/usage.py) ────────────────────────────────
-
-
-@contextlib.asynccontextmanager
-async def _db_timeout(
-    event_name: str, db_timeout_seconds: int
-) -> AsyncIterator[None]:
-    """Wrap a database query with the configured per-query timeout budget."""
-    async with timeout_operation(
-        event_name, "db", budget_ms=db_timeout_seconds * 1000
-    ):
-        yield
-
-
-@contextlib.asynccontextmanager
-async def _request_timeout(
-    total_request_timeout_seconds: int,
-) -> AsyncIterator[None]:
-    """Wrap an endpoint handler body with the total request timeout budget."""
-    async with timeout_operation(
-        "request.total", "request",
-        budget_ms=total_request_timeout_seconds * 1000,
-    ):
-        yield
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

@@ -403,6 +403,41 @@ must pass BOTH layers — either by using the Admin API Key itself (with
 its hash registered in `collector_credentials`), or by using a
 provisioned collector token that also matches `GATEWAY_API_KEY`.
 
+**Operator Token**:
+The `GATEWAY_OPERATOR_TOKEN` environment variable. A dedicated operator
+bearer token, DISTINCT from the Admin API Key (`GATEWAY_API_KEY`) and from
+per-client Collector Credentials, that gates operator-only read surfaces
+(delivery payload, DLQ) via the `require_operator_token` dependency. It is
+transported in the dedicated `X-Operator-Token` header on operator-only read
+requests — never `Authorization`, which carries the Admin API Key — so the
+two credentials are distinct and both gates are satisfiable on the same
+request. An empty operator token fails closed — no operator-only surface is
+reachable (no broad read). Delivery payload and state trails are readable
+**only** through the operator-gated Reporting Read API (issue #484, ADR 0021), which
+is the sanctioned read path for those tables; every other route touching
+them is write-only. The Admin API Key does not satisfy the operator gate;
+the three credential types are never shared across pipelines.
+_Avoid_: admin key, collector token (when the operator role is meant)
+
+**Retention Tier**:
+One of the configurable data-lifecycle buckets for the AFK outcome +
+reporting read-model (issue #483, ADR 0022), declared on Settings and
+env-driven via `GATEWAY_RETENTION_*`:
+
+* **Aggregates** (`afk_runs`, `afk_run_sessions`) — indefinite (`0` days =
+  never swept).
+* **Metadata** (`engineering_events`, `delivery_log`,
+  `delivery_state_trails`, `afk_run_entities`, `unresolved_correlations`)
+  — 12 months (365 days).
+* **Redacted payload storage** (`reporting_deliveries.payload` and the
+  `engineering_events.payload` redacted projection) — 90 days.
+* **DLQ operational max** (`afk.events-dlq`) — 30 days, never unbounded.
+
+Retention boundaries use strict ordering: a row/message exactly at the
+cutoff edge is retained; only strictly-older data expires; unknown-age data
+(no timestamp) is never prematurely expired.
+_Avoid_: a single monolithic retention window, retention without a tier
+
 **Usage Record Consumer**:
 A companion container that reads JSON-serialised usage records from the
 ``opencode-usage`` Kafka topic and POSTs each one to the Gateway's
@@ -416,6 +451,30 @@ sends messages that cannot be processed — invalid payloads (Pydantic
 validation failure) or requests that received a 4xx response from the
 Gateway ingest endpoint. DLQ messages include the original payload and a
 reason string describing the failure.
+
+**DLQ Operational Max**:
+The bound that keeps the AFK outcome DLQ topic (`afk.events-dlq`) from
+growing unbounded (issue #483, ADR 0022). Every DLQ record is stamped with
+`dead_lettered_at` and `max_age_days` at producer time; records strictly
+older than `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` (default 30 days) are
+**escalated** by the DLQ sweep (`python -m app.consumer.afk_consumer
+--dlq-sweep`) to `afk.events-dlq-expired`, preserving the original payload
++ reason + `dead_lettered_at` + a deterministic `escalation_key` +
+`escalation_reason` for operator resolution. Escalation records are
+content-stable: the `escalation_key` is a SHA-256 natural key over the DLQ
+record's own identity, so the same record always escalates to an identical
+record (deduplicable by content). The sweep commits consumed offsets in
+write mode — per partition at its first retained (not-yet-expired) record's
+offset, or past the last consumed record when none are retained — so re-runs
+do **not** re-escalate already-escalated records, while retained records are
+re-examined on later runs until they age past the operational max; dry-run
+never commits. Physical removal is enforced by the DLQ topic's Kafka
+retention configured to the same max age. A record without a usable
+`dead_lettered_at` has unknown age and is retained. "Never unbounded" is
+enforced per-DLQ: the operational-max sweep covers only `afk.events-dlq`; the
+reporting DLQ (`afk.events-reporting-dlq`, issue #479) has no operational-max
+sweep and is out of #483's scope.
+_Avoid_: unbounded DLQ growth, silently dropping poison messages
 
 **Canonical Event**:
 A row in the ``usage_events`` table (migration 0021) — the canonical
@@ -631,6 +690,29 @@ poison messages, and runs scheduled bounded-window reconciliation reusing the
 backfill engine for terminal states (merged/closed) the topic does not carry.
 _Avoid_: Kafka consumer (generic), outcomes ingestion bridge
 
+**Normalized Provider Event**:
+A schema-versioned, provider-agnostic event on the provider-events topic
+emitted by the producer (`fast-api-eda-gateway`, issues #97–#102). It carries
+the producer's native resource vocabulary (`issue`, `pull_request`,
+`merge_request`) — never the outcome layer's canonical `change_request`
+vocabulary — plus a forwarded `delivery_id`, a stable `resource_id`,
+`resource_type`, `action`, `occurred_at`, `ingested_at`, `actor`, and a
+`payload_ref` (a *reference* to the redacted payload, never the payload
+itself). Distinct from the legacy ten-type message shape
+(`ProviderEventMessage`, discriminated by its `type`/`number` fields).
+_Avoid_: Legacy provider event (when the normalized shape is meant)
+
+**Mapping Bridge**:
+The Stage-2 addition to the AFK Outcome Consumer's `map_provider_event` that
+bridges a **Normalized Provider Event** into the outcome layer's canonical
+vocabulary (ADR 0020): `issue` → `issue`; `pull_request` and `merge_request`
+→ `change_request`. `action` becomes the canonical event-type suffix, and the
+result is validated against the locked canonical vocabulary — an unknown
+resource type or action returns unmappable and is DLQ'd, never persisted and
+never conflated with a legacy type. The legacy ten-type mapping is preserved
+unchanged.
+_Avoid_: Conflating `pull_request`/`merge_request` with `change_request`
+
 **AFK Backfill CLI**:
 The operator CLI ``scripts/afk_backfill.py`` that pulls a bounded window of
 engineering activity from a provider adapter, runs it through the
@@ -701,6 +783,53 @@ as an opaque string (issue/MR number, commit SHA, review id). It mirrors the
 ``EngineeringEntity`` identity (``entity_id = "<resource_type>:<resource_number>"``)
 without collapsing onto the display metadata.
 _Avoid_: resource number as an integer, entity_id string, project label
+
+**Reporting Read API**:
+The read-only API surface for the reporting read-model
+(``app/api/reporting.py``, prefix ``/api/v1/reporting``, ADR 0021, issue
+#484): ``GET /resources`` (paginated ingested resources filterable by any
+subset of the stable resource identity — ``provider`` + ``repository_url`` +
+``resource_type`` + ``resource_number``), ``GET /resources/detail`` (the
+current aggregate plus the per-delivery State Trail plus session links for
+one resource), and ``GET /session-links`` (provisional Reporting Session
+Links). It is strictly read-only — the write path remains
+``app/api/reporting_ingest.py`` (issue #479) — uses the ``{status, data,
+error}`` envelope and API-key auth, and — because delivery payload and the
+state trail are operator-only (ADR 0022) — additionally requires the
+dedicated Operator Token (``GATEWAY_OPERATOR_TOKEN`` via
+``require_operator_token``) on every route, on top of the Admin API Key
+(fails closed when unprovisioned). It makes **no completion claims**: it
+surfaces the resource's verbatim current payload and pipeline lifecycle
+states and never derives or asserts a "completed"/"finished"/outcome state.
+_Avoid_: Reporting endpoint (generic), completion/outcome report
+
+**Resource Summary**:
+The current aggregate for one stable reporting resource as surfaced by the
+Reporting Read API: the verbatim current ``payload``, ``delivery_count``,
+``last_delivery_id``, ``last_ingested_at``, and the composite ``resource_id``
+key (``provider:repository_url:resource_type:resource_number``). Derived at
+read time from the immutable ``reporting_deliveries`` rows until the
+current-aggregate layer (#480) lands; the shape carries no completion/outcome
+field.
+_Avoid_: Resource report (generic), finished/outcome summary
+
+**State Trail**:
+The per-delivery lifecycle observations for one reporting resource
+(``delivery_state_trails`` rows), surfaced chronologically by the Reporting
+Read API as pipeline observations — ``received``, ``normalized``,
+``published``, ``persisted``, ``rejected``, ``failed``. States describe the
+delivery pipeline, never resource completion.
+_Avoid_: Resource status, completion state
+
+**Reporting Session Link**:
+A session link surfaced by the Reporting Read API (``GET
+/api/v1/reporting/session-links``; rows from ``afk_run_sessions``). Until
+exact resource↔session correlation (#481) lands, every link is marked
+``provisional=True`` with an empty ``source_references`` list — the Gateway
+never fabricates a resource↔session link it cannot prove. When #481 lands,
+exact links populate ``source_references`` and flip ``provisional=False``;
+the response shape is forward-compatible.
+_Avoid_: Exact link, proven session association
 
 ## Architecture Note
 
@@ -781,11 +910,22 @@ manages.
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
 - An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
+- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0020)
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 - An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
+- A **Retention Tier** groups the AFK/reporting data into aggregates (indefinite), metadata (12 months), redacted payload (90 days), and the **DLQ Operational Max** (30 days), each configurable via `GATEWAY_RETENTION_*` (ADR 0022)
+- The **DLQ Operational Max** stamps every `afk.events-dlq` record with `dead_lettered_at` + `max_age_days` and escalates records strictly older than the max to `afk.events-dlq-expired` — never unbounded, never silently dropped
+- An **Operator Token** gates operator-only read surfaces (delivery payload, DLQ) and is distinct from the **Admin API Key** and **Collector Credential** — no token is shared across pipelines
+- The **Admin API Key** does not satisfy the operator-only gate (`require_operator_token`) — the three credential layers are disjoint
+- Delivery payload and state trails are readable **only** through the operator-gated Reporting Read API (`require_operator_token` on `GET /api/v1/reporting/resources`, `/resources/detail`, `/session-links`); no other route reads `reporting_deliveries` / `delivery_state_trails` back out, and `delivery_log` / `engineering_events.payload` remain readable by no API route (ADR 0021, ADR 0022)
+- The ingestion endpoint relies on the **Collector Credential** (Two-Layer Auth) — never the **Admin API Key** alone — and is not exposed to the public internet; producer webhook ingress on the EDA gateway side is unchanged
+- The **Reporting Read API** exposes the reporting read-model — ingested resources with their current aggregates (`reporting_deliveries`), per-delivery **State Trails** (`delivery_state_trails`), and **provisional Reporting Session Links** — and is strictly read-only: the write path remains the reporting ingestion endpoint (`app/api/reporting_ingest.py`, issue #479). It is the **sanctioned read path** for delivery payload and the state trail: every route is additionally gated by the **Operator Token** (`require_operator_token`) on top of the **Admin API Key**, and no other route reads those tables back out (ADR 0021, ADR 0022)
+- The **Reporting Read API** makes **no completion claims**: a **Resource Summary** carries the verbatim current payload and pipeline lifecycle states, never a derived "completed"/"finished"/outcome state
+- A **Resource Summary** is keyed by the composite `resource_id` (`provider + repository_url + resource_type + resource_number`), the stable resource identity distinct from any human-readable label
+- A **Reporting Session Link** is marked `provisional=True` with an empty `source_references` list until exact resource↔session correlation (#481) lands — the Gateway never fabricates a link it cannot prove
 
 ## Flagged Ambiguities
 
