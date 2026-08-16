@@ -56,6 +56,7 @@ from afk_outcomes.models import (
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.metrics import DEFAULT_REGISTRY, MetricsRegistry
+from app.core.repository import normalize_repository_url
 from scripts.afk_backfill import PrefetchedWindow, run_backfill
 
 logger = logging.getLogger(__name__)
@@ -250,80 +251,6 @@ def _coerce_resource_number(resource_id: str) -> int | None:
         return None
 
 
-# ── Repository URL normalization (issue #495) ────────────────────────────────
-#
-# Repository identity is derived strictly from the producer repository URL.
-# The normalization rules are deterministic and reject invalid identity rather
-# than falling back to a display label:
-#
-# 1. Require absolute HTTP(S) — reject non-HTTP schemes and relative URLs.
-# 2. Lowercase the hostname.
-# 3. Remove credentials (userinfo), query strings, and fragments.
-# 4. Strip default ports (80 for http, 443 for https).
-# 5. Strip a trailing slash.
-# 6. Strip a terminal ``.git`` suffix.
-# 7. Preserve path spelling (case-sensitive).
-# 8. Reject empty or invalid identity.
-
-import re as _re
-from urllib.parse import urlparse as _urlparse
-
-_REPO_URL_RE = _re.compile(r"^https?://", _re.IGNORECASE)
-
-
-def normalize_repository_url(raw: str) -> str | None:
-    """Normalize a repository URL into a deterministic identity string.
-
-    Returns the normalized identity, or ``None`` when the URL is invalid
-    (not an absolute HTTP(S) URL, empty, or unparseable).
-    """
-    if not raw or not isinstance(raw, str):
-        return None
-    raw = raw.strip()
-    if not raw:
-        return None
-    if not _REPO_URL_RE.match(raw):
-        return None
-
-    try:
-        parsed = _urlparse(raw)
-    except Exception:
-        return None
-
-    if not parsed.hostname:
-        return None
-
-    # Lowercase the hostname.
-    host = parsed.hostname.lower()
-
-    # Strip default ports; preserve non-default ports.
-    port = ""
-    if parsed.port is not None:
-        is_default = (parsed.scheme == "http" and parsed.port == 80) or (
-            parsed.scheme == "https" and parsed.port == 443
-        )
-        if not is_default:
-            port = f":{parsed.port}"
-
-    # Build the normalized URL: scheme + host + optional non-default port + path.
-    path = parsed.path or ""
-
-    # Strip trailing slash.
-    path = path.rstrip("/")
-
-    # Strip terminal .git suffix.
-    if path.endswith(".git"):
-        path = path[:-4]
-
-    # Remove leading slash for the canonical owner/repo form.
-    path = path.lstrip("/")
-
-    if not path:
-        return None
-
-    return f"{host}{port}/{path}"
-
-
 # ── Normalized event validation (issue #495) ─────────────────────────────────
 #
 # The validation boundary distinguishes valid v1 lifecycle observations from
@@ -354,7 +281,8 @@ def validate_normalized_event(message: NormalizedProviderEvent) -> None:
 
     * **Unsupported schema version** — ``schema_version`` is not ``"1.0"``.
     * **Invalid repository identity** — the repository URL cannot be
-      normalized to a valid identity.
+      normalized to a valid identity (nested shape), or the owner/repo
+      string fails basic structural validation (flat shape).
     * **Reference mismatch** — the ``redacted_payload`` provider or
       delivery_id does not equal the envelope's provider or delivery_id.
 
@@ -368,16 +296,33 @@ def validate_normalized_event(message: NormalizedProviderEvent) -> None:
         )
 
     # ── Repository identity ─────────────────────────────────────────
-    # Only validate repository identity for the nested v1 shape (where
-    # the repository is always a URL).  The flat shape uses plain
-    # owner/repo strings that are not URLs.
     repo = message.effective_repository
     if message.resource is not None:
+        # Nested v1 shape: repository is always an absolute HTTP(S) URL.
         normalized = normalize_repository_url(repo)
         if normalized is None:
             raise NormalizedEventValidationError(
                 f"Invalid repository identity: {repo!r} — "
                 f"must be an absolute HTTP(S) URL with a valid hostname and path"
+            )
+    else:
+        # Flat shape: repository is a plain owner/repo string.
+        # Validate basic structural integrity.
+        if not repo or not isinstance(repo, str):
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be a non-empty string"
+            )
+        repo = repo.strip()
+        if not repo:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be a non-empty string"
+            )
+        if ".." in repo:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must not contain path traversal sequences"
             )
 
     # ── Reference mismatch (nested redacted_payload only) ───────────

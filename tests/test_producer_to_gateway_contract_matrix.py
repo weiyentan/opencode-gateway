@@ -29,12 +29,12 @@ from app.consumer.afk_consumer import (
     NormalizedProviderEvent,
     map_normalized_event,
     map_provider_event,
-    normalize_repository_url,
     validate_normalized_event,
 )
 from app.core.reporting_aggregates import (
     resource_identity_from_payload,
 )
+from app.core.repository import normalize_repository_url
 
 UTC = timezone.utc
 
@@ -285,12 +285,50 @@ def test_every_fixture_round_trips_through_serializer(
     """
     fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
     message = NormalizedProviderEvent.model_validate(fixture)
-    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=True))
+    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=False))
     assert re_serialized == fixture, (
         f"Fixture {resource_type}.{action} does not round-trip through the "
         f"real serializer — the fixture may be hand-crafted rather than "
         f"serializer-generated."
     )
+
+
+def test_nested_v1_envelope_passes_validation_and_maps_correctly() -> None:
+    """A nested v1 envelope fixture passes validation, resolves effective
+    properties, and maps through the full consumer pipeline without DLQ.
+    """
+    fixture_path = _FIXTURES_DIR / "issue.opened.nested.json"
+    assert fixture_path.exists(), f"Missing nested fixture: {fixture_path}"
+
+    with open(fixture_path) as f:
+        raw = _json_mod.load(f)
+
+    message = NormalizedProviderEvent.model_validate(raw)
+
+    # ── Effective properties resolve from nested objects ────────────
+    assert message.effective_resource_type == "issue"
+    assert message.effective_resource_id == "999"
+    assert message.effective_repository == "https://github.com/owner/repo"
+    assert message.effective_action == "opened"
+    assert message.effective_payload_ref == "redacted-payload-ref-999"
+
+    # ── Top-level fields are empty (delegated to nested) ────────────
+    assert message.resource_type == ""
+    assert message.resource_id == ""
+    assert message.repository == ""
+    assert message.action == ""
+
+    # ── Validation passes (exercises the nested-shape URL path) ─────
+    validate_normalized_event(message)  # must not raise
+
+    # ── Mapping produces a valid entity + event ─────────────────────
+    result = map_provider_event(message)
+    assert result is not None
+    entity, event = result
+    assert entity.entity_type == EntityType.issue
+    assert entity.external_id == "999"
+    assert entity.repository == "https://github.com/owner/repo"
+    assert event.event_type == "opened"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

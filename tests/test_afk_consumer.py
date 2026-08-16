@@ -47,12 +47,12 @@ from app.consumer.afk_consumer import (
     is_dlq_expired,
     map_normalized_event,
     map_provider_event,
-    normalize_repository_url,
     run_dlq_sweep,
     sweep_dlq,
     validate_normalized_event,
 )
 from app.core.metrics import MetricsRegistry
+from app.core.repository import normalize_repository_url
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"

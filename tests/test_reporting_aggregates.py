@@ -35,9 +35,9 @@ from app.core.reporting_aggregates import (
     enrich_aggregate,
     forward_merge,
     is_newer,
-    normalize_repository_url,
     resource_identity_from_payload,
 )
+from app.core.repository import normalize_repository_url
 from tests.conftest import mock_row
 
 UTC = timezone.utc
