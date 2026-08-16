@@ -407,7 +407,6 @@ provisioned collector token that also matches `GATEWAY_API_KEY`.
 The `GATEWAY_OPERATOR_TOKEN` environment variable. A dedicated operator
 bearer token, DISTINCT from the Admin API Key (`GATEWAY_API_KEY`) and from
 per-client Collector Credentials, that gates operator-only read surfaces
-<<<<<<< HEAD
 (delivery payload, DLQ) via the `require_operator_token` dependency. It is
 transported in the dedicated `X-Operator-Token` header on operator-only read
 requests — never `Authorization`, which carries the Admin API Key — so the
