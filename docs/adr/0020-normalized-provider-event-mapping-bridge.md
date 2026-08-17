@@ -25,7 +25,10 @@ outcome-layer vocabulary.
 normalized-event contract; the consumer-authored flat ``ProviderEventMessage``
 shape and its legacy ten-type mapping have been removed (issue #497).  The
 mapping bridge vocabulary (``pull_request``/``merge_request`` → ``change_request``)
-remains the canonical outcome-layer vocabulary.*
+remains the canonical outcome-layer vocabulary.  Issue #503 added a verifiable
+pin to the producer-owned artifacts (``producer_commit.txt``,
+``checksums.sha256``, ``consumer-policy.yaml``) with a deterministic parity
+mechanism (``scripts/verify_contract_checksums.sh``) enforced in CI.*
 
 ## Context
 

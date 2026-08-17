@@ -1,10 +1,10 @@
 # Producer→Consumer Contract Validation
 
-**Issues**: #485 (contract pinning + replay convergence), #495 (nested v1 envelope validation)
+**Issues**: #485 (contract pinning + replay convergence), #495 (nested v1 envelope validation), #503 (producer provenance and drift detection)
 **Parent**: PRD #478 — PR/MR/Issue Ingestion and Reporting Capability (cross-repository)
 **Slice layer**: validation (builds on #482's mapping bridge + DLQ path)
 **Validator**: `code-editor-senior` (T3)
-**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497)
+**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497, #503)
 **Verdict**: **PASS** — the pinned producer contract maps cleanly through
 `map_provider_event` to the canonical outcome-layer vocabulary without DLQ
 routing; re-delivery of the same `provider + delivery_id` converges on
@@ -375,10 +375,22 @@ the nested objects (the flat shape no longer exists):
   action/repository/reference violations), `normalize_repository_url()`,
   `NormalizedEventValidationError`.  `map_normalized_event()` persists the
   normalized repository URL and the payload reference object; the flat shape
-  has been removed (#497).
+  has been removed (#497).  Consumer-policy annotations added (#503).
 - `docs/contracts/normalized-event-v1/schema.json` + `fixtures/` — the pinned
   producer contract artifacts (14 real `(resource.type, action)` pairs).
+- `docs/contracts/normalized-event-v1/producer_commit.txt` — provenance record
+  of the producer commit the artifacts were copied from (#503).
+- `docs/contracts/normalized-event-v1/checksums.sha256` — SHA-256 digests of
+  every pinned artifact for drift detection (#503).
+- `docs/contracts/normalized-event-v1/consumer-policy.yaml` — separates
+  producer-owned schema constraints from consumer policy (#503).
+- `scripts/verify_contract_checksums.sh` — standalone parity verifier script
+  that recomputes digests and compares against `checksums.sha256` (#503).
 - `tests/test_afk_consumer.py` — nested v1 envelope tests, validation tests,
   repository URL normalization tests, DLQ reason tests, contract pinning tests.
+- `tests/test_producer_to_gateway_contract_matrix.py` — checksum-based drift
+  detection tests (`test_contract_checksums_match_pinned_digests`,
+  `test_verify_contract_checksums_script_clean_tree`,
+  `test_verify_contract_checksums_script_detects_drift`) (#503).
 - `docs/afk-outcome-contract-validation.md` — this report (updated for #495,
-  #497).
+  #497, #503).
