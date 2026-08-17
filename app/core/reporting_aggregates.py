@@ -136,7 +136,7 @@ def resource_identity_from_payload(
     if not repository_url:
         return None
 
-    resource_type = resource.get("resource_type")
+    resource_type = resource.get("type")
     if not isinstance(resource_type, str) or not resource_type.strip():
         return None
     resource_type = resource_type.strip()
@@ -146,7 +146,7 @@ def resource_identity_from_payload(
     if canonical_type is None:
         return None
 
-    resource_number = resource.get("resource_number")
+    resource_number = resource.get("number")
     if resource_number is None or isinstance(resource_number, bool):
         return None
     if isinstance(resource_number, int):

@@ -107,129 +107,128 @@ METRIC_LAG = "afk_consumer.lag"
 
 # ── Canonical event type vocabulary ──────────────────────────────────────────
 #
-# The locked set of canonical event types the outcome layer recognises.
-# ``map_normalized_event`` validates its bridged ``event_type`` against this
-# vocabulary; an unknown resource type or action that does not resolve to a
-# canonical event type returns ``None`` (unmappable → DLQ, never persisted).
+# The locked set of canonical event types the outcome layer recognises,
+# derived from the producer's lifecycle allowlist (fast-api-eda-gateway
+# ``normalized_event.LIFECYCLE_ALLOWLIST``).  GitHub ``edited`` and GitLab
+# ``updated`` are the same lifecycle step and both converge on the canonical
+# ``updated`` event type; the producer-native source action is retained as
+# provenance in the event payload so every valid producer action is
+# persisted.  The fabricated review/pipeline vocabulary of the previous
+# flat-shape bridge is gone: only the producer's real allowlisted actions
+# exist here.
 
 _CANONICAL_EVENT_TYPES = frozenset(
     {
         "issue.opened",
-        "issue.closed",
-        "issue.edited",
         "issue.updated",
         "issue.reopened",
+        "issue.closed",
         "change_request.opened",
-        "change_request.review_requested",
-        "change_request.changes_requested",
-        "change_request.approved",
-        "change_request.merged",
-        "change_request.closed",
-        "change_request.edited",
         "change_request.updated",
         "change_request.reopened",
-        "pipeline.failed",
-        "pipeline.succeeded",
+        "change_request.closed",
+        "change_request.merged",
     }
 )
+
+#: Producer-native action → canonical action mapping.  ``edited`` (GitHub)
+#: and ``updated`` (GitLab) are the same canonical lifecycle step.
+_ACTION_TO_CANONICAL: dict[str, str] = {
+    "opened": "opened",
+    "edited": "updated",
+    "updated": "updated",
+    "reopened": "reopened",
+    "closed": "closed",
+    "merged": "merged",
+}
+
+#: Producer lifecycle allowlist per resource type, pinned from
+#: fast-api-eda-gateway ``normalized_event.LIFECYCLE_ALLOWLIST``.  The
+#: producer emits nothing outside this vocabulary.
+_PRODUCER_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
+    "issue": frozenset({"opened", "edited", "reopened", "closed"}),
+    "pull_request": frozenset({"opened", "edited", "reopened", "closed", "merged"}),
+    "merge_request": frozenset({"opened", "updated", "reopened", "closed", "merged"}),
+}
 
 
 class _NormalizedResource(BaseModel):
     """The nested ``resource`` object in a v1 normalized event.
 
-    Carries the producer's native resource vocabulary (``pull_request`` /
-    ``merge_request`` / ``issue``) — never the outcome layer's canonical
-    ``change_request`` vocabulary.
+    Matches the producer's exact field names — ``type``,
+    ``repository_url``, ``number`` — and the producer's native resource
+    vocabulary (``pull_request`` / ``merge_request`` / ``issue``), never
+    the outcome layer's canonical ``change_request`` vocabulary.
     """
 
-    resource_type: str
-    resource_id: str
-    repository: str
-    action: str
+    type: str
+    repository_url: str
+    number: int | None = None
+
+
+class _RedactedPayloadReference(BaseModel):
+    """The ``redacted_payload.reference`` object of a v1 normalized event.
+
+    A *reference* to the redacted payload — never the payload itself —
+    keyed by ``(provider, delivery_id)`` exactly as the producer emits it.
+    """
+
+    provider: str
+    delivery_id: str
 
 
 class _RedactedPayload(BaseModel):
-    """The nested ``redacted_payload`` object in a v1 normalized event.
+    """The nested ``redacted_payload`` object in a v1 normalized event."""
 
-    ``reference`` is a *reference* to the redacted payload, never the
-    payload itself.  ``provider`` and ``delivery_id`` must equal the
-    envelope's ``provider`` and ``delivery_id`` (reference mismatch → DLQ).
-    """
-
-    reference: str | None = None
-    provider: str | None = None
-    delivery_id: str | None = None
+    reference: _RedactedPayloadReference
 
 
 class NormalizedProviderEvent(BaseModel):
     """One normalized provider event (fast-api-eda-gateway #97-#102).
 
-    The Stage-2 mapping bridge input: a schema-versioned, provider-agnostic
-    shape that carries the provider's native ``pull_request`` / ``merge_request``
-    / ``issue`` ``resource_type`` — never the outcome layer's canonical
-    ``change_request`` vocabulary.  ``resource_id`` is the stable
-    provider-scoped resource identity (the value behind ``entity_id``);
-    ``payload_ref`` is a *reference* to the redacted payload, never the
-    payload itself; ``ingested_at`` is the producer's ingest timestamp.
-
-    The v1 nested envelope (issue #495) wraps resource fields in a
-    ``resource`` object and the payload reference in a ``redacted_payload``
-    object.  The flat shape (issue #482) is also accepted.
+    The Stage-2 mapping bridge input: the schema-versioned, provider-agnostic
+    shape the producer emits on ``afk.events``.  Resource fields live in the
+    nested ``resource`` object (``type`` / ``repository_url`` / ``number``);
+    the payload reference lives in ``redacted_payload.reference``.  Only this
+    nested v1 shape is accepted — the flat shape has been removed.
     """
 
     model_config = {"ser_json_exclude_none": True}
 
     schema_version: str
+    event_type: str
     provider: Provider
     delivery_id: str
-    resource_type: str = ""
-    resource_id: str = ""
-    repository: str = ""
-    action: str = ""
-    occurred_at: datetime
-    ingested_at: datetime | None = None
+    resource: _NormalizedResource
+    action: str
+    occurred_at: datetime | None = None
+    ingested_at: datetime
     actor: str | None = None
-    payload_ref: str | None = None
-    resource: _NormalizedResource | None = None
-    redacted_payload: _RedactedPayload | None = None
+    redacted_payload: _RedactedPayload
 
     @property
     def effective_resource_type(self) -> str:
-        """Return ``resource_type`` from the nested object when present."""
-        if self.resource is not None:
-            return self.resource.resource_type
-        return self.resource_type
+        """Return the producer-native resource type (``resource.type``)."""
+        return self.resource.type
 
     @property
     def effective_resource_id(self) -> str:
-        """Return ``resource_id`` from the nested object when present."""
-        if self.resource is not None:
-            return self.resource.resource_id
-        return self.resource_id
+        """Return the resource number as a string (``""`` when absent)."""
+        number = self.resource.number
+        return "" if number is None else str(number)
 
     @property
     def effective_repository(self) -> str:
-        """Return ``repository`` from the nested object when present."""
-        if self.resource is not None:
-            return self.resource.repository
-        return self.repository
+        """Return the raw producer repository URL (``resource.repository_url``)."""
+        return self.resource.repository_url
 
     @property
     def effective_action(self) -> str:
-        """Return ``action`` from the nested object when present."""
-        if self.resource is not None:
-            return self.resource.action
+        """Return the producer-native action."""
         return self.action
 
-    @property
-    def effective_payload_ref(self) -> str | None:
-        """Return ``payload_ref`` from the nested redacted_payload when present."""
-        if self.redacted_payload is not None:
-            return self.redacted_payload.reference
-        return self.payload_ref
 
-
-# ── Normalized resource-type → canonical entity-type bridge (issue #482) ────
+# ── Normalized resource-type → canonical entity-type bridge ──────────────────
 #
 # The producer's resource types are provider-specific: ``pull_request``
 # (GitHub) and ``merge_request`` (GitLab) are the *same* outcome-layer
@@ -243,21 +242,16 @@ _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
 }
 
 
-def _coerce_resource_number(resource_id: str) -> int | None:
-    """Return ``resource_id`` as an int when it is a plain number, else None."""
-    try:
-        return int(resource_id)
-    except (TypeError, ValueError):
-        return None
-
-
 # ── Normalized event validation (issue #495) ─────────────────────────────────
 #
-# The validation boundary distinguishes valid v1 lifecycle observations from
-# malformed data and unsupported versions before mapping or persistence.
+# The validation boundary distinguishes valid producer lifecycle observations
+# from malformed data and unsupported versions before mapping or persistence.
 # Each violation class produces a distinct DLQ reason string.
 
 _VALID_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
+
+#: The only event type the producer emits for normalized events.
+_VALID_EVENT_TYPE: str = "normalized"
 
 
 class NormalizedEventValidationError(ValueError):
@@ -280,64 +274,65 @@ def validate_normalized_event(message: NormalizedProviderEvent) -> None:
     for each violation class:
 
     * **Unsupported schema version** — ``schema_version`` is not ``"1.0"``.
-    * **Invalid repository identity** — the repository URL cannot be
-      normalized to a valid identity (nested shape), or the owner/repo
-      string fails basic structural validation (flat shape).
-    * **Reference mismatch** — the ``redacted_payload`` provider or
+    * **Unsupported event type** — ``event_type`` is not ``"normalized"``.
+    * **Unsupported resource type** — ``resource.type`` is outside the
+      producer lifecycle vocabulary.
+    * **Unsupported action** — ``action`` is outside the producer lifecycle
+      allowlist for ``resource.type``.
+    * **Invalid repository identity** — ``resource.repository_url`` cannot
+      be normalized to a valid identity.
+    * **Reference mismatch** — ``redacted_payload.reference`` provider or
       delivery_id does not equal the envelope's provider or delivery_id.
 
     The caller routes the message to the DLQ with the reason string.
     """
-    # ── Schema version ──────────────────────────────────────────────
+    # ── Schema version / event type ─────────────────────────────────
     if message.schema_version not in _VALID_SCHEMA_VERSIONS:
         raise NormalizedEventValidationError(
             f"Unsupported schema version: {message.schema_version!r} "
             f"(supported: {sorted(_VALID_SCHEMA_VERSIONS)})"
         )
+    if message.event_type != _VALID_EVENT_TYPE:
+        raise NormalizedEventValidationError(
+            f"Unsupported event type: {message.event_type!r} "
+            f"(supported: {_VALID_EVENT_TYPE!r})"
+        )
+
+    # ── Resource type / action allowlist ────────────────────────────
+    resource_type = message.resource.type
+    if resource_type not in _RESOURCE_TYPE_TO_ENTITY_TYPE:
+        raise NormalizedEventValidationError(
+            f"Unsupported resource type: {resource_type!r} "
+            f"(supported: {sorted(_RESOURCE_TYPE_TO_ENTITY_TYPE)})"
+        )
+    allowed_actions = _PRODUCER_ALLOWED_ACTIONS[resource_type]
+    if message.action not in allowed_actions:
+        raise NormalizedEventValidationError(
+            f"Unsupported action: {message.action!r} for resource type "
+            f"{resource_type!r} (supported: {sorted(allowed_actions)})"
+        )
 
     # ── Repository identity ─────────────────────────────────────────
-    repo = message.effective_repository
-    if message.resource is not None:
-        # Nested v1 shape: repository is always an absolute HTTP(S) URL.
-        normalized = normalize_repository_url(repo)
-        if normalized is None:
-            raise NormalizedEventValidationError(
-                f"Invalid repository identity: {repo!r} — "
-                f"must be an absolute HTTP(S) URL with a valid hostname and path"
-            )
-    else:
-        # Flat shape: repository is a plain owner/repo string.
-        # Validate basic structural integrity.
-        if not repo or not isinstance(repo, str):
-            raise NormalizedEventValidationError(
-                f"Invalid repository identity: {repo!r} — "
-                f"must be a non-empty string"
-            )
-        repo = repo.strip()
-        if not repo:
-            raise NormalizedEventValidationError(
-                f"Invalid repository identity: {repo!r} — "
-                f"must be a non-empty string"
-            )
-        if ".." in repo:
-            raise NormalizedEventValidationError(
-                f"Invalid repository identity: {repo!r} — "
-                f"must not contain path traversal sequences"
-            )
+    repo = message.resource.repository_url
+    normalized = normalize_repository_url(repo)
+    if normalized is None:
+        raise NormalizedEventValidationError(
+            f"Invalid repository identity: {repo!r} — "
+            f"must be an absolute HTTP(S) URL with a valid hostname and path"
+        )
 
-    # ── Reference mismatch (nested redacted_payload only) ───────────
-    if message.redacted_payload is not None:
-        rp = message.redacted_payload
-        if rp.provider is not None and rp.provider != message.provider.value:
-            raise NormalizedEventValidationError(
-                f"Reference mismatch: redacted_payload.provider={rp.provider!r} "
-                f"!= envelope.provider={message.provider.value!r}"
-            )
-        if rp.delivery_id is not None and rp.delivery_id != message.delivery_id:
-            raise NormalizedEventValidationError(
-                f"Reference mismatch: redacted_payload.delivery_id={rp.delivery_id!r} "
-                f"!= envelope.delivery_id={message.delivery_id!r}"
-            )
+    # ── Reference equality with the envelope ────────────────────────
+    ref = message.redacted_payload.reference
+    if ref.provider != message.provider.value:
+        raise NormalizedEventValidationError(
+            f"Reference mismatch: redacted_payload.reference.provider="
+            f"{ref.provider!r} != envelope.provider={message.provider.value!r}"
+        )
+    if ref.delivery_id != message.delivery_id:
+        raise NormalizedEventValidationError(
+            f"Reference mismatch: redacted_payload.reference.delivery_id="
+            f"{ref.delivery_id!r} != envelope.delivery_id={message.delivery_id!r}"
+        )
 
 
 def map_normalized_event(
@@ -345,54 +340,59 @@ def map_normalized_event(
 ) -> tuple[EngineeringEntity, EngineeringEvent] | None:
     """Bridge a normalized event into the outcome layer's canonical vocabulary.
 
-    ``resource_type`` selects the canonical entity type; ``action`` becomes
-    the canonical event-type suffix.  The resulting ``event_type`` is then
-    validated against the locked canonical vocabulary: a resource type or
-    action that does not produce a canonical event type returns ``None`` (the
-    caller routes it to the DLQ as unmappable — never persisted, never
-    conflated with the legacy types).
+    ``resource.type`` selects the canonical entity type (``issue`` →
+    ``issue``; ``pull_request`` / ``merge_request`` → ``change_request``);
+    the producer-native ``action`` maps to the canonical event-type suffix
+    (``edited``/``updated`` → ``updated``).  The source resource type and
+    action are retained as provenance in the event payload, so every valid
+    producer action is persisted even when several converge on one canonical
+    event type.  The *normalized* repository identity is persisted on the
+    entity (deterministic tuple scoping in the repository layer); the short
+    ``entity_id`` (``"issue:437"``) is kept as the public-facing value.
 
-    Producer ``edited`` and ``updated`` actions both converge on the canonical
-    ``updated`` event type, with the source action retained as provenance in
-    the event payload.  Producer ``reopened`` maps directly to canonical
-    ``reopened``.  Source ``resource_type`` (e.g. ``pull_request`` vs
-    ``merge_request``) is also retained as provenance.
-
-    Returns ``None`` when ``resource_type`` is unknown or ``action`` does not
-    resolve to a locked canonical event type.
+    Returns ``None`` only as defense-in-depth for a resource type or action
+    outside the locked vocabulary — :func:`validate_normalized_event`
+    already rejects those with a distinct DLQ reason.
     """
-    resource_type = message.effective_resource_type
-    resource_id = message.effective_resource_id
-    repository = message.effective_repository
-    action = message.effective_action
-    payload_ref = message.effective_payload_ref
-
-    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource_type)
+    resource = message.resource
+    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource.type)
     if entity_type is None:
         return None
-    event_type = f"{entity_type.value}.{action}"
+    canonical_action = _ACTION_TO_CANONICAL.get(message.action)
+    if canonical_action is None:
+        return None
+    event_type = f"{entity_type.value}.{canonical_action}"
     if event_type not in _CANONICAL_EVENT_TYPES:
         return None
-    entity_id = f"{entity_type.value}:{resource_id}"
+
+    repository = normalize_repository_url(resource.repository_url)
+    if repository is None:
+        return None
+    number = resource.number
+    entity_id = f"{entity_type.value}:{'' if number is None else number}"
     entity = EngineeringEntity(
         entity_id=entity_id,
         entity_type=entity_type,
         provider=message.provider,
         repository=repository,
-        number=_coerce_resource_number(resource_id),
+        number=number,
     )
-    payload: dict[str, Any] = {}
-    if payload_ref is not None:
-        payload["payload_ref"] = payload_ref
-    # Retain source resource_type and action as provenance metadata.
-    payload["source_resource_type"] = resource_type
-    payload["source_action"] = action
+    payload: dict[str, Any] = {
+        # The redacted payload *reference* — never payload content.
+        "payload_ref": {
+            "provider": message.redacted_payload.reference.provider,
+            "delivery_id": message.redacted_payload.reference.delivery_id,
+        },
+        # Retain source resource type and action as provenance metadata.
+        "source_resource_type": resource.type,
+        "source_action": message.action,
+    }
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{action}",
+        event_id=f"{entity_id}:{canonical_action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
-        occurred_at=message.occurred_at,
+        occurred_at=message.occurred_at or message.ingested_at,
         actor=message.actor,
         payload=payload,
     )

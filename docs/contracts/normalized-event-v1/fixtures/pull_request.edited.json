@@ -2,20 +2,20 @@
   "schema_version": "1.0",
   "event_type": "normalized",
   "provider": "github",
-  "delivery_id": "00000000-0000-0000-0000-000000000004",
+  "delivery_id": "00000000-0000-0000-0000-000000000006",
   "resource": {
-    "type": "issue",
+    "type": "pull_request",
     "repository_url": "https://github.com/owner/repo",
-    "number": 104
+    "number": 106
   },
-  "action": "closed",
+  "action": "edited",
   "occurred_at": "2026-08-15T10:00:00Z",
   "ingested_at": "2026-08-15T10:00:01Z",
   "actor": "test-user",
   "redacted_payload": {
     "reference": {
       "provider": "github",
-      "delivery_id": "00000000-0000-0000-0000-000000000004"
+      "delivery_id": "00000000-0000-0000-0000-000000000006"
     }
   }
 }
