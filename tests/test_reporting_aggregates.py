@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import itertools
 import json
-from datetime import datetime, timezone
+import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -39,8 +40,6 @@ from app.core.reporting_aggregates import (
 )
 from app.core.repository import normalize_repository_url
 from tests.conftest import mock_row
-
-UTC = timezone.utc
 
 _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)
 _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
@@ -96,8 +95,8 @@ def test_identity_extracts_and_normalizes_resource() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/Acme/Backend/",
-                "resource_type": "issue",
-                "resource_number": 42,
+                "type": "issue",
+                "number": 42,
             }
         },
         provider="github",
@@ -118,8 +117,8 @@ def test_identity_maps_pull_request_to_change_request() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/acme/backend",
-                "resource_type": "pull_request",
-                "resource_number": "42",
+                "type": "pull_request",
+                "number": "42",
             }
         },
         provider="github",
@@ -133,8 +132,8 @@ def test_identity_maps_merge_request_to_change_request() -> None:
         {
             "resource": {
                 "repository_url": "https://gitlab.com/acme/frontend",
-                "resource_type": "merge_request",
-                "resource_number": "7",
+                "type": "merge_request",
+                "number": "7",
             }
         },
         provider="gitlab",
@@ -148,8 +147,8 @@ def test_identity_keeps_issue_unchanged() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/acme/backend",
-                "resource_type": "issue",
-                "resource_number": "1",
+                "type": "issue",
+                "number": "1",
             }
         },
         provider="github",
@@ -164,8 +163,8 @@ def test_identity_returns_none_for_unknown_resource_type() -> None:
             {
                 "resource": {
                     "repository_url": "https://github.com/acme/backend",
-                    "resource_type": "unknown_type",
-                    "resource_number": "42",
+                    "type": "unknown_type",
+                    "number": "42",
                 }
             },
             provider="github",
@@ -185,7 +184,7 @@ def test_identity_returns_none_when_resource_malformed() -> None:
     # missing repository_url
     assert (
         resource_identity_from_payload(
-            {"resource": {"resource_type": "issue", "resource_number": "42"}},
+            {"resource": {"type": "issue", "number": "42"}},
             provider="github",
         )
         is None
@@ -193,7 +192,7 @@ def test_identity_returns_none_when_resource_malformed() -> None:
     # empty repository_url after normalization
     assert (
         resource_identity_from_payload(
-            {"resource": {"repository_url": "///", "resource_type": "issue", "resource_number": "42"}},
+            {"resource": {"repository_url": "///", "type": "issue", "number": "42"}},
             provider="github",
         )
         is None
@@ -485,7 +484,11 @@ async def test_enrich_emits_lock_before_read(mock_conn: AsyncMock) -> None:
     mock_conn.fetchrow = AsyncMock(side_effect=_recorded_fetchrow)
     mock_conn.execute = AsyncMock(side_effect=_recorded_execute)
 
-    await enrich_aggregate(mock_conn, _identity(), _delivery(delivery_id="d1", occurred_at=_T1, payload={"a": 1}))
+    await enrich_aggregate(
+        mock_conn,
+        _identity(),
+        _delivery(delivery_id="d1", occurred_at=_T1, payload={"a": 1}),
+    )
 
     lock_sql = mock_conn.fetchval.call_args.args[0]
     assert "pg_advisory_xact_lock" in lock_sql
@@ -734,7 +737,6 @@ async def test_none_key_counterexample_converges_across_all_arrival_orders() -> 
 async def test_duplicate_delivery_skips_enrichment(mock_conn: AsyncMock) -> None:
     """A redelivery (no fresh reporting_deliveries row) never enriches."""
     from tests.conftest import create_client
-    import uuid
 
     def _auth_row():
         return mock_row(
@@ -763,8 +765,8 @@ async def test_duplicate_delivery_skips_enrichment(mock_conn: AsyncMock) -> None
                 "payload": {
                     "resource": {
                         "repository_url": "https://github.com/acme/backend",
-                        "resource_type": "issue",
-                        "resource_number": "42",
+                        "type": "issue",
+                        "number": "42",
                     },
                     "status": "open",
                 },

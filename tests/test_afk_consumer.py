@@ -1,6 +1,6 @@
 """Tests for the live AFK outcome consumer (``app.consumer.afk_consumer``).
 
-Covers the message-type → canonical-event mapping (all ten locked types),
+Covers the message-type → canonical-event mapping (all nine locked types),
 the single-transaction write path with offset-commit-after-transaction
 ordering, poison-message DLQ handling, DB-error backoff with DLQ + commit
 on exhaustion, consumer-group separation, and the scheduled reconciliation
@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -54,7 +55,6 @@ from app.consumer.afk_consumer import (
 from app.core.metrics import MetricsRegistry
 from app.core.repository import normalize_repository_url
 
-UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"
 
 
@@ -221,19 +221,40 @@ def _mk_msg(
 
 
 def _valid_payload(**overrides: object) -> dict:
+    """A contract-conforming nested v1 normalized event.
+
+    ``resource`` carries the producer's exact field names (``type`` /
+    ``repository_url`` / ``number``); ``redacted_payload`` carries the
+    payload *reference* object.  Unless the caller overrides
+    ``redacted_payload`` explicitly, the reference is kept in lockstep with
+    the envelope's provider/delivery_id (mirrors the producer).
+    """
     payload = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": DELIVERY_ID,
-        "resource_type": "pull_request",
-        "resource_id": "442",
-        "repository": "owner/repo",
+        "resource": {
+            "type": "pull_request",
+            "repository_url": "https://github.com/owner/repo",
+            "number": 442,
+        },
         "action": "merged",
         "occurred_at": "2026-08-01T10:30:00Z",
+        "ingested_at": "2026-08-01T10:31:00Z",
         "actor": "carol",
-        "payload_ref": "redacted-payload-ref-442",
+        "redacted_payload": {
+            "reference": {"provider": "github", "delivery_id": DELIVERY_ID}
+        },
     }
     payload.update(overrides)
+    if "redacted_payload" not in overrides:
+        payload["redacted_payload"] = {
+            "reference": {
+                "provider": payload["provider"],
+                "delivery_id": payload["delivery_id"],
+            }
+        }
     return payload
 
 
@@ -266,18 +287,17 @@ def _make_consumer(
 # ── Message-type → canonical-event mapping ───────────────────────────────────
 
 
-def test_canonical_event_types_is_the_locked_ten() -> None:
+def test_canonical_event_types_is_the_locked_nine() -> None:
     assert _CANONICAL_EVENT_TYPES == {
         "issue.opened",
+        "issue.updated",
+        "issue.reopened",
         "issue.closed",
         "change_request.opened",
-        "change_request.review_requested",
-        "change_request.changes_requested",
-        "change_request.approved",
-        "change_request.merged",
+        "change_request.updated",
+        "change_request.reopened",
         "change_request.closed",
-        "pipeline.failed",
-        "pipeline.succeeded",
+        "change_request.merged",
     }
 
 
@@ -317,7 +337,7 @@ async def test_valid_message_persists_and_commits_after_transaction() -> None:
         c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
     )
     assert event_call.args[1] == "github"  # provider
-    assert event_call.args[2] == "owner/repo"  # repository
+    assert event_call.args[2] == "github.com/owner/repo"  # normalized repository identity
     assert event_call.args[3] == "change_request"  # entity_type
     assert event_call.args[4] == "442"  # external_id
     assert event_call.args[5] == "change_request.merged"  # event_type
@@ -374,7 +394,7 @@ async def test_invalid_shape_sends_to_dlq_and_commits() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unmappable_type_sends_to_dlq_and_commits() -> None:
+async def test_unsupported_action_sends_to_dlq_and_commits() -> None:
     conn = _FakeConn([])
     consumer = _make_consumer(pool=_FakePool(conn))
     consumer._consumer = AsyncMock()
@@ -385,12 +405,13 @@ async def test_unmappable_type_sends_to_dlq_and_commits() -> None:
     msg = _mk_msg(_valid_payload(action="assigned"))
     await consumer._process_message(msg)
 
-    conn.execute.assert_not_called()  # unmappable → no DB write
+    conn.execute.assert_not_called()  # unsupported action → no DB write
     consumer._producer.send_and_wait.assert_called_once()
     consumer._consumer.commit.assert_called_once()
 
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
-    assert "Unmappable message type" in dlq_payload["reason"]
+    assert "Unsupported action" in dlq_payload["reason"]
+    assert "assigned" in dlq_payload["reason"]
 
 
 # ── DB error → backoff, DLQ + commit on exhaustion ───────────────────────────
@@ -596,7 +617,7 @@ async def test_db_failure_dlq_failure_does_not_commit() -> None:
         lambda: _mk_msg({"not": "valid"}),
             lambda: _mk_msg(_valid_payload(action="assigned")),
     ],
-    ids=["invalid-json", "invalid-shape", "unmappable-type"],
+    ids=["invalid-json", "invalid-shape", "unsupported-action"],
 )
 async def test_poison_message_dlq_failure_does_not_commit(make_msg) -> None:
     """A poison message whose DLQ publish fails must not be committed away."""
@@ -1257,38 +1278,63 @@ def test_import_from_afk_consumer_module() -> None:
 
 
 def _normalized_payload(**overrides: object) -> dict:
-    payload = {
+    """A nested v1 normalized event for the Stage-2 bridge tests.
+
+    Legacy-style overrides (``resource_type`` / ``resource_id`` /
+    ``repository``) are translated into the nested ``resource`` object so
+    tests express intent in the producer vocabulary without repeating the
+    envelope.  The payload reference is kept in lockstep with the envelope
+    unless ``redacted_payload`` is overridden explicitly.
+    """
+    resource_type = overrides.pop("resource_type", "pull_request")
+    resource_id = overrides.pop("resource_id", "442")
+    repository = overrides.pop("repository", "https://github.com/owner/repo")
+    payload: dict[str, object] = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": DELIVERY_ID,
-        "resource_type": "pull_request",
-        "resource_id": "442",
-        "repository": "owner/repo",
+        "resource": {
+            "type": resource_type,
+            "repository_url": repository,
+            "number": int(resource_id) if str(resource_id).isdigit() else resource_id,
+        },
         "action": "merged",
         "occurred_at": "2026-08-01T10:30:00Z",
         "ingested_at": "2026-08-01T10:31:00Z",
         "actor": "carol",
-        "payload_ref": "redacted-payload-ref-123",
+        "redacted_payload": {
+            "reference": {"provider": "github", "delivery_id": DELIVERY_ID}
+        },
     }
     payload.update(overrides)
+    if "redacted_payload" not in overrides:
+        payload["redacted_payload"] = {
+            "reference": {
+                "provider": payload["provider"],
+                "delivery_id": payload["delivery_id"],
+            }
+        }
     return payload
 
 
 @pytest.mark.parametrize(
     ("resource_type", "action", "expected_entity_type", "expected_event_type"),
     [
-        ("pull_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
-        ("merge_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
-        ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
-        ("merge_request", "approved", EntityType.CHANGE_REQUEST, "change_request.approved"),
-        (
-            "merge_request",
-            "review_requested",
-            EntityType.CHANGE_REQUEST,
-            "change_request.review_requested",
-        ),
         ("issue", "opened", EntityType.ISSUE, "issue.opened"),
+        ("issue", "edited", EntityType.ISSUE, "issue.updated"),
+        ("issue", "reopened", EntityType.ISSUE, "issue.reopened"),
         ("issue", "closed", EntityType.ISSUE, "issue.closed"),
+        ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
+        ("pull_request", "edited", EntityType.CHANGE_REQUEST, "change_request.updated"),
+        ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "change_request.reopened"),
+        ("pull_request", "closed", EntityType.CHANGE_REQUEST, "change_request.closed"),
+        ("pull_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
+        ("merge_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
+        ("merge_request", "updated", EntityType.CHANGE_REQUEST, "change_request.updated"),
+        ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "change_request.reopened"),
+        ("merge_request", "closed", EntityType.CHANGE_REQUEST, "change_request.closed"),
+        ("merge_request", "merged", EntityType.CHANGE_REQUEST, "change_request.merged"),
     ],
 )
 def test_map_normalized_event_bridges_resource_type_to_canonical(
@@ -1327,7 +1373,10 @@ def test_map_normalized_event_carries_payload_ref() -> None:
     mapped = map_normalized_event(message)
     assert mapped is not None
     _entity, event = mapped
-    assert event.payload["payload_ref"] == "redacted-payload-ref-123"
+    assert event.payload["payload_ref"] == {
+        "provider": "github",
+        "delivery_id": DELIVERY_ID,
+    }
     # Source provenance is also retained.
     assert event.payload["source_resource_type"] == "pull_request"
     assert event.payload["source_action"] == "merged"
@@ -1369,8 +1418,9 @@ async def test_normalized_message_persists_as_canonical_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unmappable_normalized_action_routes_to_dlq() -> None:
-    """A normalized event with an unmappable action is poison → DLQ, no DB write."""
+async def test_unsupported_normalized_action_routes_to_dlq() -> None:
+    """A normalized event with an action outside the producer lifecycle
+    allowlist is poison → DLQ, no DB write."""
     conn = _FakeConn([])
     consumer = _make_consumer(pool=_FakePool(conn))
     consumer._consumer = AsyncMock()
@@ -1384,8 +1434,9 @@ async def test_unmappable_normalized_action_routes_to_dlq() -> None:
     consumer._producer.send_and_wait.assert_called_once()
     consumer._consumer.commit.assert_called_once()
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
-    assert "Unmappable message type" in dlq_payload["reason"]
-    assert "pull_request.assigned" in dlq_payload["reason"]
+    assert "Unsupported action" in dlq_payload["reason"]
+    assert "pull_request" in dlq_payload["reason"]
+    assert "assigned" in dlq_payload["reason"]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1402,14 +1453,11 @@ async def test_unmappable_normalized_action_routes_to_dlq() -> None:
 @pytest.mark.parametrize(
     ("resource_type", "action", "expected_entity_type", "expected_canonical_action"),
     [
-        # edited → updated convergence
+        # edited → updated convergence (GitHub real actions)
         ("pull_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
-        ("merge_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
         ("issue", "edited", EntityType.ISSUE, "updated"),
-        # updated → updated convergence
-        ("pull_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        # updated → updated convergence (GitLab real action)
         ("merge_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
-        ("issue", "updated", EntityType.ISSUE, "updated"),
         # reopened → reopened (direct)
         ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
         ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
@@ -1452,7 +1500,10 @@ def test_map_normalized_event_retains_source_provenance() -> None:
     assert event.payload.get("source_resource_type") == "pull_request"
     assert event.payload.get("source_action") == "edited"
     # payload_ref is still forwarded.
-    assert event.payload.get("payload_ref") == "redacted-payload-ref-123"
+    assert event.payload.get("payload_ref") == {
+        "provider": "github",
+        "delivery_id": DELIVERY_ID,
+    }
 
 
 def test_map_normalized_event_merge_request_provenance() -> None:
@@ -1496,8 +1547,9 @@ async def test_edited_action_persists_not_routed_to_dlq() -> None:
 
 
 @pytest.mark.asyncio
-async def test_updated_action_persists_not_routed_to_dlq() -> None:
-    """A normalized ``issue.updated`` persists — never routed to the DLQ."""
+async def test_issue_edited_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``issue.edited`` persists as canonical ``issue.updated`` —
+    never routed to the DLQ."""
     conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
     consumer = _make_consumer(pool=_FakePool(conn))
     consumer._consumer = AsyncMock()
@@ -1505,7 +1557,7 @@ async def test_updated_action_persists_not_routed_to_dlq() -> None:
     consumer._producer = AsyncMock()
 
     await consumer._process_message(
-        _mk_msg(_normalized_payload(resource_type="issue", action="updated"))
+        _mk_msg(_normalized_payload(resource_type="issue", action="edited"))
     )
 
     consumer._producer.send_and_wait.assert_not_called()
@@ -2185,21 +2237,30 @@ async def test_sweep_dlq_skips_corrupt_record_with_warning() -> None:
 # the DLQ with the original payload plus a reason (documented in
 # ``docs/afk-outcome-contract-validation.md``).
 
-# The pinned producer contract: provider, forwarded ``delivery_id``, stable
-# ``resource_id``, ``resource_type``, ``action``, ``occurred_at``,
-# ``ingested_at``, ``actor``, redacted ``payload_ref``, and ``schema_version``.
+# The pinned producer contract: provider, forwarded ``delivery_id``, the nested
+# ``resource`` object (``type`` / ``repository_url`` / ``number``), ``action``,
+# ``occurred_at``, ``ingested_at``, ``actor``, the ``redacted_payload``
+# reference object, and ``schema_version`` / ``event_type``.
 PRODUCER_CONTRACT_EVENT: dict[str, object] = {
     "schema_version": "1.0",
+    "event_type": "normalized",
     "provider": "github",
     "delivery_id": "22222222-3333-4444-5555-666666666666",
-    "resource_type": "pull_request",
-    "resource_id": "442",
-    "repository": "owner/repo",
+    "resource": {
+        "type": "pull_request",
+        "repository_url": "https://github.com/owner/repo",
+        "number": 442,
+    },
     "action": "merged",
     "occurred_at": "2026-08-13T10:10:29Z",
     "ingested_at": "2026-08-13T10:10:30Z",
     "actor": "carol",
-    "payload_ref": "redacted-payload-ref-442",
+    "redacted_payload": {
+        "reference": {
+            "provider": "github",
+            "delivery_id": "22222222-3333-4444-5555-666666666666",
+        }
+    },
 }
 
 
@@ -2212,16 +2273,15 @@ def test_producer_contract_event_has_exact_fields() -> None:
     """
     assert set(PRODUCER_CONTRACT_EVENT) == {
         "schema_version",
+        "event_type",
         "provider",
         "delivery_id",
-        "resource_type",
-        "resource_id",
-        "repository",
+        "resource",
         "action",
         "occurred_at",
         "ingested_at",
         "actor",
-        "payload_ref",
+        "redacted_payload",
     }
 
 
@@ -2242,7 +2302,7 @@ def test_producer_contract_maps_to_canonical_change_request() -> None:
     assert entity.entity_type is EntityType.CHANGE_REQUEST
     assert entity.entity_id == "change_request:442"
     assert entity.provider is Provider.GITHUB
-    assert entity.repository == "owner/repo"
+    assert entity.repository == "github.com/owner/repo"  # normalized URL identity
     assert entity.number == 442
 
     assert event.event_type == "change_request.merged"
@@ -2250,7 +2310,10 @@ def test_producer_contract_maps_to_canonical_change_request() -> None:
     assert event.provider is Provider.GITHUB
     assert event.occurred_at == datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
     assert event.actor == "carol"
-    assert event.payload["payload_ref"] == "redacted-payload-ref-442"
+    assert event.payload["payload_ref"] == {
+        "provider": "github",
+        "delivery_id": "22222222-3333-4444-5555-666666666666",
+    }
     assert event.payload["source_resource_type"] == "pull_request"
     assert event.payload["source_action"] == "merged"
 
@@ -2280,7 +2343,14 @@ async def test_producer_contract_event_is_not_routed_to_dlq() -> None:
 def test_producer_contract_gitlab_merge_request_maps_to_change_request() -> None:
     """The same contract holds cross-provider: GitLab ``merge_request`` → change_request."""
     message = NormalizedProviderEvent.model_validate(
-        {**PRODUCER_CONTRACT_EVENT, "provider": "gitlab", "resource_type": "merge_request"}
+        {
+            **PRODUCER_CONTRACT_EVENT,
+            "provider": "gitlab",
+            "resource": {
+                **PRODUCER_CONTRACT_EVENT["resource"],
+                "type": "merge_request",
+            },
+        }
     )
     mapped = map_provider_event(message)
 
@@ -2316,8 +2386,8 @@ async def test_contract_violation_routes_to_dlq_with_payload_and_reason() -> Non
     (topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert topic == "afk.events-dlq"
     assert dlq_payload["original_topic"] == "afk.events"
-    assert "Unmappable message type" in dlq_payload["reason"]
-    assert "pull_request.synchronize" in dlq_payload["reason"]
+    assert "Unsupported action" in dlq_payload["reason"]
+    assert "synchronize" in dlq_payload["reason"]
     assert dlq_payload["payload"] == violating  # original payload preserved verbatim
 
 
@@ -2355,11 +2425,15 @@ async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> N
 # 4. Prove that every allowed v1 (resource_type, action) pair is covered.
 
 
-import json as _json_mod
-from pathlib import Path as _Path
+_json_mod = json
 
 
-_CONTRACTS_DIR = _Path(__file__).resolve().parent.parent / "docs" / "contracts" / "normalized-event-v1"
+_CONTRACTS_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "docs"
+    / "contracts"
+    / "normalized-event-v1"
+)
 _SCHEMA_PATH = _CONTRACTS_DIR / "schema.json"
 _FIXTURES_DIR = _CONTRACTS_DIR / "fixtures"
 
@@ -2375,19 +2449,19 @@ def _load_fixture(filename: str) -> dict:
 # The complete set of allowed v1 (resource_type, action) pairs.
 _ALLOWED_PAIRS: set[tuple[str, str]] = {
     ("issue", "opened"),
+    ("issue", "edited"),
+    ("issue", "reopened"),
     ("issue", "closed"),
     ("pull_request", "opened"),
-    ("pull_request", "review_requested"),
-    ("pull_request", "changes_requested"),
-    ("pull_request", "approved"),
-    ("pull_request", "merged"),
+    ("pull_request", "edited"),
+    ("pull_request", "reopened"),
     ("pull_request", "closed"),
+    ("pull_request", "merged"),
     ("merge_request", "opened"),
-    ("merge_request", "review_requested"),
-    ("merge_request", "changes_requested"),
-    ("merge_request", "approved"),
-    ("merge_request", "merged"),
+    ("merge_request", "updated"),
+    ("merge_request", "reopened"),
     ("merge_request", "closed"),
+    ("merge_request", "merged"),
 }
 
 
@@ -2448,41 +2522,34 @@ def test_fixture_validates_against_published_schema(
     validate(instance=fixture, schema=schema)
 
 
-def test_all_fixtures_share_same_provider_and_delivery_id() -> None:
-    """Payload references in generated fixtures identify the same provider and
-    delivery_id as their containing envelope (acceptance criterion)."""
-    provider = None
-    delivery_id = None
+def test_every_fixture_payload_reference_matches_envelope() -> None:
+    """Every fixture's ``redacted_payload.reference`` object identifies the
+    same provider and delivery_id as its containing envelope."""
     for resource_type, action in sorted(_ALLOWED_PAIRS):
         fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
-        if provider is None:
-            provider = fixture["provider"]
-            delivery_id = fixture["delivery_id"]
-        else:
-            assert fixture["provider"] == provider, (
-                f"Fixture {resource_type}.{action} has provider={fixture['provider']!r}, "
-                f"expected {provider!r}"
-            )
-            assert fixture["delivery_id"] == delivery_id, (
-                f"Fixture {resource_type}.{action} has delivery_id={fixture['delivery_id']!r}, "
-                f"expected {delivery_id!r}"
-            )
+        reference = fixture["redacted_payload"]["reference"]
+        assert reference["provider"] == fixture["provider"], (
+            f"Fixture {resource_type}.{action} reference provider "
+            f"{reference['provider']!r} != envelope {fixture['provider']!r}"
+        )
+        assert reference["delivery_id"] == fixture["delivery_id"], (
+            f"Fixture {resource_type}.{action} reference delivery_id "
+            f"{reference['delivery_id']!r} != envelope {fixture['delivery_id']!r}"
+        )
 
 
-def test_fixture_payload_ref_matches_resource_id() -> None:
-    """Every fixture's payload_ref identifies the same resource as its
-    resource_id (the redacted payload reference is scoped to the resource)."""
+def test_fixture_payload_reference_is_object_not_payload() -> None:
+    """Every fixture's redacted payload is a *reference object*, never payload
+    content: it carries only the nested ``reference`` key, which itself
+    carries exactly ``(provider, delivery_id)``."""
     for resource_type, action in sorted(_ALLOWED_PAIRS):
         fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
-        resource_id = fixture["resource_id"]
-        payload_ref = fixture.get("payload_ref")
-        assert payload_ref is not None, (
-            f"Fixture {resource_type}.{action} has no payload_ref"
+        redacted = fixture["redacted_payload"]
+        assert set(redacted) == {"reference"}, (
+            f"Fixture {resource_type}.{action} redacted_payload must carry "
+            f"only the reference object, got keys {sorted(redacted)}"
         )
-        assert resource_id in payload_ref, (
-            f"Fixture {resource_type}.{action} payload_ref={payload_ref!r} "
-            f"does not reference resource_id={resource_id!r}"
-        )
+        assert set(redacted["reference"]) == {"provider", "delivery_id"}
 
 
 def test_contract_artifacts_contain_no_raw_webhook_payload_or_secrets() -> None:
@@ -2547,18 +2614,29 @@ def test_schema_declares_additional_properties_false() -> None:
 
 def test_schema_rejects_unknown_resource_type() -> None:
     """The schema rejects a resource_type not in the allowed enum."""
-    from jsonschema import validate, ValidationError
+    from jsonschema import ValidationError, validate
 
     schema = _load_schema()
     invalid = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "commit",
-        "resource_id": "abc123",
-        "repository": "owner/repo",
+        "resource": {
+            "type": "commit",
+            "repository_url": "https://github.com/owner/repo",
+            "number": 1,
+        },
         "action": "opened",
         "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "redacted_payload": {
+            "reference": {
+                "provider": "github",
+                "delivery_id": "00000000-0000-0000-0000-000000000001",
+            }
+        },
     }
     with pytest.raises(ValidationError):
         validate(instance=invalid, schema=schema)
@@ -2566,18 +2644,29 @@ def test_schema_rejects_unknown_resource_type() -> None:
 
 def test_schema_rejects_issue_with_invalid_action() -> None:
     """The schema rejects an issue with a non-issue action (e.g. merged)."""
-    from jsonschema import validate, ValidationError
+    from jsonschema import ValidationError, validate
 
     schema = _load_schema()
     invalid = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
+        "resource": {
+            "type": "issue",
+            "repository_url": "https://github.com/owner/repo",
+            "number": 100,
+        },
         "action": "merged",
         "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "redacted_payload": {
+            "reference": {
+                "provider": "github",
+                "delivery_id": "00000000-0000-0000-0000-000000000001",
+            }
+        },
     }
     with pytest.raises(ValidationError):
         validate(instance=invalid, schema=schema)
@@ -2585,18 +2674,29 @@ def test_schema_rejects_issue_with_invalid_action() -> None:
 
 def test_schema_rejects_unknown_field() -> None:
     """The schema rejects a message with an unknown field."""
-    from jsonschema import validate, ValidationError
+    from jsonschema import ValidationError, validate
 
     schema = _load_schema()
     invalid = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
+        "resource": {
+            "type": "issue",
+            "repository_url": "https://github.com/owner/repo",
+            "number": 100,
+        },
         "action": "opened",
         "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "redacted_payload": {
+            "reference": {
+                "provider": "github",
+                "delivery_id": "00000000-0000-0000-0000-000000000001",
+            }
+        },
         "extra_field": "should be rejected",
     }
     with pytest.raises(ValidationError):
@@ -2604,22 +2704,30 @@ def test_schema_rejects_unknown_field() -> None:
 
 
 def test_schema_accepts_null_optional_fields() -> None:
-    """The schema accepts null for optional fields (actor, ingested_at, payload_ref)."""
+    """The schema accepts null for optional fields (actor, occurred_at, resource.number)."""
     from jsonschema import validate
 
     schema = _load_schema()
     valid = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
+        "resource": {
+            "type": "issue",
+            "repository_url": "https://github.com/owner/repo",
+            "number": None,
+        },
         "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": None,
+        "occurred_at": None,
+        "ingested_at": "2026-08-15T10:00:01Z",
         "actor": None,
-        "payload_ref": None,
+        "redacted_payload": {
+            "reference": {
+                "provider": "github",
+                "delivery_id": "00000000-0000-0000-0000-000000000001",
+            }
+        },
     }
     validate(instance=valid, schema=schema)
 
@@ -2684,25 +2792,66 @@ def test_parse_cli(argv: list[str], expected: tuple[bool, list[str]]) -> None:
 
 
 def _nested_v1_payload(**overrides: object) -> dict:
-    """A v1 nested-envelope normalized event (resource + redacted_payload objects)."""
+    """A nested v1 envelope normalized event (producer resource + reference objects).
+
+    Legacy-style ``resource`` overrides (``resource_type`` / ``resource_id`` /
+    ``repository`` / ``action``) and ``redacted_payload`` overrides
+    (``reference`` / ``provider`` / ``delivery_id``) are translated into the
+    producer's exact nested field names, so validation tests express intent
+    without repeating the envelope.
+    """
+    resource_override = overrides.pop("resource", None)
+    redacted_override = overrides.pop("redacted_payload", None)
+    resource: dict[str, object] = {
+        "type": "pull_request",
+        "repository_url": "https://github.com/owner/repo",
+        "number": 200,
+    }
+    action: object = "merged"
+    if isinstance(resource_override, dict):
+        if "resource_type" in resource_override:
+            resource["type"] = resource_override["resource_type"]
+        if "resource_id" in resource_override:
+            resource["number"] = (
+                int(resource_override["resource_id"])
+                if str(resource_override["resource_id"]).isdigit()
+                else resource_override["resource_id"]
+            )
+        if "repository" in resource_override:
+            resource["repository_url"] = resource_override["repository"]
+        if "action" in resource_override:
+            action = resource_override["action"]
+    redacted: dict[str, object] = {
+        "reference": {
+            "provider": "github",
+            "delivery_id": "33333333-4444-5555-6666-777777777777",
+        }
+    }
+    if isinstance(redacted_override, dict):
+        if isinstance(redacted_override.get("reference"), dict):
+            # Producer shape: nested reference object.
+            reference = redacted_override["reference"]
+        else:
+            # Legacy shape: plain reference string + top-level fields.
+            reference = dict(redacted_override)
+            reference.pop("reference", None)
+        redacted["reference"] = {
+            "provider": reference.get("provider", "github"),
+            "delivery_id": reference.get(
+                "delivery_id", "33333333-4444-5555-6666-777777777777"
+            ),
+        }
     payload: dict[str, object] = {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": "33333333-4444-5555-6666-777777777777",
+        "resource": resource,
+        "action": action,
         "occurred_at": "2026-08-15T10:00:00Z",
         "ingested_at": "2026-08-15T10:00:01Z",
         "actor": "test-user",
-        "resource": {
-            "resource_type": "pull_request",
-            "resource_id": "200",
-            "repository": "https://github.com/owner/repo",
-            "action": "merged",
-        },
-        "redacted_payload": {
-            "reference": "redacted-payload-ref-200",
-            "provider": "github",
-            "delivery_id": "33333333-4444-5555-6666-777777777777",
-        },
+        "redacted_payload": redacted,
     }
     payload.update(overrides)  # type: ignore[arg-type]
     return payload
@@ -2714,28 +2863,28 @@ def test_nested_v1_envelope_parses_through_normalized_provider_event() -> None:
     message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
 
     assert message.schema_version == "1.0"
+    assert message.event_type == "normalized"
     assert message.provider is Provider.GITHUB
     assert message.delivery_id == "33333333-4444-5555-6666-777777777777"
-    assert message.resource is not None
-    assert message.resource.resource_type == "pull_request"
-    assert message.resource.resource_id == "200"
-    assert message.resource.repository == "https://github.com/owner/repo"
-    assert message.resource.action == "merged"
-    assert message.redacted_payload is not None
-    assert message.redacted_payload.reference == "redacted-payload-ref-200"
-    assert message.redacted_payload.provider == "github"
-    assert message.redacted_payload.delivery_id == "33333333-4444-5555-6666-777777777777"
+    assert message.resource.type == "pull_request"
+    assert message.resource.repository_url == "https://github.com/owner/repo"
+    assert message.resource.number == 200
+    assert message.action == "merged"
+    assert message.redacted_payload.reference.provider == "github"
+    assert (
+        message.redacted_payload.reference.delivery_id
+        == "33333333-4444-5555-6666-777777777777"
+    )
 
 
 def test_nested_v1_envelope_effective_properties() -> None:
-    """Effective properties resolve from the nested objects when present."""
+    """Effective properties resolve from the nested objects."""
     message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
 
     assert message.effective_resource_type == "pull_request"
     assert message.effective_resource_id == "200"
     assert message.effective_repository == "https://github.com/owner/repo"
     assert message.effective_action == "merged"
-    assert message.effective_payload_ref == "redacted-payload-ref-200"
 
 
 def test_nested_v1_envelope_maps_to_canonical() -> None:
@@ -2748,9 +2897,12 @@ def test_nested_v1_envelope_maps_to_canonical() -> None:
     entity, event = mapped
     assert entity.entity_type is EntityType.CHANGE_REQUEST
     assert entity.entity_id == "change_request:200"
-    assert entity.repository == "https://github.com/owner/repo"
+    assert entity.repository == "github.com/owner/repo"  # normalized URL identity
     assert event.event_type == "change_request.merged"
-    assert event.payload["payload_ref"] == "redacted-payload-ref-200"
+    assert event.payload["payload_ref"] == {
+        "provider": "github",
+        "delivery_id": "33333333-4444-5555-6666-777777777777",
+    }
     assert event.payload["source_resource_type"] == "pull_request"
     assert event.payload["source_action"] == "merged"
 
@@ -2786,13 +2938,14 @@ def test_validate_rejects_unknown_schema_version() -> None:
 
 
 def test_validate_rejects_provider_mismatch() -> None:
-    """redacted_payload.provider != envelope.provider → DLQ."""
+    """redacted_payload.reference.provider != envelope.provider → DLQ."""
     message = NormalizedProviderEvent.model_validate(
         _nested_v1_payload(
             redacted_payload={
-                "reference": "ref-200",
-                "provider": "gitlab",
-                "delivery_id": "33333333-4444-5555-6666-777777777777",
+                "reference": {
+                    "provider": "gitlab",
+                    "delivery_id": "33333333-4444-5555-6666-777777777777",
+                }
             }
         )
     )
@@ -2801,13 +2954,14 @@ def test_validate_rejects_provider_mismatch() -> None:
 
 
 def test_validate_rejects_delivery_id_mismatch() -> None:
-    """redacted_payload.delivery_id != envelope.delivery_id → DLQ."""
+    """redacted_payload.reference.delivery_id != envelope.delivery_id → DLQ."""
     message = NormalizedProviderEvent.model_validate(
         _nested_v1_payload(
             redacted_payload={
-                "reference": "ref-200",
-                "provider": "github",
-                "delivery_id": "wrong-delivery-id",
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "wrong-delivery-id",
+                }
             }
         )
     )
@@ -2815,18 +2969,13 @@ def test_validate_rejects_delivery_id_mismatch() -> None:
         validate_normalized_event(message)
 
 
-def test_validate_accepts_null_redacted_payload_fields() -> None:
-    """Null provider/delivery_id in redacted_payload are not checked (no mismatch)."""
+def test_validate_rejects_unsupported_event_type() -> None:
+    """An event_type other than ``normalized`` raises NormalizedEventValidationError."""
     message = NormalizedProviderEvent.model_validate(
-        _nested_v1_payload(
-            redacted_payload={
-                "reference": "ref-200",
-                "provider": None,
-                "delivery_id": None,
-            }
-        )
+        _nested_v1_payload(event_type="afk_batch")
     )
-    validate_normalized_event(message)  # does not raise
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported event type"):
+        validate_normalized_event(message)
 
 
 # ── Validation: repository identity ─────────────────────────────────────────
@@ -3091,7 +3240,7 @@ def test_pinned_schema_has_source_provenance() -> None:
     assert _SCHEMA_PATH.is_file(), f"Schema not found at {_SCHEMA_PATH}"
     schema = _load_schema()
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-    assert schema["title"] == "Normalized Provider Event v1"
+    assert schema["title"] == "Normalized Provider Event v1 (PINNED COPY)"
 
 
 def test_pinned_fixtures_cover_all_allowed_pairs() -> None:

@@ -1,18 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://fast-api-eda-gateway/contracts/normalized-event-v1/schema.json",
-  "title": "Normalized Provider Event v1",
-  "description": "The executable producer-owned contract for the normalized, schema-versioned event emitted by fast-api-eda-gateway on the afk.events topic. Every consumer validates incoming messages against this schema.",
+  "$id": "https://opencode-gateway/contracts/normalized-event-v1/schema.json",
+  "title": "Normalized Provider Event v1 (PINNED COPY)",
+  "description": "PINNED COPY of the producer-owned contract for the normalized, schema-versioned event emitted by fast-api-eda-gateway on the afk.events topic. This file is NOT a producer-owned source artifact: it is a consumer-side transcription pinned from the producer sources `src/fast_api_eda_gateway/normalized_event.py` (build_normalized_event, SCHEMA_VERSION='1.0', EVENT_TYPE='normalized', LIFECYCLE_ALLOWLIST) and `src/fast_api_eda_gateway/normalized_event_producer.py` (build_normalized_message outbound whitelist). Provenance: see docs/afk-outcome-contract-validation.md; refresh this copy when the producer's normalized_event.py / normalized_event_producer.py change. The outbound message places schema_version and event_type first, then the whitelisted fields provider, delivery_id, resource, action, occurred_at, ingested_at, actor, redacted_payload — and nothing else (the producer whitelist drops any other key).",
   "type": "object",
   "required": [
     "schema_version",
+    "event_type",
     "provider",
     "delivery_id",
-    "resource_type",
-    "resource_id",
-    "repository",
+    "resource",
     "action",
-    "occurred_at"
+    "occurred_at",
+    "ingested_at",
+    "actor",
+    "redacted_payload"
   ],
   "properties": {
     "schema_version": {
@@ -20,57 +22,82 @@
       "description": "Producer schema version — always \"1.0\" for v1 messages.",
       "const": "1.0"
     },
+    "event_type": {
+      "type": "string",
+      "description": "Producer event type distinguishing normalized events from AFK-batch/review messages on the shared transport — always \"normalized\".",
+      "const": "normalized"
+    },
     "provider": {
       "type": "string",
-      "description": "Source provider identity.",
+      "description": "Source provider identity (forge).",
       "enum": ["github", "gitlab"]
     },
     "delivery_id": {
       "type": "string",
-      "description": "Forwarded provider delivery UUID (X-GitHub-Delivery / X-GitLab-Event-UUID). The delivery_log dedup key on the consumer side."
+      "description": "Forwarded provider delivery UUID (X-GitHub-Delivery / X-GitLab-Event-UUID). Never null: anonymous deliveries are not produced. The consumer delivery_log dedup key."
     },
-    "resource_type": {
-      "type": "string",
-      "description": "Producer-native resource vocabulary: issue, pull_request (GitHub), or merge_request (GitLab). Never the outcome layer's canonical change_request.",
-      "enum": ["issue", "pull_request", "merge_request"]
-    },
-    "resource_id": {
-      "type": "string",
-      "description": "Stable provider-scoped resource identity — the value behind the canonical entity_id (e.g. \"442\" for change_request:442)."
-    },
-    "repository": {
-      "type": "string",
-      "description": "Full owner/repo (or group/project) name."
+    "resource": {
+      "type": "object",
+      "description": "The nested resource identity object: producer-native type, repository URL, and provider number.",
+      "required": ["type", "repository_url", "number"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Producer-native resource vocabulary: issue, pull_request (GitHub), or merge_request (GitLab). Never the outcome layer's canonical change_request.",
+          "enum": ["issue", "pull_request", "merge_request"]
+        },
+        "repository_url": {
+          "type": "string",
+          "description": "Absolute HTTP(S) repository URL (GitHub repository_url; GitLab project_url)."
+        },
+        "number": {
+          "type": ["integer", "null"],
+          "description": "Provider issue/PR/MR number (may be null when the provider omitted it; the producer coerces null to '' for its partition key only)."
+        }
+      },
+      "additionalProperties": false
     },
     "action": {
       "type": "string",
-      "description": "Canonical event-type suffix: opened, closed, merged, review_requested, changes_requested, or approved.",
-      "enum": [
-        "opened",
-        "closed",
-        "merged",
-        "review_requested",
-        "changes_requested",
-        "approved"
-      ]
+      "description": "Producer canonical lifecycle action (top-level, never inside resource). Constrained per resource.type by the allOf clauses below to the producer lifecycle allowlist."
     },
     "occurred_at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "When the activity happened at the source (ISO 8601)."
-    },
-    "ingested_at": {
       "type": ["string", "null"],
       "format": "date-time",
-      "description": "Producer's ingest timestamp (ISO 8601). Optional — may be null when the producer has not yet recorded it."
+      "description": "When the activity happened at the source (ISO 8601), emitted exactly as the provider sends it; null when the provider omits a timestamp (ingested_at is the fallback reference)."
+    },
+    "ingested_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Producer's ingest timestamp (ISO 8601) — always present."
     },
     "actor": {
       "type": ["string", "null"],
-      "description": "Acting principal login. Optional — may be null for automated events."
+      "description": "Acting principal (GitHub sender; GitLab creator_username). Null for events with no actor."
     },
-    "payload_ref": {
-      "type": ["string", "null"],
-      "description": "Reference to the redacted payload — never the payload itself. Optional — may be null when no payload reference is available."
+    "redacted_payload": {
+      "type": "object",
+      "description": "Carries only the redacted-payload *reference* — never raw or redacted payload content. The reference must equal the envelope's provider/delivery_id.",
+      "required": ["reference"],
+      "properties": {
+        "reference": {
+          "type": "object",
+          "required": ["provider", "delivery_id"],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "Must equal the envelope's top-level provider.",
+              "enum": ["github", "gitlab"]
+            },
+            "delivery_id": {
+              "type": "string",
+              "description": "Must equal the envelope's top-level delivery_id."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,
@@ -78,13 +105,17 @@
     {
       "if": {
         "properties": {
-          "resource_type": { "const": "issue" }
+          "resource": {
+            "properties": {
+              "type": { "const": "issue" }
+            }
+          }
         }
       },
       "then": {
         "properties": {
           "action": {
-            "enum": ["opened", "closed"]
+            "enum": ["opened", "edited", "reopened", "closed"]
           }
         }
       }
@@ -92,20 +123,17 @@
     {
       "if": {
         "properties": {
-          "resource_type": { "const": "pull_request" }
+          "resource": {
+            "properties": {
+              "type": { "const": "pull_request" }
+            }
+          }
         }
       },
       "then": {
         "properties": {
           "action": {
-            "enum": [
-              "opened",
-              "closed",
-              "merged",
-              "review_requested",
-              "changes_requested",
-              "approved"
-            ]
+            "enum": ["opened", "edited", "reopened", "closed", "merged"]
           }
         }
       }
@@ -113,20 +141,17 @@
     {
       "if": {
         "properties": {
-          "resource_type": { "const": "merge_request" }
+          "resource": {
+            "properties": {
+              "type": { "const": "merge_request" }
+            }
+          }
         }
       },
       "then": {
         "properties": {
           "action": {
-            "enum": [
-              "opened",
-              "closed",
-              "merged",
-              "review_requested",
-              "changes_requested",
-              "approved"
-            ]
+            "enum": ["opened", "updated", "reopened", "closed", "merged"]
           }
         }
       }

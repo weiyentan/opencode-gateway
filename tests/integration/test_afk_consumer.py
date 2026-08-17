@@ -58,6 +58,7 @@ _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 REPOSITORY = "weiyentan/opencode-gateway"
+NORMALIZED_REPOSITORY = "github.com/weiyentan/opencode-gateway"
 
 
 def _dsn() -> str:
@@ -386,16 +387,24 @@ async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.P
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-cross-path-live",
-            "resource_type": "pull_request",
-            "resource_id": "300",
-            "repository": REPOSITORY,
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 300,
+            },
             "action": "merged",
             "occurred_at": _iso(merged_at),
             "ingested_at": _iso(now),
             "actor": "carol",
-            "payload_ref": "redacted-payload-ref-300",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-cross-path-live",
+                }
+            },
         }
     )
     mapped = map_provider_event(message)
@@ -427,7 +436,7 @@ async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.P
         kafka_brokers="broker:9092",
         pool=db_pool,  # type: ignore[arg-type]
         provider=Provider.GITHUB,
-        repository=REPOSITORY,
+        repository=NORMALIZED_REPOSITORY,
         adapter=GitHubAdapter(FakeGitHubApi(payloads)),
         reconcile_window_seconds=30 * 86400,
     )
@@ -459,16 +468,24 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-cross-path-live",
-            "resource_type": "pull_request",
-            "resource_id": "300",
-            "repository": REPOSITORY,
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 300,
+            },
             "action": "merged",
             "occurred_at": _iso(live_at),
             "ingested_at": _iso(now),
             "actor": "carol",
-            "payload_ref": "redacted-payload-ref-300",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-cross-path-live",
+                }
+            },
         }
     )
     mapped = map_provider_event(message)
@@ -491,7 +508,7 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
         kafka_brokers="broker:9092",
         pool=db_pool,  # type: ignore[arg-type]
         provider=Provider.GITHUB,
-        repository=REPOSITORY,
+        repository=NORMALIZED_REPOSITORY,
         adapter=GitHubAdapter(FakeGitHubApi(payloads)),
         reconcile_window_seconds=30 * 86400,
     )
@@ -544,30 +561,35 @@ def _consumer_over_pool(db_pool: asyncpg.Pool) -> AFKOutcomeConsumer:
 
 
 def _normalized_contract_event(delivery_id: str, resource_id: str) -> dict[str, object]:
-    """A producer-contract-conforming normalized ``pull_request.merged`` event."""
+    """A producer-contract-conforming nested ``pull_request.merged`` event."""
     return {
         "schema_version": "1.0",
+        "event_type": "normalized",
         "provider": "github",
         "delivery_id": delivery_id,
-        "resource_type": "pull_request",
-        "resource_id": resource_id,
-        "repository": REPOSITORY,
+        "resource": {
+            "type": "pull_request",
+            "repository_url": f"https://github.com/{REPOSITORY}",
+            "number": int(resource_id),
+        },
         "action": "merged",
         "occurred_at": "2026-08-13T10:10:29Z",
         "ingested_at": "2026-08-13T10:10:30Z",
         "actor": "carol",
-        "payload_ref": f"redacted-payload-ref-{resource_id}",
+        "redacted_payload": {
+            "reference": {"provider": "github", "delivery_id": delivery_id}
+        },
     }
 
 
-def _converged_event(resource_id: str) -> tuple[str, str, str, str, str]:
+def _converged_event(delivery_id: str, resource_id: str) -> tuple[str, str, str, str, str]:
     """The canonical engineering_events row every ordering must converge on."""
     return (
         "change_request",
         resource_id,
         "change_request.merged",
         "carol",
-        f"redacted-payload-ref-{resource_id}",
+        delivery_id,
     )
 
 
@@ -577,7 +599,7 @@ async def _event_snapshot(
     """The canonical (non-volatile) event row for ``external_id``, or None."""
     row = await conn.fetchrow(
         "SELECT entity_type, external_id, event_type, actor, "
-        "payload->>'payload_ref' AS payload_ref "
+        "payload->'payload_ref'->>'delivery_id' AS payload_ref "
         "FROM engineering_events WHERE external_id = $1",
         external_id,
     )
@@ -612,7 +634,7 @@ async def test_replay_convergence_live_then_replay(db_pool: asyncpg.Pool) -> Non
         delivery_after_live = await conn.fetchval(
             "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = $1", delivery_id
         )
-    assert after_live == _converged_event(resource_id)
+    assert after_live == _converged_event(delivery_id, resource_id)
     assert delivery_after_live == 1
 
     await consumer._process_message(_kafka_record(event))  # replay
@@ -626,7 +648,7 @@ async def test_replay_convergence_live_then_replay(db_pool: asyncpg.Pool) -> Non
         )
 
     # Convergence: replay leaves the rows identical to the live state.
-    assert after_replay == after_live == _converged_event(resource_id)
+    assert after_replay == after_live == _converged_event(delivery_id, resource_id)
     assert delivery_count == 1
     assert event_count == 1
 
@@ -647,7 +669,7 @@ async def test_replay_convergence_replay_then_live(db_pool: asyncpg.Pool) -> Non
     await consumer._process_message(_kafka_record(event))  # replay arrives first
     async with db_pool.acquire() as conn:
         after_replay = await _event_snapshot(conn, resource_id)
-    assert after_replay == _converged_event(resource_id)
+    assert after_replay == _converged_event(delivery_id, resource_id)
 
     await consumer._process_message(_kafka_record(event))  # then the live copy
     async with db_pool.acquire() as conn:
@@ -659,7 +681,7 @@ async def test_replay_convergence_replay_then_live(db_pool: asyncpg.Pool) -> Non
             "SELECT COUNT(*) FROM engineering_events WHERE external_id = $1", resource_id
         )
 
-    assert after_live == after_replay == _converged_event(resource_id)
+    assert after_live == after_replay == _converged_event(delivery_id, resource_id)
     assert delivery_count == 1
     assert event_count == 1
 
@@ -715,16 +737,24 @@ async def test_normalized_edited_persists_as_canonical_updated(db_pool: asyncpg.
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-normalized-edited",
-            "resource_type": "pull_request",
-            "resource_id": "500",
-            "repository": REPOSITORY,
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 500,
+            },
             "action": "edited",
             "occurred_at": _iso(edited_at),
             "ingested_at": _iso(now),
             "actor": "alice",
-            "payload_ref": "redacted-payload-ref-500",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-normalized-edited",
+                }
+            },
         }
     )
     mapped = map_normalized_event(message)
@@ -756,7 +786,10 @@ async def test_normalized_edited_persists_as_canonical_updated(db_pool: asyncpg.
         payload = row["payload"]
         assert payload.get("source_resource_type") == "pull_request"
         assert payload.get("source_action") == "edited"
-        assert payload.get("payload_ref") == "redacted-payload-ref-500"
+        assert payload.get("payload_ref") == {
+            "provider": "github",
+            "delivery_id": "delivery-normalized-edited",
+        }
 
 
 @pytest.mark.integration
@@ -769,16 +802,24 @@ async def test_normalized_reopened_persists_as_canonical_reopened(db_pool: async
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-normalized-reopened",
-            "resource_type": "issue",
-            "resource_id": "501",
-            "repository": REPOSITORY,
+            "resource": {
+                "type": "issue",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 501,
+            },
             "action": "reopened",
             "occurred_at": _iso(reopened_at),
             "ingested_at": _iso(now),
             "actor": "bob",
-            "payload_ref": "redacted-payload-ref-501",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-normalized-reopened",
+                }
+            },
         }
     )
     mapped = map_normalized_event(message)
@@ -810,8 +851,8 @@ async def test_normalized_reopened_persists_as_canonical_reopened(db_pool: async
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_normalized_updated_redelivery_is_idempotent(db_pool: asyncpg.Pool) -> None:
-    """Redelivery of a normalized ``pull_request.updated`` does not duplicate
+async def test_normalized_edited_redelivery_is_idempotent(db_pool: asyncpg.Pool) -> None:
+    """Redelivery of a normalized ``pull_request.edited`` does not duplicate
     engineering events."""
     now = datetime.now(timezone.utc)  # noqa: UP017
     updated_at = now - timedelta(hours=4)
@@ -819,16 +860,24 @@ async def test_normalized_updated_redelivery_is_idempotent(db_pool: asyncpg.Pool
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-updated-redelivery",
-            "resource_type": "pull_request",
-            "resource_id": "502",
-            "repository": REPOSITORY,
-            "action": "updated",
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 502,
+            },
+            "action": "edited",
             "occurred_at": _iso(updated_at),
             "ingested_at": _iso(now),
             "actor": "carol",
-            "payload_ref": "redacted-payload-ref-502",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-updated-redelivery",
+                }
+            },
         }
     )
     mapped = map_normalized_event(message)
@@ -882,16 +931,24 @@ async def test_late_event_with_older_occurred_at_enriches_trail(db_pool: asyncpg
     newer_message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-late-newer",
-            "resource_type": "pull_request",
-            "resource_id": "503",
-            "repository": REPOSITORY,
-            "action": "updated",
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 503,
+            },
+            "action": "edited",
             "occurred_at": _iso(newer_at),
             "ingested_at": _iso(now),
             "actor": "carol",
-            "payload_ref": "redacted-payload-ref-503-newer",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-late-newer",
+                }
+            },
         }
     )
     mapped_newer = map_normalized_event(newer_message)
@@ -911,16 +968,24 @@ async def test_late_event_with_older_occurred_at_enriches_trail(db_pool: asyncpg
         older_message = NormalizedProviderEvent.model_validate(
             {
                 "schema_version": "1.0",
+                "event_type": "normalized",
                 "provider": "github",
                 "delivery_id": "delivery-late-older",
-                "resource_type": "pull_request",
-                "resource_id": "503",
-                "repository": REPOSITORY,
-                "action": "updated",
+                "resource": {
+                    "type": "pull_request",
+                    "repository_url": f"https://github.com/{REPOSITORY}",
+                    "number": 503,
+                },
+                "action": "edited",
                 "occurred_at": _iso(older_at),
                 "ingested_at": _iso(now),
                 "actor": "alice",
-                "payload_ref": "redacted-payload-ref-503-older",
+                "redacted_payload": {
+                    "reference": {
+                        "provider": "github",
+                        "delivery_id": "delivery-late-older",
+                    }
+                },
             }
         )
         mapped_older = map_normalized_event(older_message)
@@ -936,7 +1001,8 @@ async def test_late_event_with_older_occurred_at_enriches_trail(db_pool: asyncpg
 
         # Both events exist — the late event enriched the trail.
         rows = await conn.fetch(
-            "SELECT occurred_at, actor, payload->>'payload_ref' AS payload_ref "
+            "SELECT occurred_at, actor, "
+            "payload->'payload_ref'->>'delivery_id' AS payload_ref "
             "FROM engineering_events "
             "WHERE external_id = '503' "
             "ORDER BY occurred_at"
@@ -945,8 +1011,8 @@ async def test_late_event_with_older_occurred_at_enriches_trail(db_pool: asyncpg
         # Older event is first.
         assert rows[0]["occurred_at"] == older_at
         assert rows[0]["actor"] == "alice"
-        assert rows[0]["payload_ref"] == "redacted-payload-ref-503-older"
+        assert rows[0]["payload_ref"] == "delivery-late-older"
         # Newer event is second.
         assert rows[1]["occurred_at"] == newer_at
         assert rows[1]["actor"] == "carol"
-        assert rows[1]["payload_ref"] == "redacted-payload-ref-503-newer"
+        assert rows[1]["payload_ref"] == "delivery-late-newer"

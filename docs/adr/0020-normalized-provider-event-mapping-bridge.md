@@ -4,6 +4,15 @@
 
 Superseded by FastAPI EDA Gateway ADR 0005 (2026-08-17)
 
+The producer ADR 0005 and its normalized-event artifacts are not yet present
+in the producer repository; this repository pins a consumer-side transcription
+of the producer contract in `docs/contracts/normalized-event-v1/` (see
+`docs/afk-outcome-contract-validation.md` for provenance). The flat
+`ProviderEventMessage` shape and its legacy ten-type mapping have been removed
+from the consumer (issue #497); the mapping bridge vocabulary
+(`pull_request`/`merge_request` → `change_request`) remains the canonical
+outcome-layer vocabulary.
+
 *Historical context: Accepted 2026-08-16.  The producer now owns the
 normalized-event contract; the consumer-authored flat ``ProviderEventMessage``
 shape and its legacy ten-type mapping have been removed (issue #497).  The

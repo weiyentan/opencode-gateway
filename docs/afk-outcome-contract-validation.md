@@ -50,54 +50,46 @@ schema-versioned event on the `afk.events` topic. The contract is pinned by
 `PRODUCER_CONTRACT_EVENT` in `tests/test_afk_consumer.py` and enforced by
 `NormalizedProviderEvent` (ADR 0020):
 
-### Flat shape (issue #482, backward-compatible)
+### Nested v1 shape (the only accepted shape)
 
-| Field | Type | Meaning |
-|---|---|---|
-| `schema_version` | `str` | Producer schema version (`"1.0"`) — carried, never dropped |
-| `provider` | `github` \| `gitlab` | Source provider |
-| `delivery_id` | `str` | Forwarded provider delivery UUID (`X-GitHub-Delivery` / `X-GitLab-Event-UUID`) — the `delivery_log` dedup key |
-| `resource_type` | `issue` \| `pull_request` \| `merge_request` | Producer-native resource vocabulary (never `change_request`) |
-| `resource_id` | `str` | Stable provider-scoped resource identity (the value behind `entity_id`) |
-| `repository` | `str` | Full `owner/repo` (or `group/project`) name |
-| `action` | `str` | Canonical event-type suffix (`opened`, `closed`, `merged`, …) |
-| `occurred_at` | `datetime` | When the activity happened at the source |
-| `ingested_at` | `datetime \| None` | Producer's ingest timestamp |
-| `actor` | `str \| None` | Acting principal login |
-| `payload_ref` | `str \| None` | *Reference* to the redacted payload — never the payload itself |
-
-### Nested v1 shape (issue #495)
-
-The v1 nested envelope wraps resource fields in a `resource` object and the
-payload reference in a `redacted_payload` object:
+The v1 envelope is nested: resource fields live in a `resource` object and the
+payload reference lives in a `redacted_payload.reference` object.  The flat
+shape (issue #482) has been removed (issue #497) — a flat payload is rejected
+as an invalid message shape.
 
 ```json
 {
   "schema_version": "1.0",
+  "event_type": "normalized",
   "provider": "github",
   "delivery_id": "...",
+  "resource": {
+    "type": "pull_request",
+    "repository_url": "https://github.com/owner/repo",
+    "number": 200
+  },
+  "action": "merged",
   "occurred_at": "2026-08-15T10:00:00Z",
   "ingested_at": "2026-08-15T10:00:01Z",
   "actor": "test-user",
-  "resource": {
-    "resource_type": "pull_request",
-    "resource_id": "200",
-    "repository": "https://github.com/owner/repo",
-    "action": "merged"
-  },
   "redacted_payload": {
-    "reference": "redacted-payload-ref-200",
-    "provider": "github",
-    "delivery_id": "..."
+    "reference": {
+      "provider": "github",
+      "delivery_id": "..."
+    }
   }
 }
 ```
 
-The bridge maps `resource_type` → canonical `entity_type`
+The bridge maps `resource.type` → canonical `entity_type`
 (`issue` → `issue`; `pull_request`/`merge_request` → `change_request`) and
-`action` → the canonical event-type suffix, validating the result against the
-locked canonical vocabulary (`_CANONICAL_EVENT_TYPES`). An unknown `resource_type`
-or an `action` that does not resolve to a canonical event type is unmappable.
+`action` → the canonical event-type suffix (`edited`/`updated` → `updated`),
+validating the result against the locked canonical vocabulary
+(`_CANONICAL_EVENT_TYPES`).  Actions are constrained to the producer lifecycle
+allowlist: `issue` opened/edited/reopened/closed; `pull_request`
+opened/edited/reopened/closed/merged; `merge_request`
+opened/updated/reopened/closed/merged.  The *normalized* repository URL is
+persisted as the repository identity.
 
 ### Pinned by tests
 
@@ -105,16 +97,19 @@ or an `action` that does not resolve to a canonical event type is unmappable.
   contract change must fail this test rather than drift silently.
 - `test_producer_contract_maps_to_canonical_change_request` — the mapped
   canonical `change_request` retains the normalized event's key identity and
-  payload fields: `provider`, `repository`, the resource identity
-  (`entity_type` from `resource_type`, `entity_id`/`number` from
-  `resource_id`), the canonical `event_type` (from `action`), `occurred_at`,
-  `actor`, and a `payload_ref` payload reference (never the payload itself).
-  Producer-internal fields (`delivery_id`, `ingested_at`, `schema_version`)
-  are not carried onto the canonical entity/event.
+  payload fields: `provider`, the normalized repository URL, the resource
+  identity (`entity_type` from `resource.type`, `entity_id`/`number` from
+  `resource.number`), the canonical `event_type` (from `action`),
+  `occurred_at`, `actor`, and a `payload_ref` payload reference object (never
+  the payload itself).  Producer-internal fields (`delivery_id`,
+  `ingested_at`, `schema_version`) are not carried onto the canonical
+  entity/event.
 - `test_producer_contract_event_is_not_routed_to_dlq` — the full consumer path
   persists the contract event and **never** calls `send_and_wait` (no DLQ).
 - `test_producer_contract_gitlab_merge_request_maps_to_change_request` —
   cross-provider parity (`merge_request` → `change_request`).
+- `test_flat_shape_is_rejected_sends_to_dlq_and_commits` — the removed flat
+  shape is rejected as an invalid message shape (issue #497).
 
 ## 3. Replay convergence & dedup guarantees
 
@@ -156,11 +151,13 @@ violation classes and their DLQ handling:
 | Violation | Detection | DLQ payload | Reason |
 |---|---|---|---|
 | Bad JSON | `json.loads` fails | `{"raw": <bytes>}` | `JSON decode failure: <error>` |
-| Bad shape | Pydantic `model_validate` fails (not a valid normalized event shape) | original dict | `Invalid message shape — failed Pydantic validation` |
-| Unmappable | `map_provider_event` returns `None` (unknown `resource_type` or non-canonical `action`) | original dict | `Unmappable message type: '<resource_type>.<action>'` |
+| Bad shape | Pydantic `model_validate` fails (not the nested v1 shape — includes the removed flat shape) | original dict | `Invalid message shape — failed Pydantic validation` |
 | Unsupported schema version | `schema_version` not in `{"1.0"}` | original dict | `Unsupported schema version: '<version>' (supported: ['1.0'])` |
-| Invalid repository identity | `normalize_repository_url` returns `None` (nested shape only) | original dict | `Invalid repository identity: '<url>' — must be an absolute HTTP(S) URL with a valid hostname and path` |
-| Reference mismatch | `redacted_payload.provider` ≠ envelope `provider` or `redacted_payload.delivery_id` ≠ envelope `delivery_id` | original dict | `Reference mismatch: redacted_payload.<field>=<value> != envelope.<field>=<value>` |
+| Unsupported event type | `event_type` is not `"normalized"` | original dict | `Unsupported event type: '<type>' (supported: 'normalized')` |
+| Unsupported resource type | `resource.type` outside the producer vocabulary | original dict | `Unsupported resource type: '<type>' (supported: [...])` |
+| Unsupported action | `action` outside the producer lifecycle allowlist for `resource.type` | original dict | `Unsupported action: '<action>' for resource type '<type>' (supported: [...])` |
+| Invalid repository identity | `normalize_repository_url` returns `None` | original dict | `Invalid repository identity: '<url>' — must be an absolute HTTP(S) URL with a valid hostname and path` |
+| Reference mismatch | `redacted_payload.reference.provider` ≠ envelope `provider` or `redacted_payload.reference.delivery_id` ≠ envelope `delivery_id` | original dict | `Reference mismatch: redacted_payload.reference.<field>=<value> != envelope.<field>=<value>` |
 
 Every DLQ publish carries the `{original_topic, reason, payload}` envelope
 (`_send_to_dlq`) and the offset is committed only **after** the publish succeeds
@@ -170,8 +167,9 @@ replay or triage it.
 
 ### Pinned by tests
 
-- `test_contract_violation_routes_to_dlq_with_payload_and_reason` — an unmappable
-  normalized action is DLQ'd with the full original payload + reason, nothing persisted.
+- `test_contract_violation_routes_to_dlq_with_payload_and_reason` — a
+  normalized action outside the producer lifecycle allowlist is DLQ'd with the
+  full original payload + reason, nothing persisted.
 - `test_contract_violation_bad_json_routes_to_dlq_with_raw_payload` — a non-JSON
   body is DLQ'd carrying the raw bytes + a reason.
 - `test_unsupported_schema_version_routes_to_dlq` — an unsupported schema version
@@ -257,13 +255,17 @@ before mapping or persistence. It raises `NormalizedEventValidationError` with
 a distinct reason string for each violation class:
 
 1. **Unsupported schema version** — `schema_version` is not `"1.0"`.
-2. **Invalid repository identity** — the repository URL in the nested
-   `resource` object cannot be normalized to a valid identity (not an absolute
-   HTTP(S) URL, empty hostname, or no path). Only applied to the nested v1
-   shape; flat-shape `owner/repo` strings are not validated as URLs.
-3. **Reference mismatch** — `redacted_payload.provider` ≠ envelope `provider`
-   or `redacted_payload.delivery_id` ≠ envelope `delivery_id`. Null values in
-   `redacted_payload` are not checked (no mismatch).
+2. **Unsupported event type** — `event_type` is not `"normalized"`.
+3. **Unsupported resource type** — `resource.type` is outside the producer
+   lifecycle vocabulary.
+4. **Unsupported action** — `action` is outside the producer lifecycle
+   allowlist for `resource.type`.
+5. **Invalid repository identity** — the `resource.repository_url` cannot be
+   normalized to a valid identity (not an absolute HTTP(S) URL, empty
+   hostname, or no path).
+6. **Reference mismatch** — `redacted_payload.reference.provider` ≠ envelope
+   `provider` or `redacted_payload.reference.delivery_id` ≠ envelope
+   `delivery_id`.
 
 ### 7.2 Repository URL normalization
 
@@ -285,14 +287,12 @@ identity.
 ### 7.3 Effective properties
 
 `NormalizedProviderEvent` exposes `effective_*` properties that resolve from
-the nested objects when present, falling back to flat fields for backward
-compatibility:
+the nested objects (the flat shape no longer exists):
 
-- `effective_resource_type` — `resource.resource_type` or `resource_type`
-- `effective_resource_id` — `resource.resource_id` or `resource_id`
-- `effective_repository` — `resource.repository` or `repository`
-- `effective_action` — `resource.action` or `action`
-- `effective_payload_ref` — `redacted_payload.reference` or `payload_ref`
+- `effective_resource_type` — `resource.type`
+- `effective_resource_id` — `resource.number` as a string (`""` when absent)
+- `effective_repository` — the raw `resource.repository_url`
+- `effective_action` — the top-level `action`
 
 ### 7.4 Pinned by tests
 
@@ -321,16 +321,26 @@ compatibility:
 - `test_reference_mismatch_routes_to_dlq` — consumer path DLQ routing.
 - `test_every_pinned_fixture_passes_validation` — all pinned fixtures validate.
 - `test_every_pinned_fixture_maps_without_dlq` — all pinned fixtures map.
-- `test_flat_shape_still_accepted_for_backward_compat` — flat shape still works.
+- `test_flat_shape_is_rejected_sends_to_dlq_and_commits` — the removed flat
+  shape is rejected as an invalid message shape.
+- `test_validate_rejects_unsupported_event_type` — non-`normalized` event
+  types are rejected.
+- `test_every_fixture_payload_reference_matches_envelope` — the payload
+  reference object matches its envelope.
 - `test_all_violation_classes_have_distinct_reason_prefixes` — distinct prefixes.
 
 ## 8. Files changed
 
 - `app/consumer/afk_consumer.py` — `NormalizedProviderEvent` model (nested
-  `resource` and `redacted_payload` objects with effective properties),
-  `validate_normalized_event()`, `normalize_repository_url()`,
-  `NormalizedEventValidationError`. Updated `map_normalized_event()` and
-  `_process_message()` to use effective properties and call validation.
+  `resource` and `redacted_payload.reference` objects), the producer lifecycle
+  allowlist, `validate_normalized_event()` (version/event-type/resource-type/
+  action/repository/reference violations), `normalize_repository_url()`,
+  `NormalizedEventValidationError`.  `map_normalized_event()` persists the
+  normalized repository URL and the payload reference object; the flat shape
+  has been removed (#497).
+- `docs/contracts/normalized-event-v1/schema.json` + `fixtures/` — the pinned
+  producer contract artifacts (14 real `(resource.type, action)` pairs).
 - `tests/test_afk_consumer.py` — nested v1 envelope tests, validation tests,
   repository URL normalization tests, DLQ reason tests, contract pinning tests.
-- `docs/afk-outcome-contract-validation.md` — this report (updated for #495).
+- `docs/afk-outcome-contract-validation.md` — this report (updated for #495,
+  #497).

@@ -2,20 +2,20 @@
   "schema_version": "1.0",
   "event_type": "normalized",
   "provider": "gitlab",
-  "delivery_id": "00000000-0000-0000-0000-000000000010",
+  "delivery_id": "00000000-0000-0000-0000-000000000011",
   "resource": {
     "type": "merge_request",
     "repository_url": "https://gitlab.com/group/project",
-    "number": 110
+    "number": 111
   },
-  "action": "opened",
+  "action": "updated",
   "occurred_at": "2026-08-15T10:00:00Z",
   "ingested_at": "2026-08-15T10:00:01Z",
   "actor": "test-user",
   "redacted_payload": {
     "reference": {
       "provider": "gitlab",
-      "delivery_id": "00000000-0000-0000-0000-000000000010"
+      "delivery_id": "00000000-0000-0000-0000-000000000011"
     }
   }
 }

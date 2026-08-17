@@ -1,118 +1,99 @@
-#!/usr/bin/env python3
-"""Generate serializer-produced fixture examples for every allowed v1
-(resource_type, action) pair.
+"""Generate producer-shaped normalized-event v1 contract fixtures.
 
-Each fixture is built through the real NormalizedProviderEvent Pydantic model
-(serializer), validated against the published JSON Schema, and written to
-docs/contracts/normalized-event-v1/fixtures/.
+Pinned-copy generator for the consumer-side contract fixtures under
+``docs/contracts/normalized-event-v1/fixtures/``.  This script reproduces the
+EXACT outbound shape of the producer-owned contract — ``build_normalized_message``
+in fast-api-eda-gateway (``src/fast_api_eda_gateway/normalized_event.py`` +
+``normalized_event_producer.py``): schema_version "1.0", event_type "normalized",
+provider, delivery_id, nested resource{type, repository_url, number}, top-level
+action, occurred_at, ingested_at, actor, and redacted_payload.reference
+{provider, delivery_id} equal to the envelope.
 
-Usage:
-    python scripts/generate_normalized_event_fixtures.py
+It deliberately does NOT import the consumer's ``NormalizedProviderEvent``
+model: the fixtures are the pinned contract's source of truth, never the
+consumer's serializer.  Only the producer's real allowlisted (resource_type,
+action) pairs are generated.
 """
 
 from __future__ import annotations
 
 import json
-import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
-# Ensure the project root is on sys.path so we can import the consumer module.
-_PROJ_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PROJ_ROOT))
+SCHEMA_VERSION = "1.0"
+EVENT_TYPE = "normalized"
 
-from app.consumer.afk_consumer import NormalizedProviderEvent  # noqa: E402
+FIXTURES_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "docs"
+    / "contracts"
+    / "normalized-event-v1"
+    / "fixtures"
+)
 
-UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
-
-# ── Allowed v1 (resource_type, action) pairs ─────────────────────────────────
-#
-# These are the producer-contract vocabulary: every pair the producer may emit
-# for v1.  The consumer's mapping bridge validates these against the locked
-# canonical vocabulary (_MAPPED_EVENT_TYPES).
-
-ALLOWED_PAIRS: list[tuple[str, str]] = [
-    # issue lifecycle
-    ("issue", "opened"),
-    ("issue", "closed"),
-    # pull_request lifecycle (GitHub)
-    ("pull_request", "opened"),
-    ("pull_request", "review_requested"),
-    ("pull_request", "changes_requested"),
-    ("pull_request", "approved"),
-    ("pull_request", "merged"),
-    ("pull_request", "closed"),
-    # merge_request lifecycle (GitLab)
-    ("merge_request", "opened"),
-    ("merge_request", "review_requested"),
-    ("merge_request", "changes_requested"),
-    ("merge_request", "approved"),
-    ("merge_request", "merged"),
-    ("merge_request", "closed"),
+#: Every real producer-allowlisted pair (resource type, action, forge).
+ALLOWED_PAIRS: list[tuple[str, str, str]] = [
+    ("issue", "opened", "github"),
+    ("issue", "edited", "github"),
+    ("issue", "reopened", "github"),
+    ("issue", "closed", "github"),
+    ("pull_request", "opened", "github"),
+    ("pull_request", "edited", "github"),
+    ("pull_request", "reopened", "github"),
+    ("pull_request", "closed", "github"),
+    ("pull_request", "merged", "github"),
+    ("merge_request", "opened", "gitlab"),
+    ("merge_request", "updated", "gitlab"),
+    ("merge_request", "reopened", "gitlab"),
+    ("merge_request", "closed", "gitlab"),
+    ("merge_request", "merged", "gitlab"),
 ]
 
-# ── Fixture base data ────────────────────────────────────────────────────────
-#
-# Every fixture shares the same provider, delivery_id, repository, and
-# timestamps so payload references identify the same provider and delivery_id
-# as their containing envelope (acceptance criterion).
 
-FIXTURE_PROVIDER = "github"
-FIXTURE_DELIVERY_ID = "00000000-0000-0000-0000-000000000001"
-FIXTURE_REPOSITORY = "owner/repo"
-FIXTURE_OCCURRED_AT = datetime(2026, 8, 15, 10, 0, 0, tzinfo=UTC)
-FIXTURE_INGESTED_AT = datetime(2026, 8, 15, 10, 0, 1, tzinfo=UTC)
-FIXTURE_ACTOR = "test-user"
-
-# Resource IDs are stable across fixtures so the same resource appears in
-# multiple lifecycle states (e.g. issue:100 opened → closed).
-_RESOURCE_ID_MAP: dict[str, str] = {
-    "issue": "100",
-    "pull_request": "200",
-    "merge_request": "300",
-}
+def _repository_url(provider: str) -> str:
+    if provider == "github":
+        return "https://github.com/owner/repo"
+    return "https://gitlab.com/group/project"
 
 
-def _fixture_filename(resource_type: str, action: str) -> str:
-    return f"{resource_type}.{action}.json"
-
-
-def _build_fixture(resource_type: str, action: str) -> dict:
-    """Build one fixture through the real NormalizedProviderEvent serializer."""
-    resource_id = _RESOURCE_ID_MAP[resource_type]
-    message = NormalizedProviderEvent(
-        schema_version="1.0",
-        provider=FIXTURE_PROVIDER,
-        delivery_id=FIXTURE_DELIVERY_ID,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        repository=FIXTURE_REPOSITORY,
-        action=action,
-        occurred_at=FIXTURE_OCCURRED_AT,
-        ingested_at=FIXTURE_INGESTED_AT,
-        actor=FIXTURE_ACTOR,
-        payload_ref=f"redacted-payload-ref-{resource_id}",
-    )
-    # Serialize through the model to get the exact producer output shape.
-    return json.loads(message.model_dump_json())
+def _message(
+    resource_type: str, action: str, provider: str, delivery_suffix: int
+) -> dict:
+    delivery_id = f"00000000-0000-0000-0000-{delivery_suffix:012d}"
+    number = 100 + delivery_suffix
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_type": EVENT_TYPE,
+        "provider": provider,
+        "delivery_id": delivery_id,
+        "resource": {
+            "type": resource_type,
+            "repository_url": _repository_url(provider),
+            "number": number,
+        },
+        "action": action,
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "redacted_payload": {
+            "reference": {
+                "provider": provider,
+                "delivery_id": delivery_id,
+            },
+        },
+    }
 
 
 def main() -> None:
-    fixtures_dir = (
-        _PROJ_ROOT / "docs" / "contracts" / "normalized-event-v1" / "fixtures"
-    )
-    fixtures_dir.mkdir(parents=True, exist_ok=True)
-
-    generated = 0
-    for resource_type, action in ALLOWED_PAIRS:
-        fixture = _build_fixture(resource_type, action)
-        filename = _fixture_filename(resource_type, action)
-        filepath = fixtures_dir / filename
-        filepath.write_text(json.dumps(fixture, indent=2) + "\n", encoding="utf-8")
-        generated += 1
-        print(f"  wrote {filename}")
-
-    print(f"\nGenerated {generated} fixture(s) in {fixtures_dir}")
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in FIXTURES_DIR.glob("*.json"):
+        stale.unlink()
+        print(f"removed stale {stale.name}")
+    for index, (resource_type, action, provider) in enumerate(ALLOWED_PAIRS, start=1):
+        message = _message(resource_type, action, provider, index)
+        path = FIXTURES_DIR / f"{resource_type}.{action}.json"
+        path.write_text(json.dumps(message, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {path.name}")
 
 
 if __name__ == "__main__":

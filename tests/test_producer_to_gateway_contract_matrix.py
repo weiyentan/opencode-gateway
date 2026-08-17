@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import json as _json_mod
-from datetime import timezone
 from pathlib import Path as _Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,8 +35,6 @@ from app.core.reporting_aggregates import (
 )
 from app.core.repository import normalize_repository_url
 
-UTC = timezone.utc
-
 # ── Paths to producer-owned contract artifacts ───────────────────────────────
 
 _CONTRACTS_DIR = (
@@ -51,19 +48,19 @@ _FIXTURES_DIR = _CONTRACTS_DIR / "fixtures"
 
 _ALLOWED_PAIRS: set[tuple[str, str]] = {
     ("issue", "opened"),
+    ("issue", "edited"),
+    ("issue", "reopened"),
     ("issue", "closed"),
     ("pull_request", "opened"),
-    ("pull_request", "review_requested"),
-    ("pull_request", "changes_requested"),
-    ("pull_request", "approved"),
-    ("pull_request", "merged"),
+    ("pull_request", "edited"),
+    ("pull_request", "reopened"),
     ("pull_request", "closed"),
+    ("pull_request", "merged"),
     ("merge_request", "opened"),
-    ("merge_request", "review_requested"),
-    ("merge_request", "changes_requested"),
-    ("merge_request", "approved"),
-    ("merge_request", "merged"),
+    ("merge_request", "updated"),
+    ("merge_request", "reopened"),
     ("merge_request", "closed"),
+    ("merge_request", "merged"),
 }
 
 # ── Expected canonical mapping for every allowed pair ────────────────────────
@@ -73,27 +70,19 @@ _ALLOWED_PAIRS: set[tuple[str, str]] = {
 
 _EXPECTED_CANONICAL: dict[tuple[str, str], tuple[EntityType, str]] = {
     ("issue", "opened"): (EntityType.ISSUE, "issue.opened"),
+    ("issue", "edited"): (EntityType.ISSUE, "issue.updated"),
+    ("issue", "reopened"): (EntityType.ISSUE, "issue.reopened"),
     ("issue", "closed"): (EntityType.ISSUE, "issue.closed"),
     ("pull_request", "opened"): (EntityType.CHANGE_REQUEST, "change_request.opened"),
-    ("pull_request", "review_requested"): (
-        EntityType.CHANGE_REQUEST, "change_request.review_requested",
-    ),
-    ("pull_request", "changes_requested"): (
-        EntityType.CHANGE_REQUEST, "change_request.changes_requested",
-    ),
-    ("pull_request", "approved"): (EntityType.CHANGE_REQUEST, "change_request.approved"),
-    ("pull_request", "merged"): (EntityType.CHANGE_REQUEST, "change_request.merged"),
+    ("pull_request", "edited"): (EntityType.CHANGE_REQUEST, "change_request.updated"),
+    ("pull_request", "reopened"): (EntityType.CHANGE_REQUEST, "change_request.reopened"),
     ("pull_request", "closed"): (EntityType.CHANGE_REQUEST, "change_request.closed"),
+    ("pull_request", "merged"): (EntityType.CHANGE_REQUEST, "change_request.merged"),
     ("merge_request", "opened"): (EntityType.CHANGE_REQUEST, "change_request.opened"),
-    ("merge_request", "review_requested"): (
-        EntityType.CHANGE_REQUEST, "change_request.review_requested",
-    ),
-    ("merge_request", "changes_requested"): (
-        EntityType.CHANGE_REQUEST, "change_request.changes_requested",
-    ),
-    ("merge_request", "approved"): (EntityType.CHANGE_REQUEST, "change_request.approved"),
-    ("merge_request", "merged"): (EntityType.CHANGE_REQUEST, "change_request.merged"),
+    ("merge_request", "updated"): (EntityType.CHANGE_REQUEST, "change_request.updated"),
+    ("merge_request", "reopened"): (EntityType.CHANGE_REQUEST, "change_request.reopened"),
     ("merge_request", "closed"): (EntityType.CHANGE_REQUEST, "change_request.closed"),
+    ("merge_request", "merged"): (EntityType.CHANGE_REQUEST, "change_request.merged"),
 }
 
 # ── Outcome-relevant actions (acceptance criterion 3) ────────────────────────
@@ -200,6 +189,40 @@ def _make_consumer(
     )
 
 
+def _nested_event(
+    delivery_id: str,
+    resource_type: str,
+    number: int,
+    action: str,
+    *,
+    provider: str = "github",
+    schema_version: str = "1.0",
+) -> dict:
+    """A contract-conforming nested v1 normalized event."""
+    return {
+        "schema_version": schema_version,
+        "event_type": "normalized",
+        "provider": provider,
+        "delivery_id": delivery_id,
+        "resource": {
+            "type": resource_type,
+            "repository_url": (
+                "https://github.com/owner/repo"
+                if provider == "github"
+                else "https://gitlab.com/group/project"
+            ),
+            "number": number,
+        },
+        "action": action,
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "redacted_payload": {
+            "reference": {"provider": provider, "delivery_id": delivery_id}
+        },
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Section 1: Fixture source provenance verification
 # ══════════════════════════════════════════════════════════════════════════════
@@ -297,28 +320,17 @@ def test_nested_v1_envelope_passes_validation_and_maps_correctly() -> None:
     """A nested v1 envelope fixture passes validation, resolves effective
     properties, and maps through the full consumer pipeline without DLQ.
     """
-    fixture_path = _FIXTURES_DIR / "issue.opened.nested.json"
-    assert fixture_path.exists(), f"Missing nested fixture: {fixture_path}"
-
-    with open(fixture_path) as f:
-        raw = _json_mod.load(f)
+    raw = _load_fixture("issue.opened.json")
 
     message = NormalizedProviderEvent.model_validate(raw)
 
-    # ── Effective properties resolve from nested objects ────────────
+    # ── Effective properties resolve from the nested resource object ─
     assert message.effective_resource_type == "issue"
-    assert message.effective_resource_id == "999"
+    assert message.effective_resource_id == "101"
     assert message.effective_repository == "https://github.com/owner/repo"
     assert message.effective_action == "opened"
-    assert message.effective_payload_ref == "redacted-payload-ref-999"
 
-    # ── Top-level fields are empty (delegated to nested) ────────────
-    assert message.resource_type == ""
-    assert message.resource_id == ""
-    assert message.repository == ""
-    assert message.action == ""
-
-    # ── Validation passes (exercises the nested-shape URL path) ─────
+    # ── Validation passes ──────────────────────────────────────────
     validate_normalized_event(message)  # must not raise
 
     # ── Mapping produces a valid entity + event ─────────────────────
@@ -326,8 +338,8 @@ def test_nested_v1_envelope_passes_validation_and_maps_correctly() -> None:
     assert result is not None
     entity, event = result
     assert entity.entity_type == EntityType.ISSUE
-    assert entity.entity_id == "issue:999"
-    assert entity.repository == "https://github.com/owner/repo"
+    assert entity.entity_id == "issue:101"
+    assert entity.repository == "github.com/owner/repo"  # normalized URL identity
     assert event.event_type == "issue.opened"
 
 
@@ -368,9 +380,13 @@ def test_every_fixture_maps_to_canonical_engineering_event(
         f"Expected entity_type={expected_entity_type.value}, "
         f"got {entity.entity_type.value}"
     )
-    assert entity.entity_id == f"{expected_entity_type.value}:{fixture['resource_id']}"
+    assert entity.entity_id == (
+        f"{expected_entity_type.value}:{fixture['resource']['number']}"
+    )
     assert entity.provider.value == fixture["provider"]
-    assert entity.repository == fixture["repository"]
+    assert entity.repository == normalize_repository_url(
+        fixture["resource"]["repository_url"]
+    )
 
     # Event assertions.
     assert event.event_type == expected_event_type
@@ -382,10 +398,12 @@ def test_every_fixture_maps_to_canonical_engineering_event(
     assert event.payload.get("source_resource_type") == resource_type
     assert event.payload.get("source_action") == action
 
-    # payload_ref is forwarded.
-    payload_ref = fixture.get("payload_ref")
-    if payload_ref is not None:
-        assert event.payload.get("payload_ref") == payload_ref
+    # The payload reference object is forwarded.
+    reference = fixture["redacted_payload"]["reference"]
+    assert event.payload.get("payload_ref") == {
+        "provider": reference["provider"],
+        "delivery_id": reference["delivery_id"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -453,7 +471,9 @@ def test_outcome_relevant_actions_produce_intended_observations(
     entity, event = mapped
 
     assert entity.entity_type is expected_entity_type
-    assert entity.entity_id == f"{expected_entity_type.value}:{fixture['resource_id']}"
+    assert entity.entity_id == (
+        f"{expected_entity_type.value}:{fixture['resource']['number']}"
+    )
     assert event.event_type == expected_event_type
     assert event.entity_id == entity.entity_id
 
@@ -469,14 +489,11 @@ def test_outcome_relevant_actions_produce_intended_observations(
 @pytest.mark.parametrize(
     ("resource_type", "action", "expected_entity_type", "expected_event_type"),
     [
-        # edited → edited (direct — no convergence in v1 contract)
-        ("pull_request", "edited", EntityType.CHANGE_REQUEST, "change_request.edited"),
-        ("merge_request", "edited", EntityType.CHANGE_REQUEST, "change_request.edited"),
-        ("issue", "edited", EntityType.ISSUE, "issue.edited"),
-        # updated → updated (direct)
-        ("pull_request", "updated", EntityType.CHANGE_REQUEST, "change_request.updated"),
+        # edited → updated convergence (GitHub real actions)
+        ("pull_request", "edited", EntityType.CHANGE_REQUEST, "change_request.updated"),
+        ("issue", "edited", EntityType.ISSUE, "issue.updated"),
+        # updated → updated convergence (GitLab real action)
         ("merge_request", "updated", EntityType.CHANGE_REQUEST, "change_request.updated"),
-        ("issue", "updated", EntityType.ISSUE, "issue.updated"),
         # reopened → reopened (direct)
         ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "change_request.reopened"),
         ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "change_request.reopened"),
@@ -489,23 +506,12 @@ def test_edited_updated_reopened_map_without_dlq(
     expected_entity_type: EntityType,
     expected_event_type: str,
 ) -> None:
-    """``edited``, ``updated``, and ``reopened`` actions map to canonical events
-    without returning None (which would route to the DLQ)."""
-    # These actions don't have producer fixtures, so we construct them
-    # programmatically using the same shape as the fixtures.
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000099",
-        "resource_type": resource_type,
-        "resource_id": "999",
-        "repository": "owner/repo",
-        "action": action,
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-999",
-    }
+    """``edited`` and ``updated`` map to canonical ``updated`` without returning
+    None (which would route to the DLQ); ``reopened`` maps directly."""
+    # Constructed programmatically with the same nested shape as the fixtures.
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000099", resource_type, 999, action
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     mapped = map_normalized_event(message)
 
@@ -529,10 +535,10 @@ def test_edited_updated_reopened_map_without_dlq(
     ("resource_type", "action"),
     [
         ("pull_request", "edited"),
-        ("pull_request", "updated"),
-        ("pull_request", "reopened"),
+        ("merge_request", "updated"),
         ("issue", "edited"),
-        ("issue", "updated"),
+        ("pull_request", "reopened"),
+        ("merge_request", "reopened"),
         ("issue", "reopened"),
     ],
 )
@@ -547,19 +553,9 @@ async def test_edited_updated_reopened_persist_not_routed_to_dlq(
     consumer._consumer.commit = AsyncMock()
     consumer._producer = AsyncMock()
 
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000099",
-        "resource_type": resource_type,
-        "resource_id": "999",
-        "repository": "owner/repo",
-        "action": action,
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-999",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000099", resource_type, 999, action
+    )
 
     await consumer._process_message(_mk_msg(payload))
 
@@ -587,19 +583,19 @@ async def test_edited_updated_reopened_persist_not_routed_to_dlq(
     ("resource_type", "action", "expected_canonical_type"),
     [
         ("issue", "opened", "issue"),
+        ("issue", "edited", "issue"),
+        ("issue", "reopened", "issue"),
         ("issue", "closed", "issue"),
         ("pull_request", "opened", "change_request"),
+        ("pull_request", "edited", "change_request"),
+        ("pull_request", "reopened", "change_request"),
         ("pull_request", "closed", "change_request"),
         ("pull_request", "merged", "change_request"),
-        ("pull_request", "approved", "change_request"),
-        ("pull_request", "changes_requested", "change_request"),
-        ("pull_request", "review_requested", "change_request"),
         ("merge_request", "opened", "change_request"),
+        ("merge_request", "updated", "change_request"),
+        ("merge_request", "reopened", "change_request"),
         ("merge_request", "closed", "change_request"),
         ("merge_request", "merged", "change_request"),
-        ("merge_request", "approved", "change_request"),
-        ("merge_request", "changes_requested", "change_request"),
-        ("merge_request", "review_requested", "change_request"),
     ],
 )
 def test_reporting_extraction_returns_exact_stable_identity(
@@ -610,24 +606,15 @@ def test_reporting_extraction_returns_exact_stable_identity(
     """Reporting extraction (resource_identity_from_payload) returns the exact
     stable ResourceIdentity for every resource type.
 
-    The reporting layer uses a different payload shape (with a ``resource``
-    object containing ``repository_url``, ``resource_type``, ``resource_number``)
-    than the consumer's flat shape.  We construct a reporting-shaped payload
-    from the fixture data and verify the identity extraction.
+    The reporting layer reads the same producer ``resource`` object
+    (``type`` / ``repository_url`` / ``number``) that the consumer
+    validates, so the fixture's resource object feeds the extraction
+    directly.
     """
     fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
 
-    # Construct a reporting-shaped payload from the fixture data.
-    reporting_payload = {
-        "resource": {
-            "repository_url": f"https://github.com/{fixture['repository']}",
-            "resource_type": fixture["resource_type"],
-            "resource_number": fixture["resource_id"],
-        }
-    }
-
     identity = resource_identity_from_payload(
-        reporting_payload, provider=fixture["provider"]
+        {"resource": fixture["resource"]}, provider=fixture["provider"]
     )
 
     assert identity is not None, (
@@ -637,11 +624,9 @@ def test_reporting_extraction_returns_exact_stable_identity(
 
     assert identity.provider == fixture["provider"]
     assert identity.resource_type == expected_canonical_type
-    assert identity.resource_number == fixture["resource_id"]
+    assert identity.resource_number == str(fixture["resource"]["number"])
     # Repository URL is normalized.
-    expected_repo = normalize_repository_url(
-        f"https://github.com/{fixture['repository']}"
-    )
+    expected_repo = normalize_repository_url(fixture["resource"]["repository_url"])
     assert identity.repository_url == expected_repo
 
 
@@ -659,7 +644,7 @@ def test_reporting_extraction_handles_malformed_resource() -> None:
     # Missing repository_url.
     assert (
         resource_identity_from_payload(
-            {"resource": {"resource_type": "issue", "resource_number": "100"}},
+            {"resource": {"type": "issue", "number": "100"}},
             provider="github",
         )
         is None
@@ -670,7 +655,7 @@ def test_reporting_extraction_handles_malformed_resource() -> None:
             {
                 "resource": {
                     "repository_url": "https://github.com/owner/repo",
-                    "resource_number": "100",
+                    "number": "100",
                 }
             },
             provider="github",
@@ -683,7 +668,7 @@ def test_reporting_extraction_handles_malformed_resource() -> None:
             {
                 "resource": {
                     "repository_url": "https://github.com/owner/repo",
-                    "resource_type": "issue",
+                    "type": "issue",
                 }
             },
             provider="github",
@@ -698,8 +683,8 @@ def test_reporting_extraction_unknown_resource_type_returns_none() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/owner/repo",
-                "resource_type": "commit",
-                "resource_number": "abc123",
+                "type": "commit",
+                "number": "abc123",
             }
         },
         provider="github",
@@ -715,19 +700,10 @@ def test_reporting_extraction_unknown_resource_type_returns_none() -> None:
 def test_malformed_schema_version_routes_to_dlq() -> None:
     """An unsupported schema version raises NormalizedEventValidationError with
     a distinct reason."""
-    payload = {
-        "schema_version": "2.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "issue", 100, "opened",
+        schema_version="2.0",
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     with pytest.raises(NormalizedEventValidationError) as exc_info:
         validate_normalized_event(message)
@@ -738,25 +714,10 @@ def test_malformed_schema_version_routes_to_dlq() -> None:
 def test_malformed_invalid_repository_url_routes_to_dlq() -> None:
     """An invalid repository URL (non-HTTP) raises NormalizedEventValidationError
     with a distinct reason."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "resource": {
-            "resource_type": "pull_request",
-            "resource_id": "200",
-            "repository": "ftp://github.com/owner/repo",
-            "action": "opened",
-        },
-        "redacted_payload": {
-            "reference": "redacted-payload-ref-200",
-            "provider": "github",
-            "delivery_id": "00000000-0000-0000-0000-000000000001",
-        },
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "opened"
+    )
+    payload["resource"]["repository_url"] = "ftp://github.com/owner/repo"
     message = NormalizedProviderEvent.model_validate(payload)
     with pytest.raises(NormalizedEventValidationError) as exc_info:
         validate_normalized_event(message)
@@ -767,25 +728,10 @@ def test_malformed_invalid_repository_url_routes_to_dlq() -> None:
 def test_malformed_payload_ref_provider_mismatch_routes_to_dlq() -> None:
     """A redacted_payload.provider mismatch raises NormalizedEventValidationError
     with a distinct reason."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "resource": {
-            "resource_type": "pull_request",
-            "resource_id": "200",
-            "repository": "https://github.com/owner/repo",
-            "action": "opened",
-        },
-        "redacted_payload": {
-            "reference": "redacted-payload-ref-200",
-            "provider": "gitlab",  # mismatch
-            "delivery_id": "00000000-0000-0000-0000-000000000001",
-        },
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "opened"
+    )
+    payload["redacted_payload"]["reference"]["provider"] = "gitlab"  # mismatch
     message = NormalizedProviderEvent.model_validate(payload)
     with pytest.raises(NormalizedEventValidationError) as exc_info:
         validate_normalized_event(message)
@@ -796,25 +742,10 @@ def test_malformed_payload_ref_provider_mismatch_routes_to_dlq() -> None:
 def test_malformed_payload_ref_delivery_id_mismatch_routes_to_dlq() -> None:
     """A redacted_payload.delivery_id mismatch raises NormalizedEventValidationError
     with a distinct reason."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "resource": {
-            "resource_type": "pull_request",
-            "resource_id": "200",
-            "repository": "https://github.com/owner/repo",
-            "action": "opened",
-        },
-        "redacted_payload": {
-            "reference": "redacted-payload-ref-200",
-            "provider": "github",
-            "delivery_id": "wrong-delivery-id",  # mismatch
-        },
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "opened"
+    )
+    payload["redacted_payload"]["reference"]["delivery_id"] = "wrong-delivery-id"  # mismatch
     message = NormalizedProviderEvent.model_validate(payload)
     with pytest.raises(NormalizedEventValidationError) as exc_info:
         validate_normalized_event(message)
@@ -825,19 +756,9 @@ def test_malformed_payload_ref_delivery_id_mismatch_routes_to_dlq() -> None:
 def test_malformed_unmappable_action_routes_to_dlq() -> None:
     """An action not in the canonical vocabulary returns None from
     map_normalized_event (routes to DLQ)."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "pull_request",
-        "resource_id": "200",
-        "repository": "owner/repo",
-        "action": "synchronize",  # not canonical
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-200",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "synchronize"
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     mapped = map_normalized_event(message)
     assert mapped is None, (
@@ -847,19 +768,9 @@ def test_malformed_unmappable_action_routes_to_dlq() -> None:
 
 def test_malformed_unknown_resource_type_routes_to_dlq() -> None:
     """An unknown resource_type returns None from map_normalized_event (DLQ)."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "commit",  # unknown
-        "resource_id": "abc123",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-abc",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "commit", 200, "opened"
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     mapped = map_normalized_event(message)
     assert mapped is None, (
@@ -878,45 +789,25 @@ async def test_malformed_input_routes_to_dlq_with_distinct_reasons() -> None:
     consumer._producer = AsyncMock()
     consumer._producer.send_and_wait = AsyncMock()
 
-    # Test 1: Unmappable action → DLQ with "Unmappable message type"
-    violating = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "pull_request",
-        "resource_id": "200",
-        "repository": "owner/repo",
-        "action": "synchronize",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-200",
-    }
+    # Test 1: Action outside the lifecycle allowlist → DLQ with "Unsupported action"
+    violating = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "synchronize"
+    )
     await consumer._process_message(_mk_msg(violating))
     consumer._producer.send_and_wait.assert_called_once()
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
-    assert "Unmappable message type" in dlq_payload["reason"]
-    assert "pull_request.synchronize" in dlq_payload["reason"]
+    assert "Unsupported action" in dlq_payload["reason"]
+    assert "synchronize" in dlq_payload["reason"]
     consumer._producer.send_and_wait.reset_mock()
 
-    # Test 2: Unknown resource_type → DLQ with "Unmappable message type"
-    unknown_type = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000002",
-        "resource_type": "commit",
-        "resource_id": "abc123",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-abc",
-    }
+    # Test 2: Unknown resource_type → DLQ with "Unsupported resource type"
+    unknown_type = _nested_event(
+        "00000000-0000-0000-0000-000000000002", "commit", 200, "opened"
+    )
     await consumer._process_message(_mk_msg(unknown_type))
     assert consumer._producer.send_and_wait.call_count == 1
     (_topic, dlq_payload2), _kwargs = consumer._producer.send_and_wait.call_args
-    assert "Unmappable message type" in dlq_payload2["reason"]
+    assert "Unsupported resource type" in dlq_payload2["reason"]
     assert "commit" in dlq_payload2["reason"]
     consumer._producer.send_and_wait.reset_mock()
 
@@ -955,19 +846,9 @@ async def test_redelivery_of_same_delivery_id_creates_no_duplicate() -> None:
     consumer._consumer.commit = AsyncMock()
     consumer._producer = AsyncMock()
 
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "pull_request",
-        "resource_id": "200",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-200",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "pull_request", 200, "opened"
+    )
 
     # First delivery — should persist.
     await consumer._process_message(_mk_msg(payload))
@@ -994,19 +875,9 @@ async def test_redelivery_with_different_offset_is_idempotent() -> None:
     consumer._consumer.commit = AsyncMock()
     consumer._producer = AsyncMock()
 
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-000000000001",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "issue", 100, "opened"
+    )
 
     # First delivery at offset 42.
     await consumer._process_message(_mk_msg(payload, offset=42))
@@ -1027,38 +898,20 @@ def test_equal_short_entity_ids_in_separate_repos_are_isolated() -> None:
     """Equal short entity IDs (e.g. issue #100) in separate repositories produce
     distinct entity_id values, keeping them isolated in entity and event reads."""
     # Repo A: owner/repo-a, issue #100
-    payload_a = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-00000000000a",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo-a",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100a",
-    }
+    payload_a = _nested_event(
+        "00000000-0000-0000-0000-00000000000a", "issue", 100, "opened"
+    )
+    payload_a["resource"]["repository_url"] = "https://github.com/owner/repo-a"
     message_a = NormalizedProviderEvent.model_validate(payload_a)
     mapped_a = map_normalized_event(message_a)
     assert mapped_a is not None
     entity_a, event_a = mapped_a
 
     # Repo B: owner/repo-b, also issue #100
-    payload_b = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-00000000000b",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo-b",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100b",
-    }
+    payload_b = _nested_event(
+        "00000000-0000-0000-0000-00000000000b", "issue", 100, "opened"
+    )
+    payload_b["resource"]["repository_url"] = "https://github.com/owner/repo-b"
     message_b = NormalizedProviderEvent.model_validate(payload_b)
     mapped_b = map_normalized_event(message_b)
     assert mapped_b is not None
@@ -1069,8 +922,8 @@ def test_equal_short_entity_ids_in_separate_repos_are_isolated() -> None:
     assert entity_b.entity_id == "issue:100"
 
     # But the repository field distinguishes them.
-    assert entity_a.repository == "owner/repo-a"
-    assert entity_b.repository == "owner/repo-b"
+    assert entity_a.repository == "github.com/owner/repo-a"
+    assert entity_b.repository == "github.com/owner/repo-b"
     assert entity_a.repository != entity_b.repository
 
     # The events have distinct event_ids (though entity_id is the same).
@@ -1089,8 +942,8 @@ def test_equal_short_entity_ids_in_separate_repos_reporting_isolation() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/owner/repo-a",
-                "resource_type": "issue",
-                "resource_number": "100",
+                "type": "issue",
+                "number": "100",
             }
         },
         provider="github",
@@ -1104,8 +957,8 @@ def test_equal_short_entity_ids_in_separate_repos_reporting_isolation() -> None:
         {
             "resource": {
                 "repository_url": "https://github.com/owner/repo-b",
-                "resource_type": "issue",
-                "resource_number": "100",
+                "type": "issue",
+                "number": "100",
             }
         },
         provider="github",
@@ -1124,38 +977,18 @@ def test_equal_short_entity_ids_different_resource_types_are_isolated() -> None:
     """Equal short IDs with different resource types (e.g. issue #100 vs PR #100)
     produce distinct entity_id values."""
     # Issue #100.
-    payload_issue = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-00000000000c",
-        "resource_type": "issue",
-        "resource_id": "100",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100-issue",
-    }
+    payload_issue = _nested_event(
+        "00000000-0000-0000-0000-00000000000c", "issue", 100, "opened"
+    )
     message_issue = NormalizedProviderEvent.model_validate(payload_issue)
     mapped_issue = map_normalized_event(message_issue)
     assert mapped_issue is not None
     entity_issue, _event_issue = mapped_issue
 
     # PR #100.
-    payload_pr = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-00000000000d",
-        "resource_type": "pull_request",
-        "resource_id": "100",
-        "repository": "owner/repo",
-        "action": "opened",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-100-pr",
-    }
+    payload_pr = _nested_event(
+        "00000000-0000-0000-0000-00000000000d", "pull_request", 100, "opened"
+    )
     message_pr = NormalizedProviderEvent.model_validate(payload_pr)
     mapped_pr = map_normalized_event(message_pr)
     assert mapped_pr is not None
@@ -1174,19 +1007,13 @@ def test_equal_short_entity_ids_different_resource_types_are_isolated() -> None:
 
 def test_gitlab_merge_request_maps_to_change_request() -> None:
     """GitLab merge_request maps to change_request (cross-provider contract)."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "gitlab",
-        "delivery_id": "00000000-0000-0000-0000-00000000000e",
-        "resource_type": "merge_request",
-        "resource_id": "300",
-        "repository": "group/project",
-        "action": "merged",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-300",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-00000000000e",
+        "merge_request",
+        300,
+        "merged",
+        provider="gitlab",
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     mapped = map_normalized_event(message)
 
@@ -1202,19 +1029,9 @@ def test_gitlab_merge_request_maps_to_change_request() -> None:
 
 def test_github_pull_request_maps_to_change_request() -> None:
     """GitHub pull_request maps to change_request."""
-    payload = {
-        "schema_version": "1.0",
-        "provider": "github",
-        "delivery_id": "00000000-0000-0000-0000-00000000000f",
-        "resource_type": "pull_request",
-        "resource_id": "200",
-        "repository": "owner/repo",
-        "action": "merged",
-        "occurred_at": "2026-08-15T10:00:00Z",
-        "ingested_at": "2026-08-15T10:00:01Z",
-        "actor": "test-user",
-        "payload_ref": "redacted-payload-ref-200",
-    }
+    payload = _nested_event(
+        "00000000-0000-0000-0000-00000000000f", "pull_request", 200, "merged"
+    )
     message = NormalizedProviderEvent.model_validate(payload)
     mapped = map_normalized_event(message)
 
