@@ -30,6 +30,24 @@ Accepted (2026-08-18)
 - Dual-write / dual-consume during migration (rejected: reconcile loop already covers the cutover gap; avoids temporary compatibility code).
 - Producer-side canonical type normalization (rejected in favor of the already-implemented provider-specific contract; canonical vocabulary remains the consumer's internal mapping layer).
 
+## Test Matrix
+
+| # | Check | Expectation |
+|---|---|---|
+| 1 | AFK-labelled issue | Command on `afk.events` (Rulebook/AWX unchanged) AND observation on `engineering.events.normalized` |
+| 2 | Human PR/MR | Observation only, no command |
+| 3 | Agent-opened PR/MR | Command (`pr_mr_opened`) AND observation with `linked_issues` extracted from title/description |
+| 4 | Human issue (no label) | Observation only (`issue.opened`) |
+| 5 | Non-lifecycle webhook (edited/comment) | Nothing produced on either topic |
+| 6 | Observation persistence | Rows in `engineering_events` (Postgres) |
+| 7 | Duplicate delivery | Same `delivery_id` → deduped |
+| 8 | Malformed event | → `engineering.events.normalized.dlq`, consumer healthy |
+| 9 | Postgres outage | Retry ×5 → DLQ + commit |
+| 10 | Cutover hygiene | No legitimate AFK commands in outcomes DLQ after migration |
+| 11 | Rollback drill | Reverted to `afk.events` → idempotent re-processing |
+
+Plus: topic names configurable via env vars (`AFK_EVENTS_TOPIC`, `NORMALIZED_EVENTS_TOPIC`), schema validation passes, `linked_issues` populated for develop-loop PRs/MRs.
+
 ## References
 - ADR 0003 (kafka-events-cross-repository-transport)
 - ADR 0020 (normalized-provider-event-mapping-bridge, superseded by FastAPI EDA Gateway ADR 0005)
