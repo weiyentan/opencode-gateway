@@ -1,8 +1,8 @@
 ---
 # Kubernetes Deployment for the OpenCode Gateway AFK Outcome Consumer.
 #
-# This consumer reads normalized provider webhook events from the config-driven
-# normalized-events topic (``engineering.events.normalized``) in its OWN consumer group
+# This consumer reads provider webhook events from the config-driven
+# provider-events topic (``afk.events``) in its OWN consumer group
 # (``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
 # group), maps message types to canonical engineering events, and writes
 # them to Postgres in a single transaction per message.  A scheduled
@@ -40,10 +40,10 @@ spec:
                 secretKeyRef:
                   name: opencode-gateway-secrets
                   key: kafka-brokers
-            - name: GATEWAY_NORMALIZED_EVENTS_TOPIC
-              value: "engineering.events.normalized"
-            - name: GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC
-              value: "engineering.events.normalized.dlq"
+            - name: GATEWAY_AFK_OUTCOMES_TOPIC
+              value: "afk.events"
+            - name: GATEWAY_AFK_OUTCOMES_DLQ_TOPIC
+              value: "afk.events-dlq"
             - name: GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID
               value: "opencode-outcomes"
             - name: GATEWAY_AFK_OUTCOMES_PROVIDER
