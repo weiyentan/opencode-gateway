@@ -711,10 +711,11 @@ lifecycle event, independently. An AFK-labelled issue produces two records
 
 **linked_issues**:
 The list of issue numbers extracted by the FastAPI EDA Gateway from a PR/MR
-title and description (e.g. "Implemented issues #503", "Closes #494") and
-included in the normalized ``change_request.opened`` observation to capture
-the issue↔change-request relationship for correlation. Empty for PRs/MRs that
-reference no issues.
+title and description using regex matching (e.g. "Implemented issues #503",
+"Closes #494") and included in the normalized ``change_request.opened``
+observation to capture the issue↔change-request relationship for correlation.
+The regex pattern matches ``#\d+`` references in the title and description
+body. Empty for PRs/MRs that reference no issues.
 
 **engineering.events.normalized**:
 The Kafka topic carrying normalized engineering lifecycle events

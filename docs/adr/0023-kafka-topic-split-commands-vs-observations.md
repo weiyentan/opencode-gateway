@@ -8,16 +8,16 @@ Accepted (2026-08-18)
 - Today both AFK command messages and normalized lifecycle observations share the single topic `afk.events`. The outcomes consumer receives messages it does not own, must inspect message type before processing, and routes legitimate AFK command records to the DLQ as invalid outcome records (DLQ noise).
 - A separate consumer group does NOT filter message types from one topic — every consumer group reading a topic receives every record. The topic split is the correct isolation boundary.
 - The normalized-event v1 contract is producer-owned (FastAPI EDA Gateway ADR 0005 supersedes this repo's ADR 0020) and pinned in `docs/contracts/normalized-event-v1/` (schema.json, fixtures, checksums.sha256, consumer-policy.yaml).
-- Live cluster facts: Strimzi Kafka, `auto.create.topics.enable: "false"` (topics must be explicitly provisioned), all topics RF=3, cleanup=delete, min ISR=2, 7-day retention (30-day for DLQs). `afk.events` exists (6 partitions) but is not declared in the k8s_app/kafka repo; no `afk.events-dlq` topic exists despite ADR 0003 referencing it.
+- Live cluster facts: Strimzi Kafka, `auto.create.topics.enable: "false"` (topics must be explicitly provisioned), all topics RF=3, cleanup=delete, min ISR=2, 7-day retention (30-day for DLQs). `afk.events` exists (6 partitions) but is not declared in the k8s_app/kafka repo; no `afk.events-dlq` topic declaration exists in k8s_app/kafka despite ADR 0003 referencing it.
 
 ## Decision
 1. **Two topics**: `afk.events` (actionable commands — "do something") and `engineering.events.normalized` (observable lifecycle events — "something happened").
 2. **Fan-out model**: an AFK-labelled issue produces BOTH a command on `afk.events` (EDA `event_type` vocabulary unchanged: `label`, `review_request`, `developer_request`, `review_verdict`, `pr_mr_opened`, `container_upgrade_requested`) AND an observation on `engineering.events.normalized`. Human issues/PRs/MRs produce observation only. `afk.events` carries derived commands only, never raw webhook payloads.
 3. **Consumer**: the AFK Outcome Consumer subscribes to `engineering.events.normalized` instead of `afk.events`, keeping the same failure semantics (invalid → DLQ immediately; DB errors → retry ×5 → DLQ + commit; offset committed only after successful persistence; reconcile loop unchanged as repair path).
 4. **Contract unchanged**: the producer emits provider-specific types in the normalized envelope (pull_request.opened, merge_request.opened, issue.opened, etc.); the canonical outcome vocabulary remains the consumer's internal mapping layer. `linked_issues` (extracted from PR/MR title/description) is included in `change_request.opened` observations for issue↔change-request correlation.
-5. **DLQ strategy**: declare `engineering-events-normalized.yaml` (topic `engineering.events.normalized`, 6 partitions, 7-day retention) and `engineering-events-normalized-dlq.yaml` (topic `engineering.events.normalized.dlq`, 3 partitions, 30-day retention) in `kafka-instance/` of the k8s_app/kafka repo, mirroring the `opencode-usage-v1` pattern. Also declare the missing `afk-events-dlq.yaml` (topic `afk.events.dlq`) as part of this change.
+5. **DLQ strategy**: declare `engineering-events-normalized.yaml` (topic `engineering.events.normalized`, 6 partitions, 7-day retention) and `engineering-events-normalized-dlq.yaml` (topic `engineering.events.normalized-dlq`, 3 partitions, 30-day retention) in `kafka-instance/` of the k8s_app/kafka repo, mirroring the `opencode-usage-v1` pattern. Also declare the missing `afk-events-dlq.yaml` (topic `afk.events.dlq`) as part of this change.
 6. **Configuration**: topic names via environment variables (`AFK_EVENTS_TOPIC`, `NORMALIZED_EVENTS_TOPIC`), not hardcoded.
-7. **Migration**: create topics → deploy consumer on new topic → switch producer → verify. The reconcile loop (1h cadence, 24h window) backfills the small cutover gap; no dual-write/dual-consume compatibility code. Rollback is idempotent via `delivery_log UNIQUE(provider, delivery_id)` dedup.
+7. **Migration**: create topics → deploy consumer on new topic → validate consumer health (lag trending to zero, no errors) → switch producer → verify. The reconcile loop (1h cadence, 24h window) backfills the small cutover gap; no dual-write/dual-consume compatibility code. Rollback is idempotent via `delivery_log UNIQUE(provider, delivery_id)` dedup.
 
 ## Consequences
 - Each consumer gets a clean contract: everything on `engineering.events.normalized` is a normalized lifecycle event; everything on `afk.events` is AFK orchestration.
@@ -41,7 +41,7 @@ Accepted (2026-08-18)
 | 5 | Non-lifecycle webhook (edited/comment) | Nothing produced on either topic |
 | 6 | Observation persistence | Rows in `engineering_events` (Postgres) |
 | 7 | Duplicate delivery | Same `delivery_id` → deduped |
-| 8 | Malformed event | → `engineering.events.normalized.dlq`, consumer healthy |
+| 8 | Malformed event | → `engineering.events.normalized-dlq`, consumer healthy |
 | 9 | Postgres outage | Retry ×5 → DLQ + commit |
 | 10 | Cutover hygiene | No legitimate AFK commands in outcomes DLQ after migration |
 | 11 | Rollback drill | Reverted to `afk.events` → idempotent re-processing |
