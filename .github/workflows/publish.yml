@@ -1,10 +1,11 @@
-# ── Publish Gateway, Aurora Glass, and Consumer ───────────────────────────────
+# ── Publish Gateway, Aurora Glass, and Consumers ──────────────────────────────
 # Builds and publishes separate container images for the modules that
 # together form the OpenCode Gateway observability platform:
 #
 #   Gateway      (root Dockerfile)             — Python/FastAPI REST API
 #   Aurora Glass (frontend/Dockerfile)          — browser-based telemetry dashboard
 #   Consumer     (Dockerfile.consumer)          — Kafka consumer for usage events
+#   AFK Consumer (Dockerfile.afk-consumer)      — Kafka consumer for AFK outcomes
 #
 # All images are built from the same repository revision and receive
 # identical version tags (semver, SHA) so they are always deployed together.
@@ -16,7 +17,7 @@
 # them to the Gateway ingest endpoint.
 # ──────────────────────────────────────────────────────────────────────────────
 
-name: Publish Gateway, Aurora Glass, and Consumer
+name: Publish Gateway, Aurora Glass, and Consumers
 
 on:
   push:
@@ -41,7 +42,7 @@ jobs:
       - name: Define image matrix
         id: define
         run: |
-          echo 'matrix=[{"name":"gateway","context":".","dockerfile":"Dockerfile"},{"name":"aurora-glass","context":".","dockerfile":"frontend/Dockerfile"},{"name":"consumer","context":".","dockerfile":"Dockerfile.consumer"}]' >> "$GITHUB_OUTPUT"
+          echo 'matrix=[{"name":"gateway","context":".","dockerfile":"Dockerfile"},{"name":"aurora-glass","context":".","dockerfile":"frontend/Dockerfile"},{"name":"consumer","context":".","dockerfile":"Dockerfile.consumer"},{"name":"afk-consumer","context":".","dockerfile":"Dockerfile.afk-consumer"}]' >> "$GITHUB_OUTPUT"
 
   build:
     needs: images
@@ -101,8 +102,8 @@ jobs:
           set -euo pipefail
 
           # Pre-flight: every candidate image must exist before any release tag
-          # is promoted, otherwise a missing candidate would still leave the
-          # three images on different published revisions. With `set -e`, a
+          # is promoted, otherwise a missing candidate could leave the image
+          # set on different published revisions. With `set -e`, a
           # failed inspect aborts before the first promote tag is written.
           for image in $(echo "${IMAGES_JSON}" | jq -r '.[].name'); do
             docker buildx imagetools inspect \
