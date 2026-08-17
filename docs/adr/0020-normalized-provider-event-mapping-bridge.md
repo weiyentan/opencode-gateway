@@ -4,10 +4,18 @@
 
 Superseded by FastAPI EDA Gateway ADR 0005 (2026-08-17)
 
-The producer ADR 0005 and its normalized-event artifacts are not yet present
-in the producer repository; this repository pins a consumer-side transcription
-of the producer contract in `docs/contracts/normalized-event-v1/` (see
-`docs/afk-outcome-contract-validation.md` for provenance). The flat
+The producer owns the normalized-event contract; this repository pins a
+verifiable copy of the producer-owned artifacts in
+`docs/contracts/normalized-event-v1/` (`schema.json` + 14 serializer-generated
+fixtures). The pin records the producer commit SHA in
+`docs/contracts/normalized-event-v1/producer_commit.txt`, and a deterministic
+parity mechanism — `scripts/verify_contract_checksums.sh` backed by
+`docs/contracts/normalized-event-v1/checksums.sha256` and enforced by the
+contract-matrix test suite in CI — detects any local edit or drift from the
+recorded producer artifact set (see `docs/afk-outcome-contract-validation.md`
+for provenance). Consumer-specific validation and mapping rules remain
+consumer policy, documented in
+`docs/contracts/normalized-event-v1/consumer-policy.yaml`. The flat
 `ProviderEventMessage` shape and its legacy ten-type mapping have been removed
 from the consumer (issue #497); the mapping bridge vocabulary
 (`pull_request`/`merge_request` → `change_request`) remains the canonical
@@ -17,7 +25,10 @@ outcome-layer vocabulary.
 normalized-event contract; the consumer-authored flat ``ProviderEventMessage``
 shape and its legacy ten-type mapping have been removed (issue #497).  The
 mapping bridge vocabulary (``pull_request``/``merge_request`` → ``change_request``)
-remains the canonical outcome-layer vocabulary.*
+remains the canonical outcome-layer vocabulary.  Issue #503 added a verifiable
+pin to the producer-owned artifacts (``producer_commit.txt``,
+``checksums.sha256``, ``consumer-policy.yaml``) with a deterministic parity
+mechanism (``scripts/verify_contract_checksums.sh``) enforced in CI.*
 
 ## Context
 

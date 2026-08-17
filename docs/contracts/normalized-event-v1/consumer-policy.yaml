@@ -1,0 +1,83 @@
+# Consumer-Policy Annotations — Normalized Event v1
+#
+# This companion file marks which constraints in this contract directory are
+# **producer-owned** (part of the ``fast-api-eda-gateway`` normalized-event
+# schema) and which are **consumer policy** (owned by this repository, enforced
+# by ``app/consumer/afk_consumer.py``).  It is documentation only — it is not
+# itself a producer artifact and is not covered by ``checksums.sha256``.
+
+provenance:
+  producer_repository: https://gitlab.com/prometheus-build-repository/sourcecontrollayout/containers-group/fast-api-eda-gateway
+  producer_commit_sha: "0000000000000000000000000000000000000000"  # placeholder — see producer_commit.txt
+  producer_commit_record: producer_commit.txt
+  parity_mechanism:
+    checksums_file: checksums.sha256
+    verifier_script: scripts/verify_contract_checksums.sh  # repo-root relative
+
+# ── Producer-owned schema constraints ──────────────────────────────────────────
+#
+# These constraints describe the producer's serializer output.  They are part
+# of the producer-owned contract and must not be edited here independently of
+# the producer: any change must originate in ``fast-api-eda-gateway`` and flow
+# into this directory via a contract refresh (see ``producer_commit.txt``).
+
+producer_owned:
+  - name: v1 envelope field set and nesting
+    where: schema.json (required + properties); afk_consumer.py NormalizedProviderEvent
+    detail: >-
+      The top-level envelope (schema_version, event_type, provider, delivery_id,
+      resource, action, occurred_at, ingested_at, actor, redacted_payload) and
+      the nested objects (resource{type, repository_url, number},
+      redacted_payload.reference{provider, delivery_id}) are produced by the
+      producer's build_normalized_message outbound whitelist.
+  - name: lifecycle action allowlist per resource type
+    where: schema.json (allOf clauses); afk_consumer.py _PRODUCER_ALLOWED_ACTIONS
+    detail: >-
+      The per-resource-type action allowlist is producer-owned
+      (fast-api-eda-gateway normalized_event.LIFECYCLE_ALLOWLIST):
+      issue = opened/edited/reopened/closed;
+      pull_request = opened/edited/reopened/closed/merged;
+      merge_request = opened/updated/reopened/closed/merged.
+      The consumer must not extend or narrow this vocabulary; ``_PRODUCER_ALLOWED_ACTIONS``
+      is a pinned copy, not an independent policy surface.
+  - name: "additionalProperties: false (exact-shape)"
+    where: schema.json (top level + resource + redacted_payload + reference)
+    detail: >-
+      The exact-shape constraint (reject unknown properties) is producer-owned:
+      the producer's serializer emits nothing outside the whitelisted keys.
+
+# ── Consumer-policy constraints ────────────────────────────────────────────────
+#
+# These rules are owned by the Gateway consumer.  They layer on top of the
+# producer-owned schema and are NOT part of the producer contract.  Changing
+# them is a consumer decision and does not require a producer-contract refresh.
+
+consumer_policy:
+  - name: validate_normalized_event()
+    where: app/consumer/afk_consumer.py
+    detail: >-
+      Consumer-owned defense-in-depth validation applied after parsing and
+      before mapping/persistence.  It re-checks the producer-owned
+      schema_version / event_type / resource-type / action allowlist AND
+      additionally enforces consumer policy: repository-identity normalization
+      (normalize_repository_url) and redacted_payload.reference equality with
+      the envelope.  The distinct per-violation DLQ reason strings are consumer
+      policy, not producer contract.
+  - name: mapping bridge (map_normalized_event / map_provider_event)
+    where: app/consumer/afk_consumer.py
+    detail: >-
+      Consumer policy.  Bridges the producer-native vocabulary into the outcome
+      layer's canonical vocabulary (pull_request / merge_request → change_request,
+      issue → issue; edited / updated → updated).  The producer has no concept of
+      change_request — this translation is entirely consumer-owned (ADR 0020).
+  - name: canonical event type vocabulary (_CANONICAL_EVENT_TYPES)
+    where: app/consumer/afk_consumer.py
+    detail: >-
+      Consumer policy.  The locked outcome-layer vocabulary a mapped event_type
+      must resolve to.  Derived from the producer allowlist, but owned here.
+  - name: source-action / source-resource-type provenance metadata
+    where: app/consumer/afk_consumer.py map_normalized_event
+    detail: >-
+      Consumer policy.  The event payload's source_resource_type / source_action
+      provenance fields are retained by the consumer so every valid producer
+      action is preserved even when several converge on one canonical event type.

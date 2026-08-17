@@ -1,10 +1,10 @@
 # Producer→Consumer Contract Validation
 
-**Issues**: #485 (contract pinning + replay convergence), #495 (nested v1 envelope validation)
+**Issues**: #485 (contract pinning + replay convergence), #495 (nested v1 envelope validation), #503 (producer provenance and drift detection)
 **Parent**: PRD #478 — PR/MR/Issue Ingestion and Reporting Capability (cross-repository)
 **Slice layer**: validation (builds on #482's mapping bridge + DLQ path)
 **Validator**: `code-editor-senior` (T3)
-**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497)
+**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497, #503)
 **Verdict**: **PASS** — the pinned producer contract maps cleanly through
 `map_provider_event` to the canonical outcome-layer vocabulary without DLQ
 routing; re-delivery of the same `provider + delivery_id` converges on
@@ -13,8 +13,9 @@ contract-violating payload routes to `afk.events-dlq` with the original payload
 plus a reason. The nested v1 envelope (issue #495) is validated before mapping
 with distinct DLQ reasons per violation class. Contract pinning is exercised
 with fixture normalized events and mock records driving the consumer
-`_process_message` path — not live producer emission (the cross-repo producer
-is GitLab-hosted and unreachable in this environment). Real-history validation
+`_process_message` path — not live producer emission: the pinned producer
+artifacts are exact copies from the recorded `fast-api-eda-gateway` commit
+(see §2.1), so live emission is not required here. Real-history validation
 is limited to a read-only cross-check in this environment (no docker/Postgres,
 no `GITHUB_TOKEN`) — the full live-run harness is provided in §6.
 
@@ -110,6 +111,40 @@ persisted as the repository identity.
   cross-provider parity (`merge_request` → `change_request`).
 - `test_flat_shape_is_rejected_sends_to_dlq_and_commits` — the removed flat
   shape is rejected as an invalid message shape (issue #497).
+
+## 2.1 Producer provenance and drift detection (issue #503)
+
+The pinned contract is a verifiable copy of the producer-owned artifacts, not
+an independent consumer transcription.  Its provenance is recorded and its
+integrity is enforced mechanically:
+
+- **`docs/contracts/normalized-event-v1/producer_commit.txt`** records the
+  producer repository URL
+  (`prometheus-build-repository/sourcecontrollayout/containers-group/fast-api-eda-gateway`),
+  the producer commit SHA the artifacts were copied from, the date the pin was
+  recorded, and step-by-step instructions for refreshing the pin.  The commit
+  SHA is currently a placeholder (`0000…0000`) because the producer repository
+  is not fetched from public GitHub CI without credentials (producer work item
+  #105); it is filled with the real revision when the producer artifacts are
+  finalized.
+- **`docs/contracts/normalized-event-v1/checksums.sha256`** holds the SHA-256
+  digest of every pinned artifact (`schema.json` + all 14 fixtures).
+- **`scripts/verify_contract_checksums.sh`** recomputes those digests and
+  compares them against `checksums.sha256`, exiting non-zero on any edit,
+  addition, removal, or reorder.  It depends only on coreutils
+  (`sha256sum`, `sort`) — no network and no producer access — so it runs
+  unchanged in public GitHub CI.  `--write` regenerates the checksums file
+  after a contract refresh.
+- **`tests/test_producer_to_gateway_contract_matrix.py`** enforces the parity
+  mechanism in the ordinary CI test run (`test_contract_checksums_match_pinned_digests`
+  and the script-backed drift-detection tests), so a locally edited artifact
+  fails CI rather than drifting silently.
+- **`docs/contracts/normalized-event-v1/consumer-policy.yaml`** separates
+  producer-owned schema constraints (envelope field set/nesting, the lifecycle
+  action allowlist, `additionalProperties: false`) from consumer policy
+  (`validate_normalized_event()`, the mapping bridge, the canonical event-type
+  vocabulary) so a reader can tell which rules originate with the producer and
+  which are owned by this repository.
 
 ## 3. Replay convergence & dedup guarantees
 
@@ -207,7 +242,10 @@ Full end-to-end validation against the *real* producer emission is not possible
 here for three reasons, each outside the slice's control:
 
 1. The cross-repo producer (`fast-api-eda-gateway` #100/#101/#102) is
-   GitLab-hosted and unreachable — its emission is not locally available.
+   GitLab-hosted and is not fetched in this environment — its live emission is
+   not exercised locally, so validation runs against the pinned producer
+   artifacts (recorded in `producer_commit.txt`, see §2.1) instead of live
+   emission.
 2. No docker/Postgres — the `docker-compose.test.yml` integration stack cannot
    be started, so the asyncpg-backed integration tests skip (they assert the
    skip-if-unreachable path).
@@ -337,10 +375,22 @@ the nested objects (the flat shape no longer exists):
   action/repository/reference violations), `normalize_repository_url()`,
   `NormalizedEventValidationError`.  `map_normalized_event()` persists the
   normalized repository URL and the payload reference object; the flat shape
-  has been removed (#497).
+  has been removed (#497).  Consumer-policy annotations added (#503).
 - `docs/contracts/normalized-event-v1/schema.json` + `fixtures/` — the pinned
   producer contract artifacts (14 real `(resource.type, action)` pairs).
+- `docs/contracts/normalized-event-v1/producer_commit.txt` — provenance record
+  of the producer commit the artifacts were copied from (#503).
+- `docs/contracts/normalized-event-v1/checksums.sha256` — SHA-256 digests of
+  every pinned artifact for drift detection (#503).
+- `docs/contracts/normalized-event-v1/consumer-policy.yaml` — separates
+  producer-owned schema constraints from consumer policy (#503).
+- `scripts/verify_contract_checksums.sh` — standalone parity verifier script
+  that recomputes digests and compares against `checksums.sha256` (#503).
 - `tests/test_afk_consumer.py` — nested v1 envelope tests, validation tests,
   repository URL normalization tests, DLQ reason tests, contract pinning tests.
+- `tests/test_producer_to_gateway_contract_matrix.py` — checksum-based drift
+  detection tests (`test_contract_checksums_match_pinned_digests`,
+  `test_verify_contract_checksums_script_clean_tree`,
+  `test_verify_contract_checksums_script_detects_drift`) (#503).
 - `docs/afk-outcome-contract-validation.md` — this report (updated for #495,
-  #497).
+  #497, #503).

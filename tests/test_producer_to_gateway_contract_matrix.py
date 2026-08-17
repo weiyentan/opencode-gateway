@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import json as _json_mod
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path as _Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -43,6 +47,9 @@ _CONTRACTS_DIR = (
 )
 _SCHEMA_PATH = _CONTRACTS_DIR / "schema.json"
 _FIXTURES_DIR = _CONTRACTS_DIR / "fixtures"
+_REPO_ROOT = _Path(__file__).resolve().parent.parent
+_CHECKSUMS_PATH = _CONTRACTS_DIR / "checksums.sha256"
+_VERIFIER_SCRIPT = _REPO_ROOT / "scripts" / "verify_contract_checksums.sh"
 
 # ── The complete set of allowed v1 (resource_type, action) pairs ─────────────
 
@@ -103,6 +110,18 @@ def _load_fixture(filename: str) -> dict:
 
 def _expected_fixture_filename(resource_type: str, action: str) -> str:
     return f"{resource_type}.{action}.json"
+
+
+def _parse_checksums(text: str) -> dict[str, str]:
+    """Parse a ``checksums.sha256`` file into ``{relative_path: hex_digest}``."""
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, path = line.split(None, 1)
+        result[path] = digest
+    return result
 
 
 def _mk_msg(value: dict, *, offset: int = 42, partition: int = 0) -> MagicMock:
@@ -269,6 +288,77 @@ def test_fixture_source_provenance_all_fixtures_are_valid_json() -> None:
         assert isinstance(fixture, dict), (
             f"Fixture {filename} is not a JSON object"
         )
+
+
+def test_contract_checksums_match_pinned_digests() -> None:
+    """Every pinned artifact's SHA-256 digest matches ``checksums.sha256``.
+
+    This is the CI-enforced parity mechanism (issue #503): a local edit to
+    ``schema.json`` or any fixture changes its digest and fails this test,
+    exposing drift from the recorded producer artifact set.
+    """
+    assert _CHECKSUMS_PATH.exists(), (
+        "checksums.sha256 missing — the producer contract pin is incomplete"
+    )
+
+    pinned = _parse_checksums(_CHECKSUMS_PATH.read_text(encoding="utf-8"))
+
+    expected_paths = ["schema.json"] + sorted(
+        f"fixtures/{f.name}" for f in _FIXTURES_DIR.glob("*.json")
+    )
+    computed = {
+        rel: hashlib.sha256((_CONTRACTS_DIR / rel).read_bytes()).hexdigest()
+        for rel in expected_paths
+    }
+
+    assert computed == pinned, (
+        "Drift detected: pinned artifact digests differ from checksums.sha256. "
+        "Reconcile with the producer contract, or refresh the pin with "
+        "`scripts/verify_contract_checksums.sh --write`."
+    )
+
+
+def test_verify_contract_checksums_script_clean_tree() -> None:
+    """The standalone verifier script reports a clean tree (exit 0)."""
+    if shutil.which("sha256sum") is None or os.name != "posix":
+        pytest.skip("sha256sum (coreutils) not available on this platform")
+
+    result = subprocess.run(
+        ["bash", str(_VERIFIER_SCRIPT)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"verifier script failed on a clean tree: "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+def test_verify_contract_checksums_script_detects_drift() -> None:
+    """The verifier script exits non-zero when a pinned artifact is edited."""
+    if shutil.which("sha256sum") is None or os.name != "posix":
+        pytest.skip("sha256sum (coreutils) not available on this platform")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = _Path(tmp) / "contracts"
+        shutil.copytree(_CONTRACTS_DIR, target)
+
+        # Tamper with one fixture: an edit must change its digest.
+        fixture = target / "fixtures" / "issue.opened.json"
+        tampered = fixture.read_text(encoding="utf-8").replace(
+            "test-user", "tampered-user"
+        )
+        fixture.write_text(tampered, encoding="utf-8")
+
+        result = subprocess.run(
+            ["bash", str(_VERIFIER_SCRIPT), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0, (
+            "verifier script must fail when a pinned artifact is edited"
+        )
+        assert "DRIFT DETECTED" in result.stderr
 
 
 # ══════════════════════════════════════════════════════════════════════════════

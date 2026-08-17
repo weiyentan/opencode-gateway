@@ -116,6 +116,11 @@ METRIC_LAG = "afk_consumer.lag"
 # persisted.  The fabricated review/pipeline vocabulary of the previous
 # flat-shape bridge is gone: only the producer's real allowlisted actions
 # exist here.
+#
+# CONSUMER POLICY (issue #503): this vocabulary is owned by this repository
+# (it derives from the producer allowlist but is not part of the
+# producer-owned schema) — see
+# ``docs/contracts/normalized-event-v1/consumer-policy.yaml``.
 
 _CANONICAL_EVENT_TYPES = frozenset(
     {
@@ -145,6 +150,12 @@ _ACTION_TO_CANONICAL: dict[str, str] = {
 #: Producer lifecycle allowlist per resource type, pinned from
 #: fast-api-eda-gateway ``normalized_event.LIFECYCLE_ALLOWLIST``.  The
 #: producer emits nothing outside this vocabulary.
+#:
+#: PRODUCER-OWNED (issue #503): this is a copy of the producer contract, not
+#: consumer policy.  Do not extend or narrow it here — a change must originate
+#: in the producer and flow in via a contract refresh
+#: (``docs/contracts/normalized-event-v1/producer_commit.txt`` +
+#: ``docs/contracts/normalized-event-v1/consumer-policy.yaml``).
 _PRODUCER_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
     "issue": frozenset({"opened", "edited", "reopened", "closed"}),
     "pull_request": frozenset({"opened", "edited", "reopened", "closed", "merged"}),
@@ -234,6 +245,10 @@ class NormalizedProviderEvent(BaseModel):
 # (GitHub) and ``merge_request`` (GitLab) are the *same* outcome-layer
 # concept, ``change_request`` (CONTEXT.md / ADR 0020).  ``issue`` is
 # unchanged.
+#
+# CONSUMER POLICY (issue #503): the producer has no ``change_request``
+# concept — this translation is owned by the consumer (ADR 0020), not part
+# of the producer-owned schema.
 
 _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
     "issue": EntityType.ISSUE,
@@ -247,6 +262,14 @@ _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
 # The validation boundary distinguishes valid producer lifecycle observations
 # from malformed data and unsupported versions before mapping or persistence.
 # Each violation class produces a distinct DLQ reason string.
+#
+# CONSUMER POLICY (issue #503): ``validate_normalized_event()`` is owned by
+# this repository.  It re-checks the producer-owned schema (version / event
+# type / resource type / action allowlist) AND layers on consumer policy
+# (repository-identity normalization and payload-reference equality).  The
+# producer owns the allowlist; the DLQ reasons and the extra checks are
+# consumer policy — see
+# ``docs/contracts/normalized-event-v1/consumer-policy.yaml``.
 
 _VALID_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
 
