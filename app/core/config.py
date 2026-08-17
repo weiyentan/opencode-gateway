@@ -140,11 +140,23 @@ class Settings(BaseSettings):
     # AFK outcome consumer (issue #451) — the live ingestion side of AFK
     # Outcome Observability.  Runs in its OWN Kafka consumer group
     # (``opencode-outcomes``, never the usage consumer's ``opencode-gateway``
-    # group), consuming the existing provider-events topic (external — the
+    # group), consuming the normalized provider-events topic (external — the
     # topic is not created here) and mapping message types to canonical
     # engineering events.  Terminal states the topic does not carry
     # (merged/closed) are converged by a scheduled reconciliation loop that
     # reuses the backfill engine over a bounded window.
+    #
+    # ``normalized_events_topic`` (issue #507): the topic the AFK Outcome
+    # Consumer subscribes to for normalized provider events.  Defaults to
+    # ``engineering.events.normalized``.  Maps to
+    # GATEWAY_NORMALIZED_EVENTS_TOPIC.
+    normalized_events_topic: str = "engineering.events.normalized"
+    normalized_events_dlq_topic: str = "engineering.events.normalized.dlq"
+
+    # ``afk_outcomes_topic`` (retained for any remaining command consumption):
+    # the legacy ``afk.events`` topic.  The AFK Outcome Consumer no longer
+    # subscribes to this topic by default; it is kept for backward
+    # compatibility and any remaining command consumption.
     afk_outcomes_topic: str = "afk.events"
     afk_outcomes_dlq_topic: str = "afk.events-dlq"
     afk_outcomes_consumer_group_id: str = "opencode-outcomes"
