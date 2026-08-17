@@ -43,7 +43,6 @@ from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.consumer.afk_consumer import (
     AFKOutcomeConsumer,
     NormalizedProviderEvent,
-    ProviderEventMessage,
     map_normalized_event,
     map_provider_event,
 )
@@ -384,14 +383,20 @@ async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.P
     merged_at = now - timedelta(hours=12)
 
     # Live path: a producer-forwarded merge event for change_request:300.
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id="delivery-cross-path-live",
-        type="change_request.merged",
-        repository=REPOSITORY,
-        number=300,
-        occurred_at=merged_at,
-        actor="carol",
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-cross-path-live",
+            "resource_type": "pull_request",
+            "resource_id": "300",
+            "repository": REPOSITORY,
+            "action": "merged",
+            "occurred_at": _iso(merged_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-300",
+        }
     )
     mapped = map_provider_event(message)
     assert mapped is not None
@@ -451,14 +456,20 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
     live_at = now - timedelta(hours=12)
     backfill_at = now - timedelta(hours=12, seconds=5)  # 5 seconds later
 
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id="delivery-cross-path-live",
-        type="change_request.merged",
-        repository=REPOSITORY,
-        number=300,
-        occurred_at=live_at,
-        actor="carol",
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-cross-path-live",
+            "resource_type": "pull_request",
+            "resource_id": "300",
+            "repository": REPOSITORY,
+            "action": "merged",
+            "occurred_at": _iso(live_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-300",
+        }
     )
     mapped = map_provider_event(message)
     assert mapped is not None
@@ -686,3 +697,256 @@ async def test_redelivery_creates_no_duplicate_rows_across_full_path(
     assert delivery_count == 1
     assert delivery_provider == "github"
     assert event_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer: map and persist every valid normalized lifecycle event (#496)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_normalized_edited_persists_as_canonical_updated(db_pool: asyncpg.Pool) -> None:
+    """A normalized ``pull_request.edited`` bridges to ``change_request.updated``
+    with source provenance retained."""
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    edited_at = now - timedelta(hours=6)
+
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-normalized-edited",
+            "resource_type": "pull_request",
+            "resource_id": "500",
+            "repository": REPOSITORY,
+            "action": "edited",
+            "occurred_at": _iso(edited_at),
+            "ingested_at": _iso(now),
+            "actor": "alice",
+            "payload_ref": "redacted-payload-ref-500",
+        }
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.updated"
+    assert event.payload.get("source_resource_type") == "pull_request"
+    assert event.payload.get("source_action") == "edited"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-normalized-edited",
+            entity=entity,
+            event=event,
+        )
+
+        row = await conn.fetchrow(
+            "SELECT entity_type, event_type, external_id, payload "
+            "FROM engineering_events "
+            "WHERE event_type = 'change_request.updated' AND external_id = '500'"
+        )
+        assert row is not None
+        assert row["entity_type"] == "change_request"
+        assert row["event_type"] == "change_request.updated"
+        assert row["external_id"] == "500"
+        payload = row["payload"]
+        assert payload.get("source_resource_type") == "pull_request"
+        assert payload.get("source_action") == "edited"
+        assert payload.get("payload_ref") == "redacted-payload-ref-500"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_normalized_reopened_persists_as_canonical_reopened(db_pool: asyncpg.Pool) -> None:
+    """A normalized ``issue.reopened`` bridges to ``issue.reopened``."""
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    reopened_at = now - timedelta(hours=3)
+
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-normalized-reopened",
+            "resource_type": "issue",
+            "resource_id": "501",
+            "repository": REPOSITORY,
+            "action": "reopened",
+            "occurred_at": _iso(reopened_at),
+            "ingested_at": _iso(now),
+            "actor": "bob",
+            "payload_ref": "redacted-payload-ref-501",
+        }
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.ISSUE
+    assert event.event_type == "issue.reopened"
+    assert event.payload.get("source_resource_type") == "issue"
+    assert event.payload.get("source_action") == "reopened"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-normalized-reopened",
+            entity=entity,
+            event=event,
+        )
+
+        row = await conn.fetchrow(
+            "SELECT entity_type, event_type, external_id "
+            "FROM engineering_events "
+            "WHERE event_type = 'issue.reopened' AND external_id = '501'"
+        )
+        assert row is not None
+        assert row["entity_type"] == "issue"
+        assert row["event_type"] == "issue.reopened"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_normalized_updated_redelivery_is_idempotent(db_pool: asyncpg.Pool) -> None:
+    """Redelivery of a normalized ``pull_request.updated`` does not duplicate
+    engineering events."""
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    updated_at = now - timedelta(hours=4)
+
+    message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-updated-redelivery",
+            "resource_type": "pull_request",
+            "resource_id": "502",
+            "repository": REPOSITORY,
+            "action": "updated",
+            "occurred_at": _iso(updated_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-502",
+        }
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    entity, event = mapped
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        # First delivery.
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-updated-redelivery",
+            entity=entity,
+            event=event,
+        )
+        # Redelivery — same delivery_id.
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-updated-redelivery",
+            entity=entity,
+            event=event,
+        )
+
+        delivery_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM delivery_log "
+            "WHERE delivery_id = 'delivery-updated-redelivery'"
+        )
+        event_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM engineering_events "
+            "WHERE event_type = 'change_request.updated' AND external_id = '502'"
+        )
+        assert delivery_count == 1
+        assert event_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_late_event_with_older_occurred_at_enriches_trail(db_pool: asyncpg.Pool) -> None:
+    """A late event with an older ``occurred_at`` enriches the trail without
+    regressing newer lifecycle state.
+
+    The ``engineering_events`` identity key includes ``occurred_at``, so a
+    late event with a different (older) timestamp is a distinct row — it
+    enriches the trail rather than overwriting the newer event.
+    """
+    now = datetime.now(timezone.utc)  # noqa: UP017
+    newer_at = now - timedelta(hours=2)
+    older_at = now - timedelta(hours=6)
+
+    # First: a newer updated event arrives.
+    newer_message = NormalizedProviderEvent.model_validate(
+        {
+            "schema_version": "1.0",
+            "provider": "github",
+            "delivery_id": "delivery-late-newer",
+            "resource_type": "pull_request",
+            "resource_id": "503",
+            "repository": REPOSITORY,
+            "action": "updated",
+            "occurred_at": _iso(newer_at),
+            "ingested_at": _iso(now),
+            "actor": "carol",
+            "payload_ref": "redacted-payload-ref-503-newer",
+        }
+    )
+    mapped_newer = map_normalized_event(newer_message)
+    assert mapped_newer is not None
+    entity_newer, event_newer = mapped_newer
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-late-newer",
+            entity=entity_newer,
+            event=event_newer,
+        )
+
+        # Second: a late event with an older occurred_at arrives.
+        older_message = NormalizedProviderEvent.model_validate(
+            {
+                "schema_version": "1.0",
+                "provider": "github",
+                "delivery_id": "delivery-late-older",
+                "resource_type": "pull_request",
+                "resource_id": "503",
+                "repository": REPOSITORY,
+                "action": "updated",
+                "occurred_at": _iso(older_at),
+                "ingested_at": _iso(now),
+                "actor": "alice",
+                "payload_ref": "redacted-payload-ref-503-older",
+            }
+        )
+        mapped_older = map_normalized_event(older_message)
+        assert mapped_older is not None
+        entity_older, event_older = mapped_older
+
+        await repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-late-older",
+            entity=entity_older,
+            event=event_older,
+        )
+
+        # Both events exist — the late event enriched the trail.
+        rows = await conn.fetch(
+            "SELECT occurred_at, actor, payload->>'payload_ref' AS payload_ref "
+            "FROM engineering_events "
+            "WHERE external_id = '503' "
+            "ORDER BY occurred_at"
+        )
+        assert len(rows) == 2
+        # Older event is first.
+        assert rows[0]["occurred_at"] == older_at
+        assert rows[0]["actor"] == "alice"
+        assert rows[0]["payload_ref"] == "redacted-payload-ref-503-older"
+        # Newer event is second.
+        assert rows[1]["occurred_at"] == newer_at
+        assert rows[1]["actor"] == "carol"
+        assert rows[1]["payload_ref"] == "redacted-payload-ref-503-newer"

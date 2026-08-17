@@ -39,8 +39,8 @@ from app.core.identity import hash_token
 from app.core.reporting_aggregates import (
     ResourceIdentity,
     get_aggregate,
-    normalize_repository_url,
 )
+from app.core.repository import normalize_repository_url
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"

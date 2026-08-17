@@ -35,9 +35,9 @@ from app.core.reporting_aggregates import (
     enrich_aggregate,
     forward_merge,
     is_newer,
-    normalize_repository_url,
     resource_identity_from_payload,
 )
+from app.core.repository import normalize_repository_url
 from tests.conftest import mock_row
 
 UTC = timezone.utc
@@ -65,7 +65,7 @@ def _delivery(
 def _identity(resource_number: str = "42") -> ResourceIdentity:
     return ResourceIdentity(
         provider="github",
-        repository_url="https://github.com/acme/backend",
+        repository_url="github.com/Acme/Backend",
         resource_type="issue",
         resource_number=resource_number,
     )
@@ -104,12 +104,73 @@ def test_identity_extracts_and_normalizes_resource() -> None:
     )
     assert identity is not None
     assert identity.provider == "github"
-    assert identity.repository_url == "https://github.com/acme/backend"
+    assert identity.repository_url == "github.com/Acme/Backend"
     assert identity.resource_type == "issue"
     assert identity.resource_number == "42"
     assert (
         identity.composite_key
-        == "github:https://github.com/acme/backend:issue:42"
+        == "github:github.com/Acme/Backend:issue:42"
+    )
+
+
+def test_identity_maps_pull_request_to_change_request() -> None:
+    identity = resource_identity_from_payload(
+        {
+            "resource": {
+                "repository_url": "https://github.com/acme/backend",
+                "resource_type": "pull_request",
+                "resource_number": "42",
+            }
+        },
+        provider="github",
+    )
+    assert identity is not None
+    assert identity.resource_type == "change_request"
+
+
+def test_identity_maps_merge_request_to_change_request() -> None:
+    identity = resource_identity_from_payload(
+        {
+            "resource": {
+                "repository_url": "https://gitlab.com/acme/frontend",
+                "resource_type": "merge_request",
+                "resource_number": "7",
+            }
+        },
+        provider="gitlab",
+    )
+    assert identity is not None
+    assert identity.resource_type == "change_request"
+
+
+def test_identity_keeps_issue_unchanged() -> None:
+    identity = resource_identity_from_payload(
+        {
+            "resource": {
+                "repository_url": "https://github.com/acme/backend",
+                "resource_type": "issue",
+                "resource_number": "1",
+            }
+        },
+        provider="github",
+    )
+    assert identity is not None
+    assert identity.resource_type == "issue"
+
+
+def test_identity_returns_none_for_unknown_resource_type() -> None:
+    assert (
+        resource_identity_from_payload(
+            {
+                "resource": {
+                    "repository_url": "https://github.com/acme/backend",
+                    "resource_type": "unknown_type",
+                    "resource_number": "42",
+                }
+            },
+            provider="github",
+        )
+        is None
     )
 
 
@@ -140,10 +201,16 @@ def test_identity_returns_none_when_resource_malformed() -> None:
 
 
 def test_normalize_repository_url_lowercases_and_strips_trailing_slash() -> None:
+    # Hostname is lowercased; path preserves original case (mirrors afk_consumer).
     assert normalize_repository_url("https://github.com/Acme/Backend/") == (
-        "https://github.com/acme/backend"
+        "github.com/Acme/Backend"
     )
-    assert normalize_repository_url("HTTPS://EXAMPLE.COM/") == "https://example.com"
+    assert normalize_repository_url("HTTPS://EXAMPLE.COM/Repo") == "example.com/Repo"
+    assert normalize_repository_url("https://github.com/acme/backend.git") == (
+        "github.com/acme/backend"
+    )
+    assert normalize_repository_url("") is None
+    assert normalize_repository_url("not-a-url") is None
 
 
 # ── Advisory lock key ────────────────────────────────────────────────────────
@@ -443,7 +510,7 @@ async def test_enrich_inserts_when_aggregate_absent(mock_conn: AsyncMock) -> Non
     # positional: sql, provider, repository_url, resource_type, resource_number,
     #            last_occurred_at, last_delivery_id, payload, key_provenance
     assert args[1] == "github"
-    assert args[2] == "https://github.com/acme/backend"
+    assert args[2] == "github.com/Acme/Backend"
     assert args[3] == "issue"
     assert args[4] == "42"
     assert args[5] == _T1

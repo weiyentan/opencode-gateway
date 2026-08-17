@@ -10,7 +10,9 @@ Semantics (ADR 0018):
 - **Stable identity** — an aggregate is keyed by the composite
   ``provider:repository_url:resource_type:resource_number``, sourced from a
   delivery's ``resource`` object.  ``repository_url`` is normalized
-  (lowercased, trailing slash stripped) so the insert and query paths agree.
+  (lowercased hostname, trailing slash stripped, ``.git`` suffix removed)
+  so the insert and query paths agree, and the reporting and outcome
+  pipelines produce the same normalized repository identity.
 - **Forward-only merge (per-key provenance)** — a newer event's non-null
   values overwrite; a stale (late) event fills only keys absent from the
   stored payload and never regresses state already set by a newer event.
@@ -55,24 +57,29 @@ from typing import Any
 
 import asyncpg
 
+from app.core.repository import normalize_repository_url
 from app.core.schemas.reporting import ReportingDeliveryIn
 from app.core.secrets import redact_dict
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Canonical resource-type mapping (mirrors app/consumer/afk_consumer.py)
+# ---------------------------------------------------------------------------
+# The producer's resource types are provider-specific: ``pull_request``
+# (GitHub) and ``merge_request`` (GitLab) are the *same* reporting-layer
+# concept, ``change_request``.  ``issue`` is unchanged.  The mapping is
+# explicit and additive — it never reinterprets unknown types.
+
+_RESOURCE_TYPE_TO_CANONICAL: dict[str, str] = {
+    "issue": "issue",
+    "pull_request": "change_request",
+    "merge_request": "change_request",
+}
+
+# ---------------------------------------------------------------------------
 # Stable resource identity
 # ---------------------------------------------------------------------------
-
-
-def normalize_repository_url(repository_url: str) -> str:
-    """Normalize a repository URL: lowercase and strip trailing slashes.
-
-    Applied identically on both insert and query paths so a URL written as
-    ``https://github.com/Acme/Backend/`` and queried as
-    ``https://github.com/acme/backend`` resolve to the same aggregate.
-    """
-    return repository_url.strip().lower().rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,10 @@ def resource_identity_from_payload(
     raises — when the payload is malformed or the ``resource`` object is
     absent/incomplete, so the caller can skip enrichment without rejecting
     the delivery (immutable fact).
+
+    Producer resource types (``pull_request``, ``merge_request``) are
+    mapped to the canonical ``change_request`` type, mirroring the outcome
+    consumer's ``_RESOURCE_TYPE_TO_ENTITY_TYPE`` mapping.
     """
     if not isinstance(payload, Mapping) or not provider:
         return None
@@ -128,6 +139,12 @@ def resource_identity_from_payload(
     resource_type = resource.get("resource_type")
     if not isinstance(resource_type, str) or not resource_type.strip():
         return None
+    resource_type = resource_type.strip()
+
+    # Map producer resource types to canonical reporting types.
+    canonical_type = _RESOURCE_TYPE_TO_CANONICAL.get(resource_type)
+    if canonical_type is None:
+        return None
 
     resource_number = resource.get("resource_number")
     if resource_number is None or isinstance(resource_number, bool):
@@ -140,7 +157,7 @@ def resource_identity_from_payload(
     return ResourceIdentity(
         provider=str(provider),
         repository_url=repository_url,
-        resource_type=resource_type.strip(),
+        resource_type=canonical_type,
         resource_number=resource_number.strip(),
     )
 

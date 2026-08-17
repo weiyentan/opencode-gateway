@@ -1,22 +1,22 @@
-# Producer→Consumer Contract & Replay Convergence — Validation (#485)
+# Producer→Consumer Contract Validation
 
-**Issue**: #485 — End-to-end + contract validation: producer/consumer contract
-pinning and replay convergence
+**Issues**: #485 (contract pinning + replay convergence), #495 (nested v1 envelope validation)
 **Parent**: PRD #478 — PR/MR/Issue Ingestion and Reporting Capability (cross-repository)
 **Slice layer**: validation (builds on #482's mapping bridge + DLQ path)
 **Validator**: `code-editor-senior` (T3)
-**Date**: 2026-08-16
+**Date**: 2026-08-16 (updated 2026-08-17 for #495, #497)
 **Verdict**: **PASS** — the pinned producer contract maps cleanly through
 `map_provider_event` to the canonical outcome-layer vocabulary without DLQ
 routing; re-delivery of the same `provider + delivery_id` converges on
 identical `delivery_log`/`engineering_events` rows regardless of order; and a
 contract-violating payload routes to `afk.events-dlq` with the original payload
-plus a reason. Contract pinning is exercised with fixture normalized events and
-mock records driving the consumer `_process_message` path — not live producer
-emission (the cross-repo producer is GitLab-hosted and unreachable in this
-environment). Real-history validation is limited to a read-only cross-check in
-this environment (no docker/Postgres, no `GITHUB_TOKEN`) — the full live-run
-harness is provided in §6.
+plus a reason. The nested v1 envelope (issue #495) is validated before mapping
+with distinct DLQ reasons per violation class. Contract pinning is exercised
+with fixture normalized events and mock records driving the consumer
+`_process_message` path — not live producer emission (the cross-repo producer
+is GitLab-hosted and unreachable in this environment). Real-history validation
+is limited to a read-only cross-check in this environment (no docker/Postgres,
+no `GITHUB_TOKEN`) — the full live-run harness is provided in §6.
 
 ---
 
@@ -39,6 +39,9 @@ re-delivery converges without duplicates. This slice locks that contract down:
    payload routes to the DLQ with the original payload + a reason.
 5. **Real-history validation** is performed read-only (§5) with the full
    live-run harness documented for environments with docker + credentials (§6).
+6. **Nested v1 envelope validation** (issue #495, §7) validates the shipped
+   nested envelope before mapping or persistence, with distinct DLQ reasons
+   per violation class.
 
 ## 2. The pinned producer→consumer contract
 
@@ -46,6 +49,8 @@ The producer (`fast-api-eda-gateway` #97–#102) emits a normalized,
 schema-versioned event on the `afk.events` topic. The contract is pinned by
 `PRODUCER_CONTRACT_EVENT` in `tests/test_afk_consumer.py` and enforced by
 `NormalizedProviderEvent` (ADR 0020):
+
+### Flat shape (issue #482, backward-compatible)
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -61,10 +66,37 @@ schema-versioned event on the `afk.events` topic. The contract is pinned by
 | `actor` | `str \| None` | Acting principal login |
 | `payload_ref` | `str \| None` | *Reference* to the redacted payload — never the payload itself |
 
+### Nested v1 shape (issue #495)
+
+The v1 nested envelope wraps resource fields in a `resource` object and the
+payload reference in a `redacted_payload` object:
+
+```json
+{
+  "schema_version": "1.0",
+  "provider": "github",
+  "delivery_id": "...",
+  "occurred_at": "2026-08-15T10:00:00Z",
+  "ingested_at": "2026-08-15T10:00:01Z",
+  "actor": "test-user",
+  "resource": {
+    "resource_type": "pull_request",
+    "resource_id": "200",
+    "repository": "https://github.com/owner/repo",
+    "action": "merged"
+  },
+  "redacted_payload": {
+    "reference": "redacted-payload-ref-200",
+    "provider": "github",
+    "delivery_id": "..."
+  }
+}
+```
+
 The bridge maps `resource_type` → canonical `entity_type`
 (`issue` → `issue`; `pull_request`/`merge_request` → `change_request`) and
 `action` → the canonical event-type suffix, validating the result against the
-locked ten-type vocabulary (`_MAPPED_EVENT_TYPES`). An unknown `resource_type`
+locked canonical vocabulary (`_CANONICAL_EVENT_TYPES`). An unknown `resource_type`
 or an `action` that does not resolve to a canonical event type is unmappable.
 
 ### Pinned by tests
@@ -119,13 +151,16 @@ Postgres (port 5433), following the existing skip-if-unreachable pattern.
 
 A payload that violates the contract routes to the `afk.events-dlq` topic and is
 **never persisted**, so a poison message cannot block the consumer group. The
-three violation classes and their DLQ handling:
+violation classes and their DLQ handling:
 
 | Violation | Detection | DLQ payload | Reason |
 |---|---|---|---|
 | Bad JSON | `json.loads` fails | `{"raw": <bytes>}` | `JSON decode failure: <error>` |
-| Bad shape | Pydantic `model_validate` fails (neither legacy nor normalized shape) | original dict | `Invalid message shape — failed Pydantic validation` |
+| Bad shape | Pydantic `model_validate` fails (not a valid normalized event shape) | original dict | `Invalid message shape — failed Pydantic validation` |
 | Unmappable | `map_provider_event` returns `None` (unknown `resource_type` or non-canonical `action`) | original dict | `Unmappable message type: '<resource_type>.<action>'` |
+| Unsupported schema version | `schema_version` not in `{"1.0"}` | original dict | `Unsupported schema version: '<version>' (supported: ['1.0'])` |
+| Invalid repository identity | `normalize_repository_url` returns `None` (nested shape only) | original dict | `Invalid repository identity: '<url>' — must be an absolute HTTP(S) URL with a valid hostname and path` |
+| Reference mismatch | `redacted_payload.provider` ≠ envelope `provider` or `redacted_payload.delivery_id` ≠ envelope `delivery_id` | original dict | `Reference mismatch: redacted_payload.<field>=<value> != envelope.<field>=<value>` |
 
 Every DLQ publish carries the `{original_topic, reason, payload}` envelope
 (`_send_to_dlq`) and the offset is committed only **after** the publish succeeds
@@ -139,6 +174,12 @@ replay or triage it.
   normalized action is DLQ'd with the full original payload + reason, nothing persisted.
 - `test_contract_violation_bad_json_routes_to_dlq_with_raw_payload` — a non-JSON
   body is DLQ'd carrying the raw bytes + a reason.
+- `test_unsupported_schema_version_routes_to_dlq` — an unsupported schema version
+  is DLQ'd with a distinct reason.
+- `test_invalid_repository_identity_routes_to_dlq` — an invalid repository URL
+  is DLQ'd with a distinct reason.
+- `test_reference_mismatch_routes_to_dlq` — a reference mismatch is DLQ'd with
+  a distinct reason.
 
 ## 5. Real-history validation
 
@@ -206,14 +247,90 @@ GITHUB_TOKEN=<token> python scripts/afk_backfill.py \
 docker compose -f docker-compose.test.yml down -v
 ```
 
-## 7. Files changed
+## 7. Nested v1 envelope validation (issue #495)
 
-- `tests/test_afk_consumer.py` — producer-contract pinning + contract-violation
-  DLQ-envelope tests (unit, mocked Kafka + asyncpg).
-- `tests/integration/test_afk_consumer.py` — e2e replay-convergence +
-  redelivery tests driving the full consumer path (skip-guarded on Postgres).
-- `docs/afk-outcome-contract-validation.md` — this report.
+### 7.1 Validation boundary
 
-No changes to `app/consumer/*`, migrations, or `afk_outcomes/*` — the pinned
-contract was already satisfied by the #482 mapping bridge; no consumer gap was
-found.
+The `validate_normalized_event()` function (in `app/consumer/afk_consumer.py`)
+is called by `_process_message` after parsing a `NormalizedProviderEvent` but
+before mapping or persistence. It raises `NormalizedEventValidationError` with
+a distinct reason string for each violation class:
+
+1. **Unsupported schema version** — `schema_version` is not `"1.0"`.
+2. **Invalid repository identity** — the repository URL in the nested
+   `resource` object cannot be normalized to a valid identity (not an absolute
+   HTTP(S) URL, empty hostname, or no path). Only applied to the nested v1
+   shape; flat-shape `owner/repo` strings are not validated as URLs.
+3. **Reference mismatch** — `redacted_payload.provider` ≠ envelope `provider`
+   or `redacted_payload.delivery_id` ≠ envelope `delivery_id`. Null values in
+   `redacted_payload` are not checked (no mismatch).
+
+### 7.2 Repository URL normalization
+
+`normalize_repository_url()` derives repository identity strictly from the
+producer repository URL:
+
+- Require absolute HTTP(S) — reject non-HTTP schemes and relative URLs.
+- Lowercase the hostname.
+- Remove credentials (userinfo), query strings, and fragments.
+- Strip default ports (80 for http, 443 for https); preserve non-default ports.
+- Strip a trailing slash.
+- Strip a terminal `.git` suffix.
+- Preserve path spelling (case-sensitive).
+- Reject empty or invalid identity (returns `None`).
+
+Credentials, query strings, and fragments cannot become part of repository
+identity.
+
+### 7.3 Effective properties
+
+`NormalizedProviderEvent` exposes `effective_*` properties that resolve from
+the nested objects when present, falling back to flat fields for backward
+compatibility:
+
+- `effective_resource_type` — `resource.resource_type` or `resource_type`
+- `effective_resource_id` — `resource.resource_id` or `resource_id`
+- `effective_repository` — `resource.repository` or `repository`
+- `effective_action` — `resource.action` or `action`
+- `effective_payload_ref` — `redacted_payload.reference` or `payload_ref`
+
+### 7.4 Pinned by tests
+
+- `test_nested_v1_envelope_parses_through_normalized_provider_event` — the
+  nested shape parses through the real serializer.
+- `test_nested_v1_envelope_effective_properties` — effective properties resolve
+  from nested objects.
+- `test_nested_v1_envelope_maps_to_canonical` — the nested shape maps to the
+  canonical outcome-layer vocabulary.
+- `test_validate_accepts_v1_schema_version` — schema version `"1.0"` passes.
+- `test_validate_rejects_unsupported_schema_version` — unsupported versions
+  raise `NormalizedEventValidationError`.
+- `test_validate_rejects_provider_mismatch` — reference mismatch on provider.
+- `test_validate_rejects_delivery_id_mismatch` — reference mismatch on delivery_id.
+- `test_validate_rejects_invalid_repository_identity` — invalid URL rejected.
+- `test_normalize_repository_url` — parametrized normalization rules.
+- `test_normalize_repository_url_rejects_invalid` — parametrized rejection cases.
+- `test_normalize_repository_url_credentials_not_in_identity` — credentials
+  stripped.
+- `test_each_violation_class_produces_distinct_dlq_reason` — distinct reasons
+  per violation class.
+- `test_nested_v1_event_passes_validation_and_persists` — valid nested event
+  persists without DLQ.
+- `test_unsupported_schema_version_routes_to_dlq` — consumer path DLQ routing.
+- `test_invalid_repository_identity_routes_to_dlq` — consumer path DLQ routing.
+- `test_reference_mismatch_routes_to_dlq` — consumer path DLQ routing.
+- `test_every_pinned_fixture_passes_validation` — all pinned fixtures validate.
+- `test_every_pinned_fixture_maps_without_dlq` — all pinned fixtures map.
+- `test_flat_shape_still_accepted_for_backward_compat` — flat shape still works.
+- `test_all_violation_classes_have_distinct_reason_prefixes` — distinct prefixes.
+
+## 8. Files changed
+
+- `app/consumer/afk_consumer.py` — `NormalizedProviderEvent` model (nested
+  `resource` and `redacted_payload` objects with effective properties),
+  `validate_normalized_event()`, `normalize_repository_url()`,
+  `NormalizedEventValidationError`. Updated `map_normalized_event()` and
+  `_process_message()` to use effective properties and call validation.
+- `tests/test_afk_consumer.py` — nested v1 envelope tests, validation tests,
+  repository URL normalization tests, DLQ reason tests, contract pinning tests.
+- `docs/afk-outcome-contract-validation.md` — this report (updated for #495).

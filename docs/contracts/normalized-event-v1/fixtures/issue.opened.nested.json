@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "provider": "github",
+  "delivery_id": "00000000-0000-0000-0000-000000000099",
+  "occurred_at": "2026-08-15T10:00:00Z",
+  "ingested_at": "2026-08-15T10:00:01Z",
+  "resource": {
+    "resource_type": "issue",
+    "resource_id": "999",
+    "repository": "https://github.com/owner/repo",
+    "action": "opened"
+  },
+  "redacted_payload": {
+    "reference": "redacted-payload-ref-999",
+    "provider": "github",
+    "delivery_id": "00000000-0000-0000-0000-000000000099"
+  }
+}

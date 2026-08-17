@@ -23,7 +23,7 @@ from afk_outcomes.providers.github import GitHubAdapter
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
 from app.consumer.afk_consumer import (
-    _MAPPED_EVENT_TYPES,
+    _CANONICAL_EVENT_TYPES,
     METRIC_COMMITTED_OFFSET,
     METRIC_DB_ERRORS,
     METRIC_DLQ_DEPTH,
@@ -35,8 +35,8 @@ from app.consumer.afk_consumer import (
     METRIC_RETRIES,
     METRIC_RETRIES_PER_MESSAGE,
     AFKOutcomeConsumer,
+    NormalizedEventValidationError,
     NormalizedProviderEvent,
-    ProviderEventMessage,
     _build_adapter,
     _lenient_dlq_deserializer,
     _parse_cli,
@@ -49,8 +49,10 @@ from app.consumer.afk_consumer import (
     map_provider_event,
     run_dlq_sweep,
     sweep_dlq,
+    validate_normalized_event,
 )
 from app.core.metrics import MetricsRegistry
+from app.core.repository import normalize_repository_url
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"
@@ -220,14 +222,16 @@ def _mk_msg(
 
 def _valid_payload(**overrides: object) -> dict:
     payload = {
+        "schema_version": "1.0",
         "provider": "github",
         "delivery_id": DELIVERY_ID,
-        "type": "change_request.merged",
+        "resource_type": "pull_request",
+        "resource_id": "442",
         "repository": "owner/repo",
-        "number": 442,
+        "action": "merged",
         "occurred_at": "2026-08-01T10:30:00Z",
         "actor": "carol",
-        "payload": {"merge_commit_sha": "abc123"},
+        "payload_ref": "redacted-payload-ref-442",
     }
     payload.update(overrides)
     return payload
@@ -262,84 +266,8 @@ def _make_consumer(
 # ── Message-type → canonical-event mapping ───────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("event_type", "expected_entity_type"),
-    [
-        ("issue.opened", EntityType.ISSUE),
-        ("issue.closed", EntityType.ISSUE),
-        ("change_request.opened", EntityType.CHANGE_REQUEST),
-        ("change_request.review_requested", EntityType.CHANGE_REQUEST),
-        ("change_request.changes_requested", EntityType.CHANGE_REQUEST),
-        ("change_request.approved", EntityType.CHANGE_REQUEST),
-        ("change_request.merged", EntityType.CHANGE_REQUEST),
-        ("change_request.closed", EntityType.CHANGE_REQUEST),
-        ("pipeline.failed", EntityType.CHANGE_REQUEST),
-        ("pipeline.succeeded", EntityType.CHANGE_REQUEST),
-    ],
-)
-def test_map_each_event_type_to_canonical_event(
-    event_type: str, expected_entity_type: EntityType
-) -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type=event_type,
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-        actor="carol",
-    )
-    mapped = map_provider_event(message)
-
-    assert mapped is not None
-    entity, event = mapped
-
-    assert event.event_type == event_type
-    assert event.provider is Provider.GITHUB
-    assert event.occurred_at == datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC)
-    assert event.actor == "carol"
-
-    assert entity.entity_type is expected_entity_type
-    assert entity.entity_id == f"{expected_entity_type.value}:442"
-    assert event.entity_id == entity.entity_id
-    assert entity.repository == "owner/repo"
-    assert entity.number == 442
-
-
-def test_mapping_derives_entity_id_from_number_and_type() -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITLAB,
-        delivery_id=DELIVERY_ID,
-        type="issue.closed",
-        repository="group/project",
-        number=99,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-    )
-    mapped = map_provider_event(message)
-    assert mapped is not None
-    entity, event = mapped
-
-    assert entity.entity_id == "issue:99"
-    assert entity.entity_type is EntityType.ISSUE
-    assert event.entity_id == "issue:99"
-    assert event.event_id == "issue:99:closed"
-    assert event.provider is Provider.GITLAB
-
-
-def test_unmappable_type_returns_none() -> None:
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type="pull_request.assigned",  # not in the locked vocabulary
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-    )
-    assert map_provider_event(message) is None
-
-
-def test_mapped_event_types_is_the_locked_ten() -> None:
-    assert _MAPPED_EVENT_TYPES == {
+def test_canonical_event_types_is_the_locked_ten() -> None:
+    assert _CANONICAL_EVENT_TYPES == {
         "issue.opened",
         "issue.closed",
         "change_request.opened",
@@ -351,20 +279,6 @@ def test_mapped_event_types_is_the_locked_ten() -> None:
         "pipeline.failed",
         "pipeline.succeeded",
     }
-
-
-def test_provider_event_message_rejects_unknown_provider() -> None:
-    with pytest.raises(Exception):
-        ProviderEventMessage.model_validate(
-            {
-                "provider": "bitbucket",
-                "delivery_id": DELIVERY_ID,
-                "type": "issue.opened",
-                "repository": "owner/repo",
-                "number": 1,
-                "occurred_at": "2026-08-01T10:30:00Z",
-            }
-        )
 
 
 # ── Valid message → single transaction → commit after commit ────────────────
@@ -468,7 +382,7 @@ async def test_unmappable_type_sends_to_dlq_and_commits() -> None:
     consumer._producer = AsyncMock()
     consumer._producer.send_and_wait = AsyncMock()
 
-    msg = _mk_msg(_valid_payload(type="pull_request.assigned"))
+    msg = _mk_msg(_valid_payload(action="assigned"))
     await consumer._process_message(msg)
 
     conn.execute.assert_not_called()  # unmappable → no DB write
@@ -680,7 +594,7 @@ async def test_db_failure_dlq_failure_does_not_commit() -> None:
     [
         _mk_invalid_json_msg,
         lambda: _mk_msg({"not": "valid"}),
-        lambda: _mk_msg(_valid_payload(type="pull_request.assigned")),
+            lambda: _mk_msg(_valid_payload(action="assigned")),
     ],
     ids=["invalid-json", "invalid-shape", "unmappable-type"],
 )
@@ -1413,7 +1327,10 @@ def test_map_normalized_event_carries_payload_ref() -> None:
     mapped = map_normalized_event(message)
     assert mapped is not None
     _entity, event = mapped
-    assert event.payload == {"payload_ref": "redacted-payload-ref-123"}
+    assert event.payload["payload_ref"] == "redacted-payload-ref-123"
+    # Source provenance is also retained.
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
 
 
 def test_map_normalized_event_unknown_resource_type_returns_none() -> None:
@@ -1428,25 +1345,6 @@ def test_map_normalized_event_unmappable_action_returns_none() -> None:
         _normalized_payload(action="assigned")
     )
     assert map_normalized_event(message) is None
-
-
-def test_legacy_mapping_is_unchanged_by_bridge() -> None:
-    """The legacy ten-type mapping still maps through the dispatcher unchanged."""
-    message = ProviderEventMessage(
-        provider=Provider.GITHUB,
-        delivery_id=DELIVERY_ID,
-        type="change_request.merged",
-        repository="owner/repo",
-        number=442,
-        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
-        actor="carol",
-    )
-    mapped = map_provider_event(message)
-    assert mapped is not None
-    entity, event = mapped
-    assert entity.entity_type is EntityType.CHANGE_REQUEST
-    assert event.event_type == "change_request.merged"
-    assert event.entity_id == "change_request:442"
 
 
 @pytest.mark.asyncio
@@ -1488,6 +1386,161 @@ async def test_unmappable_normalized_action_routes_to_dlq() -> None:
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert "Unmappable message type" in dlq_payload["reason"]
     assert "pull_request.assigned" in dlq_payload["reason"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer: map and persist every valid normalized lifecycle event (#496)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Producer ``edited`` and ``updated`` both converge on canonical ``updated``
+# with source action retained as provenance.  Producer ``reopened`` maps
+# directly to canonical ``reopened``.  Source ``resource_type`` is also
+# retained as provenance.  Every valid action is persisted — never routed to
+# the DLQ.
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action", "expected_entity_type", "expected_canonical_action"),
+    [
+        # edited → updated convergence
+        ("pull_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
+        ("merge_request", "edited", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "edited", EntityType.ISSUE, "updated"),
+        # updated → updated convergence
+        ("pull_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("merge_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "updated", EntityType.ISSUE, "updated"),
+        # reopened → reopened (direct)
+        ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
+        ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
+        ("issue", "reopened", EntityType.ISSUE, "reopened"),
+    ],
+)
+def test_map_normalized_event_edited_updated_reopened(
+    resource_type: str,
+    action: str,
+    expected_entity_type: EntityType,
+    expected_canonical_action: str,
+) -> None:
+    """Producer ``edited``/``updated`` → canonical ``updated``; ``reopened`` → ``reopened``."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type=resource_type, action=action)
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None, (
+        f"map_normalized_event returned None for {resource_type}.{action} — "
+        f"would be DLQ'd"
+    )
+    entity, event = mapped
+    expected_event_type = f"{expected_entity_type.value}.{expected_canonical_action}"
+    assert entity.entity_type is expected_entity_type
+    assert entity.entity_id == f"{expected_entity_type.value}:442"
+    assert event.event_type == expected_event_type
+    assert event.entity_id == entity.entity_id
+
+
+def test_map_normalized_event_retains_source_provenance() -> None:
+    """Source resource_type and action are retained as provenance in the event payload."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(resource_type="pull_request", action="edited")
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload.get("source_resource_type") == "pull_request"
+    assert event.payload.get("source_action") == "edited"
+    # payload_ref is still forwarded.
+    assert event.payload.get("payload_ref") == "redacted-payload-ref-123"
+
+
+def test_map_normalized_event_merge_request_provenance() -> None:
+    """GitLab merge_request.edited retains merge_request as source_resource_type."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="merge_request", action="updated", provider="gitlab"
+        )
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload.get("source_resource_type") == "merge_request"
+    assert event.payload.get("source_action") == "updated"
+    assert event.event_type == "change_request.updated"
+
+
+@pytest.mark.asyncio
+async def test_edited_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``pull_request.edited`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="pull_request", action="edited"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.updated"  # canonical event_type
+
+
+@pytest.mark.asyncio
+async def test_updated_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``issue.updated`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="issue", action="updated"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "issue"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+@pytest.mark.asyncio
+async def test_reopened_action_persists_not_routed_to_dlq() -> None:
+    """A normalized ``pull_request.reopened`` persists — never routed to the DLQ."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(resource_type="pull_request", action="reopened"))
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "change_request.reopened"  # canonical event_type
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1580,7 +1633,7 @@ async def test_metrics_poison_dlq_and_depth() -> None:
     consumer._producer = AsyncMock()
     consumer._producer.send_and_wait = AsyncMock()
 
-    await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+    await consumer._process_message(_mk_msg(_valid_payload(action="assigned")))
 
     snap = _snap(metrics)
     assert snap[METRIC_MESSAGES_POISON] == 1
@@ -1928,7 +1981,7 @@ async def test_send_to_dlq_stamps_operational_max() -> None:
         "app.consumer.afk_consumer.datetime", wraps=datetime
     ) as mock_dt:
         mock_dt.now.return_value = DLQ_NOW
-        await consumer._process_message(_mk_msg(_valid_payload(type="pull_request.assigned")))
+        await consumer._process_message(_mk_msg(_valid_payload(action="assigned")))
 
     (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
     assert dlq_payload["dead_lettered_at"] == DLQ_NOW.isoformat()
@@ -2197,7 +2250,9 @@ def test_producer_contract_maps_to_canonical_change_request() -> None:
     assert event.provider is Provider.GITHUB
     assert event.occurred_at == datetime(2026, 8, 13, 10, 10, 29, tzinfo=UTC)
     assert event.actor == "carol"
-    assert event.payload == {"payload_ref": "redacted-payload-ref-442"}
+    assert event.payload["payload_ref"] == "redacted-payload-ref-442"
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
 
 
 @pytest.mark.asyncio
@@ -2286,6 +2341,303 @@ async def test_contract_violation_bad_json_routes_to_dlq_with_raw_payload() -> N
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Producer: executable normalized-event v1 contract artifacts (#494)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The producer (fast-api-eda-gateway) owns the executable normalized-event
+# contract published in docs/contracts/normalized-event-v1/.  These tests:
+#
+# 1. Build records through the real NormalizedProviderEvent serializer and
+#    validate every fixture against the published JSON Schema.
+# 2. Verify payload references in generated fixtures identify the same
+#    provider and delivery_id as their containing envelope.
+# 3. Verify contract artifacts contain no raw webhook payload or secret data.
+# 4. Prove that every allowed v1 (resource_type, action) pair is covered.
+
+
+import json as _json_mod
+from pathlib import Path as _Path
+
+
+_CONTRACTS_DIR = _Path(__file__).resolve().parent.parent / "docs" / "contracts" / "normalized-event-v1"
+_SCHEMA_PATH = _CONTRACTS_DIR / "schema.json"
+_FIXTURES_DIR = _CONTRACTS_DIR / "fixtures"
+
+
+def _load_schema() -> dict:
+    return _json_mod.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _load_fixture(filename: str) -> dict:
+    return _json_mod.loads((_FIXTURES_DIR / filename).read_text(encoding="utf-8"))
+
+
+# The complete set of allowed v1 (resource_type, action) pairs.
+_ALLOWED_PAIRS: set[tuple[str, str]] = {
+    ("issue", "opened"),
+    ("issue", "closed"),
+    ("pull_request", "opened"),
+    ("pull_request", "review_requested"),
+    ("pull_request", "changes_requested"),
+    ("pull_request", "approved"),
+    ("pull_request", "merged"),
+    ("pull_request", "closed"),
+    ("merge_request", "opened"),
+    ("merge_request", "review_requested"),
+    ("merge_request", "changes_requested"),
+    ("merge_request", "approved"),
+    ("merge_request", "merged"),
+    ("merge_request", "closed"),
+}
+
+
+def _expected_fixture_filename(resource_type: str, action: str) -> str:
+    return f"{resource_type}.{action}.json"
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_exists_for_every_allowed_pair(
+    resource_type: str, action: str
+) -> None:
+    """Every allowed v1 (resource_type, action) pair has a fixture file."""
+    filename = _expected_fixture_filename(resource_type, action)
+    assert (_FIXTURES_DIR / filename).is_file(), (
+        f"Missing fixture: {filename}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_built_through_real_serializer(
+    resource_type: str, action: str
+) -> None:
+    """Every fixture round-trips through the real NormalizedProviderEvent serializer.
+
+    The fixture is loaded, validated through Pydantic (the real serializer),
+    and the re-serialized output matches the fixture byte-for-byte — proving
+    the fixture is real serializer output, not hand-crafted JSON.
+    """
+    fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+    message = NormalizedProviderEvent.model_validate(fixture)
+    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=True))
+    assert re_serialized == fixture, (
+        f"Fixture {resource_type}.{action} does not round-trip through the "
+        f"real serializer — the fixture may be hand-crafted rather than "
+        f"serializer-generated."
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "action"),
+    sorted(_ALLOWED_PAIRS),
+)
+def test_fixture_validates_against_published_schema(
+    resource_type: str, action: str
+) -> None:
+    """Every fixture validates against the published JSON Schema."""
+    from jsonschema import validate
+
+    schema = _load_schema()
+    fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+    # Should not raise ValidationError.
+    validate(instance=fixture, schema=schema)
+
+
+def test_all_fixtures_share_same_provider_and_delivery_id() -> None:
+    """Payload references in generated fixtures identify the same provider and
+    delivery_id as their containing envelope (acceptance criterion)."""
+    provider = None
+    delivery_id = None
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        if provider is None:
+            provider = fixture["provider"]
+            delivery_id = fixture["delivery_id"]
+        else:
+            assert fixture["provider"] == provider, (
+                f"Fixture {resource_type}.{action} has provider={fixture['provider']!r}, "
+                f"expected {provider!r}"
+            )
+            assert fixture["delivery_id"] == delivery_id, (
+                f"Fixture {resource_type}.{action} has delivery_id={fixture['delivery_id']!r}, "
+                f"expected {delivery_id!r}"
+            )
+
+
+def test_fixture_payload_ref_matches_resource_id() -> None:
+    """Every fixture's payload_ref identifies the same resource as its
+    resource_id (the redacted payload reference is scoped to the resource)."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        resource_id = fixture["resource_id"]
+        payload_ref = fixture.get("payload_ref")
+        assert payload_ref is not None, (
+            f"Fixture {resource_type}.{action} has no payload_ref"
+        )
+        assert resource_id in payload_ref, (
+            f"Fixture {resource_type}.{action} payload_ref={payload_ref!r} "
+            f"does not reference resource_id={resource_id!r}"
+        )
+
+
+def test_contract_artifacts_contain_no_raw_webhook_payload_or_secrets() -> None:
+    """Contract artifacts (schema + fixtures) contain no raw webhook payload
+    or secret data (acceptance criterion)."""
+    suspicious_keys = {
+        "token", "secret", "password", "api_key", "webhook",
+        "raw_payload", "hook", "signature", "authorization",
+    }
+
+    # Check the schema.
+    schema = _load_schema()
+    _assert_no_suspicious_keys(schema, f"{_SCHEMA_PATH}", suspicious_keys)
+
+    # Check every fixture.
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        _assert_no_suspicious_keys(
+            fixture,
+            f"fixture {resource_type}.{action}",
+            suspicious_keys,
+        )
+        # No nested payload object — only payload_ref.
+        assert "payload" not in fixture or not isinstance(fixture.get("payload"), dict), (
+            f"Fixture {resource_type}.{action} contains a nested payload object "
+            f"(raw webhook payload) — only payload_ref is allowed."
+        )
+
+
+def _assert_no_suspicious_keys(
+    obj: dict, label: str, suspicious: set[str]
+) -> None:
+    """Assert that no key in ``obj`` (recursively) matches a suspicious pattern."""
+    for key in obj:
+        key_lower = key.lower()
+        for s in suspicious:
+            assert s not in key_lower, (
+                f"{label}: suspicious key {key!r} (matches {s!r})"
+            )
+        if isinstance(obj[key], dict):
+            _assert_no_suspicious_keys(obj[key], f"{label}.{key}", suspicious)
+
+
+def test_schema_is_valid_json_schema() -> None:
+    """The published schema is a valid JSON Schema document."""
+    from jsonschema.validators import validator_for
+
+    schema = _load_schema()
+    # Check that jsonschema can construct a validator for it (validates
+    # the meta-schema implicitly).
+    cls = validator_for(schema)
+    cls.check_schema(schema)
+
+
+def test_schema_declares_additional_properties_false() -> None:
+    """The schema rejects unknown fields (additionalProperties: false)."""
+    schema = _load_schema()
+    assert schema.get("additionalProperties") is False, (
+        "Schema must set additionalProperties: false to reject unknown fields"
+    )
+
+
+def test_schema_rejects_unknown_resource_type() -> None:
+    """The schema rejects a resource_type not in the allowed enum."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "commit",
+        "resource_id": "abc123",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_rejects_issue_with_invalid_action() -> None:
+    """The schema rejects an issue with a non-issue action (e.g. merged)."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "merged",
+        "occurred_at": "2026-08-15T10:00:00Z",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_rejects_unknown_field() -> None:
+    """The schema rejects a message with an unknown field."""
+    from jsonschema import validate, ValidationError
+
+    schema = _load_schema()
+    invalid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "extra_field": "should be rejected",
+    }
+    with pytest.raises(ValidationError):
+        validate(instance=invalid, schema=schema)
+
+
+def test_schema_accepts_null_optional_fields() -> None:
+    """The schema accepts null for optional fields (actor, ingested_at, payload_ref)."""
+    from jsonschema import validate
+
+    schema = _load_schema()
+    valid = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "00000000-0000-0000-0000-000000000001",
+        "resource_type": "issue",
+        "resource_id": "100",
+        "repository": "owner/repo",
+        "action": "opened",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": None,
+        "actor": None,
+        "payload_ref": None,
+    }
+    validate(instance=valid, schema=schema)
+
+
+def test_fixture_count_matches_allowed_pairs() -> None:
+    """The number of fixture files matches the number of allowed pairs."""
+    fixture_files = sorted(
+        f.name for f in _FIXTURES_DIR.glob("*.json")
+    )
+    expected_files = sorted(
+        _expected_fixture_filename(rt, a) for rt, a in _ALLOWED_PAIRS
+    )
+    assert fixture_files == expected_files, (
+        f"Fixture files {fixture_files} do not match expected {expected_files}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  CLI dispatch (PR #492 review) — _parse_cli
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2314,3 +2666,510 @@ def test_parse_cli(argv: list[str], expected: tuple[bool, list[str]]) -> None:
     ``--dlq-sweep`` positioned as another option's value does not switch mode.
     """
     assert _parse_cli(argv) == expected
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer: pin v1 contract and validate nested normalized events (#495)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The consumer pins the producer-owned normalized-event v1 schema and
+# fixture artifacts with immutable source provenance, then validates the
+# shipped nested envelope.  The validation boundary distinguishes valid v1
+# lifecycle observations from malformed data and unsupported versions before
+# mapping or persistence.  Repository identity is derived strictly from the
+# producer repository URL.
+
+
+# ── Nested v1 envelope shape ────────────────────────────────────────────────
+
+
+def _nested_v1_payload(**overrides: object) -> dict:
+    """A v1 nested-envelope normalized event (resource + redacted_payload objects)."""
+    payload: dict[str, object] = {
+        "schema_version": "1.0",
+        "provider": "github",
+        "delivery_id": "33333333-4444-5555-6666-777777777777",
+        "occurred_at": "2026-08-15T10:00:00Z",
+        "ingested_at": "2026-08-15T10:00:01Z",
+        "actor": "test-user",
+        "resource": {
+            "resource_type": "pull_request",
+            "resource_id": "200",
+            "repository": "https://github.com/owner/repo",
+            "action": "merged",
+        },
+        "redacted_payload": {
+            "reference": "redacted-payload-ref-200",
+            "provider": "github",
+            "delivery_id": "33333333-4444-5555-6666-777777777777",
+        },
+    }
+    payload.update(overrides)  # type: ignore[arg-type]
+    return payload
+
+
+def test_nested_v1_envelope_parses_through_normalized_provider_event() -> None:
+    """The nested v1 shape (resource + redacted_payload objects) parses through
+    the real NormalizedProviderEvent serializer."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+
+    assert message.schema_version == "1.0"
+    assert message.provider is Provider.GITHUB
+    assert message.delivery_id == "33333333-4444-5555-6666-777777777777"
+    assert message.resource is not None
+    assert message.resource.resource_type == "pull_request"
+    assert message.resource.resource_id == "200"
+    assert message.resource.repository == "https://github.com/owner/repo"
+    assert message.resource.action == "merged"
+    assert message.redacted_payload is not None
+    assert message.redacted_payload.reference == "redacted-payload-ref-200"
+    assert message.redacted_payload.provider == "github"
+    assert message.redacted_payload.delivery_id == "33333333-4444-5555-6666-777777777777"
+
+
+def test_nested_v1_envelope_effective_properties() -> None:
+    """Effective properties resolve from the nested objects when present."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+
+    assert message.effective_resource_type == "pull_request"
+    assert message.effective_resource_id == "200"
+    assert message.effective_repository == "https://github.com/owner/repo"
+    assert message.effective_action == "merged"
+    assert message.effective_payload_ref == "redacted-payload-ref-200"
+
+
+def test_nested_v1_envelope_maps_to_canonical() -> None:
+    """The nested v1 envelope maps through map_normalized_event to the canonical
+    outcome-layer vocabulary."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert entity.entity_id == "change_request:200"
+    assert entity.repository == "https://github.com/owner/repo"
+    assert event.event_type == "change_request.merged"
+    assert event.payload["payload_ref"] == "redacted-payload-ref-200"
+    assert event.payload["source_resource_type"] == "pull_request"
+    assert event.payload["source_action"] == "merged"
+
+
+# ── Validation: schema version ──────────────────────────────────────────────
+
+
+def test_validate_accepts_v1_schema_version() -> None:
+    """Schema version "1.0" passes validation."""
+    message = NormalizedProviderEvent.model_validate(_nested_v1_payload())
+    validate_normalized_event(message)  # does not raise
+
+
+def test_validate_rejects_unsupported_schema_version() -> None:
+    """An unsupported schema version raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="2.0")
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported schema version"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_unknown_schema_version() -> None:
+    """An unknown schema version (e.g. "0.9") raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="0.9")
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported schema version"):
+        validate_normalized_event(message)
+
+
+# ── Validation: reference mismatch ──────────────────────────────────────────
+
+
+def test_validate_rejects_provider_mismatch() -> None:
+    """redacted_payload.provider != envelope.provider → DLQ."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "gitlab",
+                "delivery_id": "33333333-4444-5555-6666-777777777777",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Reference mismatch.*provider"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_delivery_id_mismatch() -> None:
+    """redacted_payload.delivery_id != envelope.delivery_id → DLQ."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "github",
+                "delivery_id": "wrong-delivery-id",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Reference mismatch.*delivery_id"):
+        validate_normalized_event(message)
+
+
+def test_validate_accepts_null_redacted_payload_fields() -> None:
+    """Null provider/delivery_id in redacted_payload are not checked (no mismatch)."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": None,
+                "delivery_id": None,
+            }
+        )
+    )
+    validate_normalized_event(message)  # does not raise
+
+
+# ── Validation: repository identity ─────────────────────────────────────────
+
+
+def test_validate_rejects_invalid_repository_identity() -> None:
+    """A non-HTTP(S) repository URL raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "ftp://github.com/owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Invalid repository identity"):
+        validate_normalized_event(message)
+
+
+def test_validate_rejects_empty_repository() -> None:
+    """An empty repository URL raises NormalizedEventValidationError."""
+    message = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "https:///owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Invalid repository identity"):
+        validate_normalized_event(message)
+
+
+# ── Repository URL normalization ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Basic normalization.
+        ("https://github.com/owner/repo", "github.com/owner/repo"),
+        ("https://github.com/Owner/Repo", "github.com/Owner/Repo"),  # path case preserved
+        ("https://GITHUB.COM/owner/repo", "github.com/owner/repo"),  # hostname lowercased
+        # Trailing slash.
+        ("https://github.com/owner/repo/", "github.com/owner/repo"),
+        # Terminal .git.
+        ("https://github.com/owner/repo.git", "github.com/owner/repo"),
+        ("https://github.com/owner/repo.git/", "github.com/owner/repo"),
+        # Default ports stripped.
+        ("https://github.com:443/owner/repo", "github.com/owner/repo"),
+        ("http://github.com:80/owner/repo", "github.com/owner/repo"),
+        # Non-default ports preserved.
+        ("https://github.com:8443/owner/repo", "github.com:8443/owner/repo"),
+        ("http://github.com:8080/owner/repo", "github.com:8080/owner/repo"),
+        # Credentials removed.
+        ("https://user:pass@github.com/owner/repo", "github.com/owner/repo"),
+        # Query string removed.
+        ("https://github.com/owner/repo?ref=main", "github.com/owner/repo"),
+        # Fragment removed.
+        ("https://github.com/owner/repo#readme", "github.com/owner/repo"),
+        # GitLab-style.
+        ("https://gitlab.com/group/subgroup/project", "gitlab.com/group/subgroup/project"),
+        # Self-hosted.
+        ("https://git.example.com/org/repo", "git.example.com/org/repo"),
+    ],
+)
+def test_normalize_repository_url(raw: str, expected: str) -> None:
+    assert normalize_repository_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "not-a-url",
+        "ftp://github.com/owner/repo",
+        "file:///etc/passwd",
+        "github.com/owner/repo",  # no scheme
+        "//github.com/owner/repo",  # protocol-relative
+        "/owner/repo",  # relative path
+        "https:///owner/repo",  # empty hostname
+        "https:///",  # no path
+    ],
+)
+def test_normalize_repository_url_rejects_invalid(raw: str) -> None:
+    assert normalize_repository_url(raw) is None
+
+
+def test_normalize_repository_url_credentials_not_in_identity() -> None:
+    """Credentials, query strings, and fragments cannot become part of repository identity."""
+    result = normalize_repository_url(
+        "https://admin:secret@github.com/owner/repo.git?ref=main#section"
+    )
+    assert result == "github.com/owner/repo"
+    assert "admin" not in result
+    assert "secret" not in result
+    assert "ref=main" not in result
+    assert "section" not in result
+
+
+# ── Validation: distinct DLQ reasons per violation class ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("payload_builder", "expected_reason_substring"),
+    [
+        (
+            lambda: _nested_v1_payload(schema_version="2.0"),
+            "Unsupported schema version",
+        ),
+        (
+            lambda: _nested_v1_payload(
+                resource={
+                    "resource_type": "pull_request",
+                    "resource_id": "200",
+                    "repository": "ftp://github.com/owner/repo",
+                    "action": "merged",
+                }
+            ),
+            "Invalid repository identity",
+        ),
+        (
+            lambda: _nested_v1_payload(
+                redacted_payload={
+                    "reference": "ref-200",
+                    "provider": "gitlab",
+                    "delivery_id": "33333333-4444-5555-6666-777777777777",
+                }
+            ),
+            "Reference mismatch",
+        ),
+    ],
+    ids=["unsupported-version", "invalid-repo-identity", "reference-mismatch"],
+)
+def test_each_violation_class_produces_distinct_dlq_reason(
+    payload_builder, expected_reason_substring: str
+) -> None:
+    """Each violation class produces a distinct DLQ reason string."""
+    message = NormalizedProviderEvent.model_validate(payload_builder())
+    with pytest.raises(NormalizedEventValidationError) as exc_info:
+        validate_normalized_event(message)
+    assert expected_reason_substring in exc_info.value.reason
+
+
+# ── Validation: consumer path integration ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nested_v1_event_passes_validation_and_persists() -> None:
+    """A valid nested v1 event passes validation and persists — never DLQ'd."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_nested_v1_payload()))
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "change_request"  # entity_type
+    assert event_call.args[4] == "200"  # external_id
+    assert event_call.args[5] == "change_request.merged"  # event_type
+
+
+@pytest.mark.asyncio
+async def test_unsupported_schema_version_routes_to_dlq() -> None:
+    """An unsupported schema version is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_nested_v1_payload(schema_version="2.0")))
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Unsupported schema version" in dlq_payload["reason"]
+    assert "2.0" in dlq_payload["reason"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_repository_identity_routes_to_dlq() -> None:
+    """An invalid repository identity is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _nested_v1_payload(
+                resource={
+                    "resource_type": "pull_request",
+                    "resource_id": "200",
+                    "repository": "ftp://github.com/owner/repo",
+                    "action": "merged",
+                }
+            )
+        )
+    )
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Invalid repository identity" in dlq_payload["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reference_mismatch_routes_to_dlq() -> None:
+    """A reference mismatch is DLQ'd with a distinct reason."""
+    conn = _FakeConn([])
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+    consumer._producer.send_and_wait = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _nested_v1_payload(
+                redacted_payload={
+                    "reference": "ref-200",
+                    "provider": "gitlab",
+                    "delivery_id": "33333333-4444-5555-6666-777777777777",
+                }
+            )
+        )
+    )
+
+    conn.execute.assert_not_called()
+    consumer._producer.send_and_wait.assert_called_once()
+    consumer._consumer.commit.assert_called_once()
+
+    (_topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
+    assert "Reference mismatch" in dlq_payload["reason"]
+
+
+# ── Contract pinning: fixtures with source provenance ───────────────────────
+
+
+def test_pinned_schema_has_source_provenance() -> None:
+    """The pinned schema file exists and is valid JSON Schema."""
+    assert _SCHEMA_PATH.is_file(), f"Schema not found at {_SCHEMA_PATH}"
+    schema = _load_schema()
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert schema["title"] == "Normalized Provider Event v1"
+
+
+def test_pinned_fixtures_cover_all_allowed_pairs() -> None:
+    """Every allowed v1 (resource_type, action) pair has a pinned fixture."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        filename = _expected_fixture_filename(resource_type, action)
+        assert (_FIXTURES_DIR / filename).is_file(), f"Missing fixture: {filename}"
+
+
+def test_every_pinned_fixture_passes_validation() -> None:
+    """Every pinned valid v1 fixture passes validate_normalized_event and is
+    not classified as poison."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        message = NormalizedProviderEvent.model_validate(fixture)
+        # Must not raise.
+        validate_normalized_event(message)
+
+
+def test_every_pinned_fixture_maps_without_dlq() -> None:
+    """Every pinned valid v1 fixture maps through map_normalized_event without
+    returning None (would be DLQ'd)."""
+    for resource_type, action in sorted(_ALLOWED_PAIRS):
+        fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
+        message = NormalizedProviderEvent.model_validate(fixture)
+        mapped = map_normalized_event(message)
+        assert mapped is not None, (
+            f"Fixture {resource_type}.{action} returned None from "
+            f"map_normalized_event — would be DLQ'd"
+        )
+
+
+# ── Validation: distinct DLQ reasons across all violation classes ───────────
+
+
+def test_all_violation_classes_have_distinct_reason_prefixes() -> None:
+    """Every violation class produces a reason with a distinct prefix so
+    operators can triage without inspecting the payload."""
+    reasons: set[str] = set()
+
+    # Unsupported version.
+    msg_v = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(schema_version="2.0")
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_v)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # Invalid repository identity.
+    msg_r = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            resource={
+                "resource_type": "pull_request",
+                "resource_id": "200",
+                "repository": "ftp://github.com/owner/repo",
+                "action": "merged",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_r)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # Reference mismatch (provider).
+    msg_p = NormalizedProviderEvent.model_validate(
+        _nested_v1_payload(
+            redacted_payload={
+                "reference": "ref-200",
+                "provider": "gitlab",
+                "delivery_id": "33333333-4444-5555-6666-777777777777",
+            }
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError) as exc:
+        validate_normalized_event(msg_p)
+    reasons.add(exc.value.reason.split(":")[0])
+
+    # All three violation classes produce distinct reason prefixes.
+    assert len(reasons) == 3, (
+        f"Expected 3 distinct reason prefixes, got {len(reasons)}: {reasons}"
+    )

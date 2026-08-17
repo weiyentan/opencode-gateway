@@ -45,7 +45,7 @@ import httpx
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord, OffsetAndMetadata, TopicPartition
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from afk_outcomes.models import (
     EngineeringEntity,
@@ -56,6 +56,7 @@ from afk_outcomes.models import (
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.metrics import DEFAULT_REGISTRY, MetricsRegistry
+from app.core.repository import normalize_repository_url
 from scripts.afk_backfill import PrefetchedWindow, run_backfill
 
 logger = logging.getLogger(__name__)
@@ -104,48 +105,60 @@ METRIC_DLQ_DEPTH = "afk_consumer.dlq.depth"
 METRIC_COMMITTED_OFFSET = "afk_consumer.committed_offset"
 METRIC_LAG = "afk_consumer.lag"
 
-# ── Message-type → canonical-event mapping ──────────────────────────────────
+# ── Canonical event type vocabulary ──────────────────────────────────────────
 #
-# The provider-events topic is external and its payload contract is defined
-# here.  ``type`` carries one of the ten locked canonical event types (PRD
-# decision #7), shared with the provider adapters' normalization vocabulary.
-# The entity a message maps onto is derived from the event-type prefix:
-# ``issue.*`` maps to an ``issue`` entity; ``change_request.*`` and
-# ``pipeline.*`` map to a ``change_request`` entity (pipeline events attach
-# to the owning change request, matching the provider adapters).
+# The locked set of canonical event types the outcome layer recognises.
+# ``map_normalized_event`` validates its bridged ``event_type`` against this
+# vocabulary; an unknown resource type or action that does not resolve to a
+# canonical event type returns ``None`` (unmappable → DLQ, never persisted).
 
-_MAPPED_EVENT_TYPES = frozenset(
+_CANONICAL_EVENT_TYPES = frozenset(
     {
         "issue.opened",
         "issue.closed",
+        "issue.edited",
+        "issue.updated",
+        "issue.reopened",
         "change_request.opened",
         "change_request.review_requested",
         "change_request.changes_requested",
         "change_request.approved",
         "change_request.merged",
         "change_request.closed",
+        "change_request.edited",
+        "change_request.updated",
+        "change_request.reopened",
         "pipeline.failed",
         "pipeline.succeeded",
     }
 )
 
 
-class ProviderEventMessage(BaseModel):
-    """One legacy message on the provider-events topic.
+class _NormalizedResource(BaseModel):
+    """The nested ``resource`` object in a v1 normalized event.
 
-    ``delivery_id`` is the provider's delivery UUID (``X-GitHub-Delivery`` /
-    ``X-GitLab-Event-UUID``) forwarded in the payload (PRD decision #8); it
-    is the key ``delivery_log`` dedups on, so a redelivered message no-ops.
+    Carries the producer's native resource vocabulary (``pull_request`` /
+    ``merge_request`` / ``issue``) — never the outcome layer's canonical
+    ``change_request`` vocabulary.
     """
 
-    provider: Provider
-    delivery_id: str
-    type: str
+    resource_type: str
+    resource_id: str
     repository: str
-    number: int
-    occurred_at: datetime
-    actor: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
+    action: str
+
+
+class _RedactedPayload(BaseModel):
+    """The nested ``redacted_payload`` object in a v1 normalized event.
+
+    ``reference`` is a *reference* to the redacted payload, never the
+    payload itself.  ``provider`` and ``delivery_id`` must equal the
+    envelope's ``provider`` and ``delivery_id`` (reference mismatch → DLQ).
+    """
+
+    reference: str | None = None
+    provider: str | None = None
+    delivery_id: str | None = None
 
 
 class NormalizedProviderEvent(BaseModel):
@@ -158,19 +171,62 @@ class NormalizedProviderEvent(BaseModel):
     provider-scoped resource identity (the value behind ``entity_id``);
     ``payload_ref`` is a *reference* to the redacted payload, never the
     payload itself; ``ingested_at`` is the producer's ingest timestamp.
+
+    The v1 nested envelope (issue #495) wraps resource fields in a
+    ``resource`` object and the payload reference in a ``redacted_payload``
+    object.  The flat shape (issue #482) is also accepted.
     """
+
+    model_config = {"ser_json_exclude_none": True}
 
     schema_version: str
     provider: Provider
     delivery_id: str
-    resource_type: str
-    resource_id: str
-    repository: str
-    action: str
+    resource_type: str = ""
+    resource_id: str = ""
+    repository: str = ""
+    action: str = ""
     occurred_at: datetime
     ingested_at: datetime | None = None
     actor: str | None = None
     payload_ref: str | None = None
+    resource: _NormalizedResource | None = None
+    redacted_payload: _RedactedPayload | None = None
+
+    @property
+    def effective_resource_type(self) -> str:
+        """Return ``resource_type`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.resource_type
+        return self.resource_type
+
+    @property
+    def effective_resource_id(self) -> str:
+        """Return ``resource_id`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.resource_id
+        return self.resource_id
+
+    @property
+    def effective_repository(self) -> str:
+        """Return ``repository`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.repository
+        return self.repository
+
+    @property
+    def effective_action(self) -> str:
+        """Return ``action`` from the nested object when present."""
+        if self.resource is not None:
+            return self.resource.action
+        return self.action
+
+    @property
+    def effective_payload_ref(self) -> str | None:
+        """Return ``payload_ref`` from the nested redacted_payload when present."""
+        if self.redacted_payload is not None:
+            return self.redacted_payload.reference
+        return self.payload_ref
 
 
 # ── Normalized resource-type → canonical entity-type bridge (issue #482) ────
@@ -178,21 +234,13 @@ class NormalizedProviderEvent(BaseModel):
 # The producer's resource types are provider-specific: ``pull_request``
 # (GitHub) and ``merge_request`` (GitLab) are the *same* outcome-layer
 # concept, ``change_request`` (CONTEXT.md / ADR 0020).  ``issue`` is
-# unchanged.  The bridge is explicit and additive: it never reinterprets the
-# legacy ten-type mapping above.
+# unchanged.
 
 _RESOURCE_TYPE_TO_ENTITY_TYPE: dict[str, EntityType] = {
     "issue": EntityType.ISSUE,
     "pull_request": EntityType.CHANGE_REQUEST,
     "merge_request": EntityType.CHANGE_REQUEST,
 }
-
-
-def _entity_type_for(event_type: str) -> EntityType:
-    """Derive the canonical entity type a message type maps onto."""
-    if event_type.startswith("issue."):
-        return EntityType.ISSUE
-    return EntityType.CHANGE_REQUEST
 
 
 def _coerce_resource_number(resource_id: str) -> int | None:
@@ -203,32 +251,93 @@ def _coerce_resource_number(resource_id: str) -> int | None:
         return None
 
 
-def _map_legacy_event(
-    message: ProviderEventMessage,
-) -> tuple[EngineeringEntity, EngineeringEvent] | None:
-    """Map a legacy provider message to the canonical entity + event (or None)."""
-    if message.type not in _MAPPED_EVENT_TYPES:
-        return None
-    entity_type = _entity_type_for(message.type)
-    entity_id = f"{entity_type.value}:{message.number}"
-    suffix = message.type.split(".", 1)[1]
-    entity = EngineeringEntity(
-        entity_id=entity_id,
-        entity_type=entity_type,
-        provider=message.provider,
-        repository=message.repository,
-        number=message.number,
-    )
-    event = EngineeringEvent(
-        event_id=f"{entity_id}:{suffix}",
-        event_type=message.type,
-        provider=message.provider,
-        entity_id=entity_id,
-        occurred_at=message.occurred_at,
-        actor=message.actor,
-        payload=message.payload,
-    )
-    return entity, event
+# ── Normalized event validation (issue #495) ─────────────────────────────────
+#
+# The validation boundary distinguishes valid v1 lifecycle observations from
+# malformed data and unsupported versions before mapping or persistence.
+# Each violation class produces a distinct DLQ reason string.
+
+_VALID_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
+
+
+class NormalizedEventValidationError(ValueError):
+    """A normalized event failed validation with a distinct reason.
+
+    The ``reason`` is a stable string suitable for DLQ routing; it is
+    distinct per violation class so operators can triage without inspecting
+    the payload.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def validate_normalized_event(message: NormalizedProviderEvent) -> None:
+    """Validate a normalized event before mapping or persistence.
+
+    Raises :class:`NormalizedEventValidationError` with a distinct reason
+    for each violation class:
+
+    * **Unsupported schema version** — ``schema_version`` is not ``"1.0"``.
+    * **Invalid repository identity** — the repository URL cannot be
+      normalized to a valid identity (nested shape), or the owner/repo
+      string fails basic structural validation (flat shape).
+    * **Reference mismatch** — the ``redacted_payload`` provider or
+      delivery_id does not equal the envelope's provider or delivery_id.
+
+    The caller routes the message to the DLQ with the reason string.
+    """
+    # ── Schema version ──────────────────────────────────────────────
+    if message.schema_version not in _VALID_SCHEMA_VERSIONS:
+        raise NormalizedEventValidationError(
+            f"Unsupported schema version: {message.schema_version!r} "
+            f"(supported: {sorted(_VALID_SCHEMA_VERSIONS)})"
+        )
+
+    # ── Repository identity ─────────────────────────────────────────
+    repo = message.effective_repository
+    if message.resource is not None:
+        # Nested v1 shape: repository is always an absolute HTTP(S) URL.
+        normalized = normalize_repository_url(repo)
+        if normalized is None:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be an absolute HTTP(S) URL with a valid hostname and path"
+            )
+    else:
+        # Flat shape: repository is a plain owner/repo string.
+        # Validate basic structural integrity.
+        if not repo or not isinstance(repo, str):
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be a non-empty string"
+            )
+        repo = repo.strip()
+        if not repo:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must be a non-empty string"
+            )
+        if ".." in repo:
+            raise NormalizedEventValidationError(
+                f"Invalid repository identity: {repo!r} — "
+                f"must not contain path traversal sequences"
+            )
+
+    # ── Reference mismatch (nested redacted_payload only) ───────────
+    if message.redacted_payload is not None:
+        rp = message.redacted_payload
+        if rp.provider is not None and rp.provider != message.provider.value:
+            raise NormalizedEventValidationError(
+                f"Reference mismatch: redacted_payload.provider={rp.provider!r} "
+                f"!= envelope.provider={message.provider.value!r}"
+            )
+        if rp.delivery_id is not None and rp.delivery_id != message.delivery_id:
+            raise NormalizedEventValidationError(
+                f"Reference mismatch: redacted_payload.delivery_id={rp.delivery_id!r} "
+                f"!= envelope.delivery_id={message.delivery_id!r}"
+            )
 
 
 def map_normalized_event(
@@ -243,28 +352,43 @@ def map_normalized_event(
     caller routes it to the DLQ as unmappable — never persisted, never
     conflated with the legacy types).
 
+    Producer ``edited`` and ``updated`` actions both converge on the canonical
+    ``updated`` event type, with the source action retained as provenance in
+    the event payload.  Producer ``reopened`` maps directly to canonical
+    ``reopened``.  Source ``resource_type`` (e.g. ``pull_request`` vs
+    ``merge_request``) is also retained as provenance.
+
     Returns ``None`` when ``resource_type`` is unknown or ``action`` does not
     resolve to a locked canonical event type.
     """
-    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(message.resource_type)
+    resource_type = message.effective_resource_type
+    resource_id = message.effective_resource_id
+    repository = message.effective_repository
+    action = message.effective_action
+    payload_ref = message.effective_payload_ref
+
+    entity_type = _RESOURCE_TYPE_TO_ENTITY_TYPE.get(resource_type)
     if entity_type is None:
         return None
-    event_type = f"{entity_type.value}.{message.action}"
-    if event_type not in _MAPPED_EVENT_TYPES:
+    event_type = f"{entity_type.value}.{action}"
+    if event_type not in _CANONICAL_EVENT_TYPES:
         return None
-    entity_id = f"{entity_type.value}:{message.resource_id}"
+    entity_id = f"{entity_type.value}:{resource_id}"
     entity = EngineeringEntity(
         entity_id=entity_id,
         entity_type=entity_type,
         provider=message.provider,
-        repository=message.repository,
-        number=_coerce_resource_number(message.resource_id),
+        repository=repository,
+        number=_coerce_resource_number(resource_id),
     )
     payload: dict[str, Any] = {}
-    if message.payload_ref is not None:
-        payload["payload_ref"] = message.payload_ref
+    if payload_ref is not None:
+        payload["payload_ref"] = payload_ref
+    # Retain source resource_type and action as provenance metadata.
+    payload["source_resource_type"] = resource_type
+    payload["source_action"] = action
     event = EngineeringEvent(
-        event_id=f"{entity_id}:{message.action}",
+        event_id=f"{entity_id}:{action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
@@ -276,17 +400,16 @@ def map_normalized_event(
 
 
 def map_provider_event(
-    message: ProviderEventMessage | NormalizedProviderEvent,
+    message: NormalizedProviderEvent,
 ) -> tuple[EngineeringEntity, EngineeringEvent] | None:
-    """Map a provider message to the canonical entity + event (or None).
+    """Map a normalized provider event to the canonical entity + event (or None).
 
-    Dispatches on the message shape: legacy ten-type messages (unchanged) or
-    normalized bridge messages.  Returns ``None`` when the message cannot be
-    mapped — the caller treats that as a poison message (DLQ, no DB write).
+    Bridges the producer's native resource vocabulary into the outcome layer's
+    canonical vocabulary via :func:`map_normalized_event`.  Returns ``None``
+    when the message cannot be mapped — the caller treats that as a poison
+    message (DLQ, no DB write).
     """
-    if isinstance(message, NormalizedProviderEvent):
-        return map_normalized_event(message)
-    return _map_legacy_event(message)
+    return map_normalized_event(message)
 
 
 class AFKOutcomeConsumer:
@@ -657,6 +780,26 @@ class AFKOutcomeConsumer:
             await self._commit()
             return
 
+        # ── Validate normalized events (issue #495) ─────────────────
+        try:
+            validate_normalized_event(message)
+        except NormalizedEventValidationError as exc:
+            logger.warning(
+                "Normalized event validation failed — sending to DLQ "
+                "(key=%s offset=%d): %s",
+                msg.key,
+                msg.offset,
+                exc.reason,
+            )
+            await self._send_to_dlq(
+                raw_value if isinstance(raw_value, dict) else {},
+                reason=exc.reason,
+            )
+            self._metrics.counter(METRIC_MESSAGES_POISON).inc()
+            self._mark_committable(msg)
+            await self._commit()
+            return
+
         # ── Map message type → canonical entity/event ───────────────
         mapped = map_provider_event(message)
         if mapped is None:
@@ -720,26 +863,23 @@ class AFKOutcomeConsumer:
     @staticmethod
     def _parse_message(
         raw_value: Any,
-    ) -> ProviderEventMessage | NormalizedProviderEvent:
-        """Parse a raw payload into a legacy or normalized message model.
+    ) -> NormalizedProviderEvent:
+        """Parse a raw payload into a normalized provider event model.
 
-        The normalized shape is identified by its ``resource_type`` field
-        (absent from the legacy shape); everything else is validated as a
-        legacy message.  Raises :class:`pydantic.ValidationError` when the
-        payload matches neither shape.
+        Only producer-owned normalized-event versions are accepted.  The
+        nested v1 shape is identified by its ``resource`` object; the flat
+        shape is identified by its ``resource_type`` field.  Raises
+        :class:`pydantic.ValidationError` when the payload matches neither
+        shape.
         """
-        if isinstance(raw_value, dict) and "resource_type" in raw_value:
-            return NormalizedProviderEvent.model_validate(raw_value)
-        return ProviderEventMessage.model_validate(raw_value)
+        return NormalizedProviderEvent.model_validate(raw_value)
 
     @staticmethod
     def _message_type_label(
-        message: ProviderEventMessage | NormalizedProviderEvent,
+        message: NormalizedProviderEvent,
     ) -> str:
         """Return the human-readable message type for logs/DLQ reasons."""
-        if isinstance(message, NormalizedProviderEvent):
-            return f"{message.resource_type}.{message.action}"
-        return message.type
+        return f"{message.effective_resource_type}.{message.effective_action}"
 
     def _retry_delay(self, attempt: int) -> float:
         """Bounded exponential backoff with jitter (issue #482).
@@ -760,7 +900,7 @@ class AFKOutcomeConsumer:
 
     async def _persist(
         self,
-        message: ProviderEventMessage | NormalizedProviderEvent,
+        message: NormalizedProviderEvent,
         entity: EngineeringEntity,
         event: EngineeringEvent,
     ) -> None:
