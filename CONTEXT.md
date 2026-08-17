@@ -682,13 +682,46 @@ _Avoid_: Blocked link, pending match
 
 **AFK Outcome Consumer**:
 A companion Kafka consumer (``app/consumer/afk_consumer.py``) that reads the
-external provider-events topic (``afk.events``) in its OWN consumer group
+external provider-events topic — ``engineering.events.normalized`` after the
+topic split (ADR 0023), previously ``afk.events`` — in its OWN consumer group
 (``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
 group), maps message types to canonical Engineering Events, writes each
 message in a single DB transaction (offset committed only after success), DLQs
 poison messages, and runs scheduled bounded-window reconciliation reusing the
 backfill engine for terminal states (merged/closed) the topic does not carry.
 _Avoid_: Kafka consumer (generic), outcomes ingestion bridge
+
+**AFK command** (alias: actionable event):
+A derived event published to the Kafka topic ``afk.events`` that requests work
+to be done ("do something"). Uses the EDA ``event_type`` vocabulary
+(``label``, ``review_request``, ``developer_request``, ``review_verdict``,
+``pr_mr_opened``, ``container_upgrade_requested``). Produced only when a
+webhook triggers an AFK action; never carries raw webhook payloads.
+
+**Normalized engineering lifecycle event** (alias: observable event):
+An unconditional lifecycle observation published to the Kafka topic
+``engineering.events.normalized`` ("something happened"). Produced for every
+qualifying webhook regardless of whether it triggered an AFK action.
+
+**Event fan-out rule**:
+A single webhook may produce both an AFK command and a normalized engineering
+lifecycle event, independently. An AFK-labelled issue produces two records
+(one command + one observation); human issues/PRs/MRs produce one record
+(observation only).
+
+**linked_issues**:
+The list of issue numbers extracted by the FastAPI EDA Gateway from a PR/MR
+title and description using regex matching (e.g. "Implemented issues #503",
+"Closes #494") and included in the normalized ``change_request.opened``
+observation to capture the issue↔change-request relationship for correlation.
+The regex pattern matches ``#\d+`` references in the title and description
+body. Empty for PRs/MRs that reference no issues.
+
+**engineering.events.normalized**:
+The Kafka topic carrying normalized engineering lifecycle events
+(observations), consumed by the AFK Outcome Consumer after the topic split
+(ADR 0023).
+_Avoid_: afk.events (that is the actionable-command topic)
 
 **Normalized Provider Event**:
 A schema-versioned, provider-agnostic event on the provider-events topic
@@ -944,3 +977,5 @@ manages.
 - "frontend layer inside the Gateway" was used to mean **Aurora Glass**.
   Resolved: **Aurora Glass** is a separate frontend that consumes the
   **Gateway** API.
+- ``afk_events`` (underscore) is deprecated — the canonical spelling is
+  ``afk.events`` (dot), confirmed against the live Strimzi cluster.
