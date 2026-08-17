@@ -214,7 +214,7 @@ def _mk_msg(
     msg.value = json.dumps(value).encode("utf-8")
     msg.offset = offset
     msg.partition = partition
-    msg.topic = "afk.events"
+    msg.topic = "engineering.events.normalized"
     msg.key = None
     msg.headers = ()
     return msg
@@ -359,7 +359,7 @@ async def test_unparseable_json_sends_to_dlq_and_commits() -> None:
     msg.value = b"not valid json at all"
     msg.offset = 101
     msg.partition = 0
-    msg.topic = "afk.events"
+    msg.topic = "engineering.events.normalized"
     msg.key = None
     msg.headers = ()
 
@@ -558,7 +558,7 @@ def _mk_invalid_json_msg() -> MagicMock:
     msg.value = b"not valid json at all"
     msg.offset = 101
     msg.partition = 0
-    msg.topic = "afk.events"
+    msg.topic = "engineering.events.normalized"
     msg.key = None
     msg.headers = ()
     return msg
@@ -640,7 +640,7 @@ async def test_poison_message_dlq_failure_does_not_commit(make_msg) -> None:
 
 
 def _tp(partition: int = 0) -> TopicPartition:
-    return TopicPartition("afk.events", partition)
+    return TopicPartition("engineering.events.normalized", partition)
 
 
 def _last_commit_offsets(consumer: AFKOutcomeConsumer) -> dict[TopicPartition, int]:
@@ -886,7 +886,7 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
     assert mock_kafka_consumer.call_args.kwargs["group_id"] == "opencode-outcomes"
     assert mock_kafka_consumer.call_args.kwargs["enable_auto_commit"] is False
     assert mock_kafka_consumer.call_args.kwargs["auto_offset_reset"] == "earliest"
-    assert mock_kafka_consumer.call_args.args[0] == "afk.events"
+    assert mock_kafka_consumer.call_args.args[0] == "engineering.events.normalized"
 
 
 # ── Scheduled reconciliation reuses the backfill engine ──────────────────────
@@ -991,8 +991,8 @@ async def test_from_env_reads_afk_settings() -> None:
     env_vars = {
         "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
-        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
-        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
         "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
@@ -1009,8 +1009,8 @@ async def test_from_env_reads_afk_settings() -> None:
     ):
         consumer = await AFKOutcomeConsumer.from_env()
 
-    assert consumer._topic == "afk.events"
-    assert consumer._dlq_topic == "afk.events-dlq"
+    assert consumer._topic == "engineering.events.normalized"
+    assert consumer._dlq_topic == "engineering.events.normalized.dlq"
     assert consumer._consumer_group_id == "opencode-outcomes"
     assert consumer._repository == "owner/repo"
     assert consumer._reconcile_cadence_seconds == 600.0
@@ -1028,8 +1028,8 @@ async def test_from_env_fails_fast_when_repository_empty() -> None:
     env_vars = {
         "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
-        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
-        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
         "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
@@ -1824,8 +1824,8 @@ async def test_from_env_reads_afk_retry_settings() -> None:
     env_vars = {
         "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
-        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
-        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
         "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
@@ -1864,7 +1864,7 @@ def _dlq_payload(
 ) -> dict:
     """A DLQ message as produced by ``_send_to_dlq`` (with age metadata)."""
     return {
-        "original_topic": "afk.events",
+        "original_topic": "engineering.events.normalized",
         "reason": "DB persist failed after 3 retries",
         "payload": {"delivery_id": DELIVERY_ID},
         "dead_lettered_at": dead_lettered_at,
@@ -1876,10 +1876,10 @@ def test_build_dlq_payload_stamps_age_metadata() -> None:
     """Every DLQ message carries dead_lettered_at + max_age_days so its age and
     the operational max are self-describing (measurable by the sweep)."""
     payload = build_dlq_payload(
-        "afk.events", "boom", {"x": 1}, now=DLQ_NOW, max_age_days=MAX_AGE
+        "engineering.events.normalized", "boom", {"x": 1}, now=DLQ_NOW, max_age_days=MAX_AGE
     )
 
-    assert payload["original_topic"] == "afk.events"
+    assert payload["original_topic"] == "engineering.events.normalized"
     assert payload["reason"] == "boom"
     assert payload["payload"] == {"x": 1}
     assert payload["dead_lettered_at"] == DLQ_NOW.isoformat()
@@ -1888,7 +1888,7 @@ def test_build_dlq_payload_stamps_age_metadata() -> None:
 
 def test_build_dlq_payload_defaults_max_age() -> None:
     """When no max age is given, the default operational max is stamped."""
-    payload = build_dlq_payload("afk.events", "boom", {}, now=DLQ_NOW)
+    payload = build_dlq_payload("engineering.events.normalized", "boom", {}, now=DLQ_NOW)
     assert payload["max_age_days"] == 30
 
 
@@ -1946,7 +1946,7 @@ def test_build_escalation_payload_preserves_original_and_reason() -> None:
     payload = _dlq_payload()
     escalated = build_escalation_payload(payload, now=DLQ_NOW, max_age_days=MAX_AGE)
 
-    assert escalated["original_topic"] == "afk.events"
+    assert escalated["original_topic"] == "engineering.events.normalized"
     assert escalated["reason"] == payload["reason"]
     assert escalated["payload"] == payload["payload"]
     assert escalated["dead_lettered_at"] == payload["dead_lettered_at"]
@@ -2045,8 +2045,8 @@ async def test_from_env_reads_dlq_max_age() -> None:
     env_vars = {
         "GATEWAY_ENV": "development",
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
-        "GATEWAY_AFK_OUTCOMES_TOPIC": "afk.events",
-        "GATEWAY_AFK_OUTCOMES_DLQ_TOPIC": "afk.events-dlq",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
         "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
@@ -2112,8 +2112,8 @@ async def test_sweep_dlq_commits_offsets_in_write_mode() -> None:
     """Write-mode sweep commits per-partition offsets: a partition with a
     retained record commits at its first retained offset (re-examined later);
     an all-expired partition commits at max-consumed + 1 (never re-read)."""
-    dlq_topic = "afk.events-dlq"
-    escalation_topic = "afk.events-dlq-expired"
+    dlq_topic = "engineering.events.normalized.dlq"
+    escalation_topic = "engineering.events.normalized.dlq-expired"
     expired = _dlq_payload(
         dead_lettered_at=(DLQ_NOW - timedelta(days=MAX_AGE + 5)).isoformat()
     )
@@ -2176,7 +2176,7 @@ async def test_sweep_dlq_dry_run_does_not_commit_or_publish() -> None:
         report = await sweep_dlq(
             "broker:9092",
             dlq_topic,
-            "afk.events-dlq-expired",
+            "engineering.events.normalized.dlq-expired",
             MAX_AGE,
             now=DLQ_NOW,
             dry_run=True,
@@ -2210,7 +2210,7 @@ async def test_sweep_dlq_skips_corrupt_record_with_warning() -> None:
         patch("app.consumer.afk_consumer.logger") as mock_logger,
     ):
         report = await sweep_dlq(
-            "broker:9092", dlq_topic, "afk.events-dlq-expired", MAX_AGE, now=DLQ_NOW
+            "broker:9092", dlq_topic, "engineering.events.normalized.dlq-expired", MAX_AGE, now=DLQ_NOW
         )
 
     assert report.scanned == 1  # only the well-formed record is scanned
@@ -2384,8 +2384,8 @@ async def test_contract_violation_routes_to_dlq_with_payload_and_reason() -> Non
     consumer._consumer.commit.assert_called_once()
 
     (topic, dlq_payload), _kwargs = consumer._producer.send_and_wait.call_args
-    assert topic == "afk.events-dlq"
-    assert dlq_payload["original_topic"] == "afk.events"
+    assert topic == "engineering.events.normalized.dlq"
+    assert dlq_payload["original_topic"] == "engineering.events.normalized"
     assert "Unsupported action" in dlq_payload["reason"]
     assert "synchronize" in dlq_payload["reason"]
     assert dlq_payload["payload"] == violating  # original payload preserved verbatim

@@ -537,7 +537,7 @@ def _kafka_record(value: dict[str, object], *, offset: int = 0, partition: int =
     msg.value = json.dumps(value).encode("utf-8")
     msg.offset = offset
     msg.partition = partition
-    msg.topic = "afk.events"
+    msg.topic = "engineering.events.normalized"
     msg.key = None
     msg.headers = ()
     return msg

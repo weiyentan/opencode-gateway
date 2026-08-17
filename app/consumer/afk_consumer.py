@@ -63,8 +63,8 @@ logger = logging.getLogger(__name__)
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
-_DEFAULT_TOPIC = "afk.events"
-_DEFAULT_DLQ_TOPIC = "afk.events-dlq"
+_DEFAULT_TOPIC = "engineering.events.normalized"
+_DEFAULT_DLQ_TOPIC = "engineering.events.normalized.dlq"
 _DEFAULT_CONSUMER_GROUP_ID = "opencode-outcomes"
 
 _DEFAULT_RECONCILE_CADENCE_SECONDS = 3600.0
@@ -78,7 +78,7 @@ _MAX_BACKOFF_SECONDS = 60.0
 # resolved, but never unbounded — messages older than this many days are
 # escalated/expired by the DLQ sweep.  Mirrors GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS.
 _DEFAULT_DLQ_MAX_AGE_DAYS = 30
-_DEFAULT_DLQ_ESCALATION_TOPIC = "afk.events-dlq-expired"
+_DEFAULT_DLQ_ESCALATION_TOPIC = "engineering.events.normalized.dlq-expired"
 _DEFAULT_DLQ_SWEEP_GROUP_ID = "opencode-outcomes-dlq-sweep"
 
 # Backoff jitter multiplier bounds (issue #482).  The retry delay is
@@ -565,8 +565,8 @@ class AFKOutcomeConsumer:
             provider=provider,
             repository=settings.afk_outcomes_repository,
             adapter=adapter,
-            topic=settings.afk_outcomes_topic,
-            dlq_topic=settings.afk_outcomes_dlq_topic,
+            topic=settings.normalized_events_topic,
+            dlq_topic=settings.normalized_events_dlq_topic,
             consumer_group_id=settings.afk_outcomes_consumer_group_id,
             reconcile_cadence_seconds=settings.afk_outcomes_reconcile_cadence_seconds,
             reconcile_window_seconds=settings.afk_outcomes_reconcile_window_seconds,
@@ -1504,7 +1504,7 @@ async def _main_dlq_sweep(argv: list[str] | None = None) -> int:
     settings = get_settings()
     report = await sweep_dlq(
         settings.kafka_brokers,
-        settings.afk_outcomes_dlq_topic,
+        settings.normalized_events_dlq_topic,
         _DEFAULT_DLQ_ESCALATION_TOPIC,
         settings.retention_dlq_max_age_days,
         dry_run=args.dry_run,
