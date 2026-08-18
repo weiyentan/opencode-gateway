@@ -21,7 +21,7 @@ from __future__ import annotations
 import itertools
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -40,6 +40,8 @@ from app.core.reporting_aggregates import (
 )
 from app.core.repository import normalize_repository_url
 from tests.conftest import mock_row
+
+UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
 _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)
 _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
