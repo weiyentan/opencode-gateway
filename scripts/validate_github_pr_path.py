@@ -36,7 +36,24 @@ from pathlib import Path
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-REPO = os.environ.get("GITHUB_REPOSITORY", "weiyentan/opencode-gateway")
+def _detect_default_repo() -> str:
+    """Detect the default repository from git remote origin."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=True,
+        )
+        url = result.stdout.strip()
+        # Handle both SSH (git@github.com:owner/repo.git) and HTTPS (https://github.com/owner/repo.git)
+        for prefix in ("git@github.com:", "https://github.com/"):
+            if prefix in url:
+                repo = url.split(prefix)[-1].removesuffix(".git")
+                return repo
+    except (subprocess.CalledProcessError, IndexError):
+        pass
+    return "weiyentan/opencode-gateway"  # Ultimate fallback
+
+REPO = os.environ.get("GITHUB_REPOSITORY") or _detect_default_repo()
 BRANCH_PREFIX = "validate/issue-515"
 PR_TITLE = "[Validation] Issue #515 — GitHub PR observation path"
 PR_BODY = """## Validation PR (Issue #515)
@@ -101,6 +118,12 @@ def step_2_create_disposable_pr(dry_run: bool) -> tuple[bool, str | None, str | 
     branch_name = f"{BRANCH_PREFIX}-{timestamp}"
     pr_number: str | None = None
 
+    # Capture the original branch for reliable return
+    original_branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
     if dry_run:
         print("  [DRY-RUN] Would create branch and PR:")
         print(f"    Branch: {branch_name}")
@@ -150,7 +173,7 @@ This PR will be closed without merging.
             print(f"  [FAIL] Failed to push branch: {push_result.stderr.strip()}")
             # Clean up marker file
             Path(marker_file).unlink(missing_ok=True)
-            subprocess.run(["git", "checkout", "-"], capture_output=True)
+            subprocess.run(["git", "checkout", original_branch], capture_output=True)
             return False, None, branch_name
 
         # Create the PR (non-draft)
@@ -166,7 +189,7 @@ This PR will be closed without merging.
             print(f"  [FAIL] Failed to create PR: {pr_result.stderr.strip()}")
             # Clean up
             Path(marker_file).unlink(missing_ok=True)
-            subprocess.run(["git", "checkout", "-"], capture_output=True)
+            subprocess.run(["git", "checkout", original_branch], capture_output=True)
             return False, None, branch_name
 
         # Extract PR number from output
@@ -178,7 +201,7 @@ This PR will be closed without merging.
 
         # Clean up marker file and switch back
         Path(marker_file).unlink(missing_ok=True)
-        subprocess.run(["git", "checkout", "-"], capture_output=True)
+        subprocess.run(["git", "checkout", original_branch], capture_output=True)
 
         success = pr_number is not None
         check("Disposable PR created", success, f"PR #{pr_number}" if pr_number else "")
@@ -187,12 +210,12 @@ This PR will be closed without merging.
     except subprocess.CalledProcessError as e:
         print(f"  [FAIL] Git operation failed: {e}")
         Path(marker_file).unlink(missing_ok=True)
-        subprocess.run(["git", "checkout", "-"], capture_output=True)
+        subprocess.run(["git", "checkout", original_branch], capture_output=True)
         return False, None, branch_name
     except Exception as e:
         print(f"  [FAIL] Unexpected error: {e}")
         Path(marker_file).unlink(missing_ok=True)
-        subprocess.run(["git", "checkout", "-"], capture_output=True)
+        subprocess.run(["git", "checkout", original_branch], capture_output=True)
         return False, None, branch_name
 
 
@@ -201,7 +224,7 @@ def step_3_verify_webhook_delivery(pr_number: str, dry_run: bool) -> bool:
     section("Step 3: Verify webhook delivery")
 
     if dry_run:
-        print("  [DRY-RUN] Would check webhook deliveries for PR #{pr_number}")
+        print(f"  [DRY-RUN] Would check webhook deliveries for PR #{pr_number}")
         print("  [DRY-RUN] Would verify delivery_id appears in normalized observation provenance")
         return True
 
@@ -211,20 +234,35 @@ def step_3_verify_webhook_delivery(pr_number: str, dry_run: bool) -> bool:
 
     # Check recent deliveries via GitHub API
     # Note: requires admin access to the repo to list webhook deliveries
-    result = run_gh(
+    hook_result = run_gh(
         "api",
         f"repos/{REPO}/hooks",
-        "--jq", "length",
+        "--jq", ".[].id",
     )
-    if result.returncode == 0 and result.stdout.strip().isdigit():
-        hook_count = int(result.stdout.strip())
-        print(f"  Found {hook_count} webhook(s) configured on the repository")
-        check("Webhooks are configured", hook_count > 0)
-        return hook_count > 0
-    else:
-        print(f"  Cannot list webhooks (requires admin access): {result.stderr.strip()}")
+    if hook_result.returncode != 0 or not hook_result.stdout.strip():
+        print(f"  Cannot list webhooks (requires admin access): {hook_result.stderr.strip()}")
         print("  [SKIP] Webhook delivery verification requires admin access")
         return True  # Skip — not a failure of the pipeline
+
+    hook_ids = hook_result.stdout.strip().splitlines()
+    print(f"  Found {len(hook_ids)} webhook(s) configured on the repository")
+
+    # Try to check deliveries for each hook
+    delivery_found = False
+    for hook_id in hook_ids:
+        delivery_result = run_gh(
+            "api",
+            f"repos/{REPO}/hooks/{hook_id}/deliveries",
+            "--jq", ".[0].id",
+        )
+        if delivery_result.returncode == 0 and delivery_result.stdout.strip():
+            last_delivery_id = delivery_result.stdout.strip()
+            print(f"  Hook {hook_id}: last delivery ID = {last_delivery_id}")
+            delivery_found = True
+
+    check("Webhook deliveries verified", delivery_found,
+          f"found deliveries for PR #{pr_number}" if delivery_found else "no deliveries found")
+    return delivery_found
 
 
 def step_4_validate_consumer_mapping(dry_run: bool) -> bool:
