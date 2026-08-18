@@ -557,6 +557,7 @@ opencode-gateway/
 | [0020](docs/adr/0020-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Superseded |
 | [0021](docs/adr/0021-reporting-read-api.md) | Reporting Read API | Accepted |
 | [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
+| [0023](docs/adr/0023-kafka-topic-split-commands-vs-observations.md) | Kafka Topic Split: afk.events vs engineering.events.normalized | Accepted |
 
 ---
 
