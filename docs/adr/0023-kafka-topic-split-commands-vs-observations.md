@@ -12,7 +12,7 @@ Accepted (2026-08-18)
 
 ## Decision
 1. **Two topics**: `afk.events` (actionable commands — "do something") and `engineering.events.normalized` (observable lifecycle events — "something happened").
-2. **Fan-out model**: an AFK-labelled issue produces BOTH a command on `afk.events` and an observation on `engineering.events.normalized`. Opening an authorized, non-draft PR/MR also produces both a `pr_mr_opened` command and an observation, regardless of whether it has an `afk` label. Lifecycle events that match no automation trigger produce an observation only. The EDA command vocabulary remains unchanged (`label`, `review_request`, `developer_request`, `review_verdict`, `pr_mr_opened`, `container_upgrade_requested`), and `afk.events` carries derived commands only, never raw webhook payloads.
+2. **Fan-out model**: an AFK-labelled issue produces BOTH a command on `afk.events` and an observation on `engineering.events.normalized`. Opening a user-initiated, non-draft PR/MR also produces both a `pr_mr_opened` command and an observation, regardless of whether it has an `afk` label. Lifecycle events that match no automation trigger produce an observation only. The EDA command vocabulary remains unchanged (`label`, `review_request`, `developer_request`, `review_verdict`, `pr_mr_opened`, `container_upgrade_requested`), and `afk.events` carries derived commands only, never raw webhook payloads.
 3. **Consumer**: the AFK Outcome Consumer subscribes to `engineering.events.normalized` instead of `afk.events`, keeping the same failure semantics (invalid → DLQ immediately; DB errors → retry ×5 → DLQ + commit; offset committed only after successful persistence; reconcile loop unchanged as repair path).
 4. **Contract unchanged**: the producer emits provider-specific types in the normalized envelope (`pull_request.opened`, `merge_request.opened`, `issue.opened`, etc.); the canonical outcome vocabulary remains the consumer's internal mapping layer. `linked_issues` (extracted from PR/MR title/description) is included in `pull_request.opened` and `merge_request.opened` wire observations for issue-to-change-request correlation.
 5. **DLQ strategy**: declare `engineering-events-normalized.yaml` (topic `engineering.events.normalized`, 6 partitions, 7-day retention) and `engineering-events-normalized-dlq.yaml` (topic `engineering.events.normalized.dlq`, 3 partitions, 30-day retention) in `kafka-instance/` of the k8s_app/kafka repo, mirroring the `opencode-usage-v1` pattern. Also declare `afk-events-dlq.yaml` (topic `afk.events.dlq`). Kubernetes resource filenames are hyphenated; their `spec.topicName` values are dot-separated Kafka topic names.
@@ -35,7 +35,7 @@ Accepted (2026-08-18)
 | # | Check | Expectation |
 |---|---|---|
 | 1 | AFK-labelled issue | Command on `afk.events` (Rulebook/AWX unchanged) AND observation on `engineering.events.normalized` |
-| 2 | Authorized, non-draft PR/MR opened without `afk` label | Command (`pr_mr_opened`) AND observation |
+| 2 | User-initiated, non-draft PR/MR opened without `afk` label | Command (`pr_mr_opened`) AND observation |
 | 3 | PR/MR edited or updated without another command trigger | Observation only; no command |
 | 4 | Human issue (no label) | Observation only (`issue.opened`) |
 | 5 | Unmatched non-lifecycle webhook or comment | Nothing produced on either topic |
