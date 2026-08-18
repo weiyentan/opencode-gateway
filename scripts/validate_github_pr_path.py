@@ -120,7 +120,7 @@ def step_2_create_disposable_pr(dry_run: bool) -> tuple[bool, str | None, str | 
 
     # Capture the original branch for reliable return
     original_branch = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        ["git", "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 
