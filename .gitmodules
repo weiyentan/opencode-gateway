@@ -1,3 +1,0 @@
-[submodule "k8s_app/git-fastapi-eda"]
-	path = k8s_app/git-fastapi-eda
-	url = https://gitlab.com/prometheus-build-repository/sourcecontrollayout/containers-group/fast-api-eda-gateway
