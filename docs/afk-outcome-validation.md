@@ -251,3 +251,133 @@ new issues with rationale:
 
 No changes to `afk_outcomes/*`, `app/*`, migrations, or `scripts/afk_backfill.py`
 (validation-only slice, per the task contract).
+
+---
+
+# Live GitLab MR Observation & AWX Command Path Validation — issue #516
+
+**Issue**: #516 — Validate GitLab MR observation and AWX command path
+**Parent**: #511 (validation pair with #515, the GitHub PR equivalent)
+**Validator**: `code-editor-senior` (T3)
+**Date**: 2026-08-18
+**Verdict**: **PASS (qualified)** — the live GitLab MR open→command→review→close
+path works end to end: one disposable non-draft MR produced exactly one
+`pr_mr_opened` command, one `merge_request.opened` observation with the GitLab
+event UUID in its provenance, exactly one AWX review job (posted its review
+and its verdict round-tripped through Kafka), and a clean `merge_request.closed`
+observation on close-without-merge, with **no** container-upgrade command.
+Two acceptance criteria are **blocked by the in-flight #512–#514 topic-split
+rollout**, not by this path: the observation is still published to `afk.events`
+instead of `engineering.events.normalized` (the producer switch #513 is not
+deployed yet), and the `engineering_events` row could not be verified because
+the `opencode-outcomes` consumer group holds no committed offsets (the consumer
+leg of the cutover is mid-flight). Evidence for every verified criterion is
+recorded in §2–§3 with exact offsets and delivery IDs.
+
+## 1. Method
+
+This validation ran against the **live** stack, not fixtures:
+
+- GitLab API (gitlab.com) as `wyautomation` — a member of
+  `AUTHORIZED_ISSUERS=weiyentan,wyautomation` on the deployed EDA gateway, and
+  Developer on `openclaw/openclaw_ansible_playbooks` (the disposable-MR host,
+  chosen because its MR webhook path was proven live earlier the same day by
+  MR #123).
+- Strimzi Kafka at `192.168.1.105:9094` — direct consumer reads of
+  `afk.events` / `engineering.events.normalized` / DLQ topics and of the
+  consumer-group committed offsets (`ansible-eda-afk-trigger`,
+  `opencode-outcomes`).
+- GitLab MR notes API — the AWX "MR Review Runner" job posts its review as a
+  comment (`AGENT: Reviewer`), which is the observable completion signal for
+  the AWX leg (direct AAP API job listing requires a controller token that is
+  not provisioned in this environment).
+
+Sequence: create branch → add one file via the repository API → open
+non-draft MR → observe Kafka → wait for the review job → close without
+merging → observe Kafka → sweep for container-upgrade commands.
+
+## 2. Disposable MR and open-path evidence
+
+MR `!124` on `prometheus-build-repository/sourcecontrollayout/openclaw/
+openclaw_ansible_playbooks`:
+`test: issue-516 disposable MR — GitLab MR observation validation`
+(web_url `.../merge_requests/124`; author `wyautomation`; draft=False;
+no `afk` label; source branch `val/issue-516-mr-obs-20260818052055`).
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| MR opened by authorized issuer, no afk label | ✅ | MR iid 124, author wyautomation, draft=False, opened 05:21:29.708Z via API |
+| GitLab event UUID recorded & in normalized provenance | ✅ | `delivery_id = e6e1b140-cf66-47dd-9be2-c234f75413ed` (open) — the producer forwards GitLab's `X-Gitlab-Event-UUID` header verbatim as the envelope `delivery_id`, and it appears in both the envelope and `redacted_payload.reference.delivery_id` (self-consistent reference). Direct GitLab "Recent deliveries" cross-check requires Maintainer+ on the project (403 for the validator) — format and code-path verified instead (`main.py`: `delivery_id=event_uuid`) |
+| One `merge_request.opened` observation | ✅ (topic deviation, see §4.1) | `afk.events` p4 off792, ts 05:21:30.430Z: nested v1 envelope, `provider=gitlab`, `resource.type=merge_request`, `resource.number=124`, `action=opened`, `actor=wyautomation`, `occurred_at=2026-08-18T05:21:29.708Z`, `ingested_at=…05:21:30.391Z`, redacted reference matches envelope |
+| One `pr_mr_opened` command | ✅ | `afk.events` p2 off463, ts 05:21:30.393Z: `event_type=pr_mr_opened`, 10-field schema, `forge=gitlab`, `pr_number=124`, `created_by=wyautomation`, correct source/target branches and title |
+| Exactly one AWX review job launches & completes | ✅ | EDA rulebook consumed the command (`ansible-eda-afk-trigger` committed offsets advanced past p2 off463 → 465 and p4 off792 → 795); the "MR Review Runner" job posted exactly **one** `AGENT: Reviewer` comment on MR 124 at 05:25:32.931Z (approve), and its Note Hook produced one `review_verdict approve` on `afk.events` (p2 off464, 05:25:34.316Z) — the verdict round-trip is the job's completion signal |
+| No raw webhook body persisted | ✅ | Wire level: the captured Kafka messages carry only `redacted_payload.reference` (provider + delivery_id) — no title/description/diff content. Producer redacts at the ingest boundary (`_redact_and_record`) before any routing; the consumer mapping tests pin that only `payload_ref` (never the body) reaches the canonical event |
+
+## 3. Close-path evidence (close without merging, no container-upgrade)
+
+MR 124 was closed via `state_event=close` at 05:27:28.351Z — never merged.
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| Normalized close observation persisted | ✅ | `afk.events` p4 off793, ts 05:27:28.926Z: `merge_request` `number=124`, `action=closed`, `delivery_id=f7142cca-2781-43c8-97a8-f43efd355a9e`, `actor=wyautomation`, `occurred_at=2026-08-18T05:27:28.020Z`. (GitLab also fires an update webhook on the close transition → an additional `action=updated` observation, p4 off794 — expected GitLab behavior, both actions are in the producer lifecycle allowlist) |
+| No container-upgrade command during cleanup | ✅ | Full sweep of `afk.events` across the 05:20–05:35Z window found **zero** `container_upgrade_requested` events; the merge path (which produces that command) was never taken |
+
+## 4. Findings (two criteria blocked by the in-flight topic-split rollout)
+
+### 4.1 `engineering.events.normalized` is empty — producer switch not deployed
+
+The `merge_request.opened`/`closed` observations were published to
+`afk.events`, and `engineering.events.normalized` holds **zero** messages
+(all six partitions at offset 0). The deployed producer image is still the
+pre-split revision (`fast-api-eda-gateway:60433d49`), whose
+`normalized_event_producer` defaults to `afk.events`; the split revision
+(`200aae50`, which adds `NORMALIZED_EVENTS_TOPIC`) is pinned in the
+GitOps repo's working tree but the deployment manifest still references the
+old image, so the #513 producer switch has not reached the cluster. The
+acceptance criterion "observation published to `engineering.events.normalized`"
+therefore **fails under current deployment state** and must be re-checked
+after #513 lands — the observation itself is produced and well-formed, only
+its destination topic is stale.
+
+### 4.2 `engineering_events` row not verifiable — consumer group has no committed offsets
+
+The gateway's AFK outcome consumer group `opencode-outcomes` shows **no
+committed offsets** on `afk.events`, `engineering.events.normalized`, or the
+DLQ topics (control check: the `opencode-gateway` usage group on
+`opencode.usage.v1` returns committed offsets, so the measurement is valid;
+the `ansible-eda-afk-trigger` group likewise shows healthy advancing offsets).
+The consumer commits only after a successful transactional DB write, so the
+zero-commit state means the consumer→Postgres leg is not currently processing
+(or is subscribed to the still-empty new topic). This is the expected mid-cutover
+gap of the #512–#514 sequence (ADR 0023: consumer on the new topic before the
+producer switch), but it blocks direct verification of the "exactly one matching
+`engineering_events` row" criterion from this environment, which also has no
+direct Postgres access (CNPG is cluster-internal; no API route reads
+`engineering_events` by design, ADR 0021/0022). The DLQ topics are empty, so
+no delivery was rejected — the row is *expected* to exist for the two observed
+normalized events once the consumer leg is healthy; re-verification is a
+follow-up once #514 completes.
+
+## 5. Reproducibility
+
+Disposable MR created and closed entirely via the GitLab API (no local git
+push): branch from `main` head `89ec915f`, one-commit add of `VALIDATION_516.md`,
+`POST /projects/:id/merge_requests`, then `PUT …/merge_requests/124` with
+`state_event=close`. Kafka observation used a plain `kafka-python` consumer
+(no group, `enable_auto_commit=False`) reading `afk.events` from the end
+offsets, then re-scanning partition history for the MR's resource number.
+
+Test suites run per the task contract:
+- `python -m pytest tests/test_afk_outcomes_*.py -q` — **134 passed**
+- `python -m pytest tests/test_producer_to_gateway_contract_matrix.py -q` — **130 passed**
+- `python -m pytest tests/integration/test_afk_consumer.py -v -m integration` — **12 skipped** (no local Postgres 5433; skip-if-unreachable path, pre-existing)
+- `python -m pytest tests/test_afk_consumer.py -q` — **collection error on this host**: Python 3.9 cannot import `datetime.UTC` (3.11+); the repo declares `requires-python = ">=3.12"`. Pre-existing environment limitation, not a regression (worktree otherwise clean).
+
+## 6. Files changed
+
+- `docs/afk-outcome-validation.md` — this findings section (primary deliverable).
+
+No changes to `afk_outcomes/*`, `app/*`, migrations, or `scripts/afk_backfill.py`
+(validation-only slice, per the task contract). The disposable MR was closed
+without merging; its source branch `val/issue-516-mr-obs-20260818052055` was
+left in place (deleting it would fire a push webhook — unnecessary noise).
