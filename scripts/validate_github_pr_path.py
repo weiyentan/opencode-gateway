@@ -118,7 +118,7 @@ def step_2_create_disposable_pr(dry_run: bool) -> tuple[bool, str | None, str | 
     branch_name = f"{BRANCH_PREFIX}-{timestamp}"
     pr_number: str | None = None
 
-    # Capture the original branch for reliable return
+    # Capture the current commit hash for reliable return
     original_branch = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
