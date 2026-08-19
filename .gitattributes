@@ -1,0 +1,3 @@
+docs/contracts/normalized-event-v1/schema.json text eol=lf
+docs/contracts/normalized-event-v1/checksums.sha256 text eol=lf
+docs/contracts/normalized-event-v1/fixtures/*.json text eol=lf

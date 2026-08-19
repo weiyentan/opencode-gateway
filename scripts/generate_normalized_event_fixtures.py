@@ -7,7 +7,8 @@ in fast-api-eda-gateway (``src/fast_api_eda_gateway/normalized_event.py`` +
 ``normalized_event_producer.py``): schema_version "1.0", event_type "normalized",
 provider, delivery_id, nested resource{type, repository_url, number}, top-level
 action, occurred_at, ingested_at, actor, and redacted_payload.reference
-{provider, delivery_id} equal to the envelope.
+{provider, delivery_id} equal to the envelope, plus optional ``issue_links``
+snapshots on change-request open/update observations.
 
 It deliberately does NOT import the consumer's ``NormalizedProviderEvent``
 model: the fixtures are the pinned contract's source of truth, never the
@@ -49,6 +50,33 @@ ALLOWED_PAIRS: list[tuple[str, str, str]] = [
     ("merge_request", "merged", "gitlab"),
 ]
 
+ISSUE_LINKS_BY_PAIR: dict[tuple[str, str], dict[str, list[dict[str, str]]]] = {
+    ("pull_request", "opened"): {
+        "references": [],
+        "declares_closure": [
+            {"repository": "https://github.com/owner/repo", "number": "123"}
+        ],
+    },
+    ("pull_request", "edited"): {
+        "references": [
+            {"repository": "https://github.com/owner/repo", "number": "456"}
+        ],
+        "declares_closure": [],
+    },
+    ("merge_request", "opened"): {
+        "references": [],
+        "declares_closure": [
+            {"repository": "https://gitlab.com/group/project", "number": "42"}
+        ],
+    },
+    ("merge_request", "updated"): {
+        "references": [
+            {"repository": "https://gitlab.com/group/project", "number": "50"}
+        ],
+        "declares_closure": [],
+    },
+}
+
 
 def _repository_url(provider: str) -> str:
     if provider == "github":
@@ -61,7 +89,7 @@ def _message(
 ) -> dict:
     delivery_id = f"00000000-0000-0000-0000-{delivery_suffix:012d}"
     number = 100 + delivery_suffix
-    return {
+    message = {
         "schema_version": SCHEMA_VERSION,
         "event_type": EVENT_TYPE,
         "provider": provider,
@@ -82,6 +110,10 @@ def _message(
             },
         },
     }
+    issue_links = ISSUE_LINKS_BY_PAIR.get((resource_type, action))
+    if issue_links is not None:
+        message["issue_links"] = issue_links
+    return message
 
 
 def main() -> None:
@@ -92,7 +124,8 @@ def main() -> None:
     for index, (resource_type, action, provider) in enumerate(ALLOWED_PAIRS, start=1):
         message = _message(resource_type, action, provider, index)
         path = FIXTURES_DIR / f"{resource_type}.{action}.json"
-        path.write_text(json.dumps(message, indent=2) + "\n", encoding="utf-8")
+        with path.open("w", encoding="utf-8", newline="\n") as fixture_file:
+            fixture_file.write(json.dumps(message, indent=2) + "\n")
         print(f"wrote {path.name}")
 
 
