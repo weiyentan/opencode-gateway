@@ -17,5 +17,11 @@
       "provider": "gitlab",
       "delivery_id": "00000000-0000-0000-0000-000000000011"
     }
+  },
+  "issue_links": {
+    "references": [
+      {"repository": "https://gitlab.com/group/project", "number": "50"}
+    ],
+    "declares_closure": []
   }
 }

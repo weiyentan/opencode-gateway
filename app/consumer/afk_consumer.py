@@ -163,6 +163,33 @@ _PRODUCER_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
 }
 
 
+class _IssueLink(BaseModel):
+    """One issue reference within ``issue_links``.
+
+    Carries a cross-repository issue reference: the repository URL of the
+    issue and its provider-scoped number as an opaque string.  The
+    ``repository`` field matches the repository_url of the referenced
+    issue, which may differ from the change request's repository (cross-repo).
+    """
+
+    repository: str
+    number: str
+
+
+class _IssueLinks(BaseModel):
+    """Structured ``issue_links`` snapshot on a normalized change-request event.
+
+    Carries two distinct relationship kinds: ``references`` (plain mentions)
+    and ``declares_closure`` (closing-syntax declarations).  Both carry
+    full-snapshot sets on every open/update; revocations are derived from
+    snapshot diffs by downstream consumers.  The field is producer-owned
+    and optional — messages without it must still pass validation.
+    """
+
+    references: list[_IssueLink] = []
+    declares_closure: list[_IssueLink] = []
+
+
 class _NormalizedResource(BaseModel):
     """The nested ``resource`` object in a v1 normalized event.
 
@@ -216,6 +243,7 @@ class NormalizedProviderEvent(BaseModel):
     ingested_at: datetime
     actor: str | None = None
     redacted_payload: _RedactedPayload
+    issue_links: _IssueLinks | None = None
 
     @property
     def effective_resource_type(self) -> str:

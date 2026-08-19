@@ -45,6 +45,18 @@ producer_owned:
     detail: >-
       The exact-shape constraint (reject unknown properties) is producer-owned:
       the producer's serializer emits nothing outside the whitelisted keys.
+  - name: issue_links (structured issue↔change-request snapshot)
+    where: schema.json (issue_links property); afk_consumer.py _IssueLinks/_IssueLink
+    detail: >-
+      A structured full-snapshot field on the normalized contract (additive
+      schema v1 change, producer-owned) carrying, per change-request open/update
+      observation, the complete current references and declares_closure sets
+      (including cross-repo targets). Full snapshots on every open/update;
+      explicit revocations are derived from snapshot diffs. The field is optional
+      — messages without it must still pass validation. The producer owns this
+      contract; the consumer models it as _IssueLinks on NormalizedProviderEvent
+      for tolerance. issue_links carries structured references and closure
+      declarations, never raw bodies.
 
 # ── Consumer-policy constraints ────────────────────────────────────────────────
 #
