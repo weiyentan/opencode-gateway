@@ -258,7 +258,9 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 Read-only endpoints exposing the reporting read-model (ADR 0021, issue #484)
 — the first report of what the Gateway has ingested from the normalized-event
-stream (write path: `app/api/reporting_ingest.py`, issue #479): ingested
+stream (`engineering.events.normalized`, the same external normalized
+provider-events topic the AFK Outcome Consumer subscribes to; write path:
+`app/api/reporting_ingest.py`, issue #479): ingested
 resources with their current aggregate, the per-delivery state trail, and the
 session links that can be provably linked to them. The surface is strictly
 read-only and never derives a "completed"/"finished"/outcome state for a
