@@ -1,7 +1,5 @@
 """Tests for the app factory — the core FastAPI application builder."""
 
-from unittest.mock import AsyncMock
-
 import pytest
 from fastapi import FastAPI
 

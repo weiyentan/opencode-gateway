@@ -32,8 +32,6 @@ class TestSchemaLifespanIntegration:
     @pytest.mark.asyncio
     async def test_schema_sourced_on_startup(self):
         """The factory lifespan should call ensure_schema() after pool connection."""
-        from unittest.mock import MagicMock
-
         from app.core.factory import create_app
 
         mock_asyncpg_pool = AsyncMock()

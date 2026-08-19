@@ -215,10 +215,6 @@ class TestAuthInvalidKey:
 
         app = create_app()
         _setup_app_state(app)
-        client = _make_client(app, api_key="")  # Bearer with empty token
-        # _make_client uses "Bearer <api_key>", so api_key="" gives "Bearer "
-        # We need to handle this — the auth check strips and then compares.
-        # Let's use a custom header instead.
 
         async with AsyncClient(
             transport=ASGITransport(app=app, raise_app_exceptions=False),
@@ -287,7 +283,7 @@ class TestInsecureAuthOptIn:
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            settings = Settings()
+            _settings = Settings()  # instantiation emits the insecure-auth warning
             insecure_warnings = [
                 x for x in w if "INSECURE AUTH" in str(x.message)
             ]

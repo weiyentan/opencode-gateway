@@ -48,7 +48,7 @@ class OpenCodeClient(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
-    credentials: Mapped[list["CollectorCredential"]] = relationship(
+    credentials: Mapped[list[CollectorCredential]] = relationship(
         back_populates="client", lazy="selectin"
     )
 

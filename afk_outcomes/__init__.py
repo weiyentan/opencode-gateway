@@ -45,7 +45,6 @@ from afk_outcomes.models import (
     UnresolvedReason,
 )
 from afk_outcomes.repository import (
-    RESOLVER_VERSION,
     AsyncpgOutcomeRepository,
 )
 from afk_outcomes.serialization import (
