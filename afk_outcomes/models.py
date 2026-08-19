@@ -134,16 +134,16 @@ def build_observation_key(
     volatile delivery identifiers.
 
     ``occurred_at`` is normalised to UTC before hashing so the same instant
-    expressed with different UTC offsets derives the identical key.
+    expressed with different UTC offsets derives the identical key.  A naive
+    ``occurred_at`` (no ``tzinfo``) is interpreted as UTC.
     """
     provider_value = provider.value if isinstance(provider, Provider) else str(provider)
     entity_type_value = (
         entity_type.value if isinstance(entity_type, EntityType) else str(entity_type)
     )
-    if occurred_at.tzinfo is not None:
-        occurred_at_value = occurred_at.astimezone(timezone.utc).isoformat()  # noqa: UP017 - datetime.UTC is 3.11+
-    else:
-        occurred_at_value = occurred_at.isoformat()
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)  # noqa: UP017 - datetime.UTC is 3.11+
+    occurred_at_value = occurred_at.astimezone(timezone.utc).isoformat()  # noqa: UP017 - datetime.UTC is 3.11+
     canonical = json.dumps(
         {
             "provider": provider_value,
