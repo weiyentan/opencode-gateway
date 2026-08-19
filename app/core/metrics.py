@@ -220,3 +220,40 @@ class MetricsRegistry:
 # Process-wide default registry, shared by the consumers.  Tests inject their
 # own :class:`MetricsRegistry` instance to assert exact counts in isolation.
 DEFAULT_REGISTRY = MetricsRegistry()
+
+
+# ── Closure-projection recompute metrics (issue #525) ────────────────────────
+#
+# The closure-relationships read API (Slice 4, PRD #521) surfaces projection
+# freshness — every response exposes the stored ``derived_at`` (last
+# successful recompute) and ``resolver_version`` — and these two stable
+# metric names expose the recompute outcome through the registry snapshot
+# seam so staleness/failures are never silent:
+#
+# * ``closure_projection.recompute.failures`` — counter incremented by the
+#   recompute owner when a projection recompute fails after facts commit
+#   (projection stays stale until the next relevant fact triggers a
+#   recompute).
+# * ``closure_projection.recompute.last_success`` — gauge holding the epoch
+#   seconds of the last successful recompute.
+
+METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES = "closure_projection.recompute.failures"
+METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS = (
+    "closure_projection.recompute.last_success"
+)
+
+
+def register_closure_projection_metrics(
+    registry: MetricsRegistry | None = None,
+) -> None:
+    """Eagerly register the closure-projection recompute metrics.
+
+    Get-or-creates the failure counter and the last-success gauge on
+    ``registry`` (the process-wide :data:`DEFAULT_REGISTRY` when omitted) so
+    the snapshot seam always surfaces both names — zero-valued until a
+    recompute owner records a failure/success.  Mirrors the consumer's
+    eager-registration convention.
+    """
+    target = registry if registry is not None else DEFAULT_REGISTRY
+    target.counter(METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES)
+    target.gauge(METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS)

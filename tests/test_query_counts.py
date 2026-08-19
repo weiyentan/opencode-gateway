@@ -16,6 +16,12 @@ import pytest
 from httpx import AsyncClient
 
 from tests.test_agent_runs import _mk_child_row, _mk_session_row, _mk_todo_row
+from tests.test_api_closure_relationships import (
+    _CR_PARAMS,
+    _ISSUE_PARAMS,
+    _mk_episode_row,
+    _mk_link_row,
+)
 from tests.test_usage import _mk_aggregate_row
 from tests.test_usage import _mk_session_row as _mk_usage_session_row
 
@@ -271,6 +277,72 @@ class TestAggregatesQueryCount:
         assert "COALESCE(oc.canonical_name, oc.name)" in sql, (
             f"Expected canonical-name COALESCE in rollup SQL, got: {sql[:200]}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Query counting tests — Closure Relationships read API (#525)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestClosureRelationshipsQueryCount:
+    """Verify the closure-relationships read endpoints use a fixed query
+    budget with no N+1: current answer 3, history 3, reverse 2."""
+
+    @pytest.mark.asyncio
+    async def test_current_answer_uses_three_queries(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Current answer: 1 fetchrow (episode) + 2 fetch (evidence, unresolved)
+        = 3 queries."""
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_episode_row())
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/closure-relationships/issues/current", params=_ISSUE_PARAMS
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetchrow.call_count == 1
+        assert mock_conn.fetch.call_count == 2
+        assert mock_conn.fetchrow.call_count + mock_conn.fetch.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_episode_history_uses_three_queries(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Episode history: 3 fetch (episodes, evidence, unresolved) = 3 queries."""
+        mock_conn.fetch = AsyncMock(
+            side_effect=[[_mk_episode_row(status="superseded")], [_mk_link_row()], []]
+        )
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/closure-relationships/issues/episodes", params=_ISSUE_PARAMS
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetch.call_count == 3
+        assert mock_conn.fetchrow.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_reverse_lookup_uses_two_queries(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Reverse lookup: 1 fetchval (count) + 1 fetch (data) = 2 queries."""
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(return_value=[_mk_link_row()])
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/closure-relationships/change-requests/issues",
+                params=_CR_PARAMS,
+            )
+
+        assert response.status_code == 200
+        assert mock_conn.fetchval.call_count == 1
+        assert mock_conn.fetch.call_count == 1
+        assert mock_conn.fetchval.call_count + mock_conn.fetch.call_count == 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
