@@ -68,7 +68,7 @@ CHECKSUMS_FILE="$CONTRACTS_DIR/checksums.sha256"
 # ``sha256sum <files>`` emits ``<hex>  <relative-path>`` per line; sorting makes
 # the comparison deterministic and independent of filesystem enumeration order.
 cd "$CONTRACTS_DIR"
-fresh_listing="$(sha256sum schema.json fixtures/*.json | sort)"
+fresh_listing="$(sha256sum --text schema.json fixtures/*.json | sort)"
 
 if [[ "$WRITE_MODE" -eq 1 ]]; then
     printf '%s\n' "$fresh_listing" > checksums.sha256

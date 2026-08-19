@@ -398,7 +398,7 @@ def test_every_fixture_round_trips_through_serializer(
     """
     fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
     message = NormalizedProviderEvent.model_validate(fixture)
-    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=False))
+    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=True))
     assert re_serialized == fixture, (
         f"Fixture {resource_type}.{action} does not round-trip through the "
         f"real serializer — the fixture may be hand-crafted rather than "

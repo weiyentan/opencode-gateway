@@ -20,7 +20,10 @@
   },
   "issue_links": {
     "references": [
-      {"repository": "https://gitlab.com/group/project", "number": "50"}
+      {
+        "repository": "https://gitlab.com/group/project",
+        "number": "50"
+      }
     ],
     "declares_closure": []
   }

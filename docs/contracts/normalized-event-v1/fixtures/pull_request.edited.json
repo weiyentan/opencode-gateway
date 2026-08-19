@@ -20,7 +20,10 @@
   },
   "issue_links": {
     "references": [
-      {"repository": "https://github.com/owner/repo", "number": "456"}
+      {
+        "repository": "https://github.com/owner/repo",
+        "number": "456"
+      }
     ],
     "declares_closure": []
   }
