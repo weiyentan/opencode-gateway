@@ -38,18 +38,27 @@ Every derived link stores ``correlation_method``, ``correlation_confidence``,
 from __future__ import annotations
 
 import json
+from typing import Callable
 
 import asyncpg
 
+from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.interfaces import OutcomeRepository
 from afk_outcomes.models import (
     AFKRun,
+    CLOSURE_RESOLVER_VERSION,
+    ClosureEpisode,
+    ClosureEpisodeStatus,
+    ClosureLink,
+    ClosureUnresolved,
     Correlation,
     CorrelationEvidence,
     EngineeringEntity,
     EngineeringEvent,
     EngineeringOutcome,
     EntityType,
+    IssueLinkTarget,
+    IssueLinksSnapshot,
     Provider,
     ReferenceSource,
     ResourceSessionAssociation,
@@ -110,6 +119,87 @@ def _evidence_json(evidence: list[CorrelationEvidence]) -> str:
 def _source_reference_json(sources: list[ReferenceSource]) -> str:
     """Serialize a list of :class:`ReferenceSource` to a JSONB-ready string."""
     return json.dumps([item.model_dump(mode="json") for item in sources])
+
+
+def _issue_links_from_payload(
+    raw: object,
+    normalize: Callable[[str], str | None],
+) -> IssueLinksSnapshot | None:
+    """Extract a normalized :class:`IssueLinksSnapshot` from a fact payload.
+
+    The producer stores ``issue_links`` repository URLs verbatim; the caller
+    supplies the application's URL normalizer so link targets resolve to the
+    same normalized identities as ``engineering_events.repository``.  Targets
+    whose repository cannot be normalized are skipped (never an identity
+    collision); a payload without an ``issue_links`` dict yields ``None``
+    (a missing field is never a revocation — see the projector).
+    """
+    if not isinstance(raw, dict):
+        return None
+    snapshot = IssueLinksSnapshot()
+    found = False
+    for field, kind in (("references", "references"), ("declares_closure", "declares_closure")):
+        items = raw.get(field)
+        if not isinstance(items, list):
+            continue
+        targets: list[IssueLinkTarget] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            repository = item.get("repository")
+            number = item.get("number")
+            if not isinstance(repository, str) or not isinstance(number, str):
+                continue
+            normalized = normalize(repository)
+            if normalized is None:
+                continue
+            targets.append(IssueLinkTarget(repository=normalized, number=number))
+        if kind == "references":
+            snapshot.references = targets
+        else:
+            snapshot.declares_closure = targets
+        found = found or bool(items)
+    return snapshot if found else None
+
+
+def _to_closure_fact(
+    *,
+    provider: Provider,
+    repository: str,
+    entity_type: EntityType,
+    external_id: str,
+    event_type: str,
+    occurred_at: object,
+    observed_via: object,
+    payload: dict,
+    normalize: Callable[[str], str | None],
+) -> ClosureFact:
+    """Build a :class:`ClosureFact` from an ``engineering_events``-shaped row."""
+    return ClosureFact(
+        provider=provider,
+        repository=repository,
+        entity_type=entity_type,
+        external_id=external_id,
+        event_type=event_type,
+        occurred_at=occurred_at,
+        observed_via=observed_via,
+        issue_links=_issue_links_from_payload(payload.get("issue_links"), normalize),
+    )
+
+
+#: Fact event types the closure-episode projection consumes.  Anything else
+#: (issue.updated, change_request.closed/reopened, …) carries no closure-
+#: relevant signal and never triggers a recompute.
+_CLOSURE_RELEVANT_EVENT_TYPES = frozenset(
+    {
+        "issue.opened",
+        "issue.reopened",
+        "issue.closed",
+        "change_request.opened",
+        "change_request.updated",
+        "change_request.merged",
+    }
+)
 
 
 class AsyncpgOutcomeRepository(OutcomeRepository):
@@ -279,6 +369,419 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             observation_key,
             event.observed_via,
             event.snapshot_at,
+        )
+
+    async def recompute_closure_projection(
+        self,
+        *,
+        seed_event: EngineeringEvent,
+        seed_entity: EngineeringEntity,
+        normalize_repository: Callable[[str], str | None] | None = None,
+    ) -> None:
+        """Recompute the closure-episode projection for one committed fact (issue #524).
+
+        DB-local, event-triggered recompute: the caller invokes this AFTER the
+        facts transaction committed (write boundary — facts first, projection
+        second, best-effort).  The affected issues are the seed fact's own
+        issue (issue lifecycle facts) or, for a change-request fact, every
+        issue in its ``issue_links`` snapshot plus every issue already linked
+        to that change request in ``closure_links`` (so a snapshot-diff
+        revocation and a merge both reach their episodes).
+
+        The recompute loads the complete fact history of the affected issues
+        and of every change request linked to them (revoked links are
+        retained, so the declaring set is complete), projects it with the
+        pure-domain projector scoped to the affected issues, and reconciles
+        the derived state into ``closure_links`` / ``closure_episodes`` /
+        ``closure_unresolved``.  Every write is a deterministic upsert of
+        recomputed state, so a partial failure or a concurrent recompute
+        converges on the next trigger — the projection is rebuildable from
+        facts and never authoritative over them.
+
+        ``normalize_repository`` converts raw producer repository URLs inside
+        ``issue_links`` snapshots to the same normalized identities the facts
+        carry (the pure-domain package cannot import the application
+        normalizer, so the caller supplies it).  Defaults to identity.
+
+        The caller owns transaction boundaries: statements run in asyncpg
+        autocommit when invoked outside a transaction.  A failure here must
+        never block ingestion — the caller wraps this best-effort.
+        """
+        normalize = (
+            normalize_repository
+            if normalize_repository is not None
+            else (lambda value: value)
+        )
+        if seed_event.event_type not in _CLOSURE_RELEVANT_EVENT_TYPES:
+            return
+        _, external_id = _split_entity_id(seed_event.entity_id)
+        seed_fact = _to_closure_fact(
+            provider=seed_event.provider,
+            repository=seed_entity.repository,
+            entity_type=seed_entity.entity_type,
+            external_id=external_id,
+            event_type=seed_event.event_type,
+            occurred_at=seed_event.occurred_at,
+            observed_via=seed_event.observed_via,
+            payload=seed_event.payload or {},
+            normalize=normalize,
+        )
+
+        # ── affected issue identities ──────────────────────────────────
+        affected: set[tuple[str, str, str]] = set()
+        if seed_fact.entity_type is EntityType.ISSUE:
+            affected.add(
+                (seed_fact.provider.value, seed_fact.repository, seed_fact.external_id)
+            )
+        else:  # change_request
+            if seed_fact.issue_links is not None:
+                for target in (
+                    seed_fact.issue_links.declares_closure
+                    + seed_fact.issue_links.references
+                ):
+                    affected.add((seed_fact.provider.value, target.repository, target.number))
+            linked = await self._conn.fetch(
+                """
+                SELECT DISTINCT issue_provider, issue_repository, issue_external_id
+                FROM closure_links
+                WHERE change_request_provider = $1
+                  AND change_request_repository = $2
+                  AND change_request_external_id = $3
+                """,
+                seed_fact.provider.value,
+                seed_fact.repository,
+                seed_fact.external_id,
+            )
+            for row in linked:
+                affected.add(
+                    (row["issue_provider"], row["issue_repository"], row["issue_external_id"])
+                )
+        if not affected:
+            return
+        affected_sorted = sorted(affected)
+        issue_providers = [key[0] for key in affected_sorted]
+        issue_repositories = [key[1] for key in affected_sorted]
+        issue_external_ids = [key[2] for key in affected_sorted]
+
+        # ── load the affected issues' lifecycle facts ──────────────────
+        issue_rows = await self._conn.fetch(
+            """
+            SELECT provider, repository, entity_type, external_id, event_type,
+                   occurred_at, observed_via, payload
+            FROM engineering_events
+            WHERE entity_type = 'issue'
+              AND (provider, repository, external_id) IN (
+                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+            """,
+            issue_providers,
+            issue_repositories,
+            issue_external_ids,
+        )
+
+        # ── every change request linked to the affected issues ─────────
+        cr_link_rows = await self._conn.fetch(
+            """
+            SELECT DISTINCT change_request_provider,
+                            change_request_repository,
+                            change_request_external_id
+            FROM closure_links
+            WHERE (issue_provider, issue_repository, issue_external_id) IN (
+                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+            """,
+            issue_providers,
+            issue_repositories,
+            issue_external_ids,
+        )
+        cr_keys: set[tuple[str, str, str]] = {
+            (
+                row["change_request_provider"],
+                row["change_request_repository"],
+                row["change_request_external_id"],
+            )
+            for row in cr_link_rows
+        }
+        if seed_fact.entity_type is EntityType.CHANGE_REQUEST:
+            cr_keys.add(
+                (seed_fact.provider.value, seed_fact.repository, seed_fact.external_id)
+            )
+        cr_keys_sorted = sorted(cr_keys)
+        cr_rows = await self._conn.fetch(
+            """
+            SELECT provider, repository, entity_type, external_id, event_type,
+                   occurred_at, observed_via, payload
+            FROM engineering_events
+            WHERE entity_type = 'change_request'
+              AND (provider, repository, external_id) IN (
+                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+            """,
+            [key[0] for key in cr_keys_sorted],
+            [key[1] for key in cr_keys_sorted],
+            [key[2] for key in cr_keys_sorted],
+        )
+
+        facts: list[ClosureFact] = []
+        for row in issue_rows:
+            facts.append(
+                _to_closure_fact(
+                    provider=Provider(row["provider"]),
+                    repository=row["repository"],
+                    entity_type=EntityType(row["entity_type"]),
+                    external_id=row["external_id"],
+                    event_type=row["event_type"],
+                    occurred_at=row["occurred_at"],
+                    observed_via=row["observed_via"],
+                    payload=row["payload"] or {},
+                    normalize=normalize,
+                )
+            )
+        for row in cr_rows:
+            facts.append(
+                _to_closure_fact(
+                    provider=Provider(row["provider"]),
+                    repository=row["repository"],
+                    entity_type=EntityType(row["entity_type"]),
+                    external_id=row["external_id"],
+                    event_type=row["event_type"],
+                    occurred_at=row["occurred_at"],
+                    observed_via=row["observed_via"],
+                    payload=row["payload"] or {},
+                    normalize=normalize,
+                )
+            )
+
+        projection = project_closure_episodes(
+            facts,
+            issues=frozenset(affected),
+            resolver_version=CLOSURE_RESOLVER_VERSION,
+        )
+
+        # ── reconcile (deterministic upserts — rebuildable from facts) ─
+        for link in projection.links:
+            await self._upsert_closure_link(link)
+        await self._reconcile_closure_episodes(projection.episodes)
+        for record in projection.unresolved:
+            await self._upsert_closure_unresolved(record)
+
+    async def _upsert_closure_link(self, link: ClosureLink) -> None:
+        """Upsert one derived link state, corrected toward the latest derivation.
+
+        The projection is a recomputed view over facts, not an enrich-only
+        log: ``state`` (active/revoked/parked) is corrected on conflict, and
+        ``revoked_at`` is stamped only while the link is revoked (cleared on
+        re-activation).  Deterministic recompute makes the upsert idempotent.
+        """
+        await self._conn.execute(
+            """
+            INSERT INTO closure_links
+                (change_request_provider, change_request_repository,
+                 change_request_external_id, issue_provider, issue_repository,
+                 issue_external_id, kind, state, revoked_at, resolver_version,
+                 first_seen_at, last_seen_at, derived_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    CASE WHEN $8 = 'revoked' THEN now() ELSE NULL END,
+                    $9, now(), now(), now())
+            ON CONFLICT (change_request_provider, change_request_repository,
+                         change_request_external_id, issue_provider,
+                         issue_repository, issue_external_id, kind)
+            DO UPDATE SET
+                state = EXCLUDED.state,
+                revoked_at = CASE WHEN EXCLUDED.state = 'revoked' THEN now() ELSE NULL END,
+                resolver_version = EXCLUDED.resolver_version,
+                derived_at = now(),
+                last_seen_at = now()
+            """,
+            link.change_request_provider.value,
+            link.change_request_repository,
+            link.change_request_external_id,
+            link.issue_provider.value,
+            link.issue_repository,
+            link.issue_external_id,
+            link.kind.value,
+            link.state.value,
+            link.resolver_version,
+        )
+
+    async def _reconcile_closure_episodes(
+        self, episodes: list[ClosureEpisode]
+    ) -> None:
+        """Reconcile the computed episode list into ``closure_episodes``.
+
+        Matches computed episodes to stored rows by (issue identity,
+        closed_at) — the open episode against the stored current open row —
+        updates matched rows toward the recomputed state (the current
+        episode's ``superseded_at`` cleared, superseded episodes' stamp
+        preserved), inserts new rows, and marks stored rows the projector no
+        longer produces as superseded (never deleted).  The partial unique
+        index (one current episode per issue) guarantees the current pointer.
+        """
+        by_issue: dict[tuple[str, str, str], list[ClosureEpisode]] = {}
+        for episode in episodes:
+            key = (
+                episode.issue_provider.value,
+                episode.issue_repository,
+                episode.issue_external_id,
+            )
+            by_issue.setdefault(key, []).append(episode)
+        if not by_issue:
+            return
+
+        providers = [key[0] for key in sorted(by_issue)]
+        repositories = [key[1] for key in sorted(by_issue)]
+        external_ids = [key[2] for key in sorted(by_issue)]
+        stored_rows = await self._conn.fetch(
+            """
+            SELECT id, issue_provider, issue_repository, issue_external_id,
+                   closed_at, superseded_at
+            FROM closure_episodes
+            WHERE (issue_provider, issue_repository, issue_external_id) IN (
+                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
+            """,
+            providers,
+            repositories,
+            external_ids,
+        )
+        stored_by_issue: dict[tuple[str, str, str], list] = {}
+        for row in stored_rows:
+            key = (row["issue_provider"], row["issue_repository"], row["issue_external_id"])
+            stored_by_issue.setdefault(key, []).append(row)
+
+        for issue_key in sorted(by_issue):
+            computed = by_issue[issue_key]
+            stored = stored_by_issue.get(issue_key, [])
+            matched_ids: set = set()
+            stored_closed = {
+                row["closed_at"]: row
+                for row in stored
+                if row["closed_at"] is not None
+            }
+            stored_open_current = next(
+                (
+                    row
+                    for row in stored
+                    if row["closed_at"] is None and row["superseded_at"] is None
+                ),
+                None,
+            )
+            for index, episode in enumerate(computed):
+                is_current = index == len(computed) - 1
+                row = (
+                    stored_open_current
+                    if episode.closed_at is None
+                    else stored_closed.get(episode.closed_at)
+                )
+                if row is not None:
+                    matched_ids.add(row["id"])
+                    await self._conn.execute(
+                        """
+                        UPDATE closure_episodes
+                        SET opened_at = $2,
+                            closed_at = $3,
+                            status = $4,
+                            change_request_provider = $5,
+                            change_request_repository = $6,
+                            change_request_external_id = $7,
+                            resolver_version = $8,
+                            superseded_at = CASE WHEN $9 THEN
+                                COALESCE(closure_episodes.superseded_at, now())
+                                ELSE NULL END,
+                            derived_at = now(),
+                            last_seen_at = now()
+                        WHERE id = $1
+                        """,
+                        row["id"],
+                        episode.opened_at,
+                        episode.closed_at,
+                        episode.status.value,
+                        (
+                            episode.change_request_provider.value
+                            if episode.change_request_provider is not None
+                            else None
+                        ),
+                        episode.change_request_repository,
+                        episode.change_request_external_id,
+                        episode.resolver_version,
+                        not is_current,
+                    )
+                else:
+                    await self._conn.execute(
+                        """
+                        INSERT INTO closure_episodes
+                            (issue_provider, issue_repository, issue_external_id,
+                             opened_at, closed_at, status,
+                             change_request_provider, change_request_repository,
+                             change_request_external_id, resolver_version,
+                             superseded_at, derived_at, first_seen_at, last_seen_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                CASE WHEN $11 THEN NULL ELSE now() END,
+                                now(), now(), now())
+                        """,
+                        episode.issue_provider.value,
+                        episode.issue_repository,
+                        episode.issue_external_id,
+                        episode.opened_at,
+                        episode.closed_at,
+                        episode.status.value,
+                        (
+                            episode.change_request_provider.value
+                            if episode.change_request_provider is not None
+                            else None
+                        ),
+                        episode.change_request_repository,
+                        episode.change_request_external_id,
+                        episode.resolver_version,
+                        is_current,
+                    )
+            # stored rows the projector no longer produces (e.g. an open
+            # interval whose declarations were all revoked) are superseded —
+            # never deleted, never re-activated.
+            for row in stored:
+                if row["id"] in matched_ids:
+                    continue
+                if row["superseded_at"] is not None:
+                    continue
+                await self._conn.execute(
+                    """
+                    UPDATE closure_episodes
+                    SET status = $2,
+                        superseded_at = now(),
+                        derived_at = now(),
+                        last_seen_at = now()
+                    WHERE id = $1
+                    """,
+                    row["id"],
+                    ClosureEpisodeStatus.SUPERSEDED.value,
+                )
+
+    async def _upsert_closure_unresolved(self, record: ClosureUnresolved) -> None:
+        """Upsert one versioned unresolved record (enrich-corrected, never deleted).
+
+        Keyed by (issue identity, closed_at, reason) — one record per
+        unresolved episode outcome, versioned via ``resolver_version`` and
+        ``derived_at``.  Historical records of episodes that later resolved
+        are retained (no hard delete anywhere in the projection).
+        """
+        await self._conn.execute(
+            """
+            INSERT INTO closure_unresolved
+                (issue_provider, issue_repository, issue_external_id,
+                 closed_at, reason, candidates, resolver_version,
+                 derived_at, first_seen_at, last_seen_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, now(), now(), now())
+            ON CONFLICT (issue_provider, issue_repository, issue_external_id,
+                         closed_at, reason)
+            DO UPDATE SET
+                candidates = EXCLUDED.candidates,
+                resolver_version = EXCLUDED.resolver_version,
+                derived_at = now(),
+                last_seen_at = now()
+            """,
+            record.issue_provider.value,
+            record.issue_repository,
+            record.issue_external_id,
+            record.closed_at,
+            record.reason,
+            json.dumps([item.model_dump(mode="json") for item in record.candidates]),
+            record.resolver_version,
         )
 
     async def _log_delivery(self, run: AFKRun) -> None:

@@ -395,3 +395,168 @@ class ResourceSessionAssociation(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+
+
+class ClosureLink(Base):
+    """The derived current state of one change-request->issue link (migration 0036).
+
+    Keyed by ``UNIQUE (change_request_provider, change_request_repository,
+    change_request_external_id, issue_provider, issue_repository,
+    issue_external_id, kind)`` — both endpoint identities (flattened stable
+    resource identities, no ``engineering_resources`` registry) plus the
+    relationship kind (``references`` vs ``declares_closure``, never
+    conflated).  ``state`` is ``active`` / ``revoked`` (explicit
+    snapshot-diff revocation) / ``parked`` (conflicting same-timestamp
+    snapshots, never arbitrarily won); ``revoked_at`` stamps the revocation
+    and is cleared on re-activation.  The projection is a recomputed view
+    over the immutable ``engineering_events`` facts: state is corrected
+    toward the latest derivation on every recompute (conflict-update),
+    never a separate source of truth.  Revoked rows are retained so the
+    declaring set of an issue stays complete for incremental recomputes.
+    """
+
+    __tablename__ = "closure_links"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "change_request_provider",
+            "change_request_repository",
+            "change_request_external_id",
+            "issue_provider",
+            "issue_repository",
+            "issue_external_id",
+            "kind",
+            name="uq_closure_links_identity",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    change_request_provider: Mapped[str] = mapped_column(String, nullable=False)
+    change_request_repository: Mapped[str] = mapped_column(String, nullable=False)
+    change_request_external_id: Mapped[str] = mapped_column(String, nullable=False)
+    issue_provider: Mapped[str] = mapped_column(String, nullable=False)
+    issue_repository: Mapped[str] = mapped_column(String, nullable=False)
+    issue_external_id: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    derived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class ClosureEpisode(Base):
+    """One immutable closure episode: an open->close interval for one issue
+    (migration 0036).
+
+    Keyed by the issue endpoint identity (its flattened stable resource
+    identity) plus the close observation time; ``closed_at IS NULL`` marks
+    the currently-open interval.  ``status`` carries the fixed episode
+    vocabulary (``pending``, ``awaiting_closure``, ``unmatched``,
+    ``ambiguous``, ``inferred``, ``superseded``); the attributed
+    change-request tuple is set only for ``inferred`` episodes.  The partial
+    unique index ``uq_closure_episodes_current_issue`` (``superseded_at IS
+    NULL``) guarantees at most one current episode per issue; a
+    reopen/reclose cycle marks the earlier episode ``superseded`` — never
+    deleted.  Episode identity and historical attribution are immutable; the
+    outcome is recomputed toward the latest facts.
+    """
+
+    __tablename__ = "closure_episodes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    issue_provider: Mapped[str] = mapped_column(String, nullable=False)
+    issue_repository: Mapped[str] = mapped_column(String, nullable=False)
+    issue_external_id: Mapped[str] = mapped_column(String, nullable=False)
+    opened_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    change_request_provider: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    change_request_repository: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    change_request_external_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    derived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class ClosureUnresolved(Base):
+    """A versioned unresolved record for one closed closure episode
+    (migration 0036).
+
+    Keyed by ``UNIQUE (issue_provider, issue_repository, issue_external_id,
+    closed_at, reason)`` — one record per (episode, outcome), versioned via
+    ``resolver_version`` / ``derived_at``.  ``reason`` is ``unmatched``
+    (zero candidates) or ``ambiguous`` (multiple candidates, or an eligible
+    parked declaration); ``candidates`` holds the competing change-request
+    identities (empty for unmatched).  Never tie-broken, never scored;
+    historical records of episodes that later resolved are retained (no
+    hard delete anywhere in the projection).
+    """
+
+    __tablename__ = "closure_unresolved"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "issue_provider",
+            "issue_repository",
+            "issue_external_id",
+            "closed_at",
+            "reason",
+            name="uq_closure_unresolved_episode_reason",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    issue_provider: Mapped[str] = mapped_column(String, nullable=False)
+    issue_repository: Mapped[str] = mapped_column(String, nullable=False)
+    issue_external_id: Mapped[str] = mapped_column(String, nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    derived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )

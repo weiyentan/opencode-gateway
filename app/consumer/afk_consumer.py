@@ -970,15 +970,38 @@ class AFKOutcomeConsumer:
         entity: EngineeringEntity,
         event: EngineeringEvent,
     ) -> None:
-        """Write delivery_log + event in a single transaction (via repository)."""
+        """Write delivery_log + event in a single transaction (via repository).
+
+        The closure-episode projection recompute (issue #524) runs AFTER the
+        facts transaction commits — the write boundary: facts first, projection
+        second, best-effort.  A projection failure must never block valid
+        ingestion (the retry/DLQ path is unchanged); the projection is
+        rebuildable from facts, so staleness self-heals on the next relevant
+        fact.  The recompute is DB-local and event-triggered only — no
+        scheduler, no provider API call.
+        """
         async with self._pool.acquire() as conn:
+            repo = AsyncpgOutcomeRepository(conn)
             async with conn.transaction():
-                repo = AsyncpgOutcomeRepository(conn)
                 await repo.record_event(
                     provider=message.provider,
                     delivery_id=message.delivery_id,
                     entity=entity,
                     event=event,
+                )
+            try:
+                await repo.recompute_closure_projection(
+                    seed_event=event,
+                    seed_entity=entity,
+                    normalize_repository=normalize_repository_url,
+                )
+            except Exception:
+                logger.exception(
+                    "Closure-episode projection recompute failed after facts "
+                    "committed (delivery=%s, entity=%s) — projection stays "
+                    "stale until the next relevant fact triggers a recompute",
+                    message.delivery_id,
+                    event.entity_id,
                 )
 
     async def _commit(self) -> None:
