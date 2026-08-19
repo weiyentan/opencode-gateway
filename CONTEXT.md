@@ -782,57 +782,57 @@ and opens the chain detail overlay for one run. Follows the shared panel
 conventions (freshness/stale-on-error retention, Token Breakdown, Active
 Tokens).
 _Avoid_: AFK panel (generic)
-> **Accepted planned design — MR↔issue relationship terminology.**
-> The following terms describe the proposed durable MR↔issue relationship
-> (reinforced by the grill-with-docs session). They are **not yet
-> implemented** — no product code, migration, contract, or table exists for
-> them yet. They are recorded here now so vocabulary used in later slices
-> stays consistent and so the relationship is clearly distinguished from
-> currently-implemented associations.
+**Accepted planned design — MR↔issue relationship terminology.**
+The following terms describe the proposed durable MR↔issue relationship
+(reinforced by the grill-with-docs session). They are **not yet
+implemented** — no product code, migration, contract, or table exists for
+them yet. They are recorded here now so vocabulary used in later slices
+stays consistent and so the relationship is clearly distinguished from
+currently-implemented associations.
 
 **change-request repository**:
 The repository that owns the pull/merge request carrying the issue reference
-or closure declaration (e.g. for ``cloudnative-pg MR !6`` the change-request
-repository is ``cloudnative-pg``). The endpoint of a relationship edge that
+or closure declaration (e.g. for `cloudnative-pg MR !6` the change-request
+repository is `cloudnative-pg`). The endpoint of a relationship edge that
 originates from the change request. Stored independently of the issue
 repository because cross-repository references are in initial scope.
 _Avoid_: source repository, target repository (in this relationship domain)
 
 **issue repository**:
-The repository that owns the referenced issue (e.g. for ``#1`` referenced by
-``cloudnative-pg MR !6`` the issue repository is ``cloudnative-pg``; for a
-cross-repository reference like ``application/api MR !10 -> platform/tracking
-issue #25`` the issue repository is ``platform/tracking``). The endpoint of a
+The repository that owns the referenced issue (e.g. for `#1` referenced by
+`cloudnative-pg MR !6` the issue repository is `cloudnative-pg`; for a
+cross-repository reference like `application/api MR !10 -> platform/tracking
+issue #25` the issue repository is `platform/tracking`). The endpoint of a
 relationship edge that points at the issue. Stored independently of the
 change-request repository.
 _Avoid_: source repository, target repository (in this relationship domain)
 
 **Repository (scope) note**:
-The generic terms ``source repository`` and ``target repository`` are NOT used
-in this relationship domain. ``source repository`` is overloaded — it already
+The generic terms `source repository` and `target repository` are NOT used
+in this relationship domain. `source repository` is overloaded — it already
 means the branch origin in Git change-request context and a workload
 collector source in the usage-telemetry domain — so reusing it here would be
-ambiguous. Use the relationship-specific ``change-request repository`` and
-``issue repository`` instead.
+ambiguous. Use the relationship-specific `change-request repository` and
+`issue repository` instead.
 
 **Relationship edge identity**:
 The stable identity of one endpoint of an MR↔issue relationship. Each endpoint
-is a **Stable Resource Identity**: ``(provider, repository, resource_type,
-external_id)`` — e.g. ``(gitlab, cloudnative-pg, change_request, "6")`` and
-``(gitlab, cloudnative-pg, issue, "1")`` (same-repo), or
-``(gitlab, application/api, change_request, "10")`` and
-``(gitlab, platform/tracking, issue, "25")`` (cross-repo). An MR↔issue
+is a **Stable Resource Identity**: `(provider, repository, resource_type,
+external_id)` — e.g. `(gitlab, cloudnative-pg, change_request, "6")` and
+`(gitlab, cloudnative-pg, issue, "1")` (same-repo), or
+`(gitlab, application/api, change_request, "10")` and
+`(gitlab, platform/tracking, issue, "25")` (cross-repo). An MR↔issue
 relationship edge therefore spans two independent repository keys, one for
 the change-request repository and one for the issue repository.
 _Avoid_: a single shared repository key covering both endpoints
 
 **Cross-repository references (planned)**:
-References of the form ``group/project#N`` (e.g. ``platform/tracking#25``)
+References of the form `group/project#N` (e.g. `platform/tracking#25`)
 that point at an issue in a different repository than the change request.
 Cross-repository references are in the initial implementation scope, so the
 relationship schema must represent the change-request and issue repositories
 independently (or as two resource foreign keys) from the start. Same-repo
-shorthand ``#N`` resolves to the change-request repository by default.
+shorthand `#N` resolves to the change-request repository by default.
 This feature is **not yet implemented** — recorded as accepted planned design
 only.
 _Avoid_: assuming change-request and issue are always in the same repository
