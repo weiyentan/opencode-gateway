@@ -153,10 +153,16 @@ class Settings(BaseSettings):
     normalized_events_topic: str = "engineering.events.normalized"
     normalized_events_dlq_topic: str = "engineering.events.normalized.dlq"
 
-    # ``afk_outcomes_topic`` (retained for any remaining command consumption):
-    # the legacy ``afk.events`` topic.  The AFK Outcome Consumer no longer
-    # subscribes to this topic by default; it is kept for backward
-    # compatibility and any remaining command consumption.
+    # ``afk_outcomes_topic`` / ``afk_outcomes_dlq_topic`` — compatibility-only
+    # (issue #531).  The legacy ``afk.events`` command topic and its DLQ.  The
+    # AFK Outcome Consumer no longer subscribes to these settings — it reads
+    # ``normalized_events_topic`` / ``normalized_events_dlq_topic`` above —
+    # and the deployment manifests (docker-compose.yaml,
+    # k8s/afk-consumer-deployment.yaml) configure the normalized variables.
+    # These fields are retained ONLY so that environments still setting
+    # GATEWAY_AFK_OUTCOMES_TOPIC / GATEWAY_AFK_OUTCOMES_DLQ_TOPIC do not fail
+    # settings validation (``extra="forbid"``); they are never consumed by
+    # the consumer path.
     afk_outcomes_topic: str = "afk.events"
     afk_outcomes_dlq_topic: str = "afk.events-dlq"
     afk_outcomes_consumer_group_id: str = "opencode-outcomes"
