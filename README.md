@@ -161,7 +161,7 @@ curl http://localhost:8000/health
 Expected response (example):
 
 ```json
-{"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
+{"status":"ok","data":{"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}}
 ```
 
 **Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, operational events, collector health, agent/LLM usage, and recent sessions — auto-refreshing every 30 seconds (client metadata is cached for 10 minutes). The frontend is served by a separate nginx container that proxies API requests to the Gateway.
