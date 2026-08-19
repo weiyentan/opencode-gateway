@@ -33,8 +33,21 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - run: |
           pip install -r requirements.txt
           pip install -e .
 
       - run: pytest --maxfail=5 -v -m "not integration"
+
+      - name: Lint Python
+        run: ruff check .
+
+      - name: Type-check application
+        run: mypy app/ afk_outcomes/
+
+      - name: Test frontend pure functions
+        run: node frontend/tests/test_pure_functions.js
