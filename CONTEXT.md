@@ -623,7 +623,7 @@ A deterministic link between an AFK Run and one Engineering Entity
 (``afk_outcomes.models.Correlation``), produced by the CorrelationEngine.
 Every derived link records ``correlation_method`` (the rule that produced it),
 ``correlation_confidence``, evidence with source identifiers, and
-``resolver_version``. Persisted on ``afk_run_entities`` /
+`resolver_version`. Persisted on ``afk_run_entities`` /
 ``unresolved_correlations``.
 _Avoid_: Match, guess
 
@@ -668,14 +668,14 @@ _Avoid_: The full provider-scoped entity id (``change_request:442``), branch nam
 **Provisional Link**:
 A derived link marked ``provisional`` — an entity link whose role is not
 ``resolved`` (i.e. ``referenced`` or ``noise``), or a session link marked
-``inferred``. Provisional links are visibly distinguished in Aurora Glass and
+`inferred`. Provisional links are visibly distinguished in Aurora Glass and
 never silently conflated with explicit resolved links.
 _Avoid_: Uncertain link, best-effort link (ambiguous)
 
 **Unresolved Correlation**:
 A correlation the resolver could not deterministically establish
-(``unresolved_correlations`` table): ``ambiguous`` (competing candidates with
-no higher-confidence tie-breaker) or ``unmatched`` (no rule produced a link).
+(``unresolved_correlations`` table): `ambiguous` (competing candidates with
+no higher-confidence tie-breaker) or `unmatched` (no rule produced a link).
 Never random-tiebroken. Exposed via the AFK Outcomes REST API with
 ``provisional=true``.
 _Avoid_: Blocked link, pending match
@@ -734,7 +734,7 @@ flat shape has been removed.  The event carries the producer's native
 resource vocabulary (``issue``, ``pull_request``, ``merge_request``) — never
 the outcome layer's canonical ``change_request`` vocabulary — plus
 ``event_type`` (always ``"normalized"``), a forwarded ``delivery_id``,
-``action``, ``occurred_at``, ``ingested_at``, and ``actor``.  Actions are
+``action``, `occurred_at`, ``ingested_at``, and ``actor``.  Actions are
 constrained to the producer lifecycle allowlist: ``issue``
 opened/edited/reopened/closed; ``pull_request`` opened/edited/reopened/closed/
 merged; ``merge_request`` opened/updated/reopened/closed/merged.  ``edited``
@@ -769,7 +769,7 @@ _Avoid_: Backfill script (generic), reconciliation daemon
 
 **AFK Outcomes REST API**:
 The read-only API surface for the AFK outcome read-model
-(``app/api/afk_outcomes.py``, prefix ``/api/v1/afk-outcomes``):
+(``app/api/afk_outcomes.py``, prefix `/api/v1/afk-outcomes`):
 ``GET /runs`` (filterable by repository, window, status, outcome, origin;
 paginated), ``GET /runs/{afk_run_id}`` (full chain with per-link provenance),
 ``GET /entities``, ``GET /correlations``. Uses the ``{status, data, error}``
@@ -782,6 +782,210 @@ and opens the chain detail overlay for one run. Follows the shared panel
 conventions (freshness/stale-on-error retention, Token Breakdown, Active
 Tokens).
 _Avoid_: AFK panel (generic)
+**Accepted planned design — MR↔issue relationship terminology.**
+The following terms describe the proposed durable MR↔issue relationship
+(reinforced by the grill-with-docs session). They are **not yet
+implemented** — no product code, migration, contract, or table exists for
+them yet. They are recorded here now so vocabulary used in later slices
+stays consistent and so the relationship is clearly distinguished from
+currently-implemented associations.
+
+**change-request repository**:
+The repository that owns the pull/merge request carrying the issue reference
+or closure declaration (e.g. for `cloudnative-pg MR !6` the change-request
+repository is `cloudnative-pg`). The endpoint of a relationship edge that
+originates from the change request. Stored independently of the issue
+repository because cross-repository references are in initial scope.
+_Avoid_: source repository, target repository (in this relationship domain)
+
+**issue repository**:
+The repository that owns the referenced issue (e.g. for `#1` referenced by
+`cloudnative-pg MR !6` the issue repository is `cloudnative-pg`; for a
+cross-repository reference like `application/api MR !10 -> platform/tracking
+issue #25` the issue repository is `platform/tracking`). The endpoint of a
+relationship edge that points at the issue. Stored independently of the
+change-request repository.
+_Avoid_: source repository, target repository (in this relationship domain)
+
+**Repository (scope) note**:
+The generic terms `source repository` and `target repository` are NOT used
+in this relationship domain. `source repository` is overloaded — it already
+means the branch origin in Git change-request context and a workload
+collector source in the usage-telemetry domain — so reusing it here would be
+ambiguous. Use the relationship-specific `change-request repository` and
+`issue repository` instead.
+
+**Relationship edge identity**:
+The stable identity of one endpoint of an MR↔issue relationship. Each endpoint
+is a **Stable Resource Identity**: `(provider, repository, resource_type,
+external_id)` — e.g. `(gitlab, cloudnative-pg, change_request, "6")` and
+`(gitlab, cloudnative-pg, issue, "1")` (same-repo), or
+`(gitlab, application/api, change_request, "10")` and
+`(gitlab, platform/tracking, issue, "25")` (cross-repo). An MR↔issue
+relationship edge therefore spans two independent repository keys, one for
+the change-request repository and one for the issue repository.
+_Avoid_: a single shared repository key covering both endpoints
+
+**Cross-repository references (planned)**:
+References of the form `group/project#N` (e.g. `platform/tracking#25`)
+that point at an issue in a different repository than the change request.
+Cross-repository references are in the initial implementation scope, so the
+relationship schema must represent the change-request and issue repositories
+independently (or as two resource foreign keys) from the start. Same-repo
+shorthand `#N` resolves to the change-request repository by default.
+This feature is **not yet implemented** — recorded as accepted planned design
+only.
+_Avoid_: assuming change-request and issue are always in the same repository
+
+**Accepted planned design — MR↔issue closure relationship.**
+This is a **planned design, not yet implemented.** No product code,
+migration, contract, table, or endpoint for this relationship exists yet.
+The decisions below are recorded so implementation slices stay consistent.
+They are distinct from the currently-implemented associations.
+
+Goal: answer "which GitLab MR / GitHub PR closed this issue?" from webhook
+observations, **without claiming provider-authoritative causation** — the
+system records observed facts and the inferred attribution, never a claim
+that the provider itself recorded as fact.
+
+**Webhook-first**:
+The MR↔issue relationship is derived from webhook observations in normal
+operation. There are **no routine/automated GitHub or GitLab API calls** from
+the application. Provider API enrichment or reconciliation is out of scope
+and is not retained as a fallback requirement. The only provider-API path is
+the explicit operator-invoked relationship backfill (below), and it reuses the
+existing adapter's already-returned data (no new per-MR call shape).
+_Avoid_: provider API confirmation, API-driven reconciliation as a fallback
+
+**references** / **declares_closure**:
+Two distinct relationship kinds. `references` — the change request merely
+mentions an issue (any `#N` / `group/project#N`). `declares_closure` —
+the change request uses provider-documented closing syntax (GitHub
+`fixes/fixed/fix`, `closes/closed/close`, `resolves/resolved/resolve`;
+GitLab equivalently) to declare that merging closes the issue. Each forge is
+parsed by a provider-specific parser matching its documented closing syntax;
+cross-repository references (`group/project#N`) are supported in v1 and
+same-repo `#N` resolves to the change-request repository. These are stored
+as separate kinds and never conflated.
+_Avoid_: treating any mention as a closure declaration
+
+**change-request repository** / **issue repository**:
+Terminology for the two endpoints of an MR↔issue relationship
+(see the terminology block above). Never use `source repository` / `target repository` in this relationship domain — `source repository` is overloaded
+by Git branch and workload-collector terminology.
+_Avoid_: source repository / target repository
+
+**Relationship edge identity**:
+Each endpoint is a **Stable Resource Identity**
+`(provider, repository, resource_type, external_id)`. Projection tables
+store **both natural tuples directly** (the change-request tuple and the
+issue tuple) — there is **no `engineering_resources` registry**; this
+matches the existing `engineering_events` / `resource_session_associations`
+flattened-identity convention.
+_Avoid_: an engineering_resources registry, a single shared repository key
+
+**issue_links**:
+A structured full-snapshot field on the normalized contract (additive schema
+v1 change, producer-owned) carrying, per change-request open/update
+observation, the complete current `references` and `declares_closure` sets
+(including cross-repo targets). Full snapshots on every open/update; explicit
+revocations are derived from snapshot diffs. Legacy `linked_issues` is
+retained but **deprecated** (`[]`), and the consumer contract is pinned to a
+real producer SHA. The producer owns this contract.
+_Avoid_: repurposing `linked_issues`, a schema v2 fork for this in v1
+
+**Immutable fact identity (observation key)**:
+Every `engineering_events` fact has a deterministic, **NOT NULL**,
+**UNIQUE** `observation_key` (never random). Webhook facts derive it from
+provider + delivery ID; backfill facts derive it from a canonical content hash
+over (provider, repository, resource_type, external_id, event_type,
+occurred_at, payload). `observed_via` (webhook/backfill) and `snapshot_at`
+provenance distinguish occurrence time from observation time; backfill
+snapshots never masquerade as historical webhook snapshots.
+_Avoid_: random UUID identity, collapsing distinct webhook deliveries
+
+**Ordering policy (D)**:
+All webhook deliveries are preserved. Projection order is by provider
+`occurred_at`; identical same-timestamp snapshots are harmless; **conflicting
+same-timestamp snapshots are unresolved** (parked), never arbitrarily won.
+Differing same-time snapshots from webhook vs backfill: identical sets
+coalesce; conflicting sets unresolved; webhook outranks backfill at equal
+timestamps without provider API calls.
+_Avoid_: arbitrary tie-breaking, ingestion-order-as-authority
+
+**Historical backfill policy**:
+Forward webhook processing plus **explicit operator-invoked bounded
+relationship backfill** only (an explicit operator flag over a bounded
+window). **No scheduled provider polling.** Descriptions already returned by
+the existing adapter are retained to record `issue_links` snapshots; no
+extra/provider API call shape on the normal path.
+_Avoid_: scheduled automatic reconciliation, automated provider polling
+
+**Inference**:
+An episode's closure attribution is `inferred` only when **exactly one**
+eligible merged change request has an active declaration **and** its merge
+occurred before the issue-close observation. Zero or multiple candidates are
+**unresolved** — never an arbitrary winner.
+_Avoid_: tie-breaking, heuristic winner selection, scoring
+
+**Closure episodes**:
+Projection preserves reopen/reclose history as immutable **closure episodes**
+(open → close intervals keyed by issue + closed_at). The current projection
+points at the latest episode. Episodes keep a per-episode single-candidate
+attribution or an unresolved marker.
+_Avoid_: one permanent MR→issue edge that lies across reopen cycles
+
+**Event-triggered recomputation**:
+The affected closure episode(s) are recomputed on every relevant webhook or
+backfill fact — DB-local, no grace window, no scheduler, no provider call.
+Episodes with zero/ambiguous candidates remain provisional in the unresolved
+table, versioned.
+_Avoid_: one-shot resolution, grace-window finalization, scheduled reconciliation
+
+**Facts + projection**:
+`engineering_events` is the immutable source of truth; the relationship is a
+**versioned, rebuildable projection** plus unresolved records, derived from
+those facts (never a separate source of truth).
+_Avoid_: a projection treated as authoritative over facts
+
+**Write boundary**:
+Facts are committed first (the existing `delivery_log` + `engineering_events`
+single transaction, offset committed on success); the projection recompute runs
+**afterward in a separate best-effort transaction**. Projection failure must
+**never block valid event ingestion** (the existing retry/DLQ path is
+unchanged); a failed projection leaves temporary staleness recoverable by a
+later fact or an explicit rebuild.
+_Avoid_: coupling fact durability to projector correctness, a durable
+outbox in v1
+
+**Status vocabulary**:
+A small explicit finite set, per episode: `pending` (declaration active,
+not yet merged), `awaiting_closure` (merged with active declaration, no
+`issue.closed` observed yet), `unmatched` (issue closed, zero candidates),
+`ambiguous` (issue closed, multiple candidates), `inferred` (exactly one
+candidate), `superseded` (overtaken by a reopen/reclose cycle; current
+projection points to the latest episode).
+_Avoid_: collapsing all non-answers into one opaque `unresolved`
+
+**Read API**:
+A read-only surface (`/api/v1/afk-outcomes` style) exposing: (1) the current
+issue→MR answer with status; and (2) auditable closure-episode/evidence history
+(endpoint identities, declaration/revocation snapshots, `resolver_version`,
+status, historical episodes), plus reverse MR→issues where supported. **No UI
+in v1.**
+_Avoid_: a bare current-answer endpoint with no evidence, a dashboard in v1
+
+**Freshness / observability**:
+Every projection response exposes **`derived_at`** and the existing
+**`resolver_version`**. Metrics/health signal projection recompute failures
+and last successful recompute. No durable dirty-marker or outbox in v1.
+_Avoid_: log-only staleness detection, silent indefinite staleness
+
+**Structured facts only**:
+This design persists **structured relationship facts** (declarations,
+references, snapshots, revocations, statuses). **Raw webhook / MR bodies are
+not persisted** as part of this design.
+_Avoid_: persisting raw webhook or MR description bodies for this purpose
 
 **Session Resource Reference**:
 An explicit stable resource reference carried by one session's metadata
