@@ -8,10 +8,13 @@ Adds three additive columns to ``engineering_events``:
   occurred_at)`` — the same fields as the existing 6-column identity UNIQUE
   (``uq_engineering_events_identity``, migration 0026).  Webhook facts
   derive it at ingest; existing rows are backfilled below with the same
-  derivation (shared ``afk_outcomes.models.build_observation_key``) so a
-  later redelivery of a pre-existing fact derives the identical key.
+  derivation so a later redelivery of a pre-existing fact derives the
+  identical key.
 * ``observed_via`` — provenance of the observation (``webhook`` or
-  ``backfill``), NOT NULL with a ``webhook`` server default.
+  ``backfill``), NOT NULL with a ``webhook`` server default.  Pre-existing
+  rows were all written by the backfill engine, so they are set to
+  ``backfill`` below; future inserts omitting the value still default to
+  ``webhook``.
 * ``snapshot_at`` — observation time, distinct from the provider occurrence
   time (``occurred_at``); nullable (pre-0035 rows have no known observation
   time).
@@ -22,9 +25,13 @@ identity UNIQUE, and the write path (``delivery_log`` +
 ``engineering_events`` single transaction, ``ON CONFLICT ... DO NOTHING`` on
 the 6-column identity) is unchanged.
 
-The backfill derives keys in Python with the shared helper — the single
-source of truth for the canonical derivation — so backfilled keys cannot
-drift from the consumer's canonical form.
+The backfill derives keys with a self-contained, version-pinned copy of the
+canonical derivation (:func:`_observation_key`) — migrations must never
+import live application code, whose semantics can drift after a migration is
+authored.  The copy produces byte-identical keys to
+``afk_outcomes.models.build_observation_key`` at authoring time (pinned by
+``tests/test_migration_0035.py``), and is applied as a single batched UPDATE
+rather than row-by-row.
 
 Downgrade drops the three columns and the observation_key UNIQUE
 (reversible; only the provenance fields themselves are lost).
@@ -33,7 +40,11 @@ Revision ID: 0035
 Revises:     0034
 """
 
+import hashlib
+import json
 from collections.abc import Sequence
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Union
 
 import sqlalchemy as sa
@@ -45,6 +56,52 @@ revision: str = "0035"
 down_revision: Union[str, None] = "0034"  # noqa: UP007
 branch_labels: Union[str, Sequence[str], None] = None  # noqa: UP007
 depends_on: Union[str, Sequence[str], None] = None  # noqa: UP007
+
+
+def _observation_key(
+    *,
+    provider: object,
+    repository: str,
+    entity_type: object,
+    external_id: str,
+    event_type: str,
+    occurred_at: datetime,
+) -> str:
+    """Frozen snapshot of ``afk_outcomes.models.build_observation_key``.
+
+    Self-contained, version-pinned copy of the canonical derivation at
+    migration authoring time: SHA-256 over the canonical JSON form of the
+    fact's six identity fields.  Migrations must not import live application
+    code (semantics drift after authoring), so this stdlib-only copy keeps
+    the backfilled keys identical to what the consumer derives for a
+    redelivery of the same fact.  ``provider``/``entity_type`` are
+    ``object``-typed because database rows arrive as plain strings while the
+    canonical helper accepts ``str`` Enums; enum members are reduced to
+    their values, and a naive ``occurred_at`` is interpreted as UTC.
+    """
+    provider_value = (
+        provider.value if isinstance(provider, Enum) else str(provider)
+    )
+    entity_type_value = (
+        entity_type.value if isinstance(entity_type, Enum) else str(entity_type)
+    )
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    occurred_at_value = occurred_at.astimezone(timezone.utc).isoformat()
+    canonical = json.dumps(
+        {
+            "provider": provider_value,
+            "repository": repository,
+            "entity_type": entity_type_value,
+            "external_id": external_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at_value,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def upgrade() -> None:
@@ -68,14 +125,10 @@ def upgrade() -> None:
         sa.Column("snapshot_at", sa.DateTime(timezone=True), nullable=True),
     )
 
-    # ── defensive backfill: deterministic observation_key for existing rows ──
-    # The shared helper is the single source of truth for the canonical
-    # derivation, so backfilled keys match what the consumer derives for a
-    # redelivery of the same fact.  Skipped in offline (SQL-render) mode,
-    # where there are no rows to backfill.
+    # ── backfill: deterministic observation_key + observed_via for
+    #    pre-existing rows (skipped in offline/SQL-render mode, where there
+    #    are no rows to backfill) ────────────────────────────────────────
     if not context.is_offline_mode():
-        from afk_outcomes.models import build_observation_key
-
         bind = op.get_bind()
         rows = bind.execute(
             sa.text(
@@ -84,22 +137,28 @@ def upgrade() -> None:
                 "WHERE observation_key IS NULL"
             )
         ).fetchall()
-        for row in rows:
-            key = build_observation_key(
-                provider=row.provider,
-                repository=row.repository,
-                entity_type=row.entity_type,
-                external_id=row.external_id,
-                event_type=row.event_type,
-                occurred_at=row.occurred_at,
-            )
-            bind.execute(
-                sa.text(
-                    "UPDATE engineering_events SET observation_key = :key "
-                    "WHERE id = :id"
+        params = [
+            {
+                "key": _observation_key(
+                    provider=r.provider,
+                    repository=r.repository,
+                    entity_type=r.entity_type,
+                    external_id=r.external_id,
+                    event_type=r.event_type,
+                    occurred_at=r.occurred_at,
                 ),
-                {"key": key, "id": row.id},
+                "id": r.id,
+            }
+            for r in rows
+        ]
+        if params:
+            bind.execute(
+                sa.text("UPDATE engineering_events SET observation_key = :key WHERE id = :id"),
+                params,
             )
+        # Every pre-existing row was written by the backfill engine before
+        # provenance existed — it must never masquerade as a webhook fact.
+        bind.execute(sa.text("UPDATE engineering_events SET observed_via = 'backfill'"))
 
     # ── NOT NULL + UNIQUE after the backfill ───────────────────────────
     op.alter_column(
