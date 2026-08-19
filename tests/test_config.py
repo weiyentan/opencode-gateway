@@ -468,3 +468,30 @@ def test_operator_token_override_from_env(monkeypatch):
 
     settings = Settings()
     assert settings.operator_token == "op-token-123"
+
+
+# ── Issue #530: Reporting topic default ────────────────────────────────────
+
+
+def test_reporting_topic_defaults_to_normalized_events(monkeypatch):
+    """The reporting ingestion source topic defaults to the normalized event
+    stream (``engineering.events.normalized``), the same external topic the
+    AFK Outcome Consumer subscribes to — never the legacy ``afk.events``
+    command topic."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.delenv("GATEWAY_REPORTING_TOPIC", raising=False)
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.reporting_topic == "engineering.events.normalized"
+
+
+def test_reporting_topic_override_from_env(monkeypatch):
+    """GATEWAY_REPORTING_TOPIC is configurable via env."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_REPORTING_TOPIC", "custom.reporting.topic")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.reporting_topic == "custom.reporting.topic"

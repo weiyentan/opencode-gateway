@@ -104,8 +104,10 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_KAFKA_TOPIC` | `opencode-usage` | Kafka topic for usage records |
 | `GATEWAY_KAFKA_DLQ_TOPIC` | `opencode-usage-dlq` | Dead-letter queue topic for unprocessable messages |
 | `GATEWAY_CONSUMER_GROUP_ID` | `opencode-gateway` | Kafka consumer group ID |
-| `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Provider-events topic for the AFK outcome consumer (external; not created here) |
-| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Dead-letter queue topic for poison AFK outcome messages |
+| `GATEWAY_NORMALIZED_EVENTS_TOPIC` | `engineering.events.normalized` | Normalized provider-events topic the AFK outcome consumer subscribes to (issue #531; external; not created here) |
+| `GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC` | `engineering.events.normalized.dlq` | Dead-letter queue topic for poison normalized provider-events messages |
+| `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Compatibility-only (issue #531): legacy `afk.events` command topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
+| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Compatibility-only (issue #531): legacy AFK outcome DLQ topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
 | `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
 | `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
@@ -161,7 +163,7 @@ curl http://localhost:8000/health
 Expected response (example):
 
 ```json
-{"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}
+{"status":"ok","data":{"status":"ok","version":"0.1.0-dev","database":"connected","last_ingest_timestamp":null,"collectors":[],"source_databases":[]}}
 ```
 
 **Dashboard:** When running with Docker Compose (see below), open [http://localhost:8080/](http://localhost:8080/) in a browser to view the **Aurora Glass** telemetry dashboard. It displays KPIs, model-mix charts, operational events, collector health, agent/LLM usage, and recent sessions — auto-refreshing every 30 seconds (client metadata is cached for 10 minutes). The frontend is served by a separate nginx container that proxies API requests to the Gateway.
@@ -186,7 +188,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
 | **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
 | **kafka**   | `opencode-gateway-kafka`| —         | 9092          | Local KRaft Kafka broker (single node; internal — no host ports). Backstops both streaming consumers; the provider-events topic is external |
-| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the provider-events topic in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
+| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the normalized provider-events topic (`engineering.events.normalized`) in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
 
 > **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
@@ -258,7 +260,9 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 Read-only endpoints exposing the reporting read-model (ADR 0021, issue #484)
 — the first report of what the Gateway has ingested from the normalized-event
-stream (write path: `app/api/reporting_ingest.py`, issue #479): ingested
+stream (`engineering.events.normalized`, the same external normalized
+provider-events topic the AFK Outcome Consumer subscribes to; write path:
+`app/api/reporting_ingest.py`, issue #479): ingested
 resources with their current aggregate, the per-delivery state trail, and the
 session links that can be provably linked to them. The surface is strictly
 read-only and never derives a "completed"/"finished"/outcome state for a

@@ -153,10 +153,16 @@ class Settings(BaseSettings):
     normalized_events_topic: str = "engineering.events.normalized"
     normalized_events_dlq_topic: str = "engineering.events.normalized.dlq"
 
-    # ``afk_outcomes_topic`` (retained for any remaining command consumption):
-    # the legacy ``afk.events`` topic.  The AFK Outcome Consumer no longer
-    # subscribes to this topic by default; it is kept for backward
-    # compatibility and any remaining command consumption.
+    # ``afk_outcomes_topic`` / ``afk_outcomes_dlq_topic`` — compatibility-only
+    # (issue #531).  The legacy ``afk.events`` command topic and its DLQ.  The
+    # AFK Outcome Consumer no longer subscribes to these settings — it reads
+    # ``normalized_events_topic`` / ``normalized_events_dlq_topic`` above —
+    # and the deployment manifests (docker-compose.yaml,
+    # k8s/afk-consumer-deployment.yaml) configure the normalized variables.
+    # These fields are retained ONLY so that environments still setting
+    # GATEWAY_AFK_OUTCOMES_TOPIC / GATEWAY_AFK_OUTCOMES_DLQ_TOPIC do not fail
+    # settings validation (``extra="forbid"``); they are never consumed by
+    # the consumer path.
     afk_outcomes_topic: str = "afk.events"
     afk_outcomes_dlq_topic: str = "afk.events-dlq"
     afk_outcomes_consumer_group_id: str = "opencode-outcomes"
@@ -225,15 +231,16 @@ class Settings(BaseSettings):
     transcript_retention_tool_calls_days: int = 90
 
     # Reporting ingestion (issue #479) — the normalized-event stream from
-    # the producer (``fast-api-eda-gateway``) rides the existing external
-    # topic (``afk.events``).  The future normalized-event consumer runs in
-    # its OWN group (``opencode-reporting``, never ``opencode-gateway`` or
-    # ``opencode-outcomes``) and POSTs to the reporting ingestion endpoint.
-    # These settings are declared here so ``extra="forbid"`` cannot break
-    # startup later; the consumer container is out of scope for #479.  Maps
-    # to GATEWAY_REPORTING_TOPIC, GATEWAY_REPORTING_DLQ_TOPIC,
-    # GATEWAY_REPORTING_CONSUMER_GROUP_ID.
-    reporting_topic: str = "afk.events"
+    # the producer (``fast-api-eda-gateway``) rides the external normalized
+    # provider-events topic (``engineering.events.normalized``), the same
+    # topic the AFK Outcome Consumer subscribes to.  The future
+    # normalized-event consumer runs in its OWN group (``opencode-reporting``,
+    # never ``opencode-gateway`` or ``opencode-outcomes``) and POSTs to the
+    # reporting ingestion endpoint.  These settings are declared here so
+    # ``extra="forbid"`` cannot break startup later; the consumer container
+    # is out of scope for #479.  Maps to GATEWAY_REPORTING_TOPIC,
+    # GATEWAY_REPORTING_DLQ_TOPIC, GATEWAY_REPORTING_CONSUMER_GROUP_ID.
+    reporting_topic: str = "engineering.events.normalized"
     reporting_dlq_topic: str = "afk.events-reporting-dlq"
     reporting_consumer_group_id: str = "opencode-reporting"
 
