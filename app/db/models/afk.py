@@ -188,6 +188,12 @@ class EngineeringEvent(Base):
     ``ON CONFLICT DO NOTHING``.  ``provider_event_id`` is stored when a
     provider emits one and is the authority for ``occurred_at`` in that case.
 
+    ``observation_key`` (issue #523) is the fact's deterministic, NOT NULL,
+    UNIQUE natural key derived from the six identity fields; ``observed_via``
+    (``webhook``/``backfill``) and ``snapshot_at`` record observation
+    provenance.  The 6-column identity UNIQUE is unchanged — the key is
+    additive, never a replacement.
+
     Retention (issue #483, ADR 0022): the event row is metadata (12 months,
     ``GATEWAY_RETENTION_AFK_METADATA_DAYS``); the ``payload`` column is the
     redacted-payload tier (90 days, ``GATEWAY_RETENTION_AFK_PAYLOAD_DAYS``).
@@ -204,6 +210,10 @@ class EngineeringEvent(Base):
             "event_type",
             "occurred_at",
             name="uq_engineering_events_identity",
+        ),
+        UniqueConstraint(
+            "observation_key",
+            name="uq_engineering_events_observation_key",
         ),
     )
 
@@ -223,6 +233,13 @@ class EngineeringEvent(Base):
     )
     actor: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    observation_key: Mapped[str] = mapped_column(String, nullable=False)
+    observed_via: Mapped[str] = mapped_column(
+        String, nullable=False, server_default=text("'webhook'")
+    )
+    snapshot_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     first_ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

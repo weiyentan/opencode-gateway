@@ -57,6 +57,7 @@ from afk_outcomes.models import (
     RunSessionLink,
     RunStatus,
     UnresolvedCorrelation,
+    build_observation_key,
 )
 
 # Version of the correlation resolver that produces the derived links stored
@@ -248,12 +249,21 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             event.event_type,
         )
         entity_type, external_id = _split_entity_id(event.entity_id)
+        observation_key = event.observation_key or build_observation_key(
+            provider=event.provider,
+            repository=entity.repository,
+            entity_type=entity_type,
+            external_id=external_id,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+        )
         await self._conn.execute(
             """
             INSERT INTO engineering_events
                 (provider, repository, entity_type, external_id, event_type,
-                 occurred_at, provider_event_id, actor, payload, first_ingested_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                 occurred_at, provider_event_id, actor, payload, observation_key,
+                 observed_via, snapshot_at, first_ingested_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
             ON CONFLICT (provider, repository, entity_type, external_id, event_type, occurred_at)
             DO NOTHING
             """,
@@ -266,6 +276,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             _provider_event_id(event),
             event.actor,
             json.dumps(event.payload or {}),
+            observation_key,
+            event.observed_via,
+            event.snapshot_at,
         )
 
     async def _log_delivery(self, run: AFKRun) -> None:
@@ -323,12 +336,21 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         entity = entity_map.get(event.entity_id)
         entity_type, external_id = _split_entity_id(event.entity_id)
         repository = entity.repository if entity is not None else ""
+        observation_key = event.observation_key or build_observation_key(
+            provider=event.provider,
+            repository=repository,
+            entity_type=entity_type,
+            external_id=external_id,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+        )
         await self._conn.execute(
             """
             INSERT INTO engineering_events
                 (provider, repository, entity_type, external_id, event_type,
-                 occurred_at, provider_event_id, actor, payload, first_ingested_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                 occurred_at, provider_event_id, actor, payload, observation_key,
+                 observed_via, snapshot_at, first_ingested_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
             ON CONFLICT (provider, repository, entity_type, external_id, event_type, occurred_at)
             DO NOTHING
             """,
@@ -341,6 +363,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             _provider_event_id(event),
             event.actor,
             json.dumps(event.payload or {}),
+            observation_key,
+            event.observed_via,
+            event.snapshot_at,
         )
 
     async def _upsert_entity_link(

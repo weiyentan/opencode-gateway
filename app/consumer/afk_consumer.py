@@ -52,6 +52,7 @@ from afk_outcomes.models import (
     EngineeringEvent,
     EntityType,
     Provider,
+    build_observation_key,
 )
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.repository import AsyncpgOutcomeRepository
@@ -428,6 +429,15 @@ def map_normalized_event(
         repository=repository,
         number=number,
     )
+    occurred_at = message.occurred_at or message.ingested_at
+    observation_key = build_observation_key(
+        provider=message.provider,
+        repository=repository,
+        entity_type=entity_type,
+        external_id="" if number is None else str(number),
+        event_type=event_type,
+        occurred_at=occurred_at,
+    )
     payload: dict[str, Any] = {
         # The redacted payload *reference* — never payload content.
         "payload_ref": {
@@ -438,14 +448,19 @@ def map_normalized_event(
         "source_resource_type": resource.type,
         "source_action": message.action,
     }
+    if message.issue_links is not None:
+        payload["issue_links"] = message.issue_links.model_dump(mode="json")
     event = EngineeringEvent(
         event_id=f"{entity_id}:{canonical_action}",
         event_type=event_type,
         provider=message.provider,
         entity_id=entity_id,
-        occurred_at=message.occurred_at or message.ingested_at,
+        occurred_at=occurred_at,
         actor=message.actor,
         payload=payload,
+        observation_key=observation_key,
+        observed_via="webhook",
+        snapshot_at=datetime.now(timezone.utc),  # noqa: UP017 - datetime.UTC is 3.11+
     )
     return entity, event
 
