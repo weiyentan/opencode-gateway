@@ -419,6 +419,28 @@ async def test_real_run_persists_resolved_runs_via_repository() -> None:
     assert any("INSERT INTO afk_run_sessions" in s for s in sqls)
 
 
+async def test_real_run_labels_backfill_events_observed_via_backfill() -> None:
+    """Backfill-persisted facts must never masquerade as webhook observations.
+
+    ``run_backfill`` is the shared write path for both the operator CLI and
+    the consumer reconciliation loop; every engineering_events insert it
+    issues must carry ``observed_via = 'backfill'`` (the 12th positional
+    parameter, after the SQL string).
+    """
+    conn = _mock_conn([_session_row()])
+    report = await _run(conn, FakeGitHubApi(_payloads()), dry_run=False)
+
+    assert report.dry_run is False
+    event_calls = [
+        call
+        for call in conn.execute.call_args_list
+        if "INSERT INTO engineering_events" in call.args[0]
+    ]
+    assert event_calls, "no engineering_events insert issued"
+    for call in event_calls:
+        assert call.args[11] == "backfill"
+
+
 def _unresolved_insert_params(conn: AsyncMock) -> list[tuple]:
     """Return (sql, params) for every unresolved_correlations insert issued."""
     return [

@@ -40,6 +40,7 @@ from afk_outcomes import (
     UnresolvedCorrelation,
     UnresolvedReason,
 )
+from afk_outcomes.models import build_observation_key
 from tests.conftest import mock_row
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
@@ -184,6 +185,88 @@ def test_save_inserts_events_with_conflict_ignore(mock_conn: AsyncMock) -> None:
         in sql
     )
     assert "DO NOTHING" in sql
+    assert "observation_key" in sql
+
+
+def test_save_event_insert_includes_observation_key_and_provenance(
+    mock_conn: AsyncMock,
+) -> None:
+    """The event INSERT carries observation_key/observed_via/snapshot_at and
+    derives a deterministic observation_key from the event identity when the
+    domain event does not carry one."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    run = _build_run()
+
+    import asyncio
+
+    asyncio.run(repo.save(run))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO engineering_events")
+    assert calls
+    sql = calls[0][0]
+    assert "observation_key" in sql
+    assert "observed_via" in sql
+    assert "snapshot_at" in sql
+    assert (
+        "ON CONFLICT (provider, repository, entity_type, external_id, event_type, occurred_at)"
+        in sql
+    )
+    args = calls[0][1]
+    expected = build_observation_key(
+        provider="github",
+        repository=REPO,
+        entity_type="issue",
+        external_id="437",
+        event_type="opened",
+        occurred_at=STARTED,
+    )
+    assert args[9] == expected  # derived deterministic key
+    assert args[10] == "webhook"  # model default provenance
+    assert args[11] is None  # snapshot_at unset on the domain event
+
+
+def test_record_event_insert_carries_observation_key_provenance(
+    mock_conn: AsyncMock,
+) -> None:
+    """The live-ingest seam writes explicit observation_key/observed_via/snapshot_at."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    entity = EngineeringEntity(
+        entity_id="issue:437",
+        entity_type=EntityType.ISSUE,
+        provider=Provider.GITHUB,
+        repository=REPO,
+        number=437,
+    )
+    event = EngineeringEvent(
+        event_id="issue:437:opened",
+        event_type="opened",
+        provider=Provider.GITHUB,
+        entity_id="issue:437",
+        occurred_at=STARTED,
+        actor="wyautomation",
+        payload={},
+        observation_key="obs-explicit-key",
+        observed_via="webhook",
+        snapshot_at=FINISHED,
+    )
+
+    import asyncio
+
+    asyncio.run(
+        repo.record_event(
+            provider=Provider.GITHUB,
+            delivery_id="delivery-0001",
+            entity=entity,
+            event=event,
+        )
+    )
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO engineering_events")
+    assert len(calls) == 1
+    args = calls[0][1]
+    assert args[9] == "obs-explicit-key"  # explicit key carried verbatim
+    assert args[10] == "webhook"
+    assert args[11] == FINISHED
 
 
 def test_save_event_redelivery_is_a_noop_by_sql(mock_conn: AsyncMock) -> None:

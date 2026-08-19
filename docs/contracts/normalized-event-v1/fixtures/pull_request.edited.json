@@ -17,5 +17,14 @@
       "provider": "github",
       "delivery_id": "00000000-0000-0000-0000-000000000006"
     }
+  },
+  "issue_links": {
+    "references": [
+      {
+        "repository": "https://github.com/owner/repo",
+        "number": "456"
+      }
+    ],
+    "declares_closure": []
   }
 }

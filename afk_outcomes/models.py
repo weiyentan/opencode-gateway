@@ -9,7 +9,9 @@ application package (``app``).
 
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+import json
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -111,6 +113,53 @@ class EngineeringEntity(BaseModel):
     )
 
 
+def build_observation_key(
+    *,
+    provider: Provider | str,
+    repository: str,
+    entity_type: EntityType | str,
+    external_id: str,
+    event_type: str,
+    occurred_at: datetime,
+) -> str:
+    """Derive the deterministic observation key for one engineering event fact.
+
+    Every ``engineering_events`` fact carries a deterministic, NOT NULL,
+    UNIQUE ``observation_key`` (never random).  The key is a SHA-256 over the
+    canonical form of the fact's six identity fields — ``(provider,
+    repository, entity_type, external_id, event_type, occurred_at)``, the
+    same fields as the table's 6-column identity UNIQUE — so re-deriving the
+    same fact always yields the identical key (content-stable, replay-safe)
+    and distinct facts yield distinct keys.  The key never depends on
+    volatile delivery identifiers.
+
+    ``occurred_at`` is normalised to UTC before hashing so the same instant
+    expressed with different UTC offsets derives the identical key.  A naive
+    ``occurred_at`` (no ``tzinfo``) is interpreted as UTC.
+    """
+    provider_value = provider.value if isinstance(provider, Provider) else str(provider)
+    entity_type_value = (
+        entity_type.value if isinstance(entity_type, EntityType) else str(entity_type)
+    )
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)  # noqa: UP017 - datetime.UTC is 3.11+
+    occurred_at_value = occurred_at.astimezone(timezone.utc).isoformat()  # noqa: UP017 - datetime.UTC is 3.11+
+    canonical = json.dumps(
+        {
+            "provider": provider_value,
+            "repository": repository,
+            "entity_type": entity_type_value,
+            "external_id": external_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at_value,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class EngineeringEvent(BaseModel):
     """A timestamped observation about an :class:`EngineeringEntity`."""
 
@@ -123,6 +172,25 @@ class EngineeringEvent(BaseModel):
     occurred_at: datetime
     actor: str | None = None
     payload: dict[str, object] = Field(default_factory=dict)
+    observation_key: str = Field(
+        default="",
+        description=(
+            "Deterministic fact identity — see build_observation_key.  Empty "
+            "for backfill/engine-built events; the repository derives the key "
+            "from the fact's identity fields at persist time."
+        ),
+        exclude=True,
+    )
+    observed_via: str = Field(
+        default="webhook",
+        description="Provenance of the observation: 'webhook' or 'backfill'",
+        exclude=True,
+    )
+    snapshot_at: datetime | None = Field(
+        default=None,
+        description="Observation time (distinct from the occurred_at occurrence time)",
+        exclude=True,
+    )
 
 
 class CorrelationEvidence(BaseModel):

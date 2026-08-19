@@ -37,7 +37,12 @@ pinned_artifacts:
 producer_commit_sha: 0000000000000000000000000000000000000000
 
 # The date this pin was recorded.
-date_recorded: 2026-08-17
+date_recorded: 2026-08-19
+
+# issue_links support: consumer-side tolerance ships first (issue #522).
+# Producer-side issue_links support pending (fast-api-eda-gateway).
+# Consumer tolerance ships first — messages with or without issue_links
+# pass validation and mapping.
 
 # ── How to refresh the pin ────────────────────────────────────────────────────
 #

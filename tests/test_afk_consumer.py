@@ -19,7 +19,12 @@ import pytest
 from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord, TopicPartition
 
-from afk_outcomes.models import EntityType, Provider
+from afk_outcomes.models import (
+    EngineeringEvent,
+    EntityType,
+    Provider,
+    build_observation_key,
+)
 from afk_outcomes.providers.github import GitHubAdapter
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.providers.gitlab import GitLabAdapter
@@ -1520,6 +1525,119 @@ def test_map_normalized_event_merge_request_provenance() -> None:
     assert event.payload.get("source_resource_type") == "merge_request"
     assert event.payload.get("source_action") == "updated"
     assert event.event_type == "change_request.updated"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consumer fact identity: observation_key / observed_via / snapshot_at (#523)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Every engineering-events fact carries a deterministic, NOT NULL, UNIQUE
+# observation_key plus observed_via/snapshot_at provenance.  Webhook facts
+# derive the key from the six event identity fields; two deliveries of the
+# same fact converge on the same key (dedup), and the key never depends on
+# the volatile delivery UUID.
+
+
+def _mapped_event(**overrides: object) -> EngineeringEvent:
+    """Map one normalized payload and return the event (entity discarded)."""
+    message = NormalizedProviderEvent.model_validate(_normalized_payload(**overrides))
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    return mapped[1]
+
+
+def test_map_normalized_event_generates_deterministic_observation_key() -> None:
+    """observation_key derives from the six identity fields — never random.
+
+    The key equals the canonical derivation over
+    (provider, repository, entity_type, external_id, event_type, occurred_at),
+    and two deliveries of the same identity produce the identical key even
+    when their delivery UUIDs differ.
+    """
+    event = _mapped_event()
+    expected = build_observation_key(
+        provider="github",
+        repository="github.com/owner/repo",
+        entity_type="change_request",
+        external_id="442",
+        event_type="change_request.merged",
+        occurred_at=datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
+    )
+    assert event.observation_key == expected
+    assert event.observation_key
+
+    other = _mapped_event(delivery_id="99999999-8888-7777-6666-555555555555")
+    assert other.observation_key == event.observation_key
+
+
+def test_map_normalized_event_sets_webhook_provenance() -> None:
+    """observed_via='webhook'; snapshot_at captures the observation time."""
+    event = _mapped_event()
+    assert event.observed_via == "webhook"
+    assert event.snapshot_at is not None
+    assert event.snapshot_at.tzinfo is not None
+    # Observation time is distinct from provider occurrence time.
+    assert event.snapshot_at != event.occurred_at
+
+
+def test_map_normalized_event_observation_key_distinguishes_identity_fields() -> None:
+    """Distinct identity fields derive distinct keys."""
+    base = _mapped_event()
+    other_entity = _mapped_event(resource_type="issue", action="closed")
+    later = _mapped_event(occurred_at="2026-08-01T10:35:00Z")
+    assert other_entity.observation_key != base.observation_key
+    assert later.observation_key != base.observation_key
+
+
+def test_map_normalized_event_passes_issue_links_to_payload() -> None:
+    """issue_links (#522) passes through to the event payload verbatim."""
+    issue_links = {
+        "references": [{"repository": "https://github.com/owner/repo", "number": "437"}],
+        "declares_closure": [
+            {"repository": "https://github.com/other/repo", "number": "12"}
+        ],
+    }
+    event = _mapped_event(issue_links=issue_links)
+    assert event.payload["issue_links"] == issue_links
+
+    plain = _mapped_event()
+    assert "issue_links" not in plain.payload
+
+
+@pytest.mark.asyncio
+async def test_duplicate_deliveries_dedupe_on_observation_key() -> None:
+    """Two deliveries of the same fact write one observation_key under the
+    conflict-ignore insert — never a second fact row."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(_mk_msg(_normalized_payload()))
+    await consumer._process_message(
+        _mk_msg(_normalized_payload(delivery_id="99999999-8888-7777-6666-555555555555"))
+    )
+
+    event_calls = [
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    ]
+    assert len(event_calls) == 2
+    sql = event_calls[0].args[0]
+    assert "observation_key" in sql
+    assert "observed_via" in sql
+    assert "snapshot_at" in sql
+    # The 6-column identity remains the conflict target (additive key).
+    assert (
+        "ON CONFLICT (provider, repository, entity_type, external_id, event_type, occurred_at)"
+        in sql
+    )
+    assert "DO NOTHING" in sql
+    keys = {c.args[10] for c in event_calls}
+    assert len(keys) == 1
+    assert next(iter(keys)), "observation_key must be non-empty"
+    assert all(c.args[11] == "webhook" for c in event_calls)
+    assert all(isinstance(c.args[12], datetime) for c in event_calls)
 
 
 @pytest.mark.asyncio

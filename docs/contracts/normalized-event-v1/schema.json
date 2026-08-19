@@ -98,6 +98,53 @@
         }
       },
       "additionalProperties": false
+    },
+    "issue_links": {
+      "type": "object",
+      "description": "Structured full-snapshot of issue↔change-request relationships observed on this change request. Optional — messages without it must still pass validation. Carries two distinct relationship kinds: references (plain mentions) and declares_closure (closing-syntax declarations). Full snapshots on every open/update; revocations are derived from snapshot diffs.",
+      "properties": {
+        "references": {
+          "type": "array",
+          "description": "Issue references that merely mention the issue (any #N or group/project#N). Empty array when no mentions exist.",
+          "items": {
+            "type": "object",
+            "description": "A cross-repository issue reference.",
+            "required": ["repository", "number"],
+            "properties": {
+              "repository": {
+                "type": "string",
+                "description": "Repository URL of the referenced issue. Matches the issue's repository URL; may differ from the change-request's repository (cross-repo)."
+              },
+              "number": {
+                "type": "string",
+                "description": "Provider-scoped issue number as an opaque string."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "declares_closure": {
+          "type": "array",
+          "description": "Issue references using provider-documented closing syntax (fixes/closes/resolves). Merging the change request declares these issues should be closed.",
+          "items": {
+            "type": "object",
+            "description": "A cross-repository issue closure declaration.",
+            "required": ["repository", "number"],
+            "properties": {
+              "repository": {
+                "type": "string",
+                "description": "Repository URL of the referenced issue."
+              },
+              "number": {
+                "type": "string",
+                "description": "Provider-scoped issue number as an opaque string."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,

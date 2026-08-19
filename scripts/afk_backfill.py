@@ -438,6 +438,8 @@ async def run_backfill(
             existing = await _find_existing_run_id(conn, result.run)
             if existing is not None and existing != result.run.afk_run_id:
                 result = _remap_run(result, existing)
+            for event in result.run.events:
+                event.observed_via = "backfill"
             await repository_impl.save(result.run)
             await repository_impl.save_unresolved(
                 result.run, result.unresolved, repository=repository

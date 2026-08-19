@@ -398,7 +398,7 @@ def test_every_fixture_round_trips_through_serializer(
     """
     fixture = _load_fixture(_expected_fixture_filename(resource_type, action))
     message = NormalizedProviderEvent.model_validate(fixture)
-    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=False))
+    re_serialized = _json_mod.loads(message.model_dump_json(exclude_none=True))
     assert re_serialized == fixture, (
         f"Fixture {resource_type}.{action} does not round-trip through the "
         f"real serializer — the fixture may be hand-crafted rather than "
@@ -866,6 +866,106 @@ def test_malformed_unknown_resource_type_routes_to_dlq() -> None:
     assert mapped is None, (
         "Unknown resource_type 'commit' should return None (DLQ route)"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Section 7a: issue_links tolerance (issue #522)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_message_without_issue_links_still_passes_validation() -> None:
+    """A message WITHOUT issue_links passes NormalizedProviderEvent validation.
+
+    The issue_links field is optional — existing messages without it must
+    continue to validate and pass through the consumer pipeline.
+    """
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000001", "issue", 100, "opened"
+    )
+    assert "issue_links" not in payload
+    message = NormalizedProviderEvent.model_validate(payload)
+    validate_normalized_event(message)  # must not raise
+
+
+def test_message_without_issue_links_maps_through_pipeline() -> None:
+    """A message without issue_links maps through map_normalized_event correctly."""
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000002", "pull_request", 200, "opened"
+    )
+    assert "issue_links" not in payload
+    message = NormalizedProviderEvent.model_validate(payload)
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.opened"
+
+
+def test_message_with_valid_issue_links_passes_validation() -> None:
+    """A message WITH valid issue_links passes NormalizedProviderEvent validation."""
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000003", "pull_request", 300, "opened"
+    )
+    payload["issue_links"] = {
+        "references": [{"repository": "https://github.com/owner/repo", "number": "456"}],
+        "declares_closure": [{"repository": "https://github.com/owner/repo", "number": "123"}],
+    }
+    message = NormalizedProviderEvent.model_validate(payload)
+    validate_normalized_event(message)  # must not raise
+
+
+def test_message_with_issue_links_maps_through_pipeline() -> None:
+    """A message with issue_links maps through map_normalized_event correctly.
+
+    issue_links is not consumed by the mapping bridge — it passes through
+    to the event payload as-is for downstream use.
+    """
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000004", "merge_request", 400, "opened",
+        provider="gitlab",
+    )
+    payload["issue_links"] = {
+        "references": [
+            {"repository": "https://gitlab.com/group/project", "number": "50"}
+        ],
+        "declares_closure": [
+            {"repository": "https://gitlab.com/group/project", "number": "42"}
+        ],
+    }
+    message = NormalizedProviderEvent.model_validate(payload)
+    validate_normalized_event(message)
+    mapped = map_provider_event(message)
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.CHANGE_REQUEST
+    assert event.event_type == "change_request.opened"
+
+
+def test_issue_links_with_empty_arrays_passes_validation() -> None:
+    """A message with issue_links containing empty arrays still passes validation."""
+    payload = _nested_event(
+        "00000000-0000-0000-0000-000000000005", "pull_request", 500, "opened"
+    )
+    payload["issue_links"] = {"references": [], "declares_closure": []}
+    message = NormalizedProviderEvent.model_validate(payload)
+    validate_normalized_event(message)  # must not raise
+
+
+def test_issue_links_fixture_files_accept_issue_links() -> None:
+    """Updated fixtures with issue_links pass validation and mapping."""
+    for filename in [
+        "pull_request.opened.json",
+        "merge_request.opened.json",
+        "pull_request.edited.json",
+        "merge_request.updated.json",
+    ]:
+        fixture = _load_fixture(filename)
+        message = NormalizedProviderEvent.model_validate(fixture)
+        validate_normalized_event(message)
+        mapped = map_provider_event(message)
+        assert mapped is not None, (
+            f"Fixture {filename} with issue_links failed mapping"
+        )
 
 
 @pytest.mark.asyncio
