@@ -36,6 +36,7 @@ import os
 import random
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -56,7 +57,13 @@ from afk_outcomes.models import (
 )
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.repository import AsyncpgOutcomeRepository
-from app.core.metrics import DEFAULT_REGISTRY, MetricsRegistry
+from app.core.metrics import (
+    DEFAULT_REGISTRY,
+    METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES,
+    METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS,
+    MetricsRegistry,
+    register_closure_projection_metrics,
+)
 from app.core.repository import normalize_repository_url
 from scripts.afk_backfill import PrefetchedWindow, run_backfill
 
@@ -564,6 +571,12 @@ class AFKOutcomeConsumer:
         self._metrics.gauge(METRIC_DLQ_DEPTH)
         self._metrics.histogram(METRIC_RETRIES_PER_MESSAGE)
 
+        # Eagerly register the closure-projection recompute metrics so the
+        # snapshot seam always surfaces both names even before any recompute
+        # succeeds or fails (zero-valued defaults until a recompute owner
+        # records a failure/success).
+        register_closure_projection_metrics(self._metrics)
+
     # ── Factory ────────────────────────────────────────────────────────
 
     @classmethod
@@ -970,15 +983,44 @@ class AFKOutcomeConsumer:
         entity: EngineeringEntity,
         event: EngineeringEvent,
     ) -> None:
-        """Write delivery_log + event in a single transaction (via repository)."""
+        """Write delivery_log + event in a single transaction (via repository).
+
+        The closure-episode projection recompute (issue #524) runs AFTER the
+        facts transaction commits — the write boundary: facts first, projection
+        second, best-effort.  A projection failure must never block valid
+        ingestion (the retry/DLQ path is unchanged); the projection is
+        rebuildable from facts, so staleness self-heals on the next relevant
+        fact.  The recompute is DB-local and event-triggered only — no
+        scheduler, no provider API call.
+        """
         async with self._pool.acquire() as conn:
+            repo = AsyncpgOutcomeRepository(conn)
             async with conn.transaction():
-                repo = AsyncpgOutcomeRepository(conn)
                 await repo.record_event(
                     provider=message.provider,
                     delivery_id=message.delivery_id,
                     entity=entity,
                     event=event,
+                )
+            try:
+                await repo.recompute_closure_projection(
+                    seed_event=event,
+                    seed_entity=entity,
+                    normalize_repository=normalize_repository_url,
+                )
+                self._metrics.gauge(
+                    METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS
+                ).set(time.time())
+            except Exception:
+                self._metrics.counter(
+                    METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES
+                ).inc()
+                logger.exception(
+                    "Closure-episode projection recompute failed after facts "
+                    "committed (delivery=%s, entity=%s) — projection stays "
+                    "stale until the next relevant fact triggers a recompute",
+                    message.delivery_id,
+                    event.entity_id,
                 )
 
     async def _commit(self) -> None:

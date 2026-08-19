@@ -30,6 +30,16 @@ RESOLVER_VERSION = "2"
 # the reference-extraction or dedup logic changes.
 ASSOCIATION_RESOLVER_VERSION = "1"
 
+# Version of the closure-episode projector (issue #524).  Independent of
+# ``RESOLVER_VERSION`` (the correlation engine) and
+# ``ASSOCIATION_RESOLVER_VERSION`` (the exact-association resolver): the
+# closure-episode path derives the change-request->issue closure relationship
+# from immutable engineering facts and ``issue_links`` snapshot diffs and
+# shares no rule semantics with either.  Recorded on every
+# :class:`ClosureEpisode`, :class:`ClosureLink`, and :class:`ClosureUnresolved`.
+# Bump when any projection/ordering-policy rule changes.
+CLOSURE_RESOLVER_VERSION = "1"
+
 
 class Provider(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
     """The source provider that produced the observed engineering data."""
@@ -424,4 +434,193 @@ class ResourceSessionAssociation(BaseModel):
     resolver_version: str = Field(
         default=ASSOCIATION_RESOLVER_VERSION,
         description="Version of the association resolver that produced this link",
+    )
+
+
+class ClosureEpisodeStatus(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """Lifecycle status of one closure episode (issue #524).
+
+    The fixed vocabulary from PRD #521 — unknowns are never collapsed into one
+    opaque ``unresolved``:
+
+    * ``pending`` — an active declaration whose change request is not merged.
+    * ``awaiting_closure`` — a merged change request with an active
+      declaration, no ``issue.closed`` observed yet.
+    * ``unmatched`` — issue closed, zero eligible candidates.
+    * ``ambiguous`` — issue closed, multiple candidates (or an eligible
+      parked declaration) — never an arbitrary winner.
+    * ``inferred`` — exactly one eligible candidate.
+    * ``superseded`` — overtaken by a reopen/reclose cycle; the current
+      projection points at the latest episode.
+    """
+
+    PENDING = "pending"
+    AWAITING_CLOSURE = "awaiting_closure"
+    UNMATCHED = "unmatched"
+    AMBIGUOUS = "ambiguous"
+    INFERRED = "inferred"
+    SUPERSEDED = "superseded"
+
+
+class ClosureLinkKind(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """The two distinct change-request->issue relationship kinds.
+
+    ``references`` — a plain mention (any ``#N`` / ``group/project#N``).
+    ``declares_closure`` — closing-syntax declaration (provider-documented
+    syntax).  Stored as separate kinds and never conflated.
+    """
+
+    REFERENCES = "references"
+    DECLARES_CLOSURE = "declares_closure"
+
+
+class ClosureLinkState(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """The derived current state of one closure link.
+
+    ``active`` — present in the latest unambiguous snapshot.
+    ``revoked`` — present in an earlier snapshot, absent in the latest
+    (an explicit snapshot-diff revocation).
+    ``parked`` — conflicting same-timestamp snapshots left the link
+    indeterminate; never arbitrarily won.
+    """
+
+    ACTIVE = "active"
+    REVOKED = "revoked"
+    PARKED = "parked"
+
+
+class IssueLinkTarget(BaseModel):
+    """One issue endpoint referenced by an ``issue_links`` snapshot.
+
+    Carries the issue repository (a normalized identity) and its
+    provider-scoped number as an opaque string.  Cross-repository references
+    carry the issue's own repository, which may differ from the
+    change-request repository.
+    """
+
+    repository: str = Field(description="Normalized issue repository identity")
+    number: str = Field(description="Provider-scoped issue number as an opaque string")
+
+
+class IssueLinksSnapshot(BaseModel):
+    """A full ``issue_links`` snapshot on one change-request observation.
+
+    Two distinct relationship kinds: ``references`` (plain mentions) and
+    ``declares_closure`` (closing-syntax declarations).  Both are full
+    snapshot sets on every open/update observation; revocations are derived
+    from snapshot diffs by the closure-episode projector.
+    """
+
+    references: list[IssueLinkTarget] = Field(default_factory=list)
+    declares_closure: list[IssueLinkTarget] = Field(default_factory=list)
+
+
+class ClosureLink(BaseModel):
+    """The derived current state of one change-request->issue link.
+
+    Keyed by the change-request endpoint identity (its stable resource
+    identity), the issue endpoint identity, and the relationship kind.  The
+    projector derives the state from snapshot diffs in provider
+    ``occurred_at`` order (ordering policy D) and corrects it toward the
+    latest observation on every recompute — the projection is rebuildable
+    from facts, never a separate source of truth.
+    """
+
+    change_request_provider: Provider
+    change_request_repository: str
+    change_request_external_id: str
+    issue_provider: Provider
+    issue_repository: str
+    issue_external_id: str
+    kind: ClosureLinkKind
+    state: ClosureLinkState
+    resolver_version: str = Field(
+        default=CLOSURE_RESOLVER_VERSION,
+        description="Version of the closure-episode projector that derived this link",
+    )
+
+
+class ClosureEpisode(BaseModel):
+    """One immutable closure episode: an open->close interval for one issue.
+
+    Keyed by the issue endpoint identity (its stable resource identity) plus
+    the close observation time.  The episode identity and historical
+    attribution never change; the ``superseded`` marker is the one designed
+    transition applied when a later reopen/reclose episode overtakes it.
+    The attributed change request is set only when the episode is
+    ``inferred`` — ambiguous/unmatched episodes attribute nothing.
+    """
+
+    issue_provider: Provider
+    issue_repository: str
+    issue_external_id: str
+    opened_at: datetime | None = Field(
+        default=None,
+        description="Interval start — the issue's own open/reopen observation",
+    )
+    closed_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Interval end — the issue.closed occurrence; NULL while the "
+            "episode is still open"
+        ),
+    )
+    status: ClosureEpisodeStatus
+    change_request_provider: Provider | None = Field(
+        default=None,
+        description="Provider of the attributed change request (inferred only)",
+    )
+    change_request_repository: str | None = None
+    change_request_external_id: str | None = None
+    resolver_version: str = Field(
+        default=CLOSURE_RESOLVER_VERSION,
+        description="Version of the closure-episode projector that derived this episode",
+    )
+
+
+class ClosureCandidate(BaseModel):
+    """One competing change-request candidate in an ambiguous episode."""
+
+    provider: Provider
+    repository: str
+    external_id: str
+
+
+class ClosureUnresolved(BaseModel):
+    """A versioned unresolved record for one closed closure episode.
+
+    ``reason`` is ``unmatched`` (zero candidates) or ``ambiguous`` (multiple
+    candidates, or an eligible parked declaration).  Candidates are the
+    competing change-request endpoint identities — empty for unmatched.
+    Never tie-broken, never scored; the projection keeps these provisional
+    until a later fact resolves them.
+    """
+
+    issue_provider: Provider
+    issue_repository: str
+    issue_external_id: str
+    closed_at: datetime
+    reason: str = Field(description="unmatched | ambiguous")
+    candidates: list[ClosureCandidate] = Field(default_factory=list)
+    resolver_version: str = Field(
+        default=CLOSURE_RESOLVER_VERSION,
+        description="Version of the closure-episode projector that derived this record",
+    )
+
+
+class ClosureProjection(BaseModel):
+    """The full closure-episode projector output for a set of facts.
+
+    ``links`` carries the derived per-kind link states for every change
+    request present in the facts; ``episodes`` the immutable closure
+    episodes (the last per issue is current, all earlier are superseded);
+    ``unresolved`` the versioned unmatched/ambiguous records.
+    """
+
+    links: list[ClosureLink] = Field(default_factory=list)
+    episodes: list[ClosureEpisode] = Field(default_factory=list)
+    unresolved: list[ClosureUnresolved] = Field(default_factory=list)
+    resolver_version: str = Field(
+        default=CLOSURE_RESOLVER_VERSION,
+        description="Version of the closure-episode projector that produced this output",
     )
