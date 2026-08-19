@@ -14,9 +14,10 @@ case "$ACTION" in
   create)
     BRANCH="tmp/issue-${N}-${SLUG}"
     WORKTREE_PATH="${WORKTREES_DIR}/issue-${N}-${SLUG}"
+    BASE="${5:-HEAD}"
     mkdir -p "$WORKTREES_DIR"
     mkdir -p "$STATUS_DIR"
-    git worktree add -b "$BRANCH" "$WORKTREE_PATH" HEAD
+    git worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE"
     echo "$WORKTREE_PATH"
     ;;
   assign)

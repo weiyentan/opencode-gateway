@@ -837,11 +837,201 @@ This feature is **not yet implemented** — recorded as accepted planned design
 only.
 _Avoid_: assuming change-request and issue are always in the same repository
 
-**Accepted planned design — MR↔issue closure relationship.**
-This is a **planned design, not yet implemented.** No product code,
-migration, contract, table, or endpoint for this relationship exists yet.
-The decisions below are recorded so implementation slices stay consistent.
-They are distinct from the currently-implemented associations.
+**Closure Episode Projection**:
+The DB-local, versioned, rebuildable projection (migration 0036, issue #524)
+that derives the change-request→issue closure relationship from the immutable
+``engineering_events`` facts (Slice 2). Comprises three tables —
+``closure_links``, ``closure_episodes``, ``closure_unresolved`` — written
+only by ``AsyncpgOutcomeRepository.recompute_closure_projection`` after the
+facts transaction commits (best-effort, never blocks ingestion). The
+projection is never a separate source of truth and never authoritative over
+facts. Every row carries ``resolver_version`` (``CLOSURE_RESOLVER_VERSION``)
+and ``derived_at`` (freshness marker).
+_Avoid_: authoritative source, separate source of truth
+
+**Closure Link**:
+A row in ``closure_links`` (migration 0036) representing the derived current
+state of one change-request→issue link. Keyed by both endpoint identities
+(the change-request tuple and the issue tuple — flattened stable resource
+identities, no ``engineering_resources`` registry) plus the relationship
+kind (``references`` vs ``declares_closure``, never conflated). ``state`` is
+``active`` / ``revoked`` (explicit snapshot-diff revocation) / ``parked``
+(conflicting same-timestamp snapshots, never arbitrarily won). Corrected
+toward the latest derivation on every recompute (conflict-update).
+_Avoid_: authoritative link, provider-confirmed relationship
+
+**Closure Episode**:
+A row in ``closure_episodes`` (migration 0036) representing one immutable
+open→close interval for one issue. Keyed by the issue endpoint identity plus
+the close observation time; ``closed_at IS NULL`` marks the currently-open
+interval. ``status`` carries the fixed episode vocabulary (``pending``,
+``awaiting_closure``, ``unmatched``, ``ambiguous``, ``inferred``,
+``superseded`` — unknowns never collapsed into one opaque ``unresolved``).
+The attributed change-request tuple is set only for ``inferred`` episodes.
+The partial unique index ``uq_closure_episodes_current_issue`` guarantees at
+most one current (not-yet-superseded) episode per issue; a reopen/reclose
+cycle marks the earlier episode ``superseded`` (never deleted).
+_Avoid_: permanent MR→issue edge, one-shot resolution
+
+**Closure Unresolved**:
+A row in ``closure_unresolved`` (migration 0036) representing a versioned
+unresolved record for one closed closure episode. ``reason`` is ``unmatched``
+(zero candidates) or ``ambiguous`` (multiple candidates, or an eligible
+parked declaration). ``candidates`` holds the competing change-request
+endpoint identities (empty for unmatched). Never tie-broken, never scored;
+historical records are retained (no hard delete anywhere in the projection).
+_Avoid_: opaque unresolved, arbitrary winner
+
+**Closure Episode Status**:
+The fixed vocabulary for a closure episode's lifecycle status
+(``afk_outcomes.models.ClosureEpisodeStatus``): ``pending`` (active
+declaration, change request not merged), ``awaiting_closure`` (merged change
+request with active declaration, no ``issue.closed`` observed yet),
+``unmatched`` (issue closed, zero eligible candidates), ``ambiguous`` (issue
+closed, multiple candidates or an eligible parked declaration — never an
+arbitrary winner), ``inferred`` (exactly one eligible candidate),
+``superseded`` (overtaken by a reopen/reclose cycle; current projection
+points at the latest episode). Unknowns are never collapsed into one opaque
+``unresolved``.
+_Avoid_: collapsing non-answers into one opaque unresolved
+
+**Closure Link Kind**:
+The two distinct change-request→issue relationship kinds
+(``afk_outcomes.models.ClosureLinkKind``): ``references`` (a plain mention,
+any ``#N`` / ``group/project#N``) and ``declares_closure`` (closing-syntax
+declaration using provider-documented syntax — GitHub ``fixes/fixed/fix``,
+``closes/closed/close``, ``resolves/resolved/resolve``; GitLab
+equivalently). Stored as separate kinds and never conflated.
+_Avoid_: treating any mention as a closure declaration
+
+**Closure Link State**:
+The derived current state of one closure link
+(``afk_outcomes.models.ClosureLinkState``): ``active`` (present in the
+latest unambiguous snapshot), ``revoked`` (present in an earlier snapshot,
+absent in the latest — an explicit snapshot-diff revocation), ``parked``
+(conflicting same-timestamp snapshots left the link indeterminate; never
+arbitrarily won).
+_Avoid_: active/inactive only, conflating revoked with parked
+
+**Closure Projection**:
+The full output of the closure-episode projector
+(``afk_outcomes.closure_episodes.project_closure_episodes``): the derived
+per-kind link states for every change request present in the facts, the
+immutable closure episodes (the last per issue is current, all earlier are
+superseded), and the versioned unmatched/ambiguous unresolved records.
+Deterministic: identical input produces identical output regardless of input
+order — stable sorts, order-independent snapshot comparison, no randomness,
+no clock dependence.
+_Avoid_: projection-as-source-of-truth, non-deterministic projection
+
+**Closure Fact**:
+One normalized fact projected from ``engineering_events`` for the
+closure-episode projector (``afk_outcomes.closure_episodes.ClosureFact``).
+Carries the provider, repository, entity type, external ID, event type,
+occurred-at timestamp, observed-via provenance (webhook/backfill), and the
+optional ``issue_links`` snapshot. Repositories are already-normalized
+identities — the caller normalizes ``issue_links`` repository URLs before
+constructing facts (the pure domain package never imports the application's
+URL normalizer).
+_Avoid_: raw engineering_events row, unnormalized repository URL
+
+**Closure Candidate**:
+One competing change-request endpoint identity in an ambiguous closure
+episode (``afk_outcomes.models.ClosureCandidate``): ``provider``,
+``repository``, ``external_id``. Carried in the ``closure_unresolved``
+``candidates`` JSONB column. Never tie-broken, never scored.
+_Avoid_: winner, scored candidate
+
+**Closure Relationships Read API**:
+The read-only REST API surface for the closure-episode projection (issue
+#525, ``app/api/closure_relationships.py``, prefix
+``/api/v1/closure-relationships``): ``GET /issues/current`` (the current
+issue→change-request answer with status, attribution, and evidence),
+``GET /issues/episodes`` (the auditable episode/evidence history — every
+immutable episode including ``superseded``, never hidden), and
+``GET /change-requests/issues`` (reverse lookup: the issues a change request
+references and/or declares closing, paginated). All responses use the
+``{status, data, error}`` envelope and are protected by the global
+``ApiKeyMiddleware``. Strictly read-only — makes **no provider API calls**,
+reads only the DB projection/unresolved rows, and never derives a
+provider-authoritative causation claim. Every response exposes
+``derived_at`` (last successful recompute) and ``resolver_version``.
+_Avoid_: closure API (generic), authoritative causation endpoint
+
+**CLOSURE_RESOLVER_VERSION**:
+The version constant (``"1"``) of the closure-episode projector
+(``afk_outcomes.models.CLOSURE_RESOLVER_VERSION``). Independent of
+``RESOLVER_VERSION`` (the correlation engine) and
+``ASSOCIATION_RESOLVER_VERSION`` (the exact-association resolver): the
+closure-episode path derives the change-request→issue closure relationship
+from immutable engineering facts and ``issue_links`` snapshot diffs and
+shares no rule semantics with either. Recorded on every ``ClosureEpisode``,
+``ClosureLink``, and ``ClosureUnresolved``. Bump when any projection or
+ordering-policy rule changes.
+_Avoid_: conflating with RESOLVER_VERSION or ASSOCIATION_RESOLVER_VERSION
+
+**Closure Projection Recompute Metrics**:
+Two stable metric names registered on the process-wide metrics registry
+(``app.core.metrics``): ``closure_projection.recompute.failures`` (counter
+incremented when a projection recompute fails after facts commit) and
+``closure_projection.recompute.last_success`` (gauge holding the epoch
+seconds of the last successful recompute). Eagerly registered so the metrics
+snapshot seam always surfaces both names — zero-valued until a recompute
+owner records a failure/success.
+_Avoid_: log-only staleness detection, silent indefinite staleness
+
+**Closure-Episode Projection Recompute**:
+The event-triggered, DB-local recompute that runs after the facts
+transaction commits (best-effort, never blocks ingestion). Triggered by the
+AFK Outcome Consumer on every relevant fact (``issue.opened``,
+``issue.reopened``, ``issue.closed``, ``change_request.opened``,
+``change_request.updated``, ``change_request.merged``). Reads the affected
+facts from ``engineering_events``, runs the pure-domain projector
+(``project_closure_episodes``), and upserts the three projection tables
+(``closure_links``, ``closure_episodes``, ``closure_unresolved``) via
+``AsyncpgOutcomeRepository.recompute_closure_projection``. A failed
+recompute leaves temporary staleness that self-heals on the next relevant
+fact — no scheduler, no provider API call.
+_Avoid_: scheduled reconciliation, provider API enrichment
+
+**Observation Key**:
+The deterministic, NOT NULL, UNIQUE natural key on every
+``engineering_events`` fact (migration 0035, issue #523). Derived as a
+SHA-256 over the canonical JSON form of the fact's six identity fields
+``(provider, repository, entity_type, external_id, event_type,
+occurred_at)`` — the same fields as the existing 6-column identity UNIQUE.
+Webhook facts derive it at ingest via ``build_observation_key``; backfill
+facts derive it from a canonical content hash. The key is content-stable:
+re-deriving the same fact always yields the identical key, and distinct facts
+yield distinct keys. Never depends on volatile delivery identifiers.
+_Avoid_: random UUID identity, delivery-ID-based key
+
+**Observed Via**:
+The provenance of an ``engineering_events`` observation (migration 0035):
+``webhook`` (produced by the AFK Outcome Consumer from a normalized provider
+event) or ``backfill`` (produced by the AFK Backfill CLI). NOT NULL with a
+``webhook`` server default. Distinguishes occurrence time from observation
+time in conjunction with ``snapshot_at``.
+_Avoid_: conflating webhook and backfill provenance
+
+**Snapshot At**:
+The observation time of an ``engineering_events`` fact (migration 0035),
+distinct from the provider occurrence time (``occurred_at``). Set by the
+AFK Outcome Consumer at ingest time; nullable for pre-0035 rows. Used by
+the closure-episode projector to distinguish occurrence time from
+observation time — backfill snapshots never masquerade as historical
+webhook snapshots.
+_Avoid_: conflating observation time with occurrence time
+
+**MR↔issue closure relationship (implemented)**:
+The implemented change-request→issue closure relationship (issues #524,
+#525, migration 0036). Answers "which GitLab MR / GitHub PR closed this
+issue?" from webhook observations **without claiming provider-authoritative
+causation** — the system records observed facts and the inferred attribution,
+never a claim that the provider itself recorded as fact. Comprises the
+closure-episode projection (Slice 3) and the closure-relationships read API
+(Slice 4). The design decisions below are now implemented and reflect the
+shipped code.
 
 Goal: answer "which GitLab MR / GitHub PR closed this issue?" from webhook
 observations, **without claiming provider-authoritative causation** — the
@@ -1175,6 +1365,14 @@ manages.
 - The **Reporting Read API** makes **no completion claims**: a **Resource Summary** carries the verbatim current payload and pipeline lifecycle states, never a derived "completed"/"finished"/outcome state
 - A **Resource Summary** is keyed by the composite `resource_id` (`provider + repository_url + resource_type + resource_number`), the stable resource identity distinct from any human-readable label
 - A **Reporting Session Link** is marked `provisional=True` with an empty `source_references` list until exact resource↔session correlation (#481) lands — the Gateway never fabricates a link it cannot prove
+- The **Closure Episode Projection** (migration 0036) is written only by `AsyncpgOutcomeRepository.recompute_closure_projection` after the facts transaction commits — best-effort, never blocks ingestion, rebuildable from facts
+- A **Closure Link** belongs to one change-request→issue pair and one relationship kind (`references` / `declares_closure`), keyed by both endpoint identities (flattened stable resource identities, no `engineering_resources` registry)
+- A **Closure Episode** belongs to one issue and is keyed by the issue endpoint identity plus the close observation time; at most one current (non-superseded) episode per issue (`uq_closure_episodes_current_issue` partial unique index)
+- A **Closure Unresolved** record belongs to one closed closure episode and is keyed by `(issue identity, closed_at, reason)` — historical records are retained, never deleted
+- The **Closure Relationships Read API** (`/api/v1/closure-relationships`) is strictly read-only — reads only the DB projection/unresolved rows, makes **no provider API calls**, and never derives a provider-authoritative causation claim
+- The **Closure-Episode Projection Recompute** is triggered by the **AFK Outcome Consumer** on every relevant fact (`issue.opened`, `issue.reopened`, `issue.closed`, `change_request.opened`, `change_request.updated`, `change_request.merged`) — DB-local, no scheduler, no provider API call
+- An **Observation Key** is the deterministic, NOT NULL, UNIQUE natural key on every `engineering_events` fact (migration 0035), derived as a SHA-256 over the fact's six identity fields — content-stable, replay-safe, never dependent on volatile delivery identifiers
+- An `engineering_events` fact carries **Observed Via** (`webhook`/`backfill`) and **Snapshot At** (observation time) provenance (migration 0035), distinguishing occurrence time from observation time
 
 ## Flagged Ambiguities
 
