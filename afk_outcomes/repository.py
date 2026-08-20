@@ -38,6 +38,8 @@ Every derived link stores ``correlation_method``, ``correlation_confidence``,
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 import asyncpg
@@ -50,6 +52,7 @@ from afk_outcomes.models import (
     ClosureEpisode,
     ClosureEpisodeStatus,
     ClosureLink,
+    ClosureProjection,
     ClosureUnresolved,
     Correlation,
     CorrelationEvidence,
@@ -200,6 +203,20 @@ _CLOSURE_RELEVANT_EVENT_TYPES = frozenset(
         "change_request.merged",
     }
 )
+
+
+@dataclass
+class ClosureRebuildResult:
+    """The outcome of a full closure-projection rebuild (issue #539).
+
+    Carries the recomputed :class:`ClosureProjection` plus the processed
+    fact range so the operator CLI can report what was rebuilt.
+    """
+
+    projection: ClosureProjection
+    facts_processed: int
+    event_range_start: datetime | None
+    event_range_end: datetime | None
 
 
 class AsyncpgOutcomeRepository(OutcomeRepository):
@@ -561,6 +578,94 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         await self._reconcile_closure_episodes(projection.episodes)
         for record in projection.unresolved:
             await self._upsert_closure_unresolved(record)
+
+    async def rebuild_closure_projection(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        normalize_repository: Callable[[str], str | None] | None = None,
+    ) -> ClosureRebuildResult:
+        """Rebuild the full closure-episode projection from committed facts (issue #539).
+
+        Operator-only rebuild operation (CLI/AWX): reads every closure-relevant
+        ``engineering_events`` fact — optionally bounded by ``occurred_at`` to
+        ``[since, until]`` — projects it with the same pure-domain projector
+        (:func:`afk_outcomes.closure_episodes.project_closure_episodes`) and
+        reconciles the derived state into ``closure_links`` /
+        ``closure_episodes`` / ``closure_unresolved`` via the same reconcile
+        helpers as the incremental recompute.  Deterministic and idempotent:
+        repeated rebuilds converge to identical projection state.
+
+        ``normalize_repository`` converts raw producer repository URLs inside
+        ``issue_links`` snapshots to the same normalized identities the facts
+        carry (the pure-domain package cannot import the application
+        normalizer, so the caller supplies it).  Defaults to identity.
+
+        The caller owns transaction boundaries.  Returns a
+        :class:`ClosureRebuildResult` carrying the recomputed projection and
+        the processed fact range for reporting.
+        """
+        normalize = (
+            normalize_repository
+            if normalize_repository is not None
+            else (lambda value: value)
+        )
+        rows = await self._conn.fetch(
+            """
+            SELECT provider, repository, entity_type, external_id, event_type,
+                   occurred_at, observed_via, payload
+            FROM engineering_events
+            WHERE event_type = ANY($1::text[])
+            """,
+            list(_CLOSURE_RELEVANT_EVENT_TYPES),
+        )
+
+        facts: list[ClosureFact] = []
+        range_start: datetime | None = None
+        range_end: datetime | None = None
+        for row in rows:
+            occurred_at = row["occurred_at"]
+            if since is not None and occurred_at < since:
+                continue
+            if until is not None and occurred_at > until:
+                continue
+            facts.append(
+                _to_closure_fact(
+                    provider=Provider(row["provider"]),
+                    repository=row["repository"],
+                    entity_type=EntityType(row["entity_type"]),
+                    external_id=row["external_id"],
+                    event_type=row["event_type"],
+                    occurred_at=occurred_at,
+                    observed_via=row["observed_via"],
+                    payload=row["payload"] or {},
+                    normalize=normalize,
+                )
+            )
+            if range_start is None or occurred_at < range_start:
+                range_start = occurred_at
+            if range_end is None or occurred_at > range_end:
+                range_end = occurred_at
+
+        projection = project_closure_episodes(
+            facts,
+            resolver_version=CLOSURE_RESOLVER_VERSION,
+        )
+
+        # ── reconcile (deterministic upserts — rebuildable from facts) ─
+        for link in projection.links:
+            await self._upsert_closure_link(link)
+        await self._reconcile_closure_episodes(projection.episodes)
+        for record in projection.unresolved:
+            await self._upsert_closure_unresolved(record)
+
+        return ClosureRebuildResult(
+            projection=projection,
+            facts_processed=len(facts),
+            event_range_start=range_start,
+            event_range_end=range_end,
+        )
 
     async def _upsert_closure_link(self, link: ClosureLink) -> None:
         """Upsert one derived link state, corrected toward the latest derivation.
