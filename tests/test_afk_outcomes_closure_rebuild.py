@@ -77,7 +77,10 @@ def _declares_snapshot(number: str) -> dict:
         "issue_links": {
             "references": [],
             "declares_closure": [
-                {"repository": f"https://gitlab.com/{REPO.removeprefix('gitlab.com/')}", "number": number}
+                {
+                    "repository": f"https://gitlab.com/{REPO.removeprefix('gitlab.com/')}",
+                    "number": number,
+                }
             ],
         }
     }
@@ -365,8 +368,8 @@ async def test_rebuild_empty_facts_produces_empty_projection() -> None:
 
 
 def _fake_result(**overrides) -> object:
-    from afk_outcomes.repository import ClosureRebuildResult
     from afk_outcomes.models import ClosureProjection
+    from afk_outcomes.repository import ClosureRebuildResult
 
     base = {
         "projection": ClosureProjection(),
