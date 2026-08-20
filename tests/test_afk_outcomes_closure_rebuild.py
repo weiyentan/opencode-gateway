@@ -29,6 +29,7 @@ from afk_outcomes.models import (
     ClosureEpisodeStatus,
     ClosureLinkKind,
     ClosureLinkState,
+    ClosureProjection,
     EntityType,
     Provider,
 )
@@ -109,17 +110,52 @@ def _inferred_facts() -> list[dict]:
     ]
 
 
-def _mock_conn(rows: list[dict]) -> AsyncMock:
+def _mock_conn(
+    rows: list[dict],
+    *,
+    closure_links_rows: list[dict] | None = None,
+    closure_unresolved_rows: list[dict] | None = None,
+) -> AsyncMock:
     conn = AsyncMock()
 
     async def _fetch(sql: str, *args):
         if "FROM engineering_events" in sql:
             return [mock_row(row) for row in rows]
+        if "FROM closure_links" in sql:
+            return [mock_row(row) for row in (closure_links_rows or [])]
+        if "FROM closure_unresolved" in sql:
+            return [mock_row(row) for row in (closure_unresolved_rows or [])]
         return []
 
     conn.fetch = AsyncMock(side_effect=_fetch)
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     return conn
+
+
+def _stale_link_row() -> dict:
+    """A ``closure_links`` key the ``_inferred_facts`` projection does not
+    produce (a reference to issue "99" instead of the declaration on "1")."""
+    return {
+        "change_request_provider": Provider.GITLAB.value,
+        "change_request_repository": REPO,
+        "change_request_external_id": "6",
+        "issue_provider": Provider.GITLAB.value,
+        "issue_repository": REPO,
+        "issue_external_id": "99",
+        "kind": "references",
+    }
+
+
+def _stale_unresolved_row() -> dict:
+    """A ``closure_unresolved`` key the ``_inferred_facts`` projection does not
+    produce (an unmatched close of issue "42")."""
+    return {
+        "issue_provider": Provider.GITLAB.value,
+        "issue_repository": REPO,
+        "issue_external_id": "42",
+        "closed_at": _t(20),
+        "reason": "unmatched",
+    }
 
 
 # ── repository rebuild_closure_projection ────────────────────────────────────
@@ -155,8 +191,9 @@ async def test_rebuild_projects_full_closure_projection() -> None:
 
 
 async def test_rebuild_filters_facts_by_time_bounds() -> None:
-    """Optional time bounds filter the processed fact range: facts outside the
-    window are not projected."""
+    """A bounded window excludes any issue whose closure-relevant fact history
+    is cut by the window: the issue is never re-persisted from a partial fact
+    set (data regression) — it is excluded from the write set entirely."""
     facts = _inferred_facts()
     conn = _mock_conn(facts)
     repo = AsyncpgOutcomeRepository(conn)
@@ -171,10 +208,123 @@ async def test_rebuild_filters_facts_by_time_bounds() -> None:
     assert result.facts_processed == 2
     assert result.event_range_start == _t(0)
     assert result.event_range_end == _t(10)
-    # no issue.closed in the window → no closed episode; the open interval
-    # with a merged declaration renders awaiting_closure
+    # the issue has a touching fact (issue.closed at t(20)) outside the
+    # window, so it is NOT whole-window: no episode and no link are written
+    # for it (never regressed to awaiting_closure from a partial fact set)
+    assert result.projection.episodes == []
+    assert result.projection.links == []
+
+
+async def test_rebuild_window_fully_containing_issue_writes_it() -> None:
+    """A window that fully contains an issue's closure-relevant fact history
+    writes the issue normally (whole-window)."""
+    conn = _mock_conn(_inferred_facts())
+    repo = AsyncpgOutcomeRepository(conn)
+
+    result = await repo.rebuild_closure_projection(
+        since=_t(0),
+        until=_t(30),
+        normalize_repository=normalize_repository_url,
+    )
+
+    assert result.facts_processed == 3
+    assert result.event_range_start == _t(0)
+    assert result.event_range_end == _t(20)
     assert len(result.projection.episodes) == 1
-    assert result.projection.episodes[0].status is ClosureEpisodeStatus.AWAITING_CLOSURE
+    episode = result.projection.episodes[0]
+    assert episode.status is ClosureEpisodeStatus.INFERRED
+    assert episode.change_request_external_id == "6"
+    assert len(result.projection.links) == 1
+
+
+async def test_rebuild_full_removes_stale_links_and_unresolved() -> None:
+    """A full rebuild deletes closure_links / closure_unresolved rows absent
+    from the fresh projection, converging on identical projection state."""
+    conn = _mock_conn(
+        _inferred_facts(),
+        closure_links_rows=[_stale_link_row()],
+        closure_unresolved_rows=[_stale_unresolved_row()],
+    )
+    repo = AsyncpgOutcomeRepository(conn)
+
+    result = await repo.rebuild_closure_projection(
+        normalize_repository=normalize_repository_url
+    )
+
+    assert result.facts_processed == 3
+    sqls = [call.args[0] for call in conn.execute.call_args_list]
+    link_deletes = [sql for sql in sqls if "DELETE FROM closure_links" in sql]
+    unresolved_deletes = [
+        sql for sql in sqls if "DELETE FROM closure_unresolved" in sql
+    ]
+    assert len(link_deletes) == 1
+    assert len(unresolved_deletes) == 1
+    # the fresh projection's own link state is still upserted, not deleted
+    assert any("INSERT INTO closure_links" in sql for sql in sqls)
+
+
+async def test_rebuild_windowed_does_not_delete() -> None:
+    """A windowed rebuild never deletes projection rows — even whole-window
+    issues are only upserted, and nothing else is touched."""
+    conn = _mock_conn(_inferred_facts())
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo.rebuild_closure_projection(
+        since=_t(0),
+        until=_t(30),
+        normalize_repository=normalize_repository_url,
+    )
+
+    sqls = [call.args[0] for call in conn.execute.call_args_list]
+    assert not any("DELETE FROM" in sql for sql in sqls)
+
+
+async def test_reconcile_closure_links_absent_deletes_stale() -> None:
+    """_reconcile_closure_links_absent deletes every stored link key the
+    projection no longer produces (full-rebuild convergence seam)."""
+    conn = _mock_conn([], closure_links_rows=[_stale_link_row()])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo._reconcile_closure_links_absent(ClosureProjection())
+
+    deletes = [
+        call
+        for call in conn.execute.call_args_list
+        if "DELETE FROM closure_links" in call.args[0]
+    ]
+    assert len(deletes) == 1
+    assert deletes[0].args[1:] == (
+        Provider.GITLAB.value,
+        REPO,
+        "6",
+        Provider.GITLAB.value,
+        REPO,
+        "99",
+        "references",
+    )
+
+
+async def test_reconcile_closure_unresolved_absent_deletes_stale() -> None:
+    """_reconcile_closure_unresolved_absent deletes every stored unresolved
+    key the projection no longer produces (full-rebuild convergence seam)."""
+    conn = _mock_conn([], closure_unresolved_rows=[_stale_unresolved_row()])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo._reconcile_closure_unresolved_absent(ClosureProjection())
+
+    deletes = [
+        call
+        for call in conn.execute.call_args_list
+        if "DELETE FROM closure_unresolved" in call.args[0]
+    ]
+    assert len(deletes) == 1
+    assert deletes[0].args[1:] == (
+        Provider.GITLAB.value,
+        REPO,
+        "42",
+        _t(20),
+        "unmatched",
+    )
 
 
 async def test_rebuild_is_deterministic_and_idempotent() -> None:

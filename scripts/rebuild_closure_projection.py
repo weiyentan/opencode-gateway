@@ -20,19 +20,24 @@ Usage::
 
 Flags:
     --since/--until  optional time bounds (ISO 8601; naive values assumed
-                     UTC).  When given, only facts whose ``occurred_at``
-                     falls within ``[since, until]`` are processed — a
-                     bounded repair primitive over a window.  Defaults to a
-                     full rebuild over every closure-relevant fact.
+                     UTC).  When given, only issues whose ENTIRE
+                     closure-relevant fact history falls within
+                     ``[since, until]`` are written; issues whose lifecycle
+                     is cut by the window are excluded from the write set
+                     (never regressed from a partial fact set) and no
+                     projection rows are deleted.  Defaults to a full
+                     rebuild over every closure-relevant fact.
     --confirm        explicitly confirm the rebuild.  A full rebuild refuses
                      to write anything without this flag (or ``--yes``).
     --dry-run        print the full report (facts processed, event range,
                      and the resulting closure_links / closure_episodes /
                      closure_unresolved counts) and write nothing.
 
-Idempotency by construction: the projector is deterministic and the
-reconcile writes are conflict-updates, so re-running the same rebuild
-converges on identical projection state.
+A full rebuild converges on identical projection state: the projector is
+deterministic, the reconcile writes are conflict-updates, and stale
+closure_links / closure_unresolved rows absent from the fresh projection
+are removed.  A windowed rebuild only ever writes whole-window issues and
+never deletes — it is a bounded repair primitive, not a convergence run.
 
 This is a CLI/AWX-only operation — no public API endpoint is added, no
 schema migration and no automatic reconciliation scheduler are introduced.
@@ -198,13 +203,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--since",
         type=_parse_datetime,
         default=None,
-        help="Process only facts at/after this time (ISO 8601; naive assumed UTC).",
+        help="Process only facts at/after this time (ISO 8601; naive assumed UTC). Only issues whose entire closure-relevant fact history falls within [since, until] are written; issues cut by the window are excluded and never regressed.",
     )
     parser.add_argument(
         "--until",
         type=_parse_datetime,
         default=None,
-        help="Process only facts at/before this time (ISO 8601; naive assumed UTC).",
+        help="Process only facts at/before this time (ISO 8601; naive assumed UTC). Only issues whose entire closure-relevant fact history falls within [since, until] are written; issues cut by the window are excluded and never regressed.",
     )
     parser.add_argument(
         "--confirm",
