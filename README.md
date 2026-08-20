@@ -516,7 +516,8 @@ opencode-gateway/
 │           └── afk.py            # ORM models: AFKRun, EngineeringEntity, delivery log, unresolved correlations
 ├── afk_outcomes/                 # Pure-domain AFK outcome package (models, serialization, correlation engine, provider adapters, repository)
 ├── scripts/
-│   └── afk_backfill.py           # AFK outcome backfill/reconciliation CLI (--dry-run, --show-evidence)
+│   ├── afk_backfill.py           # AFK outcome backfill/reconciliation CLI (--dry-run, --show-evidence)
+│   └── rebuild_closure_projection.py  # Operator-only closure projection rebuild CLI (--since/--until, --confirm, --dry-run)
 ├── frontend/                     # Aurora Glass telemetry dashboard (HTML/CSS/JS SPA)
 ├── tests/                        # Foundation tests (more to be added)
 ├── docs/
