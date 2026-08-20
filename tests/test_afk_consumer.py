@@ -880,7 +880,7 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
         patch(
             "app.consumer.afk_consumer.AFKOutcomeConsumer._reconcile_loop",
             new_callable=AsyncMock,
-        ),
+        ) as mock_reconcile_loop,
         patch("app.consumer.afk_consumer.AIOKafkaConsumer") as mock_kafka_consumer,
         patch("app.consumer.afk_consumer.AIOKafkaProducer") as mock_kafka_producer,
     ):
@@ -892,6 +892,9 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
     assert mock_kafka_consumer.call_args.kwargs["enable_auto_commit"] is False
     assert mock_kafka_consumer.call_args.kwargs["auto_offset_reset"] == "earliest"
     assert mock_kafka_consumer.call_args.args[0] == "engineering.events.normalized"
+    # Startup no longer creates a reconciliation task (issue #536): the
+    # reconcile loop must not be scheduled by ``start()``.
+    mock_reconcile_loop.assert_not_awaited()
 
 
 # ── Scheduled reconciliation reuses the backfill engine ──────────────────────

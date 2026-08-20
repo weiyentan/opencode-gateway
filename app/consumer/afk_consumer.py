@@ -540,7 +540,6 @@ class AFKOutcomeConsumer:
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._in_flight: asyncio.Task[Any] | None = None
-        self._reconcile_task: asyncio.Task[Any] | None = None
         self._owns_pool = False
         self._adapter_client: Any = None
 
@@ -638,7 +637,7 @@ class AFKOutcomeConsumer:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise Kafka consumer/producer and begin polling + reconciliation."""
+        """Initialise Kafka consumer/producer and begin polling."""
         self._consumer = AIOKafkaConsumer(
             self._topic,
             bootstrap_servers=self._kafka_brokers,
@@ -663,8 +662,6 @@ class AFKOutcomeConsumer:
             except NotImplementedError:
                 # Signal handlers not available on this platform
                 pass
-
-        self._reconcile_task = asyncio.ensure_future(self._reconcile_loop())
 
         logger.info(
             "AFK outcome consumer started: topic=%s group=%s",
@@ -738,17 +735,10 @@ class AFKOutcomeConsumer:
                 break
 
     async def stop(self) -> None:
-        """Gracefully shut down the consumer (drain in-flight, stop reconciler)."""
+        """Gracefully shut down the consumer (drain in-flight)."""
         logger.info("Stopping AFK outcome consumer …")
         self._running = False
         self._shutdown_event.set()
-
-        # Stop the reconciliation loop.
-        if self._reconcile_task is not None and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reconcile_task
-        self._reconcile_task = None
 
         # Wait for in-flight processing to finish.
         if self._in_flight is not None and not self._in_flight.done():
