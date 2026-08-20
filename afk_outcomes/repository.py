@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from typing import Callable
 
 import asyncpg
@@ -71,6 +72,8 @@ from afk_outcomes.models import (
     UnresolvedCorrelation,
     build_observation_key,
 )
+
+logger = logging.getLogger(__name__)
 
 # Version of the correlation resolver that produces the derived links stored
 # by this repository.  Bumped whenever link-derivation semantics change.
@@ -124,6 +127,38 @@ def _source_reference_json(sources: list[ReferenceSource]) -> str:
     return json.dumps([item.model_dump(mode="json") for item in sources])
 
 
+def _decode_jsonb(raw: object) -> dict | None:
+    """Decode a JSONB value that asyncpg may return as a dict or a JSON string.
+
+    asyncpg returns JSONB columns as JSON strings unless a codec is
+    registered, so the repository boundary must tolerate both shapes.  Returns
+    the decoded object when it is a JSON object (``dict``), or ``None`` when
+    the value is missing, malformed JSON, or a non-object payload.  ``None``
+    is never a valid JSONB object, so callers treat it as "no usable object"
+    and omit closure metadata while preserving the committed fact.  Diagnostics
+    are bounded — a fixed message, never the raw payload contents.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("Closure projection: malformed JSONB payload (skipped)")
+            return None
+        if isinstance(decoded, dict):
+            return decoded
+        logger.warning("Closure projection: non-object JSONB payload (skipped)")
+        return None
+    if raw is None:
+        return None
+    logger.warning(
+        "Closure projection: unexpected JSONB payload type %s (skipped)",
+        type(raw).__name__,
+    )
+    return None
+
+
 def _issue_links_from_payload(
     raw: object,
     normalize: Callable[[str], str | None],
@@ -136,13 +171,19 @@ def _issue_links_from_payload(
     whose repository cannot be normalized are skipped (never an identity
     collision); a payload without an ``issue_links`` dict yields ``None``
     (a missing field is never a revocation — see the projector).
+
+    The ``issue_links`` value may arrive as a dict or a JSON string (asyncpg
+    JSONB shape); both are decoded.  Malformed individual link entries are
+    skipped while valid entries in the same payload are retained, and
+    ``references`` / ``declares_closure`` stay in distinct buckets.
     """
-    if not isinstance(raw, dict):
+    decoded = _decode_jsonb(raw)
+    if decoded is None:
         return None
     snapshot = IssueLinksSnapshot()
     found = False
     for field, kind in (("references", "references"), ("declares_closure", "declares_closure")):
-        items = raw.get(field)
+        items = decoded.get(field)
         if not isinstance(items, list):
             continue
         targets: list[IssueLinkTarget] = []
@@ -174,10 +215,18 @@ def _to_closure_fact(
     event_type: str,
     occurred_at: object,
     observed_via: object,
-    payload: dict,
+    payload: object,
     normalize: Callable[[str], str | None],
 ) -> ClosureFact:
-    """Build a :class:`ClosureFact` from an ``engineering_events``-shaped row."""
+    """Build a :class:`ClosureFact` from an ``engineering_events``-shaped row.
+
+    ``payload`` may be a dict or a JSON string (asyncpg JSONB shape).  A
+    malformed or non-object payload never crashes the fact build: the fact is
+    still produced (the committed fact is preserved) with closure metadata
+    omitted.
+    """
+    decoded = _decode_jsonb(payload)
+    issue_links_raw = decoded.get("issue_links") if decoded is not None else None
     return ClosureFact(
         provider=provider,
         repository=repository,
@@ -186,7 +235,7 @@ def _to_closure_fact(
         event_type=event_type,
         occurred_at=occurred_at,
         observed_via=observed_via,
-        issue_links=_issue_links_from_payload(payload.get("issue_links"), normalize),
+        issue_links=_issue_links_from_payload(issue_links_raw, normalize),
     )
 
 
