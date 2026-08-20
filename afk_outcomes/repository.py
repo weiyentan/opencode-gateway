@@ -38,6 +38,9 @@ Every derived link stores ``correlation_method``, ``correlation_confidence``,
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from datetime import datetime
+import logging
 from typing import Callable
 
 import asyncpg
@@ -50,6 +53,7 @@ from afk_outcomes.models import (
     ClosureEpisode,
     ClosureEpisodeStatus,
     ClosureLink,
+    ClosureProjection,
     ClosureUnresolved,
     Correlation,
     CorrelationEvidence,
@@ -68,6 +72,8 @@ from afk_outcomes.models import (
     UnresolvedCorrelation,
     build_observation_key,
 )
+
+logger = logging.getLogger(__name__)
 
 # Version of the correlation resolver that produces the derived links stored
 # by this repository.  Bumped whenever link-derivation semantics change.
@@ -121,6 +127,38 @@ def _source_reference_json(sources: list[ReferenceSource]) -> str:
     return json.dumps([item.model_dump(mode="json") for item in sources])
 
 
+def _decode_jsonb(raw: object) -> dict | None:
+    """Decode a JSONB value that asyncpg may return as a dict or a JSON string.
+
+    asyncpg returns JSONB columns as JSON strings unless a codec is
+    registered, so the repository boundary must tolerate both shapes.  Returns
+    the decoded object when it is a JSON object (``dict``), or ``None`` when
+    the value is missing, malformed JSON, or a non-object payload.  ``None``
+    is never a valid JSONB object, so callers treat it as "no usable object"
+    and omit closure metadata while preserving the committed fact.  Diagnostics
+    are bounded — a fixed message, never the raw payload contents.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("Closure projection: malformed JSONB payload (skipped)")
+            return None
+        if isinstance(decoded, dict):
+            return decoded
+        logger.warning("Closure projection: non-object JSONB payload (skipped)")
+        return None
+    if raw is None:
+        return None
+    logger.warning(
+        "Closure projection: unexpected JSONB payload type %s (skipped)",
+        type(raw).__name__,
+    )
+    return None
+
+
 def _issue_links_from_payload(
     raw: object,
     normalize: Callable[[str], str | None],
@@ -133,13 +171,19 @@ def _issue_links_from_payload(
     whose repository cannot be normalized are skipped (never an identity
     collision); a payload without an ``issue_links`` dict yields ``None``
     (a missing field is never a revocation — see the projector).
+
+    The ``issue_links`` value may arrive as a dict or a JSON string (asyncpg
+    JSONB shape); both are decoded.  Malformed individual link entries are
+    skipped while valid entries in the same payload are retained, and
+    ``references`` / ``declares_closure`` stay in distinct buckets.
     """
-    if not isinstance(raw, dict):
+    decoded = _decode_jsonb(raw)
+    if decoded is None:
         return None
     snapshot = IssueLinksSnapshot()
     found = False
     for field, kind in (("references", "references"), ("declares_closure", "declares_closure")):
-        items = raw.get(field)
+        items = decoded.get(field)
         if not isinstance(items, list):
             continue
         targets: list[IssueLinkTarget] = []
@@ -171,10 +215,18 @@ def _to_closure_fact(
     event_type: str,
     occurred_at: object,
     observed_via: object,
-    payload: dict,
+    payload: object,
     normalize: Callable[[str], str | None],
 ) -> ClosureFact:
-    """Build a :class:`ClosureFact` from an ``engineering_events``-shaped row."""
+    """Build a :class:`ClosureFact` from an ``engineering_events``-shaped row.
+
+    ``payload`` may be a dict or a JSON string (asyncpg JSONB shape).  A
+    malformed or non-object payload never crashes the fact build: the fact is
+    still produced (the committed fact is preserved) with closure metadata
+    omitted.
+    """
+    decoded = _decode_jsonb(payload)
+    issue_links_raw = decoded.get("issue_links") if decoded is not None else None
     return ClosureFact(
         provider=provider,
         repository=repository,
@@ -183,8 +235,29 @@ def _to_closure_fact(
         event_type=event_type,
         occurred_at=occurred_at,
         observed_via=observed_via,
-        issue_links=_issue_links_from_payload(payload.get("issue_links"), normalize),
+        issue_links=_issue_links_from_payload(issue_links_raw, normalize),
     )
+
+
+def _closure_fact_issue_keys(fact: ClosureFact) -> list[tuple[str, str, str]]:
+    """Return the issue keys one closure fact touches (empty when it touches none).
+
+    An issue fact touches its own issue identity
+    ``(provider.value, repository, external_id)``; a change-request fact
+    touches every issue in its ``issue_links`` snapshot — both
+    ``declares_closure`` and ``references`` targets — as
+    ``(provider.value, target.repository, target.number)``.  Used by the
+    windowed rebuild to decide which issues have their ENTIRE fact history
+    inside the requested window.
+    """
+    if fact.entity_type is EntityType.ISSUE:
+        return [(fact.provider.value, fact.repository, fact.external_id)]
+    if fact.issue_links is None:
+        return []
+    return [
+        (fact.provider.value, target.repository, target.number)
+        for target in fact.issue_links.declares_closure + fact.issue_links.references
+    ]
 
 
 #: Fact event types the closure-episode projection consumes.  Anything else
@@ -200,6 +273,20 @@ _CLOSURE_RELEVANT_EVENT_TYPES = frozenset(
         "change_request.merged",
     }
 )
+
+
+@dataclass
+class ClosureRebuildResult:
+    """The outcome of a full closure-projection rebuild (issue #539).
+
+    Carries the recomputed :class:`ClosureProjection` plus the processed
+    fact range so the operator CLI can report what was rebuilt.
+    """
+
+    projection: ClosureProjection
+    facts_processed: int
+    event_range_start: datetime | None
+    event_range_end: datetime | None
 
 
 class AsyncpgOutcomeRepository(OutcomeRepository):
@@ -562,6 +649,159 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         for record in projection.unresolved:
             await self._upsert_closure_unresolved(record)
 
+    async def rebuild_closure_projection(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        normalize_repository: Callable[[str], str | None] | None = None,
+    ) -> ClosureRebuildResult:
+        """Rebuild the closure-episode projection from committed facts (issue #539).
+
+        Operator-only rebuild operation (CLI/AWX): reads every closure-relevant
+        ``engineering_events`` fact, projects it with the same pure-domain
+        projector (:func:`afk_outcomes.closure_episodes.project_closure_episodes`)
+        and reconciles the derived state into ``closure_links`` /
+        ``closure_episodes`` / ``closure_unresolved`` via the same reconcile
+        helpers as the incremental recompute.
+
+        **Full rebuild** (no bounds): every closure-relevant fact is projected
+        with no issue restriction and, in addition to the upsert reconcile,
+        stored ``closure_links`` and ``closure_unresolved`` rows absent from
+        the fresh projection are deleted — repeated full rebuilds converge to
+        identical projection state.
+
+        **Windowed rebuild** (``since``/``until`` given): a windowed rebuild
+        must never persist projection state derived from an incomplete fact
+        history.  Only issues whose ENTIRE closure-relevant fact history is
+        fully contained within ``[since, until]`` are written ("whole-window"
+        issues): any issue with a touching fact outside the window is
+        excluded from the write set entirely, so a bounded rebuild can never
+        regress an already-correct episode (e.g. overwrite a
+        ``CLOSED``/``SUPERSEDED`` episode with ``AWAITING_CLOSURE``).  The
+        projector's ``issues`` restriction scopes episodes/unresolved to the
+        whole-window issues, and the always-computed link states are filtered
+        to the same set before writing.  Non-whole-window issues are left
+        untouched — never written, never deleted.
+
+        ``normalize_repository`` converts raw producer repository URLs inside
+        ``issue_links`` snapshots to the same normalized identities the facts
+        carry (the pure-domain package cannot import the application
+        normalizer, so the caller supplies it).  Defaults to identity.
+
+        The caller owns transaction boundaries.  Returns a
+        :class:`ClosureRebuildResult` carrying the recomputed projection and
+        the processed fact range for reporting.
+        """
+        normalize = (
+            normalize_repository
+            if normalize_repository is not None
+            else (lambda value: value)
+        )
+        rows = await self._conn.fetch(
+            """
+            SELECT provider, repository, entity_type, external_id, event_type,
+                   occurred_at, observed_via, payload
+            FROM engineering_events
+            WHERE event_type = ANY($1::text[])
+            """,
+            list(_CLOSURE_RELEVANT_EVENT_TYPES),
+        )
+
+        all_facts: list[ClosureFact] = [
+            _to_closure_fact(
+                provider=Provider(row["provider"]),
+                repository=row["repository"],
+                entity_type=EntityType(row["entity_type"]),
+                external_id=row["external_id"],
+                event_type=row["event_type"],
+                occurred_at=row["occurred_at"],
+                observed_via=row["observed_via"],
+                payload=row["payload"] or {},
+                normalize=normalize,
+            )
+            for row in rows
+        ]
+
+        windowed = since is not None or until is not None
+        issues_restriction: frozenset[tuple[str, str, str]] | None = None
+        if windowed:
+            # A bounded rebuild must not persist state derived from an
+            # incomplete fact history.  Compute, over the COMPLETE fact set,
+            # every issue's touching-fact times; an issue is whole-window only
+            # when ALL of them fall inside [since, until].
+            issue_fact_times: dict[tuple[str, str, str], list[datetime]] = {}
+            for fact in all_facts:
+                for issue_key in _closure_fact_issue_keys(fact):
+                    issue_fact_times.setdefault(issue_key, []).append(
+                        fact.occurred_at
+                    )
+            issues_restriction = frozenset(
+                issue_key
+                for issue_key, times in issue_fact_times.items()
+                if all(
+                    (since is None or occurred_at >= since)
+                    and (until is None or occurred_at <= until)
+                    for occurred_at in times
+                )
+            )
+
+        facts: list[ClosureFact] = []
+        range_start: datetime | None = None
+        range_end: datetime | None = None
+        for fact in all_facts:
+            if since is not None and fact.occurred_at < since:
+                continue
+            if until is not None and fact.occurred_at > until:
+                continue
+            facts.append(fact)
+            if range_start is None or fact.occurred_at < range_start:
+                range_start = fact.occurred_at
+            if range_end is None or fact.occurred_at > range_end:
+                range_end = fact.occurred_at
+
+        projection = project_closure_episodes(
+            facts,
+            issues=issues_restriction,
+            resolver_version=CLOSURE_RESOLVER_VERSION,
+        )
+        if issues_restriction is not None:
+            # link states are computed for every change request in ``facts``
+            # regardless of the ``issues`` restriction — drop links whose
+            # issue is not whole-window so a bounded rebuild never writes
+            # them (and never regresses their stored state).
+            projection.links = [
+                link
+                for link in projection.links
+                if (
+                    link.issue_provider.value,
+                    link.issue_repository,
+                    link.issue_external_id,
+                )
+                in issues_restriction
+            ]
+
+        # ── reconcile (deterministic upserts — rebuildable from facts) ─
+        for link in projection.links:
+            await self._upsert_closure_link(link)
+        await self._reconcile_closure_episodes(projection.episodes)
+        for record in projection.unresolved:
+            await self._upsert_closure_unresolved(record)
+
+        # A FULL rebuild additionally removes projection rows the fresh
+        # projection no longer produces, so repeated full rebuilds converge
+        # to identical projection state.  A windowed rebuild never deletes.
+        if not windowed:
+            await self._reconcile_closure_links_absent(projection)
+            await self._reconcile_closure_unresolved_absent(projection)
+
+        return ClosureRebuildResult(
+            projection=projection,
+            facts_processed=len(facts),
+            event_range_start=range_start,
+            event_range_end=range_end,
+        )
+
     async def _upsert_closure_link(self, link: ClosureLink) -> None:
         """Upsert one derived link state, corrected toward the latest derivation.
 
@@ -783,6 +1023,118 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             json.dumps([item.model_dump(mode="json") for item in record.candidates]),
             record.resolver_version,
         )
+
+    async def _reconcile_closure_links_absent(
+        self, projection: ClosureProjection
+    ) -> None:
+        """Delete stored ``closure_links`` rows absent from the fresh projection.
+
+        Full-rebuild convergence seam (issue #539 review fix): the reconcile
+        loop only ever upserts (and the incremental recompute deliberately
+        never deletes), so a full rebuild additionally removes link rows the
+        fresh projection no longer produces — repeated full rebuilds converge
+        to identical projection state.  The link key is the seven-column row
+        identity ``(change-request tuple, issue tuple, kind)``.  Windowed
+        rebuilds never call this: they must not delete anything.
+        """
+        present = {
+            (
+                link.change_request_provider.value,
+                link.change_request_repository,
+                link.change_request_external_id,
+                link.issue_provider.value,
+                link.issue_repository,
+                link.issue_external_id,
+                link.kind.value,
+            )
+            for link in projection.links
+        }
+        existing_rows = await self._conn.fetch(
+            """
+            SELECT change_request_provider, change_request_repository,
+                   change_request_external_id, issue_provider, issue_repository,
+                   issue_external_id, kind
+            FROM closure_links
+            """
+        )
+        stale = {
+            (
+                row["change_request_provider"],
+                row["change_request_repository"],
+                row["change_request_external_id"],
+                row["issue_provider"],
+                row["issue_repository"],
+                row["issue_external_id"],
+                row["kind"],
+            )
+            for row in existing_rows
+        } - present
+        for key in sorted(stale):
+            await self._conn.execute(
+                """
+                DELETE FROM closure_links
+                WHERE change_request_provider = $1
+                  AND change_request_repository = $2
+                  AND change_request_external_id = $3
+                  AND issue_provider = $4
+                  AND issue_repository = $5
+                  AND issue_external_id = $6
+                  AND kind = $7
+                """,
+                *key,
+            )
+
+    async def _reconcile_closure_unresolved_absent(
+        self, projection: ClosureProjection
+    ) -> None:
+        """Delete stored ``closure_unresolved`` rows absent from the fresh projection.
+
+        Full-rebuild convergence seam, mirroring
+        :meth:`_reconcile_closure_links_absent`: historical unresolved rows
+        are normally retained (the incremental recompute never deletes), but
+        a full rebuild removes rows the fresh projection no longer produces,
+        keyed by ``(issue tuple, closed_at, reason)``.  Windowed rebuilds
+        never call this: they must not delete anything.
+        """
+        present = {
+            (
+                record.issue_provider.value,
+                record.issue_repository,
+                record.issue_external_id,
+                record.closed_at,
+                record.reason,
+            )
+            for record in projection.unresolved
+        }
+        existing_rows = await self._conn.fetch(
+            """
+            SELECT issue_provider, issue_repository, issue_external_id,
+                   closed_at, reason
+            FROM closure_unresolved
+            """
+        )
+        stale = {
+            (
+                row["issue_provider"],
+                row["issue_repository"],
+                row["issue_external_id"],
+                row["closed_at"],
+                row["reason"],
+            )
+            for row in existing_rows
+        } - present
+        for key in sorted(stale):
+            await self._conn.execute(
+                """
+                DELETE FROM closure_unresolved
+                WHERE issue_provider = $1
+                  AND issue_repository = $2
+                  AND issue_external_id = $3
+                  AND closed_at = $4
+                  AND reason = $5
+                """,
+                *key,
+            )
 
     async def _log_delivery(self, run: AFKRun) -> None:
         """Record the delivery idempotently; re-delivery of the same run no-ops."""
