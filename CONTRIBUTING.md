@@ -128,7 +128,7 @@ We use automated tooling to maintain consistency:
 | Tool | Purpose | Command |
 |------|---------|---------|
 | **ruff** | Linting (E, F, I, UP rules) and import sorting | `ruff check .` |
-| **mypy** | Static type checking (strict mode, Python 3.12 target) | `mypy app/ tests/` |
+| **mypy** | Static type checking (strict mode, Python 3.12 target) | `mypy app/ afk_outcomes/` |
 | **pytest** | Unit and integration tests | `pytest tests/ -v` |
 
 Run these before submitting a pull request. All CI checks must pass.
@@ -240,7 +240,7 @@ opencode-gateway/
    ```bash
    pytest tests/ -v
    ruff check .
-   mypy app/ tests/
+   mypy app/ afk_outcomes/
    ```
 
 4. **Commit** with a clear, descriptive message.

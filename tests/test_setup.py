@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.db.setup import _REQUIRED_TABLES, check_required_tables
+from app.db.setup import check_required_tables
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
