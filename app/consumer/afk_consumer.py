@@ -591,10 +591,10 @@ class AFKOutcomeConsumer:
         standard env vars (``GITHUB_TOKEN`` / ``GITLAB_TOKEN``).
 
         Fails fast with :class:`ValueError` when
-        ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` is empty/absent: the consumer
-        always reconciles against this repository, so an empty value would
-        otherwise start a reconcile loop that silently retries forever
-        against an adapter error.
+        ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` is empty/absent: the repository
+        is required by the preserved manual/archival reconciliation path
+        (``_reconcile_once`` via the AFK Backfill CLI); an empty value would
+        make that path fail against an adapter error.
         """
         from app.core.config import get_settings
 
@@ -603,7 +603,7 @@ class AFKOutcomeConsumer:
             raise ValueError(
                 "GATEWAY_AFK_OUTCOMES_REPOSITORY must be set: the AFK outcome "
                 "consumer reconciles a bounded window against this repository; "
-                "without it the reconcile loop would silently retry forever."
+                "without it the manual/archival reconciliation path fails."
             )
         provider = Provider(settings.afk_outcomes_provider)
         pool = await asyncpg.create_pool(
