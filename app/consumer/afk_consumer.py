@@ -12,9 +12,12 @@ offset commit re-delivers the message, which the dedup layers
 identity UNIQUE) absorb harmlessly.
 
 Terminal states the topic does not carry (merged/closed) are converged by
-a scheduled reconciliation loop reusing the #449 backfill engine
-(``scripts.afk_backfill.run_backfill``) over a bounded, config-driven
-window.
+the explicit AFK Backfill CLI (``scripts.afk_backfill.run_backfill``) over a
+bounded, config-driven window.  The consumer's ``_reconcile_loop`` /
+``_reconcile_once`` methods are preserved for archival/manual use but are
+never scheduled by ``start()`` — startup is Kafka-only (issues #536/#537):
+it consumes the topic and persists events, and makes no provider API calls
+and runs no reconciliation.
 
 Operational pattern mirrors :mod:`app.consumer.consumer`: no auto-commit,
 ``earliest`` reset, DLQ for poison messages, exponential backoff with DLQ
@@ -540,7 +543,6 @@ class AFKOutcomeConsumer:
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._in_flight: asyncio.Task[Any] | None = None
-        self._reconcile_task: asyncio.Task[Any] | None = None
         self._owns_pool = False
         self._adapter_client: Any = None
 
@@ -589,10 +591,10 @@ class AFKOutcomeConsumer:
         standard env vars (``GITHUB_TOKEN`` / ``GITLAB_TOKEN``).
 
         Fails fast with :class:`ValueError` when
-        ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` is empty/absent: the consumer
-        always reconciles against this repository, so an empty value would
-        otherwise start a reconcile loop that silently retries forever
-        against an adapter error.
+        ``GATEWAY_AFK_OUTCOMES_REPOSITORY`` is empty/absent: the repository
+        is required by the preserved manual/archival reconciliation path
+        (``_reconcile_once`` via the AFK Backfill CLI); an empty value would
+        make that path fail against an adapter error.
         """
         from app.core.config import get_settings
 
@@ -601,7 +603,7 @@ class AFKOutcomeConsumer:
             raise ValueError(
                 "GATEWAY_AFK_OUTCOMES_REPOSITORY must be set: the AFK outcome "
                 "consumer reconciles a bounded window against this repository; "
-                "without it the reconcile loop would silently retry forever."
+                "without it the manual/archival reconciliation path fails."
             )
         provider = Provider(settings.afk_outcomes_provider)
         pool = await asyncpg.create_pool(
@@ -638,7 +640,7 @@ class AFKOutcomeConsumer:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise Kafka consumer/producer and begin polling + reconciliation."""
+        """Initialise Kafka consumer/producer and begin polling."""
         self._consumer = AIOKafkaConsumer(
             self._topic,
             bootstrap_servers=self._kafka_brokers,
@@ -663,8 +665,6 @@ class AFKOutcomeConsumer:
             except NotImplementedError:
                 # Signal handlers not available on this platform
                 pass
-
-        self._reconcile_task = asyncio.ensure_future(self._reconcile_loop())
 
         logger.info(
             "AFK outcome consumer started: topic=%s group=%s",
@@ -738,17 +738,10 @@ class AFKOutcomeConsumer:
                 break
 
     async def stop(self) -> None:
-        """Gracefully shut down the consumer (drain in-flight, stop reconciler)."""
+        """Gracefully shut down the consumer (drain in-flight)."""
         logger.info("Stopping AFK outcome consumer …")
         self._running = False
         self._shutdown_event.set()
-
-        # Stop the reconciliation loop.
-        if self._reconcile_task is not None and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reconcile_task
-        self._reconcile_task = None
 
         # Wait for in-flight processing to finish.
         if self._in_flight is not None and not self._in_flight.done():
