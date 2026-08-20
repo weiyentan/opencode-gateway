@@ -18,7 +18,6 @@ introduced — this is a CLI/AWX-only operation.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -30,7 +29,6 @@ from afk_outcomes.models import (
     ClosureLinkKind,
     ClosureLinkState,
     ClosureProjection,
-    EntityType,
     Provider,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
