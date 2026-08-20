@@ -44,7 +44,11 @@ from afk_outcomes.models import (
     EntityType,
     Provider,
 )
-from afk_outcomes.repository import AsyncpgOutcomeRepository
+from afk_outcomes.repository import (
+    AsyncpgOutcomeRepository,
+    _issue_links_from_payload,
+    _to_closure_fact,
+)
 from app.consumer.afk_consumer import AFKOutcomeConsumer
 from app.core.repository import normalize_repository_url
 from app.db.models.afk import ClosureEpisode, ClosureLink
@@ -152,6 +156,165 @@ def test_recompute_skips_irrelevant_event_types(mock_conn: AsyncMock) -> None:
 
     mock_conn.execute.assert_not_called()
     mock_conn.fetch.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  JSONB boundary decoding (issue #540)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_IDENTITY = lambda value: value  # noqa: E731 - identity normalizer for unit tests
+
+
+def _snapshot_targets(snapshot) -> list[tuple[str, str]]:
+    """Return the (repository, number) pairs of a snapshot's references."""
+    return [(t.repository, t.number) for t in snapshot.references]
+
+
+def test_issue_links_from_dict_payload_projects_references() -> None:
+    """A dictionary-shaped ``issue_links`` payload projects its references."""
+    raw = {
+        "references": [
+            {"repository": "gitlab.com/group/proj", "number": "1"},
+            {"repository": "gitlab.com/group/proj", "number": "2"},
+        ],
+        "declares_closure": [],
+    }
+    snapshot = _issue_links_from_payload(raw, _IDENTITY)
+    assert snapshot is not None
+    assert _snapshot_targets(snapshot) == [
+        ("gitlab.com/group/proj", "1"),
+        ("gitlab.com/group/proj", "2"),
+    ]
+    assert snapshot.declares_closure == []
+
+
+def test_issue_links_from_json_string_payload_projects_references() -> None:
+    """A JSON-string ``issue_links`` payload (asyncpg JSONB shape) decodes and
+    projects its references — the regression this issue fixes."""
+    raw = json.dumps(
+        {
+            "references": [
+                {"repository": "gitlab.com/group/proj", "number": "1"},
+            ],
+            "declares_closure": [],
+        }
+    )
+    snapshot = _issue_links_from_payload(raw, _IDENTITY)
+    assert snapshot is not None
+    assert _snapshot_targets(snapshot) == [("gitlab.com/group/proj", "1")]
+
+
+def test_issue_links_missing_or_empty_metadata_yields_none() -> None:
+    """A payload without an ``issue_links`` object (or with empty sets) yields
+    no snapshot — a missing field is never a revocation."""
+    assert _issue_links_from_payload(None, _IDENTITY) is None
+    assert _issue_links_from_payload({}, _IDENTITY) is None
+    assert (
+        _issue_links_from_payload(
+            {"references": [], "declares_closure": []}, _IDENTITY
+        )
+        is None
+    )
+
+
+def test_issue_links_malformed_json_yields_none_without_crashing() -> None:
+    """Malformed JSON in the ``issue_links`` value is tolerated: no snapshot,
+    no exception — the committed fact is preserved and closure metadata
+    omitted."""
+    assert _issue_links_from_payload("{not valid json", _IDENTITY) is None
+    assert _issue_links_from_payload("[]", _IDENTITY) is None
+    assert _issue_links_from_payload('"a string"', _IDENTITY) is None
+
+
+def test_issue_links_skips_malformed_entries_keeps_valid_ones() -> None:
+    """Within a valid payload, malformed individual link entries are skipped
+    while valid entries in the same payload are retained."""
+    raw = {
+        "references": [
+            {"repository": "gitlab.com/group/proj", "number": "1"},
+            {"repository": "gitlab.com/group/proj", "number": 2},  # non-str number
+            "not-a-dict",
+            {"repository": "gitlab.com/group/proj"},  # missing number
+            {"number": "5"},  # missing repository
+            {"repository": "gitlab.com/group/proj", "number": "3"},
+        ],
+        "declares_closure": [],
+    }
+    snapshot = _issue_links_from_payload(raw, _IDENTITY)
+    assert snapshot is not None
+    assert _snapshot_targets(snapshot) == [
+        ("gitlab.com/group/proj", "1"),
+        ("gitlab.com/group/proj", "3"),
+    ]
+
+
+def test_issue_links_references_and_declares_closure_stay_distinct() -> None:
+    """``references`` and ``declares_closure`` are projected into separate
+    buckets and never conflated."""
+    raw = {
+        "references": [{"repository": "gitlab.com/group/proj", "number": "1"}],
+        "declares_closure": [{"repository": "gitlab.com/group/proj", "number": "2"}],
+    }
+    snapshot = _issue_links_from_payload(raw, _IDENTITY)
+    assert snapshot is not None
+    assert _snapshot_targets(snapshot) == [("gitlab.com/group/proj", "1")]
+    assert [(t.repository, t.number) for t in snapshot.declares_closure] == [
+        ("gitlab.com/group/proj", "2")
+    ]
+
+
+def test_to_closure_fact_accepts_dict_and_json_string_payloads() -> None:
+    """``_to_closure_fact`` tolerates both a dict payload and a JSON-string
+    payload (the whole JSONB column returned by asyncpg as a string)."""
+    base = dict(
+        provider=Provider.GITLAB,
+        repository="gitlab.com/group/proj",
+        entity_type=EntityType.CHANGE_REQUEST,
+        external_id="6",
+        event_type="change_request.opened",
+        occurred_at=datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC),
+        observed_via="webhook",
+        normalize=_IDENTITY,
+    )
+    payload_dict = {
+        "issue_links": {
+            "references": [{"repository": "gitlab.com/group/proj", "number": "1"}],
+            "declares_closure": [],
+        }
+    }
+    payload_str = json.dumps(payload_dict)
+
+    fact_dict = _to_closure_fact(payload=payload_dict, **base)
+    fact_str = _to_closure_fact(payload=payload_str, **base)
+
+    assert fact_dict.issue_links is not None
+    assert fact_str.issue_links is not None
+    assert _snapshot_targets(fact_dict.issue_links) == [
+        ("gitlab.com/group/proj", "1")
+    ]
+    assert _snapshot_targets(fact_str.issue_links) == [
+        ("gitlab.com/group/proj", "1")
+    ]
+
+
+def test_to_closure_fact_malformed_payload_omits_closure_metadata() -> None:
+    """A malformed or non-object payload does not crash ``_to_closure_fact``:
+    the fact is still built (the committed fact is preserved) with closure
+    metadata omitted."""
+    base = dict(
+        provider=Provider.GITLAB,
+        repository="gitlab.com/group/proj",
+        entity_type=EntityType.CHANGE_REQUEST,
+        external_id="6",
+        event_type="change_request.opened",
+        occurred_at=datetime(2026, 8, 1, 12, 0, 0, tzinfo=UTC),
+        observed_via="webhook",
+        normalize=_IDENTITY,
+    )
+    for bad_payload in ("{not valid json", "[]", '"a string"', 42, None):
+        fact = _to_closure_fact(payload=bad_payload, **base)
+        assert fact.issue_links is None, f"payload {bad_payload!r} leaked closure metadata"
+        assert fact.event_type == "change_request.opened"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
