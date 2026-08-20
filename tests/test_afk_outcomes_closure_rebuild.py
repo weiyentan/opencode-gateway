@@ -244,19 +244,21 @@ async def test_run_rebuild_requires_confirmation_to_write() -> None:
 
 
 async def test_run_rebuild_dry_run_does_not_require_confirmation() -> None:
-    """Dry-run never writes, so it needs no confirmation and issues no writes."""
-    conn = _mock_conn([])
-    with patch.object(
-        AsyncpgOutcomeRepository,
-        "rebuild_closure_projection",
-        new_callable=AsyncMock,
-        return_value=_fake_result(),
-    ) as mock_rebuild:
-        report = await run_rebuild(conn, dry_run=True, confirm=False)
+    """Dry-run never writes, so it needs no confirmation and issues no writes.
+
+    This exercises the real repository write path (no mocking of
+    ``rebuild_closure_projection``): the projection is computed read-only and
+    the underlying connection receives no write (``execute``) calls.
+    """
+    conn = _mock_conn(_inferred_facts())
+    report = await run_rebuild(conn, dry_run=True, confirm=False)
 
     assert report.dry_run is True
     assert report.confirmed is False
-    mock_rebuild.assert_awaited_once()
+    # The real rebuild ran and computed the projection...
+    assert report.facts_processed == 3
+    assert report.closure_episodes == 1
+    # ...but no write ever reached the database.
     conn.execute.assert_not_called()
 
 

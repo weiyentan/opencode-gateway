@@ -61,6 +61,30 @@ from app.core.repository import normalize_repository_url  # noqa: E402
 logger = logging.getLogger("rebuild_closure_projection")
 
 
+class _ReadOnlyConnection:
+    """Wrap an asyncpg connection so writes are blocked (``--dry-run``).
+
+    Forwards reads (``fetch`` and any other attribute) to the underlying
+    connection so the rebuild can compute the projection, but turns every
+    write (``execute``) into a no-op.  This guarantees ``--dry-run`` never
+    touches the database while still producing an accurate "what WOULD be
+    written" report.
+    """
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self._conn = conn
+
+    def __getattr__(self, name: str):
+        # Forward any attribute not explicitly overridden (e.g. ``fetch``) to
+        # the underlying connection.
+        return getattr(self._conn, name)
+
+    async def execute(self, *args, **kwargs) -> str:
+        # Block every write.  Return a benign status string so callers that
+        # inspect the result (none do in the rebuild path) still work.
+        return "DRY RUN 0 0"
+
+
 @dataclass
 class RebuildReport:
     """The full report printed by the CLI (and asserted by tests)."""
@@ -126,7 +150,12 @@ async def run_rebuild(
             "re-run with --confirm (or --yes) to persist, or use --dry-run."
         )
 
-    repository = AsyncpgOutcomeRepository(conn)
+    # In dry-run mode, wrap the connection so every write is blocked: the
+    # repository still computes the projection (reads) so the report reflects
+    # what WOULD be written, but no row is ever upserted.
+    repository = AsyncpgOutcomeRepository(
+        _ReadOnlyConnection(conn) if dry_run else conn
+    )
     result: ClosureRebuildResult = await repository.rebuild_closure_projection(
         since=since,
         until=until,
