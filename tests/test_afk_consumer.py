@@ -897,6 +897,125 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
     mock_reconcile_loop.assert_not_awaited()
 
 
+# ── Startup is Kafka-only (issue #537) ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_makes_no_provider_api_calls() -> None:
+    """Startup touches only Kafka: it never invokes the provider adapter.
+
+    The adapter's ``fetch_entities`` / ``fetch_events`` are the consumer's
+    only provider API surface.  A Kafka-only startup must not call either —
+    provider access is reserved for the explicit AFK Backfill CLI and the
+    preserved manual ``_reconcile_once`` archival path.
+    """
+    calls: list[str] = []
+
+    class _RecordingAdapter(_FakeAdapter):
+        async def fetch_entities(self, repository, *, since=None, until=None):
+            calls.append("fetch_entities")
+            return []
+
+        async def fetch_events(self, repository, *, since=None, until=None):
+            calls.append("fetch_events")
+            return []
+
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    consumer._adapter = _RecordingAdapter()
+
+    with (
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer") as mock_kafka_consumer,
+        patch("app.consumer.afk_consumer.AIOKafkaProducer") as mock_kafka_producer,
+    ):
+        mock_kafka_consumer.return_value.start = AsyncMock()
+        mock_kafka_producer.return_value.start = AsyncMock()
+        await consumer.start()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_performs_no_immediate_reconciliation() -> None:
+    """Startup runs no reconcile window: neither the preserved
+    ``_reconcile_once`` archival method nor the backfill engine it drives may
+    be invoked by ``start()`` — reconciliation is explicit-only (AFK Backfill
+    CLI / direct method call)."""
+    consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
+    with (
+        patch(
+            "app.consumer.afk_consumer.AFKOutcomeConsumer._reconcile_loop",
+            new_callable=AsyncMock,
+        ) as mock_reconcile_loop,
+        patch(
+            "app.consumer.afk_consumer.AFKOutcomeConsumer._reconcile_once",
+            new_callable=AsyncMock,
+        ) as mock_reconcile_once,
+        patch(
+            "app.consumer.afk_consumer.run_backfill", new_callable=AsyncMock
+        ) as mock_backfill,
+        patch("app.consumer.afk_consumer.AIOKafkaConsumer") as mock_kafka_consumer,
+        patch("app.consumer.afk_consumer.AIOKafkaProducer") as mock_kafka_producer,
+    ):
+        mock_kafka_consumer.return_value.start = AsyncMock()
+        mock_kafka_producer.return_value.start = AsyncMock()
+        await consumer.start()
+
+    mock_reconcile_loop.assert_not_awaited()
+    mock_reconcile_once.assert_not_awaited()
+    mock_backfill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_then_run_consumes_and_persists_live_event() -> None:
+    """The Kafka-only consume path is operational after ``start()`` (issue #537).
+
+    Drives the production ``start()`` → ``run()`` flow: the started Kafka
+    consumer yields one normalized event, ``run()`` persists it in the single
+    delivery_log + engineering_events transaction and commits the offset —
+    live consumption and event persistence, with no reconciliation involved.
+    """
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn), max_retries=3)
+    consumer._running = True
+
+    msg = _mk_msg(_valid_payload(), offset=5)
+    instances: list[_FakeKafkaConsumer] = []
+
+    def factory(*args: object, **kwargs: object) -> _FakeKafkaConsumer:
+        inst = _FakeKafkaConsumer([msg])
+
+        async def commit(offsets: object) -> None:
+            consumer._running = False  # stop run() after the successful commit
+
+        inst.commit = AsyncMock(side_effect=commit)
+        instances.append(inst)
+        return inst
+
+    with (
+        patch(
+            "app.consumer.afk_consumer.AIOKafkaConsumer", side_effect=factory
+        ) as mock_kafka_consumer,
+        patch("app.consumer.afk_consumer.AIOKafkaProducer") as mock_kafka_producer,
+    ):
+        mock_kafka_producer.return_value.start = AsyncMock()
+        await consumer.start()
+        await consumer.run()
+
+    # Exactly one consumer was created and started by ``start()``.
+    assert len(instances) == 1
+    mock_kafka_consumer.assert_called_once()
+    # The consumed event was persisted in the delivery_log transaction.
+    delivery_log_calls = [
+        c
+        for c in conn.execute.call_args_list
+        if "INSERT INTO delivery_log" in c.args[0]
+    ]
+    assert len(delivery_log_calls) == 1
+    assert "ON CONFLICT (provider, delivery_id) DO NOTHING" in delivery_log_calls[0].args[0]
+    # Its offset was committed (live consumption advances the frontier).
+    assert _last_commit_offsets(consumer) == {_tp(): 6}
+
+
 # ── Scheduled reconciliation reuses the backfill engine ──────────────────────
 
 

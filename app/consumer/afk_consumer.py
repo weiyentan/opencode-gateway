@@ -12,9 +12,12 @@ offset commit re-delivers the message, which the dedup layers
 identity UNIQUE) absorb harmlessly.
 
 Terminal states the topic does not carry (merged/closed) are converged by
-a scheduled reconciliation loop reusing the #449 backfill engine
-(``scripts.afk_backfill.run_backfill``) over a bounded, config-driven
-window.
+the explicit AFK Backfill CLI (``scripts.afk_backfill.run_backfill``) over a
+bounded, config-driven window.  The consumer's ``_reconcile_loop`` /
+``_reconcile_once`` methods are preserved for archival/manual use but are
+never scheduled by ``start()`` — startup is Kafka-only (issues #536/#537):
+it consumes the topic and persists events, and makes no provider API calls
+and runs no reconciliation.
 
 Operational pattern mirrors :mod:`app.consumer.consumer`: no auto-commit,
 ``earliest`` reset, DLQ for poison messages, exponential backoff with DLQ
