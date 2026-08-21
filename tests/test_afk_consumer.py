@@ -269,7 +269,7 @@ def _make_consumer(
     *,
     pool: _FakePool,
     order: list[str] | None = None,
-    consumer_group_id: str = "opencode-outcomes",
+    consumer_group_id: str = "opencode-normalized-events",
     reconcile_window_seconds: float = 3600.0,
     max_retries: int = 3,
     initial_backoff: float = 1.0,
@@ -862,21 +862,21 @@ async def test_mark_committable_clears_block_on_redelivery() -> None:
 def test_default_consumer_group_is_separate_from_usage_consumer() -> None:
     from app.consumer.afk_consumer import _DEFAULT_CONSUMER_GROUP_ID
 
-    assert _DEFAULT_CONSUMER_GROUP_ID == "opencode-outcomes"
+    assert _DEFAULT_CONSUMER_GROUP_ID == "opencode-normalized-events"
     assert _DEFAULT_CONSUMER_GROUP_ID != "opencode-gateway"
 
 
 @pytest.mark.asyncio
 async def test_constructed_consumer_uses_separate_group() -> None:
     consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
-    assert consumer._consumer_group_id == "opencode-outcomes"
+    assert consumer._consumer_group_id == "opencode-normalized-events"
     assert consumer._consumer_group_id != "opencode-gateway"
 
 
 @pytest.mark.asyncio
 async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
     consumer = _make_consumer(
-        pool=_FakePool(_FakeConn([])), consumer_group_id="opencode-outcomes"
+        pool=_FakePool(_FakeConn([])), consumer_group_id="opencode-normalized-events"
     )
     with (
         patch(
@@ -890,7 +890,7 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
         mock_kafka_producer.return_value.start = AsyncMock()
         await consumer.start()
 
-    assert mock_kafka_consumer.call_args.kwargs["group_id"] == "opencode-outcomes"
+    assert mock_kafka_consumer.call_args.kwargs["group_id"] == "opencode-normalized-events"
     assert mock_kafka_consumer.call_args.kwargs["enable_auto_commit"] is False
     assert mock_kafka_consumer.call_args.kwargs["auto_offset_reset"] == "earliest"
     assert mock_kafka_consumer.call_args.args[0] == "engineering.events.normalized"
@@ -1122,7 +1122,7 @@ async def test_from_env_reads_afk_settings() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
@@ -1140,7 +1140,7 @@ async def test_from_env_reads_afk_settings() -> None:
 
     assert consumer._topic == "engineering.events.normalized"
     assert consumer._dlq_topic == "engineering.events.normalized.dlq"
-    assert consumer._consumer_group_id == "opencode-outcomes"
+    assert consumer._consumer_group_id == "opencode-normalized-events"
     assert consumer._repository == "owner/repo"
     assert consumer._reconcile_cadence_seconds == 600.0
     assert consumer._reconcile_window_seconds == 3600.0
@@ -1159,7 +1159,7 @@ async def test_from_env_fails_fast_when_repository_empty() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS": "3600",
@@ -2201,7 +2201,7 @@ async def test_from_env_reads_afk_retry_settings() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_AFK_OUTCOMES_MAX_RETRIES": "7",
@@ -2422,7 +2422,7 @@ async def test_from_env_reads_dlq_max_age() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS": "14",
@@ -2438,6 +2438,62 @@ async def test_from_env_reads_dlq_max_age() -> None:
         consumer = await AFKOutcomeConsumer.from_env()
 
     assert consumer._dlq_max_age_days == 14
+
+
+@pytest.mark.asyncio
+async def test_from_env_normalized_consumer_group() -> None:
+    """GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID maps to consumer._consumer_group_id.
+
+    Issue #555: the normalized-events env var must be honored instead of the
+    legacy GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID.
+    """
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._consumer_group_id == "opencode-normalized-events"
+
+
+@pytest.mark.asyncio
+async def test_from_env_legacy_group_var_not_used() -> None:
+    """The legacy GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID does not override the
+    normalized group when GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID is set."""
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._consumer_group_id == "opencode-normalized-events"
 
 
 # ── DLQ sweep offset commits + lenient deserialization (PR #492 findings) ──
