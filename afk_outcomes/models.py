@@ -14,7 +14,7 @@ import json
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Version of the correlation engine that produced a derived link.  Recorded on
 # every Correlation, RunEntityLink, RunSessionLink, and UnresolvedCorrelation so
@@ -623,4 +623,122 @@ class ClosureProjection(BaseModel):
     resolver_version: str = Field(
         default=CLOSURE_RESOLVER_VERSION,
         description="Version of the closure-episode projector that produced this output",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Execution Binding domain model (issue #546)
+# ---------------------------------------------------------------------------
+
+# Maximum length for the bounded failure metadata string.  The model contract
+# requires optional failure metadata to be bounded and redacted — raw secrets,
+# stdout dumps, and arbitrary AWX payloads must never be stored here.
+_EXECUTION_BINDING_MAX_FAILURE_REASON_LENGTH = 1000
+
+
+class ExecutionOutcome(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """Terminal result of an :class:`ExecutionBinding`.
+
+    Constrained to the three valid terminal outcomes: ``completed``,
+    ``failed``, and ``cancelled``.  Invalid values are rejected by Pydantic
+    validation on the :class:`ExecutionBinding.outcome` field.
+    """
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AWXJobIdentity(BaseModel):
+    """The externally identified AWX job run that invokes an OpenCode execution.
+
+    ``job_id`` is the AWX-assigned identifier for the job run;
+    ``job_template_id`` is the numeric template that launched it.
+    """
+
+    job_id: str = Field(
+        description="AWX-assigned job run identifier",
+        min_length=1,
+    )
+    job_template_id: int = Field(description="Numeric AWX job template id")
+
+
+class ProviderResourceIdentity(BaseModel):
+    """Normalized provider resource identity for an execution binding.
+
+    GitHub pull requests and GitLab merge requests both normalize to the
+    canonical ``change_request`` entity type.  The ``resource_number`` is
+    the provider-scoped external id stored as an opaque string (issue/MR
+    number).
+    """
+
+    provider: Provider
+    repository: str = Field(description="Full owner/repo (or group/project) name")
+    resource_type: EntityType = Field(
+        description=(
+            "Entity type — must be ``change_request`` (GitHub PRs and "
+            "GitLab MRs both normalize here)"
+        ),
+    )
+    resource_number: str = Field(
+        description="Provider-scoped external id (issue/MR number as opaque string)"
+    )
+
+    @model_validator(mode="after")
+    def _validate_resource_type_is_change_request(self) -> ProviderResourceIdentity:
+        """Ensure resource_type is change_request (the only allowed type for
+        execution bindings — GitHub PRs and GitLab MRs both normalize here)."""
+        if self.resource_type is not EntityType.CHANGE_REQUEST:
+            raise ValueError(
+                f"resource_type must be 'change_request', got '{self.resource_type.value}'"
+            )
+        return self
+
+
+class ExecutionBinding(BaseModel):
+    """A durable Gateway record linking one AWX execution to one OpenCode
+    external session and one provider resource identity.
+
+    Carries the AWX job identity, the external session id, the normalized
+    provider resource identity, the terminal :class:`ExecutionOutcome`,
+    and optional traceability metadata (branch, title, timestamps, source
+    event id).  The optional ``failure_reason`` is bounded and redacted by
+    the model contract — raw secrets, stdout dumps, and arbitrary AWX
+    payloads must never be stored here.
+
+    GitHub pull requests and GitLab merge requests both use the canonical
+    ``change_request`` entity type in :attr:`resource`.
+    """
+
+    binding_id: str = Field(description="ULID primary key of the binding")
+    awx_job: AWXJobIdentity = Field(description="AWX job run identity")
+    external_session_id: str = Field(
+        description="External OpenCode session id (e.g. ses_* id)",
+        min_length=1,
+    )
+    resource: ProviderResourceIdentity = Field(
+        description="Normalized provider resource identity"
+    )
+    outcome: ExecutionOutcome = Field(description="Terminal execution outcome")
+
+    # Optional traceability metadata — bounded and redacted by model contract.
+    failure_reason: str | None = Field(
+        default=None,
+        max_length=_EXECUTION_BINDING_MAX_FAILURE_REASON_LENGTH,
+        description=(
+            "Bounded failure summary (max 1000 chars).  Raw secrets, stdout "
+            "dumps, and arbitrary AWX payloads must never be stored here."
+        ),
+    )
+    title: str | None = Field(default=None, description="Execution title")
+    branch: str | None = Field(default=None, description="Branch or ref")
+    started_at: datetime | None = Field(
+        default=None, description="Execution start timestamp"
+    )
+    finished_at: datetime | None = Field(
+        default=None, description="Execution finish timestamp"
+    )
+    source_event_id: str | None = Field(
+        default=None,
+        description="Originating EDA source event id (for traceability)",
     )
