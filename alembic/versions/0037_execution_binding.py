@@ -49,6 +49,9 @@ def upgrade() -> None:
         ),
         # AWX job identity — unique, one row per AWX job.
         sa.Column("awx_job_id", sa.BigInteger(), nullable=False),
+        # AWX job template identity — the numeric template that launched the
+        # job (carried by AWXJobIdentity and persisted, never hardcoded).
+        sa.Column("job_template_id", sa.BigInteger(), nullable=False),
         # OpenCode external session ID — nullable (may not be resolved yet).
         sa.Column("external_session_id", sa.String(), nullable=True),
         # Normalized provider resource identity — NOT unique (multiple

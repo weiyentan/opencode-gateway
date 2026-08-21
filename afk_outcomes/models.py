@@ -712,8 +712,12 @@ class ExecutionBinding(BaseModel):
 
     binding_id: str = Field(description="ULID primary key of the binding")
     awx_job: AWXJobIdentity = Field(description="AWX job run identity")
-    external_session_id: str = Field(
-        description="External OpenCode session id (e.g. ses_* id)",
+    external_session_id: str | None = Field(
+        default=None,
+        description=(
+            "External OpenCode session id (e.g. ses_* id); None when the "
+            "binding has no resolved session (the DB column is nullable)"
+        ),
         min_length=1,
     )
     resource: ProviderResourceIdentity = Field(

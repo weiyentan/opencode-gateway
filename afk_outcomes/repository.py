@@ -129,12 +129,29 @@ def _source_reference_json(sources: list[ReferenceSource]) -> str:
     return json.dumps([item.model_dump(mode="json") for item in sources])
 
 
+def _parse_awx_job_id(awx_job_id: str) -> int:
+    """Coerce an AWX job id string to int, rejecting non-numeric values.
+
+    The API layer validates the id before reaching the repository; this
+    guard keeps direct repository callers from surfacing a bare
+    ``ValueError`` from ``int()`` (issue #549 review).  The raised error
+    carries a clear message instead of leaking the raw conversion failure.
+    """
+    try:
+        return int(awx_job_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid AWX job id: {awx_job_id!r}") from exc
+
+
 def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
     """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`."""
     return ExecutionBinding(
         binding_id=str(row["id"]),
-        awx_job={"job_id": str(row["awx_job_id"]), "job_template_id": 0},
-        external_session_id=row["external_session_id"] or "",
+        awx_job={
+            "job_id": str(row["awx_job_id"]),
+            "job_template_id": row["job_template_id"],
+        },
+        external_session_id=row["external_session_id"],
         resource={
             "provider": row["provider"],
             "repository": row["repository_url"],
@@ -1633,15 +1650,16 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         await self._conn.execute(
             """
             INSERT INTO execution_bindings
-                (awx_job_id, external_session_id, provider, repository_url,
-                 entity_type, entity_number, outcome, source_event_id,
-                 branch, title, failure_reason, started_at, finished_at,
-                 created_at, updated_at)
+                (awx_job_id, job_template_id, external_session_id, provider,
+                 repository_url, entity_type, entity_number, outcome,
+                 source_event_id, branch, title, failure_reason, started_at,
+                 finished_at, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    now(), now())
+                    $14, now(), now())
             ON CONFLICT (awx_job_id) DO NOTHING
             """,
-            int(binding.awx_job.job_id),
+            _parse_awx_job_id(binding.awx_job.job_id),
+            binding.awx_job.job_template_id,
             binding.external_session_id,
             binding.resource.provider.value,
             binding.resource.repository,
@@ -1667,13 +1685,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         row = await self._conn.fetchrow(
             """
-            SELECT id, awx_job_id, external_session_id, provider, repository_url,
-                   entity_type, entity_number, outcome, source_event_id,
-                   branch, title, failure_reason, started_at, finished_at
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, started_at,
+                   finished_at
             FROM execution_bindings
             WHERE awx_job_id = $1
             """,
-            int(awx_job_id),
+            _parse_awx_job_id(awx_job_id),
         )
         if row is None:
             return None
@@ -1696,9 +1715,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         rows = await self._conn.fetch(
             """
-            SELECT id, awx_job_id, external_session_id, provider, repository_url,
-                   entity_type, entity_number, outcome, source_event_id,
-                   branch, title, failure_reason, started_at, finished_at
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, started_at,
+                   finished_at
             FROM execution_bindings
             WHERE provider = $1
               AND repository_url = $2

@@ -136,7 +136,14 @@ def test_upgrade_uses_server_defaults() -> None:
 
 def test_upgrade_creates_awx_job_id_column() -> None:
     sql = _render_upgrade_delta_guarded()
-    assert '"awx_job_id"' in sql
+    assert "awx_job_id" in sql
+    assert "BIGINT" in sql.upper() or "bigint" in sql
+
+
+def test_upgrade_creates_job_template_id_column() -> None:
+    """The AWX job template id is persisted, never hardcoded at read time."""
+    sql = _render_upgrade_delta_guarded()
+    assert "job_template_id" in sql
     assert "BIGINT" in sql.upper() or "bigint" in sql
 
 
@@ -175,6 +182,7 @@ def test_execution_binding_model_has_expected_columns() -> None:
     assert {
         "id",
         "awx_job_id",
+        "job_template_id",
         "external_session_id",
         "provider",
         "repository_url",
@@ -210,6 +218,14 @@ def test_awx_job_id_is_not_nullable() -> None:
     from app.db.models import ExecutionBinding
 
     col = ExecutionBinding.__table__.c.awx_job_id
+    assert col.nullable is False
+
+
+def test_job_template_id_is_not_nullable() -> None:
+    """AWX job template identity must be NOT NULL (never hardcoded at read)."""
+    from app.db.models import ExecutionBinding
+
+    col = ExecutionBinding.__table__.c.job_template_id
     assert col.nullable is False
 
 

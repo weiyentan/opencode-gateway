@@ -431,8 +431,8 @@ async def test_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
         resp1 = await c.post("/api/v1/afk/executions", json=payload)
         assert resp1.status_code == 201, resp1.text
         resp2 = await c.post("/api/v1/afk/executions", json=payload)
-        # Idempotent replay — same data, same awx_job_id
-        assert resp2.status_code == 201, resp2.text
+        # Idempotent replay — same data, same awx_job_id → 200, no new row
+        assert resp2.status_code == 200, resp2.text
         data2 = resp2.json()["data"]
         assert data2["awx_job"]["job_id"] == str(awx_job_id)
 
@@ -469,15 +469,13 @@ async def test_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
         resp1 = await c.post("/api/v1/afk/executions", json=payload_original)
         assert resp1.status_code == 201, resp1.text
 
-        # The API currently returns 201 (idempotent) because the endpoint
-        # checks for existing binding first and returns the existing one.
-        # Let's verify the data is not mutated.
+        # A conflicting replay (changed outcome) must be rejected with 409
+        # without mutating the stored binding.
         resp2 = await c.post("/api/v1/afk/executions", json=payload_conflict)
-        # Should return 201 with the EXISTING binding (not the conflicting data)
-        assert resp2.status_code == 201, resp2.text
-        data2 = resp2.json()["data"]
-        # Original outcome is preserved — not overwritten
-        assert data2["outcome"] == "completed"
+        assert resp2.status_code == 409, resp2.text
+        data2 = resp2.json()
+        assert data2["status"] == "error"
+        assert data2["error"]["code"] == "CONFLICT"
 
     # Verify DB still has original outcome
     async with db_pool.acquire() as conn:
@@ -498,10 +496,11 @@ async def test_unique_constraint_enforced_at_sql_level(db_pool: asyncpg.Pool) ->
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO execution_bindings"
-            " (awx_job_id, external_session_id, provider, repository_url,"
-            "  entity_type, entity_number, outcome)"
-            " VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            " (awx_job_id, job_template_id, external_session_id, provider,"
+            "  repository_url, entity_type, entity_number, outcome)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             awx_job_id,
+            7,
             "ses_test",
             "github",
             "acme/proj",
@@ -513,10 +512,11 @@ async def test_unique_constraint_enforced_at_sql_level(db_pool: asyncpg.Pool) ->
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
                 "INSERT INTO execution_bindings"
-                " (awx_job_id, external_session_id, provider, repository_url,"
-                "  entity_type, entity_number, outcome)"
-                " VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                " (awx_job_id, job_template_id, external_session_id, provider,"
+                "  repository_url, entity_type, entity_number, outcome)"
+                " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 awx_job_id,
+                7,
                 "ses_test_2",
                 "github",
                 "acme/proj",

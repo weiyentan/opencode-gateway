@@ -145,6 +145,11 @@ class TestExecutionBinding:
         with pytest.raises(ValueError, match="external_session_id"):
             self._make_binding(external_session_id="")
 
+    def test_none_session_id_accepted(self) -> None:
+        """An unresolved binding may carry no external session id (None)."""
+        binding = self._make_binding(external_session_id=None)
+        assert binding.external_session_id is None
+
     def test_failure_reason_bounded(self) -> None:
         """Failure metadata is bounded by the model contract."""
         binding = self._make_binding(

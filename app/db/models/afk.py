@@ -425,6 +425,7 @@ class ExecutionBinding(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    job_template_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     external_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     provider: Mapped[str] = mapped_column(String, nullable=False)
     repository_url: Mapped[str] = mapped_column(String, nullable=False)

@@ -66,6 +66,7 @@ def _saved_row() -> MagicMock:
         {
             "id": uuid.uuid4(),
             "awx_job_id": 42,
+            "job_template_id": 7,
             "external_session_id": "ses_abc123",
             "provider": "github",
             "repository_url": "acme/proj",

@@ -108,6 +108,7 @@ def test_save_execution_binding_writes_all_identity_fields(mock_conn: AsyncMock)
     # Verify all expected columns are in the INSERT
     for col in (
         "awx_job_id",
+        "job_template_id",
         "external_session_id",
         "provider",
         "repository_url",
@@ -126,13 +127,14 @@ def test_save_execution_binding_writes_all_identity_fields(mock_conn: AsyncMock)
         assert col in sql, f"INSERT missing column: {col}"
     args = calls[0][1]
     assert args[0] == 200  # awx_job_id as int
-    assert args[1] == "ses_abc123"  # external_session_id
-    assert args[2] == "github"  # provider
-    assert args[3] == "weiyentan/opencode-gateway"  # repository_url
-    assert args[4] == "change_request"  # entity_type
-    assert args[5] == "442"  # entity_number
-    assert args[6] == "completed"  # outcome
-    assert args[9] == "Fix caching bug"  # title
+    assert args[1] == 42  # job_template_id as int
+    assert args[2] == "ses_abc123"  # external_session_id
+    assert args[3] == "github"  # provider
+    assert args[4] == "weiyentan/opencode-gateway"  # repository_url
+    assert args[5] == "change_request"  # entity_type
+    assert args[6] == "442"  # entity_number
+    assert args[7] == "completed"  # outcome
+    assert args[10] == "Fix caching bug"  # title
 
 
 # ── Conflict rejection ───────────────────────────────────────────────────────
@@ -194,6 +196,49 @@ def test_get_execution_binding_returns_none_when_missing(mock_conn: AsyncMock) -
     assert result is None
 
 
+def test_get_execution_binding_null_session_reads_none(mock_conn: AsyncMock) -> None:
+    """A NULL external_session_id reconstructs as None, never as ""."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "awx_job_id": 501,
+                "job_template_id": 42,
+                "external_session_id": None,
+                "provider": "github",
+                "repository_url": "org/repo",
+                "entity_type": "change_request",
+                "entity_number": "42",
+                "outcome": "completed",
+                "source_event_id": None,
+                "branch": None,
+                "title": None,
+                "failure_reason": None,
+                "started_at": None,
+                "finished_at": None,
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    binding = asyncio.run(repo.get_execution_binding_by_awx_job_id("501"))
+    assert binding is not None
+    assert binding.external_session_id is None
+
+
+def test_get_execution_binding_rejects_non_numeric_job_id(mock_conn: AsyncMock) -> None:
+    """A non-numeric AWX job id raises ValueError, never a bare int() failure."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="Invalid AWX job id"):
+        asyncio.run(repo.get_execution_binding_by_awx_job_id("abc"))
+
+
 def test_get_execution_binding_returns_binding(mock_conn: AsyncMock) -> None:
     """Lookup by AWX job ID returns the reconstructed ExecutionBinding."""
     mock_conn.fetchrow = AsyncMock(
@@ -201,6 +246,7 @@ def test_get_execution_binding_returns_binding(mock_conn: AsyncMock) -> None:
             {
                 "id": uuid.uuid4(),
                 "awx_job_id": 500,
+                "job_template_id": 42,
                 "external_session_id": "ses_abc123",
                 "provider": "github",
                 "repository_url": "weiyentan/opencode-gateway",
@@ -224,6 +270,7 @@ def test_get_execution_binding_returns_binding(mock_conn: AsyncMock) -> None:
     binding = asyncio.run(repo.get_execution_binding_by_awx_job_id("500"))
     assert binding is not None
     assert binding.awx_job.job_id == "500"
+    assert binding.awx_job.job_template_id == 42
     assert binding.resource.provider == Provider.GITHUB
     assert binding.resource.repository == "weiyentan/opencode-gateway"
     assert binding.resource.resource_type == EntityType.CHANGE_REQUEST
@@ -292,6 +339,7 @@ def test_list_execution_bindings_returns_all_bindings(
                 {
                     "id": uuid.uuid4(),
                     "awx_job_id": 100,
+                    "job_template_id": 42,
                     "external_session_id": "ses_001",
                     "provider": "github",
                     "repository_url": "org/repo",
@@ -310,6 +358,7 @@ def test_list_execution_bindings_returns_all_bindings(
                 {
                     "id": uuid.uuid4(),
                     "awx_job_id": 101,
+                    "job_template_id": 42,
                     "external_session_id": "ses_002",
                     "provider": "github",
                     "repository_url": "org/repo",
@@ -380,6 +429,7 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
                 {
                     "id": uuid.uuid4(),
                     "awx_job_id": 500,
+                    "job_template_id": 42,
                     "external_session_id": "ses_001",
                     "provider": "github",
                     "repository_url": "weiyentan/opencode-gateway",
@@ -398,6 +448,7 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
                 {
                     "id": uuid.uuid4(),
                     "awx_job_id": 501,
+                    "job_template_id": 42,
                     "external_session_id": "ses_002",
                     "provider": "github",
                     "repository_url": "weiyentan/opencode-gateway",

@@ -280,6 +280,13 @@ class TestResponseSchemas:
         assert response.failure_reason == "Transient AWX failure"
         assert response.resource.resource_type is EntityType.CHANGE_REQUEST
 
+    def test_read_response_nullable_session_id(self) -> None:
+        """A binding without a resolved session reads back with None."""
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding(external_session_id=None)
+        )
+        assert response.external_session_id is None
+
     def test_resource_history_preserves_failed_then_successful(self) -> None:
         history = ExecutionBindingHistoryResponse.model_validate(
             {

@@ -35,9 +35,14 @@ from __future__ import annotations
 import logging
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from afk_outcomes.models import EntityType, Provider, ProviderResourceIdentity
+from afk_outcomes.models import (
+    EntityType,
+    ExecutionBinding,
+    Provider,
+    ProviderResourceIdentity,
+)
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.auth import require_collector_token
 from app.core.config import get_settings
@@ -101,11 +106,61 @@ async def require_awx_execution_binding_credential(
     return auth
 
 
+def _validate_awx_job_id(awx_job_id: str) -> str:
+    """Validate an AWX job id is a numeric string, else raise 400.
+
+    The request/path schemas accept arbitrary strings while the repository
+    coerces the id to ``int``.  Validating here turns a malformed id into a
+    deterministic 400 instead of an unhandled ``ValueError`` surfacing as a
+    500 (issue #549 review).
+    """
+    try:
+        int(awx_job_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid AWX job id: {awx_job_id!r} must be a numeric string",
+        )
+    return awx_job_id
+
+
+def _binding_conflicts_with(
+    existing: ExecutionBinding,
+    body: ExecutionBindingCreateRequest,
+) -> bool:
+    """Return True when ANY field of ``body`` differs from ``existing``.
+
+    Every persisted field participates in the comparison — external session
+    id, AWX job template id, the full resource identity (including
+    repository), outcome, and optional traceability metadata.  A replay that
+    changes any value is a 409 conflict, never a silent accept of stale
+    data (issue #549 review).
+    """
+    resource = body.resource
+    return (
+        existing.external_session_id != body.external_session_id
+        or existing.awx_job.job_template_id != body.awx_job.job_template_id
+        or existing.resource.provider != resource.provider
+        or existing.resource.repository != resource.repository
+        or existing.resource.resource_type.value != resource.resource_type
+        or existing.resource.resource_number != resource.resource_number
+        or existing.outcome != body.outcome
+        or existing.source_event_id != body.source_event_id
+        or existing.branch != body.branch
+        or existing.title != body.title
+        or existing.failure_reason != body.failure_reason
+        or existing.started_at != body.started_at
+        or existing.finished_at != body.finished_at
+    )
+
+
 def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
     """Convert a domain :class:`ExecutionBinding` to the API read response.
 
     The ``binding_id`` is the UUID primary key from the ``execution_bindings``
-    table, used as the gateway-assigned identifier.
+    table, used as the gateway-assigned identifier.  ``external_session_id``
+    passes through as ``None`` for unresolved bindings (the read schema and
+    domain model both accept ``None``).
     """
     # Import here to avoid circular imports at module level.
     from afk_outcomes.models import ExecutionBinding as ExecutionBindingModel
@@ -140,11 +195,17 @@ def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
 @router.post(
     "",
     response_model=ExecutionBindingReadResponse,
-    status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Idempotent replay — existing binding returned unchanged"
+        },
+        status.HTTP_201_CREATED: {"description": "New execution binding persisted"},
+    },
 )
 async def create_execution_binding(
     body: ExecutionBindingCreateRequest,
     request: Request,
+    response: Response,
     auth: dict = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
@@ -163,29 +224,25 @@ async def create_execution_binding(
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         repo = AsyncpgOutcomeRepository(conn)
-        awx_job_id_str = body.awx_job.job_id
+        awx_job_id_str = _validate_awx_job_id(body.awx_job.job_id)
 
         # Check if a binding already exists for this AWX job ID.
         existing = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
 
         if existing is not None:
-            # Check for conflict: different data for same AWX job
-            if (existing.external_session_id != body.external_session_id or
-                existing.resource.provider != body.resource.provider or
-                existing.resource.resource_type.value != body.resource.resource_type or
-                existing.resource.resource_number != body.resource.resource_number):
+            # Conflict check: ANY differing field — session, resource identity,
+            # outcome, or traceability metadata — rejects the replay.
+            if _binding_conflicts_with(existing, body):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Conflicting data for existing AWX job binding"
                 )
             # Idempotent replay: same data → 200 with existing binding.
-            existing_response = _binding_to_read_response(existing)
-            return existing_response
+            response.status_code = status.HTTP_200_OK
+            return _binding_to_read_response(existing)
 
         # New binding — persist it.
-        from afk_outcomes.models import ExecutionBinding as ExecutionBindingModel
-
-        domain_binding = ExecutionBindingModel(
+        domain_binding = ExecutionBinding(
             binding_id="",
             awx_job=body.awx_job,
             external_session_id=body.external_session_id,
@@ -213,6 +270,7 @@ async def create_execution_binding(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to retrieve saved execution binding",
             )
+        response.status_code = status.HTTP_201_CREATED
         return _binding_to_read_response(saved)
 
 
@@ -227,7 +285,12 @@ async def get_execution_binding(
     awx_job_id: str,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
-    """Return one execution binding by AWX job ID, or 404 when not found."""
+    """Return one execution binding by AWX job ID, or 404 when not found.
+
+    A non-numeric ``awx_job_id`` is rejected with 400 before any database
+    access (the path schema accepts arbitrary strings).
+    """
+    awx_job_id = _validate_awx_job_id(awx_job_id)
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         repo = AsyncpgOutcomeRepository(conn)

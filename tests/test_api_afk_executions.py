@@ -59,18 +59,19 @@ def _mk_binding_row(
     *,
     binding_id: str = "00000000-0000-0000-0000-000000000001",
     awx_job_id: int = 42,
-    external_session_id: str = "ses_abc123",
+    job_template_id: int = 7,
+    external_session_id: str | None = "ses_abc123",
     provider: str = "github",
     repository_url: str = "acme/proj",
     entity_type: str = "change_request",
     entity_number: str = "99",
     outcome: str = "completed",
-    source_event_id: str | None = "evt_001",
-    branch: str | None = "feat/auth",
-    title: str | None = "Implement auth",
+    source_event_id: str | None = None,
+    branch: str | None = None,
+    title: str | None = None,
     failure_reason: str | None = None,
-    started_at: datetime | None = _A_TS,
-    finished_at: datetime | None = _B_TS,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
 ):
     """Build a mock asyncpg Record for an execution_bindings row."""
     return mock_row(
@@ -78,6 +79,7 @@ def _mk_binding_row(
             "id": uuid.UUID(binding_id),
             "binding_id": binding_id,
             "awx_job_id": awx_job_id,
+            "job_template_id": job_template_id,
             "external_session_id": external_session_id,
             "provider": provider,
             "repository_url": repository_url,
@@ -219,8 +221,8 @@ class TestCreateExecutionBinding:
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
-        # Idempotent replay returns 201 (endpoint default) — no duplication.
-        assert resp.status_code == 201
+        # Idempotent replay returns 200 (not 201) — no new row created.
+        assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
         assert data["data"]["awx_job"]["job_id"] == "42"
@@ -283,6 +285,124 @@ class TestCreateExecutionBinding:
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_conflicting_outcome_returns_409(self) -> None:
+        """A replay changing only the outcome is a conflict, not a silent accept."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        existing_row = _mk_binding_row(awx_job_id=42, outcome="completed")
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_conflicting_repository_returns_409(self) -> None:
+        """A replay changing the resource repository is a conflict."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        existing_row = _mk_binding_row(awx_job_id=42)
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/other-repo",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_conflicting_metadata_returns_409(self) -> None:
+        """A replay changing optional metadata (source_event_id) is a conflict."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        existing_row = _mk_binding_row(awx_job_id=42)
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+            "source_event_id": "evt_changed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_awx_job_id_rejected_400(self) -> None:
+        """A non-numeric awx_job_id in the body is rejected with 400, not 500."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "abc", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 400
         data = resp.json()
         assert data["status"] == "error"
 
@@ -362,7 +482,7 @@ class TestCreateExecutionBinding:
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
-        assert resp.status_code == 201
+        assert resp.status_code == 200
         data = resp.json()
         binding = data["data"]
         for key in (
@@ -414,6 +534,36 @@ class TestGetExecutionBinding:
         data = resp.json()
         assert data["status"] == "error"
         assert "not found" in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_non_numeric_awx_job_id_returns_400(self) -> None:
+        """A non-numeric path awx_job_id is rejected with 400, not 500."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/abc")
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_get_binding_with_null_session_returns_null(self) -> None:
+        """A binding whose external_session_id is NULL reads back as None."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        row = _mk_binding_row(awx_job_id=42, external_session_id=None)
+        conn.fetchrow = AsyncMock(return_value=row)
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["external_session_id"] is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

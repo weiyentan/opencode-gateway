@@ -150,7 +150,13 @@ class ExecutionBindingReadResponse(BaseModel):
 
     binding_id: str = Field(description="Gateway-assigned binding id")
     awx_job: AWXJobIdentity = Field(description="AWX job run identity")
-    external_session_id: str = Field(description="External OpenCode session id")
+    external_session_id: str | None = Field(
+        default=None,
+        description=(
+            "External OpenCode session id (e.g. ses_* id); None when the "
+            "binding has no resolved session"
+        ),
+    )
     resource: ProviderResourceIdentity = Field(
         description="Normalized provider resource identity (change_request)"
     )
