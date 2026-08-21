@@ -89,6 +89,17 @@
     drCustomInputs: $('dr-custom-inputs'),
     drStartDate:    $('dr-start-date'),
     drEndDate:      $('dr-end-date'),
+
+    // Transcript view (issue #469)
+    trSessionInput:    $('tr-session-input'),
+    trLoadBtn:         $('tr-load-btn'),
+    trSessionHeader:   $('tr-session-header'),
+    trViewToggle:      $('tr-view-toggle'),
+    trTimelineWrap:    $('tr-timeline-wrap'),
+    trMessagesWrap:    $('tr-messages-wrap'),
+    trPartsWrap:       $('tr-parts-wrap'),
+    trNextPageBtn:     $('tr-next-page-btn'),
+    trStatus:          $('tr-status'),
   };
 
   // ── State ──────────────────────────────────────────────────────────────
@@ -111,6 +122,13 @@
   let dateRangeState = { preset: 'this-month' }; // selected date-range preset
   let expandedClientNames = {}; // drilldown: client names with expanded project rows
   let _lastDateRangeKey = null; // tracks previous render's date range context for resetting drilldown
+
+  // ── Transcript view state (issue #469) ────────────────────────────────
+  let trSessionId = null;        // current loaded session UUID
+  let trActiveView = 'timeline'; // 'timeline' | 'messages' | 'parts'
+  let trNextCursor = null;       // keyset cursor for the active view
+  let trHasMore = false;         // whether more pages exist
+  let trItems = [];              // accumulated items for the active view
 
   // ── Panel freshness state (issue #357) ────────────────────────────────
   // Per-panel freshness map: panelId → { status: 'ok'|'refreshing'|'stale',
@@ -2712,6 +2730,343 @@
     });
   }
 
+  // ── Transcript view (issue #469) ───────────────────────────────────────
+  // Renders a session's execution transcript: header, messages, parts, and
+  // unified timeline with depth-annotated parent/child distinction.  Uses
+  // keyset cursor pagination (next_cursor) for all list endpoints.
+
+  /** Validate a session UUID string (simple check: non-empty, matches UUID
+   *  format).  Pure -- no DOM or fetch access. */
+  function isValidSessionId(raw) {
+    if (!raw || typeof raw !== 'string') return false;
+    var trimmed = raw.trim();
+    if (trimmed.length === 0) return false;
+    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(trimmed);
+  }
+
+  /** Format a Transcript Timeline depth as a human-readable label.
+   *  depth=0 -> 'Root session', depth=1 -> 'Subagent (L1)', etc.
+   *  Pure -- no DOM access. */
+  function fmtTranscriptDepth(depth) {
+    if (depth == null || depth === 0) return 'Root session';
+    return 'Subagent (L' + depth + ')';
+  }
+
+  /** Return a CSS class for depth-based visual distinction.
+   *  depth=0 -> 'tr-depth-root', depth=1 -> 'tr-depth-1', etc.
+   *  Pure -- no DOM access. */
+  function depthClass(depth) {
+    var d = (depth != null) ? depth : 0;
+    if (d === 0) return 'tr-depth-root';
+    if (d <= 5) return 'tr-depth-' + d;
+    return 'tr-depth-deep';
+  }
+
+  /** Return a CSS class for a transcript event type.
+   *  Pure -- no DOM access. */
+  function transcriptPartTypeClass(partType) {
+    if (partType === 'tool') return 'tr-part-tool';
+    if (partType === 'text') return 'tr-part-text';
+    if (partType === 'reasoning') return 'tr-part-reasoning';
+    if (partType === 'step-start') return 'tr-part-step-start';
+    if (partType === 'step-finish') return 'tr-part-step-finish';
+    return 'tr-part-unknown';
+  }
+
+  /** Render the transcript session header card.
+   *  Pure -- returns HTML string. */
+  function renderTranscriptHeader(header) {
+    if (!header) return '';
+    var html = '<div class="tr-header-card">';
+    html += '<div class="tr-header-grid">';
+    html += fieldHtml('Session', shortUUID(header.id));
+    html += fieldHtml('External ID', escHtml(header.external_session_id || '--'));
+    html += fieldHtml('Agent', escHtml(header.agent || '--'));
+    html += fieldHtml('Messages', fmtNum(header.message_count));
+    html += fieldHtml('Parts', fmtNum(header.part_count));
+    html += fieldHtml('Tool Calls', fmtNum(header.tool_call_count));
+    if (header.first_part_at && header.last_part_at) {
+      html += fieldHtml('Duration', fmtDuration(header.first_part_at, header.last_part_at));
+    }
+    html += fieldHtml('Parent', header.parent_session_id
+      ? escHtml(header.parent_session_id)
+      : '<span style="color:var(--text-muted)">None (root)</span>');
+    if (header.child_session_ids && header.child_session_ids.length > 0) {
+      html += fieldHtml('Children', fmtNum(header.child_session_ids.length));
+    }
+    html += '</div></div>';
+    return html;
+  }
+
+  /** Render one timeline event row.  Pure -- returns HTML string. */
+  function renderTimelineEvent(event) {
+    var depth = event.depth || 0;
+    var cls = depthClass(depth) + ' ' + transcriptPartTypeClass(event.part_type);
+    var depthLabel = fmtTranscriptDepth(depth);
+    var agent = event.agent || '';
+    var time = fmtDT(event.source_created_at_tz || event.source_created_at);
+    var data = event.data || {};
+
+    var html = '<div class="tr-event ' + cls + '">';
+    html += '<div class="tr-event-head">';
+    html += '<span class="tr-event-depth">' + escHtml(depthLabel) + '</span>';
+    if (agent) html += ' <span class="tr-event-agent">' + escHtml(agent) + '</span>';
+    html += ' <span class="tr-event-type">' + escHtml(event.part_type || 'unknown') + '</span>';
+    html += ' <span class="tr-event-time">' + time + '</span>';
+    html += '</div>';
+
+    if (event.part_type === 'tool') {
+      var toolName = data.tool || data.name || '';
+      var toolStatus = data.status || '';
+      var toolInput = data.input != null ? data.input : data.tool_input;
+      var toolOutput = data.output != null ? data.output : data.tool_output;
+      html += '<div class="tr-event-body">';
+      if (toolName) html += '<span class="tr-tool-name">' + escHtml(toolName) + '</span>';
+      if (toolStatus) html += ' ' + badge(toolStatus, 'badge-' + (toolStatus === 'completed' ? 'completed' : toolStatus === 'error' ? 'failed' : 'unknown')).outerHTML;
+      if (toolInput != null) {
+        var inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput, null, 2);
+        html += '<pre class="tr-tool-io">' + escHtml(inputStr) + '</pre>';
+      }
+      if (toolOutput != null) {
+        var outputStr = typeof toolOutput === 'string' ? toolOutput : JSON.stringify(toolOutput, null, 2);
+        html += '<pre class="tr-tool-io">' + escHtml(outputStr) + '</pre>';
+      }
+      html += '</div>';
+    } else if (event.part_type === 'text' || event.part_type === 'reasoning') {
+      var text = data.text || data.content || '';
+      if (text) {
+        html += '<div class="tr-event-body tr-text-content">' + escHtml(text) + '</div>';
+      }
+    } else {
+      var summary = data.text || data.content || '';
+      if (summary) {
+        html += '<div class="tr-event-body tr-text-content">' + escHtml(summary) + '</div>';
+      }
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /** Render one message row.  Pure -- returns HTML string. */
+  function renderTranscriptMessage(msg) {
+    var role = msg.role || 'unknown';
+    var agent = msg.agent || '';
+    var time = fmtDT(msg.source_created_at_tz || msg.source_created_at);
+    var tokens = (msg.input_tokens || 0) + (msg.output_tokens || 0);
+
+    var html = '<div class="tr-msg tr-msg-' + escHtml(role) + '">';
+    html += '<div class="tr-msg-head">';
+    html += '<span class="tr-msg-role">' + badge(role, 'badge-' + (role === 'assistant' ? 'completed' : role === 'user' ? 'running' : 'unknown')).outerHTML + '</span>';
+    if (agent) html += ' <span class="tr-msg-agent">' + escHtml(agent) + '</span>';
+    if (msg.mode) html += ' <span class="tr-msg-mode">' + escHtml(msg.mode) + '</span>';
+    html += ' <span class="tr-msg-time">' + time + '</span>';
+    if (tokens > 0) {
+      html += ' <span class="tr-msg-tokens">' + fmtNum(tokens) + ' tokens</span>';
+    }
+    html += '</div>';
+
+    var msgData = msg.data || {};
+    var text = msgData.text || msgData.content || '';
+    if (text) {
+      html += '<div class="tr-msg-body tr-text-content">' + escHtml(text) + '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /** Render one part row.  Pure -- returns HTML string. */
+  function renderTranscriptPart(part) {
+    var cls = transcriptPartTypeClass(part.part_type);
+    var time = fmtDT(part.source_created_at_tz || part.source_created_at);
+    var partData = part.data || {};
+
+    var html = '<div class="tr-part ' + cls + '">';
+    html += '<div class="tr-part-head">';
+    html += '<span class="tr-part-type">' + badge(part.part_type || 'unknown', 'badge-' + (part.part_type === 'tool' ? 'completed' : part.part_type === 'text' ? 'running' : 'unknown')).outerHTML + '</span>';
+    html += ' <span class="tr-part-time">' + time + '</span>';
+    html += '</div>';
+
+    if (part.part_type === 'tool') {
+      var toolName = partData.tool || partData.name || '';
+      var toolStatus = partData.status || '';
+      var toolInput = partData.input != null ? partData.input : partData.tool_input;
+      var toolOutput = partData.output != null ? partData.output : partData.tool_output;
+      html += '<div class="tr-part-body">';
+      if (toolName) html += '<span class="tr-tool-name">' + escHtml(toolName) + '</span>';
+      if (toolStatus) html += ' ' + badge(toolStatus, 'badge-' + (toolStatus === 'completed' ? 'completed' : toolStatus === 'error' ? 'failed' : 'unknown')).outerHTML;
+      if (toolInput != null) {
+        var inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput, null, 2);
+        html += '<pre class="tr-tool-io">' + escHtml(inputStr) + '</pre>';
+      }
+      if (toolOutput != null) {
+        var outputStr = typeof toolOutput === 'string' ? toolOutput : JSON.stringify(toolOutput, null, 2);
+        html += '<pre class="tr-tool-io">' + escHtml(outputStr) + '</pre>';
+      }
+      html += '</div>';
+    } else {
+      var text = partData.text || partData.content || '';
+      if (text) {
+        html += '<div class="tr-part-body tr-text-content">' + escHtml(text) + '</div>';
+      }
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /** Render a list of events/parts/messages into a container. */
+  function renderTranscriptList(items, renderer) {
+    if (!items || items.length === 0) {
+      return '<p class="empty-state">No items to display</p>';
+    }
+    return items.map(renderer).join('');
+  }
+
+  /** Switch the active transcript sub-view (timeline/messages/parts). */
+  function switchTranscriptView(viewName) {
+    trActiveView = viewName;
+    trNextCursor = null;
+    trHasMore = false;
+    trItems = [];
+    var btns = els.trViewToggle ? els.trViewToggle.querySelectorAll('.tr-view-btn') : [];
+    btns.forEach(function (btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-view') === viewName);
+    });
+    if (els.trTimelineWrap) els.trTimelineWrap.style.display = (viewName === 'timeline') ? '' : 'none';
+    if (els.trMessagesWrap) els.trMessagesWrap.style.display = (viewName === 'messages') ? '' : 'none';
+    if (els.trPartsWrap)    els.trPartsWrap.style.display    = (viewName === 'parts')    ? '' : 'none';
+    if (trSessionId) fetchTranscriptPage();
+  }
+
+  /** Update the "next page" button and status text. */
+  function updateTranscriptPagination() {
+    if (els.trNextPageBtn) {
+      els.trNextPageBtn.disabled = !trHasMore;
+      els.trNextPageBtn.textContent = trHasMore ? 'Load more \u2192' : 'End of stream';
+    }
+    if (els.trStatus) {
+      var count = trItems.length;
+      var cursorInfo = trNextCursor ? ' (paginated)' : '';
+      els.trStatus.textContent = count + ' items loaded' + cursorInfo;
+    }
+  }
+
+  /** Fetch a page of transcript data for the active view. */
+  async function fetchTranscriptPage() {
+    if (!trSessionId) return;
+    var baseUrl = '/api/v1/execution/sessions/' + encodeURIComponent(trSessionId);
+    var url;
+    switch (trActiveView) {
+      case 'timeline': url = baseUrl + '/timeline'; break;
+      case 'messages': url = baseUrl + '/messages'; break;
+      case 'parts':    url = baseUrl + '/parts';    break;
+      default: return;
+    }
+    var params = ['limit=100'];
+    if (trNextCursor) params.push('after=' + encodeURIComponent(trNextCursor));
+    url += '?' + params.join('&');
+
+    if (els.trStatus) els.trStatus.textContent = 'Loading\u2026';
+    if (els.trNextPageBtn) els.trNextPageBtn.disabled = true;
+
+    try {
+      var data = await apiFetch(url);
+      var items = data.items || [];
+      var renderer;
+      switch (trActiveView) {
+        case 'timeline': renderer = renderTimelineEvent; break;
+        case 'messages': renderer = renderTranscriptMessage; break;
+        case 'parts':    renderer = renderTranscriptPart;    break;
+        default: renderer = renderTimelineEvent;
+      }
+      trItems = trItems.concat(items);
+      trNextCursor = data.next_cursor || null;
+      trHasMore = !!data.has_more;
+
+      var container;
+      switch (trActiveView) {
+        case 'timeline': container = els.trTimelineWrap; break;
+        case 'messages': container = els.trMessagesWrap; break;
+        case 'parts':    container = els.trPartsWrap;    break;
+        default: container = els.trTimelineWrap;
+      }
+      if (container) {
+        container.innerHTML = renderTranscriptList(trItems, renderer);
+      }
+      updateTranscriptPagination();
+    } catch (e) {
+      console.error('Transcript fetch error:', e);
+      if (els.trStatus) els.trStatus.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  /** Load a transcript session: fetch header and first page of timeline. */
+  async function loadTranscriptSession() {
+    var raw = els.trSessionInput ? els.trSessionInput.value.trim() : '';
+    if (!isValidSessionId(raw)) {
+      if (els.trStatus) els.trStatus.textContent = 'Please enter a valid session UUID';
+      return;
+    }
+    trSessionId = raw;
+    trNextCursor = null;
+    trHasMore = false;
+    trItems = [];
+    trActiveView = 'timeline';
+
+    var btns = els.trViewToggle ? els.trViewToggle.querySelectorAll('.tr-view-btn') : [];
+    btns.forEach(function (btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-view') === 'timeline');
+    });
+    if (els.trTimelineWrap) els.trTimelineWrap.style.display = '';
+    if (els.trMessagesWrap) els.trMessagesWrap.style.display = 'none';
+    if (els.trPartsWrap)    els.trPartsWrap.style.display    = 'none';
+
+    if (els.trSessionHeader) {
+      els.trSessionHeader.innerHTML = '<p class="empty-state">Loading session header\u2026</p>';
+    }
+    if (els.trStatus) els.trStatus.textContent = 'Loading session\u2026';
+
+    try {
+      var header = await apiFetch('/api/v1/execution/sessions/' + encodeURIComponent(trSessionId));
+      if (els.trSessionHeader) {
+        els.trSessionHeader.innerHTML = renderTranscriptHeader(header);
+      }
+      await fetchTranscriptPage();
+    } catch (e) {
+      var notFound = /404/.test(e && e.message);
+      if (els.trSessionHeader) {
+        els.trSessionHeader.innerHTML = '<p class="empty-state">' +
+          (notFound ? 'Session not found' : 'Failed to load session: ' + escHtml(e.message)) +
+          '</p>';
+      }
+      if (els.trStatus) els.trStatus.textContent = notFound ? 'Session not found' : 'Error: ' + e.message;
+    }
+  }
+
+  /** Wire transcript view DOM events. */
+  function setupTranscriptEventHandlers() {
+    if (els.trLoadBtn) {
+      els.trLoadBtn.addEventListener('click', loadTranscriptSession);
+    }
+    if (els.trSessionInput) {
+      els.trSessionInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') loadTranscriptSession();
+      });
+    }
+    if (els.trViewToggle) {
+      els.trViewToggle.querySelectorAll('.tr-view-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var view = btn.getAttribute('data-view');
+          if (view) switchTranscriptView(view);
+        });
+      });
+    }
+    if (els.trNextPageBtn) {
+      els.trNextPageBtn.addEventListener('click', fetchTranscriptPage);
+    }
+  }
+  // ── End transcript view (issue #469) ──────────────────────────────────
+
+
   function setupTabNavigation() {
     var navItems = document.querySelectorAll('.top-nav-item');
     var tabContents = document.querySelectorAll('.tab-content');
@@ -2804,6 +3159,7 @@
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
     setupAfkOutcomesEventHandlers();
+    setupTranscriptEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
     // Issue #426: read ?page / ?page_size from the URL before the initial
@@ -2919,6 +3275,18 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  // Transcript view (issue #469): pure helpers for depth formatting, part-type
+  // classification, and the header/timeline/message/part renderers.  The Node
+  // test harness exercises these through the vm-sandbox window seam.
+  window.isValidSessionId = isValidSessionId;
+  window.fmtTranscriptDepth = fmtTranscriptDepth;
+  window.depthClass = depthClass;
+  window.transcriptPartTypeClass = transcriptPartTypeClass;
+  window.renderTranscriptHeader = renderTranscriptHeader;
+  window.renderTimelineEvent = renderTimelineEvent;
+  window.renderTranscriptMessage = renderTranscriptMessage;
+  window.renderTranscriptPart = renderTranscriptPart;
+  window.renderTranscriptList = renderTranscriptList;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };

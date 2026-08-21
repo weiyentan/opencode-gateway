@@ -163,6 +163,28 @@ elementRegistry['afk-detail-title'] = afkDetailTitleEl;
 elementRegistry['afk-detail-body'] = afkDetailBodyEl;
 elementRegistry['afk-detail-close'] = afkDetailCloseEl;
 
+// Transcript view fakes (issue #469): the session input, load button, header,
+// view toggle, view containers, next page button, and status text.  Registered
+// before loadRealAppJs so app.js captures them in els (like the AFK fakes).
+var trSessionInputEl = makeFakeElement('tr-session-input');
+var trLoadBtnEl = makeFakeElement('tr-load-btn');
+var trSessionHeaderEl = makeFakeElement('tr-session-header');
+var trViewToggleEl = makeFakeElement('tr-view-toggle');
+var trTimelineWrapEl = makeFakeElement('tr-timeline-wrap');
+var trMessagesWrapEl = makeFakeElement('tr-messages-wrap');
+var trPartsWrapEl = makeFakeElement('tr-parts-wrap');
+var trNextPageBtnEl = makeFakeElement('tr-next-page-btn');
+var trStatusEl = makeFakeElement('tr-status');
+elementRegistry['tr-session-input'] = trSessionInputEl;
+elementRegistry['tr-load-btn'] = trLoadBtnEl;
+elementRegistry['tr-session-header'] = trSessionHeaderEl;
+elementRegistry['tr-view-toggle'] = trViewToggleEl;
+elementRegistry['tr-timeline-wrap'] = trTimelineWrapEl;
+elementRegistry['tr-messages-wrap'] = trMessagesWrapEl;
+elementRegistry['tr-parts-wrap'] = trPartsWrapEl;
+elementRegistry['tr-next-page-btn'] = trNextPageBtnEl;
+elementRegistry['tr-status'] = trStatusEl;
+
 // Agent Run detail overlay fakes (issue #473): the AFK session drill-down
 // opens the existing Agent Run detail overlay via openAgentRunDetail, which
 // reads/writes els.arDetailOverlay / arDetailBody / arDetailTitle.  Registered
@@ -302,6 +324,18 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  // Issue #469: Transcript view — pure helpers for UUID validation, depth
+  // formatting, part-type classification, and the header/timeline/message/part
+  // renderers, exposed on the same window test seam.
+  window.isValidSessionId = sandboxWindow.isValidSessionId;
+  window.fmtTranscriptDepth = sandboxWindow.fmtTranscriptDepth;
+  window.depthClass = sandboxWindow.depthClass;
+  window.transcriptPartTypeClass = sandboxWindow.transcriptPartTypeClass;
+  window.renderTranscriptHeader = sandboxWindow.renderTranscriptHeader;
+  window.renderTimelineEvent = sandboxWindow.renderTimelineEvent;
+  window.renderTranscriptMessage = sandboxWindow.renderTranscriptMessage;
+  window.renderTranscriptPart = sandboxWindow.renderTranscriptPart;
+  window.renderTranscriptList = sandboxWindow.renderTranscriptList;
 })();
 
 // ── Pure functions (duplicated from app.js for testability) ──────────────
@@ -2103,9 +2137,10 @@ console.log('\u25B6 index.html markup (smoke check)');
   var indexPath = path.join(__dirname, '..', 'index.html');
   var html = fs.readFileSync(indexPath, 'utf8');
 
-  // Four tabs: top-nav item + matching content panel (the Sessions tab was
-  // merged into Agent Runs — issue #402; AFK Outcomes added — issue #453)
-  var tabs = ['overview', 'agent-runs', 'clients-projects', 'afk-outcomes'];
+  // Five tabs: top-nav item + matching content panel (the Sessions tab was
+  // merged into Agent Runs -- issue #402; AFK Outcomes added -- issue #453;
+  // Transcript added -- issue #469)
+  var tabs = ['overview', 'agent-runs', 'clients-projects', 'afk-outcomes', 'transcript'];
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '"') !== -1, 'top nav: item for tab "' + tab + '" exists');
     assert(html.indexOf('id="tab-' + tab + '"') !== -1, 'top nav: tab-content panel #tab-' + tab + ' exists');
@@ -2114,7 +2149,7 @@ console.log('\u25B6 index.html markup (smoke check)');
   // Keyboard reachability: every top-nav item is focusable (tabindex="0"),
   // so tabbing enters Overview → Agent Runs → Clients / Projects → AFK Outcomes.
   var navItemCount = (html.match(/class="top-nav-item/g) || []).length;
-  assert(navItemCount === 4, 'top nav: exactly four top-nav-item elements (' + navItemCount + ' found)');
+  assert(navItemCount === 5, 'top nav: exactly five top-nav-item elements (' + navItemCount + ' found)');
   tabs.forEach(function (tab) {
     assert(html.indexOf('data-tab="' + tab + '" tabindex="0"') !== -1,
       'top nav: tab "' + tab + '" is keyboard-focusable (tabindex="0")');
@@ -4549,6 +4584,208 @@ console.log('\u25B6 AFK Outcomes — session drill-down click wiring (issue #473
     return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
   };
 })();
+
+
+// ── Transcript view (issue #469) ──────────────────────────────────────────
+// Pure helpers for UUID validation, depth formatting, part-type classification,
+// and the header/timeline/message/part renderers.
+
+console.log('\u25B6 isValidSessionId');
+
+assert(window.isValidSessionId(null) === false, 'null \u2192 false');
+assert(window.isValidSessionId('') === false, 'empty \u2192 false');
+assert(window.isValidSessionId('not-a-uuid') === false, 'plain text \u2192 false');
+assert(window.isValidSessionId('  550e8400-e29b-41d4-a716-446655440000  ') === true, 'UUID with whitespace \u2192 true (trimmed)');
+assert(window.isValidSessionId('550e8400-e29b-41d4-a716-446655440000') === true, 'lowercase UUID \u2192 true');
+assert(window.isValidSessionId('550E8400-E29B-41D4-A716-446655440000') === true, 'uppercase UUID \u2192 true');
+assert(window.isValidSessionId('550e8400e29b41d4a716446655440000') === false, 'UUID without hyphens \u2192 false');
+assert(window.isValidSessionId('550e8400-e29b-41d4-a716') === false, 'truncated UUID \u2192 false');
+assert(window.isValidSessionId(123) === false, 'number \u2192 false');
+
+console.log('\u25B6 fmtTranscriptDepth');
+
+assert(window.fmtTranscriptDepth(null) === 'Root session', 'null \u2192 Root session');
+assert(window.fmtTranscriptDepth(undefined) === 'Root session', 'undefined \u2192 Root session');
+assert(window.fmtTranscriptDepth(0) === 'Root session', '0 \u2192 Root session');
+assert(window.fmtTranscriptDepth(1) === 'Subagent (L1)', '1 \u2192 Subagent (L1)');
+assert(window.fmtTranscriptDepth(2) === 'Subagent (L2)', '2 \u2192 Subagent (L2)');
+assert(window.fmtTranscriptDepth(5) === 'Subagent (L5)', '5 \u2192 Subagent (L5)');
+
+console.log('\u25B6 depthClass');
+
+assert(window.depthClass(null) === 'tr-depth-root', 'null \u2192 tr-depth-root');
+assert(window.depthClass(0) === 'tr-depth-root', '0 \u2192 tr-depth-root');
+assert(window.depthClass(1) === 'tr-depth-1', '1 \u2192 tr-depth-1');
+assert(window.depthClass(2) === 'tr-depth-2', '2 \u2192 tr-depth-2');
+assert(window.depthClass(3) === 'tr-depth-3', '3 \u2192 tr-depth-3');
+assert(window.depthClass(4) === 'tr-depth-4', '4 \u2192 tr-depth-4');
+assert(window.depthClass(5) === 'tr-depth-5', '5 \u2192 tr-depth-5');
+assert(window.depthClass(6) === 'tr-depth-deep', '6 \u2192 tr-depth-deep');
+assert(window.depthClass(10) === 'tr-depth-deep', '10 \u2192 tr-depth-deep');
+
+console.log('\u25B6 transcriptPartTypeClass');
+
+assert(window.transcriptPartTypeClass('tool') === 'tr-part-tool', 'tool \u2192 tr-part-tool');
+assert(window.transcriptPartTypeClass('text') === 'tr-part-text', 'text \u2192 tr-part-text');
+assert(window.transcriptPartTypeClass('reasoning') === 'tr-part-reasoning', 'reasoning \u2192 tr-part-reasoning');
+assert(window.transcriptPartTypeClass('step-start') === 'tr-part-step-start', 'step-start \u2192 tr-part-step-start');
+assert(window.transcriptPartTypeClass('step-finish') === 'tr-part-step-finish', 'step-finish \u2192 tr-part-step-finish');
+assert(window.transcriptPartTypeClass('unknown-type') === 'tr-part-unknown', 'unknown type \u2192 tr-part-unknown');
+assert(window.transcriptPartTypeClass(null) === 'tr-part-unknown', 'null \u2192 tr-part-unknown');
+
+console.log('\u25B6 renderTranscriptHeader');
+
+assert(window.renderTranscriptHeader(null) === '', 'null header \u2192 empty string');
+assert(window.renderTranscriptHeader({}) !== '', 'empty header object \u2192 non-empty HTML');
+
+var hdrHtml = window.renderTranscriptHeader({
+  id: '550e8400-e29b-41d4-a716-446655440000',
+  external_session_id: 'ses_abc123',
+  agent: 'test-agent',
+  message_count: 15,
+  part_count: 42,
+  tool_call_count: 8,
+  first_part_at: '2026-01-01T00:00:00Z',
+  last_part_at: '2026-01-01T01:00:00Z',
+  parent_session_id: null,
+  child_session_ids: ['child-1', 'child-2']
+});
+assert(hdrHtml.indexOf('tr-header-card') !== -1, 'header contains tr-header-card');
+assert(hdrHtml.indexOf('550e8400') !== -1, 'header contains short UUID');
+assert(hdrHtml.indexOf('ses_abc123') !== -1, 'header contains external session id');
+assert(hdrHtml.indexOf('test-agent') !== -1, 'header contains agent name');
+assert(hdrHtml.indexOf('15') !== -1, 'header contains message count');
+assert(hdrHtml.indexOf('42') !== -1, 'header contains part count');
+assert(hdrHtml.indexOf('8') !== -1, 'header contains tool call count');
+assert(hdrHtml.indexOf('None (root)') !== -1, 'header shows None (root) for no parent');
+assert(hdrHtml.indexOf('2') !== -1, 'header shows 2 children');
+
+console.log('\u25B6 renderTimelineEvent');
+
+var tlEvent = window.renderTimelineEvent({
+  depth: 0,
+  agent: 'coordinator',
+  part_type: 'tool',
+  source_created_at: '2026-01-01T00:05:00Z',
+  source_created_at_tz: '2026-01-01T00:05:00Z',
+  data: { tool: 'read_file', status: 'completed', input: { path: '/tmp/test.py' }, output: 'file contents' }
+});
+assert(tlEvent.indexOf('tr-depth-root') !== -1, 'timeline event depth=0 has tr-depth-root class');
+assert(tlEvent.indexOf('coordinator') !== -1, 'timeline event shows agent');
+assert(tlEvent.indexOf('tr-part-tool') !== -1, 'timeline event tool type has tr-part-tool class');
+assert(tlEvent.indexOf('read_file') !== -1, 'timeline event shows tool name');
+assert(tlEvent.indexOf('tr-tool-io') !== -1, 'timeline event tool shows input/output blocks');
+
+var tlText = window.renderTimelineEvent({
+  depth: 1,
+  agent: 'subagent',
+  part_type: 'text',
+  source_created_at: '2026-01-01T00:10:00Z',
+  source_created_at_tz: '2026-01-01T00:10:00Z',
+  data: { text: 'Hello world' }
+});
+assert(tlText.indexOf('tr-depth-1') !== -1, 'timeline event depth=1 has tr-depth-1 class');
+assert(tlText.indexOf('subagent') !== -1, 'timeline event shows subagent');
+assert(tlText.indexOf('tr-part-text') !== -1, 'timeline event text type has tr-part-text class');
+assert(tlText.indexOf('Hello world') !== -1, 'timeline event shows text content');
+
+console.log('\u25B6 renderTranscriptMessage');
+
+var msgHtml = window.renderTranscriptMessage({
+  role: 'assistant',
+  agent: 'coder',
+  mode: 'chat',
+  source_created_at: '2026-01-01T00:05:00Z',
+  source_created_at_tz: '2026-01-01T00:05:00Z',
+  input_tokens: 1000,
+  output_tokens: 500,
+  data: { text: 'I will fix the bug' }
+});
+assert(msgHtml.indexOf('tr-msg') !== -1, 'message has tr-msg class');
+assert(msgHtml.indexOf('tr-msg-assistant') !== -1, 'assistant message has role class');
+assert(msgHtml.indexOf('coder') !== -1, 'message shows agent');
+assert(msgHtml.indexOf('I will fix the bug') !== -1, 'message shows text content');
+
+console.log('\u25B6 renderTranscriptPart');
+
+var partHtml = window.renderTranscriptPart({
+  part_type: 'tool',
+  source_created_at: '2026-01-01T00:05:00Z',
+  source_created_at_tz: '2026-01-01T00:05:00Z',
+  data: { tool: 'write_file', status: 'completed', input: { path: '/tmp/out.py' }, output: 'done' }
+});
+assert(partHtml.indexOf('tr-part') !== -1, 'part has tr-part class');
+assert(partHtml.indexOf('tr-part-tool') !== -1, 'tool part has tr-part-tool class');
+assert(partHtml.indexOf('write_file') !== -1, 'part shows tool name');
+assert(partHtml.indexOf('tr-tool-io') !== -1, 'part shows tool input/output blocks');
+
+console.log('\u25B6 renderTranscriptList');
+
+assert(window.renderTranscriptList([], function () { return ''; }) === '<p class="empty-state">No items to display</p>',
+  'empty list \u2192 empty state');
+assert(window.renderTranscriptList(null, function () { return ''; }) === '<p class="empty-state">No items to display</p>',
+  'null list \u2192 empty state');
+var listHtml = window.renderTranscriptList(['a', 'b'], function (x) { return '<div>' + x + '</div>'; });
+assert(listHtml.indexOf('<div>a</div>') !== -1, 'list renders first item');
+assert(listHtml.indexOf('<div>b</div>') !== -1, 'list renders second item');
+
+// ── Transcript markup smoke check (frontend/index.html) ─────────────────
+// Static verification of the transcript tab in the real index.html.
+
+console.log('\u25B6 index.html — transcript tab markup (smoke check)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // Transcript tab exists in the nav
+  assert(html.indexOf('data-tab="transcript"') !== -1, 'top nav: transcript tab exists');
+  assert(html.indexOf('id="tab-transcript"') !== -1, 'top nav: transcript tab-content panel exists');
+  assert(html.indexOf('data-tab="transcript" tabindex="0"') !== -1, 'transcript tab is keyboard-focusable');
+
+  // Five tabs total now (overview, agent-runs, clients-projects, afk-outcomes, transcript)
+  var navItemCount = (html.match(/class="top-nav-item/g) || []).length;
+  assert(navItemCount === 5, 'top nav: exactly five top-nav-item elements (' + navItemCount + ' found)');
+
+  // Transcript panel elements exist
+  assert(html.indexOf('id="tr-session-input"') !== -1, 'transcript: session input exists');
+  assert(html.indexOf('id="tr-load-btn"') !== -1, 'transcript: load button exists');
+  assert(html.indexOf('id="tr-session-header"') !== -1, 'transcript: session header container exists');
+  assert(html.indexOf('id="tr-view-toggle"') !== -1, 'transcript: view toggle exists');
+  assert(html.indexOf('id="tr-timeline-wrap"') !== -1, 'transcript: timeline container exists');
+  assert(html.indexOf('id="tr-messages-wrap"') !== -1, 'transcript: messages container exists');
+  assert(html.indexOf('id="tr-parts-wrap"') !== -1, 'transcript: parts container exists');
+  assert(html.indexOf('id="tr-next-page-btn"') !== -1, 'transcript: next page button exists');
+  assert(html.indexOf('id="tr-status"') !== -1, 'transcript: status text exists');
+
+  // View toggle buttons with data-view attributes
+  assert(html.indexOf('data-view="timeline"') !== -1, 'transcript: timeline view button exists');
+  assert(html.indexOf('data-view="messages"') !== -1, 'transcript: messages view button exists');
+  assert(html.indexOf('data-view="parts"') !== -1, 'transcript: parts view button exists');
+})();
+
+// ── Transcript CSS smoke check (frontend/style.css) ─────────────────────
+
+console.log('\u25B6 style.css — transcript styles (smoke check)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.tr-controls') !== -1, 'style.css: .tr-controls rule exists');
+  assert(live.indexOf('.tr-view-toggle') !== -1, 'style.css: .tr-view-toggle rule exists');
+  assert(live.indexOf('.tr-view-btn') !== -1, 'style.css: .tr-view-btn rule exists');
+  assert(live.indexOf('.tr-depth-root') !== -1, 'style.css: .tr-depth-root rule exists');
+  assert(live.indexOf('.tr-depth-1') !== -1, 'style.css: .tr-depth-1 rule exists');
+  assert(live.indexOf('.tr-tool-name') !== -1, 'style.css: .tr-tool-name rule exists');
+  assert(live.indexOf('.tr-tool-io') !== -1, 'style.css: .tr-tool-io rule exists');
+  assert(live.indexOf('.tr-msg') !== -1, 'style.css: .tr-msg rule exists');
+  assert(live.indexOf('.tr-part') !== -1, 'style.css: .tr-part rule exists');
+  assert(live.indexOf('.tr-pagination') !== -1, 'style.css: .tr-pagination rule exists');
+  assert(live.indexOf('.panel-transcript') !== -1, 'style.css: .panel-transcript rule exists');
+  assert(live.indexOf('.tr-text-content') !== -1, 'style.css: .tr-text-content rule exists');
+  assert(live.indexOf('.tr-view-wrap') !== -1, 'style.css: .tr-view-wrap rule exists');
+})();
+
 
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
