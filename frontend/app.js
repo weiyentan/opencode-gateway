@@ -3067,7 +3067,7 @@
   // ── End transcript view (issue #469) ──────────────────────────────────
 
 
-    function setupTabNavigation() {
+  function setupTabNavigation() {
     var navItems = document.querySelectorAll('.top-nav-item');
     var tabContents = document.querySelectorAll('.tab-content');
 
