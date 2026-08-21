@@ -78,6 +78,7 @@ _ALLOWED_PAIRS: set[tuple[str, str]] = {
 _EXPECTED_CANONICAL: dict[tuple[str, str], tuple[EntityType, str]] = {
     ("issue", "opened"): (EntityType.ISSUE, "issue.opened"),
     ("issue", "edited"): (EntityType.ISSUE, "issue.updated"),
+    ("issue", "updated"): (EntityType.ISSUE, "issue.updated"),
     ("issue", "reopened"): (EntityType.ISSUE, "issue.reopened"),
     ("issue", "closed"): (EntityType.ISSUE, "issue.closed"),
     ("pull_request", "opened"): (EntityType.CHANGE_REQUEST, "change_request.opened"),

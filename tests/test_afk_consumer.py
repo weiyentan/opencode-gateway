@@ -1452,6 +1452,7 @@ def _normalized_payload(**overrides: object) -> dict:
     [
         ("issue", "opened", EntityType.ISSUE, "issue.opened"),
         ("issue", "edited", EntityType.ISSUE, "issue.updated"),
+        ("issue", "updated", EntityType.ISSUE, "issue.updated"),
         ("issue", "reopened", EntityType.ISSUE, "issue.reopened"),
         ("issue", "closed", EntityType.ISSUE, "issue.closed"),
         ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
@@ -1587,6 +1588,7 @@ async def test_unsupported_normalized_action_routes_to_dlq() -> None:
         ("issue", "edited", EntityType.ISSUE, "updated"),
         # updated → updated convergence (GitLab real action)
         ("merge_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "updated", EntityType.ISSUE, "updated"),
         # reopened → reopened (direct)
         ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
         ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
@@ -1811,6 +1813,137 @@ async def test_issue_edited_action_persists_not_routed_to_dlq() -> None:
     assert event_call.args[3] == "issue"  # entity_type
     assert event_call.args[4] == "442"  # external_id
     assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GitLab issue.updated acceptance (issue #554)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# GitLab emits ``issue.updated`` (not ``issue.edited``).  The consumer
+# must accept it, map it to canonical ``issue.updated``, persist it, and
+# never route it to the DLQ.  GitHub ``issue.edited`` continues to work.
+
+
+def test_validate_accepts_gitlab_issue_updated() -> None:
+    """A GitLab issue event with action=updated passes validate_normalized_event."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    # Must not raise — this is the core acceptance criterion.
+    validate_normalized_event(message)
+
+
+def test_map_normalized_event_issue_updated_to_canonical() -> None:
+    """GitLab ``issue.updated`` maps to entity_type=issue, event_type=issue.updated."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.ISSUE
+    assert entity.entity_id == "issue:442"
+    assert event.event_type == "issue.updated"
+
+
+def test_map_normalized_event_issue_updated_retains_source_action() -> None:
+    """Source action ``updated`` is retained as provenance on the event payload."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload["source_action"] == "updated"
+    assert event.payload["source_resource_type"] == "issue"
+
+
+@pytest.mark.asyncio
+async def test_issue_updated_persists_not_routed_to_dlq() -> None:
+    """A normalized ``issue.updated`` persists as canonical ``issue.updated``
+    — never routed to the DLQ (issue #554 live bug fix)."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _normalized_payload(
+                resource_type="issue",
+                action="updated",
+                provider="gitlab",
+            )
+        )
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "issue"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+def test_issue_edited_and_issue_updated_map_to_same_canonical() -> None:
+    """GitHub ``issue.edited`` and GitLab ``issue.updated`` converge on the
+    same canonical ``issue.updated`` event type (parity)."""
+    edited_msg = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="edited",
+            provider="github",
+        )
+    )
+    updated_msg = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    edited_mapped = map_normalized_event(edited_msg)
+    updated_mapped = map_normalized_event(updated_msg)
+
+    assert edited_mapped is not None
+    assert updated_mapped is not None
+    _, edited_event = edited_mapped
+    _, updated_event = updated_mapped
+    assert edited_event.event_type == updated_event.event_type == "issue.updated"
+    # Source actions differ — provenance preserved.
+    assert edited_event.payload["source_action"] == "edited"
+    assert updated_event.payload["source_action"] == "updated"
+
+
+def test_issue_unsupported_action_still_routes_to_dlq() -> None:
+    """Unsupported actions for issue (e.g. ``assigned``) are still rejected
+    by validate_normalized_event."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="assigned",
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported action"):
+        validate_normalized_event(message)
 
 
 @pytest.mark.asyncio

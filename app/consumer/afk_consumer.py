@@ -168,7 +168,7 @@ _ACTION_TO_CANONICAL: dict[str, str] = {
 #: (``docs/contracts/normalized-event-v1/producer_commit.txt`` +
 #: ``docs/contracts/normalized-event-v1/consumer-policy.yaml``).
 _PRODUCER_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
-    "issue": frozenset({"opened", "edited", "reopened", "closed"}),
+    "issue": frozenset({"opened", "edited", "updated", "reopened", "closed"}),
     "pull_request": frozenset({"opened", "edited", "reopened", "closed", "merged"}),
     "merge_request": frozenset({"opened", "updated", "reopened", "closed", "merged"}),
 }
