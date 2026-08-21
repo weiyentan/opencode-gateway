@@ -73,6 +73,16 @@
           </span>
           <span class="top-nav-label">AFK Outcomes</span>
         </li>
+        <!-- Transcript / Timeline (issue #469): session-level execution
+             transcript view backed by /api/v1/execution/* endpoints. -->
+        <li class="top-nav-item" data-tab="transcript" tabindex="0">
+          <span class="top-nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M4 6h16M4 10h16M4 14h10M4 18h6"></path>
+            </svg>
+          </span>
+          <span class="top-nav-label">Transcript</span>
+        </li>
       </ul>
     </nav>
 
@@ -400,6 +410,59 @@
     </section>
 
     </div><!-- #tab-afk-outcomes -->
+
+    <!-- ── Tab: Transcript / Timeline (issue #469) ─────────────────────── -->
+    <!-- Execution transcript view: session header, chronological messages,
+         parts, and unified timeline with depth-annotated parent/child
+         distinction.  Consumes /api/v1/execution/* with keyset cursor
+         pagination (next_cursor).  Kept distinct from usage/aggregate views. -->
+    <div class="tab-content" id="tab-transcript">
+
+    <section class="glass-panel panel-transcript">
+      <h2 class="panel-title">Execution Transcript</h2>
+
+      <!-- Session input + Load button -->
+      <div class="tr-controls">
+        <div class="tr-controls-row">
+          <label for="tr-session-input" class="tr-label">Session UUID</label>
+          <input type="text" id="tr-session-input" class="tr-input"
+                 placeholder="e.g. 550e8400-e29b-41d4-a716-446655440000"
+                 spellcheck="false" autocomplete="off">
+          <button id="tr-load-btn" class="tr-load-btn">Load</button>
+        </div>
+      </div>
+
+      <!-- Session header card -->
+      <div id="tr-session-header" class="tr-session-header">
+        <p class="empty-state">Enter a session UUID above to view its execution transcript</p>
+      </div>
+
+      <!-- View toggle: Timeline / Messages / Parts -->
+      <div id="tr-view-toggle" class="tr-view-toggle">
+        <button class="tr-view-btn active" data-view="timeline">Timeline</button>
+        <button class="tr-view-btn" data-view="messages">Messages</button>
+        <button class="tr-view-btn" data-view="parts">Parts</button>
+      </div>
+
+      <!-- View containers (only one visible at a time) -->
+      <div id="tr-timeline-wrap" class="tr-view-wrap tr-timeline-wrap">
+        <p class="empty-state">Load a session to view the unified timeline</p>
+      </div>
+      <div id="tr-messages-wrap" class="tr-view-wrap tr-messages-wrap" style="display:none">
+        <p class="empty-state">Load a session to view messages</p>
+      </div>
+      <div id="tr-parts-wrap" class="tr-view-wrap tr-parts-wrap" style="display:none">
+        <p class="empty-state">Load a session to view parts</p>
+      </div>
+
+      <!-- Pagination + status -->
+      <div class="tr-pagination">
+        <button id="tr-next-page-btn" class="tr-next-page-btn" disabled>End of stream</button>
+        <span id="tr-status" class="tr-status"></span>
+      </div>
+    </section>
+
+    </div><!-- #tab-transcript -->
 
   </main>
 
