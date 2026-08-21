@@ -35,14 +35,21 @@ _CREDENTIAL_ID = uuid.uuid4()
 
 
 def _auth_row() -> MagicMock:
-    """Return a mock row that passes require_collector_token."""
+    """Return a mock row that passes require_collector_token.
+
+    The credential is attributable to the dedicated AWX execution-binding
+    integration client (issue #550) — the only client accepted by the
+    write path.
+    """
+    from app.api.afk_executions import AWX_EXECUTION_BINDING_CLIENT_NAME
+
     return mock_row(
         {
             "credential_id": _CREDENTIAL_ID,
             "revoked_at": None,
             "last_used_at": None,
             "client_id": _CLIENT_ID,
-            "client_name": "test-client",
+            "client_name": AWX_EXECUTION_BINDING_CLIENT_NAME,
             "client_is_active": True,
         }
     )
