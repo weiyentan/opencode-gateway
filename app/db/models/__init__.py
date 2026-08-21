@@ -6,6 +6,7 @@ from app.db.models.afk import (
     AFKRunSessionLink,
     DeliveryLog,
     EngineeringEvent,
+    ExecutionBinding,
     ResourceSessionAssociation,
     UnresolvedCorrelation,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "DeliveryLog",
     "DeliveryStateTrail",
     "EngineeringEvent",
+    "ExecutionBinding",
     "IngestAudit",
     "IngestBatch",
     "ObservedMessage",
