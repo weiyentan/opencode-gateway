@@ -75,6 +75,7 @@ def _mk_binding_row(
     """Build a mock asyncpg Record for an execution_bindings row."""
     return mock_row(
         {
+            "id": uuid.UUID(binding_id),
             "binding_id": binding_id,
             "awx_job_id": awx_job_id,
             "external_session_id": external_session_id,

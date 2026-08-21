@@ -64,6 +64,7 @@ def _saved_row() -> MagicMock:
     """Return a mock ``execution_bindings`` row for a saved binding."""
     return mock_row(
         {
+            "id": uuid.uuid4(),
             "awx_job_id": 42,
             "external_session_id": "ses_abc123",
             "provider": "github",

@@ -132,7 +132,7 @@ def _source_reference_json(sources: list[ReferenceSource]) -> str:
 def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
     """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`."""
     return ExecutionBinding(
-        binding_id="",
+        binding_id=str(row["id"]),
         awx_job={"job_id": str(row["awx_job_id"]), "job_template_id": 0},
         external_session_id=row["external_session_id"] or "",
         resource={

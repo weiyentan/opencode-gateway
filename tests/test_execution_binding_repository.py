@@ -18,6 +18,7 @@ issued by the repository:
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -198,6 +199,7 @@ def test_get_execution_binding_returns_binding(mock_conn: AsyncMock) -> None:
     mock_conn.fetchrow = AsyncMock(
         return_value=mock_row(
             {
+                "id": uuid.uuid4(),
                 "awx_job_id": 500,
                 "external_session_id": "ses_abc123",
                 "provider": "github",
@@ -288,6 +290,7 @@ def test_list_execution_bindings_returns_all_bindings(
         return_value=[
             mock_row(
                 {
+                    "id": uuid.uuid4(),
                     "awx_job_id": 100,
                     "external_session_id": "ses_001",
                     "provider": "github",
@@ -305,6 +308,7 @@ def test_list_execution_bindings_returns_all_bindings(
             ),
             mock_row(
                 {
+                    "id": uuid.uuid4(),
                     "awx_job_id": 101,
                     "external_session_id": "ses_002",
                     "provider": "github",
@@ -374,6 +378,7 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
         return_value=[
             mock_row(
                 {
+                    "id": uuid.uuid4(),
                     "awx_job_id": 500,
                     "external_session_id": "ses_001",
                     "provider": "github",
@@ -391,6 +396,7 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
             ),
             mock_row(
                 {
+                    "id": uuid.uuid4(),
                     "awx_job_id": 501,
                     "external_session_id": "ses_002",
                     "provider": "github",
