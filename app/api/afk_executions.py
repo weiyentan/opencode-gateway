@@ -13,7 +13,10 @@ write and read paths:
 All responses use the ``{status, data, error}`` envelope and are protected
 by the global :class:`~app.core.auth.ApiKeyMiddleware`.  The write path
 additionally requires a collector credential via
-:func:`~app.core.auth.require_collector_token`.
+:func:`~app.core.auth.require_collector_token` — and the credential must be
+attributable to the dedicated AWX execution-binding integration client
+(``AWX_EXECUTION_BINDING_CLIENT_NAME``), never the usage collector
+(``opencode-collector``) or any other client (issue #550).
 
 Write semantics (ADR 0024):
 
@@ -52,6 +55,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["afk-executions"])
 
+# ── Dedicated AWX integration credential contract (issue #550) ──────────────
+
+# The write path accepts ONLY collector credentials attributable to this
+# client.  Provision it through the existing admin clients API
+# (``POST /admin/clients``) with this exact name, then register the AWX
+# integration's bearer-token hash as one of its collector credentials —
+# never reuse the usage collector's (``opencode-collector``) credential or
+# treat the Admin API Key alone as sufficient.
+AWX_EXECUTION_BINDING_CLIENT_NAME = "awx-execution-bindings"
+
 # ── Valid enum filter values (locked domain vocabulary) ──────────────────────
 
 _VALID_PROVIDERS = frozenset(m.value for m in Provider)
@@ -59,6 +72,33 @@ _VALID_ENTITY_TYPES = frozenset(m.value for m in EntityType)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+async def require_awx_execution_binding_credential(
+    auth: dict[str, str] = Depends(require_collector_token),
+) -> dict[str, str]:
+    """Collector-token gate for the execution-binding write path (issue #550).
+
+    Composes the existing ``require_collector_token`` dependency — missing,
+    malformed, empty, invalid, revoked, and inactive credentials are
+    rejected with the same 401 behavior and error codes as ``/ingest`` —
+    with a client-attribution check: the credential must belong to the
+    dedicated AWX execution-binding integration client.  A valid
+    credential owned by any other client (e.g. the usage collector
+    ``opencode-collector``) is rejected with 403.
+
+    Only the SHA-256 token hash is ever inspected; the raw bearer token is
+    never persisted, returned, or logged.
+    """
+    if auth["client_name"] != AWX_EXECUTION_BINDING_CLIENT_NAME:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Credential is not attributable to the dedicated AWX "
+                "execution-binding integration client"
+            ),
+        )
+    return auth
 
 
 def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
@@ -105,7 +145,7 @@ def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
 async def create_execution_binding(
     body: ExecutionBindingCreateRequest,
     request: Request,
-    auth: dict = Depends(require_collector_token),
+    auth: dict = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
     """Persist one final execution binding from AWX.
