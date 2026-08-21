@@ -1,0 +1,308 @@
+"""Tests for the execution-binding API schemas (issue #548).
+
+The execution-binding write path (``POST /api/v1/afk/executions``, ADR 0024)
+accepts an AWX job identity, an OpenCode external session id, a provider
+resource identity, and a terminal outcome.  GitHub pull requests and GitLab
+merge requests both normalize to the canonical ``change_request`` identity.
+The public schemas expose only approved execution metadata — raw tokens,
+stdout, prompts, arbitrary AWX payloads, and unbounded ``extra_vars`` are
+structurally absent and rejected as unknown fields.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from app.core.schemas.execution_binding import (
+    ExecutionBindingCreateRequest,
+    ExecutionBindingHistoryResponse,
+    ExecutionBindingReadResponse,
+    ExecutionBindingResourceIn,
+)
+from afk_outcomes.models import (
+    EntityType,
+    ExecutionOutcome,
+    Provider,
+)
+
+
+def _valid_request(**overrides) -> dict:
+    """A minimal valid write request (GitHub PR → change_request)."""
+    payload = {
+        "awx_job": {"job_id": "awx-job-42", "job_template_id": 7},
+        "external_session_id": "ses_abc123",
+        "resource": {
+            "provider": "github",
+            "repository": "owner/repo",
+            "resource_type": "pull_request",
+            "resource_number": "101",
+        },
+        "outcome": "completed",
+    }
+    payload.update(overrides)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Provider resource identity normalization
+# ---------------------------------------------------------------------------
+
+
+class TestProviderNormalization:
+    def test_github_pull_request_normalizes_to_change_request(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(_valid_request())
+        identity = request.resource.to_provider_resource_identity()
+        assert identity.provider is Provider.GITHUB
+        assert identity.resource_type is EntityType.CHANGE_REQUEST
+        assert identity.repository == "owner/repo"
+        assert identity.resource_number == "101"
+
+    def test_gitlab_merge_request_normalizes_to_change_request(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                resource={
+                    "provider": "gitlab",
+                    "repository": "group/project",
+                    "resource_type": "merge_request",
+                    "resource_number": "25",
+                }
+            )
+        )
+        identity = request.resource.to_provider_resource_identity()
+        assert identity.provider is Provider.GITLAB
+        assert identity.resource_type is EntityType.CHANGE_REQUEST
+        assert identity.resource_number == "25"
+
+    def test_canonical_change_request_passes_through(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "change_request",
+                    "resource_number": "7",
+                }
+            )
+        )
+        identity = request.resource.to_provider_resource_identity()
+        assert identity.resource_type is EntityType.CHANGE_REQUEST
+
+
+# ---------------------------------------------------------------------------
+# Required-field validation
+# ---------------------------------------------------------------------------
+
+
+class TestRequiredFields:
+    def test_minimal_request_validates(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(_valid_request())
+        assert request.awx_job.job_id == "awx-job-42"
+        assert request.external_session_id == "ses_abc123"
+        assert request.outcome is ExecutionOutcome.COMPLETED
+
+    def test_missing_awx_job_rejected(self) -> None:
+        payload = _valid_request()
+        del payload["awx_job"]
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_missing_session_id_rejected(self) -> None:
+        payload = _valid_request()
+        del payload["external_session_id"]
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_empty_session_id_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(external_session_id="")
+            )
+
+    def test_missing_resource_rejected(self) -> None:
+        payload = _valid_request()
+        del payload["resource"]
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_missing_outcome_rejected(self) -> None:
+        payload = _valid_request()
+        del payload["outcome"]
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
+# Optional-field handling
+# ---------------------------------------------------------------------------
+
+
+class TestOptionalFields:
+    def test_optional_fields_default_to_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(_valid_request())
+        assert request.source_event_id is None
+        assert request.branch is None
+        assert request.title is None
+        assert request.started_at is None
+        assert request.finished_at is None
+        assert request.failure_reason is None
+
+    def test_optional_metadata_preserved(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                source_event_id="eda-event-9",
+                branch="feature/execution-binding",
+                title="Implement execution binding",
+                started_at="2026-08-21T01:02:03Z",
+                finished_at="2026-08-21T01:05:00Z",
+                failure_reason="Process exited with code 1",
+            )
+        )
+        assert request.source_event_id == "eda-event-9"
+        assert request.branch == "feature/execution-binding"
+        assert request.title == "Implement execution binding"
+        assert request.finished_at is not None
+        assert request.failure_reason == "Process exited with code 1"
+
+    def test_resource_extra_fields_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionBindingResourceIn.model_validate(
+                {
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "1",
+                    "extra_vars": {"password": "secret"},
+                }
+            )
+
+
+# ---------------------------------------------------------------------------
+# Invalid payload rejection
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidPayloads:
+    def test_invalid_provider_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="provider"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    resource={
+                        "provider": "bitbucket",
+                        "repository": "owner/repo",
+                        "resource_type": "pull_request",
+                        "resource_number": "1",
+                    }
+                )
+            )
+
+    def test_invalid_outcome_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="outcome"):
+            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+
+    def test_outcome_must_be_terminal(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="in_progress"))
+
+    def test_non_change_request_resource_type_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="resource_type"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    resource={
+                        "provider": "github",
+                        "repository": "owner/repo",
+                        "resource_type": "issue",
+                        "resource_number": "1",
+                    }
+                )
+            )
+
+    def test_failure_reason_bounded_at_max_length(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="x" * 1000)
+        )
+        assert len(request.failure_reason) == 1000
+
+    def test_unbounded_failure_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", failure_reason="x" * 1001)
+            )
+
+    def test_raw_tokens_stdout_prompts_rejected(self) -> None:
+        """Raw tokens/stdout/prompts/extra_vars are not part of the schema."""
+        for forbidden in (
+            "input_tokens",
+            "output_tokens",
+            "stdout",
+            "prompts",
+            "extra_vars",
+        ):
+            payload = _valid_request()
+            payload[forbidden] = {"raw": "sensitive payload"}
+            with pytest.raises(ValidationError):
+                ExecutionBindingCreateRequest.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+
+def _valid_read_binding(**overrides) -> dict:
+    binding = {
+        "binding_id": "01HZX7S0KQ00000000000000",
+        "awx_job": {"job_id": "awx-job-1", "job_template_id": 3},
+        "external_session_id": "ses_retry123",
+        "resource": {
+            "provider": "gitlab",
+            "repository": "group/project",
+            "resource_type": "change_request",
+            "resource_number": "25",
+        },
+        "outcome": "completed",
+    }
+    binding.update(overrides)
+    return binding
+
+
+class TestResponseSchemas:
+    def test_single_binding_read_response(self) -> None:
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding(
+                outcome="failed",
+                failure_reason="Transient AWX failure",
+                source_event_id="eda-event-2",
+            )
+        )
+        assert response.binding_id == "01HZX7S0KQ00000000000000"
+        assert response.outcome is ExecutionOutcome.FAILED
+        assert response.failure_reason == "Transient AWX failure"
+        assert response.resource.resource_type is EntityType.CHANGE_REQUEST
+
+    def test_resource_history_preserves_failed_then_successful(self) -> None:
+        history = ExecutionBindingHistoryResponse.model_validate(
+            {
+                "resource": {
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "change_request",
+                    "resource_number": "101",
+                },
+                "bindings": [
+                    _valid_read_binding(outcome="failed"),
+                    _valid_read_binding(binding_id="01HZX7S0KQ00000000000001"),
+                ],
+            }
+        )
+        assert len(history.bindings) == 2
+        assert history.bindings[0].outcome is ExecutionOutcome.FAILED
+        assert history.bindings[1].outcome is ExecutionOutcome.COMPLETED
+        assert history.resource.resource_number == "101"
+
+    def test_response_schemas_expose_no_forbidden_fields(self) -> None:
+        """Approved metadata only — no raw tokens/stdout/prompts/extra_vars."""
+        for field_name in ("tokens", "stdout", "prompts", "extra_vars", "payload"):
+            assert field_name not in ExecutionBindingReadResponse.model_fields
+            assert field_name not in ExecutionBindingHistoryResponse.model_fields
+            assert field_name not in ExecutionBindingCreateRequest.model_fields
