@@ -123,6 +123,20 @@ timeline, not an accounting summary. Exposed read-only via the
 `/api/v1/execution` endpoints (ADR 0016).
 _Avoid_: replay blob, transcript (in the usage-aggregate sense)
 
+**Execution Binding**:
+A durable Gateway record linking one AWX execution to one OpenCode external
+session and one provider resource identity.
+_Avoid_: attempt, inferred correlation
+
+**AWX Execution**:
+One externally identified AWX job run that invokes an OpenCode execution.
+_Avoid_: AWX attempt (unless explicitly describing a separate job run)
+
+**Execution Outcome**:
+The terminal result of an Execution Binding, such as `completed`, `failed`,
+or `cancelled`.
+_Avoid_: AFK Run status
+
 **Observed Message**:
 A Gateway-owned row (`observed_messages`, migration 0029) projecting one
 OpenCode `message` row: its identity, session linkage, role/agent/mode
@@ -1355,6 +1369,12 @@ manages.
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 - An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
+- An **Execution Binding** belongs to exactly one **AWX Execution**, one **External Session ID**, and one **Stable Resource Identity**; a resource may have many bindings, including failed and later successful executions
+- An **Execution Binding** is idempotent by AWX job identity: repeating the same binding is a no-op, conflicting data for the same AWX job is rejected, and a new AWX job for the same resource creates a separate binding
+- A GitHub pull request and GitLab merge request are both represented as a `change_request` **Stable Resource Identity**; provider identity is supplied at the API boundary rather than an internal Gateway database ID
+- An **Execution Binding** may carry the originating EDA `source_event_id`, branch metadata, title, terminal timestamps, and a bounded redacted failure summary; it never stores raw `extra_vars`, stdout, prompts, tokens, or arbitrary AWX payloads
+- The execution-binding API exposes a write path for final bindings and read paths by AWX job identity or stable provider resource identity; read results preserve the full failed-to-successful execution history
+- The execution-binding write path uses a dedicated **Collector Credential** for the AWX integration; it does not reuse the `opencode-collector` credential or the **Admin API Key**
 - A **Retention Tier** groups the AFK/reporting data into aggregates (indefinite), metadata (12 months), redacted payload (90 days), and the **DLQ Operational Max** (30 days), each configurable via `GATEWAY_RETENTION_*` (ADR 0022)
 - The **DLQ Operational Max** stamps every `afk.events-dlq` record with `dead_lettered_at` + `max_age_days` and escalates records strictly older than the max to `afk.events-dlq-expired` — never unbounded, never silently dropped
 - An **Operator Token** gates operator-only read surfaces (delivery payload, DLQ) and is distinct from the **Admin API Key** and **Collector Credential** — no token is shared across pipelines
