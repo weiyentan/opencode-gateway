@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -59,6 +59,8 @@ from app.consumer.afk_consumer import (
 )
 from app.core.metrics import MetricsRegistry
 from app.core.repository import normalize_repository_url
+
+UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
 DELIVERY_ID = "11111111-2222-3333-4444-555555555555"
 
