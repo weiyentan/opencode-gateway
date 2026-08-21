@@ -146,6 +146,7 @@ def create_app(
     from app.api.admin_resolve_source_identity import (
         router as admin_resolve_source_identity_router,
     )
+    from app.api.afk_executions import router as afk_executions_router
     from app.api.afk_outcomes import router as afk_outcomes_router
     from app.api.closure_relationships import router as closure_relationships_router
     from app.api.cursor import router as cursor_router
@@ -171,5 +172,6 @@ def create_app(
     app.include_router(execution_router, prefix="/api/v1/execution")
     app.include_router(reporting_ingest_router)
     app.include_router(reporting_router)
+    app.include_router(afk_executions_router, prefix="/api/v1/afk/executions")
 
     return app
