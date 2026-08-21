@@ -113,8 +113,8 @@ services:
   # ── AFK Outcome Consumer ─────────────────────────────────────────────
   # Live ingestion for AFK Outcome Observability: consumes the normalized
   # provider-events topic (``engineering.events.normalized``, issue #531) in
-  # its OWN group (``opencode-outcomes``) and writes canonical engineering
-  # events to Postgres, plus a scheduled reconciliation loop.
+  # its OWN group (``opencode-normalized-events``) and writes canonical
+  # engineering events to Postgres, plus a scheduled reconciliation loop.
   afk-outcomes-consumer:
     build:
       context: .
@@ -128,7 +128,7 @@ services:
       # (app/core/config.py) but the consumer no longer reads them.
       GATEWAY_NORMALIZED_EVENTS_TOPIC: ${GATEWAY_NORMALIZED_EVENTS_TOPIC:-engineering.events.normalized}
       GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC: ${GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC:-engineering.events.normalized.dlq}
-      GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID: ${GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID:-opencode-outcomes}
+      GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID: ${GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID:-opencode-normalized-events}
       GATEWAY_AFK_OUTCOMES_PROVIDER: ${GATEWAY_AFK_OUTCOMES_PROVIDER:-github}
       # The consumer always needs a repository to reconcile — the Settings
       # validator fires on startup when the flag is on and the repository is

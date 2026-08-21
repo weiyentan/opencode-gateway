@@ -152,6 +152,7 @@ class Settings(BaseSettings):
     # GATEWAY_NORMALIZED_EVENTS_TOPIC.
     normalized_events_topic: str = "engineering.events.normalized"
     normalized_events_dlq_topic: str = "engineering.events.normalized.dlq"
+    normalized_events_consumer_group_id: str = "opencode-normalized-events"
 
     # ``afk_outcomes_topic`` / ``afk_outcomes_dlq_topic`` — compatibility-only
     # (issue #531).  The legacy ``afk.events`` command topic and its DLQ.  The
