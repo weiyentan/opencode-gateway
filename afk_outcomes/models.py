@@ -685,7 +685,7 @@ class ProviderResourceIdentity(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_resource_type_is_change_request(self):
+    def _validate_resource_type_is_change_request(self) -> ProviderResourceIdentity:
         """Ensure resource_type is change_request (the only allowed type for
         execution bindings — GitHub PRs and GitLab MRs both normalize here)."""
         if self.resource_type is not EntityType.CHANGE_REQUEST:
