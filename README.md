@@ -108,7 +108,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC` | `engineering.events.normalized.dlq` | Dead-letter queue topic for poison normalized provider-events messages |
 | `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Compatibility-only (issue #531): legacy `afk.events` command topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
 | `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Compatibility-only (issue #531): legacy AFK outcome DLQ topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
-| `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
+| `GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID` | `opencode-normalized-events` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
 | `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
@@ -188,7 +188,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
 | **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
 | **kafka**   | `opencode-gateway-kafka`| —         | 9092          | Local KRaft Kafka broker (single node; internal — no host ports). Backstops both streaming consumers; the provider-events topic is external |
-| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the normalized provider-events topic (`engineering.events.normalized`) in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
+| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the normalized provider-events topic (`engineering.events.normalized`) in its own group (`opencode-normalized-events`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
 
 > **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
