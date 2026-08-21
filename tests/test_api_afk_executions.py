@@ -226,6 +226,67 @@ class TestCreateExecutionBinding:
         assert data["data"]["awx_job"]["job_id"] == "42"
 
     @pytest.mark.asyncio
+    async def test_conflicting_data_returns_409(self) -> None:
+        """Different data for same AWX job ID returns 409 Conflict."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        existing_row = _mk_binding_row(awx_job_id=42)
+        # Auth lookup → existing binding found → conflict check → 409
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_different",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_conflicting_resource_number_returns_409(self) -> None:
+        """Different resource_number for same AWX job ID returns 409 Conflict."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        existing_row = _mk_binding_row(awx_job_id=42)
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "123",
+            },
+            "outcome": "completed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
     async def test_invalid_outcome_rejected(self) -> None:
         """Invalid outcome value is rejected with 422."""
         from tests.conftest import create_client

@@ -1667,7 +1667,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         row = await self._conn.fetchrow(
             """
-            SELECT awx_job_id, external_session_id, provider, repository_url,
+            SELECT id, awx_job_id, external_session_id, provider, repository_url,
                    entity_type, entity_number, outcome, source_event_id,
                    branch, title, failure_reason, started_at, finished_at
             FROM execution_bindings
@@ -1696,7 +1696,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         rows = await self._conn.fetch(
             """
-            SELECT awx_job_id, external_session_id, provider, repository_url,
+            SELECT id, awx_job_id, external_session_id, provider, repository_url,
                    entity_type, entity_number, outcome, source_event_id,
                    branch, title, failure_reason, started_at, finished_at
             FROM execution_bindings

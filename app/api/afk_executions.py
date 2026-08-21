@@ -170,10 +170,10 @@ async def create_execution_binding(
 
         if existing is not None:
             # Check for conflict: different data for same AWX job
-            if (str(existing.awx_job.job_id) != str(body.awx_job.job_id) or
-                existing.external_session_id != body.external_session_id or
+            if (existing.external_session_id != body.external_session_id or
                 existing.resource.provider != body.resource.provider or
-                existing.resource.resource_type.value != body.resource.resource_type):
+                existing.resource.resource_type.value != body.resource.resource_type or
+                existing.resource.resource_number != body.resource.resource_number):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Conflicting data for existing AWX job binding"
