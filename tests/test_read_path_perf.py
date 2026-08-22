@@ -482,6 +482,36 @@ def _setup_synthetic_mocks(mock_conn: AsyncMock) -> None:
                     last_message_at=now - timedelta(hours=2),
                 ),
             ]
+        # Issue #557: the agent-runs list and sessions queries now join
+        # usage_events (read-time reasoning/provider CTEs), so they MUST be
+        # dispatched on their outer-CTE markers BEFORE the generic
+        # "usage_events" branch below — otherwise they receive
+        # record-shaped rows.
+        if "FROM base s" in sql:
+            return [
+                _mk_session_row(
+                    session_id=uuid.uuid4(),
+                    client_id=_SYNTH_CLIENT_ID,
+                    external_session_id=f"ses_{i:04d}",
+                    last_message_at=now - timedelta(minutes=i * 10),
+                    message_count=i + 5,
+                    agent="code-editor",
+                    child_run_count=1 if i < 3 else 0,
+                    session_model="gpt-4",
+                )
+                for i in range(10)
+            ]
+        if "FROM page p" in sql:
+            return [
+                _mk_usage_session_row(
+                    session_id=uuid.uuid4(),
+                    client_id=_SYNTH_CLIENT_ID,
+                    first_message_at=now - timedelta(days=i),
+                    last_message_at=now - timedelta(hours=i),
+                    message_count=i + 1,
+                )
+                for i in range(10)
+            ]
         # Usage records queries (must match BEFORE sessions join to avoid wrong-shape rows).
         # Augments with context fields so records-with-context endpoint gets them.
         if "usage_events" in sql:

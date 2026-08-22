@@ -268,6 +268,11 @@ var historyStub = {
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
   window.formatAgentRunTimestamp = sandboxWindow.formatAgentRunTimestamp;
+  // Issue #557: provider badge/missing-label, cache hit ratio, and the
+  // Token Breakdown detail-section builder join the window test seam.
+  window.fmtProvider = sandboxWindow.fmtProvider;
+  window.fmtCacheHitRatio = sandboxWindow.fmtCacheHitRatio;
+  window.fmtTokenBreakdownSection = sandboxWindow.fmtTokenBreakdownSection;
   window.readFiltersFromUI = sandboxWindow.readFiltersFromUI;
   window.computeArDateFilterState = sandboxWindow.computeArDateFilterState;
   window.syncArDateFilterUI = sandboxWindow.syncArDateFilterUI;
@@ -2007,8 +2012,10 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
   assert(expectedAbs === 'Jun 15, 2025, 10:30 AM',
     'seam sanity: window.formatAgentRunTimestamp derives "Jun 15, 2025, 10:30 AM" (issue #4 formatter)');
 
-  // Static: the 11-column header is unchanged (no new column for the
-  // relative label — it lives inside the existing Last Updated cell).
+  // Static: the header column count (issue #557 extended the merged table
+  // from 11 to 15 columns with Provider, Cache Read, Cache Write, and
+  // Reasoning — the relative label itself still lives inside the existing
+  // Last Updated cell, no new column for it).
   var headerHtml = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   var arThead = headerHtml.slice(
     headerHtml.indexOf('<table id="agent-runs-table">'),
@@ -2016,7 +2023,7 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
   );
   // <th> followed by '>' or whitespace — <thead> does not count as a column
   var thCount = (arThead.match(/<th[\s>]/g) || []).length;
-  assert(thCount === 11, 'index.html: agent-runs header keeps exactly 11 columns (' + thCount + ' found)');
+  assert(thCount === 15, 'index.html: agent-runs header carries 15 columns (' + thCount + ' found)');
   assert(arThead.indexOf('<th>Last Updated</th>') !== -1,
     'index.html: "Last Updated" header cell present and not ar-col-low (visible at all widths)');
 
@@ -2105,15 +2112,16 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
       assert(/^<td data-label="Last Updated">--<\/td>$/.test(cellMiss),
         'row markup: missing timestamp renders bare -- without breaking the row');
 
-      // Empty state: the colspan="11" invariant is unchanged after the cell
-      // rework (row markup still spans the full 11-column table).
+      // Empty state: the colspan="15" invariant reflects the four v1.2
+      // columns added by issue #557 (Provider, Cache Read, Cache Write,
+      // Reasoning) — the row markup still spans the full 15-column table.
       appJsSandbox.fetch = function () {
         return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
       };
       arFilterClearEl._handlers.click();
       setTimeout(function () {
-        assert(arTbodyEl.innerHTML.indexOf('colspan="11"') !== -1,
-          'empty state: colspan="11" preserved');
+        assert(arTbodyEl.innerHTML.indexOf('colspan="15"') !== -1,
+          'empty state: colspan="15" preserved');
         assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
           'empty state: "No agent runs" message intact');
         pendingAsyncBlocks--; // balances the block's single increment (above)
@@ -4784,6 +4792,111 @@ console.log('\u25B6 style.css — transcript styles (smoke check)');
   assert(live.indexOf('.panel-transcript') !== -1, 'style.css: .panel-transcript rule exists');
   assert(live.indexOf('.tr-text-content') !== -1, 'style.css: .tr-text-content rule exists');
   assert(live.indexOf('.tr-view-wrap') !== -1, 'style.css: .tr-view-wrap rule exists');
+})();
+
+// ── Issue #557: provider + token-breakdown helpers (pure functions) ─────
+// The v1.2 raw-token/provider presentation: provider badges with missing
+// labels, cache hit ratio math, the Token Breakdown detail section, the
+// merged-table header additions, and the neutral provider-badge / numeric
+// column styles — all verified against the production app.js/index.html/
+// style.css (no copy-paste duplicates).
+
+console.log('\u25B6 issue #557 — provider + token breakdown');
+
+(function () {
+  // fmtProvider: badge for present values, missing labels otherwise.
+  var badgeHtml = window.fmtProvider('openai');
+  assert(badgeHtml.indexOf('badge-provider') !== -1 && badgeHtml.indexOf('openai') !== -1,
+    'fmtProvider: present provider renders a badge-provider badge with the text label');
+  assert(window.fmtProvider(null) === '\u2014', 'fmtProvider: null renders em dash by default');
+  assert(window.fmtProvider(undefined) === '\u2014', 'fmtProvider: undefined renders em dash by default');
+  assert(window.fmtProvider('') === '\u2014', 'fmtProvider: empty string renders em dash by default');
+  assert(window.fmtProvider(null, 'unknown') === 'unknown',
+    'fmtProvider: detail overlay missing label is "unknown"');
+  assert(window.fmtProvider('anthropic', 'unknown').indexOf('anthropic') !== -1,
+    'fmtProvider: present provider ignores the missing label');
+
+  // fmtCacheHitRatio: read / (input + read), '--' on zero denominator.
+  assert(window.fmtCacheHitRatio(25, 100) === '20.0%', 'fmtCacheHitRatio: 25/(100+25) = 20.0%');
+  assert(window.fmtCacheHitRatio(0, 0) === '--', 'fmtCacheHitRatio: zero denominator renders --');
+  assert(window.fmtCacheHitRatio(null, 100) === '0.0%', 'fmtCacheHitRatio: null read treated as 0');
+  assert(window.fmtCacheHitRatio(10, null) === '100.0%', 'fmtCacheHitRatio: null input treated as 0');
+
+  // fmtTokenBreakdownSection: read/write/reasoning totals + cache hit ratio
+  // + provider with overlay missing semantics.
+  var section = window.fmtTokenBreakdownSection({
+    total_input_tokens: 100,
+    total_output_tokens: 50,
+    total_cache_read_tokens: 25,
+    total_cache_write_tokens: 5,
+    total_reasoning_tokens: 7,
+    primary_provider: 'openai'
+  });
+  assert(section.indexOf('Token Breakdown') !== -1, 'token breakdown: section title present');
+  assert(section.indexOf('Cache Read Tokens') !== -1 && section.indexOf('25') !== -1,
+    'token breakdown: cache read total present');
+  assert(section.indexOf('Cache Write Tokens') !== -1 && section.indexOf('>5<') !== -1,
+    'token breakdown: cache write total present');
+  assert(section.indexOf('Reasoning Tokens') !== -1 && section.indexOf('>7<') !== -1,
+    'token breakdown: reasoning total present');
+  assert(section.indexOf('Cache Hit Ratio') !== -1 && section.indexOf('20.0%') !== -1,
+    'token breakdown: cache hit ratio present');
+  assert(section.indexOf('badge-provider') !== -1 && section.indexOf('openai') !== -1,
+    'token breakdown: provider badge present');
+
+  var missingSection = window.fmtTokenBreakdownSection({
+    total_input_tokens: 0,
+    total_output_tokens: 0,
+    total_cache_read_tokens: null,
+    total_cache_write_tokens: null,
+    total_reasoning_tokens: null,
+    primary_provider: null
+  });
+  assert(missingSection.indexOf('unknown') !== -1, 'token breakdown: missing provider renders "unknown"');
+  assert(missingSection.indexOf('>0<') !== -1, 'token breakdown: null token fields render 0');
+  assert(missingSection.indexOf('Cache Hit Ratio') !== -1 && missingSection.indexOf('--') !== -1,
+    'token breakdown: zero-denominator ratio renders --');
+})();
+
+// ── Issue #557: merged-table header + style smoke checks ────────────────
+
+console.log('\u25B6 issue #557 — index.html + style.css (provider + token columns)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, ''); // comment-stripped: guards assert on real rules only
+
+  // New headers: Provider and Cache Read are retained at tablet width;
+  // Cache Write and Reasoning carry ar-col-low (hidden at 761–1024px).
+  assert(html.indexOf('<th>Provider</th>') !== -1, 'merged header: Provider column exists');
+  assert(html.indexOf('<th>Cache Read</th>') !== -1, 'merged header: Cache Read column exists');
+  assert(html.indexOf('<th class="ar-col-low">Cache Write</th>') !== -1,
+    'merged header: Cache Write marked ar-col-low (tablet-hidden)');
+  assert(html.indexOf('<th class="ar-col-low">Reasoning</th>') !== -1,
+    'merged header: Reasoning marked ar-col-low (tablet-hidden)');
+  assert(html.indexOf('<th class="ar-col-low">Provider</th>') === -1 &&
+    html.indexOf('<th class="ar-col-low">Cache Read</th>') === -1,
+    'merged header: Provider and Cache Read retained at tablet width');
+
+  // Neutral outlined provider badge: hairline border, transparent fill,
+  // no status color, no animation.
+  assert(live.indexOf('.badge-provider') !== -1, 'style.css: .badge-provider rule exists');
+  var badgeBlock = live.slice(live.indexOf('.badge-provider'), live.indexOf('}', live.indexOf('.badge-provider')) + 1);
+  assert(badgeBlock.indexOf('border: 1px solid') !== -1, 'style.css: provider badge is outlined');
+  assert(badgeBlock.indexOf('background: transparent') !== -1, 'style.css: provider badge fill is transparent');
+  assert(badgeBlock.indexOf('animation') === -1, 'style.css: provider badge has no animation/pulse');
+
+  // Numeric columns: right-aligned with tabular numerals.
+  assert(live.indexOf('#agent-runs-table td.ar-num') !== -1, 'style.css: td.ar-num rule exists');
+  var numBlock = live.slice(live.indexOf('#agent-runs-table td.ar-num'),
+    live.indexOf('}', live.indexOf('#agent-runs-table td.ar-num')) + 1);
+  assert(numBlock.indexOf('text-align: right') !== -1, 'style.css: numeric cells right-aligned');
+  assert(numBlock.indexOf('tabular-nums') !== -1, 'style.css: numeric cells use tabular numerals');
+
+  // No green active-row wash / cyan stripe / glow / pulse introduced.
+  assert(live.indexOf('[data-active') === -1,
+    'issue #557: no status-driven [data-active] row selector added');
 })();
 
 

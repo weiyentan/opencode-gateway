@@ -622,6 +622,51 @@
     return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
   }
 
+  /** Format a provider value for display (issue #557).
+   *  Present values render as a compact outlined badge (neutral palette);
+   *  null/empty/missing values render the caller's missing label:
+   *  '—' (em dash) in tables, 'unknown' in the detail overlay. */
+  function fmtProvider(value, missingLabel) {
+    var missing = missingLabel === undefined ? '\u2014' : missingLabel;
+    if (value == null || value === '') return missing;
+    return badge(String(value), 'badge-provider').outerHTML;
+  }
+
+  /** Format a cache hit ratio percentage (issue #557):
+   *  cacheRead / (input + cacheRead).  Returns '--' when the denominator
+   *  is zero (no input activity to measure against). */
+  function fmtCacheHitRatio(cacheReadTokens, inputTokens) {
+    var cr = Number(cacheReadTokens) || 0;
+    var input = Number(inputTokens) || 0;
+    var denominator = input + cr;
+    if (!(denominator > 0)) return '--';
+    return (cr / denominator * 100).toFixed(1) + '%';
+  }
+
+  /** Build the Token Breakdown detail-section HTML (issue #557).
+   *  Per-run totals for input/output/cache read/cache write/reasoning plus
+   *  the cache hit ratio and primary provider.  Null token fields render
+   *  as 0 (numeric consistency — JSON stays null); a missing provider
+   *  renders as 'unknown' in the overlay. */
+  function fmtTokenBreakdownSection(d) {
+    var input = (d && d.total_input_tokens) || 0;
+    var output = (d && d.total_output_tokens) || 0;
+    var read = (d && d.total_cache_read_tokens) || 0;
+    var write = (d && d.total_cache_write_tokens) || 0;
+    var reasoning = (d && d.total_reasoning_tokens) || 0;
+    return '<div class="detail-section">' +
+      '<div class="detail-section-title">Token Breakdown</div>' +
+      '<div class="detail-grid">' +
+        fieldHtml('Input Tokens', fmtNum(input)) +
+        fieldHtml('Output Tokens', fmtNum(output)) +
+        fieldHtml('Cache Read Tokens', fmtNum(read)) +
+        fieldHtml('Cache Write Tokens', fmtNum(write)) +
+        fieldHtml('Reasoning Tokens', fmtNum(reasoning)) +
+        fieldHtml('Cache Hit Ratio', fmtCacheHitRatio(read, input)) +
+        fieldHtml('Provider', fmtProvider(d && d.primary_provider, 'unknown')) +
+      '</div></div>';
+  }
+
   /** Format a project label for display.
    *  Uses the resolved project_label field from the API when available;
    *  falls back to project_id / workspace_id for backward compatibility. */
@@ -1657,7 +1702,7 @@
       var errSuffix = agentRunsFetchError
         ? ' <span class="fetch-error" title="' + escHtml(agentRunsFetchError) + '">\u26A0 Fetch error</span>'
         : '';
-      els.arTbody.innerHTML = '<tr><td colspan="11" class="empty-state">No agent runs' + errSuffix + '</td></tr>';
+      els.arTbody.innerHTML = '<tr><td colspan="15" class="empty-state">No agent runs' + errSuffix + '</td></tr>';
       return;
     }
 
@@ -1682,11 +1727,15 @@
         '<td data-label="Status">' + badge(r.currentStatus || r.status, statusCls).outerHTML + '</td>' +
         '<td class="ar-col-low" data-label="Agent">' + escHtml(r.agent || '--') + '</td>' +
         '<td data-label="Model">' + fmtModel(r.model) + '</td>' +
+        '<td data-label="Provider">' + fmtProvider(r.primary_provider) + '</td>' +
         '<td data-label="Project / Worktree">' + escHtml(projectStr) + '</td>' +
         '<td class="ar-col-low" data-label="Todo">' + todoProgress + '</td>' +
         '<td class="ar-col-low" data-label="Files">' + fmtCodeChangesDiff(r.code_change_additions, r.code_change_deletions) + '</td>' +
         '<td data-label="Cost">' + fmtCost(r.total_estimated_cost_usd) + '</td>' +
         '<td data-label="Tokens">' + fmtAgentRunTokens(r.total_input_tokens, r.total_output_tokens, r.total_cache_read_tokens, r.total_cache_write_tokens) + '</td>' +
+        '<td class="ar-num" data-label="Cache Read">' + fmtNum(r.total_cache_read_tokens || 0) + '</td>' +
+        '<td class="ar-num ar-col-low" data-label="Cache Write">' + fmtNum(r.total_cache_write_tokens || 0) + '</td>' +
+        '<td class="ar-num ar-col-low" data-label="Reasoning">' + fmtNum(r.total_reasoning_tokens || 0) + '</td>' +
         '<td data-label="Last Updated">' + lastUpdatedCell + '</td>' +
         '<td class="ar-col-low" data-label="Children">' + (r.child_run_count || 0) + '</td>' +
         '</tr>';
@@ -2280,6 +2329,10 @@
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
         fieldHtml('Code Changes', fmtCodeChangesDiff(d.code_change_additions, d.code_change_deletions)) +
       '</div></div>';
+
+    // ── Token Breakdown (issue #557): read/write/reasoning + cache hit
+    //    ratio + primary provider, with missing-data semantics. ──
+    html += fmtTokenBreakdownSection(d);
 
     // ── Drill-down Link ──
     if (d.loki_search_url) {
@@ -3290,5 +3343,11 @@
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };
+  // Provider + token-breakdown helpers (issue #557): provider badge/missing
+  // label, cache hit ratio, and the Token Breakdown detail-section builder —
+  // pure string builders exercised by the Node harness.
+  window.fmtProvider = fmtProvider;
+  window.fmtCacheHitRatio = fmtCacheHitRatio;
+  window.fmtTokenBreakdownSection = fmtTokenBreakdownSection;
 
 })();

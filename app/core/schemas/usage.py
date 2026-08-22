@@ -33,6 +33,17 @@ class AggregateRow(BaseModel):
     record_count: int = Field(default=0, ge=0)
     session_count: int = Field(default=0, ge=0)
     model_count: int = Field(default=0, ge=0)
+    cache_hit_ratio: float | None = Field(
+        default=None,
+        description="Fraction of input served from cache: "
+        "cache_read / (input + cache_read), rounded to 4 decimals; "
+        "null when the denominator is zero",
+    )
+    provider_breakdown: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-provider record counts within the group; "
+        "records with a null/empty provider are grouped under 'unknown'",
+    )
     project_label: str | None = Field(
         default=None,
         description="Resolved project label (present when group includes 'project')",
@@ -41,6 +52,17 @@ class AggregateRow(BaseModel):
         default=None,
         description="Resolved agent identity (present when group includes 'agent')",
     )
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
 
 
 class AggregateQuery(BaseModel):
@@ -87,6 +109,17 @@ class RecordRow(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
 
 class RecordQuery(BaseModel):
     """Query parameters for the records endpoint."""
@@ -119,6 +152,19 @@ class SessionSummary(BaseModel):
     total_cached_tokens: int
     total_cache_read_tokens: int = 0
     total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Sum of reasoning_tokens across the session's usage "
+        "events (read-time aggregation — the sessions table carries no "
+        "reasoning aggregate)",
+    )
+    primary_provider: str | None = Field(
+        default=None,
+        description="Most frequently observed provider across the session's "
+        "usage events (record-count tie broken alphabetically); null when "
+        "no provider has been observed",
+    )
     project_id: str | None = None
     project_label: str | None = Field(
         default=None,
@@ -152,6 +198,17 @@ class SessionSummary(BaseModel):
         default=None,
         description="Grafana Explore URL for drill-down into Loki logs",
     )
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
 
 
 # ── Agent Run schemas ─────────────────────────────────────────────────────
@@ -284,6 +341,19 @@ class AgentRunSummary(BaseModel):
     total_cached_tokens: int = Field(default=0, ge=0)
     total_cache_read_tokens: int = Field(default=0, ge=0)
     total_cache_write_tokens: int = Field(default=0, ge=0)
+    total_reasoning_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Sum of reasoning_tokens across the session's usage "
+        "events (read-time aggregation — the sessions table carries no "
+        "reasoning aggregate)",
+    )
+    primary_provider: str | None = Field(
+        default=None,
+        description="Most frequently observed provider across the session's "
+        "usage events (record-count tie broken alphabetically); null when "
+        "no provider has been observed",
+    )
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     message_count: int = Field(default=0, ge=0)
     last_updated_at: datetime = Field(
@@ -302,6 +372,17 @@ class AgentRunSummary(BaseModel):
         default=None,
         description="LLM model identifier from opencode_session_contexts (null if no context)",
     )
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
 
 
 class AgentRunDetail(BaseModel):
@@ -386,6 +467,19 @@ class AgentRunDetail(BaseModel):
     total_cached_tokens: int = Field(default=0, ge=0)
     total_cache_read_tokens: int = Field(default=0, ge=0)
     total_cache_write_tokens: int = Field(default=0, ge=0)
+    total_reasoning_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Sum of reasoning_tokens across the session's usage "
+        "events (read-time aggregation — the sessions table carries no "
+        "reasoning aggregate)",
+    )
+    primary_provider: str | None = Field(
+        default=None,
+        description="Most frequently observed provider across the session's "
+        "usage events (record-count tie broken alphabetically); null when "
+        "no provider has been observed",
+    )
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     first_message_at: datetime | None = Field(
         default=None, description="Timestamp of the first message"
@@ -397,6 +491,17 @@ class AgentRunDetail(BaseModel):
         default=None,
         description="Grafana Explore URL for drill-down into Loki logs",
     )
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
 
 
 VALID_AGENT_RUN_STATUSES: frozenset[str] = frozenset(
@@ -447,6 +552,17 @@ class RecordWithContextRow(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
 
 class RecordWithContextGroupedRow(BaseModel):
     """An aggregated row returned when ``group_by`` is used.
@@ -484,6 +600,17 @@ class RecordWithContextGroupedRow(BaseModel):
     total_cache_write_tokens: int = Field(default=0, ge=0)
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     record_count: int = Field(default=0, ge=0)
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Deprecated: input + output tokens (Active Tokens). Prefer the "
+            "raw token fields; removed after the active_tokens sunset "
+            "(issue #557)."
+        ),
+    )
+    @property
+    def active_tokens(self) -> int:
+        return self.total_input_tokens + self.total_output_tokens
 
 
 # ── Paginated response ────────────────────────────────────────────────────
