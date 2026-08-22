@@ -517,3 +517,4 @@ def test_list_execution_bindings_orders_by_created_at(mock_conn: AsyncMock) -> N
 
     sql = mock_conn.fetch.call_args[0][0]
     assert "ORDER BY created_at ASC" in sql
+    assert "id ASC" in sql

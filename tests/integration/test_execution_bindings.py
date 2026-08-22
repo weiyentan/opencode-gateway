@@ -175,7 +175,7 @@ def _make_binding_payload(
     awx_job_id: int,
     external_session_id: str = "ses_integration_test",
     provider: str = "github",
-    repository: str = "acme/proj",
+    repository: str = "https://github.com/acme/proj",
     resource_type: str = "pull_request",
     resource_number: str = "42",
     outcome: str = "completed",
