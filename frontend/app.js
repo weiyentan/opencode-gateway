@@ -90,6 +90,12 @@
     drStartDate:    $('dr-start-date'),
     drEndDate:      $('dr-end-date'),
 
+    // Change Request Provenance Timeline (issue #574)
+    crProvOverlay:     $('cr-prov-overlay'),
+    crProvTitle:       $('cr-prov-title'),
+    crProvBody:        $('cr-prov-body'),
+    crProvClose:       $('cr-prov-close'),
+
     // Transcript view (issue #469)
     trSessionInput:    $('tr-session-input'),
     trLoadBtn:         $('tr-load-btn'),
@@ -2172,6 +2178,538 @@
       }
     });
   }
+  // ── Change Request Provenance Timeline (issue #574) ───────────────────
+  // When a change request is selected from the AFK Outcomes detail, a
+  // provenance timeline overlay renders the complete lifecycle: linked
+  // issues (with independent change-request and issue repository identity),
+  // every develop/review execution in chronological order (including
+  // repeated cycles), timestamps, phase, status, outcome, duration, AWX
+  // job IDs, OpenCode session identifiers, usage/cost, merge state, issue
+  // closure state, and the final EngineeringOutcome.  RunStatus and
+  // EngineeringOutcomeStatus are rendered as distinct concepts.
+
+  /** Deterministic GitHub fixture: a completed change request with linked
+   *  issues (same-repo and cross-repo), develop + review executions,
+   *  merge state, issue closure state, and a final merged outcome. */
+  function githubCompleteFixture() {
+    return {
+      change_request: {
+        provider: 'github',
+        repository: 'acme/web-app',
+        resource_type: 'change_request',
+        external_id: '142',
+        title: 'Implement user authentication module',
+        opened_at: '2026-08-01T09:00:00Z',
+        merged_at: '2026-08-05T14:30:00Z',
+        state: 'merged'
+      },
+      linked_issues: [
+        {
+          issue_number: '503',
+          issue_repository: 'acme/web-app',
+          relationship_kind: 'declares_closure',
+          closure_status: 'inferred'
+        },
+        {
+          issue_number: '25',
+          issue_repository: 'acme/platform-tracking',
+          relationship_kind: 'references',
+          closure_status: null
+        }
+      ],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-01T09:05:00Z',
+          finished_at: '2026-08-01T09:45:00Z',
+          duration_minutes: 40,
+          awx_job_id: 'awx-job-1001',
+          session_id: 'ses-auth-dev-001',
+          input_tokens: 12000,
+          output_tokens: 3500,
+          cache_read_tokens: 8000,
+          cache_write_tokens: 200,
+          estimated_cost_usd: 0.08
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-08-01T10:00:00Z',
+          finished_at: '2026-08-01T10:15:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-1002',
+          session_id: 'ses-auth-review-001',
+          input_tokens: 5000,
+          output_tokens: 800,
+          cache_read_tokens: 2000,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.02
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-02T08:00:00Z',
+          finished_at: '2026-08-02T09:30:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-1003',
+          session_id: 'ses-auth-dev-002',
+          input_tokens: 18000,
+          output_tokens: 5200,
+          cache_read_tokens: 12000,
+          cache_write_tokens: 500,
+          estimated_cost_usd: 0.12
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'approved',
+          started_at: '2026-08-02T10:00:00Z',
+          finished_at: '2026-08-02T10:10:00Z',
+          duration_minutes: 10,
+          awx_job_id: 'awx-job-1004',
+          session_id: 'ses-auth-review-002',
+          input_tokens: 4500,
+          output_tokens: 600,
+          cache_read_tokens: 1800,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.01
+        }
+      ],
+      run_status: 'completed',
+      engineering_outcome: {
+        status: 'merged',
+        merged_at: '2026-08-05T14:30:00Z',
+        change_request_ids: ['acme/web-app#142'],
+        resolved_issue_ids: ['acme/web-app#503']
+      }
+    };
+  }
+
+  /** Deterministic GitLab fixture: an incomplete change request with a
+   *  repeated review cycle and no merge. */
+  function gitlabIncompleteFixture() {
+    return {
+      change_request: {
+        provider: 'gitlab',
+        repository: 'cloudnative-pg/cloudnative-pg',
+        resource_type: 'change_request',
+        external_id: '6',
+        title: 'Add connection pool max-size config',
+        opened_at: '2026-07-20T11:00:00Z',
+        merged_at: null,
+        state: 'opened'
+      },
+      linked_issues: [
+        {
+          issue_number: '1',
+          issue_repository: 'cloudnative-pg/cloudnative-pg',
+          relationship_kind: 'declares_closure',
+          closure_status: 'pending'
+        }
+      ],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-20T11:05:00Z',
+          finished_at: '2026-07-20T12:00:00Z',
+          duration_minutes: 55,
+          awx_job_id: 'awx-job-2001',
+          session_id: 'ses-pool-dev-001',
+          input_tokens: 9000,
+          output_tokens: 2800,
+          cache_read_tokens: 5000,
+          cache_write_tokens: 100,
+          estimated_cost_usd: 0.06
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-07-20T12:30:00Z',
+          finished_at: '2026-07-20T12:45:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-2002',
+          session_id: 'ses-pool-review-001',
+          input_tokens: 4000,
+          output_tokens: 700,
+          cache_read_tokens: 1500,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.02
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-21T09:00:00Z',
+          finished_at: '2026-07-21T10:30:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-2003',
+          session_id: 'ses-pool-dev-002',
+          input_tokens: 15000,
+          output_tokens: 4500,
+          cache_read_tokens: 10000,
+          cache_write_tokens: 300,
+          estimated_cost_usd: 0.10
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-07-21T11:00:00Z',
+          finished_at: '2026-07-21T11:20:00Z',
+          duration_minutes: 20,
+          awx_job_id: 'awx-job-2004',
+          session_id: 'ses-pool-review-002',
+          input_tokens: 5500,
+          output_tokens: 900,
+          cache_read_tokens: 2200,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.03
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-22T08:30:00Z',
+          finished_at: '2026-07-22T10:00:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-2005',
+          session_id: 'ses-pool-dev-003',
+          input_tokens: 16000,
+          output_tokens: 4800,
+          cache_read_tokens: 11000,
+          cache_write_tokens: 350,
+          estimated_cost_usd: 0.11
+        }
+      ],
+      run_status: 'running',
+      engineering_outcome: {
+        status: 'open',
+        merged_at: null,
+        change_request_ids: ['cloudnative-pg/cloudnative-pg#6'],
+        resolved_issue_ids: []
+      }
+    };
+  }
+
+  /** Deterministic fixture: a repeated-review lifecycle with a failed run. */
+  function repeatedReviewFixture() {
+    return {
+      change_request: {
+        provider: 'github',
+        repository: 'acme/data-pipeline',
+        resource_type: 'change_request',
+        external_id: '88',
+        title: 'Refactor ETL scheduler',
+        opened_at: '2026-08-10T08:00:00Z',
+        merged_at: null,
+        state: 'opened'
+      },
+      linked_issues: [],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-10T08:05:00Z',
+          finished_at: '2026-08-10T09:30:00Z',
+          duration_minutes: 85,
+          awx_job_id: 'awx-job-3001',
+          session_id: 'ses-etl-dev-001',
+          input_tokens: 20000,
+          output_tokens: 6000,
+          cache_read_tokens: 14000,
+          cache_write_tokens: 400,
+          estimated_cost_usd: 0.14
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-08-10T10:00:00Z',
+          finished_at: '2026-08-10T10:15:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-3002',
+          session_id: 'ses-etl-review-001',
+          input_tokens: 6000,
+          output_tokens: 1000,
+          cache_read_tokens: 3000,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.03
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-11T09:00:00Z',
+          finished_at: '2026-08-11T10:45:00Z',
+          duration_minutes: 105,
+          awx_job_id: 'awx-job-3003',
+          session_id: 'ses-etl-dev-002',
+          input_tokens: 22000,
+          output_tokens: 6500,
+          cache_read_tokens: 15000,
+          cache_write_tokens: 450,
+          estimated_cost_usd: 0.15
+        },
+        {
+          phase: 'review',
+          status: 'failed',
+          outcome: null,
+          started_at: '2026-08-11T11:00:00Z',
+          finished_at: '2026-08-11T11:05:00Z',
+          duration_minutes: 5,
+          awx_job_id: 'awx-job-3004',
+          session_id: null,
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0
+        },
+        {
+          phase: 'develop',
+          status: 'running',
+          outcome: null,
+          started_at: '2026-08-12T08:00:00Z',
+          finished_at: null,
+          duration_minutes: null,
+          awx_job_id: 'awx-job-3005',
+          session_id: 'ses-etl-dev-003',
+          input_tokens: 8000,
+          output_tokens: 2000,
+          cache_read_tokens: 4000,
+          cache_write_tokens: 100,
+          estimated_cost_usd: 0.04
+        }
+      ],
+      run_status: 'running',
+      engineering_outcome: {
+        status: 'open',
+        merged_at: null,
+        change_request_ids: ['acme/data-pipeline#88'],
+        resolved_issue_ids: []
+      }
+    };
+  }
+
+  /** Build the provenance timeline data from a fixture or API response.
+   *  Pure — no DOM or fetch access.  Normalizes the input into the shape
+   *  the render functions expect: change_request, linked_issues, executions
+   *  (sorted chronologically), run_status, and engineering_outcome. */
+  function buildProvenanceTimeline(data) {
+    if (!data) return null;
+    var executions = (data.executions || []).slice()
+      .sort(function (a, b) {
+        return new Date(a.started_at) - new Date(b.started_at);
+      });
+    return {
+      change_request: data.change_request || null,
+      linked_issues: data.linked_issues || [],
+      executions: executions,
+      run_status: data.run_status || 'unknown',
+      engineering_outcome: data.engineering_outcome || null
+    };
+  }
+
+  /** Render the full provenance timeline into the detail overlay body.
+   *  Pure string builder — returns HTML.  Handles loading, empty, stale,
+   *  partial, and error states via the `state` parameter. */
+  function renderProvenanceTimeline(data, state) {
+    if (state === 'loading') {
+      return '<p class="empty-state">Loading provenance timeline&hellip;</p>';
+    }
+    if (state === 'error') {
+      return '<p class="empty-state">Failed to load provenance timeline</p>';
+    }
+    var timeline = buildProvenanceTimeline(data);
+    if (!timeline || !timeline.change_request) {
+      return '<p class="empty-state">No provenance data available</p>';
+    }
+
+    var cr = timeline.change_request;
+    var html = '<div class="prov-timeline">';
+
+    // ── Change Request Header ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Change Request</div>';
+    html += '<div class="prov-cr-card">';
+    html += '<div class="prov-cr-head">';
+    html += '<span class="prov-cr-id">' + escHtml(cr.provider + '/' + cr.repository + '#' + cr.external_id) + '</span>';
+    html += badge(cr.state || 'unknown', stateBadgeForCrState(cr.state)).outerHTML;
+    html += '</div>';
+    html += '<div class="prov-cr-meta">';
+    html += escHtml(cr.title || '--');
+    if (cr.opened_at) html += ' &middot; opened ' + fmtDT(cr.opened_at);
+    if (cr.merged_at) html += ' &middot; merged ' + fmtDT(cr.merged_at);
+    html += '</div>';
+    html += '</div></div>';
+
+    // ── Linked Issues ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Linked Issues (' + timeline.linked_issues.length + ')</div>';
+    if (timeline.linked_issues.length === 0) {
+      html += '<div class="prov-empty">No linked issues</div>';
+    } else {
+      html += '<div class="prov-issues-list">';
+      timeline.linked_issues.forEach(function (issue) {
+        html += '<div class="prov-issue-card">';
+        html += '<div class="prov-issue-head">';
+        html += '<span class="prov-issue-id">' + escHtml(issue.issue_repository + '#' + issue.issue_number) + '</span>';
+        html += '<span class="prov-issue-kind">' + escHtml(issue.relationship_kind) + '</span>';
+        if (issue.closure_status) {
+          html += badge(issue.closure_status, closureStatusBadgeClass(issue.closure_status)).outerHTML;
+        }
+        html += '</div>';
+        // Show different repos when they differ
+        if (issue.issue_repository !== cr.repository) {
+          html += '<div class="prov-issue-cross-repo">';
+          html += 'cross-repo: ' + escHtml(cr.repository) + ' \u2192 ' + escHtml(issue.issue_repository);
+          html += '</div>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // ── Execution Timeline ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Execution Timeline (' + timeline.executions.length + ')</div>';
+    if (timeline.executions.length === 0) {
+      html += '<div class="prov-empty">No executions recorded</div>';
+    } else {
+      html += '<div class="prov-exec-list">';
+      timeline.executions.forEach(function (ex, idx) {
+        html += renderProvenanceExecution(ex, idx);
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // ── Merge State ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Merge State</div>';
+    html += '<div class="prov-merge-card">';
+    if (cr.merged_at) {
+      html += '<span class="prov-merge-badge prov-merged">merged</span>';
+      html += '<span class="prov-merge-time">Merged ' + fmtDT(cr.merged_at) + '</span>';
+    } else {
+      html += '<span class="prov-merge-badge prov-not-merged">not merged</span>';
+    }
+    html += '</div></div>';
+
+    // ── Issue Closure State ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Issue Closure State</div>';
+    html += '<div class="prov-closure-card">';
+    var outcomes = timeline.engineering_outcome;
+    if (outcomes && outcomes.resolved_issue_ids && outcomes.resolved_issue_ids.length > 0) {
+      html += '<span class="prov-closure-resolved">resolved</span>';
+      html += '<span class="prov-closure-issues">' + escHtml(outcomes.resolved_issue_ids.join(', ')) + '</span>';
+    } else if (timeline.linked_issues.length > 0) {
+      html += '<span class="prov-closure-pending">pending</span>';
+    } else {
+      html += '<span class="prov-empty">no linked issues</span>';
+    }
+    html += '</div></div>';
+
+    // ── Engineering Outcome (distinct from RunStatus) ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Engineering Outcome</div>';
+    html += '<div class="prov-outcome-card">';
+    if (outcomes && outcomes.status) {
+      html += badge(outcomeStatusLabel(outcomes.status), outcomeStatusBadgeClass(outcomes.status)).outerHTML;
+      if (outcomes.change_request_ids && outcomes.change_request_ids.length) {
+        html += '<span class="prov-outcome-detail">change requests: ' + escHtml(outcomes.change_request_ids.join(', ')) + '</span>';
+      }
+    } else {
+      html += '<span class="prov-empty">no outcome recorded</span>';
+    }
+    html += '</div>';
+
+    // RunStatus badge — rendered DISTINCTLY from EngineeringOutcomeStatus
+    html += '<div class="prov-run-status-row">';
+    html += '<span class="prov-run-status-label">Run Status:</span>';
+    html += badge(timeline.run_status || 'unknown', afkRunStatusBadgeClass(timeline.run_status)).outerHTML;
+    html += '</div>';
+    html += '</div>';
+
+    html += '</div>'; // .prov-timeline
+    return html;
+  }
+
+  /** Render one execution entry in the timeline.  Pure string builder. */
+  function renderProvenanceExecution(ex, idx) {
+    var phaseLabel = ex.phase === 'develop' ? 'Develop' : ex.phase === 'review' ? 'Review' : (ex.phase || 'unknown');
+    var statusCls = statusBadgeClass(ex.status);
+    var outcomeLabel = ex.outcome || '--';
+    var duration = fmtDuration(ex.started_at, ex.finished_at);
+    var totalTokens = (ex.input_tokens || 0) + (ex.output_tokens || 0) +
+                      (ex.cache_read_tokens || 0) + (ex.cache_write_tokens || 0);
+
+    var html = '<div class="prov-exec-item">';
+    html += '<div class="prov-exec-connector">';
+    html += '<span class="prov-exec-dot prov-exec-dot-' + escHtml(ex.phase || 'unknown') + '"></span>';
+    if (idx < 100) html += '<span class="prov-exec-line"></span>'; // safety limit
+    html += '</div>';
+    html += '<div class="prov-exec-content">';
+    html += '<div class="prov-exec-head">';
+    html += '<span class="prov-exec-phase">' + escHtml(phaseLabel) + '</span>';
+    html += badge(ex.status || '--', statusCls).outerHTML;
+    if (ex.outcome) {
+      html += ' <span class="prov-exec-outcome">' + escHtml(outcomeLabel) + '</span>';
+    }
+    html += '</div>';
+    html += '<div class="prov-exec-meta">';
+    html += '<span class="prov-exec-time">' + fmtDT(ex.started_at) + '</span>';
+    html += ' &middot; <span class="prov-exec-duration">' + duration + '</span>';
+    if (ex.awx_job_id) {
+      html += ' &middot; <span class="prov-exec-awx">AWX: ' + escHtml(ex.awx_job_id) + '</span>';
+    }
+    html += '</div>';
+    if (ex.session_id) {
+      html += '<div class="prov-exec-session">';
+      html += 'Session: <span class="prov-exec-session-id">' + escHtml(ex.session_id) + '</span>';
+      html += '</div>';
+    }
+    if (totalTokens > 0 || (ex.estimated_cost_usd || 0) > 0) {
+      html += '<div class="prov-exec-usage">';
+      html += fmtTokenBreakdownCompact(ex.input_tokens, ex.output_tokens,
+        ex.cache_read_tokens, ex.cache_write_tokens);
+      html += ' &middot; Est. Cost: ' + fmtCost(ex.estimated_cost_usd);
+      html += '</div>';
+    }
+    html += '</div>'; // .prov-exec-content
+    html += '</div>'; // .prov-exec-item
+    return html;
+  }
+
+  /** Map a change request state to a badge CSS class. */
+  function stateBadgeForCrState(state) {
+    if (state === 'merged') return 'badge-merged';
+    if (state === 'opened') return 'badge-open';
+    if (state === 'closed') return 'badge-closed';
+    return 'badge-unknown';
+  }
+
+  /** Map a closure episode status to a badge CSS class. */
+  function closureStatusBadgeClass(status) {
+    if (status === 'inferred') return 'badge-completed';
+    if (status === 'pending') return 'badge-stale';
+    if (status === 'awaiting_closure') return 'badge-stale';
+    if (status === 'unmatched') return 'badge-failed';
+    if (status === 'ambiguous') return 'badge-unknown';
+    if (status === 'superseded') return 'badge-unknown';
+    return 'badge-unknown';
+  }
+
   // ── AFK Outcomes view (issue #453) ─────────────────────────────────────
   // The first UI for the AFK outcomes domain: an "AFK Outcomes" tab whose runs
   // list (GET /api/v1/afk-outcomes/runs) opens a detail overlay rendering the
@@ -2457,6 +2995,31 @@
     }
     html += '</div>';
     return html;
+  }
+
+  /** Open the Change Request Provenance Timeline overlay (issue #574).
+   *  Uses deterministic fixtures for now; will be backed by the Gateway
+   *  composite read contract when the API is ready.  Shows loading, error,
+   *  and empty states. */
+  async function openChangeRequestProvenance(changeRequestId) {
+    els.crProvOverlay.classList.add('visible');
+    els.crProvBody.innerHTML = '<p class="empty-state">Loading provenance timeline&hellip;</p>';
+    els.crProvTitle.textContent = 'Change Request Provenance';
+
+    // Deterministic fixtures: select by change request id prefix
+    var fixture;
+    if (changeRequestId && changeRequestId.indexOf('cloudnative-pg') !== -1) {
+      fixture = gitlabIncompleteFixture();
+    } else if (changeRequestId && changeRequestId.indexOf('data-pipeline') !== -1) {
+      fixture = repeatedReviewFixture();
+    } else {
+      fixture = githubCompleteFixture();
+    }
+
+    els.crProvTitle.textContent = escHtml(
+      (fixture.change_request.repository || '') + '#' + (fixture.change_request.external_id || '')
+    );
+    els.crProvBody.innerHTML = renderProvenanceTimeline(fixture, 'ok');
   }
 
   /** Render an entity link's provenance line (method · confidence · resolver). */
@@ -3029,6 +3592,29 @@
     }
   }
 
+  /** Wire the Change Request Provenance Timeline overlay DOM events (issue #574):
+   *  close button, backdrop click, and ESC key. */
+  function setupCrProvEventHandlers() {
+    if (els.crProvClose) {
+      els.crProvClose.addEventListener('click', function () {
+        els.crProvOverlay.classList.remove('visible');
+      });
+    }
+    if (els.crProvOverlay) {
+      els.crProvOverlay.addEventListener('click', function (e) {
+        if (e.target === els.crProvOverlay) {
+          els.crProvOverlay.classList.remove('visible');
+        }
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' &&
+          els.crProvOverlay && els.crProvOverlay.classList.contains('visible')) {
+        els.crProvOverlay.classList.remove('visible');
+      }
+    });
+  }
+
   /** Wire the AFK Outcomes detail-overlay DOM events (issue #453): the close
    *  button, backdrop click, and ESC key — mirroring the agent-runs overlay
    *  wiring (setupAgentRunEventHandlers). */
@@ -3497,6 +4083,7 @@
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
     setupAfkOutcomesEventHandlers();
+    setupCrProvEventHandlers();
     setupTranscriptEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
@@ -3613,20 +4200,18 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
-  // AFK Repository Summary (issue #572): pure aggregation helper and
-  // table renderer — the Node harness exercises the pure helper directly
-  // and the renderer through the fake tbody.
-  window.deriveRepositoryLabel = deriveRepositoryLabel;
-  window.buildRepositorySummaries = buildRepositorySummaries;
-  window.renderRepositorySummaryTable = renderRepositorySummaryTable;
-  // AFK Change Request List (issue #573): provider-specific terminology,
-  // pure CR list builder, AFK-only filter, and the list renderer.
-  window.providerCrTerm = providerCrTerm;
-  window.buildChangeRequestList = buildChangeRequestList;
-  window.filterChangeRequests = filterChangeRequests;
-  window.renderChangeRequestList = renderChangeRequestList;
-  window.selectRepository = selectRepository;
-  window.clearSelectedRepo = clearSelectedRepo;
+  // Change Request Provenance Timeline (issue #574): deterministic fixtures,
+  // the pure timeline composer, and the execution/section renderers — all
+  // pure string builders exercised through the vm-sandbox window seam.
+  window.githubCompleteFixture = githubCompleteFixture;
+  window.gitlabIncompleteFixture = gitlabIncompleteFixture;
+  window.repeatedReviewFixture = repeatedReviewFixture;
+  window.buildProvenanceTimeline = buildProvenanceTimeline;
+  window.renderProvenanceTimeline = renderProvenanceTimeline;
+  window.renderProvenanceExecution = renderProvenanceExecution;
+  window.stateBadgeForCrState = stateBadgeForCrState;
+  window.closureStatusBadgeClass = closureStatusBadgeClass;
+  window.openChangeRequestProvenance = openChangeRequestProvenance;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.

@@ -2037,6 +2037,311 @@ td.clickable:hover {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   Change Request Provenance Timeline (issue #574)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.cr-prov-panel {
+  max-width: 860px;
+}
+
+.prov-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.prov-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.prov-section-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+/* Change Request card */
+.prov-cr-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--glass-border);
+  border-left: 3px solid var(--accent-indigo);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.prov-cr-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.prov-cr-id {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.prov-cr-meta {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+/* Linked Issues list */
+.prov-issues-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.prov-issue-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--glass-border);
+  border-left: 3px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.prov-issue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.prov-issue-id {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.prov-issue-kind {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+}
+
+.prov-issue-cross-repo {
+  font-size: 0.72rem;
+  color: var(--accent-cyan);
+  margin-top: 2px;
+}
+
+/* Execution Timeline */
+.prov-exec-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.prov-exec-item {
+  display: flex;
+  gap: 12px;
+  position: relative;
+}
+
+.prov-exec-connector {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 20px;
+  flex-shrink: 0;
+}
+
+.prov-exec-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  border: 2px solid var(--bg-deep);
+  flex-shrink: 0;
+  z-index: 1;
+}
+
+.prov-exec-dot-develop {
+  background: var(--accent-cyan);
+}
+
+.prov-exec-dot-review {
+  background: var(--accent-indigo);
+}
+
+.prov-exec-line {
+  width: 2px;
+  flex: 1;
+  background: rgba(255, 255, 255, 0.08);
+  min-height: 8px;
+}
+
+.prov-exec-content {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.prov-exec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.prov-exec-phase {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: capitalize;
+}
+
+.prov-exec-outcome {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.prov-exec-meta {
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.prov-exec-session {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.prov-exec-session-id {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--text-secondary);
+}
+
+.prov-exec-usage {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
+/* Merge State */
+.prov-merge-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+}
+
+.prov-merge-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+}
+
+.prov-merged {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--status-healthy);
+}
+
+.prov-not-merged {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--status-unknown);
+}
+
+.prov-merge-time {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+/* Issue Closure State */
+.prov-closure-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+}
+
+.prov-closure-resolved {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--status-healthy);
+  background: rgba(74, 222, 128, 0.15);
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+}
+
+.prov-closure-pending {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--status-stale);
+  background: rgba(251, 191, 36, 0.15);
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+}
+
+.prov-closure-issues {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+/* Engineering Outcome + RunStatus — rendered as distinct concepts */
+.prov-outcome-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  margin-bottom: 6px;
+}
+
+.prov-outcome-detail {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.prov-run-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+}
+
+.prov-run-status-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.prov-empty {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    ACCESSIBILITY: reduced motion (S4)
    Respects the OS/browser prefers-reduced-motion setting: collapses all
    animation/transition motion. Agent run rows (Balanced Quiet Rows) carry no
