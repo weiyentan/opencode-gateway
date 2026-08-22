@@ -414,26 +414,30 @@ async def _fetch_aggregates_rollup(
             GROUP BY COALESCE(oc.canonical_name, oc.name),
                      ul.project_label,
                      ul.provider_key
+        ),
+        provider_breakdown AS (
+            SELECT
+                client_name,
+                project_label,
+                jsonb_object_agg(provider_key, cnt) AS provider_breakdown
+            FROM provider_counts
+            GROUP BY client_name, project_label
         )
         SELECT
             COALESCE(oc.canonical_name, oc.name) || '|' || ul.project_label AS group_value,
             COUNT(*) AS record_count,
             COUNT(DISTINCT ul.session_id) AS session_count,
             COUNT(DISTINCT om.model_name) AS model_count,
-            COALESCE(
-                (
-                    SELECT jsonb_object_agg(pc.provider_key, pc.cnt)
-                    FROM provider_counts pc
-                    WHERE pc.client_name = COALESCE(oc.canonical_name, oc.name)
-                      AND pc.project_label = ul.project_label
-                ),
-                '{{}}'::jsonb
-            ) AS provider_breakdown
+            COALESCE(pb.provider_breakdown, '{{}}'::jsonb) AS provider_breakdown
         FROM usage_with_label ul
         JOIN observed_models om ON om.id = ul.model_id
         JOIN opencode_clients oc ON oc.id = ul.client_id
+        LEFT JOIN provider_breakdown pb
+            ON pb.client_name = COALESCE(oc.canonical_name, oc.name)
+           AND pb.project_label = ul.project_label
         GROUP BY COALESCE(oc.canonical_name, oc.name),
-                 ul.project_label
+                 ul.project_label,
+                 pb.provider_breakdown
     """
     async with timed_operation("db.query.aggregates.client_project_counts", "db"):
         async with _db_timeout(
