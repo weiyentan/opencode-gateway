@@ -1260,7 +1260,7 @@ class TestClientProjectAggregates:
         assert " || '|' || " in count_sql
         assert "MAX(pb.provider_breakdown)" not in count_sql
         assert "GROUP BY COALESCE(oc.canonical_name, oc.name)" in count_sql
-        assert "pb.provider_breakdown" in count_sql
+        assert "jsonb_object_agg(pc.provider_key, pc.cnt)" in count_sql
 
     @pytest.mark.asyncio
     async def test_rollup_merge_counts_when_group_values_match(
