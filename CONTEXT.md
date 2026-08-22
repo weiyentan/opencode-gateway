@@ -137,6 +137,14 @@ The terminal result of an Execution Binding, such as `completed`, `failed`,
 or `cancelled`.
 _Avoid_: AFK Run status
 
+**Failure Summary**:
+Bounded, redacted diagnostic metadata attached to a failed or cancelled
+Execution Binding. It is a short explanation of the terminal failure, not
+stdout, a transcript, extra variables, prompts, credentials, or an arbitrary
+provider payload. Recognizable secret-bearing values are redacted before the
+summary is persisted, and the stored value has a fixed maximum length of 1000 characters.
+_Avoid_: failure transcript, raw failure output, AWX payload
+
 **Observed Message**:
 A Gateway-owned row (`observed_messages`, migration 0029) projecting one
 OpenCode `message` row: its identity, session linkage, role/agent/mode
