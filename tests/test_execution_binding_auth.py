@@ -145,8 +145,9 @@ class TestDedicatedCredentialEnforcement:
         """
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), _saved_row()]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -384,8 +385,9 @@ class TestBearerTokenNonLeakage:
         """The credential lookup queries by SHA-256 hash, never the raw token."""
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), _saved_row()]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = _build_collector_only_client(conn, monkeypatch)
 
