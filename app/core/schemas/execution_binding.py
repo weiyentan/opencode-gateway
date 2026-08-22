@@ -84,7 +84,7 @@ class ExecutionBindingResourceIn(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _validate_provider_type_and_normalize(self) -> "ExecutionBindingResourceIn":
+    def _validate_provider_type_and_normalize(self) -> ExecutionBindingResourceIn:
         """Enforce provider-specific resource-type compatibility and canonicalize.
 
         GitHub: pull_request | change_request
