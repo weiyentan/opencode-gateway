@@ -137,6 +137,15 @@ The terminal result of an Execution Binding, such as `completed`, `failed`,
 or `cancelled`.
 _Avoid_: AFK Run status
 
+**Failure Summary**:
+A bounded, redacted diagnostic string stored on an Execution Binding
+(`execution_bindings.failure_summary`) that carries the tail of a failed
+AWX job's stdout or error output. It is truncated to a fixed character
+limit at ingest time; raw prompts, tokens, full stdout, and arbitrary
+AWX payloads are never persisted. Paired with `failure_reason` (a
+categorical code) for programmatic filtering.
+_Avoid_: error log, full stdout, raw AWX output
+
 **Observed Message**:
 A Gateway-owned row (`observed_messages`, migration 0029) projecting one
 OpenCode `message` row: its identity, session linkage, role/agent/mode
