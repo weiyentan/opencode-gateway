@@ -412,6 +412,39 @@
       </div>
     </section>
 
+    <!-- Change Request List (issue #573): shows all change requests for
+         a selected repository.  Hidden by default; shown when a repository
+         row is clicked in the Repository Summary. -->
+    <section class="glass-panel panel-afk-cr" id="afk-change-requests-panel" style="display:none">
+      <h2 class="panel-title">
+        <button class="afk-cr-back" id="afk-cr-back" type="button" aria-label="Back to repositories">&larr;</button>
+        <span id="afk-cr-header">Change Requests</span>
+        <span class="panel-freshness" id="freshness-afk-change-requests"></span>
+      </h2>
+      <div class="afk-cr-controls">
+        <label class="afk-cr-toggle-label">
+          <input type="checkbox" id="afk-cr-toggle" class="afk-cr-toggle">
+          <span>AFK Only</span>
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table id="afk-cr-table">
+          <thead>
+            <tr>
+              <th>Change Request</th>
+              <th>Status</th>
+              <th>Outcome</th>
+              <th>AFK</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="afk-cr-tbody">
+            <tr><td colspan="5" class="empty-state">Select a repository above</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- AFK Runs list (existing) -->
     <section class="glass-panel panel-afk-outcomes">
       <h2 class="panel-title">AFK Outcomes<span class="panel-freshness" id="freshness-afk-outcomes"></span></h2>
