@@ -385,6 +385,10 @@ async def _fetch_aggregates_rollup(
         count_params.append(client_id)
     count_where = " AND ".join(count_filters)
 
+    # PERF: provider_counts CTE re-declares the main query's FROM/JOINs against
+    # usage_events, doubling I/O for this query path. Acceptable at current
+    # scale; if this becomes a bottleneck, refactor to a single pass with a
+    # two-level GROUP BY or window function.
     count_sql = f"""
         WITH usage_with_label AS (
             SELECT
@@ -642,6 +646,10 @@ async def _fetch_aggregates(
     # (including project-label and agent COALESCE fragments) resolves
     # identically, then collapses per-provider counts into one JSON object
     # per group.
+    # PERF: provider_counts CTE re-declares the main query's FROM/JOINs against
+    # usage_events, doubling I/O for this query path. Acceptable at current
+    # scale; if this becomes a bottleneck, refactor to a single pass with a
+    # two-level GROUP BY or window function.
     sql = f"""
         WITH provider_counts AS (
             SELECT
@@ -683,6 +691,9 @@ async def _fetch_aggregates(
         {project_join}
         LEFT JOIN provider_breakdown pb ON pb.group_value = {group_expr}
         WHERE {where_clause}
+        -- JSONB in GROUP BY: PostgreSQL requires non-aggregated LEFT JOIN
+        -- columns to appear in GROUP BY; COALESCE(...,'{{}}'::jsonb) keeps
+        -- groups with empty provider_breakdown distinct.
         {group_by_clause}, COALESCE(pb.provider_breakdown, '{{}}'::jsonb)
         ORDER BY group_value
     """

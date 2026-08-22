@@ -9,6 +9,14 @@ Covers the usage query API additions:
 - Ingest normalization of empty-string provider values to NULL.
 """
 
+# TODO(issue #557): Add integration test for provider_agg CTE correctness.
+# The provider_agg CTE uses ROW_NUMBER() OVER (PARTITION BY session_id
+# ORDER BY COUNT(*) DESC, provider ASC) to resolve the primary provider per
+# session. This logic is currently only tested via mock row data. An
+# integration test against a real or in-memory PostgreSQL instance should
+# exercise tie-breaking, null/empty filtering, and edge cases (single record,
+# mixed null/non-null providers).
+
 from __future__ import annotations
 
 import json

@@ -53,6 +53,9 @@ class AggregateRow(BaseModel):
         description="Resolved agent identity (present when group includes 'agent')",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -109,6 +112,9 @@ class RecordRow(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -199,6 +205,9 @@ class SessionSummary(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -373,6 +382,9 @@ class AgentRunSummary(BaseModel):
         description="LLM model identifier from opencode_session_contexts (null if no context)",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -492,6 +504,9 @@ class AgentRunDetail(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -552,6 +567,9 @@ class RecordWithContextRow(BaseModel):
         description="Grafana Explore URL for drill-down into Loki logs",
     )
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
@@ -601,6 +619,9 @@ class RecordWithContextGroupedRow(BaseModel):
     total_estimated_cost_usd: Decimal | None = Field(default=None)
     record_count: int = Field(default=0, ge=0)
 
+    # NOTE(issue #557): active_tokens moved from stored field to @computed_field
+    # to deprecate without storage. Schema-aware clients may see this as a type
+    # shift in the OpenAPI schema; JSON wire format is unchanged.
     @computed_field(  # type: ignore[prop-decorator]
         description=(
             "Deprecated: input + output tokens (Active Tokens). Prefer the "
