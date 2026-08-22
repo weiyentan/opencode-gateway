@@ -137,6 +137,10 @@ class SessionLink(BaseModel):
     total_cache_read_tokens: int = 0
     total_cache_write_tokens: int = 0
     total_estimated_cost_usd: Decimal | None = None
+    parent_session_id: str | None = Field(
+        default=None,
+        description="External session ID of the parent session, if any (issue #575)",
+    )
 
 
 class UsageAggregate(BaseModel):

@@ -392,6 +392,60 @@
          #afk-detail-overlay rendering the full chain. -->
     <div class="tab-content" id="tab-afk-outcomes">
 
+    <!-- Repository Summary (issue #572): repository-first entry view -->
+    <section class="glass-panel panel-afk-repos">
+      <h2 class="panel-title">Repository Summary<span class="panel-freshness" id="freshness-afk-repos"></span></h2>
+      <div class="table-scroll">
+        <table id="afk-repos-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Repository</th>
+              <th>AFK Runs</th>
+              <th>Last Activity</th>
+            </tr>
+          </thead>
+          <tbody id="afk-repos-tbody">
+            <tr><td colspan="4" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Change Request List (issue #573): shows all change requests for
+         a selected repository.  Hidden by default; shown when a repository
+         row is clicked in the Repository Summary. -->
+    <section class="glass-panel panel-afk-cr" id="afk-change-requests-panel" style="display:none">
+      <h2 class="panel-title">
+        <button class="afk-cr-back" id="afk-cr-back" type="button" aria-label="Back to repositories">&larr;</button>
+        <span id="afk-cr-header">Change Requests</span>
+        <span class="panel-freshness" id="freshness-afk-change-requests"></span>
+      </h2>
+      <div class="afk-cr-controls">
+        <label class="afk-cr-toggle-label">
+          <input type="checkbox" id="afk-cr-toggle" class="afk-cr-toggle">
+          <span>AFK Only</span>
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table id="afk-cr-table">
+          <thead>
+            <tr>
+              <th>Change Request</th>
+              <th>Status</th>
+              <th>Outcome</th>
+              <th>AFK</th>
+              <th>Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="afk-cr-tbody">
+            <tr><td colspan="5" class="empty-state">Select a repository above</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- AFK Runs list (existing) -->
     <section class="glass-panel panel-afk-outcomes">
       <h2 class="panel-title">AFK Outcomes<span class="panel-freshness" id="freshness-afk-outcomes"></span></h2>
       <div class="table-scroll">
@@ -408,6 +462,28 @@
           </thead>
           <tbody id="afk-runs-tbody">
             <tr><td colspan="6" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Unresolved Relationships (issue #576): dedicated view for correlation
+         exceptions — ambiguous, unmatched, parked — independent of the happy-path
+         provenance detail.  Lists uncertain relationships with their state,
+         confidence, method, evidence, and resolver version. -->
+    <section class="glass-panel panel-unresolved-relationships">
+      <h2 class="panel-title">Unresolved Relationships<span class="panel-freshness" id="freshness-unresolved-relationships"></span></h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Entity</th>
+              <th>Type</th>
+              <th>State / Provenance</th>
+            </tr>
+          </thead>
+          <tbody id="unresolved-relationships-tbody">
+            <tr><td colspan="3" class="empty-state">Loading&hellip;</td></tr>
           </tbody>
         </table>
       </div>
@@ -496,6 +572,26 @@
       </div>
       <div class="detail-body" id="afk-detail-body">
         <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Change Request Provenance Timeline (issue #574): chronological
+       lifecycle of a change request including linked issues (with
+       independent change-request and issue repository identity), every
+       develop/review execution, timestamps, phase, status, outcome,
+       duration, AWX job IDs, OpenCode session IDs, usage/cost, merge
+       state, issue closure state, and the final engineering outcome.
+       RunStatus and EngineeringOutcomeStatus are rendered as distinct
+       concepts. -->
+  <div class="detail-overlay" id="cr-prov-overlay">
+    <div class="detail-panel glass-panel cr-prov-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="cr-prov-title">Change Request Provenance</h2>
+        <button class="detail-close" id="cr-prov-close">&times;</button>
+      </div>
+      <div class="detail-body" id="cr-prov-body">
+        <p class="empty-state">Loading provenance timeline&hellip;</p>
       </div>
     </div>
   </div>

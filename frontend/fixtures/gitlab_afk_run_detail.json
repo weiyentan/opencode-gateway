@@ -1,0 +1,121 @@
+{
+  "status": "ok",
+  "data": {
+    "run": {
+      "afk_run_id": "01KZX9M4G80000000000000002",
+      "provider": "gitlab",
+      "status": "completed",
+      "title": "Develop-Loop: Add telemetry endpoint",
+      "started_at": "2026-08-14T08:30:00Z",
+      "finished_at": "2026-08-14T09:45:00Z",
+      "outcome_status": "merged"
+    },
+    "outcome": {
+      "status": "merged",
+      "change_request_ids": ["change_request:601"],
+      "resolved_issue_ids": ["issue:501"],
+      "merge_event_id": "merge_event:601",
+      "merged_at": "2026-08-14T09:45:00Z"
+    },
+    "issues": [
+      {
+        "entity_id": "issue:501",
+        "entity_type": "issue",
+        "external_id": "501",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "resolved",
+        "correlation_method": "issue_reference",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "issue_reference", "source_entity_id": "change_request:601", "detail": "resolves #501"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "sessions": [
+      {
+        "session_id": "2f9c3a6e-0000-4000-8000-000000000002",
+        "external_session_id": "ses_gl_001",
+        "agent": "code-editor-senior",
+        "inferred": true,
+        "message_count": 85,
+        "total_input_tokens": 40000,
+        "total_output_tokens": 25000,
+        "total_cache_read_tokens": 8000,
+        "total_cache_write_tokens": 1500,
+        "total_estimated_cost_usd": 3.20
+      }
+    ],
+    "agents": ["code-editor-senior"],
+    "usage": {
+      "input_tokens": 40000,
+      "output_tokens": 25000,
+      "cache_read_tokens": 8000,
+      "cache_write_tokens": 1500,
+      "active_tokens": 65000,
+      "estimated_cost_usd": 3.20,
+      "session_count": 1,
+      "message_count": 85
+    },
+    "change_requests": [
+      {
+        "entity_id": "change_request:601",
+        "entity_type": "change_request",
+        "external_id": "601",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "title_match", "source_entity_id": "change_request:601", "detail": "exact title"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "commits": [
+      {
+        "entity_id": "commit:gl789abc",
+        "entity_type": "commit",
+        "external_id": "gl789abcdef01234",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "resolved",
+        "correlation_method": "branch_issue_reference",
+        "correlation_confidence": 0.8,
+        "evidence": [{"kind": "branch_ref", "source_entity_id": "commit:gl789abc", "detail": "branch add-telemetry"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "reviews": [
+      {
+        "entity_id": "review:gl601",
+        "entity_type": "review",
+        "external_id": "gl601",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "review_event", "source_entity_id": "review:gl601", "detail": "approved"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "merge_events": [
+      {
+        "entity_id": "merge_event:601",
+        "entity_type": "merge_event",
+        "external_id": "601",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "merge_event", "source_entity_id": "merge_event:601", "detail": "merged at 2026-08-14T09:45:00Z"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ]
+  }
+}

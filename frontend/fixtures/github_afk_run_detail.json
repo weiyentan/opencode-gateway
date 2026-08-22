@@ -1,0 +1,145 @@
+{
+  "status": "ok",
+  "data": {
+    "run": {
+      "afk_run_id": "01KZX9M4G80000000000000001",
+      "provider": "github",
+      "status": "completed",
+      "title": "Develop-Loop: Fix auth middleware",
+      "started_at": "2026-08-13T09:00:00Z",
+      "finished_at": "2026-08-13T10:15:00Z",
+      "outcome_status": "merged"
+    },
+    "outcome": {
+      "status": "merged",
+      "change_request_ids": ["change_request:501"],
+      "resolved_issue_ids": ["issue:437", "issue:438"],
+      "merge_event_id": "merge_event:501",
+      "merged_at": "2026-08-13T10:15:00Z"
+    },
+    "issues": [
+      {
+        "entity_id": "issue:437",
+        "entity_type": "issue",
+        "external_id": "437",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "issue_reference",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "issue_reference", "source_entity_id": "change_request:501", "detail": "resolves #437"}],
+        "resolver_version": "2",
+        "provisional": false
+      },
+      {
+        "entity_id": "issue:438",
+        "entity_type": "issue",
+        "external_id": "438",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "issue_reference",
+        "correlation_confidence": 0.9,
+        "evidence": [{"kind": "issue_reference", "source_entity_id": "change_request:501", "detail": "closes #438"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "sessions": [
+      {
+        "session_id": "1f9c3a6e-0000-4000-8000-000000000001",
+        "external_session_id": "ses_gh_001",
+        "agent": "code-editor-senior",
+        "inferred": true,
+        "message_count": 120,
+        "total_input_tokens": 50000,
+        "total_output_tokens": 30000,
+        "total_cache_read_tokens": 10000,
+        "total_cache_write_tokens": 2000,
+        "total_estimated_cost_usd": 4.50
+      },
+      {
+        "external_session_id": "ses_gh_002",
+        "agent": "code-editor-mid",
+        "inferred": true,
+        "message_count": 45,
+        "total_input_tokens": 12000,
+        "total_output_tokens": 8000,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_estimated_cost_usd": 1.20
+      }
+    ],
+    "agents": ["code-editor-senior", "code-editor-mid"],
+    "usage": {
+      "input_tokens": 62000,
+      "output_tokens": 38000,
+      "cache_read_tokens": 10000,
+      "cache_write_tokens": 2000,
+      "active_tokens": 100000,
+      "estimated_cost_usd": 5.70,
+      "session_count": 2,
+      "message_count": 165
+    },
+    "change_requests": [
+      {
+        "entity_id": "change_request:501",
+        "entity_type": "change_request",
+        "external_id": "501",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "title_match", "source_entity_id": "change_request:501", "detail": "exact title"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "commits": [
+      {
+        "entity_id": "commit:abc1234",
+        "entity_type": "commit",
+        "external_id": "abc1234def5678",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "branch_issue_reference",
+        "correlation_confidence": 0.8,
+        "evidence": [{"kind": "branch_ref", "source_entity_id": "commit:abc1234", "detail": "branch refs/heads/fix-auth"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "reviews": [
+      {
+        "entity_id": "review:501",
+        "entity_type": "review",
+        "external_id": "501",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "review_event", "source_entity_id": "review:501", "detail": "approved"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ],
+    "merge_events": [
+      {
+        "entity_id": "merge_event:501",
+        "entity_type": "merge_event",
+        "external_id": "501",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "resolved",
+        "correlation_method": "explicit_run_id",
+        "correlation_confidence": 1.0,
+        "evidence": [{"kind": "merge_event", "source_entity_id": "merge_event:501", "detail": "merged at 2026-08-13T10:15:00Z"}],
+        "resolver_version": "2",
+        "provisional": false
+      }
+    ]
+  }
+}
