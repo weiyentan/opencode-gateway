@@ -69,7 +69,7 @@ def _saved_row() -> MagicMock:
             "job_template_id": 7,
             "external_session_id": "ses_abc123",
             "provider": "github",
-            "repository_url": "acme/proj",
+            "repository_url": "github.com/acme/proj",
             "entity_type": "change_request",
             "entity_number": "99",
             "outcome": "completed",
@@ -90,7 +90,7 @@ def _valid_binding_payload() -> dict:
         "external_session_id": "ses_abc123",
         "resource": {
             "provider": "github",
-            "repository": "acme/proj",
+            "repository": "https://github.com/acme/proj",
             "resource_type": "pull_request",
             "resource_number": "99",
         },

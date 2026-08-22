@@ -62,7 +62,7 @@ def _mk_binding_row(
     job_template_id: int = 7,
     external_session_id: str | None = "ses_abc123",
     provider: str = "github",
-    repository_url: str = "acme/proj",
+    repository_url: str = "github.com/acme/proj",
     entity_type: str = "change_request",
     entity_number: str = "99",
     outcome: str = "completed",
@@ -135,7 +135,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -165,7 +165,7 @@ class TestCreateExecutionBinding:
         saved_row = _mk_binding_row(
             awx_job_id=101,
             provider="gitlab",
-            repository_url="cloudnative-pg/cloudnative-pg",
+            repository_url="gitlab.com/cloudnative-pg/cloudnative-pg",
             entity_number="6",
         )
         conn.fetchrow = AsyncMock(
@@ -179,7 +179,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_gl456",
             "resource": {
                 "provider": "gitlab",
-                "repository": "cloudnative-pg/cloudnative-pg",
+                "repository": "https://gitlab.com/cloudnative-pg/cloudnative-pg",
                 "resource_type": "merge_request",
                 "resource_number": "6",
             },
@@ -213,7 +213,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -246,7 +246,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_different",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -276,7 +276,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "123",
             },
@@ -306,7 +306,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -336,7 +336,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/other-repo",
+                "repository": "https://github.com/acme/other-repo",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -366,7 +366,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -394,7 +394,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -421,7 +421,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -446,7 +446,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "issue",  # Invalid — not a change request
                 "resource_number": "99",
             },
@@ -474,7 +474,7 @@ class TestCreateExecutionBinding:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
@@ -591,7 +591,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": "99",
             },
@@ -616,7 +616,7 @@ class TestListExecutionBindings:
             _mk_binding_row(
                 awx_job_id=101,
                 provider="gitlab",
-                repository_url="cloudnative-pg/cloudnative-pg",
+                repository_url="gitlab.com/cloudnative-pg/cloudnative-pg",
                 entity_number="6",
                 outcome="completed",
             ),
@@ -628,7 +628,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "gitlab",
-                "repository_url": "cloudnative-pg/cloudnative-pg",
+                "repository_url": "https://gitlab.com/cloudnative-pg/cloudnative-pg",
                 "entity_type": "change_request",
                 "entity_number": "6",
             },
@@ -652,7 +652,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": "0",
             },
@@ -674,7 +674,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "bitbucket",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": "99",
             },
@@ -696,7 +696,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "issue",
                 "entity_number": "99",
             },
@@ -734,7 +734,7 @@ class TestListExecutionBindings:
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": "99",
             },
@@ -771,7 +771,7 @@ class TestAuth:
             "external_session_id": "ses_abc123",
             "resource": {
                 "provider": "github",
-                "repository": "acme/proj",
+                "repository": "https://github.com/acme/proj",
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
