@@ -1260,6 +1260,17 @@ td.clickable:hover {
 .badge-open      { background: rgba(94, 242, 255, 0.15); color: var(--accent-cyan); }
 .badge-failed    { background: rgba(248, 113, 113, 0.15); color: var(--status-error); }
 
+/* Relationship state badges (issue #576): distinct visual cues for each
+   uncertainty level.  Resolved = green (badge-completed); provisional/
+   inferred = amber (badge-provisional); ambiguous = amber-orange; unmatched
+   = red-muted; parked = purple; unresolved = red.  Each uses a unique
+   background tint + text color so states are distinguishable at a glance. */
+.badge-provisional { background: rgba(251, 191, 36, 0.18); color: var(--status-stale); }
+.badge-ambiguous   { background: rgba(251, 165, 36, 0.18); color: #f59e0b; }
+.badge-unmatched   { background: rgba(248, 113, 113, 0.15); color: var(--status-error); }
+.badge-parked      { background: rgba(167, 139, 250, 0.18); color: var(--accent-purple); }
+.badge-unresolved  { background: rgba(248, 113, 113, 0.12); color: #ef4444; }
+
 /* ── Detail Panel Overlay ──────────────────────────────────────────────── */
 
 .detail-overlay {
@@ -1604,6 +1615,14 @@ td.clickable:hover {
 
 .afk-run-row:focus-visible td {
   box-shadow: inset 0 0 0 2px var(--accent-indigo);
+}
+
+/* Unresolved Relationships panel (issue #576): dedicated view for correlation
+   exceptions independent of the happy-path provenance detail.  Follows the
+   existing panel conventions — glass-panel table styling, freshness labels,
+   empty states — with no new design system tokens. */
+.panel-unresolved-relationships {
+  margin-top: 20px;
 }
 
 /* ── Client/Project Panel ────────────────────────────────────────────── */

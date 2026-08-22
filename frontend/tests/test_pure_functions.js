@@ -329,6 +329,12 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  // Issue #576: relationship state presentation + unresolved-relationships view
+  window.fmtRelationshipState = sandboxWindow.fmtRelationshipState;
+  window.renderRelationshipBadge = sandboxWindow.renderRelationshipBadge;
+  window.buildUnresolvedRelationships = sandboxWindow.buildUnresolvedRelationships;
+  window.renderUnresolvedRelationshipsRow = sandboxWindow.renderUnresolvedRelationshipsRow;
+  window.renderUnresolvedRelationships = sandboxWindow.renderUnresolvedRelationships;
   // Issue #469: Transcript view — pure helpers for UUID validation, depth
   // formatting, part-type classification, and the header/timeline/message/part
   // renderers, exposed on the same window test seam.
@@ -4897,6 +4903,354 @@ console.log('\u25B6 issue #557 — index.html + style.css (provider + token colu
   // No green active-row wash / cyan stripe / glow / pulse introduced.
   assert(live.indexOf('[data-active') === -1,
     'issue #557: no status-driven [data-active] row selector added');
+})();
+
+
+// ── Issue #576: Provisional and Unresolved Relationships ──────────────────
+// Relationship state presentation throughout AFK Outcomes and a dedicated
+// unresolved-relationships view.  Resolved, provisional, ambiguous, unmatched,
+// parked, and unresolved states must remain distinguishable and never be
+// silently omitted or rendered as definitive links.
+
+console.log('\u25B6 issue #576 \u2014 fmtRelationshipState (relationship state to badge class)');
+
+(function () {
+  // Resolved relationships
+  assert(window.fmtRelationshipState('resolved').label === 'resolved',
+    'resolved \u2192 label "resolved"');
+  assert(window.fmtRelationshipState('resolved').cssClass === 'badge-completed',
+    'resolved \u2192 badge-completed');
+
+  // Provisional / inferred relationships
+  assert(window.fmtRelationshipState('provisional').label === 'provisional',
+    'provisional \u2192 label "provisional"');
+  assert(window.fmtRelationshipState('provisional').cssClass === 'badge-provisional',
+    'provisional \u2192 badge-provisional');
+  assert(window.fmtRelationshipState('inferred').label === 'inferred',
+    'inferred \u2192 label "inferred"');
+  assert(window.fmtRelationshipState('inferred').cssClass === 'badge-provisional',
+    'inferred \u2192 badge-provisional');
+
+  // Uncertain states
+  assert(window.fmtRelationshipState('ambiguous').label === 'ambiguous',
+    'ambiguous \u2192 label "ambiguous"');
+  assert(window.fmtRelationshipState('ambiguous').cssClass === 'badge-ambiguous',
+    'ambiguous \u2192 badge-ambiguous');
+
+  assert(window.fmtRelationshipState('unmatched').label === 'unmatched',
+    'unmatched \u2192 label "unmatched"');
+  assert(window.fmtRelationshipState('unmatched').cssClass === 'badge-unmatched',
+    'unmatched \u2192 badge-unmatched');
+
+  assert(window.fmtRelationshipState('parked').label === 'parked',
+    'parked \u2192 label "parked"');
+  assert(window.fmtRelationshipState('parked').cssClass === 'badge-parked',
+    'parked \u2192 badge-parked');
+
+  assert(window.fmtRelationshipState('unresolved').label === 'unresolved',
+    'unresolved \u2192 label "unresolved"');
+  assert(window.fmtRelationshipState('unresolved').cssClass === 'badge-unresolved',
+    'unresolved \u2192 badge-unresolved');
+
+  // Noise state
+  assert(window.fmtRelationshipState('noise').label === 'noise',
+    'noise \u2192 label "noise"');
+  assert(window.fmtRelationshipState('noise').cssClass === 'badge-unknown',
+    'noise \u2192 badge-unknown');
+
+  // Referenced state
+  assert(window.fmtRelationshipState('referenced').label === 'referenced',
+    'referenced \u2192 label "referenced"');
+  assert(window.fmtRelationshipState('referenced').cssClass === 'badge-stale',
+    'referenced \u2192 badge-stale');
+
+  // Null/unknown fallback
+  assert(window.fmtRelationshipState(null).label === '--',
+    'null \u2192 label "--"');
+  assert(window.fmtRelationshipState(null).cssClass === 'badge-unknown',
+    'null \u2192 badge-unknown');
+  assert(window.fmtRelationshipState('nonsense').label === 'nonsense',
+    'unknown state passes through as label');
+  assert(window.fmtRelationshipState('nonsense').cssClass === 'badge-unknown',
+    'unknown state \u2192 badge-unknown');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderRelationshipBadge (badge + provenance)');
+
+(function () {
+  // Resolved link with full provenance
+  var resolved = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '1'
+  });
+  assert(resolved.indexOf('badge-completed') !== -1, 'resolved badge uses badge-completed');
+  assert(resolved.indexOf('resolved') !== -1, 'resolved badge text is "resolved"');
+  assert(resolved.indexOf('100%') !== -1, 'resolved badge shows confidence as percentage');
+  assert(resolved.indexOf('issue_reference') !== -1, 'resolved badge shows method');
+  assert(resolved.indexOf('resolver v1') !== -1, 'resolved badge shows resolver version');
+  assert(resolved.indexOf('change_request:442') !== -1, 'resolved badge shows evidence source');
+
+  // Provisional link with partial provenance
+  var provisional = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1,
+    method: 'temporal_inference',
+    evidence: [],
+    resolver_version: '2'
+  });
+  assert(provisional.indexOf('badge-provisional') !== -1, 'provisional badge uses badge-provisional');
+  assert(provisional.indexOf('provisional') !== -1, 'provisional badge text is "provisional"');
+  assert(provisional.indexOf('10%') !== -1, 'provisional badge shows confidence');
+  assert(provisional.indexOf('temporal_inference') !== -1, 'provisional badge shows method');
+  assert(provisional.indexOf('resolver v2') !== -1, 'provisional badge shows resolver version');
+
+  // Minimal provenance (no evidence, no method)
+  var minimal = window.renderRelationshipBadge('ambiguous', {
+    confidence: null,
+    method: null,
+    evidence: [],
+    resolver_version: null
+  });
+  assert(minimal.indexOf('badge-ambiguous') !== -1, 'ambiguous badge uses badge-ambiguous');
+  assert(minimal.indexOf('--') !== -1, 'missing confidence renders "--"');
+
+  // No provenance object at all
+  var noProv = window.renderRelationshipBadge('unresolved', null);
+  assert(noProv.indexOf('badge-unresolved') !== -1, 'no provenance: badge still renders');
+  assert(noProv.indexOf('unresolved') !== -1, 'no provenance: badge text still renders');
+})();
+
+console.log('\u25B6 issue #576 \u2014 buildUnresolvedRelationships (extract from AFK run detail)');
+
+(function () {
+  // Full detail with ambiguous and unmatched items
+  var detail = {
+    unresolved: [
+      { entity_id: 'issue:99', entity_type: 'issue', reason: 'ambiguous',
+        correlation_method: 'issue_reference', correlation_confidence: 0.5,
+        evidence: [{ kind: 'title_match', source_entity_id: 'change_request:100' }],
+        resolver_version: '2' },
+      { entity_id: 'issue:101', entity_type: 'issue', reason: 'unmatched',
+        correlation_method: null, correlation_confidence: null,
+        evidence: [], resolver_version: '2' }
+    ],
+    parked: [
+      { entity_id: 'issue:200', entity_type: 'issue',
+        correlation_method: 'temporal_inference', correlation_confidence: 0.3,
+        evidence: [], resolver_version: '2' }
+    ]
+  };
+  var items = window.buildUnresolvedRelationships(detail);
+  assert(items.length === 3, 'buildUnresolvedRelationships: 3 total items (2 unresolved + 1 parked)');
+  assert(items[0].state === 'ambiguous', 'first item: ambiguous');
+  assert(items[1].state === 'unmatched', 'second item: unmatched');
+  assert(items[2].state === 'parked', 'third item: parked');
+
+  // Empty detail
+  assert(window.buildUnresolvedRelationships({}).length === 0, 'empty detail \u2192 0 items');
+  assert(window.buildUnresolvedRelationships(null).length === 0, 'null detail \u2192 0 items');
+  assert(window.buildUnresolvedRelationships({ unresolved: [], parked: [] }).length === 0,
+    'empty arrays \u2192 0 items');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderUnresolvedRelationshipsRow (single row)');
+
+(function () {
+  var row = window.renderUnresolvedRelationshipsRow({
+    entity_id: 'issue:99',
+    entity_type: 'issue',
+    state: 'ambiguous',
+    confidence: 0.5,
+    method: 'issue_reference',
+    evidence: [{ kind: 'title_match', source_entity_id: 'change_request:100' }],
+    resolver_version: '2'
+  });
+  assert(row.indexOf('issue:99') !== -1, 'row shows entity id');
+  assert(row.indexOf('issue') !== -1, 'row shows entity type');
+  assert(row.indexOf('badge-ambiguous') !== -1, 'row renders ambiguous badge');
+  assert(row.indexOf('ambiguous') !== -1, 'row shows state label');
+  assert(row.indexOf('50%') !== -1, 'row shows confidence as percentage');
+  assert(row.indexOf('issue_reference') !== -1, 'row shows method');
+  assert(row.indexOf('change_request:100') !== -1, 'row shows evidence source');
+  assert(row.indexOf('resolver v2') !== -1, 'row shows resolver version');
+
+  // Unmatched row (no confidence, no method)
+  var unmatched = window.renderUnresolvedRelationshipsRow({
+    entity_id: 'issue:101',
+    entity_type: 'issue',
+    state: 'unmatched',
+    confidence: null,
+    method: null,
+    evidence: [],
+    resolver_version: '2'
+  });
+  assert(unmatched.indexOf('badge-unmatched') !== -1, 'unmatched row renders badge-unmatched');
+  assert(unmatched.indexOf('unmatched') !== -1, 'unmatched row shows state label');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderUnresolvedRelationships (panel view)');
+
+(function () {
+  // With items
+  var panel = window.renderUnresolvedRelationships({
+    items: [
+      { entity_id: 'issue:99', entity_type: 'issue', state: 'ambiguous',
+        confidence: 0.5, method: 'issue_reference', evidence: [], resolver_version: '2' },
+      { entity_id: 'issue:101', entity_type: 'issue', state: 'unmatched',
+        confidence: null, method: null, evidence: [], resolver_version: '2' }
+    ]
+  });
+  assert(panel.indexOf('issue:99') !== -1, 'panel renders first item');
+  assert(panel.indexOf('issue:101') !== -1, 'panel renders second item');
+  assert(panel.indexOf('badge-ambiguous') !== -1, 'panel renders ambiguous badge');
+  assert(panel.indexOf('badge-unmatched') !== -1, 'panel renders unmatched badge');
+
+  // Empty items
+  var empty = window.renderUnresolvedRelationships({ items: [] });
+  assert(empty.indexOf('No unresolved relationships') !== -1, 'empty items \u2192 empty state message');
+
+  // Null/undefined
+  var nullView = window.renderUnresolvedRelationships(null);
+  assert(nullView.indexOf('No unresolved relationships') !== -1, 'null data \u2192 empty state message');
+})();
+
+console.log('\u25B6 issue #576 \u2014 relationship state never silently omitted');
+
+(function () {
+  // Every uncertain state must render distinctly (never conflated with resolved)
+  var states = ['provisional', 'inferred', 'ambiguous', 'unmatched', 'parked', 'unresolved', 'noise', 'referenced'];
+  states.forEach(function (state) {
+    var info = window.fmtRelationshipState(state);
+    assert(info.cssClass !== 'badge-completed',
+      state + ' is never rendered as badge-completed (resolved)');
+    assert(info.label !== 'resolved',
+      state + ' label is never "resolved"');
+    var badge = window.renderRelationshipBadge(state, null);
+    assert(badge.indexOf('badge-completed') === -1,
+      state + ' badge HTML never contains badge-completed');
+  });
+})();
+
+console.log('\u25B6 issue #576 \u2014 cross-provider parity (GitHub PR / GitLab MR fixtures)');
+
+(function () {
+  // GitHub PR fixture
+  var github = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '2'
+  });
+  assert(github.indexOf('badge-completed') !== -1 && github.indexOf('100%') !== -1,
+    'GitHub PR: resolved badge + confidence rendered');
+
+  // GitLab MR fixture (identical shape)
+  var gitlab = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '2'
+  });
+  assert(gitlab.indexOf('badge-completed') !== -1 && gitlab.indexOf('100%') !== -1,
+    'GitLab MR: resolved badge + confidence rendered (same shape as GitHub)');
+
+  // Provisional on both providers
+  var ghProv = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1, method: 'temporal_inference', evidence: [], resolver_version: '2'
+  });
+  var glProv = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1, method: 'temporal_inference', evidence: [], resolver_version: '2'
+  });
+  assert(ghProv === glProv, 'GitHub and GitLab provisional badges are identical for same input');
+})();
+
+console.log('\u25B6 issue #576 \u2014 unresolved view panel freshness + stale/error states');
+
+(function () {
+  // The unresolved-relationships panel follows the same PANEL_ENDPOINTS
+  // freshness convention as every other panel.
+  var unresolvedFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
+  assert(unresolvedFail['afk-outcomes'] === 'stale',
+    'afkRuns failure: the AFK Outcomes panel (including unresolved) goes stale');
+
+  // Stale panel with previous data: shouldRenderPanel returns false
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: 500000 } },
+    'unresolved-relationships') === false,
+    'stale unresolved panel with previous data \u2192 render skipped');
+
+  // Stale panel with NO previous data: shouldRenderPanel returns true
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: null } },
+    'unresolved-relationships') === true,
+    'stale unresolved panel with no previous data \u2192 render proceeds');
+
+  // Ok panel renders
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'ok', updatedAt: 500000 } },
+    'unresolved-relationships') === true,
+    'ok unresolved panel renders');
+
+  // Freshness label
+  var now = 1000000;
+  var stale = window.computePanelFreshness(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: 500000 } },
+    'unresolved-relationships', now);
+  assert(stale !== null && stale.label === 'Showing previous data',
+    'stale unresolved panel shows "Showing previous data"');
+})();
+
+console.log('\u25B6 issue #576 \u2014 static markup: unresolved relationships panel in AFK Outcomes tab');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // Unresolved relationships panel exists inside #tab-afk-outcomes
+  var afkTabStart = html.indexOf('id="tab-afk-outcomes"');
+  var afkTabEnd = html.indexOf('<!-- #tab-afk-outcomes -->');
+  assert(afkTabStart !== -1 && afkTabEnd !== -1, 'index.html: #tab-afk-outcomes exists');
+  var afkTabHtml = html.slice(afkTabStart, afkTabEnd);
+  assert(afkTabHtml.indexOf('id="unresolved-relationships-tbody"') !== -1,
+    'index.html: unresolved relationships tbody exists inside AFK Outcomes tab');
+  assert(afkTabHtml.indexOf('id="freshness-unresolved-relationships"') !== -1,
+    'index.html: unresolved panel carries a freshness label span');
+  assert(afkTabHtml.indexOf('Unresolved Relationships') !== -1,
+    'index.html: unresolved panel title reads "Unresolved Relationships"');
+  assert(afkTabHtml.indexOf('panel-unresolved-relationships') !== -1,
+    'index.html: unresolved panel carries panel-unresolved-relationships class');
+})();
+
+console.log('\u25B6 issue #576 \u2014 static CSS: relationship state badge styles');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // New badge classes for uncertain relationship states
+  assert(live.indexOf('.badge-provisional') !== -1, 'style.css: .badge-provisional rule exists');
+  assert(live.indexOf('.badge-ambiguous') !== -1, 'style.css: .badge-ambiguous rule exists');
+  assert(live.indexOf('.badge-unmatched') !== -1, 'style.css: .badge-unmatched rule exists');
+  assert(live.indexOf('.badge-parked') !== -1, 'style.css: .badge-parked rule exists');
+  assert(live.indexOf('.badge-unresolved') !== -1, 'style.css: .badge-unresolved rule exists');
+
+  // Provisional link styling (amber dashed border)
+  assert(live.indexOf('.afk-chain-item.afk-provisional') !== -1,
+    'style.css: .afk-chain-item.afk-provisional rule exists');
+
+  // Unresolved panel styling
+  assert(live.indexOf('.panel-unresolved-relationships') !== -1,
+    'style.css: .panel-unresolved-relationships rule exists');
+})();
+
+console.log('\u25B6 issue #576 \u2014 window exports for new helpers');
+
+(function () {
+  assert(typeof window.fmtRelationshipState === 'function', 'fmtRelationshipState exported on window');
+  assert(typeof window.renderRelationshipBadge === 'function', 'renderRelationshipBadge exported on window');
+  assert(typeof window.buildUnresolvedRelationships === 'function', 'buildUnresolvedRelationships exported on window');
+  assert(typeof window.renderUnresolvedRelationshipsRow === 'function', 'renderUnresolvedRelationshipsRow exported on window');
+  assert(typeof window.renderUnresolvedRelationships === 'function', 'renderUnresolvedRelationships exported on window');
 })();
 
 

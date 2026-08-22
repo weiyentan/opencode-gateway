@@ -413,6 +413,28 @@
       </div>
     </section>
 
+    <!-- Unresolved Relationships (issue #576): dedicated view for correlation
+         exceptions — ambiguous, unmatched, parked — independent of the happy-path
+         provenance detail.  Lists uncertain relationships with their state,
+         confidence, method, evidence, and resolver version. -->
+    <section class="glass-panel panel-unresolved-relationships">
+      <h2 class="panel-title">Unresolved Relationships<span class="panel-freshness" id="freshness-unresolved-relationships"></span></h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Entity</th>
+              <th>Type</th>
+              <th>State / Provenance</th>
+            </tr>
+          </thead>
+          <tbody id="unresolved-relationships-tbody">
+            <tr><td colspan="3" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     </div><!-- #tab-afk-outcomes -->
 
     <!-- ── Tab: Transcript / Timeline (issue #469) ─────────────────────── -->
