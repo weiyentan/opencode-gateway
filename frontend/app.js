@@ -166,6 +166,7 @@
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
     'afk-outcomes':  ['afkRuns'],
+    'afk-repos':     ['afkRuns'],
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -680,6 +681,99 @@
     if (pid) return pid;
     if (wid) return wid;
     return '--';
+  }
+
+  // ── AFK Repository Summary helpers (issue #572) ───────────────────────
+  // Aggregates AFK runs into a repository-first summary list: one row per
+  // unique (provider, repository) pair, showing AFK activity counts,
+  // provider identity, and last-activity timestamps.  Pure helpers — no DOM
+  // access — so the Node test harness exercises them through the window
+  // test seam.
+
+  /** Derive a repository label from an AFK run's title and metadata.
+   *  Falls back to provider name when no repository can be resolved.
+   *  Pure — no DOM or fetch access.
+   *  @param {Object} run - AFK run item from the API
+   *  @returns {string} a normalized repository label */
+  function deriveRepositoryLabel(run) {
+    if (!run) return 'unknown';
+    // Use the title if it contains a repository-like path (e.g. "owner/repo")
+    var title = run.title || '';
+    var match = title.match(/^([a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+)/);
+    if (match) return match[1];
+    // Fall back to provider name
+    return run.provider || 'unknown';
+  }
+
+  /** Build repository summary rows from an AFK runs list.
+   *  Pure: aggregates runs by (provider, repository) without DOM access.
+   *  @param {Array|null} runs - AFK runs items from the API
+   *  @returns {Array<{provider: string, repository: string, runCount: number,
+   *           lastActivity: string|null}>} sorted by runCount desc,
+   *           then provider asc, then repository asc */
+  function buildRepositorySummaries(runs) {
+    if (!runs || !Array.isArray(runs) || runs.length === 0) return [];
+    var groups = {};
+    runs.forEach(function (r) {
+      var provider = (r && r.provider) || 'unknown';
+      var repository = deriveRepositoryLabel(r);
+      var key = provider + '|' + repository;
+      if (!groups[key]) {
+        groups[key] = {
+          provider: provider,
+          repository: repository,
+          runCount: 0,
+          lastActivity: null
+        };
+      }
+      groups[key].runCount++;
+      var seen = r.last_seen_at || r.started_at;
+      if (seen && (!groups[key].lastActivity || seen > groups[key].lastActivity)) {
+        groups[key].lastActivity = seen;
+      }
+    });
+    return Object.keys(groups).map(function (k) { return groups[k]; })
+      .sort(function (a, b) {
+        if (b.runCount !== a.runCount) return b.runCount - a.runCount;
+        if (a.provider !== b.provider) return a.provider < b.provider ? -1 : 1;
+        return a.repository < b.repository ? -1 : (a.repository > b.repository ? 1 : 0);
+      });
+  }
+
+  /** Render the repository summary list table (issue #572).
+   *  Follows the agent-runs panel conventions: freshness guard, empty/error
+   *  states, escHtml on every interpolated value.  One row per repository
+   *  with provider badge, repository name, run count, and last activity. */
+  function renderRepositorySummaryTable(data) {
+    applyPanelFreshness('afk-repos');
+    if (!shouldRenderPanel(panelStates, 'afk-repos')) return;
+
+    var reposEl = $('afk-repos-tbody');
+    if (!reposEl) return;
+
+    var runs = data && data.items;
+    var summaries = buildRepositorySummaries(runs);
+
+    if (summaries.length === 0) {
+      var errSuffix = afkRunsFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkRunsFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      reposEl.innerHTML = '<tr><td colspan="4" class="empty-state">No repository activity' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    summaries.forEach(function (s) {
+      var providerBadge = badge(s.provider, 'badge-provider').outerHTML;
+      html += '<tr>' +
+        '<td>' + providerBadge + '</td>' +
+        '<td>' + escHtml(s.repository) + '</td>' +
+        '<td>' + fmtNum(s.runCount) + '</td>' +
+        '<td>' + fmtDT(s.lastActivity) + '</td>' +
+        '</tr>';
+    });
+
+    reposEl.innerHTML = html;
   }
 
   // ── AFK outcome chain helpers (issue #453) ─────────────────────────────
@@ -2479,6 +2573,7 @@
       }
       renderClientProjectBreakdown(data);
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderRepositorySummaryTable(data.afkRuns); // Repository summary (issue #572)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -3328,6 +3423,12 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  // AFK Repository Summary (issue #572): pure aggregation helper and
+  // table renderer — the Node harness exercises the pure helper directly
+  // and the renderer through the fake tbody.
+  window.deriveRepositoryLabel = deriveRepositoryLabel;
+  window.buildRepositorySummaries = buildRepositorySummaries;
+  window.renderRepositorySummaryTable = renderRepositorySummaryTable;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.

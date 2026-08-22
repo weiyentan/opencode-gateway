@@ -392,6 +392,27 @@
          #afk-detail-overlay rendering the full chain. -->
     <div class="tab-content" id="tab-afk-outcomes">
 
+    <!-- Repository Summary (issue #572): repository-first entry view -->
+    <section class="glass-panel panel-afk-repos">
+      <h2 class="panel-title">Repository Summary<span class="panel-freshness" id="freshness-afk-repos"></span></h2>
+      <div class="table-scroll">
+        <table id="afk-repos-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Repository</th>
+              <th>AFK Runs</th>
+              <th>Last Activity</th>
+            </tr>
+          </thead>
+          <tbody id="afk-repos-tbody">
+            <tr><td colspan="4" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- AFK Runs list (existing) -->
     <section class="glass-panel panel-afk-outcomes">
       <h2 class="panel-title">AFK Outcomes<span class="panel-freshness" id="freshness-afk-outcomes"></span></h2>
       <div class="table-scroll">
