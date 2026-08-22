@@ -337,19 +337,10 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
-  // AFK Repository Summary (issue #572): pure aggregation helper and table
-  // renderer — the Node harness exercises the pure helper directly.
-  window.deriveRepositoryLabel = sandboxWindow.deriveRepositoryLabel;
-  window.buildRepositorySummaries = sandboxWindow.buildRepositorySummaries;
-  window.renderRepositorySummaryTable = sandboxWindow.renderRepositorySummaryTable;
-  // AFK Change Request List (issue #573): provider-specific terminology,
-  // pure CR list builder, AFK-only filter, and the list renderer.
-  window.providerCrTerm = sandboxWindow.providerCrTerm;
-  window.buildChangeRequestList = sandboxWindow.buildChangeRequestList;
-  window.filterChangeRequests = sandboxWindow.filterChangeRequests;
-  window.renderChangeRequestList = sandboxWindow.renderChangeRequestList;
-  window.selectRepository = sandboxWindow.selectRepository;
-  window.clearSelectedRepo = sandboxWindow.clearSelectedRepo;
+  // Issue #575: nested session tree — build + render helpers exposed on
+  // the same vm-sandbox window seam for pure-function tests.
+  window.buildSessionTree = sandboxWindow.buildSessionTree;
+  window.renderNestedSessionNode = sandboxWindow.renderNestedSessionNode;
   // Issue #469: Transcript view — pure helpers for UUID validation, depth
   // formatting, part-type classification, and the header/timeline/message/part
   // renderers, exposed on the same window test seam.
@@ -5627,6 +5618,206 @@ console.log('\u25B6 issue #557 — index.html + style.css (provider + token colu
   // No green active-row wash / cyan stripe / glow / pulse introduced.
   assert(live.indexOf('[data-active') === -1,
     'issue #557: no status-driven [data-active] row selector added');
+})();
+
+// ── AFK Outcomes — nested session tree (issue #575) ───────────────────
+// Within each provenance-timeline execution, the root session and its child
+// sessions are rendered as an explicit nested relationship using
+// parent_session_id.  The tree builder groups flat session links by their
+// parentage, the renderer adds visual nesting depth, and missing/unresolved
+// parent references are explicitly marked.
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: root-only sessions (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_A', session_id: 'id_A', agent: 'a1' },
+    { external_session_id: 'ses_B', session_id: 'id_B', agent: 'a2' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 2, 'root-only: two root nodes');
+  assert(tree[0].session.external_session_id === 'ses_A', 'root-first: ses_A');
+  assert(tree[1].session.external_session_id === 'ses_B', 'root-second: ses_B');
+  assert(tree[0].children.length === 0, 'root-only: no children');
+  assert(!tree[0].missing_parent, 'root-only: no missing_parent marker');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: nested child sessions (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coordinator', parent_session_id: null },
+    { external_session_id: 'ses_CHILD1', session_id: 'id_C1', agent: 'editor', parent_session_id: 'ses_ROOT' },
+    { external_session_id: 'ses_CHILD2', session_id: 'id_C2', agent: 'tester', parent_session_id: 'ses_ROOT' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'nested: one root');
+  assert(tree[0].session.external_session_id === 'ses_ROOT', 'nested: root is ses_ROOT');
+  assert(tree[0].children.length === 2, 'nested: root has two children');
+  assert(tree[0].children[0].external_session_id === 'ses_CHILD1', 'nested: first child');
+  assert(tree[0].children[1].external_session_id === 'ses_CHILD2', 'nested: second child');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: missing-parent session (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coordinator', parent_session_id: null },
+    { external_session_id: 'ses_ORPHAN', session_id: 'id_O', agent: 'editor', parent_session_id: 'ses_MISSING' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 2, 'missing-parent: orphan becomes root');
+  var orphan = tree.filter(function (n) { return n.session.external_session_id === 'ses_ORPHAN'; })[0];
+  assert(orphan, 'missing-parent: orphan node exists');
+  assert(orphan.missing_parent === 'ses_MISSING', 'missing-parent: marker carries the missing parent id');
+  assert(orphan.children.length === 0, 'missing-parent: orphan has no children');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: unresolved session (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_X', session_id: null, agent: 'unknown', parent_session_id: null }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'unresolved: one root');
+  assert(tree[0].session.session_id === null, 'unresolved: session_id is null');
+  assert(!tree[0].missing_parent, 'unresolved: no missing_parent marker (no parent_session_id)');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: empty/null input (issue #575)');
+
+(function () {
+  assert(window.buildSessionTree(null).length === 0, 'null input returns empty array');
+  assert(window.buildSessionTree([]).length === 0, 'empty input returns empty array');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: multi-level nesting (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a', parent_session_id: null },
+    { external_session_id: 'ses_C1', session_id: 'id_C1', agent: 'b', parent_session_id: 'ses_R' },
+    { external_session_id: 'ses_GC1', session_id: 'id_GC1', agent: 'c', parent_session_id: 'ses_C1' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'multi-level: one root');
+  assert(tree[0].children.length === 1, 'multi-level: root has one child');
+  // Grandchild is nested under child in the flat list but the tree builder
+  // attaches it to the child's node.
+  assert(tree[0].children[0].external_session_id === 'ses_C1', 'multi-level: child is ses_C1');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: root vs nested (issue #575)');
+
+(function () {
+  var root = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 0);
+  assert(root.indexOf('afk-session-root') !== -1, 'renderNested: root gets afk-session-root class');
+  assert(root.indexOf('afk-session-nested') === -1, 'renderNested: root has no nested class');
+
+  var nested = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_C', session_id: 'id_C', agent: 'b',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 1);
+  assert(nested.indexOf('afk-session-nested') !== -1, 'renderNested: child gets afk-session-nested class');
+  assert(nested.indexOf('afk-nesting-depth-1') !== -1, 'renderNested: child gets depth-1 class');
+  assert(nested.indexOf('afk-session-root') === -1, 'renderNested: child has no root class');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: missing parent marker (issue #575)');
+
+(function () {
+  var html = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_ORPHAN', session_id: 'id_O', agent: 'x',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: [],
+    missing_parent: 'ses_GHOST'
+  }, 0);
+  assert(html.indexOf('afk-missing-parent') !== -1, 'renderNested: missing-parent gets marker class');
+  assert(html.indexOf('parent not in this run') !== -1, 'renderNested: missing-parent shows note text');
+  assert(html.indexOf('ses_GHOST') !== -1, 'renderNested: note includes the missing parent id');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: children rendered nested (issue #575)');
+
+(function () {
+  var html = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coord',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: [
+      { external_session_id: 'ses_C1', session_id: 'id_C1', agent: 'editor',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+      { external_session_id: 'ses_C2', session_id: 'id_C2', agent: 'tester',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 }
+    ]
+  }, 0);
+  assert(html.indexOf('afk-session-children') !== -1, 'renderNested: children container exists');
+  assert(html.indexOf('ses_C1') !== -1, 'renderNested: first child rendered');
+  assert(html.indexOf('ses_C2') !== -1, 'renderNested: second child rendered');
+  assert(html.indexOf('afk-nesting-depth-1') !== -1, 'renderNested: children get depth-1');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderAfkChainStep: sessions step uses nested tree (issue #575)');
+
+(function () {
+  var step = {
+    key: 'sessions', label: 'Sessions', items: [
+      { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a', parent_session_id: null,
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+      { external_session_id: 'ses_C', session_id: 'id_C', agent: 'b', parent_session_id: 'ses_R',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 }
+    ]
+  };
+  var html = window.renderAfkChainStep(step);
+  assert(html.indexOf('afk-session-root') !== -1, 'chain-step sessions: root session gets root class');
+  assert(html.indexOf('afk-session-nested') !== -1, 'chain-step sessions: child session gets nested class');
+  assert(html.indexOf('afk-session-children') !== -1, 'chain-step sessions: children container present');
+  assert(html.indexOf('ses_C') !== -1, 'chain-step sessions: child session id rendered');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderAfkChainStep: sessions step empty state (issue #575)');
+
+(function () {
+  var step = { key: 'sessions', label: 'Sessions', items: [] };
+  var html = window.renderAfkChainStep(step);
+  assert(html.indexOf('No sessions linked') !== -1, 'chain-step sessions: empty state rendered');
+})();
+
+console.log('\u25B6 AFK Outcomes — nested session deep-link (issue #575)');
+
+(function () {
+  var node = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_C', session_id: '1f9c3a6e-0000-4000-8000-000000000001',
+      agent: 'editor', inferred: true, total_input_tokens: 100, total_output_tokens: 50,
+      total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0.01 },
+    children: []
+  }, 1);
+  assert(node.indexOf('afk-session-clickable') !== -1, 'nested session with session_id is clickable');
+  assert(node.indexOf('data-session-id="1f9c3a6e-0000-4000-8000-000000000001"') !== -1,
+    'nested session carries deep-link data-session-id');
+  assert(node.indexOf('open run') !== -1, 'nested session shows open-run affordance');
+
+  var unres = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_NOR', agent: 'unknown', inferred: true,
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 0);
+  assert(unres.indexOf('afk-session-clickable') === -1, 'unresolved session is NOT clickable');
+  assert(unres.indexOf('data-session-id=') === -1, 'unresolved session has no deep-link');
 })();
 
 

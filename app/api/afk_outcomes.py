@@ -312,7 +312,7 @@ async def _fetch_run_detail(
                        ars.finished_at, s.agent, s.total_input_tokens,
                        s.total_output_tokens, s.total_cache_read_tokens,
                        s.total_cache_write_tokens, s.total_estimated_cost_usd,
-                       s.message_count
+                       s.message_count, s.parent_session_id
                 FROM afk_run_sessions ars
                 LEFT JOIN sessions s ON s.id = ars.session_id
                 WHERE ars.afk_run_id = $1
@@ -379,6 +379,7 @@ async def _fetch_run_detail(
                 total_cache_read_tokens=row["total_cache_read_tokens"] or 0,
                 total_cache_write_tokens=row["total_cache_write_tokens"] or 0,
                 total_estimated_cost_usd=row["total_estimated_cost_usd"],
+                parent_session_id=row["parent_session_id"],
             )
         )
         if row["agent"]:

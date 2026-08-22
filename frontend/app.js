@@ -1053,6 +1053,87 @@
     ];
   }
 
+  // ── Nested session tree (issue #575) ─────────────────────────────────
+  // Build a root→children tree from a flat list of session links using
+  // parent_session_id.  Sessions whose parent_session_id references a
+  // session not in the list are treated as root sessions with a
+  // missing_parent marker.  Sessions with no parent_session_id are roots.
+  // Pure — no DOM access.
+
+  /** Build a nested session tree from a flat list of session links.
+   *  Returns an array of root nodes, each optionally carrying a `children`
+   *  array.  A node is `{ session, children, missing_parent }`.
+   *  Pure — no DOM access. */
+  function buildSessionTree(sessions) {
+    if (!sessions || !sessions.length) return [];
+    var byParent = {};
+    var byExtId = {};
+    var roots = [];
+    sessions.forEach(function (s) {
+      var extId = s.external_session_id || s.session_id || '';
+      byExtId[extId] = s;
+    });
+    sessions.forEach(function (s) {
+      var extId = s.external_session_id || s.session_id || '';
+      var parentId = s.parent_session_id || '';
+      if (parentId && byExtId[parentId]) {
+        if (!byParent[parentId]) byParent[parentId] = [];
+        byParent[parentId].push(s);
+      } else if (parentId && !byExtId[parentId]) {
+        roots.push({ session: s, children: [], missing_parent: parentId });
+      } else {
+        roots.push({ session: s, children: [] });
+      }
+    });
+    Object.keys(byParent).forEach(function (parentId) {
+      var node = _findNode(roots, parentId);
+      if (node) node.children = byParent[parentId];
+    });
+    return roots;
+  }
+
+  /** Find a node in the tree by external_session_id. */
+  function _findNode(nodes, extId) {
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if ((n.session.external_session_id || n.session.session_id) === extId) return n;
+      if (n.children && n.children.length) {
+        var found = _findNode(
+          n.children.map(function (c) { return { session: c, children: [] }; }),
+          extId
+        );
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /** Render a nested session node with tree indentation.
+   *  Pure — returns an HTML string. */
+  function renderNestedSessionNode(node, depth) {
+    depth = depth || 0;
+    var html = renderAfkSessionLink(node.session);
+    if (depth > 0) {
+      html = html.replace('afk-chain-item', 'afk-chain-item afk-session-nested afk-nesting-depth-' + Math.min(depth, 5));
+    } else {
+      html = html.replace('afk-chain-item', 'afk-chain-item afk-session-root');
+    }
+    if (node.missing_parent) {
+      html = html.replace('afk-chain-item', 'afk-chain-item afk-missing-parent');
+      html += '<div class="afk-missing-parent-note">\u26A0 parent not in this run: ' +
+        escHtml(node.missing_parent) + '</div>';
+    }
+    if (node.children && node.children.length) {
+      html += '<div class="afk-session-children">';
+      node.children.forEach(function (child) {
+        var childNode = { session: child, children: [] };
+        html += renderNestedSessionNode(childNode, depth + 1);
+      });
+      html += '</div>';
+    }
+    return html;
+  }
+
   // ── Panel freshness (pure helpers — no DOM) ───────────────────────────
   // Freshness state model (issue #357): refreshDashboard() maintains a
   // per-panel state map (panelStates: panelId → { status, updatedAt }) and
@@ -2853,9 +2934,12 @@
       body = renderAfkRunStep(step.run);
     } else if (step.key === 'sessions') {
       var sessions = step.items || [];
-      body = sessions.length
-        ? sessions.map(renderAfkSessionLink).join('')
-        : '<div class="afk-empty">No sessions linked</div>';
+      if (sessions.length) {
+        var tree = buildSessionTree(sessions);
+        body = tree.map(function (node) { return renderNestedSessionNode(node, 0); }).join('');
+      } else {
+        body = '<div class="afk-empty">No sessions linked</div>';
+      }
     } else if (step.key === 'agents') {
       var agents = step.items || [];
       body = agents.length
@@ -4200,18 +4284,11 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
-  // Change Request Provenance Timeline (issue #574): deterministic fixtures,
-  // the pure timeline composer, and the execution/section renderers — all
-  // pure string builders exercised through the vm-sandbox window seam.
-  window.githubCompleteFixture = githubCompleteFixture;
-  window.gitlabIncompleteFixture = gitlabIncompleteFixture;
-  window.repeatedReviewFixture = repeatedReviewFixture;
-  window.buildProvenanceTimeline = buildProvenanceTimeline;
-  window.renderProvenanceTimeline = renderProvenanceTimeline;
-  window.renderProvenanceExecution = renderProvenanceExecution;
-  window.stateBadgeForCrState = stateBadgeForCrState;
-  window.closureStatusBadgeClass = closureStatusBadgeClass;
-  window.openChangeRequestProvenance = openChangeRequestProvenance;
+  // Nested session tree (issue #575): build a root→children tree from flat
+  // session links using parent_session_id, and render nested rows with
+  // tree indentation.  Pure string builders exercised through the vm-sandbox.
+  window.buildSessionTree = buildSessionTree;
+  window.renderNestedSessionNode = renderNestedSessionNode;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.

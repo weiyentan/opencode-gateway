@@ -1582,6 +1582,43 @@ td.clickable:hover {
   padding: 2px 10px;
 }
 
+/* ── Nested session tree (issue #575) ──────────────────────────────── */
+
+.afk-session-root {
+  border-left: 3px solid rgba(148, 163, 184, 0.5);
+}
+
+.afk-session-nested {
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  margin-left: 16px;
+  background: rgba(99, 102, 241, 0.03);
+}
+
+.afk-nesting-depth-1 { margin-left: 16px; }
+.afk-nesting-depth-2 { margin-left: 32px; }
+.afk-nesting-depth-3 { margin-left: 48px; }
+.afk-nesting-depth-4 { margin-left: 64px; }
+.afk-nesting-depth-5 { margin-left: 80px; }
+
+.afk-session-children {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.afk-missing-parent {
+  border-left: 3px dashed rgba(239, 68, 68, 0.5) !important;
+}
+
+.afk-missing-parent-note {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-style: italic;
+  padding-left: 12px;
+  margin-top: 2px;
+}
+
 .afk-empty {
   font-size: 0.74rem;
   color: var(--text-muted);
