@@ -123,10 +123,11 @@ class TestCreateExecutionBinding:
 
         conn = AsyncMock()
         saved_row = _mk_binding_row(awx_job_id=42)
-        # Call sequence: auth lookup → get_binding (None=new) → re-read after save
+        # Call sequence: auth lookup → atomic insert → re-read after save
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), saved_row]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -169,8 +170,9 @@ class TestCreateExecutionBinding:
             entity_number="6",
         )
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), saved_row]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -201,10 +203,11 @@ class TestCreateExecutionBinding:
 
         conn = AsyncMock()
         existing_row = _mk_binding_row(awx_job_id=42)
-        # Auth lookup → existing binding found → returns existing (no insert)
+        # Auth lookup → atomic insert conflicts → fetch existing → identical → 200
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -234,10 +237,11 @@ class TestCreateExecutionBinding:
 
         conn = AsyncMock()
         existing_row = _mk_binding_row(awx_job_id=42)
-        # Auth lookup → existing binding found → conflict check → 409
+        # Auth lookup → atomic insert conflicts → fetch existing → conflict → 409
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -268,6 +272,7 @@ class TestCreateExecutionBinding:
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -298,6 +303,7 @@ class TestCreateExecutionBinding:
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -328,6 +334,7 @@ class TestCreateExecutionBinding:
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -358,6 +365,7 @@ class TestCreateExecutionBinding:
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -466,6 +474,7 @@ class TestCreateExecutionBinding:
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row]
         )
+        conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 

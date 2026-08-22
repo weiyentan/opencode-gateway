@@ -1,16 +1,17 @@
-"""Unit tests for the execution-binding repository methods (issue #547).
+"""Unit tests for the execution-binding repository methods (issue #547, #568).
 
 These tests mock asyncpg and verify the *write semantics* encoded in the SQL
 issued by the repository:
 
-* **Idempotent by AWX job identity** — ON CONFLICT (awx_job_id) DO NOTHING
-  ensures repeating the same binding is a no-op.
+* **Atomic insert** — INSERT ON CONFLICT DO NOTHING RETURNING id ensures
+  the insert is the linearisation point and returns the inserted row ID
+  (or None on conflict).
 * **Conflict rejection** — conflicting data for the same AWX job is rejected
   without overwriting the original record.
 * **Multiple jobs per resource** — different AWX jobs targeting the same
   GitHub pull request or GitLab merge request are both persisted.
 * **Deterministic ordering** — list by provider resource returns all bindings
-  in created_at ASC order.
+  in created_at ASC, id ASC order.
 * **Failed-then-successful retry** — a failed execution followed by a
   successful retry for the same resource is visible in the history.
 """
@@ -61,16 +62,11 @@ def _make_binding(
     )
 
 
-def _execute_calls(conn: AsyncMock) -> list[str]:
-    """Return the SQL string of every ``conn.execute`` call, in order."""
-    return [call.args[0] for call in conn.execute.call_args_list]
-
-
 def _calls_matching(conn: AsyncMock, pattern: str) -> list[tuple]:
-    """Return (sql, params) for every execute call whose SQL matches ``pattern``."""
+    """Return (sql, params) for every fetch call whose SQL matches ``pattern``."""
     return [
         (call.args[0], call.args[1:])
-        for call in conn.execute.call_args_list
+        for call in conn.fetch.call_args_list
         if re.search(pattern, call.args[0])
     ]
 
@@ -79,18 +75,21 @@ def _calls_matching(conn: AsyncMock, pattern: str) -> list[tuple]:
 
 
 def test_save_execution_binding_uses_on_conflict_do_nothing(mock_conn: AsyncMock) -> None:
-    """Repeating the same AWX job binding is a successful no-op."""
+    """Atomic insert uses ON CONFLICT DO NOTHING RETURNING id."""
+    mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
     repo = AsyncpgOutcomeRepository(mock_conn)
     binding = _make_binding(awx_job_id="100")
 
     import asyncio
 
-    asyncio.run(repo.save_execution_binding(binding))
+    result = asyncio.run(repo.save_execution_binding(binding))
+    assert result is not None, "should return inserted row ID on success"
 
     calls = _calls_matching(mock_conn, r"INSERT INTO execution_bindings")
     assert calls, "no execution_bindings insert issued"
     sql = calls[0][0]
     assert "ON CONFLICT (awx_job_id) DO NOTHING" in sql
+    assert "RETURNING id" in sql
 
 
 def test_save_execution_binding_writes_all_identity_fields(mock_conn: AsyncMock) -> None:

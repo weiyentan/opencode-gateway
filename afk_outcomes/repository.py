@@ -1627,27 +1627,28 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
     # ── execution bindings ────────────────────────────────────────────
 
-    async def save_execution_binding(self, binding: ExecutionBinding) -> None:
-        """Persist one execution binding idempotently (issue #547).
+    async def save_execution_binding(self, binding: ExecutionBinding) -> int | None:
+        """Persist one execution binding atomically (issue #568).
 
-        **Idempotent by AWX job identity**: ``awx_job_id`` is the unique
-        key.  Repeating the same binding (identical ``awx_job_id``) is a
-        successful no-op — the INSERT ON CONFLICT DO NOTHING ensures no
-        duplicate row is created and no existing row is overwritten.
+        The INSERT is the linearisation point: ``UNIQUE (awx_job_id)`` is
+        enforced by the database, and ``ON CONFLICT DO NOTHING RETURNING id``
+        lets the caller distinguish a genuinely-new insert from a
+        conflict-skip in a single round-trip.
 
-        **Conflict rejection**: When a binding with the same ``awx_job_id``
-        already exists and the incoming data differs, the ON CONFLICT DO
-        NOTHING clause silently ignores the conflicting insert rather than
-        overwriting the original record.  The caller may detect this by
-        checking if a row already exists before inserting (see
-        :meth:`get_execution_binding_by_awx_job_id`).
+        * **Returns the inserted row's ``id``** when the insert succeeded
+          (the caller should respond with ``201 Created``).
+        * **Returns ``None``** when the insert was skipped due to a
+          ``UNIQUE`` conflict — another concurrent or earlier insert won the
+          race.  The caller must then fetch the existing row and compare
+          fields to decide between ``200`` (idempotent replay) and
+          ``409`` (conflicting data).
 
         **Multiple jobs per resource**: Different AWX jobs targeting the same
         GitHub pull request or GitLab merge request (same provider resource
         identity) are both persisted — the provider resource columns are NOT
         part of any unique constraint.
         """
-        await self._conn.execute(
+        rows = await self._conn.fetch(
             """
             INSERT INTO execution_bindings
                 (awx_job_id, job_template_id, external_session_id, provider,
@@ -1657,6 +1658,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                     $14, now(), now())
             ON CONFLICT (awx_job_id) DO NOTHING
+            RETURNING id
             """,
             _parse_awx_job_id(binding.awx_job.job_id),
             binding.awx_job.job_template_id,
@@ -1673,6 +1675,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             binding.started_at,
             binding.finished_at,
         )
+        if rows:
+            return rows[0]["id"]
+        return None
 
     async def get_execution_binding_by_awx_job_id(
         self, awx_job_id: str
@@ -1708,10 +1713,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
     ) -> list[ExecutionBinding]:
         """Return all execution bindings for a provider resource (issue #547).
 
-        Ordered deterministically by ``created_at ASC`` (earliest first,
-        failed-then-successful retry visible in history).  Different AWX
-        jobs targeting the same GitHub pull request or GitLab merge request
-        are both returned.
+        Ordered deterministically by ``created_at ASC, id ASC`` (earliest
+        first, with ``id`` as a tie-breaker for same-timestamp rows).
+        Different AWX jobs targeting the same GitHub pull request or GitLab
+        merge request are both returned.
         """
         rows = await self._conn.fetch(
             """
@@ -1724,7 +1729,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
               AND repository_url = $2
               AND entity_type = $3
               AND entity_number = $4
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, id ASC
             """,
             provider.value,
             repository,

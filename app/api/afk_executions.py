@@ -211,12 +211,15 @@ async def create_execution_binding(
 ) -> ExecutionBindingReadResponse:
     """Persist one final execution binding from AWX.
 
-    **Idempotency**: repeating an identical POST (same ``awx_job_id`` and same
-    data) returns 200 with the existing binding without inserting a duplicate
-    row.
+    **Atomic idempotency**: the INSERT is the linearisation point.
+    ``UNIQUE (awx_job_id)`` is enforced by the database and
+    ``ON CONFLICT DO NOTHING RETURNING id`` lets us distinguish a
+    genuinely-new insert from a conflict-skip in a single round-trip.
 
-    **Conflict**: different data for the same ``awx_job_id`` returns 409
-    Conflict without mutating stored data.
+    * Insert succeeded → ``201 Created`` with the new binding.
+    * Insert conflict → fetch existing, compare fields:
+      - Identical data → ``200 OK`` (idempotent replay, no mutation).
+      - Different data → ``409 Conflict`` (no mutation).
 
     **Multiple jobs per resource**: different AWX jobs targeting the same
     GitHub pull request or GitLab merge request are both persisted.
@@ -226,22 +229,6 @@ async def create_execution_binding(
         repo = AsyncpgOutcomeRepository(conn)
         awx_job_id_str = _validate_awx_job_id(body.awx_job.job_id)
 
-        # Check if a binding already exists for this AWX job ID.
-        existing = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
-
-        if existing is not None:
-            # Conflict check: ANY differing field — session, resource identity,
-            # outcome, or traceability metadata — rejects the replay.
-            if _binding_conflicts_with(existing, body):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Conflicting data for existing AWX job binding"
-                )
-            # Idempotent replay: same data → 200 with existing binding.
-            response.status_code = status.HTTP_200_OK
-            return _binding_to_read_response(existing)
-
-        # New binding — persist it.
         domain_binding = ExecutionBinding(
             binding_id="",
             awx_job=body.awx_job,
@@ -256,22 +243,43 @@ async def create_execution_binding(
             failure_reason=body.failure_reason,
         )
 
+        # Atomic insert — the INSERT is the linearisation point.
         async with timed_operation("db.insert.execution_binding", "db"):
             async with _db_timeout(
                 "db.insert.execution_binding", settings.database_timeout_seconds
             ):
-                await repo.save_execution_binding(domain_binding)
+                inserted_id = await repo.save_execution_binding(domain_binding)
 
-        # Re-read to get the gateway-assigned binding_id.
-        saved = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
-        if saved is None:
-            # Should not happen — save succeeded — but handle gracefully.
+        if inserted_id is not None:
+            # New binding was inserted.
+            saved = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
+            if saved is None:
+                # Should not happen — save succeeded — but handle gracefully.
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to retrieve saved execution binding",
+                )
+            response.status_code = status.HTTP_201_CREATED
+            return _binding_to_read_response(saved)
+
+        # Conflict — another request inserted first. Fetch and compare.
+        existing = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
+        if existing is None:
+            # Should not happen — the INSERT conflicted, so a row must exist.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve saved execution binding",
+                detail="Execution binding disappeared after insert conflict",
             )
-        response.status_code = status.HTTP_201_CREATED
-        return _binding_to_read_response(saved)
+
+        if _binding_conflicts_with(existing, body):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflicting data for existing AWX job binding",
+            )
+
+        # Idempotent replay: same data → 200 with existing binding.
+        response.status_code = status.HTTP_200_OK
+        return _binding_to_read_response(existing)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
