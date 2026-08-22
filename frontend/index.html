@@ -500,6 +500,26 @@
     </div>
   </div>
 
+  <!-- Change Request Provenance Timeline (issue #574): chronological
+       lifecycle of a change request including linked issues (with
+       independent change-request and issue repository identity), every
+       develop/review execution, timestamps, phase, status, outcome,
+       duration, AWX job IDs, OpenCode session IDs, usage/cost, merge
+       state, issue closure state, and the final engineering outcome.
+       RunStatus and EngineeringOutcomeStatus are rendered as distinct
+       concepts. -->
+  <div class="detail-overlay" id="cr-prov-overlay">
+    <div class="detail-panel glass-panel cr-prov-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="cr-prov-title">Change Request Provenance</h2>
+        <button class="detail-close" id="cr-prov-close">&times;</button>
+      </div>
+      <div class="detail-body" id="cr-prov-body">
+        <p class="empty-state">Loading provenance timeline&hellip;</p>
+      </div>
+    </div>
+  </div>
+
   </div><!-- .app-layout -->
 
   <footer class="footer">
