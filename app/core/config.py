@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from datetime import datetime, timezone
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -152,6 +153,7 @@ class Settings(BaseSettings):
     # GATEWAY_NORMALIZED_EVENTS_TOPIC.
     normalized_events_topic: str = "engineering.events.normalized"
     normalized_events_dlq_topic: str = "engineering.events.normalized.dlq"
+    normalized_events_consumer_group_id: str = "opencode-normalized-events"
 
     # ``afk_outcomes_topic`` / ``afk_outcomes_dlq_topic`` — compatibility-only
     # (issue #531).  The legacy ``afk.events`` command topic and its DLQ.  The
@@ -279,6 +281,20 @@ class Settings(BaseSettings):
     # ``require_operator_token`` dependency fails closed.  Maps to
     # GATEWAY_OPERATOR_TOKEN.
     operator_token: str = ""
+
+    # active_tokens deprecation (issue #557) — the legacy ``active_tokens``
+    # field (input + output tokens) is deprecated in favour of the raw token
+    # fields (``cache_read_tokens`` / ``cache_write_tokens`` /
+    # ``reasoning_tokens``).  While the current instant is strictly before
+    # this sunset instant, usage query responses carry the
+    # ``Deprecation: active_tokens; sunset=<ISO-8601>`` HTTP header.  Setting
+    # an operator-chosen past date ends the 90-day deprecation window (the
+    # header stops being emitted).  Maps to
+    # GATEWAY_ACTIVE_TOKENS_DEPRECATION_SUNSET.
+    active_tokens_deprecation_sunset: datetime = Field(
+        default_factory=lambda: datetime(2026, 11, 20, tzinfo=timezone.utc),
+        description="Sunset instant of the deprecated active_tokens field",
+    )
 
 
 def get_settings() -> Settings:

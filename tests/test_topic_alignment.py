@@ -18,6 +18,11 @@ subscription topic so the two can never silently diverge again:
   to them;
 * the legacy topic variables must no longer be configured (they remain
   compatibility-only settings in ``app/core/config.py``).
+
+Issue #555: the consumer group must also be aligned — the manifests must
+configure ``GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID`` (not the legacy
+``GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID``) and the configured value must
+match the consumer's default.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ CONSUMER_CONTAINER = "opencode-afk-outcomes-consumer"
 
 NORMALIZED_TOPIC = "engineering.events.normalized"
 NORMALIZED_DLQ_TOPIC = "engineering.events.normalized.dlq"
+NORMALIZED_CONSUMER_GROUP_ID = "opencode-normalized-events"
 
 
 def _compose_env() -> dict[str, str]:
@@ -179,7 +185,7 @@ class TestDeploymentTopicEqualsConsumerSubscription:
             "GATEWAY_KAFKA_BROKERS": "broker1:9092",
             "GATEWAY_NORMALIZED_EVENTS_TOPIC": compose_topic,
             "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": compose_dlq,
-            "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+            "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
             "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
             "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         }
@@ -200,4 +206,93 @@ class TestDeploymentTopicEqualsConsumerSubscription:
         )
         assert consumer._dlq_topic == compose_dlq == NORMALIZED_DLQ_TOPIC, (
             "The consumer must DLQ to the deployment-configured DLQ topic."
+        )
+
+
+class TestDeploymentConsumerGroupConfiguration:
+    """Both deployment manifests configure the normalized-events consumer group."""
+
+    def test_compose_configures_normalized_consumer_group(self, _deployment_envs) -> None:
+        env = _deployment_envs["compose"]
+        compose_group = _compose_default(env["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"])
+        assert compose_group == NORMALIZED_CONSUMER_GROUP_ID
+
+    def test_k8s_configures_normalized_consumer_group(self, _deployment_envs) -> None:
+        env = _deployment_envs["k8s"]
+        assert env["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"] == NORMALIZED_CONSUMER_GROUP_ID
+
+    def test_legacy_consumer_group_variable_is_not_configured(self, _deployment_envs) -> None:
+        """The legacy variable is removed from the manifests (compatibility-only)."""
+        for env in _deployment_envs.values():
+            assert "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID" not in env, (
+                "Legacy GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID must not be "
+                "configured — the consumer does not read it (it is a "
+                "compatibility-only Settings field)."
+            )
+
+    def test_deployment_consumer_groups_match_across_manifests(self, _deployment_envs) -> None:
+        compose_group = _compose_default(
+            _deployment_envs["compose"]["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"]
+        )
+        k8s_group = _deployment_envs["k8s"]["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"]
+        assert compose_group == k8s_group, (
+            "Compose and Kubernetes must configure the same consumer group."
+        )
+
+    def test_configured_consumer_group_equals_settings_defaults(self, _deployment_envs, monkeypatch) -> None:
+        from app.core.config import Settings
+
+        monkeypatch.delenv("GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID", raising=False)
+
+        settings = Settings(
+            _env_file=None,
+            api_key="test-key-for-topic-alignment",
+        )
+        compose_group = _compose_default(
+            _deployment_envs["compose"]["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"]
+        )
+        k8s_group = _deployment_envs["k8s"]["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"]
+
+        assert compose_group == k8s_group == settings.normalized_events_consumer_group_id, (
+            "The deployment consumer group must equal the consumer's default "
+            "(settings.normalized_events_consumer_group_id)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_from_env_uses_configured_consumer_group(self, _deployment_envs) -> None:
+        """``AFKOutcomeConsumer.from_env()`` wires the configured consumer group
+        into the consumer's ``_consumer_group_id``."""
+        compose_group = _compose_default(
+            _deployment_envs["compose"]["GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID"]
+        )
+        compose_topic = _compose_default(
+            _deployment_envs["compose"]["GATEWAY_NORMALIZED_EVENTS_TOPIC"]
+        )
+        compose_dlq = _compose_default(
+            _deployment_envs["compose"]["GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC"]
+        )
+
+        env_vars = {
+            "GATEWAY_ENV": "development",
+            "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+            "GATEWAY_NORMALIZED_EVENTS_TOPIC": compose_topic,
+            "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": compose_dlq,
+            "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": compose_group,
+            "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+            "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+        }
+        with (
+            patch.dict(os.environ, env_vars, clear=True),
+            patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+            patch(
+                "app.consumer.afk_consumer._build_adapter",
+                return_value=(None, None),
+            ),
+        ):
+            from app.consumer.afk_consumer import AFKOutcomeConsumer
+
+            consumer = await AFKOutcomeConsumer.from_env()
+
+        assert consumer._consumer_group_id == compose_group == NORMALIZED_CONSUMER_GROUP_ID, (
+            "The consumer must use the deployment-configured consumer group."
         )

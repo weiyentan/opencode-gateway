@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, UniqueConstraint, text
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -397,6 +397,60 @@ class ResourceSessionAssociation(Base):
     )
 
 
+class ExecutionBinding(Base):
+    """A durable Gateway record linking one AWX execution to one OpenCode
+    external session and one provider resource identity (migration 0037).
+
+    One row per AWX job.  ``awx_job_id`` carries a ``UNIQUE`` constraint
+    so repeating the same binding is a no-op.  The provider resource
+    identity (``provider``, ``repository_url``, ``entity_type``,
+    ``entity_number``) is NOT unique — multiple failed and successful
+    executions for the same change request are allowed.
+
+    ``failure_reason`` and ``failure_summary`` carry bounded diagnostic
+    information.  Raw ``extra_vars``, stdout, prompts, tokens, or
+    arbitrary AWX payloads are never stored.
+    """
+
+    __tablename__ = "execution_bindings"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "awx_job_id",
+            name="uq_execution_bindings_awx_job_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    job_template_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    external_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    repository_url: Mapped[str] = mapped_column(String, nullable=False)
+    entity_type: Mapped[str] = mapped_column(String, nullable=False)
+    entity_number: Mapped[str] = mapped_column(String, nullable=False)
+    outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    source_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    branch: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    failure_summary: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class ClosureLink(Base):
     """The derived current state of one change-request->issue link (migration 0036).
 
@@ -560,3 +614,4 @@ class ClosureUnresolved(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+

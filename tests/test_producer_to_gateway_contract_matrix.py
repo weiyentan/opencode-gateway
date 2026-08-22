@@ -78,6 +78,7 @@ _ALLOWED_PAIRS: set[tuple[str, str]] = {
 _EXPECTED_CANONICAL: dict[tuple[str, str], tuple[EntityType, str]] = {
     ("issue", "opened"): (EntityType.ISSUE, "issue.opened"),
     ("issue", "edited"): (EntityType.ISSUE, "issue.updated"),
+    ("issue", "updated"): (EntityType.ISSUE, "issue.updated"),
     ("issue", "reopened"): (EntityType.ISSUE, "issue.reopened"),
     ("issue", "closed"): (EntityType.ISSUE, "issue.closed"),
     ("pull_request", "opened"): (EntityType.CHANGE_REQUEST, "change_request.opened"),
@@ -194,7 +195,7 @@ def _make_consumer(
     *,
     pool: _FakePool,
     order: list[str] | None = None,
-    consumer_group_id: str = "opencode-outcomes",
+    consumer_group_id: str = "opencode-normalized-events",
     max_retries: int = 3,
 ) -> AFKOutcomeConsumer:
     return AFKOutcomeConsumer(
@@ -1292,14 +1293,14 @@ async def test_full_pipeline_fixture_to_persist(
 
 
 @pytest.mark.asyncio
-async def test_consumer_uses_opencode_outcomes_group() -> None:
-    """The AFK Outcome Consumer uses the opencode-outcomes consumer group,
+async def test_consumer_uses_opencode_normalized_events_group() -> None:
+    """The AFK Outcome Consumer uses the opencode-normalized-events consumer group,
     never the usage consumer's opencode-gateway group."""
     conn = _FakeConn([])
     consumer = _make_consumer(
-        pool=_FakePool(conn), consumer_group_id="opencode-outcomes"
+        pool=_FakePool(conn), consumer_group_id="opencode-normalized-events"
     )
-    assert consumer._consumer_group_id == "opencode-outcomes"
+    assert consumer._consumer_group_id == "opencode-normalized-events"
 
 
 @pytest.mark.asyncio
@@ -1307,6 +1308,6 @@ async def test_consumer_group_is_not_usage_group() -> None:
     """The AFK consumer group is distinct from the usage consumer group."""
     conn = _FakeConn([])
     consumer = _make_consumer(
-        pool=_FakePool(conn), consumer_group_id="opencode-outcomes"
+        pool=_FakePool(conn), consumer_group_id="opencode-normalized-events"
     )
     assert consumer._consumer_group_id != "opencode-gateway"

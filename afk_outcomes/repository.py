@@ -61,6 +61,8 @@ from afk_outcomes.models import (
     EngineeringEvent,
     EngineeringOutcome,
     EntityType,
+    ExecutionBinding,
+    ExecutionOutcome,
     IssueLinkTarget,
     IssueLinksSnapshot,
     Provider,
@@ -125,6 +127,45 @@ def _evidence_json(evidence: list[CorrelationEvidence]) -> str:
 def _source_reference_json(sources: list[ReferenceSource]) -> str:
     """Serialize a list of :class:`ReferenceSource` to a JSONB-ready string."""
     return json.dumps([item.model_dump(mode="json") for item in sources])
+
+
+def _parse_awx_job_id(awx_job_id: str) -> int:
+    """Coerce an AWX job id string to int, rejecting non-numeric values.
+
+    The API layer validates the id before reaching the repository; this
+    guard keeps direct repository callers from surfacing a bare
+    ``ValueError`` from ``int()`` (issue #549 review).  The raised error
+    carries a clear message instead of leaking the raw conversion failure.
+    """
+    try:
+        return int(awx_job_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid AWX job id: {awx_job_id!r}") from exc
+
+
+def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
+    """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`."""
+    return ExecutionBinding(
+        binding_id=str(row["id"]),
+        awx_job={
+            "job_id": str(row["awx_job_id"]),
+            "job_template_id": row["job_template_id"],
+        },
+        external_session_id=row["external_session_id"],
+        resource={
+            "provider": row["provider"],
+            "repository": row["repository_url"],
+            "resource_type": row["entity_type"],
+            "resource_number": row["entity_number"],
+        },
+        outcome=ExecutionOutcome(row["outcome"]) if row["outcome"] else ExecutionOutcome.COMPLETED,
+        source_event_id=row["source_event_id"],
+        branch=row["branch"],
+        title=row["title"],
+        failure_reason=row["failure_reason"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+    )
 
 
 def _decode_jsonb(raw: object) -> dict | None:
@@ -818,7 +859,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                  issue_external_id, kind, state, revoked_at, resolver_version,
                  first_seen_at, last_seen_at, derived_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                    CASE WHEN $8 = 'revoked' THEN now() ELSE NULL END,
+                    CASE WHEN $8::text = 'revoked' THEN now() ELSE NULL END,
                     $9, now(), now(), now())
             ON CONFLICT (change_request_provider, change_request_repository,
                          change_request_external_id, issue_provider,
@@ -1583,3 +1624,111 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             entity_links=entity_links,
             session_links=session_links,
         )
+
+    # ── execution bindings ────────────────────────────────────────────
+
+    async def save_execution_binding(self, binding: ExecutionBinding) -> None:
+        """Persist one execution binding idempotently (issue #547).
+
+        **Idempotent by AWX job identity**: ``awx_job_id`` is the unique
+        key.  Repeating the same binding (identical ``awx_job_id``) is a
+        successful no-op — the INSERT ON CONFLICT DO NOTHING ensures no
+        duplicate row is created and no existing row is overwritten.
+
+        **Conflict rejection**: When a binding with the same ``awx_job_id``
+        already exists and the incoming data differs, the ON CONFLICT DO
+        NOTHING clause silently ignores the conflicting insert rather than
+        overwriting the original record.  The caller may detect this by
+        checking if a row already exists before inserting (see
+        :meth:`get_execution_binding_by_awx_job_id`).
+
+        **Multiple jobs per resource**: Different AWX jobs targeting the same
+        GitHub pull request or GitLab merge request (same provider resource
+        identity) are both persisted — the provider resource columns are NOT
+        part of any unique constraint.
+        """
+        await self._conn.execute(
+            """
+            INSERT INTO execution_bindings
+                (awx_job_id, job_template_id, external_session_id, provider,
+                 repository_url, entity_type, entity_number, outcome,
+                 source_event_id, branch, title, failure_reason, started_at,
+                 finished_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, now(), now())
+            ON CONFLICT (awx_job_id) DO NOTHING
+            """,
+            _parse_awx_job_id(binding.awx_job.job_id),
+            binding.awx_job.job_template_id,
+            binding.external_session_id,
+            binding.resource.provider.value,
+            binding.resource.repository,
+            binding.resource.resource_type.value,
+            binding.resource.resource_number,
+            binding.outcome.value,
+            binding.source_event_id,
+            binding.branch,
+            binding.title,
+            binding.failure_reason,
+            binding.started_at,
+            binding.finished_at,
+        )
+
+    async def get_execution_binding_by_awx_job_id(
+        self, awx_job_id: str
+    ) -> ExecutionBinding | None:
+        """Return one execution binding by AWX job ID, or ``None`` (issue #547).
+
+        The AWX job ID is the idempotency key; at most one row exists for a
+        given job id.  Returns ``None`` when no binding with that job id
+        exists.
+        """
+        row = await self._conn.fetchrow(
+            """
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, started_at,
+                   finished_at
+            FROM execution_bindings
+            WHERE awx_job_id = $1
+            """,
+            _parse_awx_job_id(awx_job_id),
+        )
+        if row is None:
+            return None
+        return _row_to_execution_binding(row)
+
+    async def list_execution_bindings_for_resource(
+        self,
+        *,
+        provider: Provider,
+        repository: str,
+        resource_type: EntityType,
+        resource_number: str,
+    ) -> list[ExecutionBinding]:
+        """Return all execution bindings for a provider resource (issue #547).
+
+        Ordered deterministically by ``created_at ASC`` (earliest first,
+        failed-then-successful retry visible in history).  Different AWX
+        jobs targeting the same GitHub pull request or GitLab merge request
+        are both returned.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, started_at,
+                   finished_at
+            FROM execution_bindings
+            WHERE provider = $1
+              AND repository_url = $2
+              AND entity_type = $3
+              AND entity_number = $4
+            ORDER BY created_at ASC
+            """,
+            provider.value,
+            repository,
+            resource_type.value,
+            resource_number,
+        )
+        return [_row_to_execution_binding(row) for row in rows]

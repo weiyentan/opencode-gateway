@@ -108,7 +108,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC` | `engineering.events.normalized.dlq` | Dead-letter queue topic for poison normalized provider-events messages |
 | `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Compatibility-only (issue #531): legacy `afk.events` command topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
 | `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Compatibility-only (issue #531): legacy AFK outcome DLQ topic. Settings still accepts it, but the AFK outcome consumer no longer reads it |
-| `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
+| `GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID` | `opencode-normalized-events` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
 | `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
 | `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
@@ -125,6 +125,7 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_OPERATOR_TOKEN` | *(empty)* | Operator-only read gate (ADR 0022). Presented in the dedicated `X-Operator-Token` header (never `Authorization`, which carries the Admin API Key). Distinct from `GATEWAY_API_KEY` and collector credentials; fails closed (403) when unset — no operator-only surface (delivery payload, DLQ) is reachable |
 | `GATEWAY_TOOL_PAYLOAD_MAX_CHARS` | `4096` | Execution transcript (ADR 0016): per-field character cap for tool input/output payloads stored in `observed_tool_calls` (truncated at ingest; verbatim content stays in `observed_parts`) |
 | `GATEWAY_PART_DATA_MAX_CHARS` | `65536` | Execution transcript (ADR 0016): verbatim character cap for `message`/`part` payloads stored in the `data` JSONB column (truncated at ingest with a `truncated` marker) |
+| `GATEWAY_ACTIVE_TOKENS_DEPRECATION_SUNSET` | `2026-11-20T00:00:00+00:00` | Usage query API (issue #557): sunset instant for the deprecated `active_tokens` field (`input + output`). While the current server instant is strictly before this instant, every usage query response carries `Deprecation: active_tokens; sunset=<ISO-8601>`. Set a past date to end the 90-day window (header stops being emitted) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is unreachable at startup, the app still starts and the health endpoint returns `"database": "disconnected"` instead of crashing.
 
@@ -188,7 +189,7 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
 | **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
 | **kafka**   | `opencode-gateway-kafka`| —         | 9092          | Local KRaft Kafka broker (single node; internal — no host ports). Backstops both streaming consumers; the provider-events topic is external |
-| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the normalized provider-events topic (`engineering.events.normalized`) in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
+| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the normalized provider-events topic (`engineering.events.normalized`) in its own group (`opencode-normalized-events`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
 
 > **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
@@ -244,17 +245,19 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month`, `project`, `agent` — comma-separated). Date-range filterable. |
-| `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Default sorting is by source-created message time (`sort_by=source_created_at`, `COALESCE(source_created_at_tz, reported_at)`), not ingest time. Includes `loki_search_url` for Grafana drill-down. |
-| `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, Loki drill-down URLs, and `session_title` from Session Context. Paginated. |
-| `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` and `model` enrichment from Session Context. |
-| `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including `session_context` (title, model, code changes) and `todo_rows` (latest OpenCode todo snapshot) alongside usage data. |
-| `GET` | `/api/v1/usage/records-with-context` | Paginated usage records enriched with `session_title`, `project_label`, and `agent`. Supports `group_by` aggregation by `project`, `agent`, `session`, or `model`. |
+| `GET` | `/api/v1/usage/aggregates` | Token/cost aggregates grouped by dimension (`client`, `model`, `session`, `day`, `week`, `month`, `project`, `agent` — comma-separated). Date-range filterable. Each row now exposes `cache_hit_ratio` (`cache_read / (input + cache_read)`, rounded to 4 decimals; `null` when no input) and `provider_breakdown` (per-provider record counts, `unknown` for null/empty) alongside a deprecated `active_tokens` (`input + output`) computed field. |
+| `GET` | `/api/v1/usage/records` | Paginated raw usage records. Supports filtering by `client_id`, `model`, `session_id`, date range, sorting, and pagination (`limit`/`offset`). Default sorting is by source-created message time (`sort_by=source_created_at`, `COALESCE(source_created_at_tz, reported_at)`), not ingest time. Includes `provider` (null → JSON `null`), raw token fields `cache_read_tokens`/`cache_write_tokens`/`reasoning_tokens`, the deprecated `active_tokens` computed field, and `loki_search_url` for Grafana drill-down. |
+| `GET` | `/api/v1/usage/sessions` | Session-level summaries with token/cost totals, message counts, Loki drill-down URLs, and `session_title` from Session Context. Paginated. Now also surfaces `total_reasoning_tokens` (read-time sum from `usage_events`; the `sessions` table carries no reasoning aggregate — ADR 0012) and `primary_provider` (most frequent provider by record count, alphabetical tie-break; `null` when none observed), plus the deprecated `active_tokens` computed field. |
+| `GET` | `/api/v1/usage/agent-runs` | Paginated list of Agent Run Summaries with `session_title` and `model` enrichment from Session Context. Now also surfaces `total_reasoning_tokens`, `primary_provider`, and the deprecated `active_tokens` computed field (same read-time derivation as sessions). |
+| `GET` | `/api/v1/usage/agent-runs/{session_id}` | Detail view for a specific agent run, including `session_context` (title, model, code changes) and `todo_rows` (latest OpenCode todo snapshot) alongside usage data. Now also surfaces `total_reasoning_tokens`, `primary_provider`, and the deprecated `active_tokens` computed field. |
+| `GET` | `/api/v1/usage/records-with-context` | Paginated usage records enriched with `session_title`, `project_label`, and `agent`. Supports `group_by` aggregation by `project`, `agent`, `session`, or `model`. Now also exposes the deprecated `active_tokens` computed field alongside the raw token fields. |
 
 > **Note:** Usage query endpoints read from the canonical `usage_events` table
 > (replay-safe accounting, migration 0021). API contracts are unchanged. The
 > legacy `opencode_usage_records` table is still written at ingest but is no
 > longer the query source.
+
+> **Deprecation (issue #557):** The `active_tokens` field (`input + output`) on every usage query row is deprecated in favour of the raw token fields (`cache_read_tokens` / `cache_write_tokens` / `reasoning_tokens`). While the current server instant is strictly before `GATEWAY_ACTIVE_TOKENS_DEPRECATION_SUNSET` (default `2026-11-20T00:00:00+00:00`), every `/api/v1/usage/*` response carries `Deprecation: active_tokens; sunset=<ISO-8601>`. Exactly at or after the sunset the header is omitted. The ingest path also normalises empty-string `provider`/`mode`/`finish_reason` values to `NULL` (null provider serialises as JSON `null`; aggregates group null/empty under `unknown`).
 
 ### Reporting
 
@@ -431,8 +434,8 @@ The dashboard polls the Gateway REST API every 30 seconds (client metadata is ca
 | **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
 | **Agent Usage** | `/api/v1/usage/aggregates?group_by=agent` | Dynamic per-agent aggregate rows (token breakdown, estimated cost, request count), grouped by recorded agent identity with missing identities as `unknown`, ordered by total token usage descending |
-| **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status |
-| **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with session title, status, model, costs, and a detail overlay showing session context (title, model, code changes) and todo progress |
+| **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status. The Agent Runs view also surfaces `total_reasoning_tokens` and `primary_provider` per session (issue #557) |
+| **Agent Runs** | `/api/v1/usage/agent-runs` | Agent run table with session title, status, model, provider, project/worktree, todo/files, costs, compact tokens, cache read/write, reasoning, last updated, and children. Detail overlay includes a Token Breakdown section (input/output/cache read/cache write/reasoning, cache hit ratio, provider) alongside session context (title, model, code changes) and todo progress (issue #557) |
 | **AFK Outcomes** | `/api/v1/afk-outcomes/runs`, `/api/v1/afk-outcomes/runs/{afk_run_id}` | AFK run list (RunStatus and EngineeringOutcomeStatus badges) whose rows open the chain detail overlay — issue → run → sessions → agents → tokens/cost → change_request → commits → review cycles → outcome — with per-link correlation provenance (method, confidence, evidence, resolver version) and visibly-marked provisional/inferred links. Sessions in the chain detail that carry a resolvable internal session ID are clickable and open the existing Agent Run detail overlay (the AFK chain overlay closes first); unresolved sessions stay non-clickable |
 
 The dashboard uses the same authentication as the REST API — if the Gateway runs in production mode (`GATEWAY_ENV=production`) with an API key, the dashboard will need one. For local development, use `GATEWAY_ENV=development` to run without authentication.
@@ -562,6 +565,7 @@ opencode-gateway/
 | [0020](docs/adr/0020-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Superseded |
 | [0021](docs/adr/0021-reporting-read-api.md) | Reporting Read API | Accepted |
 | [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
+| [0023](docs/adr/0023-kafka-topic-split-commands-vs-observations.md) | Kafka Topic Split: afk.events vs engineering.events.normalized | Accepted |
 
 ---
 

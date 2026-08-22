@@ -99,6 +99,59 @@ def test_upsert_closure_link_is_deterministic_conflict_update(mock_conn: AsyncMo
     assert "DELETE" not in normalized.upper()
 
 
+# ── regression: AmbiguousParameterError (issue #559) ──────────────────────
+
+
+def test_upsert_closure_link_state_parameter_has_consistent_type(
+    mock_conn: AsyncMock,
+) -> None:
+    """Regression: $8 used in both VALUES and CASE WHEN caused
+
+    ``AmbiguousParameterError: text versus character varying``.  The SQL
+    must cast the parameter consistently so PostgreSQL sees one type.
+    """
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    for state in (ClosureLinkState.ACTIVE, ClosureLinkState.REVOKED):
+        mock_conn.reset_mock()
+        link = ClosureLink(
+            change_request_provider=Provider.GITLAB,
+            change_request_repository="gitlab.com/group/proj",
+            change_request_external_id="6",
+            issue_provider=Provider.GITLAB,
+            issue_repository="gitlab.com/group/proj",
+            issue_external_id="1",
+            kind=ClosureLinkKind.DECLARES_CLOSURE,
+            state=state,
+        )
+        asyncio.run(repo._upsert_closure_link(link))
+
+        sql_calls = [
+            call.args[0]
+            for call in mock_conn.execute.call_args_list
+            if "closure_links" in call.args[0]
+        ]
+        assert len(sql_calls) == 1, f"expected one closure_links call for state={state}"
+        normalized = " ".join(sql_calls[0].split())
+
+        # The VALUES clause must not use a bare ``$8`` in the CASE WHEN
+        # comparison — that causes PostgreSQL to infer conflicting types
+        # (text vs varchar) for the same parameter.  Either cast to
+        # ``$8::text`` or use the column reference ``EXCLUDED.state``.
+        # The ``EXCLUDED.state = 'revoked'`` in the DO UPDATE clause is
+        # already fine (column reference), so we only check that there is
+        # NO bare ``$8 = 'revoked'`` (without ``::text``) in the SQL.
+        import re
+
+        # Find all CASE WHEN comparisons involving the state parameter
+        case_matches = re.findall(r"CASE WHEN (\S+) = 'revoked'", normalized)
+        for match in case_matches:
+            # match should be "$8::text" or "EXCLUDED.state" — never bare "$8"
+            assert match != "$8", (
+                f"bare $8 in CASE WHEN causes AmbiguousParameterError; "
+                f"expected $8::text or EXCLUDED.state, got: {match} in\n{normalized}"
+            )
+
+
 def test_upsert_closure_unresolved_is_versioned_conflict_update(mock_conn: AsyncMock) -> None:
     """Unresolved records are keyed by (issue, closed_at, reason) and
     conflict-updated — versioned, never deleted, never tie-broken."""

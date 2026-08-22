@@ -8,6 +8,7 @@ wrapped in the standard envelope format.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -15,9 +16,17 @@ from decimal import Decimal
 from typing import Union
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.formatting import format_model_output
 from app.core.loki import build_loki_search_url
 from app.core.schemas.usage import (
@@ -73,6 +82,80 @@ VALID_GROUP_BY: frozenset[str] = frozenset(
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)  # noqa: UP017
+
+
+def _text_or_none(row, key: str) -> str | None:
+    """Read an optional text column from a query row, defaulting to None.
+
+    Legacy test row factories predate the v1.2 enrichment columns.  Returns
+    None when the column is NULL, empty, or absent from the row.
+    """
+    try:
+        value = row[key]
+    except (KeyError, TypeError):
+        return None
+    return value or None
+
+
+def _json_breakdown(row, key: str) -> dict[str, int]:
+    """Read a JSON breakdown column (asyncpg jsonb arrives as a JSON string).
+
+    Returns an empty dict when the column is NULL or absent from the row
+    (legacy test row factories) so the response shape stays stable.
+    """
+    try:
+        raw = row[key]
+    except (KeyError, TypeError):
+        return {}
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return {str(k): int(v) for k, v in parsed.items()}
+    return {str(k): int(v) for k, v in raw.items()}
+
+
+def _cache_hit_ratio(cache_read_tokens: int, input_tokens: int) -> float | None:
+    """Compute the cache hit ratio for an aggregate row.
+
+    ``cache_read / (input + cache_read)`` — the fraction of model input
+    served from cache — rounded to 4 decimals.  Returns None when the
+    denominator is zero (no input activity to measure against).
+    """
+    denominator = input_tokens + cache_read_tokens
+    if denominator <= 0:
+        return None
+    return round(cache_read_tokens / denominator, 4)
+
+
+def _deprecation_header_value(
+    sunset: datetime | None, now: datetime | None = None
+) -> str | None:
+    """Return the Deprecation header value while within the sunset window.
+
+    The legacy ``active_tokens`` field is deprecated (issue #557): while the
+    current instant is strictly before *sunset*, usage query responses carry
+    ``Deprecation: active_tokens; sunset=<ISO-8601>``.  Returns None when
+    *sunset* is unset or the window has passed (boundary-inclusive: a request
+    exactly at the sunset instant no longer carries the header).
+    """
+    if sunset is None:
+        return None
+    if now is None:
+        now = _utcnow()
+    if now >= sunset:
+        return None
+    return "active_tokens; sunset=" + sunset.isoformat()
+
+
+def _apply_deprecation_header(response: Response, settings: Settings) -> None:
+    """Attach the ``Deprecation`` header while the deprecation window is open."""
+    value = _deprecation_header_value(settings.active_tokens_deprecation_sunset)
+    if value is not None:
+        response.headers["Deprecation"] = value
 
 
 def _validate_date_range(start_date: datetime, end_date: datetime) -> None:
@@ -308,7 +391,8 @@ async def _fetch_aggregates_rollup(
                 r.client_id,
                 r.session_id,
                 r.model_id,
-                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label
+                ({_ROLLUP_PROJECT_LABEL_SQL}) AS project_label,
+                COALESCE(NULLIF(r.provider, ''), 'unknown') AS provider_key
             FROM usage_events r
             LEFT JOIN LATERAL (
                 SELECT osp.display_name, osp.name, osp.worktree
@@ -318,16 +402,42 @@ async def _fetch_aggregates_rollup(
                 LIMIT 1
             ) osp ON true
             WHERE {count_where}
+        ),
+        provider_counts AS (
+            SELECT
+                COALESCE(oc.canonical_name, oc.name) AS client_name,
+                ul.project_label,
+                ul.provider_key,
+                COUNT(*) AS cnt
+            FROM usage_with_label ul
+            JOIN opencode_clients oc ON oc.id = ul.client_id
+            GROUP BY COALESCE(oc.canonical_name, oc.name),
+                     ul.project_label,
+                     ul.provider_key
+        ),
+        provider_breakdown AS (
+            SELECT
+                client_name,
+                project_label,
+                jsonb_object_agg(provider_key, cnt) AS provider_breakdown
+            FROM provider_counts
+            GROUP BY client_name, project_label
         )
         SELECT
             COALESCE(oc.canonical_name, oc.name) || '|' || ul.project_label AS group_value,
             COUNT(*) AS record_count,
             COUNT(DISTINCT ul.session_id) AS session_count,
-            COUNT(DISTINCT om.model_name) AS model_count
+            COUNT(DISTINCT om.model_name) AS model_count,
+            COALESCE(pb.provider_breakdown, '{{}}'::jsonb) AS provider_breakdown
         FROM usage_with_label ul
         JOIN observed_models om ON om.id = ul.model_id
         JOIN opencode_clients oc ON oc.id = ul.client_id
-        GROUP BY COALESCE(oc.canonical_name, oc.name), ul.project_label
+        LEFT JOIN provider_breakdown pb
+            ON pb.client_name = COALESCE(oc.canonical_name, oc.name)
+           AND pb.project_label = ul.project_label
+        GROUP BY COALESCE(oc.canonical_name, oc.name),
+                 ul.project_label,
+                 pb.provider_breakdown
     """
     async with timed_operation("db.query.aggregates.client_project_counts", "db"):
         async with _db_timeout(
@@ -336,13 +446,14 @@ async def _fetch_aggregates_rollup(
             count_rows = await conn.fetch(count_sql, *count_params)
 
     # Build a lookup of counts by group_value
-    count_by_group: dict[str, dict[str, int]] = {}
+    count_by_group: dict[str, dict] = {}
     for cr in count_rows:
         gv = str(cr["group_value"])
         count_by_group[gv] = {
             "record_count": cr["record_count"],
             "session_count": cr["session_count"],
             "model_count": cr["model_count"],
+            "provider_breakdown": _json_breakdown(cr, "provider_breakdown"),
         }
 
     # ── Merge counts into rollup rows ────────────────────────────────
@@ -353,6 +464,7 @@ async def _fetch_aggregates_rollup(
             "record_count": 0,
             "session_count": 0,
             "model_count": 0,
+            "provider_breakdown": {},
         })
         result.append(
             AggregateRow(
@@ -367,6 +479,11 @@ async def _fetch_aggregates_rollup(
                 record_count=counts["record_count"],
                 session_count=counts["session_count"],
                 model_count=counts["model_count"],
+                cache_hit_ratio=_cache_hit_ratio(
+                    r["total_cache_read_tokens"] or 0,
+                    r["total_input_tokens"] or 0,
+                ),
+                provider_breakdown=counts["provider_breakdown"],
                 project_label=r["project_label"],
             )
         )
@@ -392,6 +509,21 @@ async def _fetch_aggregates(
 
     if not group_parts:
         # Single total row.  Audit: 1 query (fetchrow) — already optimal.
+        # The provider breakdown rides the SAME statement as a scalar
+        # subquery (jsonb_object_agg), reusing the date/filter placeholders
+        # ($1..$5) at identical indices, so the endpoint stays at one query.
+        provider_filters: list[str] = [
+            "p2.reported_at >= $1",
+            "p2.reported_at <= $2",
+        ]
+        if client_id is not None:
+            provider_filters.append("p2.client_id = $3")
+        if model is not None:
+            provider_filters.append("om2.model_name = $4")
+        if session_id is not None:
+            provider_filters.append("p2.session_id = $5")
+        provider_where = " AND ".join(provider_filters)
+
         sql = f"""
             SELECT
                 'total' AS group_value,
@@ -404,7 +536,20 @@ async def _fetch_aggregates(
                 SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
                 COUNT(*) AS record_count,
                 COUNT(DISTINCT our.session_id) AS session_count,
-                COUNT(DISTINCT om.model_name) AS model_count
+                COUNT(DISTINCT om.model_name) AS model_count,
+                COALESCE(
+                    (SELECT jsonb_object_agg(pb.provider_key, pb.cnt) FROM (
+                        SELECT
+                            COALESCE(NULLIF(p2.provider, ''), 'unknown')
+                                AS provider_key,
+                            COUNT(*) AS cnt
+                        FROM usage_events p2
+                        JOIN observed_models om2 ON om2.id = p2.model_id
+                        WHERE {provider_where}
+                        GROUP BY COALESCE(NULLIF(p2.provider, ''), 'unknown')
+                    ) pb),
+                    '{{}}'::jsonb
+                ) AS provider_breakdown
             FROM usage_events our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
@@ -430,6 +575,17 @@ async def _fetch_aggregates(
                 record_count=row["record_count"] if row else 0,
                 session_count=row["session_count"] if row else 0,
                 model_count=row["model_count"] if row else 0,
+                cache_hit_ratio=(
+                    _cache_hit_ratio(
+                        row["total_cache_read_tokens"] or 0,
+                        row["total_input_tokens"] or 0,
+                    )
+                    if row
+                    else None
+                ),
+                provider_breakdown=(
+                    _json_breakdown(row, "provider_breakdown") if row else {}
+                ),
             )
         ]
 
@@ -483,7 +639,33 @@ async def _fetch_aggregates(
     if has_agent and len(group_parts) > 1:
         group_by_clause += ",COALESCE(s.agent, 'unknown')"
 
+    # The provider breakdown rides the SAME statement via a CTE keyed on the
+    # group expression (one query budget preserved — see test_query_counts).
+    # The CTE replicates the main query's joins so the group expression
+    # (including project-label and agent COALESCE fragments) resolves
+    # identically, then collapses per-provider counts into one JSON object
+    # per group.
     sql = f"""
+        WITH provider_counts AS (
+            SELECT
+                {group_expr} AS group_value,
+                COALESCE(NULLIF(our.provider, ''), 'unknown') AS provider_key,
+                COUNT(*) AS cnt
+            FROM usage_events our
+            JOIN observed_models om ON om.id = our.model_id
+            LEFT JOIN opencode_clients oc ON oc.id = our.client_id
+            {sessions_join}
+            {project_join}
+            WHERE {where_clause}
+            GROUP BY {group_expr}, COALESCE(NULLIF(our.provider, ''), 'unknown')
+        ),
+        provider_breakdown AS (
+            SELECT
+                group_value,
+                jsonb_object_agg(provider_key, cnt) AS provider_breakdown
+            FROM provider_counts
+            GROUP BY group_value
+        )
         SELECT
             {group_expr} AS group_value{project_label_col}{agent_col},
             COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
@@ -495,14 +677,16 @@ async def _fetch_aggregates(
             SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
             COUNT(*) AS record_count,
             COUNT(DISTINCT our.session_id) AS session_count,
-            COUNT(DISTINCT om.model_name) AS model_count
+            COUNT(DISTINCT om.model_name) AS model_count,
+            COALESCE(pb.provider_breakdown, '{{}}'::jsonb) AS provider_breakdown
         FROM usage_events our
         JOIN observed_models om ON om.id = our.model_id
         LEFT JOIN opencode_clients oc ON oc.id = our.client_id
         {sessions_join}
         {project_join}
+        LEFT JOIN provider_breakdown pb ON pb.group_value = {group_expr}
         WHERE {where_clause}
-        {group_by_clause}
+        {group_by_clause}, COALESCE(pb.provider_breakdown, '{{}}'::jsonb)
         ORDER BY group_value
     """
     async with timed_operation("db.query.aggregates.grouped", "db"):
@@ -523,6 +707,11 @@ async def _fetch_aggregates(
             record_count=r["record_count"],
             session_count=r["session_count"],
             model_count=r["model_count"],
+            cache_hit_ratio=_cache_hit_ratio(
+                r["total_cache_read_tokens"] or 0,
+                r["total_input_tokens"] or 0,
+            ),
+            provider_breakdown=_json_breakdown(r, "provider_breakdown"),
             project_label=r["project_label"] if has_project else None,
             agent=r["agent"] if has_agent else None,
         )
@@ -632,7 +821,7 @@ async def _fetch_records(
             our.input_tokens,
             our.output_tokens,
             our.cached_tokens,
-            our.provider,
+            NULLIF(our.provider, '') AS provider,
             our.mode,
             our.finish_reason,
             our.reasoning_tokens,
@@ -760,39 +949,83 @@ async def _fetch_sessions(
         ):
             total = await conn.fetchval(count_sql, *query_params)
 
-    # Data query
+    # Data query — the page of sessions is hoisted into a ``page`` CTE so
+    # the read-time usage aggregations (reasoning total + primary provider)
+    # are scoped to the returned page's sessions only: one hash aggregate
+    # over ``usage_events`` rows belonging to those sessions, no N+1, no
+    # full-table scan of every session in the deployment.  ``sessions`` has
+    # no reasoning/provider columns (ADR 0012 keeps reasoning off the
+    # session aggregate), so these fields are derived from ``usage_events``
+    # at read time.  ``total_cache_read_tokens`` / ``total_cache_write_tokens``
+    # remain the stored session aggregates.
     data_sql = f"""
+        WITH page AS (
+            SELECT
+                s.id,
+                s.client_id,
+                s.source_database_id,
+                s.first_message_at,
+                s.last_message_at,
+                s.message_count,
+                s.total_input_tokens,
+                s.total_output_tokens,
+                s.total_cached_tokens,
+                s.total_cache_read_tokens,
+                s.total_cache_write_tokens,
+                s.project_id,
+                s.workspace_id,
+                s.agent,
+                s.parent_session_id,
+                s.total_estimated_cost_usd,
+                osc.title AS session_title,
+                osc.code_change_count,
+                osc.code_change_additions,
+                osc.code_change_deletions,
+                {_PROJECT_LABEL_SQL} AS project_label
+            FROM sessions s
+            LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+            LEFT JOIN opencode_source_projects osp
+                ON osp.source_database_id = s.source_database_id
+                AND osp.external_project_id = s.project_id
+            WHERE {where_clause}
+            ORDER BY s.last_message_at DESC
+            LIMIT ${len(query_params) + 1}
+            OFFSET ${len(query_params) + 2}
+        ),
+        usage_agg AS (
+            SELECT
+                ue.session_id,
+                COALESCE(SUM(ue.reasoning_tokens), 0)::bigint
+                    AS total_reasoning_tokens
+            FROM usage_events ue
+            JOIN page p ON p.id = ue.session_id
+            GROUP BY ue.session_id
+        ),
+        provider_agg AS (
+            SELECT session_id, provider
+            FROM (
+                SELECT
+                    ue.session_id,
+                    ue.provider,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ue.session_id
+                        ORDER BY COUNT(*) DESC, ue.provider ASC
+                    ) AS rn
+                FROM usage_events ue
+                JOIN page p ON p.id = ue.session_id
+                WHERE ue.provider IS NOT NULL AND ue.provider <> ''
+                GROUP BY ue.session_id, ue.provider
+            ) ranked
+            WHERE rn = 1
+        )
         SELECT
-            s.id,
-            s.client_id,
-            s.source_database_id,
-            s.first_message_at,
-            s.last_message_at,
-            s.message_count,
-            s.total_input_tokens,
-            s.total_output_tokens,
-            s.total_cached_tokens,
-            s.total_cache_read_tokens,
-            s.total_cache_write_tokens,
-            s.project_id,
-            s.workspace_id,
-            s.agent,
-            s.parent_session_id,
-            s.total_estimated_cost_usd,
-            osc.title AS session_title,
-            osc.code_change_count,
-            osc.code_change_additions,
-            osc.code_change_deletions,
-            {_PROJECT_LABEL_SQL} AS project_label
-        FROM sessions s
-        LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
-        LEFT JOIN opencode_source_projects osp
-            ON osp.source_database_id = s.source_database_id
-            AND osp.external_project_id = s.project_id
-        WHERE {where_clause}
-        ORDER BY s.last_message_at DESC
-        LIMIT ${len(query_params) + 1}
-        OFFSET ${len(query_params) + 2}
+            p.*,
+            COALESCE(ua.total_reasoning_tokens, 0) AS total_reasoning_tokens,
+            pa.provider AS primary_provider
+        FROM page p
+        LEFT JOIN usage_agg ua ON ua.session_id = p.id
+        LEFT JOIN provider_agg pa ON pa.session_id = p.id
+        ORDER BY p.last_message_at DESC
     """
     async with timed_operation("db.query.sessions.data", "db"):
         async with _db_timeout(
@@ -813,6 +1046,8 @@ async def _fetch_sessions(
             total_cached_tokens=r["total_cached_tokens"],
             total_cache_read_tokens=r["total_cache_read_tokens"],
             total_cache_write_tokens=r["total_cache_write_tokens"],
+            total_reasoning_tokens=_int_or_zero(r, "total_reasoning_tokens"),
+            primary_provider=_text_or_none(r, "primary_provider"),
             project_id=r["project_id"],
             project_label=r["project_label"],
             workspace_id=r["workspace_id"],
@@ -851,6 +1086,7 @@ async def _fetch_sessions(
 @router.get("/aggregates")
 async def get_aggregates(
     request: Request,
+    response: Response,
     start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
     end_date: datetime = Query(..., description="ISO-8601 end date (inclusive)"),
     client_id: uuid.UUID | None = Query(default=None),
@@ -871,6 +1107,7 @@ async def get_aggregates(
     _validate_date_range(start_date, end_date)
     group_parts = _parse_group_by(group_by)
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_aggregates(
             conn, start_date, end_date, client_id, model, session_id,
@@ -882,6 +1119,7 @@ async def get_aggregates(
 @router.get("/records")
 async def get_records(
     request: Request,
+    response: Response,
     start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
     end_date: datetime = Query(..., description="ISO-8601 end date (inclusive)"),
     client_id: uuid.UUID | None = Query(default=None),
@@ -909,6 +1147,7 @@ async def get_records(
     _validate_date_range(start_date, end_date)
     sort_by, sort_dir = _validate_sort(sort_by, sort_dir)
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_records(
             conn,
@@ -929,6 +1168,7 @@ async def get_records(
 @router.get("/sessions")
 async def get_sessions(
     request: Request,
+    response: Response,
     start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
     end_date: datetime = Query(..., description="ISO-8601 end date (inclusive)"),
     client_id: uuid.UUID | None = Query(default=None),
@@ -943,6 +1183,7 @@ async def get_sessions(
     """
     _validate_date_range(start_date, end_date)
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_sessions(
             conn,
@@ -1328,10 +1569,40 @@ async def _fetch_agent_runs(
     # session universe.  ``todo_counts`` is scoped to that universe via an
     # INNER JOIN, so the todo aggregation cost tracks the filtered result
     # set (and any client_id/date/agent/project/status predicate) rather
-    # than the full ``opencode_session_todos`` table.
+    # than the full ``opencode_session_todos`` table.  ``usage_agg`` and
+    # ``provider_agg`` (issue #557) follow the same scoping pattern for the
+    # read-time reasoning total and primary provider — the sessions table
+    # carries no reasoning/provider columns (ADR 0012), so these derive
+    # from ``usage_events`` for the filtered universe only.
     data_sql = f"""
         WITH base AS (
             {base_query}
+        ),
+        usage_agg AS (
+            SELECT
+                ue.session_id,
+                COALESCE(SUM(ue.reasoning_tokens), 0)::bigint
+                    AS total_reasoning_tokens
+            FROM usage_events ue
+            JOIN base b ON b.id = ue.session_id
+            GROUP BY ue.session_id
+        ),
+        provider_agg AS (
+            SELECT session_id, provider
+            FROM (
+                SELECT
+                    ue.session_id,
+                    ue.provider,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ue.session_id
+                        ORDER BY COUNT(*) DESC, ue.provider ASC
+                    ) AS rn
+                FROM usage_events ue
+                JOIN base b ON b.id = ue.session_id
+                WHERE ue.provider IS NOT NULL AND ue.provider <> ''
+                GROUP BY ue.session_id, ue.provider
+            ) ranked
+            WHERE rn = 1
         ),
         child_counts AS (
             SELECT parent_session_id, COUNT(*) AS cnt
@@ -1351,11 +1622,15 @@ async def _fetch_agent_runs(
             GROUP BY t.source_database_id, t.external_session_id
         )
         SELECT s.*,
+               COALESCE(ua.total_reasoning_tokens, 0) AS total_reasoning_tokens,
+               pa.provider AS primary_provider,
                COALESCE(cc.cnt, 0) AS child_run_count,
                COALESCE(tc.todo_total, 0) AS todo_total,
                COALESCE(tc.todo_completed, 0) AS todo_completed,
                COALESCE(tc.todo_blocked, 0) AS todo_blocked
         FROM base s
+        LEFT JOIN usage_agg ua ON ua.session_id = s.id
+        LEFT JOIN provider_agg pa ON pa.session_id = s.id
         LEFT JOIN child_counts cc
             ON cc.parent_session_id = s.external_session_id
         LEFT JOIN todo_counts tc
@@ -1399,6 +1674,8 @@ async def _fetch_agent_runs(
                 total_cached_tokens=r["total_cached_tokens"],
                 total_cache_read_tokens=r["total_cache_read_tokens"],
                 total_cache_write_tokens=r["total_cache_write_tokens"],
+                total_reasoning_tokens=_int_or_zero(r, "total_reasoning_tokens"),
+                primary_provider=_text_or_none(r, "primary_provider"),
                 total_estimated_cost_usd=r["total_estimated_cost_usd"],
                 message_count=r["message_count"],
                 last_updated_at=r["last_message_at"],
@@ -1497,12 +1774,36 @@ async def _fetch_agent_run_detail(
                     osc.source_input_tokens AS ctx_source_input_tokens,
                     osc.source_output_tokens AS ctx_source_output_tokens,
                     osc.source_cached_tokens AS ctx_source_cached_tokens,
-                    osc.source_reasoning_tokens AS ctx_source_reasoning_tokens
+                    osc.source_reasoning_tokens AS ctx_source_reasoning_tokens,
+                    -- Issue #557 read-time usage derivations: the sessions
+                    -- table carries no reasoning/provider columns, so the
+                    -- reasoning total and primary provider (most frequent
+                    -- provider by record count, alphabetical tie-break) are
+                    -- aggregated from usage_events for this session only.
+                    COALESCE(ua.total_reasoning_tokens, 0)
+                        AS total_reasoning_tokens,
+                    pr.provider AS primary_provider
                 FROM sessions s
                 LEFT JOIN opencode_source_projects osp
                     ON osp.source_database_id = s.source_database_id
                     AND osp.external_project_id = s.project_id
                 LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
+                LEFT JOIN LATERAL (
+                    SELECT COALESCE(SUM(ue.reasoning_tokens), 0)::bigint
+                        AS total_reasoning_tokens
+                    FROM usage_events ue
+                    WHERE ue.session_id = s.id
+                ) ua ON true
+                LEFT JOIN LATERAL (
+                    SELECT ue.provider
+                    FROM usage_events ue
+                    WHERE ue.session_id = s.id
+                      AND ue.provider IS NOT NULL
+                      AND ue.provider <> ''
+                    GROUP BY ue.provider
+                    ORDER BY COUNT(*) DESC, ue.provider ASC
+                    LIMIT 1
+                ) pr ON true
                 WHERE s.id = $1""",
                 session_id,
             )
@@ -1649,6 +1950,8 @@ async def _fetch_agent_run_detail(
         total_cached_tokens=session_row["total_cached_tokens"],
         total_cache_read_tokens=session_row["total_cache_read_tokens"],
         total_cache_write_tokens=session_row["total_cache_write_tokens"],
+        total_reasoning_tokens=_int_or_zero(session_row, "total_reasoning_tokens"),
+        primary_provider=_text_or_none(session_row, "primary_provider"),
         total_estimated_cost_usd=session_row["total_estimated_cost_usd"],
         first_message_at=session_row["first_message_at"],
         last_message_at=session_row["last_message_at"],
@@ -1669,6 +1972,7 @@ async def _fetch_agent_run_detail(
 @router.get("/agent-runs")
 async def get_agent_runs(
     request: Request,
+    response: Response,
     client_id: uuid.UUID | None = Query(default=None),
     from_date: datetime | None = Query(
         default=None,
@@ -1726,6 +2030,7 @@ async def get_agent_runs(
         )
 
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_agent_runs(
             conn,
@@ -1749,6 +2054,7 @@ async def get_agent_runs(
 async def get_agent_run_detail(
     session_id: uuid.UUID,
     request: Request,
+    response: Response,
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AgentRunDetail:
     """Return a full agent run detail view keyed by internal Gateway session UUID.
@@ -1760,6 +2066,7 @@ async def get_agent_run_detail(
     included — this endpoint returns aggregated facts only.
     """
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
     async with _request_timeout(settings.total_request_timeout_seconds):
         return await _fetch_agent_run_detail(
             conn, session_id, settings.grafana_base_url,
@@ -1930,7 +2237,7 @@ async def _fetch_records_with_context(
             our.input_tokens,
             our.output_tokens,
             our.cached_tokens,
-            our.provider,
+            NULLIF(our.provider, '') AS provider,
             our.mode,
             our.finish_reason,
             our.reasoning_tokens,
@@ -2116,6 +2423,7 @@ async def _fetch_records_with_context_grouped(
 @router.get("/records-with-context", response_model=Union[PaginatedResponse, list[RecordWithContextGroupedRow]])
 async def get_records_with_context(
     request: Request,
+    response: Response,
     start_date: datetime = Query(..., description="ISO-8601 start date (inclusive)"),
     end_date: datetime = Query(..., description="ISO-8601 end date (inclusive)"),
     project_id: str | None = Query(
@@ -2151,6 +2459,7 @@ async def get_records_with_context(
     _validate_date_range(start_date, end_date)
     group_parts = _parse_records_with_context_group_by(group_by)
     settings = get_settings()
+    _apply_deprecation_header(response, settings)
 
     async with _request_timeout(settings.total_request_timeout_seconds):
         if group_parts:
