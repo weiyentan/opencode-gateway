@@ -1606,6 +1606,22 @@ td.clickable:hover {
   box-shadow: inset 0 0 0 2px var(--accent-indigo);
 }
 
+/* ── AFK Repository Summary Panel (issue #572) ──────────────────────────
+   Repository-first entry view: one row per (provider, repository) pair
+   with provider badge, repository name, AFK run count, and last activity
+   timestamp.  Follows the sibling panel conventions: glass-panel /
+   .table-scroll / table rules apply in every viewport band.  The Provider
+   column uses the existing badge-provider outlined badge for identity. */
+.panel-afk-repos table {
+  table-layout: auto;
+}
+
+.panel-afk-repos th:nth-child(3),
+.panel-afk-repos td:nth-child(3) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Client/Project Panel ────────────────────────────────────────────── */
 
 .panel-subtitle {

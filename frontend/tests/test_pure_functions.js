@@ -146,6 +146,13 @@ elementRegistry['ar-filter-agent'] = arFilterAgentEl;
 elementRegistry['ar-filter-status'] = arFilterStatusEl;
 elementRegistry['ar-page-size'] = arPageSizeEl;
 
+// AFK Repository Summary fakes (issue #572): the repository summary tbody.
+// Registered before loadRealAppJs so app.js captures the ref in els like the
+// other table fakes; renderRepositorySummaryTable writes its rows into this
+// element.
+var afkReposTbodyEl = makeFakeElement('afk-repos-tbody');
+elementRegistry['afk-repos-tbody'] = afkReposTbodyEl;
+
 // AFK Outcomes fakes (issue #453): the runs-list tbody and the chain detail
 // overlay elements.  Registered before loadRealAppJs so app.js captures them
 // in els (like the agent-runs fakes above); renderAfkOutcomesTable writes its
@@ -329,6 +336,11 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  // AFK Repository Summary (issue #572): pure aggregation helper and table
+  // renderer — the Node harness exercises the pure helper directly.
+  window.deriveRepositoryLabel = sandboxWindow.deriveRepositoryLabel;
+  window.buildRepositorySummaries = sandboxWindow.buildRepositorySummaries;
+  window.renderRepositorySummaryTable = sandboxWindow.renderRepositorySummaryTable;
   // Issue #469: Transcript view — pure helpers for UUID validation, depth
   // formatting, part-type classification, and the header/timeline/message/part
   // renderers, exposed on the same window test seam.
@@ -4899,6 +4911,203 @@ console.log('\u25B6 issue #557 — index.html + style.css (provider + token colu
     'issue #557: no status-driven [data-active] row selector added');
 })();
 
+
+// ── AFK Repository Summary (issue #572) ────────────────────────────────────
+// Pure aggregation helper (buildRepositorySummaries) and table renderer
+// (renderRepositorySummaryTable) for the repository-first entry view.
+// Tests cover: mixed-provider normalization, provider badge rendering,
+// date-range scoping, empty-period handling, and API-error behavior.
+
+console.log('\u25B6 AFK Repository Summary — buildRepositorySummaries (issue #572)');
+
+(function () {
+  if (typeof window.buildRepositorySummaries !== 'function') {
+    assert(false, 'app.js: buildRepositorySummaries exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider normalization: GitHub and GitLab runs in one list produce
+  // two distinct summary rows, one per provider+repository pair.
+  var mixed = window.buildRepositorySummaries([
+    { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+    { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+    { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' },
+    { provider: 'github', title: 'owner/repo-c', status: 'completed', last_seen_at: '2026-07-13T06:00:00Z' }
+  ]);
+  assert(mixed.length === 3, 'mixed-provider: 4 runs across 3 repos produce 3 summary rows');
+  // Sorted by runCount desc, then provider asc, then repo asc
+  assert(mixed[0].provider === 'github' && mixed[0].repository === 'owner/repo-a' && mixed[0].runCount === 2,
+    'mixed-provider: github/owner/repo-a has 2 runs (most runs first)');
+  assert(mixed[1].provider === 'github' && mixed[1].repository === 'owner/repo-c' && mixed[1].runCount === 1,
+    'mixed-provider: github/owner/repo-c has 1 run (alphabetical tiebreak)');
+  assert(mixed[2].provider === 'gitlab' && mixed[2].repository === 'group/repo-b' && mixed[2].runCount === 1,
+    'mixed-provider: gitlab/group/repo-b has 1 run (gitlab after github)');
+
+  // Last activity tracks the most recent last_seen_at or started_at
+  assert(mixed[0].lastActivity === '2026-07-16T12:00:00Z',
+    'lastActivity: tracks the most recent last_seen_at across runs in the group');
+  assert(mixed[2].lastActivity === '2026-07-14T08:00:00Z',
+    'lastActivity: single-run group uses that run\'s last_seen_at');
+
+  // Empty input
+  assert(window.buildRepositorySummaries([]).length === 0, 'empty input: no summary rows');
+  assert(window.buildRepositorySummaries(null).length === 0, 'null input: no summary rows');
+  assert(window.buildRepositorySummaries(undefined).length === 0, 'undefined input: no summary rows');
+
+  // Runs without a repository in the title fall back to provider name
+  var noRepo = window.buildRepositorySummaries([
+    { provider: 'github', title: 'some run without repo path', status: 'completed' },
+    { provider: 'gitlab', status: 'completed' }
+  ]);
+  assert(noRepo.length === 2, 'no-repo-title: 2 runs with different providers produce 2 rows');
+  assert(noRepo[0].repository === 'github', 'no-repo-title: github run falls back to provider name as repository');
+  assert(noRepo[1].repository === 'gitlab', 'no-repo-title: gitlab run falls back to provider name as repository');
+
+  // Run without a provider falls back to 'unknown'
+  var noProvider = window.buildRepositorySummaries([
+    { title: 'owner/repo', status: 'completed' }
+  ]);
+  assert(noProvider.length === 1 && noProvider[0].provider === 'unknown',
+    'no-provider: run without provider falls back to "unknown"');
+  assert(noProvider[0].repository === 'owner/repo',
+    'no-provider: repository still derived from title');
+})();
+
+// ── deriveRepositoryLabel (issue #572) ─────────────────────────────────────
+
+console.log('\u25B6 AFK Repository Summary — deriveRepositoryLabel (issue #572)');
+
+(function () {
+  if (typeof window.deriveRepositoryLabel !== 'function') {
+    assert(false, 'app.js: deriveRepositoryLabel exposed on the window test seam');
+    return;
+  }
+
+  assert(window.deriveRepositoryLabel(null) === 'unknown', 'null run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel(undefined) === 'unknown', 'undefined run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({}) === 'unknown', 'empty run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({ title: 'owner/repo-name' }) === 'owner/repo-name',
+    'title with owner/repo: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ title: 'group/project-name here' }) === 'group/project-name',
+    'title with group/project: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ provider: 'github' }) === 'github',
+    'no title: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'gitlab', title: 'no-slash-title' }) === 'gitlab',
+    'title without slash: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'github', title: 'Complex Title With Spaces' }) === 'github',
+    'title with spaces (no slash): falls back to provider name');
+})();
+
+// ── renderRepositorySummaryTable (issue #572) ──────────────────────────────
+// The renderer follows the agent-runs panel conventions: freshness guard,
+// empty/error states, escHtml on every interpolated value, and provider
+// badges rendered via the existing badge() helper.
+
+console.log('\u25B6 AFK Repository Summary — renderRepositorySummaryTable (issue #572)');
+
+(function () {
+  if (typeof window.renderRepositorySummaryTable !== 'function') {
+    assert(false, 'app.js: renderRepositorySummaryTable exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider rendering: the table gets provider badges + repository
+  // names + run counts + last activity timestamps.
+  var mixedData = {
+    items: [
+      { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+      { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+      { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' }
+    ]
+  };
+  window.renderRepositorySummaryTable(mixedData);
+  var html = afkReposTbodyEl.innerHTML;
+  assert(html.indexOf('owner/repo-a') !== -1, 'render: repository name "owner/repo-a" present');
+  assert(html.indexOf('group/repo-b') !== -1, 'render: repository name "group/repo-b" present');
+  assert(html.indexOf('badge-provider') !== -1, 'render: provider badges rendered via badge-provider class');
+  // Run count: repo-a has 2 runs
+  assert(html.indexOf('>2<') !== -1, 'render: run count "2" for repo-a');
+  // Provider badges: github and gitlab
+  assert(html.indexOf('github') !== -1, 'render: github provider badge present');
+  assert(html.indexOf('gitlab') !== -1, 'render: gitlab provider badge present');
+
+  // Empty period: no runs in the selected period
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: empty period shows "No repository activity"');
+
+  // Null data
+  window.renderRepositorySummaryTable(null);
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: null data shows "No repository activity"');
+
+  // API error: fetch error shown inline
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: API error with empty data shows "No repository activity"');
+})();
+
+// ── AFK Repository Summary — markup smoke check (issue #572) ──────────────
+// Static verification against the real index.html: the repository summary
+// panel exists inside #tab-afk-outcomes, the tbody is addressable by id,
+// and the panel carries a freshness span for the panel-freshness system.
+
+console.log('\u25B6 index.html — AFK Repository Summary markup (issue #572)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // The repository summary panel exists inside #tab-afk-outcomes
+  var afkTabIdx = html.indexOf('id="tab-afk-outcomes"');
+  var reposPanelIdx = html.indexOf('id="afk-repos-tbody"');
+  assert(reposPanelIdx !== -1, 'index.html: #afk-repos-tbody exists');
+  assert(afkTabIdx !== -1 && reposPanelIdx > afkTabIdx,
+    'index.html: repository summary panel lives inside #tab-afk-outcomes');
+
+  // The panel carries a freshness span
+  assert(html.indexOf('id="freshness-afk-repos"') !== -1,
+    'index.html: freshness span #freshness-afk-repos exists');
+
+  // The table has the expected header columns
+  var reposTable = html.slice(
+    html.indexOf('id="afk-repos-table"'),
+    html.indexOf('</table>', html.indexOf('id="afk-repos-table"'))
+  );
+  assert(reposTable.indexOf('<th>Provider</th>') !== -1,
+    'index.html: repository summary table has Provider column');
+  assert(reposTable.indexOf('<th>Repository</th>') !== -1,
+    'index.html: repository summary table has Repository column');
+  assert(reposTable.indexOf('<th>AFK Runs</th>') !== -1,
+    'index.html: repository summary table has AFK Runs column');
+  assert(reposTable.indexOf('<th>Last Activity</th>') !== -1,
+    'index.html: repository summary table has Last Activity column');
+
+  // The existing AFK Runs panel still exists
+  assert(html.indexOf('id="afk-runs-table"') !== -1,
+    'index.html: existing #afk-runs-table still present');
+  assert(html.indexOf('id="afk-runs-tbody"') !== -1,
+    'index.html: existing #afk-runs-tbody still present');
+})();
+
+// ── AFK Repository Summary — CSS verification (issue #572) ────────────────
+// Static verification against the real style.css: the repository summary
+// panel has table rules and the panel-freshness system applies.
+
+console.log('\u25B6 style.css — AFK Repository Summary rules (issue #572)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.panel-afk-repos') !== -1,
+    'style.css: .panel-afk-repos rule exists');
+  assert(live.indexOf('#freshness-afk-repos') === -1 ||
+    live.indexOf('freshness-afk-repos') !== -1,
+    'style.css: freshness system applies to the repository summary panel');
+})();
 
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
