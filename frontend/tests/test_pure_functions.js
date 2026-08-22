@@ -57,6 +57,7 @@ function makeFakeElement(id) {
     value: '',
     disabled: false,
     innerHTML: '',
+    style: {},
     classList: {
       _classes: {},
       add: function (c) { this._classes[c] = true; },
@@ -145,6 +146,13 @@ elementRegistry['ar-filter-apply'] = arFilterApplyEl;
 elementRegistry['ar-filter-agent'] = arFilterAgentEl;
 elementRegistry['ar-filter-status'] = arFilterStatusEl;
 elementRegistry['ar-page-size'] = arPageSizeEl;
+
+// AFK Repository Summary fakes (issue #572): the repository summary tbody.
+// Registered before loadRealAppJs so app.js captures the ref in els like the
+// other table fakes; renderRepositorySummaryTable writes its rows into this
+// element.
+var afkReposTbodyEl = makeFakeElement('afk-repos-tbody');
+elementRegistry['afk-repos-tbody'] = afkReposTbodyEl;
 
 // AFK Outcomes fakes (issue #453): the runs-list tbody and the chain detail
 // overlay elements.  Registered before loadRealAppJs so app.js captures them
@@ -329,6 +337,19 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  // AFK Repository Summary (issue #572): pure aggregation helper and table
+  // renderer — the Node harness exercises the pure helper directly.
+  window.deriveRepositoryLabel = sandboxWindow.deriveRepositoryLabel;
+  window.buildRepositorySummaries = sandboxWindow.buildRepositorySummaries;
+  window.renderRepositorySummaryTable = sandboxWindow.renderRepositorySummaryTable;
+  // AFK Change Request List (issue #573): provider-specific terminology,
+  // pure CR list builder, AFK-only filter, and the list renderer.
+  window.providerCrTerm = sandboxWindow.providerCrTerm;
+  window.buildChangeRequestList = sandboxWindow.buildChangeRequestList;
+  window.filterChangeRequests = sandboxWindow.filterChangeRequests;
+  window.renderChangeRequestList = sandboxWindow.renderChangeRequestList;
+  window.selectRepository = sandboxWindow.selectRepository;
+  window.clearSelectedRepo = sandboxWindow.clearSelectedRepo;
   // Issue #469: Transcript view — pure helpers for UUID validation, depth
   // formatting, part-type classification, and the header/timeline/message/part
   // renderers, exposed on the same window test seam.
@@ -4900,6 +4921,203 @@ console.log('\u25B6 issue #557 — index.html + style.css (provider + token colu
 })();
 
 
+// ── AFK Repository Summary (issue #572) ────────────────────────────────────
+// Pure aggregation helper (buildRepositorySummaries) and table renderer
+// (renderRepositorySummaryTable) for the repository-first entry view.
+// Tests cover: mixed-provider normalization, provider badge rendering,
+// date-range scoping, empty-period handling, and API-error behavior.
+
+console.log('\u25B6 AFK Repository Summary — buildRepositorySummaries (issue #572)');
+
+(function () {
+  if (typeof window.buildRepositorySummaries !== 'function') {
+    assert(false, 'app.js: buildRepositorySummaries exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider normalization: GitHub and GitLab runs in one list produce
+  // two distinct summary rows, one per provider+repository pair.
+  var mixed = window.buildRepositorySummaries([
+    { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+    { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+    { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' },
+    { provider: 'github', title: 'owner/repo-c', status: 'completed', last_seen_at: '2026-07-13T06:00:00Z' }
+  ]);
+  assert(mixed.length === 3, 'mixed-provider: 4 runs across 3 repos produce 3 summary rows');
+  // Sorted by runCount desc, then provider asc, then repo asc
+  assert(mixed[0].provider === 'github' && mixed[0].repository === 'owner/repo-a' && mixed[0].runCount === 2,
+    'mixed-provider: github/owner/repo-a has 2 runs (most runs first)');
+  assert(mixed[1].provider === 'github' && mixed[1].repository === 'owner/repo-c' && mixed[1].runCount === 1,
+    'mixed-provider: github/owner/repo-c has 1 run (alphabetical tiebreak)');
+  assert(mixed[2].provider === 'gitlab' && mixed[2].repository === 'group/repo-b' && mixed[2].runCount === 1,
+    'mixed-provider: gitlab/group/repo-b has 1 run (gitlab after github)');
+
+  // Last activity tracks the most recent last_seen_at or started_at
+  assert(mixed[0].lastActivity === '2026-07-16T12:00:00Z',
+    'lastActivity: tracks the most recent last_seen_at across runs in the group');
+  assert(mixed[2].lastActivity === '2026-07-14T08:00:00Z',
+    'lastActivity: single-run group uses that run\'s last_seen_at');
+
+  // Empty input
+  assert(window.buildRepositorySummaries([]).length === 0, 'empty input: no summary rows');
+  assert(window.buildRepositorySummaries(null).length === 0, 'null input: no summary rows');
+  assert(window.buildRepositorySummaries(undefined).length === 0, 'undefined input: no summary rows');
+
+  // Runs without a repository in the title fall back to provider name
+  var noRepo = window.buildRepositorySummaries([
+    { provider: 'github', title: 'some run without repo path', status: 'completed' },
+    { provider: 'gitlab', status: 'completed' }
+  ]);
+  assert(noRepo.length === 2, 'no-repo-title: 2 runs with different providers produce 2 rows');
+  assert(noRepo[0].repository === 'github', 'no-repo-title: github run falls back to provider name as repository');
+  assert(noRepo[1].repository === 'gitlab', 'no-repo-title: gitlab run falls back to provider name as repository');
+
+  // Run without a provider falls back to 'unknown'
+  var noProvider = window.buildRepositorySummaries([
+    { title: 'owner/repo', status: 'completed' }
+  ]);
+  assert(noProvider.length === 1 && noProvider[0].provider === 'unknown',
+    'no-provider: run without provider falls back to "unknown"');
+  assert(noProvider[0].repository === 'owner/repo',
+    'no-provider: repository still derived from title');
+})();
+
+// ── deriveRepositoryLabel (issue #572) ─────────────────────────────────────
+
+console.log('\u25B6 AFK Repository Summary — deriveRepositoryLabel (issue #572)');
+
+(function () {
+  if (typeof window.deriveRepositoryLabel !== 'function') {
+    assert(false, 'app.js: deriveRepositoryLabel exposed on the window test seam');
+    return;
+  }
+
+  assert(window.deriveRepositoryLabel(null) === 'unknown', 'null run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel(undefined) === 'unknown', 'undefined run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({}) === 'unknown', 'empty run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({ title: 'owner/repo-name' }) === 'owner/repo-name',
+    'title with owner/repo: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ title: 'group/project-name here' }) === 'group/project-name',
+    'title with group/project: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ provider: 'github' }) === 'github',
+    'no title: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'gitlab', title: 'no-slash-title' }) === 'gitlab',
+    'title without slash: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'github', title: 'Complex Title With Spaces' }) === 'github',
+    'title with spaces (no slash): falls back to provider name');
+})();
+
+// ── renderRepositorySummaryTable (issue #572) ──────────────────────────────
+// The renderer follows the agent-runs panel conventions: freshness guard,
+// empty/error states, escHtml on every interpolated value, and provider
+// badges rendered via the existing badge() helper.
+
+console.log('\u25B6 AFK Repository Summary — renderRepositorySummaryTable (issue #572)');
+
+(function () {
+  if (typeof window.renderRepositorySummaryTable !== 'function') {
+    assert(false, 'app.js: renderRepositorySummaryTable exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider rendering: the table gets provider badges + repository
+  // names + run counts + last activity timestamps.
+  var mixedData = {
+    items: [
+      { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+      { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+      { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' }
+    ]
+  };
+  window.renderRepositorySummaryTable(mixedData);
+  var html = afkReposTbodyEl.innerHTML;
+  assert(html.indexOf('owner/repo-a') !== -1, 'render: repository name "owner/repo-a" present');
+  assert(html.indexOf('group/repo-b') !== -1, 'render: repository name "group/repo-b" present');
+  assert(html.indexOf('badge-provider') !== -1, 'render: provider badges rendered via badge-provider class');
+  // Run count: repo-a has 2 runs
+  assert(html.indexOf('>2<') !== -1, 'render: run count "2" for repo-a');
+  // Provider badges: github and gitlab
+  assert(html.indexOf('github') !== -1, 'render: github provider badge present');
+  assert(html.indexOf('gitlab') !== -1, 'render: gitlab provider badge present');
+
+  // Empty period: no runs in the selected period
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: empty period shows "No repository activity"');
+
+  // Null data
+  window.renderRepositorySummaryTable(null);
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: null data shows "No repository activity"');
+
+  // API error: fetch error shown inline
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: API error with empty data shows "No repository activity"');
+})();
+
+// ── AFK Repository Summary — markup smoke check (issue #572) ──────────────
+// Static verification against the real index.html: the repository summary
+// panel exists inside #tab-afk-outcomes, the tbody is addressable by id,
+// and the panel carries a freshness span for the panel-freshness system.
+
+console.log('\u25B6 index.html — AFK Repository Summary markup (issue #572)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // The repository summary panel exists inside #tab-afk-outcomes
+  var afkTabIdx = html.indexOf('id="tab-afk-outcomes"');
+  var reposPanelIdx = html.indexOf('id="afk-repos-tbody"');
+  assert(reposPanelIdx !== -1, 'index.html: #afk-repos-tbody exists');
+  assert(afkTabIdx !== -1 && reposPanelIdx > afkTabIdx,
+    'index.html: repository summary panel lives inside #tab-afk-outcomes');
+
+  // The panel carries a freshness span
+  assert(html.indexOf('id="freshness-afk-repos"') !== -1,
+    'index.html: freshness span #freshness-afk-repos exists');
+
+  // The table has the expected header columns
+  var reposTable = html.slice(
+    html.indexOf('id="afk-repos-table"'),
+    html.indexOf('</table>', html.indexOf('id="afk-repos-table"'))
+  );
+  assert(reposTable.indexOf('<th>Provider</th>') !== -1,
+    'index.html: repository summary table has Provider column');
+  assert(reposTable.indexOf('<th>Repository</th>') !== -1,
+    'index.html: repository summary table has Repository column');
+  assert(reposTable.indexOf('<th>AFK Runs</th>') !== -1,
+    'index.html: repository summary table has AFK Runs column');
+  assert(reposTable.indexOf('<th>Last Activity</th>') !== -1,
+    'index.html: repository summary table has Last Activity column');
+
+  // The existing AFK Runs panel still exists
+  assert(html.indexOf('id="afk-runs-table"') !== -1,
+    'index.html: existing #afk-runs-table still present');
+  assert(html.indexOf('id="afk-runs-tbody"') !== -1,
+    'index.html: existing #afk-runs-tbody still present');
+})();
+
+// ── AFK Repository Summary — CSS verification (issue #572) ────────────────
+// Static verification against the real style.css: the repository summary
+// panel has table rules and the panel-freshness system applies.
+
+console.log('\u25B6 style.css — AFK Repository Summary rules (issue #572)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.panel-afk-repos') !== -1,
+    'style.css: .panel-afk-repos rule exists');
+  assert(live.indexOf('#freshness-afk-repos') === -1 ||
+    live.indexOf('freshness-afk-repos') !== -1,
+    'style.css: freshness system applies to the repository summary panel');
+})();
+
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
 // completed (deterministic, not a fixed timer).  A safety cap at 5 s
@@ -4940,3 +5158,292 @@ if (!_summaryScheduled) {
   _summaryStart = Date.now();
   setTimeout(finishWhenIdle, 10);
 }
+
+// ── AFK Change Request List (issue #573) ────────────────────────────────────
+// Provider-specific terminology, CR list builder, AFK-only filter, and the
+// list renderer.  Tests cover: GitHub PR / GitLab MR terminology, mixed-provider
+// filtering, date-range propagation, selection preservation, AFK-only toggle,
+// empty-period handling, and markup/CSS smoke checks.
+
+console.log('\u25B6 AFK Change Request List \u2014 providerCrTerm (issue #573)');
+
+(function () {
+  if (typeof window.providerCrTerm !== 'function') {
+    assert(false, 'app.js: providerCrTerm exposed on the window test seam');
+    return;
+  }
+
+  assert(window.providerCrTerm('github') === 'PR', 'github -> PR');
+  assert(window.providerCrTerm('GitHub') === 'PR', 'GitHub (mixed case) -> PR');
+  assert(window.providerCrTerm('gitlab') === 'MR', 'gitlab -> MR');
+  assert(window.providerCrTerm('GitLab') === 'MR', 'GitLab (mixed case) -> MR');
+  assert(window.providerCrTerm('bitbucket') === 'CR', 'bitbucket -> CR (fallback)');
+  assert(window.providerCrTerm('') === 'CR', 'empty string -> CR (fallback)');
+  assert(window.providerCrTerm(null) === 'CR', 'null -> CR (fallback)');
+  assert(window.providerCrTerm(undefined) === 'CR', 'undefined -> CR (fallback)');
+})();
+
+// ── buildChangeRequestList (issue #573) ─────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 buildChangeRequestList (issue #573)');
+
+(function () {
+  if (typeof window.buildChangeRequestList !== 'function') {
+    assert(false, 'app.js: buildChangeRequestList exposed on the window test seam');
+    return;
+  }
+
+  // GitHub fixture: two runs in owner/repo-a, one in owner/repo-b
+  var githubRuns = [
+    { afk_run_id: 'run-1', provider: 'github', title: 'owner/repo-a Fix bug', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:101'] },
+      last_seen_at: '2026-07-15T10:00:00Z', started_at: '2026-07-15T09:00:00Z' },
+    { afk_run_id: 'run-2', provider: 'github', title: 'owner/repo-a Add feature', status: 'running',
+      outcome: { status: 'open', change_request_ids: ['change_request:102'] },
+      last_seen_at: '2026-07-16T12:00:00Z', started_at: '2026-07-16T11:00:00Z' },
+    { afk_run_id: 'run-3', provider: 'github', title: 'owner/repo-b Update docs', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:201'] },
+      last_seen_at: '2026-07-14T08:00:00Z', started_at: '2026-07-14T07:00:00Z' }
+  ];
+
+  // Filter by repository: only repo-a runs
+  var repoA = window.buildChangeRequestList(githubRuns, 'github', 'owner/repo-a');
+  assert(repoA.length === 2, 'github/repo-a: 2 runs produce 2 CR rows');
+  assert(repoA[0].afkRunId === 'run-2', 'sorted by last_seen_at desc: run-2 first (most recent)');
+  assert(repoA[1].afkRunId === 'run-1', 'sorted by last_seen_at desc: run-1 second');
+  assert(repoA[0].changeRequestIds[0] === 'change_request:102', 'CR IDs extracted from outcome');
+  assert(repoA[0].afkLinked === true, 'every AFK run row is afkLinked');
+  assert(repoA[0].provider === 'github', 'provider preserved');
+
+  // Filter by repository: only repo-b
+  var repoB = window.buildChangeRequestList(githubRuns, 'github', 'owner/repo-b');
+  assert(repoB.length === 1, 'github/repo-b: 1 run produces 1 CR row');
+  assert(repoB[0].changeRequestIds[0] === 'change_request:201', 'CR IDs extracted');
+
+  // No matching repository
+  var noMatch = window.buildChangeRequestList(githubRuns, 'github', 'owner/nonexistent');
+  assert(noMatch.length === 0, 'nonexistent repo: 0 CR rows');
+
+  // GitLab fixture: MR terminology
+  var gitlabRuns = [
+    { afk_run_id: 'gl-1', provider: 'gitlab', title: 'group/project Implement feature', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:301'] },
+      last_seen_at: '2026-07-17T14:00:00Z', started_at: '2026-07-17T13:00:00Z' }
+  ];
+  var gitlab = window.buildChangeRequestList(gitlabRuns, 'gitlab', 'group/project');
+  assert(gitlab.length === 1, 'gitlab/project: 1 run produces 1 CR row');
+  assert(gitlab[0].provider === 'gitlab', 'gitlab provider preserved');
+
+  // Empty/null inputs
+  assert(window.buildChangeRequestList([], 'github', 'owner/repo').length === 0, 'empty runs: 0 CR rows');
+  assert(window.buildChangeRequestList(null, 'github', 'owner/repo').length === 0, 'null runs: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, null, 'owner/repo').length === 0, 'null provider: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, 'github', null).length === 0, 'null repository: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, 'github', '').length === 0, 'empty repository: 0 CR rows');
+
+  // Run with no outcome
+  var noOutcome = window.buildChangeRequestList([
+    { afk_run_id: 'no-out', provider: 'github', title: 'owner/repo-x', status: 'running' }
+  ], 'github', 'owner/repo-x');
+  assert(noOutcome.length === 1, 'run without outcome: still produces a CR row');
+  assert(noOutcome[0].outcomeStatus === '--', 'missing outcome renders as --');
+  assert(noOutcome[0].changeRequestIds.length === 0, 'missing outcome: no CR IDs');
+})();
+
+// ── filterChangeRequests (issue #573) ───────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 filterChangeRequests (issue #573)');
+
+(function () {
+  if (typeof window.filterChangeRequests !== 'function') {
+    assert(false, 'app.js: filterChangeRequests exposed on the window test seam');
+    return;
+  }
+
+  var rows = [
+    { afkLinked: true, title: 'CR-1' },
+    { afkLinked: true, title: 'CR-2' },
+    { afkLinked: false, title: 'CR-3' }
+  ];
+
+  // afkOnly=false -> all rows pass through
+  var all = window.filterChangeRequests(rows, false);
+  assert(all.length === 3, 'afkOnly=false: all 3 rows returned');
+
+  // afkOnly=true -> only afkLinked rows
+  var afkOnly = window.filterChangeRequests(rows, true);
+  assert(afkOnly.length === 2, 'afkOnly=true: 2 AFK-linked rows returned');
+  assert(afkOnly[0].title === 'CR-1', 'afkOnly=true: first AFK row');
+  assert(afkOnly[1].title === 'CR-2', 'afkOnly=true: second AFK row');
+
+  // Empty input
+  assert(window.filterChangeRequests([], true).length === 0, 'empty rows: 0 filtered');
+  assert(window.filterChangeRequests([], false).length === 0, 'empty rows, no filter: 0');
+})();
+
+// ── renderChangeRequestList (issue #573) ────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 renderChangeRequestList (issue #573)');
+
+(function () {
+  if (typeof window.renderChangeRequestList !== 'function') {
+    assert(false, 'app.js: renderChangeRequestList exposed on the window test seam');
+    return;
+  }
+
+  // Register the change-request panel fakes for the renderer
+  var crPanelEl = makeFakeElement('afk-change-requests-panel');
+  var crTbodyEl = makeFakeElement('afk-cr-tbody');
+  var crHeaderEl = makeFakeElement('afk-cr-header');
+  var crToggleEl = makeFakeElement('afk-cr-toggle');
+  elementRegistry['afk-change-requests-panel'] = crPanelEl;
+  elementRegistry['afk-cr-tbody'] = crTbodyEl;
+  elementRegistry['afk-cr-header'] = crHeaderEl;
+  elementRegistry['afk-cr-toggle'] = crToggleEl;
+
+  // Select a GitHub repository
+  window.selectRepository('github', 'owner/repo-a');
+
+  var githubData = {
+    items: [
+      { afk_run_id: 'run-1', provider: 'github', title: 'owner/repo-a Fix bug', status: 'completed',
+        outcome: { status: 'merged', change_request_ids: ['change_request:101'] },
+        last_seen_at: '2026-07-15T10:00:00Z', started_at: '2026-07-15T09:00:00Z' },
+      { afk_run_id: 'run-2', provider: 'github', title: 'owner/repo-a Add feature', status: 'running',
+        outcome: { status: 'open', change_request_ids: ['change_request:102'] },
+        last_seen_at: '2026-07-16T12:00:00Z', started_at: '2026-07-16T11:00:00Z' }
+    ]
+  };
+  window.renderChangeRequestList(githubData);
+
+  // Panel is visible
+  assert(crPanelEl.style.display === '', 'GitHub: panel is visible after selection');
+
+  // Header shows "PRs (github)" for GitHub
+  assert(crHeaderEl.textContent.indexOf('PRs') !== -1, 'GitHub: header shows "PRs"');
+  assert(crHeaderEl.textContent.indexOf('owner/repo-a') !== -1, 'GitHub: header shows repository name');
+  assert(crHeaderEl.textContent.indexOf('github') !== -1, 'GitHub: header shows provider');
+
+  // Table has rows
+  var html = crTbodyEl.innerHTML;
+  assert(html.indexOf('change_request:101') !== -1, 'GitHub: CR ID 101 rendered');
+  assert(html.indexOf('change_request:102') !== -1, 'GitHub: CR ID 102 rendered');
+  assert(html.indexOf('badge-completed') !== -1, 'GitHub: completed badge rendered');
+  assert(html.indexOf('badge-running') !== -1, 'GitHub: running badge rendered');
+  assert(html.indexOf('afk-cr-badge') !== -1, 'GitHub: AFK badge rendered');
+  assert(html.indexOf('afk-cr-linked') !== -1, 'GitHub: AFK-linked row class present');
+
+  // GitLab fixture: MR terminology
+  window.selectRepository('gitlab', 'group/project');
+  var gitlabData = {
+    items: [
+      { afk_run_id: 'gl-1', provider: 'gitlab', title: 'group/project Implement feature', status: 'completed',
+        outcome: { status: 'merged', change_request_ids: ['change_request:301'] },
+        last_seen_at: '2026-07-17T14:00:00Z', started_at: '2026-07-17T13:00:00Z' }
+    ]
+  };
+  window.renderChangeRequestList(gitlabData);
+
+  // Header shows "MRs (gitlab)" for GitLab
+  assert(crHeaderEl.textContent.indexOf('MRs') !== -1, 'GitLab: header shows "MRs"');
+  assert(crHeaderEl.textContent.indexOf('group/project') !== -1, 'GitLab: header shows repository name');
+  assert(crHeaderEl.textContent.indexOf('gitlab') !== -1, 'GitLab: header shows provider');
+
+  var glHtml = crTbodyEl.innerHTML;
+  assert(glHtml.indexOf('change_request:301') !== -1, 'GitLab: CR ID 301 rendered');
+  assert(glHtml.indexOf('badge-completed') !== -1, 'GitLab: completed badge rendered');
+
+  // Empty period: no runs for this repository
+  window.selectRepository('github', 'owner/empty-repo');
+  window.renderChangeRequestList({ items: [] });
+  assert(crTbodyEl.innerHTML.indexOf('No change requests found') !== -1,
+    'empty period: shows "No change requests found"');
+
+  // Clear selection: panel hides
+  window.clearSelectedRepo();
+  assert(crPanelEl.style.display === 'none', 'clearSelectedRepo: panel is hidden');
+
+  // AFK-only filter: select repo, toggle filter
+  window.selectRepository('github', 'owner/repo-a');
+  window.renderChangeRequestList(githubData);
+  // Both rows visible initially
+  assert(crTbodyEl.innerHTML.indexOf('change_request:101') !== -1, 'all mode: CR 101 visible');
+  assert(crTbodyEl.innerHTML.indexOf('change_request:102') !== -1, 'all mode: CR 102 visible');
+})();
+
+// ── index.html \u2014 AFK Change Request List markup (issue #573) ──────────────
+
+console.log('\u25B6 index.html \u2014 AFK Change Request List markup (issue #573)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // The change-request panel exists inside #tab-afk-outcomes
+  var afkTabIdx = html.indexOf('id="tab-afk-outcomes"');
+  var crPanelIdx = html.indexOf('id="afk-change-requests-panel"');
+  assert(crPanelIdx !== -1, 'index.html: #afk-change-requests-panel exists');
+  assert(afkTabIdx !== -1 && crPanelIdx > afkTabIdx,
+    'index.html: change-request panel lives inside #tab-afk-outcomes');
+
+  // The panel carries a freshness span
+  assert(html.indexOf('id="freshness-afk-change-requests"') !== -1,
+    'index.html: freshness span #freshness-afk-change-requests exists');
+
+  // Back button exists
+  assert(html.indexOf('id="afk-cr-back"') !== -1, 'index.html: back button #afk-cr-back exists');
+
+  // AFK-only toggle exists
+  assert(html.indexOf('id="afk-cr-toggle"') !== -1, 'index.html: AFK-only toggle #afk-cr-toggle exists');
+
+  // The table has the expected header columns
+  var crTable = html.slice(
+    html.indexOf('id="afk-cr-table"'),
+    html.indexOf('</table>', html.indexOf('id="afk-cr-table"'))
+  );
+  assert(crTable.indexOf('<th>Change Request</th>') !== -1,
+    'index.html: change-request table has Change Request column');
+  assert(crTable.indexOf('<th>Status</th>') !== -1,
+    'index.html: change-request table has Status column');
+  assert(crTable.indexOf('<th>Outcome</th>') !== -1,
+    'index.html: change-request table has Outcome column');
+  assert(crTable.indexOf('<th>AFK</th>') !== -1,
+    'index.html: change-request table has AFK column');
+  assert(crTable.indexOf('<th>Last Seen</th>') !== -1,
+    'index.html: change-request table has Last Seen column');
+
+  // The panel starts hidden (display:none)
+  var crPanel = html.slice(
+    html.indexOf('id="afk-change-requests-panel"'),
+    html.indexOf('</section>', html.indexOf('id="afk-change-requests-panel"'))
+  );
+  assert(crPanel.indexOf('display:none') !== -1,
+    'index.html: change-request panel starts hidden');
+
+  // The existing AFK Runs panel and Repository Summary panel still exist
+  assert(html.indexOf('id="afk-runs-table"') !== -1,
+    'index.html: existing #afk-runs-table still present');
+  assert(html.indexOf('id="afk-repos-table"') !== -1,
+    'index.html: existing #afk-repos-table still present');
+})();
+
+// ── style.css \u2014 AFK Change Request List rules (issue #573) ────────────────
+
+console.log('\u25B6 style.css \u2014 AFK Change Request List rules (issue #573)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.panel-afk-cr') !== -1,
+    'style.css: .panel-afk-cr rule exists');
+  assert(live.indexOf('.afk-cr-back') !== -1,
+    'style.css: .afk-cr-back rule exists');
+  assert(live.indexOf('.afk-cr-toggle') !== -1,
+    'style.css: .afk-cr-toggle rule exists');
+  assert(live.indexOf('.afk-cr-linked') !== -1,
+    'style.css: .afk-cr-linked rule exists');
+  assert(live.indexOf('.afk-cr-badge') !== -1,
+    'style.css: .afk-cr-badge rule exists');
+  assert(live.indexOf('.repo-row') !== -1,
+    'style.css: .repo-row rule exists (clickable repository rows)');
+})();

@@ -112,6 +112,11 @@
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let afkRunsData = null;         // latest AFK runs list response
   let afkRunsFetchError = null;   // per-cycle fetch error for AFK runs
+  // Change-request list view (issue #573): selected repository + AFK-only filter.
+  // selectedRepo is { provider, repository } when a repository is selected,
+  // or null when no repository is selected (shows repository summary).
+  let selectedRepo = null;
+  let afkOnlyFilter = false;      // true → only show AFK-linked change requests
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -166,6 +171,8 @@
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
     'afk-outcomes':  ['afkRuns'],
+    'afk-repos':     ['afkRuns'],
+    'afk-change-requests': ['afkRuns'],
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -680,6 +687,267 @@
     if (pid) return pid;
     if (wid) return wid;
     return '--';
+  }
+
+  // ── AFK Repository Summary helpers (issue #572) ───────────────────────
+  // Aggregates AFK runs into a repository-first summary list: one row per
+  // unique (provider, repository) pair, showing AFK activity counts,
+  // provider identity, and last-activity timestamps.  Pure helpers — no DOM
+  // access — so the Node test harness exercises them through the window
+  // test seam.
+
+  /** Derive a repository label from an AFK run's title and metadata.
+   *  Falls back to provider name when no repository can be resolved.
+   *  Pure — no DOM or fetch access.
+   *  @param {Object} run - AFK run item from the API
+   *  @returns {string} a normalized repository label */
+  function deriveRepositoryLabel(run) {
+    if (!run) return 'unknown';
+    // Use the title if it contains a repository-like path (e.g. "owner/repo")
+    var title = run.title || '';
+    var match = title.match(/^([a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+)/);
+    if (match) return match[1];
+    // Fall back to provider name
+    return run.provider || 'unknown';
+  }
+
+  /** Build repository summary rows from an AFK runs list.
+   *  Pure: aggregates runs by (provider, repository) without DOM access.
+   *  @param {Array|null} runs - AFK runs items from the API
+   *  @returns {Array<{provider: string, repository: string, runCount: number,
+   *           lastActivity: string|null}>} sorted by runCount desc,
+   *           then provider asc, then repository asc */
+  function buildRepositorySummaries(runs) {
+    if (!runs || !Array.isArray(runs) || runs.length === 0) return [];
+    var groups = {};
+    runs.forEach(function (r) {
+      var provider = (r && r.provider) || 'unknown';
+      var repository = deriveRepositoryLabel(r);
+      var key = provider + '|' + repository;
+      if (!groups[key]) {
+        groups[key] = {
+          provider: provider,
+          repository: repository,
+          runCount: 0,
+          lastActivity: null
+        };
+      }
+      groups[key].runCount++;
+      var seen = r.last_seen_at || r.started_at;
+      if (seen && (!groups[key].lastActivity || seen > groups[key].lastActivity)) {
+        groups[key].lastActivity = seen;
+      }
+    });
+    return Object.keys(groups).map(function (k) { return groups[k]; })
+      .sort(function (a, b) {
+        if (b.runCount !== a.runCount) return b.runCount - a.runCount;
+        if (a.provider !== b.provider) return a.provider < b.provider ? -1 : 1;
+        return a.repository < b.repository ? -1 : (a.repository > b.repository ? 1 : 0);
+      });
+  }
+
+  /** Make the repository summary table rows clickable (issue #573).
+   *  Each row fires selectRepository(provider, repository) on click,
+   *  transitioning to the change-request list view for that repository. */
+  function renderRepositorySummaryTable(data) {
+    applyPanelFreshness('afk-repos');
+    if (!shouldRenderPanel(panelStates, 'afk-repos')) return;
+
+    var reposEl = $('afk-repos-tbody');
+    if (!reposEl) return;
+
+    var runs = data && data.items;
+    var summaries = buildRepositorySummaries(runs);
+
+    if (summaries.length === 0) {
+      var errSuffix = afkRunsFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkRunsFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      reposEl.innerHTML = '<tr><td colspan="4" class="empty-state">No repository activity' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    summaries.forEach(function (s) {
+      var providerBadge = badge(s.provider, 'badge-provider').outerHTML;
+      html += '<tr class="repo-row clickable" data-provider="' + escHtml(s.provider) + '" data-repository="' + escHtml(s.repository) + '" tabindex="0">' +
+        '<td>' + providerBadge + '</td>' +
+        '<td>' + escHtml(s.repository) + '</td>' +
+        '<td>' + fmtNum(s.runCount) + '</td>' +
+        '<td>' + fmtDT(s.lastActivity) + '</td>' +
+        '</tr>';
+    });
+
+    reposEl.innerHTML = html;
+
+    // Wire click + keyboard handlers for repository selection
+    var rows = reposEl.querySelectorAll('.repo-row');
+    rows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var provider = row.getAttribute('data-provider');
+        var repository = row.getAttribute('data-repository');
+        if (provider && repository) selectRepository(provider, repository);
+      });
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var provider = row.getAttribute('data-provider');
+          var repository = row.getAttribute('data-repository');
+          if (provider && repository) selectRepository(provider, repository);
+        }
+      });
+    });
+  }
+
+  // ── AFK Change Request List helpers (issue #573) ──────────────────────
+  // When a repository is selected in the Repository Summary, show all AFK
+  // runs for that repository as change requests (GitHub PRs / GitLab MRs).
+  // Uses canonical change_request vocabulary with provider-specific labels
+  // (PR for GitHub, MR for GitLab).  Pure helpers — no DOM access.
+
+  /** Derive the provider-specific term for a change request.
+   *  GitHub -> "PR", GitLab -> "MR", anything else -> "CR".
+   *  Pure — no DOM or fetch access.
+   *  @param {string} provider
+   *  @returns {string} e.g. "PR", "MR", "CR" */
+  function providerCrTerm(provider) {
+    var p = (provider || '').toLowerCase();
+    if (p === 'github') return 'PR';
+    if (p === 'gitlab') return 'MR';
+    return 'CR';
+  }
+
+  /** Build change-request rows for a selected repository from AFK runs.
+   *  Pure: filters runs by (provider, repository) and extracts change-request
+   *  details from each run's outcome.  Returns rows sorted by last_seen_at
+   *  descending (most recent first).
+   *  @param {Array|null} runs   - AFK runs items from the API
+   *  @param {string} provider   - the repository's provider
+   *  @param {string} repository - the repository label
+   *  @returns {Array<{afkRunId, title, status, outcomeStatus, changeRequestIds,
+   *           provider, repository, lastSeenAt, startedAt, afkLinked}>}
+   */
+  function buildChangeRequestList(runs, provider, repository) {
+    if (!runs || !Array.isArray(runs) || !provider || !repository) return [];
+    return runs
+      .filter(function (r) {
+        if (!r) return false;
+        var runProvider = (r.provider || '').toLowerCase();
+        var runRepo = deriveRepositoryLabel(r);
+        return runProvider === provider.toLowerCase() && runRepo === repository;
+      })
+      .map(function (r) {
+        var outcome = r.outcome || null;
+        return {
+          afkRunId: r.afk_run_id || null,
+          title: r.title || r.afk_run_id || '--',
+          status: r.status || '--',
+          outcomeStatus: outcome ? (outcome.status || '--') : '--',
+          changeRequestIds: outcome && outcome.change_request_ids ? outcome.change_request_ids : [],
+          provider: r.provider || 'unknown',
+          repository: repository,
+          lastSeenAt: r.last_seen_at || null,
+          startedAt: r.started_at || null,
+          afkLinked: true // every AFK run is AFK-linked by definition
+        };
+      })
+      .sort(function (a, b) {
+        // Most recent last_seen_at first; nulls last
+        if (a.lastSeenAt && b.lastSeenAt) {
+          return a.lastSeenAt < b.lastSeenAt ? 1 : (a.lastSeenAt > b.lastSeenAt ? -1 : 0);
+        }
+        if (a.lastSeenAt) return -1;
+        if (b.lastSeenAt) return 1;
+        return 0;
+      });
+  }
+
+  /** Apply the AFK-only filter to a change-request list.
+   *  Pure — filters rows by afkLinked flag.
+   *  @param {Array} rows - change-request rows from buildChangeRequestList
+   *  @param {boolean} afkOnly - true -> only AFK-linked rows
+   *  @returns {Array} filtered rows */
+  function filterChangeRequests(rows, afkOnly) {
+    if (!afkOnly) return rows;
+    return rows.filter(function (r) { return r.afkLinked; });
+  }
+
+  /** Handle a repository click from the Repository Summary table.
+   *  Sets the selected repository and re-renders the change-request list. */
+  function selectRepository(provider, repository) {
+    selectedRepo = { provider: provider, repository: repository };
+    afkOnlyFilter = false;
+    renderChangeRequestList(afkRunsData);
+  }
+
+  /** Return to the repository summary view (clear selection). */
+  function clearSelectedRepo() {
+    selectedRepo = null;
+    afkOnlyFilter = false;
+    var panelEl = $('afk-change-requests-panel');
+    if (panelEl) panelEl.style.display = 'none';
+  }
+
+  /** Render the change-request list table for the selected repository.
+   *  Shows the selected repository header, AFK-only toggle, and a table of
+   *  change requests with provider-specific labels (PR/MR) and AFK-linked
+   *  highlighting.  Follows the agent-runs panel conventions. */
+  function renderChangeRequestList(data) {
+    applyPanelFreshness('afk-change-requests');
+    if (!shouldRenderPanel(panelStates, 'afk-change-requests')) return;
+
+    var panelEl = $('afk-change-requests-panel');
+    var tbodyEl = $('afk-cr-tbody');
+    var headerEl = $('afk-cr-header');
+    var toggleEl = $('afk-cr-toggle');
+    if (!panelEl || !tbodyEl) return;
+
+    // No repository selected -> hide the panel
+    if (!selectedRepo) {
+      panelEl.style.display = 'none';
+      return;
+    }
+    panelEl.style.display = '';
+
+    // Update header with selected repository
+    if (headerEl) {
+      var crTerm = providerCrTerm(selectedRepo.provider);
+      headerEl.textContent = selectedRepo.repository + ' ' + crTerm + 's (' + selectedRepo.provider + ')';
+    }
+
+    // Sync the AFK-only toggle checkbox
+    if (toggleEl) {
+      toggleEl.checked = afkOnlyFilter;
+    }
+
+    var runs = data && data.items;
+    var rows = buildChangeRequestList(runs, selectedRepo.provider, selectedRepo.repository);
+    var filtered = filterChangeRequests(rows, afkOnlyFilter);
+
+    if (filtered.length === 0) {
+      var emptyMsg = rows.length === 0
+        ? 'No change requests found for ' + escHtml(selectedRepo.repository)
+        : 'No AFK-linked change requests for ' + escHtml(selectedRepo.repository);
+      tbodyEl.innerHTML = '<tr><td colspan="5" class="empty-state">' + emptyMsg + '</td></tr>';
+      return;
+    }
+
+    var crTerm = providerCrTerm(selectedRepo.provider);
+    var html = '';
+    filtered.forEach(function (r) {
+      var statusCls = afkRunStatusBadgeClass(r.status);
+      var outcomeCls = outcomeStatusBadgeClass(r.outcomeStatus);
+      var crIds = r.changeRequestIds.length > 0 ? r.changeRequestIds.join(', ') : '--';
+      html += '<tr class="afk-cr-row' + (r.afkLinked ? ' afk-cr-linked' : '') + '">' +
+        '<td data-label="' + crTerm + ' ID">' + escHtml(crIds) + '</td>' +
+        '<td data-label="Status">' + badge(r.status || '--', statusCls).outerHTML + '</td>' +
+        '<td data-label="Outcome">' + badge(outcomeStatusLabel(r.outcomeStatus), outcomeCls).outerHTML + '</td>' +
+        '<td data-label="AFK">' + (r.afkLinked ? '<span class="afk-cr-badge">AFK</span>' : '--') + '</td>' +
+        '<td data-label="Last Seen">' + fmtDT(r.lastSeenAt) + '</td>' +
+        '</tr>';
+    });
+
+    tbodyEl.innerHTML = html;
   }
 
   // ── AFK outcome chain helpers (issue #453) ─────────────────────────────
@@ -2479,6 +2747,8 @@
       }
       renderClientProjectBreakdown(data);
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderRepositorySummaryTable(data.afkRuns); // Repository summary (issue #572)
+      renderChangeRequestList(data.afkRuns); // Change-request list (issue #573)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -2781,6 +3051,21 @@
         els.afkDetailOverlay.classList.remove('visible');
       }
     });
+
+    // Change-request list panel (issue #573): back button + AFK-only toggle
+    var backBtn = $('afk-cr-back');
+    if (backBtn) {
+      backBtn.addEventListener('click', function () {
+        clearSelectedRepo();
+      });
+    }
+    var toggleEl = $('afk-cr-toggle');
+    if (toggleEl) {
+      toggleEl.addEventListener('change', function () {
+        afkOnlyFilter = toggleEl.checked;
+        renderChangeRequestList(afkRunsData);
+      });
+    }
   }
 
   // ── Transcript view (issue #469) ───────────────────────────────────────
@@ -3328,6 +3613,20 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  // AFK Repository Summary (issue #572): pure aggregation helper and
+  // table renderer — the Node harness exercises the pure helper directly
+  // and the renderer through the fake tbody.
+  window.deriveRepositoryLabel = deriveRepositoryLabel;
+  window.buildRepositorySummaries = buildRepositorySummaries;
+  window.renderRepositorySummaryTable = renderRepositorySummaryTable;
+  // AFK Change Request List (issue #573): provider-specific terminology,
+  // pure CR list builder, AFK-only filter, and the list renderer.
+  window.providerCrTerm = providerCrTerm;
+  window.buildChangeRequestList = buildChangeRequestList;
+  window.filterChangeRequests = filterChangeRequests;
+  window.renderChangeRequestList = renderChangeRequestList;
+  window.selectRepository = selectRepository;
+  window.clearSelectedRepo = clearSelectedRepo;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.
