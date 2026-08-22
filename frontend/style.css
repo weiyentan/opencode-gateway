@@ -882,6 +882,26 @@ tbody tr:hover td {
 .badge-stale    { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
 
+/* Provider badge (issue #557) — compact outlined badge with a text label.
+   Neutral palette: transparent fill, muted text, hairline glass border.
+   No semantic status color — providers are descriptive labels, never
+   lifecycle states (Badge Only vocabulary, no green wash/glow). */
+.badge-provider {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--glass-border);
+  padding: 1px 9px;
+}
+
+/* Numeric token columns (issue #557): right-aligned with tabular numerals
+   so Cache Read / Cache Write / Reasoning counts align digit-for-digit
+   across rows.  The ≤760px stacked-card band overrides alignment with its
+   flex label/value layout, so this rule is desktop/tablet only. */
+#agent-runs-table td.ar-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Fetch error indicator — shown inline in empty states when an endpoint failed */
 .fetch-error {
   display: inline-block;
