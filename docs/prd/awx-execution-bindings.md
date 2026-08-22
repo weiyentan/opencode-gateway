@@ -39,7 +39,8 @@ The Gateway will persist one binding per AWX job. A GitHub pull request or GitLa
 - Reject failure metadata on completed executions; failed and cancelled executions may omit it.
 - Persist optional source event ID, branch, title, and start/finish timestamps when supplied.
 - Never persist raw AWX extra variables, stdout, prompts, model configuration, tokens, or arbitrary payloads.
-- Expose `POST /api/v1/afk/executions`, `GET /api/v1/afk/executions/{awx_job_id}`, and a provider-resource query at `GET /api/v1/afk/executions`.
+- Expose `POST /api/v1/execution-bindings`, `GET /api/v1/execution-bindings/{awx_job_id}`, and a provider-resource query at `GET /api/v1/execution-bindings`.
+- The provider-resource query at `GET /api/v1/execution-bindings` accepts query parameters `?provider=github&repository=org/repo&entity_type=change_request&entity_number=42` to filter by provider resource identity.
 - Preserve the two-layer authentication boundary: global Admin API Key middleware plus a collector credential owned by `awx-execution-bindings`.
 - Order resource history by `created_at ASC, id ASC`.
 - Modify the existing migration `0037` if needed; do not add a duplicate migration or backfill historical executions. Keep the migration additive and reversible.

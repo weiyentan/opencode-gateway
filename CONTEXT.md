@@ -142,7 +142,7 @@ Bounded, redacted diagnostic metadata attached to a failed or cancelled
 Execution Binding. It is a short explanation of the terminal failure, not
 stdout, a transcript, extra variables, prompts, credentials, or an arbitrary
 provider payload. Recognizable secret-bearing values are redacted before the
-summary is persisted, and the stored value has a fixed maximum length.
+summary is persisted, and the stored value has a fixed maximum length of 1000 characters.
 _Avoid_: failure transcript, raw failure output, AWX payload
 
 **Observed Message**:
