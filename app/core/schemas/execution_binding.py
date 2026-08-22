@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from afk_outcomes.models import (
     AWXJobIdentity,
@@ -50,12 +50,18 @@ class ExecutionBindingResourceIn(BaseModel):
     GitLab ``merge_request`` — and normalizes both to the canonical
     ``change_request`` entity type.  Other entity types are rejected: an
     execution binding always targets a change request.
+
+    Provider/type compatibility (issue #565):
+
+    * GitHub accepts ``pull_request`` and ``change_request``.
+    * GitLab accepts ``merge_request`` and ``change_request``.
+    * GitHub ``merge_request`` and GitLab ``pull_request`` are rejected.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     provider: Provider = Field(description="Source provider: github | gitlab")
-    repository: str = Field(description="Full owner/repo (or group/project) name")
+    repository: str = Field(description="Repository URL (normalized via normalize_repository_url)")
     resource_type: str = Field(
         description=(
             "pull_request | merge_request | change_request — all normalize "
@@ -68,14 +74,37 @@ class ExecutionBindingResourceIn(BaseModel):
 
     @field_validator("resource_type", mode="after")
     @classmethod
-    def _normalize_resource_type(cls, v: str) -> str:
-        """Normalize provider-native PR/MR vocabulary to ``change_request``."""
+    def _validate_resource_type_vocab(cls, v: str) -> str:
+        """Validate provider-native PR/MR vocabulary (normalization deferred)."""
         if v not in _PROVIDER_NATIVE_RESOURCE_TYPES:
             raise ValueError(
                 "resource_type must be 'pull_request', 'merge_request', or "
                 f"'change_request'; got '{v}'"
             )
-        return EntityType.CHANGE_REQUEST.value
+        return v
+
+    @model_validator(mode="after")
+    def _validate_provider_type_and_normalize(self) -> ExecutionBindingResourceIn:
+        """Enforce provider-specific resource-type compatibility and canonicalize.
+
+        GitHub: pull_request | change_request
+        GitLab: merge_request | change_request
+        Cross-provider combos are rejected with a clear ValueError (surfaces as 422).
+        The resource_type is then normalized to the canonical ``change_request``.
+        """
+        if self.provider == Provider.GITHUB and self.resource_type == "merge_request":
+            raise ValueError(
+                "resource_type 'merge_request' is not valid for provider 'github'; "
+                "use 'pull_request' or 'change_request'"
+            )
+        if self.provider == Provider.GITLAB and self.resource_type == "pull_request":
+            raise ValueError(
+                "resource_type 'pull_request' is not valid for provider 'gitlab'; "
+                "use 'merge_request' or 'change_request'"
+            )
+        # Canonical persistence: normalize to change_request.
+        object.__setattr__(self, "resource_type", EntityType.CHANGE_REQUEST.value)
+        return self
 
     def to_provider_resource_identity(self) -> ProviderResourceIdentity:
         """Return the canonical domain identity for this resource.

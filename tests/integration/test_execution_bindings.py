@@ -175,7 +175,7 @@ def _make_binding_payload(
     awx_job_id: int,
     external_session_id: str = "ses_integration_test",
     provider: str = "github",
-    repository: str = "acme/proj",
+    repository: str = "https://github.com/acme/proj",
     resource_type: str = "pull_request",
     resource_number: str = "42",
     outcome: str = "completed",
@@ -662,3 +662,137 @@ async def test_list_bindings_empty_resource(db_pool: asyncpg.Pool) -> None:
         assert resp.status_code == 200, resp.text
         history = resp.json()["data"]
         assert history["bindings"] == []
+
+
+# ── Concurrency tests (issue #568) ──────────────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_identical_callbacks_one_201_one_200(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Concurrent identical callbacks produce one 201 and one 200, with one row.
+
+    Two concurrent POST requests with the same ``awx_job_id`` and identical
+    payload race on the INSERT.  Exactly one wins the unique constraint
+    (201 Created); the other receives the conflict path (200 OK, idempotent
+    replay).  The database must contain exactly one row for that job id.
+    """
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    payload = _make_binding_payload(awx_job_id=awx_job_id)
+
+    async with client as c:
+        # Fire both requests concurrently.
+        results = await asyncio.gather(
+            c.post("/api/v1/afk/executions", json=payload),
+            c.post("/api/v1/afk/executions", json=payload),
+        )
+        status_codes = sorted(r.status_code for r in results)
+        # Exactly one 201 (inserted) and one 200 (idempotent replay).
+        assert status_codes == [200, 201], (
+            f"Expected [200, 201], got {status_codes}"
+        )
+
+        # Both responses should return valid binding data.
+        for r in results:
+            assert r.status_code in (200, 201)
+            body = r.json()
+            assert body["data"]["awx_job"]["job_id"] == str(awx_job_id)
+
+    # Verify only one row in DB.
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert count == 1, f"Expected 1 row, got {count}"
+
+        # The stored row must be unmutated (identical payload).
+        row = await conn.fetchrow(
+            "SELECT outcome, provider, entity_type FROM execution_bindings"
+            " WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "completed"
+        assert row["provider"] == "github"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_conflicting_callbacks_one_201_one_409(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Concurrent conflicting callbacks: one 201, one 409, no mutation.
+
+    Two concurrent POST requests with the same ``awx_job_id`` but different
+    payloads race on the INSERT.  Exactly one wins (201 Created); the other
+    detects the conflict (409 Conflict).  The stored row must remain
+    unmutated — the original payload is preserved.
+    """
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    payload_original = _make_binding_payload(
+        awx_job_id=awx_job_id,
+        outcome="completed",
+        title="Original",
+    )
+    payload_conflict = _make_binding_payload(
+        awx_job_id=awx_job_id,
+        outcome="failed",
+        title="Conflicting",
+        failure_reason="intentional conflict",
+    )
+
+    async with client as c:
+        # Fire both requests concurrently — one will win, one must conflict.
+        results = await asyncio.gather(
+            c.post("/api/v1/afk/executions", json=payload_original),
+            c.post("/api/v1/afk/executions", json=payload_conflict),
+        )
+        status_codes = sorted(r.status_code for r in results)
+        # Exactly one 201 (inserted) and one 409 (conflict rejection).
+        assert status_codes == [201, 409], (
+            f"Expected [201, 409], got {status_codes}"
+        )
+
+        # The 409 response must carry a conflict error body.
+        for r in results:
+            if r.status_code == 409:
+                body = r.json()
+                assert body["status"] == "error"
+                assert body["error"]["code"] == "CONFLICT"
+
+    # Verify only one row and it is the ORIGINAL (not the conflicting one).
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert count == 1, f"Expected 1 row, got {count}"
+
+        row = await conn.fetchrow(
+            "SELECT outcome, title, failure_reason FROM execution_bindings"
+            " WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        # The winner's data must match one of the two payloads.
+        # We cannot deterministically predict which one won the race,
+        # but the row must be unmutated — it should match one input exactly.
+        assert row["outcome"] in ("completed", "failed")
+        if row["outcome"] == "completed":
+            assert row["title"] == "Original"
+            assert row["failure_reason"] is None
+        else:
+            assert row["title"] == "Conflicting"
+            assert row["failure_reason"] == "intentional conflict"

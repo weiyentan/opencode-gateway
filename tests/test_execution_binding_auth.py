@@ -69,7 +69,7 @@ def _saved_row() -> MagicMock:
             "job_template_id": 7,
             "external_session_id": "ses_abc123",
             "provider": "github",
-            "repository_url": "acme/proj",
+            "repository_url": "github.com/acme/proj",
             "entity_type": "change_request",
             "entity_number": "99",
             "outcome": "completed",
@@ -90,7 +90,7 @@ def _valid_binding_payload() -> dict:
         "external_session_id": "ses_abc123",
         "resource": {
             "provider": "github",
-            "repository": "acme/proj",
+            "repository": "https://github.com/acme/proj",
             "resource_type": "pull_request",
             "resource_number": "99",
         },
@@ -145,8 +145,9 @@ class TestDedicatedCredentialEnforcement:
         """
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), _saved_row()]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -384,8 +385,9 @@ class TestBearerTokenNonLeakage:
         """The credential lookup queries by SHA-256 hash, never the raw token."""
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), _saved_row()]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = _build_collector_only_client(conn, monkeypatch)
 
