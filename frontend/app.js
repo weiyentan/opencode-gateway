@@ -84,6 +84,9 @@
     afkDetailBody:   $('afk-detail-body'),
     afkDetailClose:  $('afk-detail-close'),
 
+    // Unresolved Relationships (issue #576)
+    unresolvedTbody: $('unresolved-relationships-tbody'),
+
     // Date range bar
     drPreset:       $('dr-preset'),
     drCustomInputs: $('dr-custom-inputs'),
@@ -118,11 +121,7 @@
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let afkRunsData = null;         // latest AFK runs list response
   let afkRunsFetchError = null;   // per-cycle fetch error for AFK runs
-  // Change-request list view (issue #573): selected repository + AFK-only filter.
-  // selectedRepo is { provider, repository } when a repository is selected,
-  // or null when no repository is selected (shows repository summary).
-  let selectedRepo = null;
-  let afkOnlyFilter = false;      // true → only show AFK-linked change requests
+  let unresolvedRelationshipsData = null; // latest unresolved relationships data
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -177,8 +176,7 @@
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
     'afk-outcomes':  ['afkRuns'],
-    'afk-repos':     ['afkRuns'],
-    'afk-change-requests': ['afkRuns'],
+    'unresolved-relationships': ['afkRuns'],
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -1053,84 +1051,130 @@
     ];
   }
 
-  // ── Nested session tree (issue #575) ─────────────────────────────────
-  // Build a root→children tree from a flat list of session links using
-  // parent_session_id.  Sessions whose parent_session_id references a
-  // session not in the list are treated as root sessions with a
-  // missing_parent marker.  Sessions with no parent_session_id are roots.
-  // Pure — no DOM access.
+  // ── Relationship state helpers (issue #576) ───────────────────────────
+  // Make relationship certainty visible throughout AFK Outcomes: resolved,
+  // provisional, ambiguous, unmatched, parked, unresolved, noise, and
+  // referenced states each map to a distinct badge class and label.  No
+  // uncertain state is ever silently omitted or rendered as a definitive link.
 
-  /** Build a nested session tree from a flat list of session links.
-   *  Returns an array of root nodes, each optionally carrying a `children`
-   *  array.  A node is `{ session, children, missing_parent }`.
-   *  Pure — no DOM access. */
-  function buildSessionTree(sessions) {
-    if (!sessions || !sessions.length) return [];
-    var byParent = {};
-    var byExtId = {};
-    var roots = [];
-    sessions.forEach(function (s) {
-      var extId = s.external_session_id || s.session_id || '';
-      byExtId[extId] = s;
-    });
-    sessions.forEach(function (s) {
-      var extId = s.external_session_id || s.session_id || '';
-      var parentId = s.parent_session_id || '';
-      if (parentId && byExtId[parentId]) {
-        if (!byParent[parentId]) byParent[parentId] = [];
-        byParent[parentId].push(s);
-      } else if (parentId && !byExtId[parentId]) {
-        roots.push({ session: s, children: [], missing_parent: parentId });
-      } else {
-        roots.push({ session: s, children: [] });
-      }
-    });
-    Object.keys(byParent).forEach(function (parentId) {
-      var node = _findNode(roots, parentId);
-      if (node) node.children = byParent[parentId];
-    });
-    return roots;
+  /** Map a relationship state to a badge CSS class and human label.
+   *  Resolved links get badge-completed (green); provisional/inferred get
+   *  badge-provisional (amber); ambiguous/unmatched/parked/unresolved each
+   *  get their own distinct class; noise and referenced fall back to existing
+   *  classes.  Null/unknown falls back to badge-unknown.
+   *  @param {string|null} state
+   *  @returns {{label: string, cssClass: string}} */
+  function fmtRelationshipState(state) {
+    if (state === 'resolved')   return { label: 'resolved',   cssClass: 'badge-completed' };
+    if (state === 'provisional') return { label: 'provisional', cssClass: 'badge-provisional' };
+    if (state === 'inferred')   return { label: 'inferred',   cssClass: 'badge-provisional' };
+    if (state === 'ambiguous')  return { label: 'ambiguous',  cssClass: 'badge-ambiguous' };
+    if (state === 'unmatched')  return { label: 'unmatched',  cssClass: 'badge-unmatched' };
+    if (state === 'parked')     return { label: 'parked',     cssClass: 'badge-parked' };
+    if (state === 'unresolved') return { label: 'unresolved', cssClass: 'badge-unresolved' };
+    if (state === 'noise')      return { label: 'noise',      cssClass: 'badge-unknown' };
+    if (state === 'referenced') return { label: 'referenced', cssClass: 'badge-stale' };
+    return { label: state || '--', cssClass: 'badge-unknown' };
   }
 
-  /** Find a node in the tree by external_session_id. */
-  function _findNode(nodes, extId) {
-    for (var i = 0; i < nodes.length; i++) {
-      var n = nodes[i];
-      if ((n.session.external_session_id || n.session.session_id) === extId) return n;
-      if (n.children && n.children.length) {
-        var found = _findNode(
-          n.children.map(function (c) { return { session: c, children: [] }; }),
-          extId
-        );
-        if (found) return found;
+  /** Render a relationship-state badge with optional provenance line.
+   *  Confidence is shown as a percentage; method, evidence, and resolver
+   *  version are shown when non-null.  Pure — returns HTML string.
+   *  @param {string|null} state
+   *  @param {{confidence, method, evidence, resolver_version}|null} provenance
+   *  @returns {string} HTML */
+  function renderRelationshipBadge(state, provenance) {
+    var info = fmtRelationshipState(state);
+    var html = badge(info.label, info.cssClass).outerHTML;
+    if (provenance) {
+      var parts = [];
+      parts.push(fmtConfidence(provenance.confidence));
+      if (provenance.method) parts.push(escHtml(provenance.method));
+      if (provenance.resolver_version) parts.push('resolver v' + escHtml(provenance.resolver_version));
+      if (parts.length) {
+        html += ' <span class="afk-provenance">' + parts.join(' \u00B7 ') + '</span>';
+      }
+      var evidence = renderAfkEvidence(provenance);
+      if (evidence) {
+        html += ' <span class="afk-evidence">' + evidence + '</span>';
       }
     }
-    return null;
+    return html;
   }
 
-  /** Render a nested session node with tree indentation.
-   *  Pure — returns an HTML string. */
-  function renderNestedSessionNode(node, depth) {
-    depth = depth || 0;
-    var html = renderAfkSessionLink(node.session);
-    if (depth > 0) {
-      html = html.replace('afk-chain-item', 'afk-chain-item afk-session-nested afk-nesting-depth-' + Math.min(depth, 5));
-    } else {
-      html = html.replace('afk-chain-item', 'afk-chain-item afk-session-root');
-    }
-    if (node.missing_parent) {
-      html = html.replace('afk-chain-item', 'afk-chain-item afk-missing-parent');
-      html += '<div class="afk-missing-parent-note">\u26A0 parent not in this run: ' +
-        escHtml(node.missing_parent) + '</div>';
-    }
-    if (node.children && node.children.length) {
-      html += '<div class="afk-session-children">';
-      node.children.forEach(function (child) {
-        var childNode = { session: child, children: [] };
-        html += renderNestedSessionNode(childNode, depth + 1);
+  /** Build the list of unresolved/provisional/parked relationships from an
+   *  AFK run detail response.  Extracts items from the `unresolved` and
+   *  `parked` arrays on the detail, mapping each to a uniform shape with a
+   *  `state` field.  Pure — no DOM or fetch access.
+   *  @param {Object|null} detail - the AFK run detail response
+   *  @returns {Array} list of unresolved relationship items */
+  function buildUnresolvedRelationships(detail) {
+    if (!detail) return [];
+    var items = [];
+    var unresolved = detail.unresolved || [];
+    var parked = detail.parked || [];
+    unresolved.forEach(function (u) {
+      items.push({
+        entity_id: u.entity_id || '--',
+        entity_type: u.entity_type || '',
+        state: u.reason || u.state || 'unresolved',
+        confidence: u.correlation_confidence,
+        method: u.correlation_method,
+        evidence: u.evidence || [],
+        resolver_version: u.resolver_version
       });
-      html += '</div>';
+    });
+    parked.forEach(function (p) {
+      items.push({
+        entity_id: p.entity_id || '--',
+        entity_type: p.entity_type || '',
+        state: 'parked',
+        confidence: p.correlation_confidence,
+        method: p.correlation_method,
+        evidence: p.evidence || [],
+        resolver_version: p.resolver_version
+      });
+    });
+    return items;
+  }
+
+  /** Render one unresolved-relationship row as HTML.  Pure — returns HTML.
+   *  @param {Object} item - {entity_id, entity_type, state, confidence, method, evidence, resolver_version}
+   *  @returns {string} HTML */
+  function renderUnresolvedRelationshipsRow(item) {
+    var html = '<tr>';
+    html += '<td>' + escHtml(item.entity_id) + '</td>';
+    html += '<td>' + escHtml(item.entity_type) + '</td>';
+    html += '<td>' + renderRelationshipBadge(item.state, {
+      confidence: item.confidence,
+      method: item.method,
+      evidence: item.evidence,
+      resolver_version: item.resolver_version
+    }) + '</td>';
+    html += '</tr>';
+    return html;
+  }
+
+  /** Render the unresolved-relationships view.  Returns HTML for the panel
+   *  body: a table of items or the empty state.  Pure — no DOM access.
+   *  @param {{items: Array}|null} data
+   *  @returns {string} HTML */
+  function renderUnresolvedRelationships(data) {
+    var items = (data && data.items) || [];
+    if (items.length === 0) {
+      return '<p class="empty-state">No unresolved relationships</p>';
     }
+    var html = '<div class="table-scroll"><table>' +
+      '<thead><tr>' +
+        '<th>Entity</th>' +
+        '<th>Type</th>' +
+        '<th>State / Provenance</th>' +
+      '</tr></thead>' +
+      '<tbody>';
+    items.forEach(function (item) {
+      html += renderUnresolvedRelationshipsRow(item);
+    });
+    html += '</tbody></table></div>';
     return html;
   }
 
@@ -2854,6 +2898,62 @@
     });
   }
 
+  /** Render the unresolved-relationships panel: one row per uncertain
+   *  correlation (ambiguous, unmatched, parked) from the AFK runs data.
+   *  Follows the established panel conventions: freshness guard, empty/error
+   *  states, escHtml on every interpolated value. */
+  function renderUnresolvedRelationshipsPanel(data) {
+    applyPanelFreshness('unresolved-relationships');
+    if (!shouldRenderPanel(panelStates, 'unresolved-relationships')) return;
+
+    if (!els.unresolvedTbody) return;
+
+    // Build the list of unresolved items from all AFK runs
+    var allItems = [];
+    var runs = data && data.items;
+    if (runs && runs.length) {
+      runs.forEach(function (r) {
+        var runItems = r.unresolved || [];
+        runItems.forEach(function (u) {
+          allItems.push({
+            entity_id: u.entity_id || '--',
+            entity_type: u.entity_type || '',
+            state: u.reason || u.state || 'unresolved',
+            confidence: u.correlation_confidence,
+            method: u.correlation_method,
+            evidence: u.evidence || [],
+            resolver_version: u.resolver_version
+          });
+        });
+        var parkedItems = r.parked || [];
+        parkedItems.forEach(function (p) {
+          allItems.push({
+            entity_id: p.entity_id || '--',
+            entity_type: p.entity_type || '',
+            state: 'parked',
+            confidence: p.correlation_confidence,
+            method: p.correlation_method,
+            evidence: p.evidence || [],
+            resolver_version: p.resolver_version
+          });
+        });
+      });
+    }
+
+    unresolvedRelationshipsData = { items: allItems };
+
+    if (allItems.length === 0) {
+      els.unresolvedTbody.innerHTML = '<tr><td colspan="3" class="empty-state">No unresolved relationships</td></tr>';
+      return;
+    }
+
+    var html = '';
+    allItems.forEach(function (item) {
+      html += renderUnresolvedRelationshipsRow(item);
+    });
+    els.unresolvedTbody.innerHTML = html;
+  }
+
   /** Open the AFK outcome chain overlay for one run.  A 404 (unknown run)
    *  renders a distinct "not found" empty state; other failures render the
    *  generic error empty state — no unhandled exception breaks the dashboard. */
@@ -3394,8 +3494,7 @@
       }
       renderClientProjectBreakdown(data);
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
-      renderRepositorySummaryTable(data.afkRuns); // Repository summary (issue #572)
-      renderChangeRequestList(data.afkRuns); // Change-request list (issue #573)
+      renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -4284,11 +4383,12 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
-  // Nested session tree (issue #575): build a root→children tree from flat
-  // session links using parent_session_id, and render nested rows with
-  // tree indentation.  Pure string builders exercised through the vm-sandbox.
-  window.buildSessionTree = buildSessionTree;
-  window.renderNestedSessionNode = renderNestedSessionNode;
+  // Issue #576: relationship state presentation + unresolved-relationships view
+  window.fmtRelationshipState = fmtRelationshipState;
+  window.renderRelationshipBadge = renderRelationshipBadge;
+  window.buildUnresolvedRelationships = buildUnresolvedRelationships;
+  window.renderUnresolvedRelationshipsRow = renderUnresolvedRelationshipsRow;
+  window.renderUnresolvedRelationships = renderUnresolvedRelationships;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.
