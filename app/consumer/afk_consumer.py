@@ -1,11 +1,11 @@
 """Live AFK outcome consumer (issue #451).
 
 Consumes the existing, config-driven provider-events topic in its OWN
-Kafka consumer group (``opencode-outcomes`` — never the usage consumer's
-``opencode-gateway`` group), mapping each message type to a canonical
-engineering event/entity and writing it to Postgres in a single database
-transaction (``delivery_log`` + ``engineering_events`` through the #448
-``AsyncpgOutcomeRepository``).  The Kafka offset is committed only after
+Kafka consumer group (``opencode-normalized-events`` — never the usage
+consumer's ``opencode-gateway`` group), mapping each message type to a
+canonical engineering event/entity and writing it to Postgres in a single
+database transaction (``delivery_log`` + ``engineering_events`` through the
+#448 ``AsyncpgOutcomeRepository``).  The Kafka offset is committed only after
 that transaction succeeds; a crash after the DB commit but before the
 offset commit re-delivers the message, which the dedup layers
 (``delivery_log`` UNIQUE(provider, delivery_id) + ``engineering_events``
@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TOPIC = "engineering.events.normalized"
 _DEFAULT_DLQ_TOPIC = "engineering.events.normalized.dlq"
-_DEFAULT_CONSUMER_GROUP_ID = "opencode-outcomes"
+_DEFAULT_CONSUMER_GROUP_ID = "opencode-normalized-events"
 
 _DEFAULT_RECONCILE_CADENCE_SECONDS = 3600.0
 _DEFAULT_RECONCILE_WINDOW_SECONDS = 86400.0
@@ -168,7 +168,7 @@ _ACTION_TO_CANONICAL: dict[str, str] = {
 #: (``docs/contracts/normalized-event-v1/producer_commit.txt`` +
 #: ``docs/contracts/normalized-event-v1/consumer-policy.yaml``).
 _PRODUCER_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
-    "issue": frozenset({"opened", "edited", "reopened", "closed"}),
+    "issue": frozenset({"opened", "edited", "updated", "reopened", "closed"}),
     "pull_request": frozenset({"opened", "edited", "reopened", "closed", "merged"}),
     "merge_request": frozenset({"opened", "updated", "reopened", "closed", "merged"}),
 }
@@ -625,7 +625,7 @@ class AFKOutcomeConsumer:
             adapter=adapter,
             topic=settings.normalized_events_topic,
             dlq_topic=settings.normalized_events_dlq_topic,
-            consumer_group_id=settings.afk_outcomes_consumer_group_id,
+            consumer_group_id=settings.normalized_events_consumer_group_id,
             reconcile_cadence_seconds=settings.afk_outcomes_reconcile_cadence_seconds,
             reconcile_window_seconds=settings.afk_outcomes_reconcile_window_seconds,
             max_retries=settings.afk_outcomes_max_retries,

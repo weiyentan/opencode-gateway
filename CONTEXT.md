@@ -698,7 +698,7 @@ _Avoid_: Blocked link, pending match
 A companion Kafka consumer (``app/consumer/afk_consumer.py``) that reads the
 external provider-events topic — ``engineering.events.normalized`` after the
 topic split (ADR 0023), previously ``afk.events`` — in its OWN consumer group
-(``opencode-outcomes`` — never the usage consumer's ``opencode-gateway``
+(``opencode-normalized-events`` — never the usage consumer's ``opencode-gateway``
 group), maps message types to canonical Engineering Events, writes each
 message in a single DB transaction (offset committed only after success), DLQs
 poison messages, and runs scheduled bounded-window reconciliation reusing the
@@ -1361,7 +1361,7 @@ manages.
 - A **change_request** anchors an **AFK Run**; its body's resolved/mentioned issue references become **resolved_issue_ids** / referenced links in the **EngineeringOutcome**
 - A **change_request**'s branch commits and reviews surface as **lineage links** on the **AFK Run** (`correlation_source = "owning_change_request"`, `owning_change_request_id` = the owning change request's external id), inheriting the owning change request's correlation confidence
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
-- An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-outcomes`, never the usage consumer's `opencode-gateway` group)
+- An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-normalized-events`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
 - A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0020)
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only

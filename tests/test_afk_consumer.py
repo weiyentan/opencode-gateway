@@ -269,7 +269,7 @@ def _make_consumer(
     *,
     pool: _FakePool,
     order: list[str] | None = None,
-    consumer_group_id: str = "opencode-outcomes",
+    consumer_group_id: str = "opencode-normalized-events",
     reconcile_window_seconds: float = 3600.0,
     max_retries: int = 3,
     initial_backoff: float = 1.0,
@@ -862,21 +862,21 @@ async def test_mark_committable_clears_block_on_redelivery() -> None:
 def test_default_consumer_group_is_separate_from_usage_consumer() -> None:
     from app.consumer.afk_consumer import _DEFAULT_CONSUMER_GROUP_ID
 
-    assert _DEFAULT_CONSUMER_GROUP_ID == "opencode-outcomes"
+    assert _DEFAULT_CONSUMER_GROUP_ID == "opencode-normalized-events"
     assert _DEFAULT_CONSUMER_GROUP_ID != "opencode-gateway"
 
 
 @pytest.mark.asyncio
 async def test_constructed_consumer_uses_separate_group() -> None:
     consumer = _make_consumer(pool=_FakePool(_FakeConn([])))
-    assert consumer._consumer_group_id == "opencode-outcomes"
+    assert consumer._consumer_group_id == "opencode-normalized-events"
     assert consumer._consumer_group_id != "opencode-gateway"
 
 
 @pytest.mark.asyncio
 async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
     consumer = _make_consumer(
-        pool=_FakePool(_FakeConn([])), consumer_group_id="opencode-outcomes"
+        pool=_FakePool(_FakeConn([])), consumer_group_id="opencode-normalized-events"
     )
     with (
         patch(
@@ -890,7 +890,7 @@ async def test_start_uses_separate_group_no_autocommit_earliest_reset() -> None:
         mock_kafka_producer.return_value.start = AsyncMock()
         await consumer.start()
 
-    assert mock_kafka_consumer.call_args.kwargs["group_id"] == "opencode-outcomes"
+    assert mock_kafka_consumer.call_args.kwargs["group_id"] == "opencode-normalized-events"
     assert mock_kafka_consumer.call_args.kwargs["enable_auto_commit"] is False
     assert mock_kafka_consumer.call_args.kwargs["auto_offset_reset"] == "earliest"
     assert mock_kafka_consumer.call_args.args[0] == "engineering.events.normalized"
@@ -1122,7 +1122,7 @@ async def test_from_env_reads_afk_settings() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
@@ -1140,7 +1140,7 @@ async def test_from_env_reads_afk_settings() -> None:
 
     assert consumer._topic == "engineering.events.normalized"
     assert consumer._dlq_topic == "engineering.events.normalized.dlq"
-    assert consumer._consumer_group_id == "opencode-outcomes"
+    assert consumer._consumer_group_id == "opencode-normalized-events"
     assert consumer._repository == "owner/repo"
     assert consumer._reconcile_cadence_seconds == 600.0
     assert consumer._reconcile_window_seconds == 3600.0
@@ -1159,7 +1159,7 @@ async def test_from_env_fails_fast_when_repository_empty() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS": "600",
         "GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS": "3600",
@@ -1452,6 +1452,7 @@ def _normalized_payload(**overrides: object) -> dict:
     [
         ("issue", "opened", EntityType.ISSUE, "issue.opened"),
         ("issue", "edited", EntityType.ISSUE, "issue.updated"),
+        ("issue", "updated", EntityType.ISSUE, "issue.updated"),
         ("issue", "reopened", EntityType.ISSUE, "issue.reopened"),
         ("issue", "closed", EntityType.ISSUE, "issue.closed"),
         ("pull_request", "opened", EntityType.CHANGE_REQUEST, "change_request.opened"),
@@ -1587,6 +1588,7 @@ async def test_unsupported_normalized_action_routes_to_dlq() -> None:
         ("issue", "edited", EntityType.ISSUE, "updated"),
         # updated → updated convergence (GitLab real action)
         ("merge_request", "updated", EntityType.CHANGE_REQUEST, "updated"),
+        ("issue", "updated", EntityType.ISSUE, "updated"),
         # reopened → reopened (direct)
         ("pull_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
         ("merge_request", "reopened", EntityType.CHANGE_REQUEST, "reopened"),
@@ -1811,6 +1813,137 @@ async def test_issue_edited_action_persists_not_routed_to_dlq() -> None:
     assert event_call.args[3] == "issue"  # entity_type
     assert event_call.args[4] == "442"  # external_id
     assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GitLab issue.updated acceptance (issue #554)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# GitLab emits ``issue.updated`` (not ``issue.edited``).  The consumer
+# must accept it, map it to canonical ``issue.updated``, persist it, and
+# never route it to the DLQ.  GitHub ``issue.edited`` continues to work.
+
+
+def test_validate_accepts_gitlab_issue_updated() -> None:
+    """A GitLab issue event with action=updated passes validate_normalized_event."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    # Must not raise — this is the core acceptance criterion.
+    validate_normalized_event(message)
+
+
+def test_map_normalized_event_issue_updated_to_canonical() -> None:
+    """GitLab ``issue.updated`` maps to entity_type=issue, event_type=issue.updated."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    mapped = map_normalized_event(message)
+
+    assert mapped is not None
+    entity, event = mapped
+    assert entity.entity_type is EntityType.ISSUE
+    assert entity.entity_id == "issue:442"
+    assert event.event_type == "issue.updated"
+
+
+def test_map_normalized_event_issue_updated_retains_source_action() -> None:
+    """Source action ``updated`` is retained as provenance on the event payload."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    mapped = map_normalized_event(message)
+    assert mapped is not None
+    _entity, event = mapped
+
+    assert event.payload["source_action"] == "updated"
+    assert event.payload["source_resource_type"] == "issue"
+
+
+@pytest.mark.asyncio
+async def test_issue_updated_persists_not_routed_to_dlq() -> None:
+    """A normalized ``issue.updated`` persists as canonical ``issue.updated``
+    — never routed to the DLQ (issue #554 live bug fix)."""
+    conn = _FakeConn([], execute=AsyncMock(return_value="OK"))
+    consumer = _make_consumer(pool=_FakePool(conn))
+    consumer._consumer = AsyncMock()
+    consumer._consumer.commit = AsyncMock()
+    consumer._producer = AsyncMock()
+
+    await consumer._process_message(
+        _mk_msg(
+            _normalized_payload(
+                resource_type="issue",
+                action="updated",
+                provider="gitlab",
+            )
+        )
+    )
+
+    consumer._producer.send_and_wait.assert_not_called()
+    consumer._consumer.commit.assert_called_once()
+
+    event_call = next(
+        c for c in conn.execute.call_args_list if "INSERT INTO engineering_events" in c.args[0]
+    )
+    assert event_call.args[3] == "issue"  # entity_type
+    assert event_call.args[4] == "442"  # external_id
+    assert event_call.args[5] == "issue.updated"  # canonical event_type
+
+
+def test_issue_edited_and_issue_updated_map_to_same_canonical() -> None:
+    """GitHub ``issue.edited`` and GitLab ``issue.updated`` converge on the
+    same canonical ``issue.updated`` event type (parity)."""
+    edited_msg = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="edited",
+            provider="github",
+        )
+    )
+    updated_msg = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="updated",
+            provider="gitlab",
+        )
+    )
+    edited_mapped = map_normalized_event(edited_msg)
+    updated_mapped = map_normalized_event(updated_msg)
+
+    assert edited_mapped is not None
+    assert updated_mapped is not None
+    _, edited_event = edited_mapped
+    _, updated_event = updated_mapped
+    assert edited_event.event_type == updated_event.event_type == "issue.updated"
+    # Source actions differ — provenance preserved.
+    assert edited_event.payload["source_action"] == "edited"
+    assert updated_event.payload["source_action"] == "updated"
+
+
+def test_issue_unsupported_action_still_routes_to_dlq() -> None:
+    """Unsupported actions for issue (e.g. ``assigned``) are still rejected
+    by validate_normalized_event."""
+    message = NormalizedProviderEvent.model_validate(
+        _normalized_payload(
+            resource_type="issue",
+            action="assigned",
+        )
+    )
+    with pytest.raises(NormalizedEventValidationError, match="Unsupported action"):
+        validate_normalized_event(message)
 
 
 @pytest.mark.asyncio
@@ -2068,7 +2201,7 @@ async def test_from_env_reads_afk_retry_settings() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_AFK_OUTCOMES_MAX_RETRIES": "7",
@@ -2289,7 +2422,7 @@ async def test_from_env_reads_dlq_max_age() -> None:
         "GATEWAY_KAFKA_BROKERS": "broker1:9092",
         "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
         "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
-        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
         "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
         "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
         "GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS": "14",
@@ -2305,6 +2438,62 @@ async def test_from_env_reads_dlq_max_age() -> None:
         consumer = await AFKOutcomeConsumer.from_env()
 
     assert consumer._dlq_max_age_days == 14
+
+
+@pytest.mark.asyncio
+async def test_from_env_normalized_consumer_group() -> None:
+    """GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID maps to consumer._consumer_group_id.
+
+    Issue #555: the normalized-events env var must be honored instead of the
+    legacy GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID.
+    """
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._consumer_group_id == "opencode-normalized-events"
+
+
+@pytest.mark.asyncio
+async def test_from_env_legacy_group_var_not_used() -> None:
+    """The legacy GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID does not override the
+    normalized group when GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID is set."""
+    env_vars = {
+        "GATEWAY_ENV": "development",
+        "GATEWAY_KAFKA_BROKERS": "broker1:9092",
+        "GATEWAY_NORMALIZED_EVENTS_TOPIC": "engineering.events.normalized",
+        "GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC": "engineering.events.normalized.dlq",
+        "GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID": "opencode-normalized-events",
+        "GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID": "opencode-outcomes",
+        "GATEWAY_AFK_OUTCOMES_PROVIDER": "github",
+        "GATEWAY_AFK_OUTCOMES_REPOSITORY": "owner/repo",
+    }
+    with (
+        patch.dict(os.environ, env_vars, clear=True),
+        patch("app.consumer.afk_consumer.asyncpg.create_pool", new_callable=AsyncMock),
+        patch(
+            "app.consumer.afk_consumer._build_adapter",
+            return_value=(_FakeAdapter(), None),
+        ),
+    ):
+        consumer = await AFKOutcomeConsumer.from_env()
+
+    assert consumer._consumer_group_id == "opencode-normalized-events"
 
 
 # ── DLQ sweep offset commits + lenient deserialization (PR #492 findings) ──
