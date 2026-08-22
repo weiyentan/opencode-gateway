@@ -113,7 +113,7 @@ class ProviderApiError(Exception):
         self.url = url
         self.status = status
         self.detail = detail
-        super().__init__(f"{method} {url} -> {status}: {detail}")
+        super().__init__(f"{method} <redacted> -> {status}: {detail}")
 
 
 class StepFailure(Exception):
@@ -656,7 +656,7 @@ class GitLabClient:
         response = await self._request(
             "POST",
             "/projects",
-            json_body={"name": name, "namespace_id": self._group, "visibility": "private"},
+            json_body={"name": name, "namespace_path": self._group, "visibility": "private"},
         )
         body = response.json()
         return {

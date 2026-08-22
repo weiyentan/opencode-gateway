@@ -700,14 +700,16 @@
   // access — so the Node test harness exercises them through the window
   // test seam.
 
-  /** Derive a repository label from an AFK run's title and metadata.
-   *  Falls back to provider name when no repository can be resolved.
-   *  Pure — no DOM or fetch access.
+  /** Derive a repository label from an AFK run's dedicated repository field,
+   *  or its title and metadata. Falls back to provider name when no
+   *  repository can be resolved. Pure — no DOM or fetch access.
    *  @param {Object} run - AFK run item from the API
    *  @returns {string} a normalized repository label */
   function deriveRepositoryLabel(run) {
     if (!run) return 'unknown';
-    // Use the title if it contains a repository-like path (e.g. "owner/repo")
+    // Prefer a dedicated repository field from the API response
+    if (run.repository) return run.repository;
+    // Fallback: parse repository from title (e.g. "owner/repo: Fix bug")
     var title = run.title || '';
     var match = title.match(/^([a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+)/);
     if (match) return match[1];
@@ -2712,7 +2714,7 @@
     } else {
       html += '<div class="prov-exec-list">';
       timeline.executions.forEach(function (ex, idx) {
-        html += renderProvenanceExecution(ex, idx);
+        html += renderProvenanceExecution(ex, idx, timeline.executions.length);
       });
       html += '</div>';
     }
@@ -2771,7 +2773,7 @@
   }
 
   /** Render one execution entry in the timeline.  Pure string builder. */
-  function renderProvenanceExecution(ex, idx) {
+  function renderProvenanceExecution(ex, idx, totalExecutions) {
     var phaseLabel = ex.phase === 'develop' ? 'Develop' : ex.phase === 'review' ? 'Review' : (ex.phase || 'unknown');
     var statusCls = statusBadgeClass(ex.status);
     var outcomeLabel = ex.outcome || '--';
@@ -2782,7 +2784,7 @@
     var html = '<div class="prov-exec-item">';
     html += '<div class="prov-exec-connector">';
     html += '<span class="prov-exec-dot prov-exec-dot-' + escHtml(ex.phase || 'unknown') + '"></span>';
-    if (idx < 100) html += '<span class="prov-exec-line"></span>'; // safety limit
+    if (idx < totalExecutions - 1) html += '<span class="prov-exec-line"></span>';
     html += '</div>';
     html += '<div class="prov-exec-content">';
     html += '<div class="prov-exec-head">';
