@@ -379,7 +379,7 @@ async def _fetch_run_detail(
                 total_cache_read_tokens=row["total_cache_read_tokens"] or 0,
                 total_cache_write_tokens=row["total_cache_write_tokens"] or 0,
                 total_estimated_cost_usd=row["total_estimated_cost_usd"],
-                parent_session_id=row["parent_session_id"],
+                parent_session_id=row.get("parent_session_id"),
             )
         )
         if row["agent"]:

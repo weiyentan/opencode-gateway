@@ -201,9 +201,16 @@ def test_provision_uses_on_conflict_with_partial_predicate(
 
 
 def test_provision_race_falls_back_to_winner_row(mock_conn: AsyncMock) -> None:
-    """A concurrent insert that loses the race returns the winner's afk_run_id."""
+    """A concurrent insert that loses the race returns the winner's afk_run_id.
+
+    The winner's full row is re-read; a matching payload classifies the lost
+    race as an idempotent replay (``is_conflict=False``).
+    """
     mock_conn.fetchrow = AsyncMock(
-        side_effect=[None, mock_row({"afk_run_id": "01HWINNER00000000000000001"})]
+        side_effect=[
+            None,
+            _existing_row(afk_run_id="01HWINNER00000000000000001"),
+        ]
     )
     mock_conn.fetch = AsyncMock(return_value=[])
 
@@ -211,6 +218,30 @@ def test_provision_race_falls_back_to_winner_row(mock_conn: AsyncMock) -> None:
     result = _run(repo.provision_afk_run(**_provision_payload()))
 
     assert result.is_created is False
+    assert result.is_conflict is False
+    assert result.afk_run_id == "01HWINNER00000000000000001"
+
+
+def test_provision_race_with_different_payload_is_conflict(
+    mock_conn: AsyncMock,
+) -> None:
+    """A lost race whose winner carries a different payload is a conflict."""
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=[
+            None,
+            _existing_row(
+                afk_run_id="01HWINNER00000000000000001",
+                repository="github.com/acme/other",
+            ),
+        ]
+    )
+    mock_conn.fetch = AsyncMock(return_value=[])
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.provision_afk_run(**_provision_payload()))
+
+    assert result.is_created is False
+    assert result.is_conflict is True
     assert result.afk_run_id == "01HWINNER00000000000000001"
 
 

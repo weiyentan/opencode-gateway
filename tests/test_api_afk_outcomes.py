@@ -74,6 +74,15 @@ def _mk_run_row(
             ),
             "first_seen_at": first_seen_at,
             "last_seen_at": last_seen_at,
+            # Lifecycle columns (migration 0039) — None for legacy rows.
+            "host": None,
+            "source_event_id": None,
+            "repository": None,
+            "trigger_type": None,
+            "change_request_provider": None,
+            "change_request_repository": None,
+            "change_request_external_id": None,
+            "recovered_from_afk_run_id": None,
         }
     )
 
@@ -142,6 +151,7 @@ def _mk_session_row(
             "afk_run_id": afk_run_id,
             "session_id": session_id,
             "external_session_id": external_session_id,
+            "parent_session_id": None,
             "started_at": started_at,
             "finished_at": finished_at,
             "agent": agent,

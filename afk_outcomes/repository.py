@@ -1959,6 +1959,28 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
     # ── provisional AFK run lifecycle (issue #589) ──────────────────────
 
+    @staticmethod
+    def provisioning_payload_matches(existing: dict, requested: dict) -> bool:
+        """Compare an existing provisioning row against a requested payload.
+
+        Returns ``True`` when all provisioning fields match, ``False`` when
+        any field differs (indicating a conflict rather than a replay).
+
+        The comparison covers the fields that define the provisioning contract:
+        ``repository``, ``trigger_type``, ``title``, and
+        ``recovered_from_afk_run_id``.  The idempotency key fields
+        (``provider``, ``host``, ``source_event_id``) are assumed to already
+        match — the caller is responsible for selecting the existing row by
+        those fields.
+        """
+        return (
+            existing.get("repository") == requested.get("repository")
+            and existing.get("trigger_type") == requested.get("trigger_type")
+            and existing.get("title") == requested.get("title")
+            and existing.get("recovered_from_afk_run_id")
+            == requested.get("recovered_from_afk_run_id")
+        )
+
     async def provision_afk_run(
         self,
         *,
@@ -2012,12 +2034,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             )
 
             if existing is not None:
-                is_match = (
-                    existing["repository"] == repository
-                    and existing["trigger_type"] == trigger_type.value
-                    and existing["title"] == title
-                    and existing["recovered_from_afk_run_id"]
-                    == recovered_from_afk_run_id
+                is_match = self.provisioning_payload_matches(
+                    existing,
+                    {
+                        "repository": repository,
+                        "trigger_type": trigger_type.value,
+                        "title": title,
+                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
+                    },
                 )
                 return ProvisionAFKRunResult(
                     afk_run_id=existing["afk_run_id"],
@@ -2065,18 +2089,35 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     is_created=True,
                 )
 
-            # Lost a concurrent race — the winner's row is authoritative.
+            # Lost a concurrent race — re-read the full winner row and compare
+            # payloads to distinguish replay from conflict.
             winner = await self._conn.fetchrow(
                 """
-                SELECT afk_run_id FROM afk_runs
+                SELECT afk_run_id, repository, trigger_type, title,
+                       recovered_from_afk_run_id
+                FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
                 provider.value,
                 host,
                 source_event_id,
             )
+            if winner is not None:
+                is_match = self.provisioning_payload_matches(
+                    winner,
+                    {
+                        "repository": repository,
+                        "trigger_type": trigger_type.value,
+                        "title": title,
+                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
+                    },
+                )
+                return ProvisionAFKRunResult(
+                    afk_run_id=winner["afk_run_id"],
+                    is_conflict=not is_match,
+                )
             return ProvisionAFKRunResult(
-                afk_run_id=winner["afk_run_id"] if winner else new_ulid,
+                afk_run_id=new_ulid,
             )
 
     async def bind_change_request(
@@ -2109,56 +2150,56 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         provider_value = provider.value
 
-        async with self._conn.transaction():
-            run = await self._conn.fetchrow(
-                """
-                SELECT afk_run_id, change_request_provider,
-                       change_request_repository, change_request_external_id
-                FROM afk_runs
-                WHERE afk_run_id = $1
-                """,
-                afk_run_id,
-            )
-            if run is None:
-                return ChangeRequestBindingResult(
-                    afk_run_id=afk_run_id,
-                    run_missing=True,
+        try:
+            async with self._conn.transaction():
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT afk_run_id, change_request_provider,
+                           change_request_repository, change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
                 )
+                if run is None:
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        run_missing=True,
+                    )
 
-            existing_tuple = (
-                run["change_request_provider"],
-                run["change_request_repository"],
-                run["change_request_external_id"],
-            )
-            if existing_tuple[0] is not None:
-                is_match = existing_tuple == (provider_value, repository, external_id)
-                return ChangeRequestBindingResult(
-                    afk_run_id=afk_run_id,
-                    is_conflict=not is_match,
+                existing_tuple = (
+                    run["change_request_provider"],
+                    run["change_request_repository"],
+                    run["change_request_external_id"],
                 )
+                if existing_tuple[0] is not None:
+                    is_match = existing_tuple == (provider_value, repository, external_id)
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_conflict=not is_match,
+                    )
 
-            # 1:1 invariant — the change request must not already belong to
-            # another lifecycle.  The partial unique index also enforces this
-            # under concurrency; this pre-check turns the common case into a
-            # clean conflict instead of a constraint violation.
-            other = await self._conn.fetchrow(
-                """
-                SELECT afk_run_id FROM afk_runs
-                WHERE change_request_provider = $1
-                  AND change_request_repository = $2
-                  AND change_request_external_id = $3
-                """,
-                provider_value,
-                repository,
-                external_id,
-            )
-            if other is not None:
-                return ChangeRequestBindingResult(
-                    afk_run_id=afk_run_id,
-                    is_conflict=True,
+                # 1:1 invariant — the change request must not already belong to
+                # another lifecycle.  The partial unique index also enforces this
+                # under concurrency; this pre-check turns the common case into a
+                # clean conflict instead of a constraint violation.
+                other = await self._conn.fetchrow(
+                    """
+                    SELECT afk_run_id FROM afk_runs
+                    WHERE change_request_provider = $1
+                      AND change_request_repository = $2
+                      AND change_request_external_id = $3
+                    """,
+                    provider_value,
+                    repository,
+                    external_id,
                 )
+                if other is not None:
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_conflict=True,
+                    )
 
-            try:
                 result = await self._conn.execute(
                     """
                     UPDATE afk_runs
@@ -2174,40 +2215,44 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     repository,
                     external_id,
                 )
-            except asyncpg.UniqueViolationError:
-                # Concurrent bind of the same change request to another
-                # lifecycle won the race — the 1:1 invariant holds; surface
-                # a conflict instead of a 500.
+
+                if result == "UPDATE 1":
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_bound=True,
+                    )
+
+                # Lost a race against a concurrent bind of this same lifecycle —
+                # re-read and classify as replay or conflict.
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT change_request_provider, change_request_repository,
+                           change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+                is_match = run is not None and (
+                    run["change_request_provider"],
+                    run["change_request_repository"],
+                    run["change_request_external_id"],
+                ) == (provider_value, repository, external_id)
                 return ChangeRequestBindingResult(
                     afk_run_id=afk_run_id,
-                    is_conflict=True,
+                    is_conflict=not is_match,
                 )
-
-            if result == "UPDATE 1":
-                return ChangeRequestBindingResult(
-                    afk_run_id=afk_run_id,
-                    is_bound=True,
-                )
-
-            # Lost a race against a concurrent bind of this same lifecycle —
-            # re-read and classify as replay or conflict.
-            run = await self._conn.fetchrow(
-                """
-                SELECT change_request_provider, change_request_repository,
-                       change_request_external_id
-                FROM afk_runs
-                WHERE afk_run_id = $1
-                """,
-                afk_run_id,
-            )
-            is_match = run is not None and (
-                run["change_request_provider"],
-                run["change_request_repository"],
-                run["change_request_external_id"],
-            ) == (provider_value, repository, external_id)
+        except asyncpg.UniqueViolationError:
+            # Concurrent bind of the same change request to another lifecycle
+            # won the race — the 1:1 invariant holds.  The exception is caught
+            # OUTSIDE the ``async with self._conn.transaction()`` block so the
+            # context manager rolls the savepoint back first (a constraint
+            # violation leaves a savepoint failed until rollback, so catching
+            # inside would poison the caller's outer transaction), and the
+            # conflict is surfaced cleanly instead of as a 500.
             return ChangeRequestBindingResult(
                 afk_run_id=afk_run_id,
-                is_conflict=not is_match,
+                is_conflict=True,
             )
 
     async def get_afk_run_lifecycle(self, afk_run_id: str) -> AFKRunLifecycle | None:
@@ -2235,19 +2280,19 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             afk_run_id=row["afk_run_id"],
             provider=Provider(row["provider"]),
             status=row["status"],
-            host=row["host"],
-            source_event_id=row["source_event_id"],
-            repository=row["repository"],
-            trigger_type=row["trigger_type"],
-            title=row["title"],
+            host=row.get("host"),
+            source_event_id=row.get("source_event_id"),
+            repository=row.get("repository"),
+            trigger_type=row.get("trigger_type"),
+            title=row.get("title"),
             change_request_provider=(
-                Provider(row["change_request_provider"])
-                if row["change_request_provider"]
+                Provider(row.get("change_request_provider"))
+                if row.get("change_request_provider")
                 else None
             ),
-            change_request_repository=row["change_request_repository"],
-            change_request_external_id=row["change_request_external_id"],
-            recovered_from_afk_run_id=row["recovered_from_afk_run_id"],
-            first_seen_at=row["first_seen_at"],
-            last_seen_at=row["last_seen_at"],
+            change_request_repository=row.get("change_request_repository"),
+            change_request_external_id=row.get("change_request_external_id"),
+            recovered_from_afk_run_id=row.get("recovered_from_afk_run_id"),
+            first_seen_at=row.get("first_seen_at"),
+            last_seen_at=row.get("last_seen_at"),
         )
