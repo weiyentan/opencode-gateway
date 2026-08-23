@@ -44,6 +44,7 @@ from afk_outcomes.models import (
     ProviderResourceIdentity,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
+from afk_outcomes.serialization import MonotonicULID
 from app.core.auth import require_collector_token
 from app.core.config import get_settings
 from app.core.repository import normalize_repository_url
@@ -174,6 +175,7 @@ def _binding_conflicts_with(
         or existing.failure_reason != body.failure_reason
         or existing.started_at != body.started_at
         or existing.finished_at != body.finished_at
+        or existing.trigger_type != body.trigger_type.value
     )
 
 
@@ -260,28 +262,35 @@ async def create_execution_binding(
         repo = AsyncpgOutcomeRepository(conn)
         awx_job_id_str = _validate_awx_job_id(body.awx_job.job_id)
 
-        domain_binding = ExecutionBinding(
-            binding_id="",
-            awx_job=body.awx_job,
-            external_session_id=body.external_session_id,
-            resource=body.resource.to_provider_resource_identity(),
-            outcome=body.outcome,
-            source_event_id=body.source_event_id,
-            branch=body.branch,
-            title=body.title,
-            started_at=body.started_at,
-            finished_at=body.finished_at,
-            failure_reason=body.failure_reason,
-        )
+        # Parse trigger_type from the request body for persistence.
+        trigger_type_value: str | None = body.trigger_type.value
 
-        # Atomic insert — the INSERT is the linearisation point.
+        # Transactional creation — inserts afk_runs + execution_bindings
+        # atomically.  Returns is_created (201), is_conflict (409), or
+        # idempotent replay (200).
         async with timed_operation("db.insert.execution_binding", "db"):
             async with _db_timeout(
                 "db.insert.execution_binding", settings.database_timeout_seconds
             ):
-                inserted_id = await repo.save_execution_binding(domain_binding)
+                result = await repo.create_or_replay_afk_execution_binding(
+                    awx_job_id=awx_job_id_str,
+                    job_template_id=body.awx_job.job_template_id,
+                    provider=body.resource.provider,
+                    repository=normalized_repo,
+                    resource_number=body.resource.resource_number,
+                    external_session_id=body.external_session_id,
+                    outcome=body.outcome,
+                    source_event_id=body.source_event_id,
+                    branch=body.branch,
+                    title=body.title,
+                    failure_reason=body.failure_reason,
+                    started_at=body.started_at,
+                    finished_at=body.finished_at,
+                    trigger_type=trigger_type_value,
+                    ulid_source=MonotonicULID(),
+                )
 
-        if inserted_id is not None:
+        if result.is_created:
             # New binding was inserted.
             saved = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
             if saved is None:
@@ -293,13 +302,24 @@ async def create_execution_binding(
             response.status_code = status.HTTP_201_CREATED
             return _binding_to_read_response(saved)
 
-        # Conflict — another request inserted first. Fetch and compare.
+        if result.is_conflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflicting data for existing AWX job binding",
+            )
+
+        # Idempotent replay — the repository compared a subset of fields
+        # (outcome, title, branch, failure_reason, source_event_id,
+        # external_session_id).  Additional fields (resource identity,
+        # trigger_type, job_template_id) may still differ; check with the
+        # full comparison helper to catch those as 409 conflicts.
         existing = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
         if existing is None:
-            # Should not happen — the INSERT conflicted, so a row must exist.
+            # Should not happen — the operation returned a result, so a row
+            # must exist.
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Execution binding disappeared after insert conflict",
+                detail="Execution binding disappeared after idempotent replay",
             )
 
         if _binding_conflicts_with(existing, body):
@@ -308,7 +328,6 @@ async def create_execution_binding(
                 detail="Conflicting data for existing AWX job binding",
             )
 
-        # Idempotent replay: same data → 200 with existing binding.
         response.status_code = status.HTTP_200_OK
         return _binding_to_read_response(existing)
 
