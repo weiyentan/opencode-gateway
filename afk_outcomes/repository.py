@@ -144,7 +144,11 @@ def _parse_awx_job_id(awx_job_id: str) -> int:
 
 
 def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
-    """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`."""
+    """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`.
+
+    Columns added in later migrations (``afk_run_id``, ``trigger_type``) are
+    read with ``.get()`` so legacy rows missing them default to ``None``.
+    """
     return ExecutionBinding(
         binding_id=str(row["id"]),
         awx_job={
@@ -165,6 +169,8 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
         failure_reason=row["failure_reason"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        afk_run_id=row.get("afk_run_id"),
+        trigger_type=row.get("trigger_type"),
     )
 
 
@@ -1693,7 +1699,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
                    source_event_id, branch, title, failure_reason, started_at,
-                   finished_at
+                   finished_at, afk_run_id, trigger_type
             FROM execution_bindings
             WHERE awx_job_id = $1
             """,
@@ -1723,7 +1729,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
                    source_event_id, branch, title, failure_reason, started_at,
-                   finished_at
+                   finished_at, afk_run_id, trigger_type
             FROM execution_bindings
             WHERE provider = $1
               AND repository_url = $2

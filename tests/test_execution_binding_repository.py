@@ -210,6 +210,8 @@ def test_get_execution_binding_null_session_reads_none(mock_conn: AsyncMock) -> 
                 "entity_number": "42",
                 "outcome": "completed",
                 "source_event_id": None,
+                "afk_run_id": None,
+                "trigger_type": None,
                 "branch": None,
                 "title": None,
                 "failure_reason": None,
@@ -253,6 +255,8 @@ def test_get_execution_binding_returns_binding(mock_conn: AsyncMock) -> None:
                 "entity_number": "442",
                 "outcome": "completed",
                 "source_event_id": None,
+                "afk_run_id": None,
+                "trigger_type": None,
                 "branch": "main",
                 "title": "Fix caching bug",
                 "failure_reason": None,
@@ -293,6 +297,83 @@ def test_get_execution_binding_queries_by_awx_job_id(mock_conn: AsyncMock) -> No
     assert "WHERE awx_job_id = $1" in sql
     args = mock_conn.fetchrow.call_args[0][1:]
     assert args[0] == 777
+
+
+def test_get_execution_binding_select_includes_afk_run_id_and_trigger_type(
+    mock_conn: AsyncMock,
+) -> None:
+    """The SELECT includes afk_run_id and trigger_type columns."""
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    asyncio.run(repo.get_execution_binding_by_awx_job_id("100"))
+
+    sql = mock_conn.fetchrow.call_args[0][0]
+    assert "afk_run_id" in sql
+    assert "trigger_type" in sql
+
+
+def test_get_execution_binding_maps_afk_run_id_and_trigger_type(
+    mock_conn: AsyncMock,
+) -> None:
+    """The converter maps afk_run_id and trigger_type from the row."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "awx_job_id": 800,
+                "job_template_id": 42,
+                "external_session_id": "ses_xyz",
+                "provider": "github",
+                "repository_url": "org/repo",
+                "entity_type": "change_request",
+                "entity_number": "42",
+                "outcome": "completed",
+                "source_event_id": None,
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWX",
+                "trigger_type": "backfill",
+                "branch": "main",
+                "title": "Test",
+                "failure_reason": None,
+                "started_at": None,
+                "finished_at": None,
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    binding = asyncio.run(repo.get_execution_binding_by_awx_job_id("800"))
+    assert binding is not None
+    assert binding.afk_run_id == "01JZABCDEFGHJKLMNPQRSTVWX"
+    assert binding.trigger_type == "backfill"
+
+
+def test_list_execution_bindings_select_includes_afk_run_id_and_trigger_type(
+    mock_conn: AsyncMock,
+) -> None:
+    """The list SELECT includes afk_run_id and trigger_type columns."""
+    mock_conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    asyncio.run(
+        repo.list_execution_bindings_for_resource(
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_type=EntityType.CHANGE_REQUEST,
+            resource_number="42",
+        )
+    )
+
+    sql = mock_conn.fetch.call_args[0][0]
+    assert "afk_run_id" in sql
+    assert "trigger_type" in sql
 
 
 # ── List by provider resource ────────────────────────────────────────────────
@@ -346,6 +427,8 @@ def test_list_execution_bindings_returns_all_bindings(
                     "entity_number": "42",
                     "outcome": "failed",
                     "source_event_id": None,
+                    "afk_run_id": None,
+                    "trigger_type": None,
                     "branch": "main",
                     "title": "First attempt",
                     "failure_reason": "timeout",
@@ -365,6 +448,8 @@ def test_list_execution_bindings_returns_all_bindings(
                     "entity_number": "42",
                     "outcome": "completed",
                     "source_event_id": None,
+                    "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWX",
+                    "trigger_type": "eda",
                     "branch": "main",
                     "title": "Retry",
                     "failure_reason": None,
@@ -436,6 +521,8 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
                     "entity_number": "442",
                     "outcome": "failed",
                     "source_event_id": None,
+                    "afk_run_id": None,
+                    "trigger_type": None,
                     "branch": None,
                     "title": "First attempt",
                     "failure_reason": "timeout",
@@ -455,6 +542,8 @@ def test_failed_then_successful_retry_both_persisted(mock_conn: AsyncMock) -> No
                     "entity_number": "442",
                     "outcome": "completed",
                     "source_event_id": None,
+                    "afk_run_id": None,
+                    "trigger_type": None,
                     "branch": None,
                     "title": "Retry",
                     "failure_reason": None,

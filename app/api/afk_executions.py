@@ -177,18 +177,15 @@ def _binding_conflicts_with(
     )
 
 
-def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
+def _binding_to_read_response(binding: ExecutionBinding) -> ExecutionBindingReadResponse:
     """Convert a domain :class:`ExecutionBinding` to the API read response.
 
     The ``binding_id`` is the UUID primary key from the ``execution_bindings``
     table, used as the gateway-assigned identifier.  ``external_session_id``
     passes through as ``None`` for unresolved bindings (the read schema and
-    domain model both accept ``None``).
+    domain model both accept ``None``).  ``afk_run_id`` and ``trigger_type``
+    pass through as ``None`` for legacy rows without the columns.
     """
-    # Import here to avoid circular imports at module level.
-    from afk_outcomes.models import ExecutionBinding as ExecutionBindingModel
-
-    assert isinstance(binding, ExecutionBindingModel)
     resource = binding.resource
     return ExecutionBindingReadResponse(
         binding_id=binding.binding_id,
@@ -202,6 +199,8 @@ def _binding_to_read_response(binding: object) -> ExecutionBindingReadResponse:
         ),
         outcome=binding.outcome,
         source_event_id=binding.source_event_id,
+        afk_run_id=binding.afk_run_id,
+        trigger_type=binding.trigger_type,
         branch=binding.branch,
         title=binding.title,
         started_at=binding.started_at,
