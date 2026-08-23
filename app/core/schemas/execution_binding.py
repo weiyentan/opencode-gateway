@@ -229,20 +229,6 @@ class ExecutionBindingReadResponse(BaseModel):
     source_event_id: str | None = Field(
         default=None, description="Originating EDA source event id"
     )
-    afk_run_id: str | None = Field(
-        default=None,
-        description=(
-            "ULID of the associated AFK run (26 chars); None for "
-            "legacy rows without the column"
-        ),
-    )
-    trigger_type: str | None = Field(
-        default=None,
-        description=(
-            "Trigger type for the execution (eda, manual, scheduled, "
-            "backfill, recovery); None for legacy rows without the column"
-        ),
-    )
     branch: str | None = Field(default=None, description="Branch or ref")
     title: str | None = Field(default=None, description="Execution title")
     started_at: datetime | None = Field(default=None, description="Start timestamp")
