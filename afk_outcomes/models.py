@@ -775,3 +775,131 @@ class ExecutionBinding(BaseModel):
             "backfill, recovery); None for legacy rows without the column"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Provisional AFK run lifecycle domain model (issue #589)
+# ---------------------------------------------------------------------------
+
+# The status a provisional lifecycle starts in.  It is deliberately a plain
+# string rather than a :class:`RunStatus` member: ``RunStatus`` is the
+# reconstruction-era lifecycle vocabulary (running/completed/…), while a
+# provisioned run has not yet launched and is simply "pending" — the same
+# literal the execution-binding path (#584) already writes for its
+# provisional ``afk_runs`` rows.
+PROVISIONAL_RUN_STATUS = "pending"
+
+
+class AFKRunLifecycle(BaseModel):
+    """The Gateway-owned provisional lifecycle of one AFK run (issue #589).
+
+    The provisional lifecycle anchors an AFK run *before* its AWX launch:
+    source provenance (``provider`` + ``host`` + ``source_event_id``), a
+    provider-qualified repository identity, and trigger metadata are
+    recorded at provisioning time, while the AWX execution and the change
+    request are bound later (nullable columns).  A recovery lifecycle
+    references its predecessor via ``recovered_from_afk_run_id`` without
+    mutating the original row.
+
+    Readback is deliberately lenient: legacy ``afk_runs`` rows
+    (backfill/reconstruction, migration 0026) predate these columns, so
+    ``host``, ``source_event_id``, ``repository``, and ``trigger_type``
+    read back as ``None`` for them — mirroring the nullable readback of
+    the execution-binding columns.  The provisioning contract (all four
+    required) is enforced by the API write schema and the repository
+    provisioning method, never by this read model.
+    """
+
+    afk_run_id: str = Field(description="ULID primary key of the run")
+    provider: Provider
+    status: str = Field(
+        default=PROVISIONAL_RUN_STATUS,
+        description=(
+            "RunStatus value; a provisioned lifecycle starts as 'pending'"
+        ),
+    )
+    host: str | None = Field(
+        default=None,
+        description="Source host provenance (idempotency key part)",
+    )
+    source_event_id: str | None = Field(
+        default=None,
+        description="Originating source event id (idempotency key part)",
+    )
+    repository: str | None = Field(
+        default=None,
+        description="Provider-qualified repository identity (normalized)",
+    )
+    trigger_type: str | None = Field(
+        default=None,
+        description=(
+            "Trigger origin (eda, manual, scheduled, backfill, recovery); "
+            "None for legacy rows"
+        ),
+    )
+    title: str | None = None
+    change_request_provider: Provider | None = Field(
+        default=None,
+        description="Provider of the bound change request (None until bound)",
+    )
+    change_request_repository: str | None = Field(
+        default=None,
+        description="Repository of the bound change request (None until bound)",
+    )
+    change_request_external_id: str | None = Field(
+        default=None,
+        description="Provider-scoped change-request id (None until bound)",
+    )
+    recovered_from_afk_run_id: str | None = Field(
+        default=None,
+        description=(
+            "ULID of the predecessor lifecycle for a recovery lifecycle; "
+            "creating a recovery lifecycle never mutates the predecessor"
+        ),
+    )
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_change_request_all_or_none(self) -> AFKRunLifecycle:
+        """The three change-request columns must be all-set or all-None.
+
+        A lifecycle owns at most one change request, and a half-written
+        tuple is never a valid bound state — the DB 1:1 constraint only
+        applies when all three are NOT NULL, so a partial state would
+        silently fall outside it.
+        """
+        values = (
+            self.change_request_provider,
+            self.change_request_repository,
+            self.change_request_external_id,
+        )
+        if any(v is not None for v in values) and not all(
+            v is not None for v in values
+        ):
+            raise ValueError(
+                "change_request_provider, change_request_repository, and "
+                "change_request_external_id must be all set or all None"
+            )
+        return self
+
+    def change_request_identity(self) -> ProviderResourceIdentity | None:
+        """Return the bound change request as a stable identity, or ``None``.
+
+        The canonical identity always uses the ``change_request`` entity
+        type — GitHub pull requests and GitLab merge requests both
+        normalize there (ADR 0020).  Returns ``None`` while the lifecycle
+        is unbound.
+        """
+        if (
+            self.change_request_provider is None
+            or self.change_request_repository is None
+            or self.change_request_external_id is None
+        ):
+            return None
+        return ProviderResourceIdentity(
+            provider=self.change_request_provider,
+            repository=self.change_request_repository,
+            resource_type=EntityType.CHANGE_REQUEST,
+            resource_number=self.change_request_external_id,
+        )
