@@ -112,8 +112,9 @@ async def require_collector_token(
 ) -> dict[str, str]:
     """FastAPI dependency — validate a collector bearer token.
 
-    Reads ``Authorization: Bearer <token>``, hashes the token with
-    SHA-256, and looks it up in ``collector_credentials``.
+    Reads ``X-Collector-Token`` when present, falling back to
+    ``Authorization: Bearer <token>`` for existing collectors. The token is
+    hashed with SHA-256 and looked up in ``collector_credentials``.
 
     Returns a dict with ``client_id``, ``credential_id``, and
     ``client_name`` for use by downstream handlers (attached to
@@ -129,7 +130,12 @@ async def require_collector_token(
         lifecycle.  The UPDATE is lightweight and adds minimal latency.
         If the update fails it is logged but never surfaced to the caller.
     """
-    auth_header = request.headers.get("Authorization", "")
+    collector_header = request.headers.get("X-Collector-Token")
+    auth_header = (
+        f"Bearer {collector_header}"
+        if collector_header is not None
+        else request.headers.get("Authorization", "")
+    )
 
     if not auth_header.startswith("Bearer "):
         raise HTTPException(
