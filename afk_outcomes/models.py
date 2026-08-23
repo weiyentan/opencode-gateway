@@ -746,3 +746,16 @@ class ExecutionBinding(BaseModel):
         default=None,
         description="Originating EDA source event id (for traceability)",
     )
+    afk_run_id: str | None = Field(
+        default=None,
+        description=(
+            "AFK run ULID this binding produced; None when the binding "
+            "has no associated AFK run (populated by a later slice)"
+        ),
+    )
+    trigger_type: str | None = Field(
+        default=None,
+        description=(
+            "Trigger origin for this binding (populated by a later slice)"
+        ),
+    )
