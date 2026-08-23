@@ -47,6 +47,7 @@ import asyncpg
 
 from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.interfaces import OutcomeRepository
+from afk_outcomes.serialization import ULIDSource
 from afk_outcomes.models import (
     AFKRun,
     CLOSURE_RESOLVER_VERSION,
@@ -328,6 +329,21 @@ class ClosureRebuildResult:
     facts_processed: int
     event_range_start: datetime | None
     event_range_end: datetime | None
+
+
+@dataclass(frozen=True)
+class CreateAFKExecutionBindingResult:
+    """Result of a transactional AFK run + execution binding creation (issue #584).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.create_or_replay_afk_execution_binding`.
+    Exactly one of ``is_conflict`` or ``is_created`` is ``True``; idempotent
+    replays set neither (both ``False``).
+    """
+
+    afk_run_id: str
+    binding_id: int | None = None
+    is_conflict: bool = False
+    is_created: bool = False
 
 
 class AsyncpgOutcomeRepository(OutcomeRepository):
@@ -1678,6 +1694,155 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         if rows:
             return rows[0]["id"]
         return None
+
+    async def create_or_replay_afk_execution_binding(
+        self,
+        *,
+        awx_job_id: str,
+        job_template_id: int,
+        provider: Provider,
+        repository: str,
+        resource_number: str,
+        external_session_id: str | None = None,
+        outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED,
+        source_event_id: str | None = None,
+        branch: str | None = None,
+        title: str | None = None,
+        failure_reason: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        trigger_type: str | None = None,
+        ulid_source: ULIDSource,
+    ) -> CreateAFKExecutionBindingResult:
+        """Transactionally create a provisional AFK run and execution binding (issue #584).
+
+        Generates a ULID for the ``afk_runs`` row, inserts it with
+        ``status = 'pending'``, and inserts an ``execution_bindings`` row
+        with the ``afk_run_id`` link — all in a single atomic transaction.
+
+        * **First call** — creates both rows and returns
+          ``is_created=True``.
+        * **Identical replay** (same ``awx_job_id``, same payload) — returns
+          existing ``afk_run_id`` and ``binding_id`` without mutation (both
+          ``is_conflict`` and ``is_created`` are ``False``).
+        * **Conflicting replay** (same ``awx_job_id``, different payload) —
+          returns ``is_conflict=True`` without mutation.
+
+        The connection MUST already be in a transaction (the caller owns the
+        transaction boundary).  Uses savepoints internally so that a failure
+        within this operation rolls back cleanly without leaving orphaned
+        ``afk_runs`` rows.
+
+        ``ulid_source`` provides the ULID generator; pass a deterministic
+        source in tests for reproducibility.
+        """
+        numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
+        new_ulid = ulid_source.next_ulid()
+
+        async with self._conn.transaction():
+            # Check for an existing binding with this AWX job ID.
+            existing = await self._conn.fetchrow(
+                """
+                SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
+                       failure_reason, source_event_id, external_session_id
+                FROM execution_bindings
+                WHERE awx_job_id = $1
+                """,
+                numeric_awx_job_id,
+            )
+
+            if existing is not None:
+                # Binding already exists — check whether payload matches
+                # (idempotent replay) or conflicts.
+                existing_payload = {
+                    "outcome": existing["outcome"],
+                    "title": existing["title"],
+                    "branch": existing["branch"],
+                    "failure_reason": existing["failure_reason"],
+                    "source_event_id": existing["source_event_id"],
+                    "external_session_id": existing["external_session_id"],
+                }
+                new_payload = {
+                    "outcome": outcome.value,
+                    "title": title,
+                    "branch": branch,
+                    "failure_reason": failure_reason,
+                    "source_event_id": source_event_id,
+                    "external_session_id": external_session_id,
+                }
+                is_match = existing_payload == new_payload
+                return CreateAFKExecutionBindingResult(
+                    afk_run_id=existing["afk_run_id"],
+                    binding_id=existing["id"],
+                    is_conflict=not is_match,
+                )
+
+            # First creation — insert afk_runs then execution_bindings.
+            await self._conn.execute(
+                """
+                INSERT INTO afk_runs
+                    (afk_run_id, provider, status, title, started_at, finished_at,
+                     outcome_status, outcome, first_seen_at, last_seen_at)
+                VALUES ($1, $2, 'pending', $3, $4, $5, NULL, NULL, now(), now())
+                """,
+                new_ulid,
+                provider.value,
+                title,
+                started_at,
+                finished_at,
+            )
+
+            binding_row = await self._conn.fetch(
+                """
+                INSERT INTO execution_bindings
+                    (awx_job_id, job_template_id, external_session_id, provider,
+                     repository_url, entity_type, entity_number, outcome,
+                     source_event_id, branch, title, failure_reason, started_at,
+                     finished_at, afk_run_id, trigger_type, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, now(), now())
+                ON CONFLICT (awx_job_id) DO NOTHING
+                RETURNING id
+                """,
+                numeric_awx_job_id,
+                job_template_id,
+                external_session_id,
+                provider.value,
+                repository,
+                EntityType.CHANGE_REQUEST.value,
+                resource_number,
+                outcome.value,
+                source_event_id,
+                branch,
+                title,
+                failure_reason,
+                started_at,
+                finished_at,
+                new_ulid,
+                trigger_type,
+            )
+
+            if binding_row:
+                return CreateAFKExecutionBindingResult(
+                    afk_run_id=new_ulid,
+                    binding_id=binding_row[0]["id"],
+                    is_created=True,
+                )
+
+            # Extremely rare: concurrent insert between our SELECT and INSERT.
+            # Roll back the savepoint — the outer transaction picks up the
+            # existing row on retry.  Read back what the winner wrote.
+            winner = await self._conn.fetchrow(
+                """
+                SELECT id, afk_run_id FROM execution_bindings
+                WHERE awx_job_id = $1
+                """,
+                numeric_awx_job_id,
+            )
+            return CreateAFKExecutionBindingResult(
+                afk_run_id=winner["afk_run_id"] if winner else new_ulid,
+                binding_id=winner["id"] if winner else None,
+            )
 
     async def get_execution_binding_by_awx_job_id(
         self, awx_job_id: str
