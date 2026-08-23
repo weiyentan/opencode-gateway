@@ -141,6 +141,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
             "source_event_id": "evt_001",
             "branch": "feat/auth",
             "title": "Implement auth",
@@ -186,6 +187,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "6",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -221,6 +223,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -255,6 +258,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -286,6 +290,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "123",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -317,6 +322,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "failed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -348,6 +354,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -379,6 +386,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
             "source_event_id": "evt_changed",
         }
 
@@ -407,6 +415,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -434,6 +443,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "running",  # Invalid — not a terminal outcome
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -459,6 +469,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -488,6 +499,7 @@ class TestCreateExecutionBinding:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -785,6 +797,7 @@ class TestAuth:
                 "resource_number": "99",
             },
             "outcome": "completed",
+            "trigger_type": "manual",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
