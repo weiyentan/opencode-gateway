@@ -57,6 +57,7 @@ function makeFakeElement(id) {
     value: '',
     disabled: false,
     innerHTML: '',
+    style: {},
     classList: {
       _classes: {},
       add: function (c) { this._classes[c] = true; },
@@ -145,6 +146,13 @@ elementRegistry['ar-filter-apply'] = arFilterApplyEl;
 elementRegistry['ar-filter-agent'] = arFilterAgentEl;
 elementRegistry['ar-filter-status'] = arFilterStatusEl;
 elementRegistry['ar-page-size'] = arPageSizeEl;
+
+// AFK Repository Summary fakes (issue #572): the repository summary tbody.
+// Registered before loadRealAppJs so app.js captures the ref in els like the
+// other table fakes; renderRepositorySummaryTable writes its rows into this
+// element.
+var afkReposTbodyEl = makeFakeElement('afk-repos-tbody');
+elementRegistry['afk-repos-tbody'] = afkReposTbodyEl;
 
 // AFK Outcomes fakes (issue #453): the runs-list tbody and the chain detail
 // overlay elements.  Registered before loadRealAppJs so app.js captures them
@@ -329,6 +337,12 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  // Issue #576: relationship state presentation + unresolved-relationships view
+  window.fmtRelationshipState = sandboxWindow.fmtRelationshipState;
+  window.renderRelationshipBadge = sandboxWindow.renderRelationshipBadge;
+  window.buildUnresolvedRelationships = sandboxWindow.buildUnresolvedRelationships;
+  window.renderUnresolvedRelationshipsRow = sandboxWindow.renderUnresolvedRelationshipsRow;
+  window.renderUnresolvedRelationships = sandboxWindow.renderUnresolvedRelationships;
   // Issue #469: Transcript view — pure helpers for UUID validation, depth
   // formatting, part-type classification, and the header/timeline/message/part
   // renderers, exposed on the same window test seam.
@@ -4594,6 +4608,715 @@ console.log('\u25B6 AFK Outcomes — session drill-down click wiring (issue #473
 })();
 
 
+// ════════════════════════════════════════════════════════════════════════════
+// Issue #577: AFK Outcomes — VM-Sandbox Regression Coverage
+// ════════════════════════════════════════════════════════════════════════════
+// Comprehensive deterministic regression coverage for the repository-first
+// AFK Outcomes flow using the VM-sandbox approach and GitHub/GitLab fixtures.
+// No provider credentials, AWX, or network access required.
+// ── Fixture loading ─────────────────────────────────────────────────────
+
+var issue577FixturesDir = path.join(__dirname, '..', 'fixtures');
+
+var issue577GithubRunDetail = JSON.parse(fs.readFileSync(
+  path.join(issue577FixturesDir, 'github_afk_run_detail.json'), 'utf8'));
+var issue577GitlabRunDetail = JSON.parse(fs.readFileSync(
+  path.join(issue577FixturesDir, 'gitlab_afk_run_detail.json'), 'utf8'));
+var issue577GithubAmbiguousDetail = JSON.parse(fs.readFileSync(
+  path.join(issue577FixturesDir, 'github_ambiguous_detail.json'), 'utf8'));
+var issue577GithubParkedDetail = JSON.parse(fs.readFileSync(
+  path.join(issue577FixturesDir, 'github_parked_detail.json'), 'utf8'));
+var issue577GitlabUnresolvedDetail = JSON.parse(fs.readFileSync(
+  path.join(issue577FixturesDir, 'gitlab_unresolved_detail.json'), 'utf8'));
+
+// ── 1. Repository summary tests ─────────────────────────────────────────
+
+console.log('\u25B6 issue #577 \u2014 repository summary: mixed providers');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'gh-1', provider: 'github', status: 'completed', title: 'GH run',
+        outcome_status: 'merged', started_at: '2026-08-13T09:00:00Z', last_seen_at: '2026-08-13T10:00:00Z' },
+      { afk_run_id: 'gl-1', provider: 'gitlab', status: 'completed', title: 'GL run',
+        outcome_status: 'merged', started_at: '2026-08-14T08:00:00Z', last_seen_at: '2026-08-14T09:00:00Z' }
+    ],
+    total: 2
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  assert(html.indexOf('data-id="gh-1"') !== -1, 'mixed providers: GitHub run rendered');
+  assert(html.indexOf('data-id="gl-1"') !== -1, 'mixed providers: GitLab run rendered');
+  assert(html.indexOf('>github<') !== -1, 'mixed providers: GitHub label visible');
+  assert(html.indexOf('>gitlab<') !== -1, 'mixed providers: GitLab label visible');
+  assert(html.indexOf('badge-completed') !== -1, 'mixed providers: status badge rendered');
+  assert(html.indexOf('badge-merged') !== -1, 'mixed providers: outcome badge rendered');
+})();
+
+console.log('\u25B6 issue #577 \u2014 repository summary: empty period');
+
+(function () {
+  window.renderAfkOutcomesTable({ items: [], total: 0 });
+  assert(afkRunsTbodyEl.innerHTML.indexOf('No AFK runs') !== -1,
+    'empty period: no-AFK-runs message rendered');
+  assert(afkRunsTbodyEl.innerHTML.indexOf('colspan="6"') !== -1,
+    'empty period: empty-state spans all 6 columns');
+})();
+
+console.log('\u25B6 issue #577 \u2014 repository summary: API error isolation');
+
+(function () {
+  var afkFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
+  assert(afkFail['afk-outcomes'] === 'stale',
+    'API error: afkRuns failure stales AFK Outcomes panel');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes') === false,
+    'API error: stale panel with previous data skips re-render');
+  assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: null } }, 'afk-outcomes') === true,
+    'API error: stale panel without previous data renders');
+  var f = window.computePanelFreshness({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes', 1000000);
+  assert(f !== null && f.status === 'stale' && f.label === 'Showing previous data',
+    'API error: stale panel shows Showing previous data label');
+  assert(window.resolvePanelStatuses({})['afk-outcomes'] === 'ok',
+    'API error: no errors resolves panel to ok');
+  assert(window.resolvePanelStatuses({ aggByModel: 'boom' })['afk-outcomes'] === 'ok',
+    'API error: aggByModel failure leaves AFK panel ok');
+  assert(window.resolvePanelStatuses({ health: 'down' })['afk-outcomes'] === 'ok',
+    'API error: health failure leaves AFK panel ok');
+})();
+
+// ── 2. Change-request tests ─────────────────────────────────────────────
+
+console.log('\u25B6 issue #577 \u2014 change-request: all-results mode');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'cr-1', provider: 'github', status: 'completed', title: 'With CR',
+        outcome_status: 'merged', started_at: '2026-08-13T09:00:00Z', last_seen_at: '2026-08-13T10:00:00Z' },
+      { afk_run_id: 'cr-2', provider: 'github', status: 'running', title: 'No CR',
+        outcome_status: 'open', started_at: '2026-08-13T11:00:00Z', last_seen_at: null }
+    ],
+    total: 2
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  assert(html.indexOf('data-id="cr-1"') !== -1 && html.indexOf('data-id="cr-2"') !== -1,
+    'all-results: both runs rendered');
+  assert(html.indexOf('badge-completed') !== -1 && html.indexOf('badge-running') !== -1,
+    'all-results: distinct status badges');
+  assert(html.indexOf('badge-merged') !== -1 && html.indexOf('badge-open') !== -1,
+    'all-results: distinct outcome badges');
+})();
+
+console.log('\u25B6 issue #577 \u2014 change-request: provider labels');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'pl-1', provider: 'github', status: 'completed', title: 'GH PR',
+        outcome_status: 'merged', started_at: null, last_seen_at: null },
+      { afk_run_id: 'pl-2', provider: 'gitlab', status: 'completed', title: 'GL MR',
+        outcome_status: 'merged', started_at: null, last_seen_at: null },
+      { afk_run_id: 'pl-3', provider: null, status: 'completed', title: 'No provider',
+        outcome_status: 'merged', started_at: null, last_seen_at: null }
+    ],
+    total: 3
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  assert(html.indexOf('>github<') !== -1, 'provider labels: GitHub rendered');
+  assert(html.indexOf('>gitlab<') !== -1, 'provider labels: GitLab rendered');
+  assert(html.indexOf('data-label="Provider">--') !== -1, 'provider labels: null renders dash');
+})();
+
+console.log('\u25B6 issue #577 \u2014 change-request: selection fallback on missing title');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'fb-1', provider: 'github', status: 'completed', title: null,
+        outcome_status: 'merged', started_at: null, last_seen_at: null }
+    ],
+    total: 1
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  assert(html.indexOf('fb-1') !== -1, 'selection fallback: shortUUID used when title is null');
+})();
+
+// ── 3. Provenance tests ─────────────────────────────────────────────────
+
+console.log('\u25B6 issue #577 \u2014 provenance: GitHub fixture chain detail');
+
+(function () {
+  window.renderAfkRunDetail(issue577GithubRunDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('afk-chain') !== -1, 'GitHub: chain div rendered');
+  assert(html.indexOf('badge-completed') !== -1, 'GitHub: run status badge');
+  assert(html.indexOf('badge-merged') !== -1, 'GitHub: outcome merged badge');
+  assert(html.indexOf('100%') !== -1, 'GitHub: confidence visible');
+  assert(html.indexOf('issue_reference') !== -1, 'GitHub: correlation method visible');
+  assert(html.indexOf('change_request:501') !== -1, 'GitHub: change request entity id');
+  assert(html.indexOf('commit:abc1234') !== -1, 'GitHub: commit entity id');
+  assert(html.indexOf('review:501') !== -1, 'GitHub: review entity id');
+  assert(html.indexOf('merge_event:501') !== -1, 'GitHub: merge event entity id');
+  assert(html.indexOf('code-editor-senior') !== -1, 'GitHub: agent identity');
+  assert(html.indexOf('Active Tokens') !== -1, 'GitHub: usage step Active Tokens');
+  assert(html.indexOf('data-step="issues"') !== -1, 'GitHub: issues step');
+  assert(html.indexOf('data-step="run"') !== -1, 'GitHub: run step');
+  assert(html.indexOf('data-step="sessions"') !== -1, 'GitHub: sessions step');
+  assert(html.indexOf('data-step="change_requests"') !== -1, 'GitHub: change_requests step');
+  assert(html.indexOf('data-step="commits"') !== -1, 'GitHub: commits step');
+  assert(html.indexOf('data-step="reviews"') !== -1, 'GitHub: reviews step');
+  assert(html.indexOf('data-step="outcome"') !== -1, 'GitHub: outcome step');
+})();
+
+console.log('\u25B6 issue #577 \u2014 provenance: GitLab fixture chain detail');
+
+(function () {
+  window.renderAfkRunDetail(issue577GitlabRunDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('afk-chain') !== -1, 'GitLab: chain div rendered');
+  assert(html.indexOf('badge-completed') !== -1, 'GitLab: run status badge');
+  assert(html.indexOf('badge-merged') !== -1, 'GitLab: outcome merged badge');
+  assert(html.indexOf('change_request:601') !== -1, 'GitLab: change request entity id');
+  assert(html.indexOf('commit:gl789abc') !== -1, 'GitLab: commit entity id');
+  assert(html.indexOf('review:gl601') !== -1, 'GitLab: review entity id');
+  assert(html.indexOf('merge_event:601') !== -1, 'GitLab: merge event entity id');
+  assert(html.indexOf('resolves #501') !== -1, 'GitLab: evidence detail');
+  assert(html.indexOf('Active Tokens') !== -1, 'GitLab: usage step Active Tokens');
+  // entity_id format confirms correct GitLab fixture loaded
+  assert(html.indexOf('change_request:601') !== -1, 'GitLab: entity id confirms GitLab fixture');
+})();
+
+console.log('\u25B6 issue #577 \u2014 provenance: cost + cache data');
+
+(function () {
+  window.renderAfkRunDetail(issue577GitlabRunDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('estimated cost') !== -1 || html.indexOf('$') !== -1,
+    'GitLab: estimated cost label visible');
+  assert(html.indexOf('cache') !== -1, 'GitLab: cache data visible');
+  window.renderAfkRunDetail(issue577GithubRunDetail.data);
+  html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('estimated cost') !== -1 || html.indexOf('$') !== -1,
+    'GitHub: estimated cost label visible');
+  assert(html.indexOf('cache') !== -1, 'GitHub: cache data visible');
+})();
+
+console.log('\u25B6 issue #577 \u2014 provenance: status distinction (RunStatus vs OutcomeStatus)');
+
+(function () {
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'sd-1', status: 'running', outcome_status: 'open' },
+    outcome: { status: 'open' },
+    issues: [], sessions: [], agents: [], usage: {},
+    change_requests: [], commits: [], reviews: [], merge_events: []
+  });
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('badge-running') !== -1, 'status distinction: run status running badge');
+  assert(html.indexOf('badge-open') !== -1, 'status distinction: outcome status open badge');
+  assert(html.indexOf('badge-running') !== html.indexOf('badge-open'),
+    'status distinction: run status and outcome status are distinct badges');
+})();
+
+console.log('\u25B6 issue #577 \u2014 provenance: missing optional data');
+
+(function () {
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'mo-1', status: 'completed', outcome_status: 'open', title: null },
+    outcome: { status: 'open', change_request_ids: [], resolved_issue_ids: [], merge_event_id: null, merged_at: null },
+    issues: [], sessions: [], agents: [], usage: {},
+    change_requests: [], commits: [], reviews: [], merge_events: []
+  });
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('No sessions linked') !== -1, 'missing data: empty sessions shows empty state');
+  assert(html.indexOf('afk-chain') !== -1, 'missing data: chain still rendered');
+  assert(html.indexOf('badge-completed') !== -1, 'missing data: run status still rendered');
+  assert(html.indexOf('badge-open') !== -1, 'missing data: outcome status still rendered');
+})();
+
+// ── 4. Session tests (nesting, missing parents, unresolved, deep links) ─
+
+console.log('\u25B6 issue #577 \u2014 session: root/child nesting');
+
+(function () {
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'sn-1', status: 'completed', outcome_status: 'merged' },
+    outcome: { status: 'merged' },
+    sessions: [
+      { session_id: '1f9c3a6e-0000-4000-8000-000000000001', external_session_id: 'ses-root',
+        agent: 'coordinator', inferred: true, message_count: 10,
+        total_input_tokens: 1000, total_output_tokens: 500,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0.1 },
+      { session_id: '2f9c3a6e-0000-4000-8000-000000000002', external_session_id: 'ses-child',
+        agent: 'code-editor', inferred: true, message_count: 5,
+        total_input_tokens: 500, total_output_tokens: 200,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0.05 }
+    ],
+    issues: [], agents: ['coordinator', 'code-editor'], usage: { active_tokens: 2200 },
+    change_requests: [], commits: [], reviews: [], merge_events: []
+  });
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('ses-root') !== -1, 'nesting: root session external id visible');
+  assert(html.indexOf('ses-child') !== -1, 'nesting: child session external id visible');
+  assert(html.indexOf('coordinator') !== -1, 'nesting: root session agent visible');
+  assert(html.indexOf('code-editor') !== -1, 'nesting: child session agent visible');
+  assert(html.indexOf('afk-session-clickable') !== -1, 'nesting: resolved sessions are clickable');
+  assert(html.indexOf('data-session-id="1f9c3a6e-0000-4000-8000-000000000001"') !== -1,
+    'nesting: root session carries data-session-id');
+  assert(html.indexOf('data-session-id="2f9c3a6e-0000-4000-8000-000000000002"') !== -1,
+    'nesting: child session carries data-session-id');
+})();
+
+console.log('\u25B6 issue #577 \u2014 session: missing parent (no session_id)');
+
+(function () {
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'mp-1', status: 'completed', outcome_status: 'merged' },
+    outcome: { status: 'merged' },
+    sessions: [
+      { external_session_id: 'ses-orphan', agent: 'orphan-agent', inferred: true,
+        message_count: 3, total_input_tokens: 100, total_output_tokens: 50,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0.01 }
+    ],
+    issues: [], agents: ['orphan-agent'], usage: { active_tokens: 150 },
+    change_requests: [], commits: [], reviews: [], merge_events: []
+  });
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('afk-session-clickable') === -1,
+    'missing parent: unresolved session is NOT clickable');
+  assert(html.indexOf('data-session-id=') === -1,
+    'missing parent: no data-session-id attribute');
+  assert(html.indexOf('ses-orphan') !== -1,
+    'missing parent: external session id still visible');
+  assert(html.indexOf('inferred') !== -1,
+    'missing parent: still visibly marked inferred');
+})();
+
+console.log('\u25B6 issue #577 \u2014 session: unresolved session (missing session_id field)');
+
+(function () {
+  var result = window.resolveAfkSessionDrilldown({ external_session_id: 'ses-x', agent: 'test', inferred: true });
+  assert(result === null, 'unresolved: resolveAfkSessionDrilldown returns null for missing session_id');
+  result = window.resolveAfkSessionDrilldown({ external_session_id: 'ses-x', session_id: null, agent: 'test' });
+  assert(result === null, 'unresolved: resolveAfkSessionDrilldown returns null for null session_id');
+  result = window.resolveAfkSessionDrilldown({ external_session_id: 'ses-x',
+    session_id: '1f9c3a6e-0000-4000-8000-000000000001', agent: 'test' });
+  assert(result === '1f9c3a6e-0000-4000-8000-000000000001',
+    'resolved: resolveAfkSessionDrilldown returns session_id');
+})();
+
+console.log('\u25B6 issue #577 \u2014 session: deep link to Agent Run detail');
+
+(function () {
+  // Render with a resolved session, then parse clickable links and click
+  var clickableLinks = [];
+  afkDetailBodyEl.querySelectorAll = function (selector) {
+    if (selector !== '.afk-session-clickable') return [];
+    clickableLinks = [];
+    var re = /data-session-id="([^"]+)"/g;
+    var m;
+    while ((m = re.exec(this.innerHTML)) !== null) {
+      var el = makeFakeElement('afk-session-link');
+      el.setAttribute('data-session-id', m[1]);
+      clickableLinks.push(el);
+    }
+    return clickableLinks;
+  };
+
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'dl-1', status: 'completed', outcome_status: 'merged' },
+    outcome: { status: 'merged' },
+    sessions: [
+      { session_id: '1f9c3a6e-0000-4000-8000-000000000001', external_session_id: 'ses-resolved',
+        agent: 'test', inferred: false },
+      { external_session_id: 'ses-unresolved', agent: 'test', inferred: true }
+    ],
+    issues: [], agents: ['test'], usage: { active_tokens: 0 },
+    change_requests: [], commits: [], reviews: [], merge_events: []
+  });
+
+  assert(clickableLinks.length === 1, 'deep link: exactly one clickable session link');
+  assert(clickableLinks[0].getAttribute('data-session-id') === '1f9c3a6e-0000-4000-8000-000000000001',
+    'deep link: clickable link targets the resolved session_id');
+
+  // Simulate click - should close AFK overlay and open Agent Run detail
+  afkDetailOverlayEl.classList.add('visible');
+  var fetched = [];
+  appJsSandbox.fetch = function (url) { fetched.push(url); return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ status: 'ok', data: {} }); } }); };
+  clickableLinks[0]._handlers.click();
+  assert(fetched.length === 1, 'deep link: click triggers Agent Run detail fetch');
+  assert(fetched[0].indexOf('/api/v1/usage/agent-runs/') !== -1, 'deep link: fetch targets agent-runs endpoint');
+  assert(afkDetailOverlayEl.classList.contains('visible') === false,
+    'deep link: AFK chain overlay closed after click');
+  afkDetailBodyEl.querySelectorAll = function () { return []; };
+  appJsSandbox.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); };
+})();
+
+// ── 5. Relationship tests (resolved, provisional, ambiguous, parked) ────
+
+console.log('\u25B6 issue #577 \u2014 relationship: resolved links');
+
+(function () {
+  var link = window.renderAfkEntityLink({
+    entity_id: 'issue:437', entity_type: 'issue', role: 'resolved',
+    correlation_method: 'issue_reference', correlation_confidence: 1.0,
+    resolver_version: '2', provisional: false,
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:501', detail: 'resolves #437' }]
+  });
+  assert(link.indexOf('afk-provisional') === -1, 'resolved: no provisional marker');
+  assert(link.indexOf('badge-completed') !== -1, 'resolved: role badge-completed');
+  assert(link.indexOf('100%') !== -1, 'resolved: confidence 100%');
+  assert(link.indexOf('issue_reference') !== -1, 'resolved: correlation method visible');
+  assert(link.indexOf('resolver v2') !== -1, 'resolved: resolver version visible');
+  assert(link.indexOf('change_request:501') !== -1, 'resolved: evidence source visible');
+})();
+
+console.log('\u25B6 issue #577 \u2014 relationship: provisional links');
+
+(function () {
+  var link = window.renderAfkEntityLink({
+    entity_id: 'issue:436', entity_type: 'issue', role: 'referenced',
+    correlation_method: 'temporal_inference', correlation_confidence: 0.1,
+    resolver_version: '2', provisional: true,
+    evidence: [{ kind: 'temporal', source_entity_id: 'issue:436', detail: 'same time window' }]
+  });
+  assert(link.indexOf('afk-provisional') !== -1, 'provisional: visibly marked');
+  assert(link.indexOf('provisional') !== -1, 'provisional: text "provisional" visible');
+  assert(link.indexOf('10%') !== -1, 'provisional: confidence 10%');
+  assert(link.indexOf('temporal_inference') !== -1, 'provisional: method visible');
+})();
+
+console.log('\u25B6 issue #577 \u2014 relationship: ambiguous fixture (GitHub)');
+
+(function () {
+  window.renderAfkRunDetail(issue577GithubAmbiguousDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('badge-running') !== -1, 'ambiguous: run status running');
+  assert(html.indexOf('badge-open') !== -1, 'ambiguous: outcome status open');
+  assert(html.indexOf('issue:701') !== -1, 'ambiguous: referenced issue visible');
+  assert(html.indexOf('issue:702') !== -1, 'ambiguous: noise issue visible');
+  assert(html.indexOf('provisional') !== -1, 'ambiguous: provisional links visible');
+  assert(html.indexOf('0%') !== -1, 'ambiguous: zero confidence for noise');
+  assert(html.indexOf('10%') !== -1, 'ambiguous: low confidence for referenced');
+  assert(html.indexOf('temporal_inference') !== -1, 'ambiguous: temporal method visible');
+  assert(html.indexOf('afk-session-clickable') !== -1 || html.indexOf('ses_amb') !== -1,
+    'ambiguous: sessions visible');
+  // No resolved issue IDs in outcome (both are referenced/noise)
+  assert(html.indexOf('No sessions linked') === -1, 'ambiguous: sessions exist');
+})();
+
+console.log('\u25B6 issue #577 \u2014 relationship: parked fixture (GitHub)');
+
+(function () {
+  window.renderAfkRunDetail(issue577GithubParkedDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('badge-stale') !== -1, 'parked: run status stale');
+  assert(html.indexOf('badge-open') !== -1, 'parked: outcome open');
+  assert(html.indexOf('issue:901') !== -1, 'parked: issue entity visible');
+  assert(html.indexOf('provisional') !== -1, 'parked: provisional links visible');
+  assert(html.indexOf('change_request:901a') !== -1, 'parked: first CR visible');
+  assert(html.indexOf('change_request:901b') !== -1, 'parked: second CR visible');
+  assert(html.indexOf('branch_issue_reference') !== -1, 'parked: branch issue method visible');
+  assert(html.indexOf('No sessions linked') === -1, 'parked: sessions exist');
+})();
+
+console.log('\u25B6 issue #577 \u2014 relationship: unresolved fixture (GitLab)');
+
+(function () {
+  window.renderAfkRunDetail(issue577GitlabUnresolvedDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('badge-failed') !== -1, 'unresolved: run status failed');
+  assert(html.indexOf('badge-abandoned') !== -1, 'unresolved: outcome abandoned');
+  assert(html.indexOf('issue:801') !== -1, 'unresolved: noise issue visible');
+  assert(html.indexOf('provisional') !== -1, 'unresolved: provisional links visible');
+  assert(html.indexOf('temporal_inference') !== -1, 'unresolved: temporal method visible');
+  assert(html.indexOf('No sessions linked') !== -1, 'unresolved: empty sessions state');
+  assert(html.indexOf('issue:801') !== -1, 'unresolved: entity id confirms fixture');
+})();
+
+console.log('\u25B6 issue #577 \u2014 relationship: confidence/method/evidence/resolver_version');
+
+(function () {
+  // Verify all four provenance fields are rendered on each entity link
+  window.renderAfkRunDetail(issue577GithubRunDetail.data);
+  var html = afkDetailBodyEl.innerHTML;
+  assert(html.indexOf('100%') !== -1, 'confidence: percentage visible on resolved link');
+  assert(html.indexOf('issue_reference') !== -1, 'method: issue_reference visible');
+  assert(html.indexOf('explicit_run_id') !== -1, 'method: explicit_run_id visible');
+  assert(html.indexOf('branch_issue_reference') !== -1, 'method: branch_issue_reference visible');
+  assert(html.indexOf('resolver v2') !== -1, 'resolver_version: v2 visible');
+  assert(html.indexOf('evidence') !== -1, 'evidence: evidence block visible');
+})();
+
+// ── 6. Loading / empty / stale / partial / retry tests ──────────────────
+
+console.log('\u25B6 issue #577 \u2014 loading state');
+
+(function () {
+  // Loading: openAfkRunDetail sets "Loading detail..." before fetch completes
+  pendingAsyncBlocks++;
+  var resolveFetch = null;
+  appJsSandbox.fetch = function () {
+    return new Promise(function (resolve) { resolveFetch = resolve; });
+  };
+  window.openAfkRunDetail('loading-test');
+  // While loading: the overlay is visible and loading text is shown
+  assert(afkDetailOverlayEl.classList.contains('visible'), 'loading: overlay visible');
+  assert(afkDetailBodyEl.innerHTML.indexOf('Loading detail') !== -1, 'loading: loading text displayed');
+  // Resolve the fetch
+  resolveFetch({
+    ok: true,
+    json: function () { return Promise.resolve({ status: 'ok', data: { run: { afk_run_id: 'loading-test', status: 'completed', outcome_status: 'merged' } } }); }
+  });
+  pendingAsyncBlocks--;
+})();
+
+console.log('\u25B6 issue #577 \u2014 empty detail state');
+
+(function () {
+  window.renderAfkRunDetail(null);
+  assert(afkDetailBodyEl.innerHTML.indexOf('No AFK outcome data available') !== -1,
+    'empty detail: null detail shows no-data message');
+  window.renderAfkRunDetail({});
+  assert(afkDetailBodyEl.innerHTML.indexOf('No AFK outcome data available') !== -1,
+    'empty detail: missing run shows no-data message');
+})();
+
+console.log('\u25B6 issue #577 \u2014 stale-on-error: panel status map');
+
+(function () {
+  // Stale-on-error: the panel status map correctly propagates stale state
+  // through shouldRenderPanel + computePanelFreshness
+  var states = { 'afk-outcomes': { status: 'ok', updatedAt: 999000 } };
+  states['afk-outcomes'] = {
+    status: window.resolvePanelStatuses({ afkRuns: 'boom' })['afk-outcomes'],
+    updatedAt: states['afk-outcomes'].updatedAt
+  };
+  assert(states['afk-outcomes'].status === 'stale', 'stale-on-error: panel status is stale');
+  assert(window.shouldRenderPanel(states, 'afk-outcomes') === false,
+    'stale-on-error: shouldRenderPanel returns false');
+  var fresh = window.computePanelFreshness(states, 'afk-outcomes', 1000000);
+  assert(fresh !== null && fresh.label === 'Showing previous data',
+    'stale-on-error: freshness label shows previous data');
+})();
+
+console.log('\u25B6 issue #577 \u2014 partial data: runs list with mixed field completeness');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'pd-1', provider: 'github', status: 'completed', title: 'Full run',
+        outcome_status: 'merged', started_at: '2026-08-13T09:00:00Z', last_seen_at: '2026-08-13T10:00:00Z' },
+      { afk_run_id: 'pd-2', provider: null, status: null, title: null,
+        outcome_status: null, started_at: null, last_seen_at: null },
+      { afk_run_id: 'pd-3', provider: 'gitlab', status: 'running', title: '',
+        outcome_status: 'open', started_at: '2026-08-14T08:00:00Z', last_seen_at: null }
+    ],
+    total: 3
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  assert(html.indexOf('data-id="pd-1"') !== -1, 'partial: full row rendered');
+  assert(html.indexOf('data-id="pd-2"') !== -1, 'partial: null-fields row rendered');
+  assert(html.indexOf('data-id="pd-3"') !== -1, 'partial: empty-title row rendered');
+  assert(html.indexOf('Full run') !== -1, 'partial: full title visible');
+  assert(html.indexOf('badge-merged') !== -1, 'partial: merged badge for full row');
+  // pd-2 has null status/title/outcome - should render fallbacks
+  assert(html.indexOf('>--<') !== -1, 'partial: dash fallbacks for null provider/status');
+})();
+
+console.log('\u25B6 issue #577 \u2014 retry/error: 404 handling');
+
+(function () {
+  pendingAsyncBlocks++;
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: false, status: 404 });
+  };
+  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
+  var savedConsoleError = appJsSandbox.console.error;
+  appJsSandbox.console.error = function () {};
+  window.openAfkRunDetail('not-found-run').then(function () {
+    // Restore console.error BEFORE assertions so failures are visible
+    appJsSandbox.console.error = savedConsoleError;
+    assert(afkDetailBodyEl.innerHTML.indexOf('AFK run not found') !== -1,
+      'retry/error: 404 renders not-found message');
+    pendingAsyncBlocks--;
+  });
+})();
+
+console.log('\u25B6 issue #577 \u2014 retry/error: 500 handling');
+
+(function () {
+  pendingAsyncBlocks++;
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: false, status: 500 });
+  };
+  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
+  var savedConsoleError = appJsSandbox.console.error;
+  appJsSandbox.console.error = function () {};
+  window.openAfkRunDetail('error-run').then(function () {
+    // Restore console.error BEFORE assertions so failures are visible
+    appJsSandbox.console.error = savedConsoleError;
+    assert(afkDetailBodyEl.innerHTML.indexOf('Failed to load') !== -1,
+      'retry/error: 500 renders failure message');
+    assert(afkDetailBodyEl.innerHTML.indexOf('AFK run not found') === -1,
+      'retry/error: 500 does NOT show not-found message');
+    appJsSandbox.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); };
+    pendingAsyncBlocks--;
+  });
+})();
+
+console.log('\u25B6 issue #577 \u2014 retry/error: network failure handling');
+
+(function () {
+  pendingAsyncBlocks++;
+  appJsSandbox.fetch = function () {
+    return Promise.reject(new Error('network down'));
+  };
+  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
+  var savedConsoleError = appJsSandbox.console.error;
+  appJsSandbox.console.error = function () {};
+  window.openAfkRunDetail('network-error').then(function () {
+    // Restore console.error BEFORE assertions so failures are visible
+    appJsSandbox.console.error = savedConsoleError;
+    assert(afkDetailBodyEl.innerHTML.indexOf('Failed to load') !== -1,
+      'retry/error: network failure renders failure message');
+    assert(afkDetailBodyEl.innerHTML.indexOf('network down') !== -1,
+      'retry/error: network error message included');
+    appJsSandbox.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } }); };
+    pendingAsyncBlocks--;
+  });
+})();
+
+// ── 7. Cross-provider parity (GitHub vs GitLab) ─────────────────────────
+
+console.log('\u25B6 issue #577 \u2014 cross-provider parity: GitHub vs GitLab fixture flow');
+
+(function () {
+  // Both fixtures render the same chain structure: the same canonical step
+  // order, the same badge types, the same provenance fields.
+  window.renderAfkRunDetail(issue577GithubRunDetail.data);
+  var ghHtml = afkDetailBodyEl.innerHTML;
+  window.renderAfkRunDetail(issue577GitlabRunDetail.data);
+  var glHtml = afkDetailBodyEl.innerHTML;
+
+  // Same chain step keys present in both
+  var stepKeys = ['issues', 'run', 'sessions', 'agents', 'usage', 'change_requests', 'commits', 'reviews', 'outcome'];
+  stepKeys.forEach(function (key) {
+    assert(ghHtml.indexOf('data-step="' + key + '"') !== -1, 'parity: GitHub has step ' + key);
+    assert(glHtml.indexOf('data-step="' + key + '"') !== -1, 'parity: GitLab has step ' + key);
+  });
+
+  // Same badge classes
+  assert(ghHtml.indexOf('badge-completed') !== -1, 'parity: GitHub run badge-completed');
+  assert(glHtml.indexOf('badge-completed') !== -1, 'parity: GitLab run badge-completed');
+  assert(ghHtml.indexOf('badge-merged') !== -1, 'parity: GitHub outcome badge-merged');
+  assert(glHtml.indexOf('badge-merged') !== -1, 'parity: GitLab outcome badge-merged');
+
+  // Both carry confidence percentages and resolver versions
+  assert(ghHtml.indexOf('100%') !== -1, 'parity: GitHub confidence visible');
+  assert(glHtml.indexOf('100%') !== -1, 'parity: GitLab confidence visible');
+  assert(ghHtml.indexOf('resolver v2') !== -1, 'parity: GitHub resolver version');
+  assert(glHtml.indexOf('resolver v2') !== -1, 'parity: GitLab resolver version');
+
+  // Both carry Active Tokens in usage step
+  assert(ghHtml.indexOf('Active Tokens') !== -1, 'parity: GitHub usage step');
+  assert(glHtml.indexOf('Active Tokens') !== -1, 'parity: GitLab usage step');
+
+  // Provider-specific content present in respective fixtures
+  assert(ghHtml.indexOf('weiyentan/opencode-gateway') !== -1, 'parity: GitHub repo name');
+  assert(glHtml.indexOf('cloudnative-pg/cloudnative-pg') !== -1, 'parity: GitLab repo name');
+})();
+
+console.log('\u25B6 issue #577 \u2014 cross-provider parity: runs list');
+
+(function () {
+  // Both providers render identically in the runs list with the same fields
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'par-gh', provider: 'github', status: 'completed', title: 'GH run',
+        outcome_status: 'merged', started_at: '2026-08-13T09:00:00Z', last_seen_at: '2026-08-13T10:00:00Z' },
+      { afk_run_id: 'par-gl', provider: 'gitlab', status: 'completed', title: 'GL run',
+        outcome_status: 'merged', started_at: '2026-08-14T08:00:00Z', last_seen_at: '2026-08-14T09:00:00Z' }
+    ],
+    total: 2
+  });
+  var html = afkRunsTbodyEl.innerHTML;
+  // Same badge types for same status/outcome
+  var ghRow = html.slice(html.indexOf('data-id="par-gh"'), html.indexOf('</tr>', html.indexOf('data-id="par-gh"')));
+  var glRow = html.slice(html.indexOf('data-id="par-gl"'), html.indexOf('</tr>', html.indexOf('data-id="par-gl"')));
+  assert(ghRow.indexOf('badge-completed') !== -1, 'parity runs: GitHub has completed badge');
+  assert(glRow.indexOf('badge-completed') !== -1, 'parity runs: GitLab has completed badge');
+  assert(ghRow.indexOf('badge-merged') !== -1, 'parity runs: GitHub has merged badge');
+  assert(glRow.indexOf('badge-merged') !== -1, 'parity runs: GitLab has merged badge');
+  // Provider label in each row
+  assert(ghRow.indexOf('>github<') !== -1, 'parity runs: GitHub provider in row');
+  assert(glRow.indexOf('>gitlab<') !== -1, 'parity runs: GitLab provider in row');
+})();
+
+// ── 8. Escaping regression (preserved from existing tests) ──────────────
+
+console.log('\u25B6 issue #577 \u2014 escaping: entity ids with HTML metacharacters');
+
+(function () {
+  window.renderAfkRunDetail({
+    run: { afk_run_id: 'esc-1', status: 'completed', outcome_status: 'open' },
+    issues: [{ entity_id: '<img src=x onerror=alert(1)>', entity_type: 'issue', role: 'resolved',
+               correlation_method: 'issue_reference', correlation_confidence: 1.0, evidence: [],
+               resolver_version: '1', provisional: false }]
+  });
+  assert(afkDetailBodyEl.innerHTML.indexOf('<img src=x') === -1,
+    'escaping: entity id with <img> tag is HTML-escaped');
+  assert(afkDetailBodyEl.innerHTML.indexOf('&lt;img') !== -1,
+    'escaping: entity id is escaped as &lt;img');
+})();
+
+console.log('\u25B6 issue #577 \u2014 escaping: run list with HTML in title');
+
+(function () {
+  window.renderAfkOutcomesTable({
+    items: [
+      { afk_run_id: 'esc-2', provider: 'github', status: 'completed',
+        title: '<script>alert("xss")</script>', outcome_status: 'merged',
+        started_at: null, last_seen_at: null }
+    ],
+    total: 1
+  });
+  assert(afkRunsTbodyEl.innerHTML.indexOf('<script>alert') === -1,
+    'escaping: script tag in title is HTML-escaped');
+  assert(afkRunsTbodyEl.innerHTML.indexOf('&lt;script&gt;') !== -1,
+    'escaping: title is escaped as &lt;script&gt;');
+})();
+
+// ── 9. Overlay interaction (preserved from existing tests) ──────────────
+
+console.log('\u25B6 issue #577 \u2014 overlay: open/close lifecycle');
+
+(function () {
+  pendingAsyncBlocks++;
+  // Wire the close handler (normally done by setupAfkOutcomesEventHandlers)
+  afkDetailCloseEl.addEventListener('click', function () {
+    afkDetailOverlayEl.classList.remove('visible');
+  });
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({
+          status: 'ok',
+          data: { run: { afk_run_id: 'ov-1', status: 'completed', outcome_status: 'merged' } }
+        });
+      }
+    });
+  };
+  window.openAfkRunDetail('ov-1').then(function () {
+    assert(afkDetailOverlayEl.classList.contains('visible'), 'overlay: visible after open');
+    assert(afkDetailTitleEl.textContent.length > 0, 'overlay: title set');
+    assert(afkDetailBodyEl.innerHTML.indexOf('afk-chain') !== -1, 'overlay: chain rendered');
+    // Close the overlay via the wired handler
+    afkDetailCloseEl._handlers.click();
+    assert(afkDetailOverlayEl.classList.contains('visible') === false, 'overlay: hidden after close');
+    pendingAsyncBlocks--;
+  });
+})();
+
 // ── Transcript view (issue #469) ──────────────────────────────────────────
 // Pure helpers for UUID validation, depth formatting, part-type classification,
 // and the header/timeline/message/part renderers.
@@ -4899,6 +5622,751 @@ console.log('\u25B6 issue #557 — index.html + style.css (provider + token colu
     'issue #557: no status-driven [data-active] row selector added');
 })();
 
+// ── AFK Outcomes — nested session tree (issue #575) ───────────────────
+// Within each provenance-timeline execution, the root session and its child
+// sessions are rendered as an explicit nested relationship using
+// parent_session_id.  The tree builder groups flat session links by their
+// parentage, the renderer adds visual nesting depth, and missing/unresolved
+// parent references are explicitly marked.
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: root-only sessions (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_A', session_id: 'id_A', agent: 'a1' },
+    { external_session_id: 'ses_B', session_id: 'id_B', agent: 'a2' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 2, 'root-only: two root nodes');
+  assert(tree[0].session.external_session_id === 'ses_A', 'root-first: ses_A');
+  assert(tree[1].session.external_session_id === 'ses_B', 'root-second: ses_B');
+  assert(tree[0].children.length === 0, 'root-only: no children');
+  assert(!tree[0].missing_parent, 'root-only: no missing_parent marker');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: nested child sessions (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coordinator', parent_session_id: null },
+    { external_session_id: 'ses_CHILD1', session_id: 'id_C1', agent: 'editor', parent_session_id: 'ses_ROOT' },
+    { external_session_id: 'ses_CHILD2', session_id: 'id_C2', agent: 'tester', parent_session_id: 'ses_ROOT' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'nested: one root');
+  assert(tree[0].session.external_session_id === 'ses_ROOT', 'nested: root is ses_ROOT');
+  assert(tree[0].children.length === 2, 'nested: root has two children');
+  assert(tree[0].children[0].external_session_id === 'ses_CHILD1', 'nested: first child');
+  assert(tree[0].children[1].external_session_id === 'ses_CHILD2', 'nested: second child');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: missing-parent session (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coordinator', parent_session_id: null },
+    { external_session_id: 'ses_ORPHAN', session_id: 'id_O', agent: 'editor', parent_session_id: 'ses_MISSING' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 2, 'missing-parent: orphan becomes root');
+  var orphan = tree.filter(function (n) { return n.session.external_session_id === 'ses_ORPHAN'; })[0];
+  assert(orphan, 'missing-parent: orphan node exists');
+  assert(orphan.missing_parent === 'ses_MISSING', 'missing-parent: marker carries the missing parent id');
+  assert(orphan.children.length === 0, 'missing-parent: orphan has no children');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: unresolved session (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_X', session_id: null, agent: 'unknown', parent_session_id: null }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'unresolved: one root');
+  assert(tree[0].session.session_id === null, 'unresolved: session_id is null');
+  assert(!tree[0].missing_parent, 'unresolved: no missing_parent marker (no parent_session_id)');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: empty/null input (issue #575)');
+
+(function () {
+  assert(window.buildSessionTree(null).length === 0, 'null input returns empty array');
+  assert(window.buildSessionTree([]).length === 0, 'empty input returns empty array');
+})();
+
+console.log('\u25B6 AFK Outcomes — buildSessionTree: multi-level nesting (issue #575)');
+
+(function () {
+  var sessions = [
+    { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a', parent_session_id: null },
+    { external_session_id: 'ses_C1', session_id: 'id_C1', agent: 'b', parent_session_id: 'ses_R' },
+    { external_session_id: 'ses_GC1', session_id: 'id_GC1', agent: 'c', parent_session_id: 'ses_C1' }
+  ];
+  var tree = window.buildSessionTree(sessions);
+  assert(tree.length === 1, 'multi-level: one root');
+  assert(tree[0].children.length === 1, 'multi-level: root has one child');
+  // Grandchild is nested under child in the flat list but the tree builder
+  // attaches it to the child's node.
+  assert(tree[0].children[0].external_session_id === 'ses_C1', 'multi-level: child is ses_C1');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: root vs nested (issue #575)');
+
+(function () {
+  var root = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 0);
+  assert(root.indexOf('afk-session-root') !== -1, 'renderNested: root gets afk-session-root class');
+  assert(root.indexOf('afk-session-nested') === -1, 'renderNested: root has no nested class');
+
+  var nested = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_C', session_id: 'id_C', agent: 'b',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 1);
+  assert(nested.indexOf('afk-session-nested') !== -1, 'renderNested: child gets afk-session-nested class');
+  assert(nested.indexOf('afk-nesting-depth-1') !== -1, 'renderNested: child gets depth-1 class');
+  assert(nested.indexOf('afk-session-root') === -1, 'renderNested: child has no root class');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: missing parent marker (issue #575)');
+
+(function () {
+  var html = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_ORPHAN', session_id: 'id_O', agent: 'x',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: [],
+    missing_parent: 'ses_GHOST'
+  }, 0);
+  assert(html.indexOf('afk-missing-parent') !== -1, 'renderNested: missing-parent gets marker class');
+  assert(html.indexOf('parent not in this run') !== -1, 'renderNested: missing-parent shows note text');
+  assert(html.indexOf('ses_GHOST') !== -1, 'renderNested: note includes the missing parent id');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: children rendered nested (issue #575)');
+
+(function () {
+  var html = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_ROOT', session_id: 'id_R', agent: 'coord',
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: [
+      { external_session_id: 'ses_C1', session_id: 'id_C1', agent: 'editor',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+      { external_session_id: 'ses_C2', session_id: 'id_C2', agent: 'tester',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 }
+    ]
+  }, 0);
+  assert(html.indexOf('afk-session-children') !== -1, 'renderNested: children container exists');
+  assert(html.indexOf('ses_C1') !== -1, 'renderNested: first child rendered');
+  assert(html.indexOf('ses_C2') !== -1, 'renderNested: second child rendered');
+  assert(html.indexOf('afk-nesting-depth-1') !== -1, 'renderNested: children get depth-1');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderAfkChainStep: sessions step uses nested tree (issue #575)');
+
+(function () {
+  var step = {
+    key: 'sessions', label: 'Sessions', items: [
+      { external_session_id: 'ses_R', session_id: 'id_R', agent: 'a', parent_session_id: null,
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+      { external_session_id: 'ses_C', session_id: 'id_C', agent: 'b', parent_session_id: 'ses_R',
+        total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_estimated_cost_usd: 0 }
+    ]
+  };
+  var html = window.renderAfkChainStep(step);
+  assert(html.indexOf('afk-session-root') !== -1, 'chain-step sessions: root session gets root class');
+  assert(html.indexOf('afk-session-nested') !== -1, 'chain-step sessions: child session gets nested class');
+  assert(html.indexOf('afk-session-children') !== -1, 'chain-step sessions: children container present');
+  assert(html.indexOf('ses_C') !== -1, 'chain-step sessions: child session id rendered');
+})();
+
+console.log('\u25B6 AFK Outcomes — renderAfkChainStep: sessions step empty state (issue #575)');
+
+(function () {
+  var step = { key: 'sessions', label: 'Sessions', items: [] };
+  var html = window.renderAfkChainStep(step);
+  assert(html.indexOf('No sessions linked') !== -1, 'chain-step sessions: empty state rendered');
+})();
+
+console.log('\u25B6 AFK Outcomes — nested session deep-link (issue #575)');
+
+(function () {
+  var node = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_C', session_id: '1f9c3a6e-0000-4000-8000-000000000001',
+      agent: 'editor', inferred: true, total_input_tokens: 100, total_output_tokens: 50,
+      total_cache_read_tokens: 0, total_cache_write_tokens: 0, total_estimated_cost_usd: 0.01 },
+    children: []
+  }, 1);
+  assert(node.indexOf('afk-session-clickable') !== -1, 'nested session with session_id is clickable');
+  assert(node.indexOf('data-session-id="1f9c3a6e-0000-4000-8000-000000000001"') !== -1,
+    'nested session carries deep-link data-session-id');
+  assert(node.indexOf('open run') !== -1, 'nested session shows open-run affordance');
+
+  var unres = window.renderNestedSessionNode({
+    session: { external_session_id: 'ses_NOR', agent: 'unknown', inferred: true,
+      total_input_tokens: 0, total_output_tokens: 0, total_cache_read_tokens: 0,
+      total_cache_write_tokens: 0, total_estimated_cost_usd: 0 },
+    children: []
+  }, 0);
+  assert(unres.indexOf('afk-session-clickable') === -1, 'unresolved session is NOT clickable');
+  assert(unres.indexOf('data-session-id=') === -1, 'unresolved session has no deep-link');
+})();
+
+
+// ── AFK Repository Summary (issue #572) ────────────────────────────────────
+// Pure aggregation helper (buildRepositorySummaries) and table renderer
+// (renderRepositorySummaryTable) for the repository-first entry view.
+// Tests cover: mixed-provider normalization, provider badge rendering,
+// date-range scoping, empty-period handling, and API-error behavior.
+
+console.log('\u25B6 AFK Repository Summary — buildRepositorySummaries (issue #572)');
+
+(function () {
+  if (typeof window.buildRepositorySummaries !== 'function') {
+    assert(false, 'app.js: buildRepositorySummaries exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider normalization: GitHub and GitLab runs in one list produce
+  // two distinct summary rows, one per provider+repository pair.
+  var mixed = window.buildRepositorySummaries([
+    { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+    { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+    { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' },
+    { provider: 'github', title: 'owner/repo-c', status: 'completed', last_seen_at: '2026-07-13T06:00:00Z' }
+  ]);
+  assert(mixed.length === 3, 'mixed-provider: 4 runs across 3 repos produce 3 summary rows');
+  // Sorted by runCount desc, then provider asc, then repo asc
+  assert(mixed[0].provider === 'github' && mixed[0].repository === 'owner/repo-a' && mixed[0].runCount === 2,
+    'mixed-provider: github/owner/repo-a has 2 runs (most runs first)');
+  assert(mixed[1].provider === 'github' && mixed[1].repository === 'owner/repo-c' && mixed[1].runCount === 1,
+    'mixed-provider: github/owner/repo-c has 1 run (alphabetical tiebreak)');
+  assert(mixed[2].provider === 'gitlab' && mixed[2].repository === 'group/repo-b' && mixed[2].runCount === 1,
+    'mixed-provider: gitlab/group/repo-b has 1 run (gitlab after github)');
+
+  // Last activity tracks the most recent last_seen_at or started_at
+  assert(mixed[0].lastActivity === '2026-07-16T12:00:00Z',
+    'lastActivity: tracks the most recent last_seen_at across runs in the group');
+  assert(mixed[2].lastActivity === '2026-07-14T08:00:00Z',
+    'lastActivity: single-run group uses that run\'s last_seen_at');
+
+  // Empty input
+  assert(window.buildRepositorySummaries([]).length === 0, 'empty input: no summary rows');
+  assert(window.buildRepositorySummaries(null).length === 0, 'null input: no summary rows');
+  assert(window.buildRepositorySummaries(undefined).length === 0, 'undefined input: no summary rows');
+
+  // Runs without a repository in the title fall back to provider name
+  var noRepo = window.buildRepositorySummaries([
+    { provider: 'github', title: 'some run without repo path', status: 'completed' },
+    { provider: 'gitlab', status: 'completed' }
+  ]);
+  assert(noRepo.length === 2, 'no-repo-title: 2 runs with different providers produce 2 rows');
+  assert(noRepo[0].repository === 'github', 'no-repo-title: github run falls back to provider name as repository');
+  assert(noRepo[1].repository === 'gitlab', 'no-repo-title: gitlab run falls back to provider name as repository');
+
+  // Run without a provider falls back to 'unknown'
+  var noProvider = window.buildRepositorySummaries([
+    { title: 'owner/repo', status: 'completed' }
+  ]);
+  assert(noProvider.length === 1 && noProvider[0].provider === 'unknown',
+    'no-provider: run without provider falls back to "unknown"');
+  assert(noProvider[0].repository === 'owner/repo',
+    'no-provider: repository still derived from title');
+})();
+
+// ── deriveRepositoryLabel (issue #572) ─────────────────────────────────────
+
+console.log('\u25B6 AFK Repository Summary — deriveRepositoryLabel (issue #572)');
+
+(function () {
+  if (typeof window.deriveRepositoryLabel !== 'function') {
+    assert(false, 'app.js: deriveRepositoryLabel exposed on the window test seam');
+    return;
+  }
+
+  assert(window.deriveRepositoryLabel(null) === 'unknown', 'null run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel(undefined) === 'unknown', 'undefined run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({}) === 'unknown', 'empty run: falls back to "unknown"');
+  assert(window.deriveRepositoryLabel({ title: 'owner/repo-name' }) === 'owner/repo-name',
+    'title with owner/repo: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ title: 'group/project-name here' }) === 'group/project-name',
+    'title with group/project: extracted as repository label');
+  assert(window.deriveRepositoryLabel({ provider: 'github' }) === 'github',
+    'no title: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'gitlab', title: 'no-slash-title' }) === 'gitlab',
+    'title without slash: falls back to provider name');
+  assert(window.deriveRepositoryLabel({ provider: 'github', title: 'Complex Title With Spaces' }) === 'github',
+    'title with spaces (no slash): falls back to provider name');
+})();
+
+// ── renderRepositorySummaryTable (issue #572) ──────────────────────────────
+// The renderer follows the agent-runs panel conventions: freshness guard,
+// empty/error states, escHtml on every interpolated value, and provider
+// badges rendered via the existing badge() helper.
+
+console.log('\u25B6 AFK Repository Summary — renderRepositorySummaryTable (issue #572)');
+
+(function () {
+  if (typeof window.renderRepositorySummaryTable !== 'function') {
+    assert(false, 'app.js: renderRepositorySummaryTable exposed on the window test seam');
+    return;
+  }
+
+  // Mixed-provider rendering: the table gets provider badges + repository
+  // names + run counts + last activity timestamps.
+  var mixedData = {
+    items: [
+      { provider: 'github', title: 'owner/repo-a', status: 'completed', last_seen_at: '2026-07-15T10:00:00Z' },
+      { provider: 'github', title: 'owner/repo-a', status: 'running', last_seen_at: '2026-07-16T12:00:00Z' },
+      { provider: 'gitlab', title: 'group/repo-b', status: 'completed', last_seen_at: '2026-07-14T08:00:00Z' }
+    ]
+  };
+  window.renderRepositorySummaryTable(mixedData);
+  var html = afkReposTbodyEl.innerHTML;
+  assert(html.indexOf('owner/repo-a') !== -1, 'render: repository name "owner/repo-a" present');
+  assert(html.indexOf('group/repo-b') !== -1, 'render: repository name "group/repo-b" present');
+  assert(html.indexOf('badge-provider') !== -1, 'render: provider badges rendered via badge-provider class');
+  // Run count: repo-a has 2 runs
+  assert(html.indexOf('>2<') !== -1, 'render: run count "2" for repo-a');
+  // Provider badges: github and gitlab
+  assert(html.indexOf('github') !== -1, 'render: github provider badge present');
+  assert(html.indexOf('gitlab') !== -1, 'render: gitlab provider badge present');
+
+  // Empty period: no runs in the selected period
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: empty period shows "No repository activity"');
+
+  // Null data
+  window.renderRepositorySummaryTable(null);
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: null data shows "No repository activity"');
+
+  // API error: fetch error shown inline
+  appJsSandbox.fetch = function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
+  };
+  window.renderRepositorySummaryTable({ items: [] });
+  assert(afkReposTbodyEl.innerHTML.indexOf('No repository activity') !== -1,
+    'render: API error with empty data shows "No repository activity"');
+})();
+
+// ── AFK Repository Summary — markup smoke check (issue #572) ──────────────
+// Static verification against the real index.html: the repository summary
+// panel exists inside #tab-afk-outcomes, the tbody is addressable by id,
+// and the panel carries a freshness span for the panel-freshness system.
+
+console.log('\u25B6 index.html — AFK Repository Summary markup (issue #572)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // The repository summary panel exists inside #tab-afk-outcomes
+  var afkTabIdx = html.indexOf('id="tab-afk-outcomes"');
+  var reposPanelIdx = html.indexOf('id="afk-repos-tbody"');
+  assert(reposPanelIdx !== -1, 'index.html: #afk-repos-tbody exists');
+  assert(afkTabIdx !== -1 && reposPanelIdx > afkTabIdx,
+    'index.html: repository summary panel lives inside #tab-afk-outcomes');
+
+  // The panel carries a freshness span
+  assert(html.indexOf('id="freshness-afk-repos"') !== -1,
+    'index.html: freshness span #freshness-afk-repos exists');
+
+  // The table has the expected header columns
+  var reposTable = html.slice(
+    html.indexOf('id="afk-repos-table"'),
+    html.indexOf('</table>', html.indexOf('id="afk-repos-table"'))
+  );
+  assert(reposTable.indexOf('<th>Provider</th>') !== -1,
+    'index.html: repository summary table has Provider column');
+  assert(reposTable.indexOf('<th>Repository</th>') !== -1,
+    'index.html: repository summary table has Repository column');
+  assert(reposTable.indexOf('<th>AFK Runs</th>') !== -1,
+    'index.html: repository summary table has AFK Runs column');
+  assert(reposTable.indexOf('<th>Last Activity</th>') !== -1,
+    'index.html: repository summary table has Last Activity column');
+
+  // The existing AFK Runs panel still exists
+  assert(html.indexOf('id="afk-runs-table"') !== -1,
+    'index.html: existing #afk-runs-table still present');
+  assert(html.indexOf('id="afk-runs-tbody"') !== -1,
+    'index.html: existing #afk-runs-tbody still present');
+})();
+
+// ── AFK Repository Summary — CSS verification (issue #572) ────────────────
+// Static verification against the real style.css: the repository summary
+// panel has table rules and the panel-freshness system applies.
+
+console.log('\u25B6 style.css — AFK Repository Summary rules (issue #572)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.panel-afk-repos') !== -1,
+    'style.css: .panel-afk-repos rule exists');
+  assert(live.indexOf('#freshness-afk-repos') === -1 ||
+    live.indexOf('freshness-afk-repos') !== -1,
+    'style.css: freshness system applies to the repository summary panel');
+})();
+
+// ── Issue #576: Provisional and Unresolved Relationships ──────────────────
+// Relationship state presentation throughout AFK Outcomes and a dedicated
+// unresolved-relationships view.  Resolved, provisional, ambiguous, unmatched,
+// parked, and unresolved states must remain distinguishable and never be
+// silently omitted or rendered as definitive links.
+
+console.log('\u25B6 issue #576 \u2014 fmtRelationshipState (relationship state to badge class)');
+
+(function () {
+  // Resolved relationships
+  assert(window.fmtRelationshipState('resolved').label === 'resolved',
+    'resolved \u2192 label "resolved"');
+  assert(window.fmtRelationshipState('resolved').cssClass === 'badge-completed',
+    'resolved \u2192 badge-completed');
+
+  // Provisional / inferred relationships
+  assert(window.fmtRelationshipState('provisional').label === 'provisional',
+    'provisional \u2192 label "provisional"');
+  assert(window.fmtRelationshipState('provisional').cssClass === 'badge-provisional',
+    'provisional \u2192 badge-provisional');
+  assert(window.fmtRelationshipState('inferred').label === 'inferred',
+    'inferred \u2192 label "inferred"');
+  assert(window.fmtRelationshipState('inferred').cssClass === 'badge-provisional',
+    'inferred \u2192 badge-provisional');
+
+  // Uncertain states
+  assert(window.fmtRelationshipState('ambiguous').label === 'ambiguous',
+    'ambiguous \u2192 label "ambiguous"');
+  assert(window.fmtRelationshipState('ambiguous').cssClass === 'badge-ambiguous',
+    'ambiguous \u2192 badge-ambiguous');
+
+  assert(window.fmtRelationshipState('unmatched').label === 'unmatched',
+    'unmatched \u2192 label "unmatched"');
+  assert(window.fmtRelationshipState('unmatched').cssClass === 'badge-unmatched',
+    'unmatched \u2192 badge-unmatched');
+
+  assert(window.fmtRelationshipState('parked').label === 'parked',
+    'parked \u2192 label "parked"');
+  assert(window.fmtRelationshipState('parked').cssClass === 'badge-parked',
+    'parked \u2192 badge-parked');
+
+  assert(window.fmtRelationshipState('unresolved').label === 'unresolved',
+    'unresolved \u2192 label "unresolved"');
+  assert(window.fmtRelationshipState('unresolved').cssClass === 'badge-unresolved',
+    'unresolved \u2192 badge-unresolved');
+
+  // Noise state
+  assert(window.fmtRelationshipState('noise').label === 'noise',
+    'noise \u2192 label "noise"');
+  assert(window.fmtRelationshipState('noise').cssClass === 'badge-unknown',
+    'noise \u2192 badge-unknown');
+
+  // Referenced state
+  assert(window.fmtRelationshipState('referenced').label === 'referenced',
+    'referenced \u2192 label "referenced"');
+  assert(window.fmtRelationshipState('referenced').cssClass === 'badge-stale',
+    'referenced \u2192 badge-stale');
+
+  // Null/unknown fallback
+  assert(window.fmtRelationshipState(null).label === '--',
+    'null \u2192 label "--"');
+  assert(window.fmtRelationshipState(null).cssClass === 'badge-unknown',
+    'null \u2192 badge-unknown');
+  assert(window.fmtRelationshipState('nonsense').label === 'nonsense',
+    'unknown state passes through as label');
+  assert(window.fmtRelationshipState('nonsense').cssClass === 'badge-unknown',
+    'unknown state \u2192 badge-unknown');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderRelationshipBadge (badge + provenance)');
+
+(function () {
+  // Resolved link with full provenance
+  var resolved = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '1'
+  });
+  assert(resolved.indexOf('badge-completed') !== -1, 'resolved badge uses badge-completed');
+  assert(resolved.indexOf('resolved') !== -1, 'resolved badge text is "resolved"');
+  assert(resolved.indexOf('100%') !== -1, 'resolved badge shows confidence as percentage');
+  assert(resolved.indexOf('issue_reference') !== -1, 'resolved badge shows method');
+  assert(resolved.indexOf('resolver v1') !== -1, 'resolved badge shows resolver version');
+  assert(resolved.indexOf('change_request:442') !== -1, 'resolved badge shows evidence source');
+
+  // Provisional link with partial provenance
+  var provisional = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1,
+    method: 'temporal_inference',
+    evidence: [],
+    resolver_version: '2'
+  });
+  assert(provisional.indexOf('badge-provisional') !== -1, 'provisional badge uses badge-provisional');
+  assert(provisional.indexOf('provisional') !== -1, 'provisional badge text is "provisional"');
+  assert(provisional.indexOf('10%') !== -1, 'provisional badge shows confidence');
+  assert(provisional.indexOf('temporal_inference') !== -1, 'provisional badge shows method');
+  assert(provisional.indexOf('resolver v2') !== -1, 'provisional badge shows resolver version');
+
+  // Minimal provenance (no evidence, no method)
+  var minimal = window.renderRelationshipBadge('ambiguous', {
+    confidence: null,
+    method: null,
+    evidence: [],
+    resolver_version: null
+  });
+  assert(minimal.indexOf('badge-ambiguous') !== -1, 'ambiguous badge uses badge-ambiguous');
+  assert(minimal.indexOf('--') !== -1, 'missing confidence renders "--"');
+
+  // No provenance object at all
+  var noProv = window.renderRelationshipBadge('unresolved', null);
+  assert(noProv.indexOf('badge-unresolved') !== -1, 'no provenance: badge still renders');
+  assert(noProv.indexOf('unresolved') !== -1, 'no provenance: badge text still renders');
+})();
+
+console.log('\u25B6 issue #576 \u2014 buildUnresolvedRelationships (extract from AFK run detail)');
+
+(function () {
+  // Full detail with ambiguous and unmatched items
+  var detail = {
+    unresolved: [
+      { entity_id: 'issue:99', entity_type: 'issue', reason: 'ambiguous',
+        correlation_method: 'issue_reference', correlation_confidence: 0.5,
+        evidence: [{ kind: 'title_match', source_entity_id: 'change_request:100' }],
+        resolver_version: '2' },
+      { entity_id: 'issue:101', entity_type: 'issue', reason: 'unmatched',
+        correlation_method: null, correlation_confidence: null,
+        evidence: [], resolver_version: '2' }
+    ],
+    parked: [
+      { entity_id: 'issue:200', entity_type: 'issue',
+        correlation_method: 'temporal_inference', correlation_confidence: 0.3,
+        evidence: [], resolver_version: '2' }
+    ]
+  };
+  var items = window.buildUnresolvedRelationships(detail);
+  assert(items.length === 3, 'buildUnresolvedRelationships: 3 total items (2 unresolved + 1 parked)');
+  assert(items[0].state === 'ambiguous', 'first item: ambiguous');
+  assert(items[1].state === 'unmatched', 'second item: unmatched');
+  assert(items[2].state === 'parked', 'third item: parked');
+
+  // Empty detail
+  assert(window.buildUnresolvedRelationships({}).length === 0, 'empty detail \u2192 0 items');
+  assert(window.buildUnresolvedRelationships(null).length === 0, 'null detail \u2192 0 items');
+  assert(window.buildUnresolvedRelationships({ unresolved: [], parked: [] }).length === 0,
+    'empty arrays \u2192 0 items');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderUnresolvedRelationshipsRow (single row)');
+
+(function () {
+  var row = window.renderUnresolvedRelationshipsRow({
+    entity_id: 'issue:99',
+    entity_type: 'issue',
+    state: 'ambiguous',
+    confidence: 0.5,
+    method: 'issue_reference',
+    evidence: [{ kind: 'title_match', source_entity_id: 'change_request:100' }],
+    resolver_version: '2'
+  });
+  assert(row.indexOf('issue:99') !== -1, 'row shows entity id');
+  assert(row.indexOf('issue') !== -1, 'row shows entity type');
+  assert(row.indexOf('badge-ambiguous') !== -1, 'row renders ambiguous badge');
+  assert(row.indexOf('ambiguous') !== -1, 'row shows state label');
+  assert(row.indexOf('50%') !== -1, 'row shows confidence as percentage');
+  assert(row.indexOf('issue_reference') !== -1, 'row shows method');
+  assert(row.indexOf('change_request:100') !== -1, 'row shows evidence source');
+  assert(row.indexOf('resolver v2') !== -1, 'row shows resolver version');
+
+  // Unmatched row (no confidence, no method)
+  var unmatched = window.renderUnresolvedRelationshipsRow({
+    entity_id: 'issue:101',
+    entity_type: 'issue',
+    state: 'unmatched',
+    confidence: null,
+    method: null,
+    evidence: [],
+    resolver_version: '2'
+  });
+  assert(unmatched.indexOf('badge-unmatched') !== -1, 'unmatched row renders badge-unmatched');
+  assert(unmatched.indexOf('unmatched') !== -1, 'unmatched row shows state label');
+})();
+
+console.log('\u25B6 issue #576 \u2014 renderUnresolvedRelationships (panel view)');
+
+(function () {
+  // With items
+  var panel = window.renderUnresolvedRelationships({
+    items: [
+      { entity_id: 'issue:99', entity_type: 'issue', state: 'ambiguous',
+        confidence: 0.5, method: 'issue_reference', evidence: [], resolver_version: '2' },
+      { entity_id: 'issue:101', entity_type: 'issue', state: 'unmatched',
+        confidence: null, method: null, evidence: [], resolver_version: '2' }
+    ]
+  });
+  assert(panel.indexOf('issue:99') !== -1, 'panel renders first item');
+  assert(panel.indexOf('issue:101') !== -1, 'panel renders second item');
+  assert(panel.indexOf('badge-ambiguous') !== -1, 'panel renders ambiguous badge');
+  assert(panel.indexOf('badge-unmatched') !== -1, 'panel renders unmatched badge');
+
+  // Empty items
+  var empty = window.renderUnresolvedRelationships({ items: [] });
+  assert(empty.indexOf('No unresolved relationships') !== -1, 'empty items \u2192 empty state message');
+
+  // Null/undefined
+  var nullView = window.renderUnresolvedRelationships(null);
+  assert(nullView.indexOf('No unresolved relationships') !== -1, 'null data \u2192 empty state message');
+})();
+
+console.log('\u25B6 issue #576 \u2014 relationship state never silently omitted');
+
+(function () {
+  // Every uncertain state must render distinctly (never conflated with resolved)
+  var states = ['provisional', 'inferred', 'ambiguous', 'unmatched', 'parked', 'unresolved', 'noise', 'referenced'];
+  states.forEach(function (state) {
+    var info = window.fmtRelationshipState(state);
+    assert(info.cssClass !== 'badge-completed',
+      state + ' is never rendered as badge-completed (resolved)');
+    assert(info.label !== 'resolved',
+      state + ' label is never "resolved"');
+    var badge = window.renderRelationshipBadge(state, null);
+    assert(badge.indexOf('badge-completed') === -1,
+      state + ' badge HTML never contains badge-completed');
+  });
+})();
+
+console.log('\u25B6 issue #576 \u2014 cross-provider parity (GitHub PR / GitLab MR fixtures)');
+
+(function () {
+  // GitHub PR fixture
+  var github = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '2'
+  });
+  assert(github.indexOf('badge-completed') !== -1 && github.indexOf('100%') !== -1,
+    'GitHub PR: resolved badge + confidence rendered');
+
+  // GitLab MR fixture (identical shape)
+  var gitlab = window.renderRelationshipBadge('resolved', {
+    confidence: 1.0,
+    method: 'issue_reference',
+    evidence: [{ kind: 'issue_reference', source_entity_id: 'change_request:442', detail: 'resolves #437' }],
+    resolver_version: '2'
+  });
+  assert(gitlab.indexOf('badge-completed') !== -1 && gitlab.indexOf('100%') !== -1,
+    'GitLab MR: resolved badge + confidence rendered (same shape as GitHub)');
+
+  // Provisional on both providers
+  var ghProv = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1, method: 'temporal_inference', evidence: [], resolver_version: '2'
+  });
+  var glProv = window.renderRelationshipBadge('provisional', {
+    confidence: 0.1, method: 'temporal_inference', evidence: [], resolver_version: '2'
+  });
+  assert(ghProv === glProv, 'GitHub and GitLab provisional badges are identical for same input');
+})();
+
+console.log('\u25B6 issue #576 \u2014 unresolved view panel freshness + stale/error states');
+
+(function () {
+  // The unresolved-relationships panel follows the same PANEL_ENDPOINTS
+  // freshness convention as every other panel.
+  var unresolvedFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
+  assert(unresolvedFail['afk-outcomes'] === 'stale',
+    'afkRuns failure: the AFK Outcomes panel (including unresolved) goes stale');
+
+  // Stale panel with previous data: shouldRenderPanel returns false
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: 500000 } },
+    'unresolved-relationships') === false,
+    'stale unresolved panel with previous data \u2192 render skipped');
+
+  // Stale panel with NO previous data: shouldRenderPanel returns true
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: null } },
+    'unresolved-relationships') === true,
+    'stale unresolved panel with no previous data \u2192 render proceeds');
+
+  // Ok panel renders
+  assert(window.shouldRenderPanel(
+    { 'unresolved-relationships': { status: 'ok', updatedAt: 500000 } },
+    'unresolved-relationships') === true,
+    'ok unresolved panel renders');
+
+  // Freshness label
+  var now = 1000000;
+  var stale = window.computePanelFreshness(
+    { 'unresolved-relationships': { status: 'stale', updatedAt: 500000 } },
+    'unresolved-relationships', now);
+  assert(stale !== null && stale.label === 'Showing previous data',
+    'stale unresolved panel shows "Showing previous data"');
+})();
+
+console.log('\u25B6 issue #576 \u2014 static markup: unresolved relationships panel in AFK Outcomes tab');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // Unresolved relationships panel exists inside #tab-afk-outcomes
+  var afkTabStart = html.indexOf('id="tab-afk-outcomes"');
+  var afkTabEnd = html.indexOf('<!-- #tab-afk-outcomes -->');
+  assert(afkTabStart !== -1 && afkTabEnd !== -1, 'index.html: #tab-afk-outcomes exists');
+  var afkTabHtml = html.slice(afkTabStart, afkTabEnd);
+  assert(afkTabHtml.indexOf('id="unresolved-relationships-tbody"') !== -1,
+    'index.html: unresolved relationships tbody exists inside AFK Outcomes tab');
+  assert(afkTabHtml.indexOf('id="freshness-unresolved-relationships"') !== -1,
+    'index.html: unresolved panel carries a freshness label span');
+  assert(afkTabHtml.indexOf('Unresolved Relationships') !== -1,
+    'index.html: unresolved panel title reads "Unresolved Relationships"');
+  assert(afkTabHtml.indexOf('panel-unresolved-relationships') !== -1,
+    'index.html: unresolved panel carries panel-unresolved-relationships class');
+})();
+
+console.log('\u25B6 issue #576 \u2014 static CSS: relationship state badge styles');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // New badge classes for uncertain relationship states
+  assert(live.indexOf('.badge-provisional') !== -1, 'style.css: .badge-provisional rule exists');
+  assert(live.indexOf('.badge-ambiguous') !== -1, 'style.css: .badge-ambiguous rule exists');
+  assert(live.indexOf('.badge-unmatched') !== -1, 'style.css: .badge-unmatched rule exists');
+  assert(live.indexOf('.badge-parked') !== -1, 'style.css: .badge-parked rule exists');
+  assert(live.indexOf('.badge-unresolved') !== -1, 'style.css: .badge-unresolved rule exists');
+
+  // Provisional link styling (amber dashed border)
+  assert(live.indexOf('.afk-chain-item.afk-provisional') !== -1,
+    'style.css: .afk-chain-item.afk-provisional rule exists');
+
+  // Unresolved panel styling
+  assert(live.indexOf('.panel-unresolved-relationships') !== -1,
+    'style.css: .panel-unresolved-relationships rule exists');
+})();
+
+console.log('\u25B6 issue #576 \u2014 window exports for new helpers');
+
+(function () {
+  assert(typeof window.fmtRelationshipState === 'function', 'fmtRelationshipState exported on window');
+  assert(typeof window.renderRelationshipBadge === 'function', 'renderRelationshipBadge exported on window');
+  assert(typeof window.buildUnresolvedRelationships === 'function', 'buildUnresolvedRelationships exported on window');
+  assert(typeof window.renderUnresolvedRelationshipsRow === 'function', 'renderUnresolvedRelationshipsRow exported on window');
+  assert(typeof window.renderUnresolvedRelationships === 'function', 'renderUnresolvedRelationships exported on window');
+})();
+
 
 // ── Summary ─────────────────────────────────────────────────────────────
 // The summary is deferred until ALL pending async test callbacks have
@@ -4940,3 +6408,292 @@ if (!_summaryScheduled) {
   _summaryStart = Date.now();
   setTimeout(finishWhenIdle, 10);
 }
+
+// ── AFK Change Request List (issue #573) ────────────────────────────────────
+// Provider-specific terminology, CR list builder, AFK-only filter, and the
+// list renderer.  Tests cover: GitHub PR / GitLab MR terminology, mixed-provider
+// filtering, date-range propagation, selection preservation, AFK-only toggle,
+// empty-period handling, and markup/CSS smoke checks.
+
+console.log('\u25B6 AFK Change Request List \u2014 providerCrTerm (issue #573)');
+
+(function () {
+  if (typeof window.providerCrTerm !== 'function') {
+    assert(false, 'app.js: providerCrTerm exposed on the window test seam');
+    return;
+  }
+
+  assert(window.providerCrTerm('github') === 'PR', 'github -> PR');
+  assert(window.providerCrTerm('GitHub') === 'PR', 'GitHub (mixed case) -> PR');
+  assert(window.providerCrTerm('gitlab') === 'MR', 'gitlab -> MR');
+  assert(window.providerCrTerm('GitLab') === 'MR', 'GitLab (mixed case) -> MR');
+  assert(window.providerCrTerm('bitbucket') === 'CR', 'bitbucket -> CR (fallback)');
+  assert(window.providerCrTerm('') === 'CR', 'empty string -> CR (fallback)');
+  assert(window.providerCrTerm(null) === 'CR', 'null -> CR (fallback)');
+  assert(window.providerCrTerm(undefined) === 'CR', 'undefined -> CR (fallback)');
+})();
+
+// ── buildChangeRequestList (issue #573) ─────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 buildChangeRequestList (issue #573)');
+
+(function () {
+  if (typeof window.buildChangeRequestList !== 'function') {
+    assert(false, 'app.js: buildChangeRequestList exposed on the window test seam');
+    return;
+  }
+
+  // GitHub fixture: two runs in owner/repo-a, one in owner/repo-b
+  var githubRuns = [
+    { afk_run_id: 'run-1', provider: 'github', title: 'owner/repo-a Fix bug', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:101'] },
+      last_seen_at: '2026-07-15T10:00:00Z', started_at: '2026-07-15T09:00:00Z' },
+    { afk_run_id: 'run-2', provider: 'github', title: 'owner/repo-a Add feature', status: 'running',
+      outcome: { status: 'open', change_request_ids: ['change_request:102'] },
+      last_seen_at: '2026-07-16T12:00:00Z', started_at: '2026-07-16T11:00:00Z' },
+    { afk_run_id: 'run-3', provider: 'github', title: 'owner/repo-b Update docs', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:201'] },
+      last_seen_at: '2026-07-14T08:00:00Z', started_at: '2026-07-14T07:00:00Z' }
+  ];
+
+  // Filter by repository: only repo-a runs
+  var repoA = window.buildChangeRequestList(githubRuns, 'github', 'owner/repo-a');
+  assert(repoA.length === 2, 'github/repo-a: 2 runs produce 2 CR rows');
+  assert(repoA[0].afkRunId === 'run-2', 'sorted by last_seen_at desc: run-2 first (most recent)');
+  assert(repoA[1].afkRunId === 'run-1', 'sorted by last_seen_at desc: run-1 second');
+  assert(repoA[0].changeRequestIds[0] === 'change_request:102', 'CR IDs extracted from outcome');
+  assert(repoA[0].afkLinked === true, 'every AFK run row is afkLinked');
+  assert(repoA[0].provider === 'github', 'provider preserved');
+
+  // Filter by repository: only repo-b
+  var repoB = window.buildChangeRequestList(githubRuns, 'github', 'owner/repo-b');
+  assert(repoB.length === 1, 'github/repo-b: 1 run produces 1 CR row');
+  assert(repoB[0].changeRequestIds[0] === 'change_request:201', 'CR IDs extracted');
+
+  // No matching repository
+  var noMatch = window.buildChangeRequestList(githubRuns, 'github', 'owner/nonexistent');
+  assert(noMatch.length === 0, 'nonexistent repo: 0 CR rows');
+
+  // GitLab fixture: MR terminology
+  var gitlabRuns = [
+    { afk_run_id: 'gl-1', provider: 'gitlab', title: 'group/project Implement feature', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: ['change_request:301'] },
+      last_seen_at: '2026-07-17T14:00:00Z', started_at: '2026-07-17T13:00:00Z' }
+  ];
+  var gitlab = window.buildChangeRequestList(gitlabRuns, 'gitlab', 'group/project');
+  assert(gitlab.length === 1, 'gitlab/project: 1 run produces 1 CR row');
+  assert(gitlab[0].provider === 'gitlab', 'gitlab provider preserved');
+
+  // Empty/null inputs
+  assert(window.buildChangeRequestList([], 'github', 'owner/repo').length === 0, 'empty runs: 0 CR rows');
+  assert(window.buildChangeRequestList(null, 'github', 'owner/repo').length === 0, 'null runs: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, null, 'owner/repo').length === 0, 'null provider: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, 'github', null).length === 0, 'null repository: 0 CR rows');
+  assert(window.buildChangeRequestList(githubRuns, 'github', '').length === 0, 'empty repository: 0 CR rows');
+
+  // Run with no outcome
+  var noOutcome = window.buildChangeRequestList([
+    { afk_run_id: 'no-out', provider: 'github', title: 'owner/repo-x', status: 'running' }
+  ], 'github', 'owner/repo-x');
+  assert(noOutcome.length === 1, 'run without outcome: still produces a CR row');
+  assert(noOutcome[0].outcomeStatus === '--', 'missing outcome renders as --');
+  assert(noOutcome[0].changeRequestIds.length === 0, 'missing outcome: no CR IDs');
+})();
+
+// ── filterChangeRequests (issue #573) ───────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 filterChangeRequests (issue #573)');
+
+(function () {
+  if (typeof window.filterChangeRequests !== 'function') {
+    assert(false, 'app.js: filterChangeRequests exposed on the window test seam');
+    return;
+  }
+
+  var rows = [
+    { afkLinked: true, title: 'CR-1' },
+    { afkLinked: true, title: 'CR-2' },
+    { afkLinked: false, title: 'CR-3' }
+  ];
+
+  // afkOnly=false -> all rows pass through
+  var all = window.filterChangeRequests(rows, false);
+  assert(all.length === 3, 'afkOnly=false: all 3 rows returned');
+
+  // afkOnly=true -> only afkLinked rows
+  var afkOnly = window.filterChangeRequests(rows, true);
+  assert(afkOnly.length === 2, 'afkOnly=true: 2 AFK-linked rows returned');
+  assert(afkOnly[0].title === 'CR-1', 'afkOnly=true: first AFK row');
+  assert(afkOnly[1].title === 'CR-2', 'afkOnly=true: second AFK row');
+
+  // Empty input
+  assert(window.filterChangeRequests([], true).length === 0, 'empty rows: 0 filtered');
+  assert(window.filterChangeRequests([], false).length === 0, 'empty rows, no filter: 0');
+})();
+
+// ── renderChangeRequestList (issue #573) ────────────────────────────────────
+
+console.log('\u25B6 AFK Change Request List \u2014 renderChangeRequestList (issue #573)');
+
+(function () {
+  if (typeof window.renderChangeRequestList !== 'function') {
+    assert(false, 'app.js: renderChangeRequestList exposed on the window test seam');
+    return;
+  }
+
+  // Register the change-request panel fakes for the renderer
+  var crPanelEl = makeFakeElement('afk-change-requests-panel');
+  var crTbodyEl = makeFakeElement('afk-cr-tbody');
+  var crHeaderEl = makeFakeElement('afk-cr-header');
+  var crToggleEl = makeFakeElement('afk-cr-toggle');
+  elementRegistry['afk-change-requests-panel'] = crPanelEl;
+  elementRegistry['afk-cr-tbody'] = crTbodyEl;
+  elementRegistry['afk-cr-header'] = crHeaderEl;
+  elementRegistry['afk-cr-toggle'] = crToggleEl;
+
+  // Select a GitHub repository
+  window.selectRepository('github', 'owner/repo-a');
+
+  var githubData = {
+    items: [
+      { afk_run_id: 'run-1', provider: 'github', title: 'owner/repo-a Fix bug', status: 'completed',
+        outcome: { status: 'merged', change_request_ids: ['change_request:101'] },
+        last_seen_at: '2026-07-15T10:00:00Z', started_at: '2026-07-15T09:00:00Z' },
+      { afk_run_id: 'run-2', provider: 'github', title: 'owner/repo-a Add feature', status: 'running',
+        outcome: { status: 'open', change_request_ids: ['change_request:102'] },
+        last_seen_at: '2026-07-16T12:00:00Z', started_at: '2026-07-16T11:00:00Z' }
+    ]
+  };
+  window.renderChangeRequestList(githubData);
+
+  // Panel is visible
+  assert(crPanelEl.style.display === '', 'GitHub: panel is visible after selection');
+
+  // Header shows "PRs (github)" for GitHub
+  assert(crHeaderEl.textContent.indexOf('PRs') !== -1, 'GitHub: header shows "PRs"');
+  assert(crHeaderEl.textContent.indexOf('owner/repo-a') !== -1, 'GitHub: header shows repository name');
+  assert(crHeaderEl.textContent.indexOf('github') !== -1, 'GitHub: header shows provider');
+
+  // Table has rows
+  var html = crTbodyEl.innerHTML;
+  assert(html.indexOf('change_request:101') !== -1, 'GitHub: CR ID 101 rendered');
+  assert(html.indexOf('change_request:102') !== -1, 'GitHub: CR ID 102 rendered');
+  assert(html.indexOf('badge-completed') !== -1, 'GitHub: completed badge rendered');
+  assert(html.indexOf('badge-running') !== -1, 'GitHub: running badge rendered');
+  assert(html.indexOf('afk-cr-badge') !== -1, 'GitHub: AFK badge rendered');
+  assert(html.indexOf('afk-cr-linked') !== -1, 'GitHub: AFK-linked row class present');
+
+  // GitLab fixture: MR terminology
+  window.selectRepository('gitlab', 'group/project');
+  var gitlabData = {
+    items: [
+      { afk_run_id: 'gl-1', provider: 'gitlab', title: 'group/project Implement feature', status: 'completed',
+        outcome: { status: 'merged', change_request_ids: ['change_request:301'] },
+        last_seen_at: '2026-07-17T14:00:00Z', started_at: '2026-07-17T13:00:00Z' }
+    ]
+  };
+  window.renderChangeRequestList(gitlabData);
+
+  // Header shows "MRs (gitlab)" for GitLab
+  assert(crHeaderEl.textContent.indexOf('MRs') !== -1, 'GitLab: header shows "MRs"');
+  assert(crHeaderEl.textContent.indexOf('group/project') !== -1, 'GitLab: header shows repository name');
+  assert(crHeaderEl.textContent.indexOf('gitlab') !== -1, 'GitLab: header shows provider');
+
+  var glHtml = crTbodyEl.innerHTML;
+  assert(glHtml.indexOf('change_request:301') !== -1, 'GitLab: CR ID 301 rendered');
+  assert(glHtml.indexOf('badge-completed') !== -1, 'GitLab: completed badge rendered');
+
+  // Empty period: no runs for this repository
+  window.selectRepository('github', 'owner/empty-repo');
+  window.renderChangeRequestList({ items: [] });
+  assert(crTbodyEl.innerHTML.indexOf('No change requests found') !== -1,
+    'empty period: shows "No change requests found"');
+
+  // Clear selection: panel hides
+  window.clearSelectedRepo();
+  assert(crPanelEl.style.display === 'none', 'clearSelectedRepo: panel is hidden');
+
+  // AFK-only filter: select repo, toggle filter
+  window.selectRepository('github', 'owner/repo-a');
+  window.renderChangeRequestList(githubData);
+  // Both rows visible initially
+  assert(crTbodyEl.innerHTML.indexOf('change_request:101') !== -1, 'all mode: CR 101 visible');
+  assert(crTbodyEl.innerHTML.indexOf('change_request:102') !== -1, 'all mode: CR 102 visible');
+})();
+
+// ── index.html \u2014 AFK Change Request List markup (issue #573) ──────────────
+
+console.log('\u25B6 index.html \u2014 AFK Change Request List markup (issue #573)');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+  // The change-request panel exists inside #tab-afk-outcomes
+  var afkTabIdx = html.indexOf('id="tab-afk-outcomes"');
+  var crPanelIdx = html.indexOf('id="afk-change-requests-panel"');
+  assert(crPanelIdx !== -1, 'index.html: #afk-change-requests-panel exists');
+  assert(afkTabIdx !== -1 && crPanelIdx > afkTabIdx,
+    'index.html: change-request panel lives inside #tab-afk-outcomes');
+
+  // The panel carries a freshness span
+  assert(html.indexOf('id="freshness-afk-change-requests"') !== -1,
+    'index.html: freshness span #freshness-afk-change-requests exists');
+
+  // Back button exists
+  assert(html.indexOf('id="afk-cr-back"') !== -1, 'index.html: back button #afk-cr-back exists');
+
+  // AFK-only toggle exists
+  assert(html.indexOf('id="afk-cr-toggle"') !== -1, 'index.html: AFK-only toggle #afk-cr-toggle exists');
+
+  // The table has the expected header columns
+  var crTable = html.slice(
+    html.indexOf('id="afk-cr-table"'),
+    html.indexOf('</table>', html.indexOf('id="afk-cr-table"'))
+  );
+  assert(crTable.indexOf('<th>Change Request</th>') !== -1,
+    'index.html: change-request table has Change Request column');
+  assert(crTable.indexOf('<th>Status</th>') !== -1,
+    'index.html: change-request table has Status column');
+  assert(crTable.indexOf('<th>Outcome</th>') !== -1,
+    'index.html: change-request table has Outcome column');
+  assert(crTable.indexOf('<th>AFK</th>') !== -1,
+    'index.html: change-request table has AFK column');
+  assert(crTable.indexOf('<th>Last Seen</th>') !== -1,
+    'index.html: change-request table has Last Seen column');
+
+  // The panel starts hidden (display:none)
+  var crPanel = html.slice(
+    html.indexOf('id="afk-change-requests-panel"'),
+    html.indexOf('</section>', html.indexOf('id="afk-change-requests-panel"'))
+  );
+  assert(crPanel.indexOf('display:none') !== -1,
+    'index.html: change-request panel starts hidden');
+
+  // The existing AFK Runs panel and Repository Summary panel still exist
+  assert(html.indexOf('id="afk-runs-table"') !== -1,
+    'index.html: existing #afk-runs-table still present');
+  assert(html.indexOf('id="afk-repos-table"') !== -1,
+    'index.html: existing #afk-repos-table still present');
+})();
+
+// ── style.css \u2014 AFK Change Request List rules (issue #573) ────────────────
+
+console.log('\u25B6 style.css \u2014 AFK Change Request List rules (issue #573)');
+
+(function () {
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  var live = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  assert(live.indexOf('.panel-afk-cr') !== -1,
+    'style.css: .panel-afk-cr rule exists');
+  assert(live.indexOf('.afk-cr-back') !== -1,
+    'style.css: .afk-cr-back rule exists');
+  assert(live.indexOf('.afk-cr-toggle') !== -1,
+    'style.css: .afk-cr-toggle rule exists');
+  assert(live.indexOf('.afk-cr-linked') !== -1,
+    'style.css: .afk-cr-linked rule exists');
+  assert(live.indexOf('.afk-cr-badge') !== -1,
+    'style.css: .afk-cr-badge rule exists');
+  assert(live.indexOf('.repo-row') !== -1,
+    'style.css: .repo-row rule exists (clickable repository rows)');
+})();

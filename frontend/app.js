@@ -84,11 +84,20 @@
     afkDetailBody:   $('afk-detail-body'),
     afkDetailClose:  $('afk-detail-close'),
 
+    // Unresolved Relationships (issue #576)
+    unresolvedTbody: $('unresolved-relationships-tbody'),
+
     // Date range bar
     drPreset:       $('dr-preset'),
     drCustomInputs: $('dr-custom-inputs'),
     drStartDate:    $('dr-start-date'),
     drEndDate:      $('dr-end-date'),
+
+    // Change Request Provenance Timeline (issue #574)
+    crProvOverlay:     $('cr-prov-overlay'),
+    crProvTitle:       $('cr-prov-title'),
+    crProvBody:        $('cr-prov-body'),
+    crProvClose:       $('cr-prov-close'),
 
     // Transcript view (issue #469)
     trSessionInput:    $('tr-session-input'),
@@ -112,6 +121,7 @@
   let agentRunsFetchError = null; // per-cycle fetch error for agent runs
   let afkRunsData = null;         // latest AFK runs list response
   let afkRunsFetchError = null;   // per-cycle fetch error for AFK runs
+  let unresolvedRelationshipsData = null; // latest unresolved relationships data
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -166,6 +176,7 @@
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
     'afk-outcomes':  ['afkRuns'],
+    'unresolved-relationships': ['afkRuns'],
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -682,6 +693,269 @@
     return '--';
   }
 
+  // ── AFK Repository Summary helpers (issue #572) ───────────────────────
+  // Aggregates AFK runs into a repository-first summary list: one row per
+  // unique (provider, repository) pair, showing AFK activity counts,
+  // provider identity, and last-activity timestamps.  Pure helpers — no DOM
+  // access — so the Node test harness exercises them through the window
+  // test seam.
+
+  /** Derive a repository label from an AFK run's dedicated repository field,
+   *  or its title and metadata. Falls back to provider name when no
+   *  repository can be resolved. Pure — no DOM or fetch access.
+   *  @param {Object} run - AFK run item from the API
+   *  @returns {string} a normalized repository label */
+  function deriveRepositoryLabel(run) {
+    if (!run) return 'unknown';
+    // Prefer a dedicated repository field from the API response
+    if (run.repository) return run.repository;
+    // Fallback: parse repository from title (e.g. "owner/repo: Fix bug")
+    var title = run.title || '';
+    var match = title.match(/^([a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+)/);
+    if (match) return match[1];
+    // Fall back to provider name
+    return run.provider || 'unknown';
+  }
+
+  /** Build repository summary rows from an AFK runs list.
+   *  Pure: aggregates runs by (provider, repository) without DOM access.
+   *  @param {Array|null} runs - AFK runs items from the API
+   *  @returns {Array<{provider: string, repository: string, runCount: number,
+   *           lastActivity: string|null}>} sorted by runCount desc,
+   *           then provider asc, then repository asc */
+  function buildRepositorySummaries(runs) {
+    if (!runs || !Array.isArray(runs) || runs.length === 0) return [];
+    var groups = {};
+    runs.forEach(function (r) {
+      var provider = (r && r.provider) || 'unknown';
+      var repository = deriveRepositoryLabel(r);
+      var key = provider + '|' + repository;
+      if (!groups[key]) {
+        groups[key] = {
+          provider: provider,
+          repository: repository,
+          runCount: 0,
+          lastActivity: null
+        };
+      }
+      groups[key].runCount++;
+      var seen = r.last_seen_at || r.started_at;
+      if (seen && (!groups[key].lastActivity || seen > groups[key].lastActivity)) {
+        groups[key].lastActivity = seen;
+      }
+    });
+    return Object.keys(groups).map(function (k) { return groups[k]; })
+      .sort(function (a, b) {
+        if (b.runCount !== a.runCount) return b.runCount - a.runCount;
+        if (a.provider !== b.provider) return a.provider < b.provider ? -1 : 1;
+        return a.repository < b.repository ? -1 : (a.repository > b.repository ? 1 : 0);
+      });
+  }
+
+  /** Make the repository summary table rows clickable (issue #573).
+   *  Each row fires selectRepository(provider, repository) on click,
+   *  transitioning to the change-request list view for that repository. */
+  function renderRepositorySummaryTable(data) {
+    applyPanelFreshness('afk-repos');
+    if (!shouldRenderPanel(panelStates, 'afk-repos')) return;
+
+    var reposEl = $('afk-repos-tbody');
+    if (!reposEl) return;
+
+    var runs = data && data.items;
+    var summaries = buildRepositorySummaries(runs);
+
+    if (summaries.length === 0) {
+      var errSuffix = afkRunsFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkRunsFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      reposEl.innerHTML = '<tr><td colspan="4" class="empty-state">No repository activity' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    summaries.forEach(function (s) {
+      var providerBadge = badge(s.provider, 'badge-provider').outerHTML;
+      html += '<tr class="repo-row clickable" data-provider="' + escHtml(s.provider) + '" data-repository="' + escHtml(s.repository) + '" tabindex="0">' +
+        '<td>' + providerBadge + '</td>' +
+        '<td>' + escHtml(s.repository) + '</td>' +
+        '<td>' + fmtNum(s.runCount) + '</td>' +
+        '<td>' + fmtDT(s.lastActivity) + '</td>' +
+        '</tr>';
+    });
+
+    reposEl.innerHTML = html;
+
+    // Wire click + keyboard handlers for repository selection
+    var rows = reposEl.querySelectorAll('.repo-row');
+    rows.forEach(function (row) {
+      row.addEventListener('click', function () {
+        var provider = row.getAttribute('data-provider');
+        var repository = row.getAttribute('data-repository');
+        if (provider && repository) selectRepository(provider, repository);
+      });
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var provider = row.getAttribute('data-provider');
+          var repository = row.getAttribute('data-repository');
+          if (provider && repository) selectRepository(provider, repository);
+        }
+      });
+    });
+  }
+
+  // ── AFK Change Request List helpers (issue #573) ──────────────────────
+  // When a repository is selected in the Repository Summary, show all AFK
+  // runs for that repository as change requests (GitHub PRs / GitLab MRs).
+  // Uses canonical change_request vocabulary with provider-specific labels
+  // (PR for GitHub, MR for GitLab).  Pure helpers — no DOM access.
+
+  /** Derive the provider-specific term for a change request.
+   *  GitHub -> "PR", GitLab -> "MR", anything else -> "CR".
+   *  Pure — no DOM or fetch access.
+   *  @param {string} provider
+   *  @returns {string} e.g. "PR", "MR", "CR" */
+  function providerCrTerm(provider) {
+    var p = (provider || '').toLowerCase();
+    if (p === 'github') return 'PR';
+    if (p === 'gitlab') return 'MR';
+    return 'CR';
+  }
+
+  /** Build change-request rows for a selected repository from AFK runs.
+   *  Pure: filters runs by (provider, repository) and extracts change-request
+   *  details from each run's outcome.  Returns rows sorted by last_seen_at
+   *  descending (most recent first).
+   *  @param {Array|null} runs   - AFK runs items from the API
+   *  @param {string} provider   - the repository's provider
+   *  @param {string} repository - the repository label
+   *  @returns {Array<{afkRunId, title, status, outcomeStatus, changeRequestIds,
+   *           provider, repository, lastSeenAt, startedAt, afkLinked}>}
+   */
+  function buildChangeRequestList(runs, provider, repository) {
+    if (!runs || !Array.isArray(runs) || !provider || !repository) return [];
+    return runs
+      .filter(function (r) {
+        if (!r) return false;
+        var runProvider = (r.provider || '').toLowerCase();
+        var runRepo = deriveRepositoryLabel(r);
+        return runProvider === provider.toLowerCase() && runRepo === repository;
+      })
+      .map(function (r) {
+        var outcome = r.outcome || null;
+        return {
+          afkRunId: r.afk_run_id || null,
+          title: r.title || r.afk_run_id || '--',
+          status: r.status || '--',
+          outcomeStatus: outcome ? (outcome.status || '--') : '--',
+          changeRequestIds: outcome && outcome.change_request_ids ? outcome.change_request_ids : [],
+          provider: r.provider || 'unknown',
+          repository: repository,
+          lastSeenAt: r.last_seen_at || null,
+          startedAt: r.started_at || null,
+          afkLinked: true // every AFK run is AFK-linked by definition
+        };
+      })
+      .sort(function (a, b) {
+        // Most recent last_seen_at first; nulls last
+        if (a.lastSeenAt && b.lastSeenAt) {
+          return a.lastSeenAt < b.lastSeenAt ? 1 : (a.lastSeenAt > b.lastSeenAt ? -1 : 0);
+        }
+        if (a.lastSeenAt) return -1;
+        if (b.lastSeenAt) return 1;
+        return 0;
+      });
+  }
+
+  /** Apply the AFK-only filter to a change-request list.
+   *  Pure — filters rows by afkLinked flag.
+   *  @param {Array} rows - change-request rows from buildChangeRequestList
+   *  @param {boolean} afkOnly - true -> only AFK-linked rows
+   *  @returns {Array} filtered rows */
+  function filterChangeRequests(rows, afkOnly) {
+    if (!afkOnly) return rows;
+    return rows.filter(function (r) { return r.afkLinked; });
+  }
+
+  /** Handle a repository click from the Repository Summary table.
+   *  Sets the selected repository and re-renders the change-request list. */
+  function selectRepository(provider, repository) {
+    selectedRepo = { provider: provider, repository: repository };
+    afkOnlyFilter = false;
+    renderChangeRequestList(afkRunsData);
+  }
+
+  /** Return to the repository summary view (clear selection). */
+  function clearSelectedRepo() {
+    selectedRepo = null;
+    afkOnlyFilter = false;
+    var panelEl = $('afk-change-requests-panel');
+    if (panelEl) panelEl.style.display = 'none';
+  }
+
+  /** Render the change-request list table for the selected repository.
+   *  Shows the selected repository header, AFK-only toggle, and a table of
+   *  change requests with provider-specific labels (PR/MR) and AFK-linked
+   *  highlighting.  Follows the agent-runs panel conventions. */
+  function renderChangeRequestList(data) {
+    applyPanelFreshness('afk-change-requests');
+    if (!shouldRenderPanel(panelStates, 'afk-change-requests')) return;
+
+    var panelEl = $('afk-change-requests-panel');
+    var tbodyEl = $('afk-cr-tbody');
+    var headerEl = $('afk-cr-header');
+    var toggleEl = $('afk-cr-toggle');
+    if (!panelEl || !tbodyEl) return;
+
+    // No repository selected -> hide the panel
+    if (!selectedRepo) {
+      panelEl.style.display = 'none';
+      return;
+    }
+    panelEl.style.display = '';
+
+    // Update header with selected repository
+    if (headerEl) {
+      var crTerm = providerCrTerm(selectedRepo.provider);
+      headerEl.textContent = selectedRepo.repository + ' ' + crTerm + 's (' + selectedRepo.provider + ')';
+    }
+
+    // Sync the AFK-only toggle checkbox
+    if (toggleEl) {
+      toggleEl.checked = afkOnlyFilter;
+    }
+
+    var runs = data && data.items;
+    var rows = buildChangeRequestList(runs, selectedRepo.provider, selectedRepo.repository);
+    var filtered = filterChangeRequests(rows, afkOnlyFilter);
+
+    if (filtered.length === 0) {
+      var emptyMsg = rows.length === 0
+        ? 'No change requests found for ' + escHtml(selectedRepo.repository)
+        : 'No AFK-linked change requests for ' + escHtml(selectedRepo.repository);
+      tbodyEl.innerHTML = '<tr><td colspan="5" class="empty-state">' + emptyMsg + '</td></tr>';
+      return;
+    }
+
+    var crTerm = providerCrTerm(selectedRepo.provider);
+    var html = '';
+    filtered.forEach(function (r) {
+      var statusCls = afkRunStatusBadgeClass(r.status);
+      var outcomeCls = outcomeStatusBadgeClass(r.outcomeStatus);
+      var crIds = r.changeRequestIds.length > 0 ? r.changeRequestIds.join(', ') : '--';
+      html += '<tr class="afk-cr-row' + (r.afkLinked ? ' afk-cr-linked' : '') + '">' +
+        '<td data-label="' + crTerm + ' ID">' + escHtml(crIds) + '</td>' +
+        '<td data-label="Status">' + badge(r.status || '--', statusCls).outerHTML + '</td>' +
+        '<td data-label="Outcome">' + badge(outcomeStatusLabel(r.outcomeStatus), outcomeCls).outerHTML + '</td>' +
+        '<td data-label="AFK">' + (r.afkLinked ? '<span class="afk-cr-badge">AFK</span>' : '--') + '</td>' +
+        '<td data-label="Last Seen">' + fmtDT(r.lastSeenAt) + '</td>' +
+        '</tr>';
+    });
+
+    tbodyEl.innerHTML = html;
+  }
+
   // ── AFK outcome chain helpers (issue #453) ─────────────────────────────
   // The locked EngineeringOutcomeStatus vocabulary (afk_outcomes.models) is
   // merged / closed / abandoned / open.  "still open" is the human rendering
@@ -777,6 +1051,133 @@
       { key: 'reviews', label: 'Review Cycles', items: d.reviews || [] },
       { key: 'outcome', label: 'Outcome', outcome: d.outcome || null, mergeEvents: d.merge_events || [] }
     ];
+  }
+
+  // ── Relationship state helpers (issue #576) ───────────────────────────
+  // Make relationship certainty visible throughout AFK Outcomes: resolved,
+  // provisional, ambiguous, unmatched, parked, unresolved, noise, and
+  // referenced states each map to a distinct badge class and label.  No
+  // uncertain state is ever silently omitted or rendered as a definitive link.
+
+  /** Map a relationship state to a badge CSS class and human label.
+   *  Resolved links get badge-completed (green); provisional/inferred get
+   *  badge-provisional (amber); ambiguous/unmatched/parked/unresolved each
+   *  get their own distinct class; noise and referenced fall back to existing
+   *  classes.  Null/unknown falls back to badge-unknown.
+   *  @param {string|null} state
+   *  @returns {{label: string, cssClass: string}} */
+  function fmtRelationshipState(state) {
+    if (state === 'resolved')   return { label: 'resolved',   cssClass: 'badge-completed' };
+    if (state === 'provisional') return { label: 'provisional', cssClass: 'badge-provisional' };
+    if (state === 'inferred')   return { label: 'inferred',   cssClass: 'badge-provisional' };
+    if (state === 'ambiguous')  return { label: 'ambiguous',  cssClass: 'badge-ambiguous' };
+    if (state === 'unmatched')  return { label: 'unmatched',  cssClass: 'badge-unmatched' };
+    if (state === 'parked')     return { label: 'parked',     cssClass: 'badge-parked' };
+    if (state === 'unresolved') return { label: 'unresolved', cssClass: 'badge-unresolved' };
+    if (state === 'noise')      return { label: 'noise',      cssClass: 'badge-unknown' };
+    if (state === 'referenced') return { label: 'referenced', cssClass: 'badge-stale' };
+    return { label: state || '--', cssClass: 'badge-unknown' };
+  }
+
+  /** Render a relationship-state badge with optional provenance line.
+   *  Confidence is shown as a percentage; method, evidence, and resolver
+   *  version are shown when non-null.  Pure — returns HTML string.
+   *  @param {string|null} state
+   *  @param {{confidence, method, evidence, resolver_version}|null} provenance
+   *  @returns {string} HTML */
+  function renderRelationshipBadge(state, provenance) {
+    var info = fmtRelationshipState(state);
+    var html = badge(info.label, info.cssClass).outerHTML;
+    if (provenance) {
+      var parts = [];
+      parts.push(fmtConfidence(provenance.confidence));
+      if (provenance.method) parts.push(escHtml(provenance.method));
+      if (provenance.resolver_version) parts.push('resolver v' + escHtml(provenance.resolver_version));
+      if (parts.length) {
+        html += ' <span class="afk-provenance">' + parts.join(' \u00B7 ') + '</span>';
+      }
+      var evidence = renderAfkEvidence(provenance);
+      if (evidence) {
+        html += ' <span class="afk-evidence">' + evidence + '</span>';
+      }
+    }
+    return html;
+  }
+
+  /** Build the list of unresolved/provisional/parked relationships from an
+   *  AFK run detail response.  Extracts items from the `unresolved` and
+   *  `parked` arrays on the detail, mapping each to a uniform shape with a
+   *  `state` field.  Pure — no DOM or fetch access.
+   *  @param {Object|null} detail - the AFK run detail response
+   *  @returns {Array} list of unresolved relationship items */
+  function buildUnresolvedRelationships(detail) {
+    if (!detail) return [];
+    var items = [];
+    var unresolved = detail.unresolved || [];
+    var parked = detail.parked || [];
+    unresolved.forEach(function (u) {
+      items.push({
+        entity_id: u.entity_id || '--',
+        entity_type: u.entity_type || '',
+        state: u.reason || u.state || 'unresolved',
+        confidence: u.correlation_confidence,
+        method: u.correlation_method,
+        evidence: u.evidence || [],
+        resolver_version: u.resolver_version
+      });
+    });
+    parked.forEach(function (p) {
+      items.push({
+        entity_id: p.entity_id || '--',
+        entity_type: p.entity_type || '',
+        state: 'parked',
+        confidence: p.correlation_confidence,
+        method: p.correlation_method,
+        evidence: p.evidence || [],
+        resolver_version: p.resolver_version
+      });
+    });
+    return items;
+  }
+
+  /** Render one unresolved-relationship row as HTML.  Pure — returns HTML.
+   *  @param {Object} item - {entity_id, entity_type, state, confidence, method, evidence, resolver_version}
+   *  @returns {string} HTML */
+  function renderUnresolvedRelationshipsRow(item) {
+    var html = '<tr>';
+    html += '<td>' + escHtml(item.entity_id) + '</td>';
+    html += '<td>' + escHtml(item.entity_type) + '</td>';
+    html += '<td>' + renderRelationshipBadge(item.state, {
+      confidence: item.confidence,
+      method: item.method,
+      evidence: item.evidence,
+      resolver_version: item.resolver_version
+    }) + '</td>';
+    html += '</tr>';
+    return html;
+  }
+
+  /** Render the unresolved-relationships view.  Returns HTML for the panel
+   *  body: a table of items or the empty state.  Pure — no DOM access.
+   *  @param {{items: Array}|null} data
+   *  @returns {string} HTML */
+  function renderUnresolvedRelationships(data) {
+    var items = (data && data.items) || [];
+    if (items.length === 0) {
+      return '<p class="empty-state">No unresolved relationships</p>';
+    }
+    var html = '<div class="table-scroll"><table>' +
+      '<thead><tr>' +
+        '<th>Entity</th>' +
+        '<th>Type</th>' +
+        '<th>State / Provenance</th>' +
+      '</tr></thead>' +
+      '<tbody>';
+    items.forEach(function (item) {
+      html += renderUnresolvedRelationshipsRow(item);
+    });
+    html += '</tbody></table></div>';
+    return html;
   }
 
   // ── Panel freshness (pure helpers — no DOM) ───────────────────────────
@@ -1904,6 +2305,538 @@
       }
     });
   }
+  // ── Change Request Provenance Timeline (issue #574) ───────────────────
+  // When a change request is selected from the AFK Outcomes detail, a
+  // provenance timeline overlay renders the complete lifecycle: linked
+  // issues (with independent change-request and issue repository identity),
+  // every develop/review execution in chronological order (including
+  // repeated cycles), timestamps, phase, status, outcome, duration, AWX
+  // job IDs, OpenCode session identifiers, usage/cost, merge state, issue
+  // closure state, and the final EngineeringOutcome.  RunStatus and
+  // EngineeringOutcomeStatus are rendered as distinct concepts.
+
+  /** Deterministic GitHub fixture: a completed change request with linked
+   *  issues (same-repo and cross-repo), develop + review executions,
+   *  merge state, issue closure state, and a final merged outcome. */
+  function githubCompleteFixture() {
+    return {
+      change_request: {
+        provider: 'github',
+        repository: 'acme/web-app',
+        resource_type: 'change_request',
+        external_id: '142',
+        title: 'Implement user authentication module',
+        opened_at: '2026-08-01T09:00:00Z',
+        merged_at: '2026-08-05T14:30:00Z',
+        state: 'merged'
+      },
+      linked_issues: [
+        {
+          issue_number: '503',
+          issue_repository: 'acme/web-app',
+          relationship_kind: 'declares_closure',
+          closure_status: 'inferred'
+        },
+        {
+          issue_number: '25',
+          issue_repository: 'acme/platform-tracking',
+          relationship_kind: 'references',
+          closure_status: null
+        }
+      ],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-01T09:05:00Z',
+          finished_at: '2026-08-01T09:45:00Z',
+          duration_minutes: 40,
+          awx_job_id: 'awx-job-1001',
+          session_id: 'ses-auth-dev-001',
+          input_tokens: 12000,
+          output_tokens: 3500,
+          cache_read_tokens: 8000,
+          cache_write_tokens: 200,
+          estimated_cost_usd: 0.08
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-08-01T10:00:00Z',
+          finished_at: '2026-08-01T10:15:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-1002',
+          session_id: 'ses-auth-review-001',
+          input_tokens: 5000,
+          output_tokens: 800,
+          cache_read_tokens: 2000,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.02
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-02T08:00:00Z',
+          finished_at: '2026-08-02T09:30:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-1003',
+          session_id: 'ses-auth-dev-002',
+          input_tokens: 18000,
+          output_tokens: 5200,
+          cache_read_tokens: 12000,
+          cache_write_tokens: 500,
+          estimated_cost_usd: 0.12
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'approved',
+          started_at: '2026-08-02T10:00:00Z',
+          finished_at: '2026-08-02T10:10:00Z',
+          duration_minutes: 10,
+          awx_job_id: 'awx-job-1004',
+          session_id: 'ses-auth-review-002',
+          input_tokens: 4500,
+          output_tokens: 600,
+          cache_read_tokens: 1800,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.01
+        }
+      ],
+      run_status: 'completed',
+      engineering_outcome: {
+        status: 'merged',
+        merged_at: '2026-08-05T14:30:00Z',
+        change_request_ids: ['acme/web-app#142'],
+        resolved_issue_ids: ['acme/web-app#503']
+      }
+    };
+  }
+
+  /** Deterministic GitLab fixture: an incomplete change request with a
+   *  repeated review cycle and no merge. */
+  function gitlabIncompleteFixture() {
+    return {
+      change_request: {
+        provider: 'gitlab',
+        repository: 'cloudnative-pg/cloudnative-pg',
+        resource_type: 'change_request',
+        external_id: '6',
+        title: 'Add connection pool max-size config',
+        opened_at: '2026-07-20T11:00:00Z',
+        merged_at: null,
+        state: 'opened'
+      },
+      linked_issues: [
+        {
+          issue_number: '1',
+          issue_repository: 'cloudnative-pg/cloudnative-pg',
+          relationship_kind: 'declares_closure',
+          closure_status: 'pending'
+        }
+      ],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-20T11:05:00Z',
+          finished_at: '2026-07-20T12:00:00Z',
+          duration_minutes: 55,
+          awx_job_id: 'awx-job-2001',
+          session_id: 'ses-pool-dev-001',
+          input_tokens: 9000,
+          output_tokens: 2800,
+          cache_read_tokens: 5000,
+          cache_write_tokens: 100,
+          estimated_cost_usd: 0.06
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-07-20T12:30:00Z',
+          finished_at: '2026-07-20T12:45:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-2002',
+          session_id: 'ses-pool-review-001',
+          input_tokens: 4000,
+          output_tokens: 700,
+          cache_read_tokens: 1500,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.02
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-21T09:00:00Z',
+          finished_at: '2026-07-21T10:30:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-2003',
+          session_id: 'ses-pool-dev-002',
+          input_tokens: 15000,
+          output_tokens: 4500,
+          cache_read_tokens: 10000,
+          cache_write_tokens: 300,
+          estimated_cost_usd: 0.10
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-07-21T11:00:00Z',
+          finished_at: '2026-07-21T11:20:00Z',
+          duration_minutes: 20,
+          awx_job_id: 'awx-job-2004',
+          session_id: 'ses-pool-review-002',
+          input_tokens: 5500,
+          output_tokens: 900,
+          cache_read_tokens: 2200,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.03
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-07-22T08:30:00Z',
+          finished_at: '2026-07-22T10:00:00Z',
+          duration_minutes: 90,
+          awx_job_id: 'awx-job-2005',
+          session_id: 'ses-pool-dev-003',
+          input_tokens: 16000,
+          output_tokens: 4800,
+          cache_read_tokens: 11000,
+          cache_write_tokens: 350,
+          estimated_cost_usd: 0.11
+        }
+      ],
+      run_status: 'running',
+      engineering_outcome: {
+        status: 'open',
+        merged_at: null,
+        change_request_ids: ['cloudnative-pg/cloudnative-pg#6'],
+        resolved_issue_ids: []
+      }
+    };
+  }
+
+  /** Deterministic fixture: a repeated-review lifecycle with a failed run. */
+  function repeatedReviewFixture() {
+    return {
+      change_request: {
+        provider: 'github',
+        repository: 'acme/data-pipeline',
+        resource_type: 'change_request',
+        external_id: '88',
+        title: 'Refactor ETL scheduler',
+        opened_at: '2026-08-10T08:00:00Z',
+        merged_at: null,
+        state: 'opened'
+      },
+      linked_issues: [],
+      executions: [
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-10T08:05:00Z',
+          finished_at: '2026-08-10T09:30:00Z',
+          duration_minutes: 85,
+          awx_job_id: 'awx-job-3001',
+          session_id: 'ses-etl-dev-001',
+          input_tokens: 20000,
+          output_tokens: 6000,
+          cache_read_tokens: 14000,
+          cache_write_tokens: 400,
+          estimated_cost_usd: 0.14
+        },
+        {
+          phase: 'review',
+          status: 'completed',
+          outcome: 'changes_requested',
+          started_at: '2026-08-10T10:00:00Z',
+          finished_at: '2026-08-10T10:15:00Z',
+          duration_minutes: 15,
+          awx_job_id: 'awx-job-3002',
+          session_id: 'ses-etl-review-001',
+          input_tokens: 6000,
+          output_tokens: 1000,
+          cache_read_tokens: 3000,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0.03
+        },
+        {
+          phase: 'develop',
+          status: 'completed',
+          outcome: 'completed',
+          started_at: '2026-08-11T09:00:00Z',
+          finished_at: '2026-08-11T10:45:00Z',
+          duration_minutes: 105,
+          awx_job_id: 'awx-job-3003',
+          session_id: 'ses-etl-dev-002',
+          input_tokens: 22000,
+          output_tokens: 6500,
+          cache_read_tokens: 15000,
+          cache_write_tokens: 450,
+          estimated_cost_usd: 0.15
+        },
+        {
+          phase: 'review',
+          status: 'failed',
+          outcome: null,
+          started_at: '2026-08-11T11:00:00Z',
+          finished_at: '2026-08-11T11:05:00Z',
+          duration_minutes: 5,
+          awx_job_id: 'awx-job-3004',
+          session_id: null,
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          estimated_cost_usd: 0
+        },
+        {
+          phase: 'develop',
+          status: 'running',
+          outcome: null,
+          started_at: '2026-08-12T08:00:00Z',
+          finished_at: null,
+          duration_minutes: null,
+          awx_job_id: 'awx-job-3005',
+          session_id: 'ses-etl-dev-003',
+          input_tokens: 8000,
+          output_tokens: 2000,
+          cache_read_tokens: 4000,
+          cache_write_tokens: 100,
+          estimated_cost_usd: 0.04
+        }
+      ],
+      run_status: 'running',
+      engineering_outcome: {
+        status: 'open',
+        merged_at: null,
+        change_request_ids: ['acme/data-pipeline#88'],
+        resolved_issue_ids: []
+      }
+    };
+  }
+
+  /** Build the provenance timeline data from a fixture or API response.
+   *  Pure — no DOM or fetch access.  Normalizes the input into the shape
+   *  the render functions expect: change_request, linked_issues, executions
+   *  (sorted chronologically), run_status, and engineering_outcome. */
+  function buildProvenanceTimeline(data) {
+    if (!data) return null;
+    var executions = (data.executions || []).slice()
+      .sort(function (a, b) {
+        return new Date(a.started_at) - new Date(b.started_at);
+      });
+    return {
+      change_request: data.change_request || null,
+      linked_issues: data.linked_issues || [],
+      executions: executions,
+      run_status: data.run_status || 'unknown',
+      engineering_outcome: data.engineering_outcome || null
+    };
+  }
+
+  /** Render the full provenance timeline into the detail overlay body.
+   *  Pure string builder — returns HTML.  Handles loading, empty, stale,
+   *  partial, and error states via the `state` parameter. */
+  function renderProvenanceTimeline(data, state) {
+    if (state === 'loading') {
+      return '<p class="empty-state">Loading provenance timeline&hellip;</p>';
+    }
+    if (state === 'error') {
+      return '<p class="empty-state">Failed to load provenance timeline</p>';
+    }
+    var timeline = buildProvenanceTimeline(data);
+    if (!timeline || !timeline.change_request) {
+      return '<p class="empty-state">No provenance data available</p>';
+    }
+
+    var cr = timeline.change_request;
+    var html = '<div class="prov-timeline">';
+
+    // ── Change Request Header ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Change Request</div>';
+    html += '<div class="prov-cr-card">';
+    html += '<div class="prov-cr-head">';
+    html += '<span class="prov-cr-id">' + escHtml(cr.provider + '/' + cr.repository + '#' + cr.external_id) + '</span>';
+    html += badge(cr.state || 'unknown', stateBadgeForCrState(cr.state)).outerHTML;
+    html += '</div>';
+    html += '<div class="prov-cr-meta">';
+    html += escHtml(cr.title || '--');
+    if (cr.opened_at) html += ' &middot; opened ' + fmtDT(cr.opened_at);
+    if (cr.merged_at) html += ' &middot; merged ' + fmtDT(cr.merged_at);
+    html += '</div>';
+    html += '</div></div>';
+
+    // ── Linked Issues ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Linked Issues (' + timeline.linked_issues.length + ')</div>';
+    if (timeline.linked_issues.length === 0) {
+      html += '<div class="prov-empty">No linked issues</div>';
+    } else {
+      html += '<div class="prov-issues-list">';
+      timeline.linked_issues.forEach(function (issue) {
+        html += '<div class="prov-issue-card">';
+        html += '<div class="prov-issue-head">';
+        html += '<span class="prov-issue-id">' + escHtml(issue.issue_repository + '#' + issue.issue_number) + '</span>';
+        html += '<span class="prov-issue-kind">' + escHtml(issue.relationship_kind) + '</span>';
+        if (issue.closure_status) {
+          html += badge(issue.closure_status, closureStatusBadgeClass(issue.closure_status)).outerHTML;
+        }
+        html += '</div>';
+        // Show different repos when they differ
+        if (issue.issue_repository !== cr.repository) {
+          html += '<div class="prov-issue-cross-repo">';
+          html += 'cross-repo: ' + escHtml(cr.repository) + ' \u2192 ' + escHtml(issue.issue_repository);
+          html += '</div>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // ── Execution Timeline ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Execution Timeline (' + timeline.executions.length + ')</div>';
+    if (timeline.executions.length === 0) {
+      html += '<div class="prov-empty">No executions recorded</div>';
+    } else {
+      html += '<div class="prov-exec-list">';
+      timeline.executions.forEach(function (ex, idx) {
+        html += renderProvenanceExecution(ex, idx, timeline.executions.length);
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // ── Merge State ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Merge State</div>';
+    html += '<div class="prov-merge-card">';
+    if (cr.merged_at) {
+      html += '<span class="prov-merge-badge prov-merged">merged</span>';
+      html += '<span class="prov-merge-time">Merged ' + fmtDT(cr.merged_at) + '</span>';
+    } else {
+      html += '<span class="prov-merge-badge prov-not-merged">not merged</span>';
+    }
+    html += '</div></div>';
+
+    // ── Issue Closure State ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Issue Closure State</div>';
+    html += '<div class="prov-closure-card">';
+    var outcomes = timeline.engineering_outcome;
+    if (outcomes && outcomes.resolved_issue_ids && outcomes.resolved_issue_ids.length > 0) {
+      html += '<span class="prov-closure-resolved">resolved</span>';
+      html += '<span class="prov-closure-issues">' + escHtml(outcomes.resolved_issue_ids.join(', ')) + '</span>';
+    } else if (timeline.linked_issues.length > 0) {
+      html += '<span class="prov-closure-pending">pending</span>';
+    } else {
+      html += '<span class="prov-empty">no linked issues</span>';
+    }
+    html += '</div></div>';
+
+    // ── Engineering Outcome (distinct from RunStatus) ──
+    html += '<div class="prov-section">';
+    html += '<div class="prov-section-title">Engineering Outcome</div>';
+    html += '<div class="prov-outcome-card">';
+    if (outcomes && outcomes.status) {
+      html += badge(outcomeStatusLabel(outcomes.status), outcomeStatusBadgeClass(outcomes.status)).outerHTML;
+      if (outcomes.change_request_ids && outcomes.change_request_ids.length) {
+        html += '<span class="prov-outcome-detail">change requests: ' + escHtml(outcomes.change_request_ids.join(', ')) + '</span>';
+      }
+    } else {
+      html += '<span class="prov-empty">no outcome recorded</span>';
+    }
+    html += '</div>';
+
+    // RunStatus badge — rendered DISTINCTLY from EngineeringOutcomeStatus
+    html += '<div class="prov-run-status-row">';
+    html += '<span class="prov-run-status-label">Run Status:</span>';
+    html += badge(timeline.run_status || 'unknown', afkRunStatusBadgeClass(timeline.run_status)).outerHTML;
+    html += '</div>';
+    html += '</div>';
+
+    html += '</div>'; // .prov-timeline
+    return html;
+  }
+
+  /** Render one execution entry in the timeline.  Pure string builder. */
+  function renderProvenanceExecution(ex, idx, totalExecutions) {
+    var phaseLabel = ex.phase === 'develop' ? 'Develop' : ex.phase === 'review' ? 'Review' : (ex.phase || 'unknown');
+    var statusCls = statusBadgeClass(ex.status);
+    var outcomeLabel = ex.outcome || '--';
+    var duration = fmtDuration(ex.started_at, ex.finished_at);
+    var totalTokens = (ex.input_tokens || 0) + (ex.output_tokens || 0) +
+                      (ex.cache_read_tokens || 0) + (ex.cache_write_tokens || 0);
+
+    var html = '<div class="prov-exec-item">';
+    html += '<div class="prov-exec-connector">';
+    html += '<span class="prov-exec-dot prov-exec-dot-' + escHtml(ex.phase || 'unknown') + '"></span>';
+    if (idx < totalExecutions - 1) html += '<span class="prov-exec-line"></span>';
+    html += '</div>';
+    html += '<div class="prov-exec-content">';
+    html += '<div class="prov-exec-head">';
+    html += '<span class="prov-exec-phase">' + escHtml(phaseLabel) + '</span>';
+    html += badge(ex.status || '--', statusCls).outerHTML;
+    if (ex.outcome) {
+      html += ' <span class="prov-exec-outcome">' + escHtml(outcomeLabel) + '</span>';
+    }
+    html += '</div>';
+    html += '<div class="prov-exec-meta">';
+    html += '<span class="prov-exec-time">' + fmtDT(ex.started_at) + '</span>';
+    html += ' &middot; <span class="prov-exec-duration">' + duration + '</span>';
+    if (ex.awx_job_id) {
+      html += ' &middot; <span class="prov-exec-awx">AWX: ' + escHtml(ex.awx_job_id) + '</span>';
+    }
+    html += '</div>';
+    if (ex.session_id) {
+      html += '<div class="prov-exec-session">';
+      html += 'Session: <span class="prov-exec-session-id">' + escHtml(ex.session_id) + '</span>';
+      html += '</div>';
+    }
+    if (totalTokens > 0 || (ex.estimated_cost_usd || 0) > 0) {
+      html += '<div class="prov-exec-usage">';
+      html += fmtTokenBreakdownCompact(ex.input_tokens, ex.output_tokens,
+        ex.cache_read_tokens, ex.cache_write_tokens);
+      html += ' &middot; Est. Cost: ' + fmtCost(ex.estimated_cost_usd);
+      html += '</div>';
+    }
+    html += '</div>'; // .prov-exec-content
+    html += '</div>'; // .prov-exec-item
+    return html;
+  }
+
+  /** Map a change request state to a badge CSS class. */
+  function stateBadgeForCrState(state) {
+    if (state === 'merged') return 'badge-merged';
+    if (state === 'opened') return 'badge-open';
+    if (state === 'closed') return 'badge-closed';
+    return 'badge-unknown';
+  }
+
+  /** Map a closure episode status to a badge CSS class. */
+  function closureStatusBadgeClass(status) {
+    if (status === 'inferred') return 'badge-completed';
+    if (status === 'pending') return 'badge-stale';
+    if (status === 'awaiting_closure') return 'badge-stale';
+    if (status === 'unmatched') return 'badge-failed';
+    if (status === 'ambiguous') return 'badge-unknown';
+    if (status === 'superseded') return 'badge-unknown';
+    return 'badge-unknown';
+  }
+
   // ── AFK Outcomes view (issue #453) ─────────────────────────────────────
   // The first UI for the AFK outcomes domain: an "AFK Outcomes" tab whose runs
   // list (GET /api/v1/afk-outcomes/runs) opens a detail overlay rendering the
@@ -1965,6 +2898,62 @@
         }
       });
     });
+  }
+
+  /** Render the unresolved-relationships panel: one row per uncertain
+   *  correlation (ambiguous, unmatched, parked) from the AFK runs data.
+   *  Follows the established panel conventions: freshness guard, empty/error
+   *  states, escHtml on every interpolated value. */
+  function renderUnresolvedRelationshipsPanel(data) {
+    applyPanelFreshness('unresolved-relationships');
+    if (!shouldRenderPanel(panelStates, 'unresolved-relationships')) return;
+
+    if (!els.unresolvedTbody) return;
+
+    // Build the list of unresolved items from all AFK runs
+    var allItems = [];
+    var runs = data && data.items;
+    if (runs && runs.length) {
+      runs.forEach(function (r) {
+        var runItems = r.unresolved || [];
+        runItems.forEach(function (u) {
+          allItems.push({
+            entity_id: u.entity_id || '--',
+            entity_type: u.entity_type || '',
+            state: u.reason || u.state || 'unresolved',
+            confidence: u.correlation_confidence,
+            method: u.correlation_method,
+            evidence: u.evidence || [],
+            resolver_version: u.resolver_version
+          });
+        });
+        var parkedItems = r.parked || [];
+        parkedItems.forEach(function (p) {
+          allItems.push({
+            entity_id: p.entity_id || '--',
+            entity_type: p.entity_type || '',
+            state: 'parked',
+            confidence: p.correlation_confidence,
+            method: p.correlation_method,
+            evidence: p.evidence || [],
+            resolver_version: p.resolver_version
+          });
+        });
+      });
+    }
+
+    unresolvedRelationshipsData = { items: allItems };
+
+    if (allItems.length === 0) {
+      els.unresolvedTbody.innerHTML = '<tr><td colspan="3" class="empty-state">No unresolved relationships</td></tr>';
+      return;
+    }
+
+    var html = '';
+    allItems.forEach(function (item) {
+      html += renderUnresolvedRelationshipsRow(item);
+    });
+    els.unresolvedTbody.innerHTML = html;
   }
 
   /** Open the AFK outcome chain overlay for one run.  A 404 (unknown run)
@@ -2047,9 +3036,12 @@
       body = renderAfkRunStep(step.run);
     } else if (step.key === 'sessions') {
       var sessions = step.items || [];
-      body = sessions.length
-        ? sessions.map(renderAfkSessionLink).join('')
-        : '<div class="afk-empty">No sessions linked</div>';
+      if (sessions.length) {
+        var tree = buildSessionTree(sessions);
+        body = tree.map(function (node) { return renderNestedSessionNode(node, 0); }).join('');
+      } else {
+        body = '<div class="afk-empty">No sessions linked</div>';
+      }
     } else if (step.key === 'agents') {
       var agents = step.items || [];
       body = agents.length
@@ -2189,6 +3181,31 @@
     }
     html += '</div>';
     return html;
+  }
+
+  /** Open the Change Request Provenance Timeline overlay (issue #574).
+   *  Uses deterministic fixtures for now; will be backed by the Gateway
+   *  composite read contract when the API is ready.  Shows loading, error,
+   *  and empty states. */
+  async function openChangeRequestProvenance(changeRequestId) {
+    els.crProvOverlay.classList.add('visible');
+    els.crProvBody.innerHTML = '<p class="empty-state">Loading provenance timeline&hellip;</p>';
+    els.crProvTitle.textContent = 'Change Request Provenance';
+
+    // Deterministic fixtures: select by change request id prefix
+    var fixture;
+    if (changeRequestId && changeRequestId.indexOf('cloudnative-pg') !== -1) {
+      fixture = gitlabIncompleteFixture();
+    } else if (changeRequestId && changeRequestId.indexOf('data-pipeline') !== -1) {
+      fixture = repeatedReviewFixture();
+    } else {
+      fixture = githubCompleteFixture();
+    }
+
+    els.crProvTitle.textContent = escHtml(
+      (fixture.change_request.repository || '') + '#' + (fixture.change_request.external_id || '')
+    );
+    els.crProvBody.innerHTML = renderProvenanceTimeline(fixture, 'ok');
   }
 
   /** Render an entity link's provenance line (method · confidence · resolver). */
@@ -2479,6 +3496,7 @@
       }
       renderClientProjectBreakdown(data);
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -2759,6 +3777,29 @@
     }
   }
 
+  /** Wire the Change Request Provenance Timeline overlay DOM events (issue #574):
+   *  close button, backdrop click, and ESC key. */
+  function setupCrProvEventHandlers() {
+    if (els.crProvClose) {
+      els.crProvClose.addEventListener('click', function () {
+        els.crProvOverlay.classList.remove('visible');
+      });
+    }
+    if (els.crProvOverlay) {
+      els.crProvOverlay.addEventListener('click', function (e) {
+        if (e.target === els.crProvOverlay) {
+          els.crProvOverlay.classList.remove('visible');
+        }
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' &&
+          els.crProvOverlay && els.crProvOverlay.classList.contains('visible')) {
+        els.crProvOverlay.classList.remove('visible');
+      }
+    });
+  }
+
   /** Wire the AFK Outcomes detail-overlay DOM events (issue #453): the close
    *  button, backdrop click, and ESC key — mirroring the agent-runs overlay
    *  wiring (setupAgentRunEventHandlers). */
@@ -2781,6 +3822,21 @@
         els.afkDetailOverlay.classList.remove('visible');
       }
     });
+
+    // Change-request list panel (issue #573): back button + AFK-only toggle
+    var backBtn = $('afk-cr-back');
+    if (backBtn) {
+      backBtn.addEventListener('click', function () {
+        clearSelectedRepo();
+      });
+    }
+    var toggleEl = $('afk-cr-toggle');
+    if (toggleEl) {
+      toggleEl.addEventListener('change', function () {
+        afkOnlyFilter = toggleEl.checked;
+        renderChangeRequestList(afkRunsData);
+      });
+    }
   }
 
   // ── Transcript view (issue #469) ───────────────────────────────────────
@@ -3212,6 +4268,7 @@
   function startAutoRefresh() {
     setupAgentRunEventHandlers();
     setupAfkOutcomesEventHandlers();
+    setupCrProvEventHandlers();
     setupTranscriptEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
@@ -3328,6 +4385,12 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  // Issue #576: relationship state presentation + unresolved-relationships view
+  window.fmtRelationshipState = fmtRelationshipState;
+  window.renderRelationshipBadge = renderRelationshipBadge;
+  window.buildUnresolvedRelationships = buildUnresolvedRelationships;
+  window.renderUnresolvedRelationshipsRow = renderUnresolvedRelationshipsRow;
+  window.renderUnresolvedRelationships = renderUnresolvedRelationships;
   // Transcript view (issue #469): pure helpers for depth formatting, part-type
   // classification, and the header/timeline/message/part renderers.  The Node
   // test harness exercises these through the vm-sandbox window seam.

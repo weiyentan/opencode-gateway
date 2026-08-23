@@ -1,0 +1,116 @@
+{
+  "status": "ok",
+  "data": {
+    "run": {
+      "afk_run_id": "01KZX9M4G80000000000000003",
+      "provider": "github",
+      "status": "running",
+      "title": "Develop-Loop: WIP multi-repo fix",
+      "started_at": "2026-08-15T11:00:00Z",
+      "finished_at": null,
+      "outcome_status": "open"
+    },
+    "outcome": {
+      "status": "open",
+      "change_request_ids": [],
+      "resolved_issue_ids": [],
+      "merge_event_id": null,
+      "merged_at": null
+    },
+    "issues": [
+      {
+        "entity_id": "issue:701",
+        "entity_type": "issue",
+        "external_id": "701",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "referenced",
+        "correlation_method": "temporal_inference",
+        "correlation_confidence": 0.1,
+        "evidence": [{"kind": "temporal", "source_entity_id": "issue:701", "detail": "same time window"}],
+        "resolver_version": "2",
+        "provisional": true
+      },
+      {
+        "entity_id": "issue:702",
+        "entity_type": "issue",
+        "external_id": "702",
+        "provider": "github",
+        "repository": "platform/tracking",
+        "role": "noise",
+        "correlation_method": "temporal_inference",
+        "correlation_confidence": 0.0,
+        "evidence": [],
+        "resolver_version": "2",
+        "provisional": true
+      }
+    ],
+    "sessions": [
+      {
+        "session_id": "3f9c3a6e-0000-4000-8000-000000000003",
+        "external_session_id": "ses_amb_001",
+        "agent": "code-editor-senior",
+        "inferred": true,
+        "message_count": 30,
+        "total_input_tokens": 15000,
+        "total_output_tokens": 10000,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_estimated_cost_usd": 0.85
+      },
+      {
+        "external_session_id": "ses_amb_002",
+        "agent": "code-editor-junior",
+        "inferred": true,
+        "message_count": 10,
+        "total_input_tokens": 5000,
+        "total_output_tokens": 3000,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_estimated_cost_usd": 0.20
+      }
+    ],
+    "agents": ["code-editor-senior", "code-editor-junior"],
+    "usage": {
+      "input_tokens": 20000,
+      "output_tokens": 13000,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "active_tokens": 33000,
+      "estimated_cost_usd": 1.05,
+      "session_count": 2,
+      "message_count": 40
+    },
+    "change_requests": [
+      {
+        "entity_id": "change_request:701",
+        "entity_type": "change_request",
+        "external_id": "701",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "referenced",
+        "correlation_method": "branch_issue_reference",
+        "correlation_confidence": 0.3,
+        "evidence": [{"kind": "branch_ref", "source_entity_id": "change_request:701", "detail": "branch refs/heads/wip-fix"}],
+        "resolver_version": "2",
+        "provisional": true
+      },
+      {
+        "entity_id": "change_request:702",
+        "entity_type": "change_request",
+        "external_id": "702",
+        "provider": "github",
+        "repository": "weiyentan/opencode-gateway",
+        "role": "referenced",
+        "correlation_method": "temporal_inference",
+        "correlation_confidence": 0.2,
+        "evidence": [],
+        "resolver_version": "2",
+        "provisional": true
+      }
+    ],
+    "commits": [],
+    "reviews": [],
+    "merge_events": []
+  }
+}

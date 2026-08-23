@@ -1,0 +1,52 @@
+{
+  "status": "ok",
+  "data": {
+    "run": {
+      "afk_run_id": "01KZX9M4G80000000000000004",
+      "provider": "gitlab",
+      "status": "failed",
+      "title": "Develop-Loop: Failed dependency resolution",
+      "started_at": "2026-08-16T14:00:00Z",
+      "finished_at": "2026-08-16T14:30:00Z",
+      "outcome_status": "abandoned"
+    },
+    "outcome": {
+      "status": "abandoned",
+      "change_request_ids": [],
+      "resolved_issue_ids": [],
+      "merge_event_id": null,
+      "merged_at": null
+    },
+    "issues": [
+      {
+        "entity_id": "issue:801",
+        "entity_type": "issue",
+        "external_id": "801",
+        "provider": "gitlab",
+        "repository": "cloudnative-pg/cloudnative-pg",
+        "role": "noise",
+        "correlation_method": "temporal_inference",
+        "correlation_confidence": 0.0,
+        "evidence": [],
+        "resolver_version": "2",
+        "provisional": true
+      }
+    ],
+    "sessions": [],
+    "agents": [],
+    "usage": {
+      "input_tokens": 5000,
+      "output_tokens": 2000,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "active_tokens": 7000,
+      "estimated_cost_usd": 0.30,
+      "session_count": 0,
+      "message_count": 0
+    },
+    "change_requests": [],
+    "commits": [],
+    "reviews": [],
+    "merge_events": []
+  }
+}
