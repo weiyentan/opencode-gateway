@@ -437,6 +437,14 @@ class ExecutionBinding(Base):
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     failure_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     failure_summary: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # FK to the AFK run this binding produced (issue #582).
+    afk_run_id: Mapped[Optional[str]] = mapped_column(
+        String(26),
+        ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Trigger origin (issue #582) — nullable, populated by a later slice.
+    trigger_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

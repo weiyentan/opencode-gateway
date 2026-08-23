@@ -649,6 +649,21 @@ class ExecutionOutcome(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep impor
     CANCELLED = "cancelled"
 
 
+class TriggerType(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
+    """How the execution binding was triggered.
+
+    Carried on the write path (``ExecutionBindingCreateRequest``) and
+    stored on the domain model.  The read path surfaces it as a nullable
+    string for backward-compatible readback of legacy rows.
+    """
+
+    EDA = "eda"
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+    BACKFILL = "backfill"
+    RECOVERY = "recovery"
+
+
 class AWXJobIdentity(BaseModel):
     """The externally identified AWX job run that invokes an OpenCode execution.
 
@@ -745,4 +760,18 @@ class ExecutionBinding(BaseModel):
     source_event_id: str | None = Field(
         default=None,
         description="Originating EDA source event id (for traceability)",
+    )
+    afk_run_id: str | None = Field(
+        default=None,
+        description=(
+            "ULID of the associated AFK run (26 chars); None for "
+            "legacy rows without the column"
+        ),
+    )
+    trigger_type: str | None = Field(
+        default=None,
+        description=(
+            "Trigger type for the execution (eda, manual, scheduled, "
+            "backfill, recovery); None for legacy rows without the column"
+        ),
     )
