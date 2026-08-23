@@ -95,6 +95,7 @@ def _valid_binding_payload() -> dict:
             "resource_number": "99",
         },
         "outcome": "completed",
+        "trigger_type": "manual",
     }
 
 

@@ -24,6 +24,7 @@ from afk_outcomes.models import (
     EntityType,
     ExecutionOutcome,
     Provider,
+    TriggerType,
 )
 
 
@@ -39,6 +40,7 @@ def _valid_request(**overrides) -> dict:
             "resource_number": "101",
         },
         "outcome": "completed",
+        "trigger_type": "manual",
     }
     payload.update(overrides)
     return payload
@@ -313,3 +315,162 @@ class TestResponseSchemas:
             assert field_name not in ExecutionBindingReadResponse.model_fields
             assert field_name not in ExecutionBindingHistoryResponse.model_fields
             assert field_name not in ExecutionBindingCreateRequest.model_fields
+
+
+# ---------------------------------------------------------------------------
+# TriggerType enum validation (issue #583)
+# ---------------------------------------------------------------------------
+
+
+class TestTriggerTypeValidation:
+    def test_valid_trigger_type_accepted(self) -> None:
+        for tt in ("eda", "manual", "scheduled", "backfill", "recovery"):
+            overrides: dict[str, object] = {"trigger_type": tt}
+            if tt == "eda":
+                overrides["source_event_id"] = "evt-001"
+            request = ExecutionBindingCreateRequest.model_validate(
+                _valid_request(**overrides)
+            )
+            assert request.trigger_type is TriggerType(tt)
+
+    def test_trigger_type_is_required(self) -> None:
+        payload = _valid_request()
+        del payload["trigger_type"]
+        with pytest.raises(ValidationError, match="trigger_type"):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_unknown_trigger_type_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="trigger_type"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(trigger_type="unknown_type")
+            )
+
+    def test_empty_trigger_type_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="trigger_type"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(trigger_type="")
+            )
+
+
+# ---------------------------------------------------------------------------
+# source_event_id conditional validation (issue #583)
+# ---------------------------------------------------------------------------
+
+
+class TestSourceEventIdConditionalValidation:
+    def test_eda_requires_source_event_id(self) -> None:
+        with pytest.raises(ValidationError, match="source_event_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(trigger_type="eda", source_event_id=None)
+            )
+
+    def test_eda_with_source_event_id_accepted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="eda", source_event_id="evt-123")
+        )
+        assert request.trigger_type is TriggerType.EDA
+        assert request.source_event_id == "evt-123"
+
+    def test_manual_allows_source_event_id_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="manual", source_event_id=None)
+        )
+        assert request.source_event_id is None
+
+    def test_scheduled_allows_source_event_id_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="scheduled", source_event_id=None)
+        )
+        assert request.source_event_id is None
+
+    def test_backfill_allows_source_event_id_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="backfill", source_event_id=None)
+        )
+        assert request.source_event_id is None
+
+    def test_recovery_allows_source_event_id_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="recovery", source_event_id=None)
+        )
+        assert request.source_event_id is None
+
+    def test_non_eda_with_source_event_id_accepted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(trigger_type="manual", source_event_id="evt-456")
+        )
+        assert request.source_event_id == "evt-456"
+
+
+# ---------------------------------------------------------------------------
+# Read response nullable AFK run fields (issue #583)
+# ---------------------------------------------------------------------------
+
+
+class TestReadResponseAfkRunFields:
+    def test_read_response_has_afk_run_id_nullable(self) -> None:
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding()
+        )
+        assert response.afk_run_id is None
+
+    def test_read_response_has_trigger_type_nullable(self) -> None:
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding()
+        )
+        assert response.trigger_type is None
+
+    def test_read_response_accepts_populated_afk_run_id(self) -> None:
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding(afk_run_id="01J_ARUN_ID_12345")
+        )
+        assert response.afk_run_id == "01J_ARUN_ID_12345"
+
+    def test_read_response_accepts_populated_trigger_type(self) -> None:
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding(trigger_type="eda")
+        )
+        assert response.trigger_type == "eda"
+
+    def test_history_response_items_have_nullable_afk_fields(self) -> None:
+        history = ExecutionBindingHistoryResponse.model_validate(
+            {
+                "resource": {
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "change_request",
+                    "resource_number": "101",
+                },
+                "bindings": [
+                    _valid_read_binding(),
+                    _valid_read_binding(
+                        binding_id="01HZX7S0KQ00000000000001",
+                        afk_run_id="01J_ARUN_ID_99999",
+                        trigger_type="scheduled",
+                    ),
+                ],
+            }
+        )
+        assert history.bindings[0].afk_run_id is None
+        assert history.bindings[0].trigger_type is None
+        assert history.bindings[1].afk_run_id == "01J_ARUN_ID_99999"
+        assert history.bindings[1].trigger_type == "scheduled"
+
+
+# ---------------------------------------------------------------------------
+# extra="forbid" preservation (issue #583)
+# ---------------------------------------------------------------------------
+
+
+class TestExtraForbidPreserved:
+    def test_create_request_rejects_unknown_top_level_fields(self) -> None:
+        payload = _valid_request()
+        payload["unknown_field"] = "should_fail"
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_create_request_rejects_unknown_nested_resource_fields(self) -> None:
+        payload = _valid_request()
+        payload["resource"]["bogus"] = "nope"
+        with pytest.raises(ValidationError):
+            ExecutionBindingCreateRequest.model_validate(payload)
