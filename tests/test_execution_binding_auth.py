@@ -159,6 +159,26 @@ class TestDedicatedCredentialEnforcement:
         assert data["status"] == "ok"
 
     @pytest.mark.asyncio
+    async def test_dedicated_collector_token_can_be_separate_from_api_key(
+        self,
+    ) -> None:
+        """The collector token header is independent of the API key header."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, _saved_row()]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions",
+            json=_valid_binding_payload(),
+            headers={"X-Collector-Token": _COLLECTOR_BEARER},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
     async def test_other_client_credential_rejected_403(self) -> None:
         """A valid credential owned by another client (usage collector) is 403.
 
