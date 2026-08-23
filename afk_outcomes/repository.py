@@ -1750,7 +1750,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             existing = await self._conn.fetchrow(
                 """
                 SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
-                       failure_reason, source_event_id, external_session_id
+                       failure_reason, source_event_id, external_session_id,
+                       trigger_type
                 FROM execution_bindings
                 WHERE awx_job_id = $1
                 """,
@@ -1767,6 +1768,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "failure_reason": existing["failure_reason"],
                     "source_event_id": existing["source_event_id"],
                     "external_session_id": existing["external_session_id"],
+                    "trigger_type": existing["trigger_type"],
                 }
                 new_payload = {
                     "outcome": outcome.value,
@@ -1775,6 +1777,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "failure_reason": failure_reason,
                     "source_event_id": source_event_id,
                     "external_session_id": external_session_id,
+                    "trigger_type": trigger_type,
                 }
                 is_match = existing_payload == new_payload
                 return CreateAFKExecutionBindingResult(
