@@ -67,6 +67,8 @@ def _mk_binding_row(
     entity_number: str = "99",
     outcome: str = "completed",
     source_event_id: str | None = None,
+    afk_run_id: str | None = None,
+    trigger_type: str | None = None,
     branch: str | None = None,
     title: str | None = None,
     failure_reason: str | None = None,
@@ -87,6 +89,8 @@ def _mk_binding_row(
             "entity_number": entity_number,
             "outcome": outcome,
             "source_event_id": source_event_id,
+            "afk_run_id": afk_run_id,
+            "trigger_type": trigger_type,
             "branch": branch,
             "title": title,
             "failure_reason": failure_reason,
@@ -586,6 +590,44 @@ class TestGetExecutionBinding:
         assert data["status"] == "ok"
         assert data["data"]["external_session_id"] is None
 
+    @pytest.mark.asyncio
+    async def test_get_binding_with_afk_run_id_returns_ulid(self) -> None:
+        """A new row with afk_run_id populated returns the 26-char ULID."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        row = _mk_binding_row(
+            awx_job_id=42,
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+            trigger_type="eda",
+        )
+        conn.fetchrow = AsyncMock(return_value=row)
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert data["data"]["trigger_type"] == "eda"
+
+    @pytest.mark.asyncio
+    async def test_get_binding_legacy_row_returns_null_for_new_fields(self) -> None:
+        """A legacy row without afk_run_id returns null for all three new fields."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        row = _mk_binding_row(awx_job_id=42)
+        conn.fetchrow = AsyncMock(return_value=row)
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["afk_run_id"] is None
+        assert data["data"]["trigger_type"] is None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GET /api/v1/afk/executions — resource history (filtered)
@@ -768,6 +810,49 @@ class TestListExecutionBindings:
         assert bindings[0]["failure_reason"] == "Timeout after 300s"
         assert bindings[1]["outcome"] == "completed"
         assert bindings[1]["failure_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_mixed_legacy_and_new_rows(self) -> None:
+        """History items include nullable afk_run_id/trigger_type for new and legacy rows."""
+        from tests.conftest import create_client
+
+        conn = AsyncMock()
+        rows = [
+            _mk_binding_row(
+                awx_job_id=10,
+                outcome="failed",
+                afk_run_id=None,
+                trigger_type=None,
+            ),
+            _mk_binding_row(
+                awx_job_id=20,
+                outcome="completed",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+                trigger_type="manual",
+            ),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+        client = create_client(conn)
+
+        resp = await client.get(
+            "/api/v1/afk/executions",
+            params={
+                "provider": "github",
+                "repository_url": "https://github.com/acme/proj",
+                "entity_type": "change_request",
+                "entity_number": "99",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        bindings = data["data"]["bindings"]
+        assert len(bindings) == 2
+        # Legacy row — null for new fields
+        assert bindings[0]["afk_run_id"] is None
+        assert bindings[0]["trigger_type"] is None
+        # New row — populated values
+        assert bindings[1]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert bindings[1]["trigger_type"] == "manual"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
