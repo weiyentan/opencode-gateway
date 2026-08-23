@@ -764,13 +764,14 @@ class ExecutionBinding(BaseModel):
     afk_run_id: str | None = Field(
         default=None,
         description=(
-            "AFK run ULID this binding produced; None when the binding "
-            "has no associated AFK run (populated by a later slice)"
+            "ULID of the associated AFK run (26 chars); None for "
+            "legacy rows without the column"
         ),
     )
     trigger_type: str | None = Field(
         default=None,
         description=(
-            "Trigger origin for this binding (populated by a later slice)"
+            "Trigger type for the execution (eda, manual, scheduled, "
+            "backfill, recovery); None for legacy rows without the column"
         ),
     )

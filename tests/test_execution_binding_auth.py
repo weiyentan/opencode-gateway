@@ -145,8 +145,12 @@ class TestDedicatedCredentialEnforcement:
         execution-binding client — the write proceeds.
         """
         conn = AsyncMock()
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), _saved_row()]
+            side_effect=[_auth_row(), None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -165,9 +169,14 @@ class TestDedicatedCredentialEnforcement:
     ) -> None:
         """The collector token header is independent of the API key header."""
         conn = AsyncMock()
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), None, _saved_row()]
         )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
@@ -405,8 +414,12 @@ class TestBearerTokenNonLeakage:
     async def test_auth_lookup_uses_hash_not_raw_token(self, monkeypatch) -> None:
         """The credential lookup queries by SHA-256 hash, never the raw token."""
         conn = AsyncMock()
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), _saved_row()]
+            side_effect=[_auth_row(), None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
