@@ -26,6 +26,7 @@ from afk_outcomes.models import (
     ExecutionOutcome,
     Provider,
     ProviderResourceIdentity,
+    TriggerType,
 )
 
 # Maximum length for the bounded failure metadata string on the public
@@ -143,12 +144,31 @@ class ExecutionBindingCreateRequest(BaseModel):
         description="Provider resource identity (normalized to change_request)"
     )
     outcome: ExecutionOutcome = Field(description="Terminal execution outcome")
+    trigger_type: TriggerType = Field(
+        description=(
+            "How this execution binding was triggered: eda, manual, scheduled, "
+            "backfill, or recovery"
+        ),
+    )
 
     # Optional traceability metadata — bounded and redacted by the contract.
     source_event_id: str | None = Field(
         default=None,
-        description="Originating EDA source event id (for traceability)",
+        description=(
+            "Originating EDA source event id (for traceability).  Required "
+            "when trigger_type is 'eda', optional otherwise."
+        ),
     )
+
+    @model_validator(mode="after")
+    def _validate_source_event_id_for_eda(self) -> ExecutionBindingCreateRequest:
+        """source_event_id is required when trigger_type is EDA."""
+        if self.trigger_type is TriggerType.EDA and self.source_event_id is None:
+            raise ValueError(
+                "source_event_id is required when trigger_type is 'eda'"
+            )
+        return self
+
     branch: str | None = Field(default=None, description="Branch or ref")
     title: str | None = Field(default=None, description="Execution title")
     started_at: datetime | None = Field(
@@ -191,6 +211,21 @@ class ExecutionBindingReadResponse(BaseModel):
     )
     outcome: ExecutionOutcome = Field(description="Terminal execution outcome")
 
+    afk_run_id: str | None = Field(
+        default=None,
+        description=(
+            "Gateway-assigned AFK run ULID when this binding produced "
+            "an AFK run; None for legacy bindings or when the run has "
+            "not yet been created"
+        ),
+    )
+    trigger_type: str | None = Field(
+        default=None,
+        description=(
+            "How this execution binding was triggered (eda, manual, "
+            "scheduled, backfill, recovery); None for legacy rows"
+        ),
+    )
     source_event_id: str | None = Field(
         default=None, description="Originating EDA source event id"
     )
