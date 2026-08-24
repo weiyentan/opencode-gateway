@@ -25,7 +25,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, UniqueConstraint, text
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,9 +55,52 @@ class AFKRun(Base):
     of the ``EngineeringOutcome`` (change-request ids, resolved issue ids,
     merge event id, merged-at).  ``first_seen_at``/``last_seen_at`` are
     advanced by the enrich-only upsert.
+
+    The provisional lifecycle columns (migration 0039) extend the aggregate
+    root into a Gateway-owned anchor for an AFK run provisioned *before*
+    its AWX launch: source provenance (``host``, ``source_event_id``), a
+    provider-qualified ``repository`` identity, ``trigger_type`` metadata,
+    a nullable change-request binding (the three ``change_request_*``
+    columns), and a nullable ``recovered_from_afk_run_id`` recovery
+    reference.  Two partial unique indexes enforce the lifecycle write
+    semantics: idempotent provisioning keyed by
+    ``(provider, host, source_event_id)`` and the 1:1
+    lifecycle<->change-request invariant.  Legacy rows (NULL keys) are
+    excluded from both.
     """
 
     __tablename__ = "afk_runs"
+
+    __table_args__ = (
+        # Idempotency key for provisional provisioning — partial, so legacy
+        # rows (NULL host/source_event_id) never participate.
+        Index(
+            "uq_afk_runs_provisioning_key",
+            "provider",
+            "host",
+            "source_event_id",
+            unique=True,
+            postgresql_where=text(
+                "host IS NOT NULL AND source_event_id IS NOT NULL"
+            ),
+        ),
+        # 1:1 lifecycle<->change_request — a change request belongs to at
+        # most one lifecycle.  Partial — unbound rows (any NULL) excluded.
+        Index(
+            "uq_afk_runs_change_request_identity",
+            "change_request_provider",
+            "change_request_repository",
+            "change_request_external_id",
+            unique=True,
+            postgresql_where=text(
+                "change_request_provider IS NOT NULL AND "
+                "change_request_repository IS NOT NULL AND "
+                "change_request_external_id IS NOT NULL"
+            ),
+        ),
+        # Lookup index for recovery relationships.
+        Index("ix_afk_runs_recovered_from", "recovered_from_afk_run_id"),
+    )
 
     afk_run_id: Mapped[str] = mapped_column(String(26), primary_key=True)
     provider: Mapped[str] = mapped_column(String, nullable=False)
@@ -67,6 +119,26 @@ class AFKRun(Base):
     )
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    # ── Provisional lifecycle columns (migration 0039) — all nullable ──
+    host: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    source_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    repository: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    trigger_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    change_request_provider: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    change_request_repository: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    change_request_external_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    recovered_from_afk_run_id: Mapped[Optional[str]] = mapped_column(
+        String(26),
+        ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
+        nullable=True,
     )
 
 

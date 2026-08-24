@@ -50,6 +50,7 @@ from afk_outcomes.interfaces import OutcomeRepository
 from afk_outcomes.serialization import ULIDSource
 from afk_outcomes.models import (
     AFKRun,
+    AFKRunLifecycle,
     CLOSURE_RESOLVER_VERSION,
     ClosureEpisode,
     ClosureEpisodeStatus,
@@ -72,6 +73,7 @@ from afk_outcomes.models import (
     RunEntityLink,
     RunSessionLink,
     RunStatus,
+    TriggerType,
     UnresolvedCorrelation,
     build_observation_key,
 )
@@ -350,6 +352,49 @@ class CreateAFKExecutionBindingResult:
     binding_id: int | None = None
     is_conflict: bool = False
     is_created: bool = False
+
+
+@dataclass(frozen=True)
+class ProvisionAFKRunResult:
+    """Result of a provisional lifecycle provisioning attempt (issue #589).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.provision_afk_run`:
+
+    * ``is_created=True`` — a genuinely-new lifecycle row was inserted.
+    * ``is_conflict=True`` — the provisioning key
+      ``(provider, host, source_event_id)`` already exists with a
+      different payload; nothing was mutated.
+    * ``predecessor_missing=True`` — ``recovered_from_afk_run_id``
+      references a run that does not exist; nothing was inserted.
+    * Idempotent replay sets none of the three flags — the existing row is
+      returned unchanged.
+    """
+
+    afk_run_id: str
+    is_created: bool = False
+    is_conflict: bool = False
+    predecessor_missing: bool = False
+
+
+@dataclass(frozen=True)
+class ChangeRequestBindingResult:
+    """Result of an explicit change-request binding attempt (issue #589).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.bind_change_request`:
+
+    * ``is_bound=True`` — the lifecycle's change request was newly set.
+    * ``is_conflict=True`` — the lifecycle already carries a different
+      change request, or the requested change request already belongs to
+      another lifecycle (the 1:1 invariant); nothing was mutated.
+    * ``run_missing=True`` — no run with ``afk_run_id`` exists.
+    * Idempotent replay (same identity already bound) sets none of the
+      three flags.
+    """
+
+    afk_run_id: str
+    is_bound: bool = False
+    is_conflict: bool = False
+    run_missing: bool = False
 
 
 class AsyncpgOutcomeRepository(OutcomeRepository):
@@ -1768,7 +1813,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "failure_reason": existing["failure_reason"],
                     "source_event_id": existing["source_event_id"],
                     "external_session_id": existing["external_session_id"],
-                    "trigger_type": existing["trigger_type"],
+                    "trigger_type": existing.get("trigger_type"),
                 }
                 new_payload = {
                     "outcome": outcome.value,
@@ -1911,3 +1956,343 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             resource_number,
         )
         return [_row_to_execution_binding(row) for row in rows]
+
+    # ── provisional AFK run lifecycle (issue #589) ──────────────────────
+
+    @staticmethod
+    def provisioning_payload_matches(existing: dict, requested: dict) -> bool:
+        """Compare an existing provisioning row against a requested payload.
+
+        Returns ``True`` when all provisioning fields match, ``False`` when
+        any field differs (indicating a conflict rather than a replay).
+
+        The comparison covers the fields that define the provisioning contract:
+        ``repository``, ``trigger_type``, ``title``, and
+        ``recovered_from_afk_run_id``.  The idempotency key fields
+        (``provider``, ``host``, ``source_event_id``) are assumed to already
+        match — the caller is responsible for selecting the existing row by
+        those fields.
+        """
+        return (
+            existing.get("repository") == requested.get("repository")
+            and existing.get("trigger_type") == requested.get("trigger_type")
+            and existing.get("title") == requested.get("title")
+            and existing.get("recovered_from_afk_run_id")
+            == requested.get("recovered_from_afk_run_id")
+        )
+
+    async def provision_afk_run(
+        self,
+        *,
+        provider: Provider,
+        host: str,
+        source_event_id: str,
+        repository: str,
+        trigger_type: TriggerType,
+        title: str | None = None,
+        recovered_from_afk_run_id: str | None = None,
+        ulid_source: ULIDSource,
+    ) -> ProvisionAFKRunResult:
+        """Idempotently provision one provisional AFK run lifecycle.
+
+        The idempotency key is ``provider + host + source_event_id``,
+        guaranteed by the partial unique index
+        ``uq_afk_runs_provisioning_key`` (migration 0039).  Write semantics:
+
+        * **First call** — inserts the ``afk_runs`` row with status
+          ``pending``, the source provenance, the repository identity, the
+          trigger metadata, and the optional recovery reference; returns
+          ``is_created=True``.
+        * **Identical replay** — returns the existing ``afk_run_id`` with
+          no flags set and issues **no** INSERT (no mutation).
+        * **Conflicting replay** — the same key with a different payload
+          returns ``is_conflict=True`` without mutation.
+        * **Missing predecessor** — a ``recovered_from_afk_run_id`` that
+          references no existing run returns ``predecessor_missing=True``
+          without inserting anything.
+
+        Creating a recovery lifecycle (``recovered_from_afk_run_id`` set)
+        never mutates the predecessor row — the predecessor is only read.
+
+        The connection MUST already be in a transaction (the caller owns
+        the transaction boundary).  Uses savepoints internally, mirroring
+        :meth:`create_or_replay_afk_execution_binding`.
+        """
+        new_ulid = ulid_source.next_ulid()
+
+        async with self._conn.transaction():
+            existing = await self._conn.fetchrow(
+                """
+                SELECT afk_run_id, repository, trigger_type, title,
+                       recovered_from_afk_run_id
+                FROM afk_runs
+                WHERE provider = $1 AND host = $2 AND source_event_id = $3
+                """,
+                provider.value,
+                host,
+                source_event_id,
+            )
+
+            if existing is not None:
+                is_match = self.provisioning_payload_matches(
+                    existing,
+                    {
+                        "repository": repository,
+                        "trigger_type": trigger_type.value,
+                        "title": title,
+                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
+                    },
+                )
+                return ProvisionAFKRunResult(
+                    afk_run_id=existing["afk_run_id"],
+                    is_conflict=not is_match,
+                )
+
+            if recovered_from_afk_run_id is not None:
+                predecessor = await self._conn.fetchrow(
+                    "SELECT afk_run_id FROM afk_runs WHERE afk_run_id = $1",
+                    recovered_from_afk_run_id,
+                )
+                if predecessor is None:
+                    return ProvisionAFKRunResult(
+                        afk_run_id=new_ulid,
+                        predecessor_missing=True,
+                    )
+
+            rows = await self._conn.fetch(
+                """
+                INSERT INTO afk_runs
+                    (afk_run_id, provider, status, title, started_at, finished_at,
+                     outcome_status, outcome, host, source_event_id, repository,
+                     trigger_type, change_request_provider, change_request_repository,
+                     change_request_external_id, recovered_from_afk_run_id,
+                     first_seen_at, last_seen_at)
+                VALUES ($1, $2, 'pending', $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
+                        NULL, NULL, NULL, $8, now(), now())
+                ON CONFLICT (provider, host, source_event_id)
+                    WHERE host IS NOT NULL AND source_event_id IS NOT NULL
+                    DO NOTHING
+                RETURNING afk_run_id
+                """,
+                new_ulid,
+                provider.value,
+                title,
+                host,
+                source_event_id,
+                repository,
+                trigger_type.value,
+                recovered_from_afk_run_id,
+            )
+            if rows:
+                return ProvisionAFKRunResult(
+                    afk_run_id=rows[0]["afk_run_id"],
+                    is_created=True,
+                )
+
+            # Lost a concurrent race — re-read the full winner row and compare
+            # payloads to distinguish replay from conflict.
+            winner = await self._conn.fetchrow(
+                """
+                SELECT afk_run_id, repository, trigger_type, title,
+                       recovered_from_afk_run_id
+                FROM afk_runs
+                WHERE provider = $1 AND host = $2 AND source_event_id = $3
+                """,
+                provider.value,
+                host,
+                source_event_id,
+            )
+            if winner is not None:
+                is_match = self.provisioning_payload_matches(
+                    winner,
+                    {
+                        "repository": repository,
+                        "trigger_type": trigger_type.value,
+                        "title": title,
+                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
+                    },
+                )
+                return ProvisionAFKRunResult(
+                    afk_run_id=winner["afk_run_id"],
+                    is_conflict=not is_match,
+                )
+            return ProvisionAFKRunResult(
+                afk_run_id=new_ulid,
+            )
+
+    async def bind_change_request(
+        self,
+        *,
+        afk_run_id: str,
+        provider: Provider,
+        repository: str,
+        external_id: str,
+    ) -> ChangeRequestBindingResult:
+        """Bind one change request to a provisional lifecycle (idempotent).
+
+        Enforces the 1:1 lifecycle<->change_request invariant (migration
+        0039's ``uq_afk_runs_change_request_identity`` partial unique
+        index) with explicit conflict signaling:
+
+        * **Unbound lifecycle** — sets the three change-request columns;
+          returns ``is_bound=True``.
+        * **Identical replay** — the same identity already bound returns
+          no flags (no UPDATE issued).
+        * **Different identity already bound** — returns
+          ``is_conflict=True`` without mutation.
+        * **Change request owned by another lifecycle** — returns
+          ``is_conflict=True`` without mutation (the 1:1 invariant).
+        * **Missing run** — returns ``run_missing=True``.
+
+        Binding is available before review processing — it never depends on
+        the correlation engine.  The connection MUST already be in a
+        transaction (the caller owns the transaction boundary).
+        """
+        provider_value = provider.value
+
+        try:
+            async with self._conn.transaction():
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT afk_run_id, change_request_provider,
+                           change_request_repository, change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+                if run is None:
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        run_missing=True,
+                    )
+
+                existing_tuple = (
+                    run["change_request_provider"],
+                    run["change_request_repository"],
+                    run["change_request_external_id"],
+                )
+                if existing_tuple[0] is not None:
+                    is_match = existing_tuple == (provider_value, repository, external_id)
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_conflict=not is_match,
+                    )
+
+                # 1:1 invariant — the change request must not already belong to
+                # another lifecycle.  The partial unique index also enforces this
+                # under concurrency; this pre-check turns the common case into a
+                # clean conflict instead of a constraint violation.
+                other = await self._conn.fetchrow(
+                    """
+                    SELECT afk_run_id FROM afk_runs
+                    WHERE change_request_provider = $1
+                      AND change_request_repository = $2
+                      AND change_request_external_id = $3
+                    """,
+                    provider_value,
+                    repository,
+                    external_id,
+                )
+                if other is not None:
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_conflict=True,
+                    )
+
+                result = await self._conn.execute(
+                    """
+                    UPDATE afk_runs
+                    SET change_request_provider = $2,
+                        change_request_repository = $3,
+                        change_request_external_id = $4,
+                        last_seen_at = now()
+                    WHERE afk_run_id = $1
+                      AND change_request_provider IS NULL
+                    """,
+                    afk_run_id,
+                    provider_value,
+                    repository,
+                    external_id,
+                )
+
+                if result == "UPDATE 1":
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_bound=True,
+                    )
+
+                # Lost a race against a concurrent bind of this same lifecycle —
+                # re-read and classify as replay or conflict.
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT change_request_provider, change_request_repository,
+                           change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+                is_match = run is not None and (
+                    run["change_request_provider"],
+                    run["change_request_repository"],
+                    run["change_request_external_id"],
+                ) == (provider_value, repository, external_id)
+                return ChangeRequestBindingResult(
+                    afk_run_id=afk_run_id,
+                    is_conflict=not is_match,
+                )
+        except asyncpg.UniqueViolationError:
+            # Concurrent bind of the same change request to another lifecycle
+            # won the race — the 1:1 invariant holds.  The exception is caught
+            # OUTSIDE the ``async with self._conn.transaction()`` block so the
+            # context manager rolls the savepoint back first (a constraint
+            # violation leaves a savepoint failed until rollback, so catching
+            # inside would poison the caller's outer transaction), and the
+            # conflict is surfaced cleanly instead of as a 500.
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=True,
+            )
+
+    async def get_afk_run_lifecycle(self, afk_run_id: str) -> AFKRunLifecycle | None:
+        """Return the provisional lifecycle for ``afk_run_id``, or ``None``.
+
+        Legacy ``afk_runs`` rows (backfill/reconstruction, migration 0026)
+        predate the lifecycle columns; for them ``host``,
+        ``source_event_id``, ``repository``, and ``trigger_type`` read back
+        as ``None`` (the domain model is lenient on readback).
+        """
+        row = await self._conn.fetchrow(
+            """
+            SELECT afk_run_id, provider, status, host, source_event_id, repository,
+                   trigger_type, title, change_request_provider,
+                   change_request_repository, change_request_external_id,
+                   recovered_from_afk_run_id, first_seen_at, last_seen_at
+            FROM afk_runs
+            WHERE afk_run_id = $1
+            """,
+            afk_run_id,
+        )
+        if row is None:
+            return None
+        return AFKRunLifecycle(
+            afk_run_id=row["afk_run_id"],
+            provider=Provider(row["provider"]),
+            status=row["status"],
+            host=row.get("host"),
+            source_event_id=row.get("source_event_id"),
+            repository=row.get("repository"),
+            trigger_type=row.get("trigger_type"),
+            title=row.get("title"),
+            change_request_provider=(
+                Provider(row.get("change_request_provider"))
+                if row.get("change_request_provider")
+                else None
+            ),
+            change_request_repository=row.get("change_request_repository"),
+            change_request_external_id=row.get("change_request_external_id"),
+            recovered_from_afk_run_id=row.get("recovered_from_afk_run_id"),
+            first_seen_at=row.get("first_seen_at"),
+            last_seen_at=row.get("last_seen_at"),
+        )

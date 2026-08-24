@@ -1,7 +1,6 @@
-"""Execution-binding REST API (issue #549).
+"""Execution-binding and provisional AFK lifecycle REST API (issues #549, #589).
 
-Three endpoints under the versioned namespace expose the execution-binding
-write and read paths:
+Execution-binding endpoints (``/api/v1/afk/executions``):
 
 - ``POST /executions``   — persist one final execution binding from AWX.
   Idempotent by AWX job identity; conflicting data returns 409.
@@ -10,15 +9,26 @@ write and read paths:
   entity type, and entity number.  Full history including failed attempts and
   later successful retries in deterministic order.
 
+Provisional AFK run lifecycle endpoints (mounted on this router as
+``/runs`` — i.e. ``/api/v1/afk/executions/runs``, issue #589):
+
+- ``POST /runs`` — provision one provisional lifecycle.  Idempotent on
+  ``provider + host + source_event_id``; a conflicting replay returns 409.
+  ``recovered_from_afk_run_id`` provisions a recovery lifecycle without
+  mutating its predecessor.
+- ``POST /runs/{afk_run_id}/change-request`` — bind one change request to a
+  lifecycle.  Idempotent per lifecycle (the 1:1 lifecycle<->change_request
+  invariant); conflicts return 409.
+
 All responses use the ``{status, data, error}`` envelope and are protected
-by the global :class:`~app.core.auth.ApiKeyMiddleware`.  The write path
-additionally requires a collector credential via
+by the global :class:`~app.core.auth.ApiKeyMiddleware`.  The write paths
+additionally require a collector credential via
 :func:`~app.core.auth.require_collector_token` — and the credential must be
 attributable to the dedicated AWX execution-binding integration client
 (``AWX_EXECUTION_BINDING_CLIENT_NAME``), never the usage collector
 (``opencode-collector``) or any other client (issue #550).
 
-Write semantics (ADR 0024):
+Write semantics (ADR 0024; issue #589):
 
 * **Idempotent by AWX job identity** — repeating an identical POST is a no-op
   (200 with the existing binding, no duplicate row).
@@ -48,6 +58,11 @@ from afk_outcomes.serialization import MonotonicULID
 from app.core.auth import require_collector_token
 from app.core.config import get_settings
 from app.core.repository import normalize_repository_url
+from app.core.schemas.afk_lifecycle import (
+    AFKRunLifecycleResponse,
+    AFKRunProvisionRequest,
+    ChangeRequestBindingRequest,
+)
 from app.core.schemas.execution_binding import (
     ExecutionBindingCreateRequest,
     ExecutionBindingHistoryResponse,
@@ -448,3 +463,162 @@ async def list_execution_bindings(
         resource=resource,
         bindings=[_binding_to_read_response(b) for b in bindings],
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST /api/v1/afk/executions/runs — provisional lifecycle provisioning
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/runs",
+    response_model=AFKRunLifecycleResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "description": "Idempotent replay — existing lifecycle returned unchanged"
+        },
+        status.HTTP_201_CREATED: {"description": "New provisional lifecycle provisioned"},
+    },
+)
+async def provision_afk_run_lifecycle(
+    body: AFKRunProvisionRequest,
+    request: Request,
+    response: Response,
+    auth: dict = Depends(require_awx_execution_binding_credential),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AFKRunLifecycleResponse:
+    """Provision one provisional AFK run lifecycle (issue #589).
+
+    **Idempotent provisioning** — keyed on ``provider + host +
+    source_event_id``, enforced by the partial unique index
+    ``uq_afk_runs_provisioning_key`` (migration 0039):
+
+    * New key → ``201 Created`` with the new lifecycle (status ``pending``).
+    * Identical replay → ``200 OK`` with the existing lifecycle unchanged.
+    * Conflicting replay → ``409 Conflict`` (no mutation).
+
+    **Recovery** — ``recovered_from_afk_run_id`` provisions a recovery
+    lifecycle that references its predecessor without mutating it; a
+    missing predecessor returns ``404``.
+    """
+    # Normalize the repository identity at the API boundary before any
+    # persistence or conflict comparison (same helper as execution bindings).
+    normalized_repo = _normalize_repository_or_400(body.repository)
+    body.repository = normalized_repo
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.insert.provisional_afk_run", "db"):
+            async with _db_timeout(
+                "db.insert.provisional_afk_run", settings.database_timeout_seconds
+            ):
+                result = await repo.provision_afk_run(
+                    provider=body.provider,
+                    host=body.host,
+                    source_event_id=body.source_event_id,
+                    repository=normalized_repo,
+                    trigger_type=body.trigger_type,
+                    title=body.title,
+                    recovered_from_afk_run_id=body.recovered_from_afk_run_id,
+                    ulid_source=MonotonicULID(),
+                )
+
+    if result.predecessor_missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "Recovered-from AFK run not found: "
+                f"{body.recovered_from_afk_run_id}"
+            ),
+        )
+    if result.is_conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Conflicting data for existing provisional lifecycle",
+        )
+
+    lifecycle = await repo.get_afk_run_lifecycle(result.afk_run_id)
+    if lifecycle is None:
+        # Should not happen — provisioning returned a result, so a row exists.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve provisioned lifecycle",
+        )
+
+    if result.is_created:
+        response.status_code = status.HTTP_201_CREATED
+    return AFKRunLifecycleResponse.from_domain(lifecycle)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST /api/v1/afk/executions/runs/{afk_run_id}/change-request — binding
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/runs/{afk_run_id}/change-request",
+    response_model=AFKRunLifecycleResponse,
+)
+async def bind_lifecycle_change_request(
+    afk_run_id: str,
+    body: ChangeRequestBindingRequest,
+    request: Request,
+    auth: dict = Depends(require_awx_execution_binding_credential),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AFKRunLifecycleResponse:
+    """Bind one change request to a provisional lifecycle (issue #589).
+
+    **Idempotent and available before review processing** — the binding
+    never depends on the correlation engine:
+
+    * Unbound lifecycle → the change request is bound (``200 OK``).
+    * Identical replay → ``200 OK`` unchanged (no mutation).
+    * Different change request already bound to this lifecycle, or the
+      requested change request already belongs to another lifecycle (the
+      1:1 invariant) → ``409 Conflict`` (no mutation).
+    * Unknown lifecycle → ``404``.
+    """
+    # Normalize the repository identity at the API boundary (same helper as
+    # execution bindings); GitHub PRs and GitLab MRs both bind under the
+    # canonical change_request identity.
+    normalized_repo = _normalize_repository_or_400(body.repository)
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.update.afk_run_change_request_binding", "db"):
+            async with _db_timeout(
+                "db.update.afk_run_change_request_binding",
+                settings.database_timeout_seconds,
+            ):
+                result = await repo.bind_change_request(
+                    afk_run_id=afk_run_id,
+                    provider=body.provider,
+                    repository=normalized_repo,
+                    external_id=body.external_id,
+                )
+
+    if result.run_missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provisional lifecycle not found: {afk_run_id}",
+        )
+    if result.is_conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Change-request binding conflict: the lifecycle already "
+                "carries a different change request, or the change request "
+                "belongs to another lifecycle"
+            ),
+        )
+
+    lifecycle = await repo.get_afk_run_lifecycle(afk_run_id)
+    if lifecycle is None:
+        # Should not happen — the bind returned a result, so a row exists.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve lifecycle after change-request binding",
+        )
+    return AFKRunLifecycleResponse.from_domain(lifecycle)
