@@ -39,6 +39,10 @@ PK  afk_run_id
     recovered_from_afk_run_id
 ```
 
+`afk_run_id` is the natural primary key of `afk_runs` — there is no surrogate `id` column. This differs from ADR 0024's `execution_bindings` table, which uses a surrogate `id` PK alongside `awx_job_id` as the idempotency key. The rationale is timing: `afk_run_id` is a ULID assigned at provisioning time before any execution exists, so it serves as both the logical identity and the physical PK from the moment the row is created. `execution_bindings`, by contrast, uses a surrogate `id` because `awx_job_id` is the idempotency key but is assigned by AWX after the binding is created — the binding row must exist before the job runs, so the identity cannot be supplied by AWX up front.
+
+`afk_runs.source_event_id` stores the first/triggering provider delivery ID that caused the lifecycle to be provisioned — the webhook delivery that triggered the batch. It is NOT the lifecycle grouping key; it is provenance for the trigger event only. The binding-level `execution_bindings.source_event_id` is different: it stores the per-execution EDA source event ID — the specific webhook delivery that triggered that particular AWX job. The two serve different purposes: the root-level field is trigger provenance for the lifecycle, while the binding-level field is per-execution provenance.
+
 The lifecycle exists independently of AWX and the eventual change request:
 
 ```text
@@ -158,12 +162,15 @@ Its uniqueness boundary is:
 UNIQUE(provider, repository, entity_type, external_id, afk_run_id)
 ```
 
+Deduplication follows a first-writer-wins rule per `(provider, repository, entity_type, external_id, afk_run_id)`: the first correlation method to persist the entity wins, and subsequent correlations for the same entity + run pair are no-ops — the existing row is not updated. This prevents churn from competing correlation methods (for example, an explicit issue mention firing alongside a body-text parse) while preserving the audit trail of which method first established the link. If a correlation method needs to supersede a previous one, the `superseded_at` column is used: it is set on the old row, and a new row is inserted with the different method.
+
 `engineering_events` stores immutable observations about those entities:
 
 ```text
 engineering_events
 ----------------------------------
 PK  id
+    afk_run_id          FK REFERENCES afk_runs(afk_run_id), nullable
     provider
     repository
     entity_type
@@ -178,6 +185,8 @@ PK  id
     snapshot_at
     first_ingested_at
 ```
+
+The `afk_run_id` foreign key is optional (nullable) because events may arrive before the lifecycle is provisioned. When set, it provides a direct query path for lifecycle-scoped event aggregation, avoiding a join through `afk_run_entities` by `(provider, repository, entity_type, external_id)`. The join path through `afk_run_entities` remains available as a secondary strategy for events that were ingested before lifecycle association.
 
 Examples include `issue.opened`, `issue.closed`, `change_request.opened`, `change_request.review_requested`, `change_request.changes_requested`, `change_request.approved`, and `change_request.merged`.
 
