@@ -60,20 +60,29 @@ def downgrade() -> None:
     * Delete resource-less rows before downgrading, or
     * Supply valid resource identities for each affected row.
     """
-    conn = op.get_bind()
-    result = conn.execute(
-        sa.text(
-            "SELECT COUNT(*) FROM execution_bindings "
-            "WHERE provider IS NULL OR repository_url IS NULL "
-            "OR entity_type IS NULL OR entity_number IS NULL"
+    try:
+        conn = op.get_bind()
+        result = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM execution_bindings "
+                "WHERE provider IS NULL OR repository_url IS NULL "
+                "OR entity_type IS NULL OR entity_number IS NULL"
+            )
         )
-    )
-    count = result.scalar()
-    if count > 0:
-        raise RuntimeError(
-            f"Cannot downgrade: {count} execution_binding(s) have NULL "
-            f"resource-identity columns.  Delete or backfill these rows "
-            f"before downgrading, or use a manual migration."
-        )
+        count = result.scalar()
+        if count > 0:
+            raise RuntimeError(
+                f"Cannot downgrade: {count} execution_binding(s) have NULL "
+                f"resource-identity columns.  Delete or backfill these rows "
+                f"before downgrading, or use a manual migration."
+            )
+    except AttributeError:
+        # Offline SQL render mode (alembic command with sql=True): the
+        # fake connection returns a result without .scalar(), so the
+        # guard cannot run.  The offline render only produces ALTER
+        # COLUMN statements — the runtime guard is exercised by the
+        # direct downgrade tests (test_downgrade_refuses_when_null_rows_exist
+        # and test_downgrade_succeeds_when_no_null_rows).
+        pass
     for column in _RESOURCE_COLUMNS:
         op.alter_column("execution_bindings", column, existing_type=sa.String(), nullable=False)
