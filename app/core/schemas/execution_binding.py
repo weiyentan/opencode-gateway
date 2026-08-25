@@ -150,6 +150,19 @@ class ExecutionBindingCreateRequest(BaseModel):
             "backfill, or recovery"
         ),
     )
+    afk_run_id: str | None = Field(
+        default=None,
+        min_length=26,
+        max_length=26,
+        description=(
+            "Optional gateway-assigned AFK run ULID (26 chars), pre-provisioned "
+            "via POST /api/v1/afk/executions/runs.  When supplied, the binding "
+            "attaches to that lifecycle (validated against afk_runs — an "
+            "unknown run is rejected with 404) so many execution bindings can "
+            "reference one lifecycle; when omitted, the gateway provisions a "
+            "run for the binding (legacy behavior preserved)."
+        ),
+    )
 
     # Optional traceability metadata — bounded and redacted by the contract.
     source_event_id: str | None = Field(

@@ -174,6 +174,10 @@ def _binding_conflicts_with(
     repository), outcome, and optional traceability metadata.  A replay that
     changes any value is a 409 conflict, never a silent accept of stale
     data (issue #549 review).
+
+    The supplied ``afk_run_id`` participates only when the caller supplied
+    one (issue #595): a legacy replay that omits it never conflicts on the
+    stored auto-created run.
     """
     resource = body.resource
     return (
@@ -191,6 +195,9 @@ def _binding_conflicts_with(
         or existing.started_at != body.started_at
         or existing.finished_at != body.finished_at
         or existing.trigger_type != body.trigger_type.value
+        or (
+            body.afk_run_id is not None and existing.afk_run_id != body.afk_run_id
+        )
     )
 
 
@@ -262,6 +269,13 @@ async def create_execution_binding(
 
     **Multiple jobs per resource**: different AWX jobs targeting the same
     GitHub pull request or GitLab merge request are both persisted.
+
+    **Lifecycle multiplicity (issue #595)**: an optional ``afk_run_id``
+    attaches the binding to a pre-provisioned lifecycle — many execution
+    bindings (a failed attempt and a later retry with a new ``awx_job_id``)
+    can reference one ``afk_run_id``.  A supplied ``afk_run_id`` that
+    references no provisioned lifecycle is rejected with ``404``; omitting
+    it preserves the legacy behavior of provisioning a run with the binding.
     """
     # Normalize repository URL at the API boundary before any persistence
     # or conflict comparison (issue #565).  Invalid identities surface as
@@ -280,9 +294,10 @@ async def create_execution_binding(
         # Parse trigger_type from the request body for persistence.
         trigger_type_value: str | None = body.trigger_type.value
 
-        # Transactional creation — inserts afk_runs + execution_bindings
-        # atomically.  Returns is_created (201), is_conflict (409), or
-        # idempotent replay (200).
+        # Transactional creation — attaches to the pre-provisioned lifecycle
+        # when afk_run_id is supplied, else inserts afk_runs +
+        # execution_bindings atomically.  Returns is_created (201),
+        # is_conflict (409), run_missing (404), or idempotent replay (200).
         async with timed_operation("db.insert.execution_binding", "db"):
             async with _db_timeout(
                 "db.insert.execution_binding", settings.database_timeout_seconds
@@ -302,8 +317,15 @@ async def create_execution_binding(
                     started_at=body.started_at,
                     finished_at=body.finished_at,
                     trigger_type=trigger_type_value,
+                    afk_run_id=body.afk_run_id,
                     ulid_source=MonotonicULID(),
                 )
+
+        if result.run_missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"AFK run not found: {body.afk_run_id}",
+            )
 
         if result.is_created:
             # New binding was inserted.
@@ -487,7 +509,7 @@ async def provision_afk_run_lifecycle(
     auth: dict = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AFKRunLifecycleResponse:
-    """Provision one provisional AFK run lifecycle (issue #589).
+    """Provision one provisional AFK run lifecycle (issues #589, #595).
 
     **Idempotent provisioning** — keyed on ``provider + host +
     source_event_id``, enforced by the partial unique index
@@ -496,6 +518,14 @@ async def provision_afk_run_lifecycle(
     * New key → ``201 Created`` with the new lifecycle (status ``pending``).
     * Identical replay → ``200 OK`` with the existing lifecycle unchanged.
     * Conflicting replay → ``409 Conflict`` (no mutation).
+
+    **Batch provenance (issue #595)** — ``deliveries`` is the ordered list
+    of contributing delivery identities of the accepted webhook batch; the
+    first element is the first triggering delivery, stored on the run as
+    ``first_delivery_id``, and every identity is stored as a batch record.
+    Batch provenance is non-erasing: a replay with a different or omitted
+    batch is a conflict, never an erasure.  Provisioning without a batch
+    (legacy behavior) simply carries no batch provenance.
 
     **Recovery** — ``recovered_from_afk_run_id`` provisions a recovery
     lifecycle that references its predecessor without mutating it; a
@@ -521,6 +551,7 @@ async def provision_afk_run_lifecycle(
                     trigger_type=body.trigger_type,
                     title=body.title,
                     recovered_from_afk_run_id=body.recovered_from_afk_run_id,
+                    deliveries=body.deliveries,
                     ulid_source=MonotonicULID(),
                 )
 
@@ -545,10 +576,17 @@ async def provision_afk_run_lifecycle(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve provisioned lifecycle",
         )
+    first_delivery_id, delivery_ids = await repo.get_afk_run_batch_provenance(
+        result.afk_run_id
+    )
 
     if result.is_created:
         response.status_code = status.HTTP_201_CREATED
-    return AFKRunLifecycleResponse.from_domain(lifecycle)
+    return AFKRunLifecycleResponse.from_domain(
+        lifecycle,
+        first_delivery_id=first_delivery_id,
+        delivery_ids=delivery_ids,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

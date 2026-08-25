@@ -344,14 +344,19 @@ class CreateAFKExecutionBindingResult:
     """Result of a transactional AFK run + execution binding creation (issue #584).
 
     Returned by :meth:`AsyncpgOutcomeRepository.create_or_replay_afk_execution_binding`.
-    Exactly one of ``is_conflict`` or ``is_created`` is ``True``; idempotent
-    replays set neither (both ``False``).
+    Exactly one of ``is_conflict``, ``is_created``, or ``run_missing`` is
+    ``True``; idempotent replays set none of the three (all ``False``).
+
+    ``run_missing`` (issue #595) signals that the caller supplied an
+    ``afk_run_id`` referencing no provisioned lifecycle — nothing was
+    inserted.
     """
 
     afk_run_id: str
     binding_id: int | None = None
     is_conflict: bool = False
     is_created: bool = False
+    run_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -1763,21 +1768,36 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         trigger_type: str | None = None,
+        afk_run_id: str | None = None,
         ulid_source: ULIDSource,
     ) -> CreateAFKExecutionBindingResult:
-        """Transactionally create a provisional AFK run and execution binding (issue #584).
+        """Transactionally create or attach an AFK execution binding.
 
-        Generates a ULID for the ``afk_runs`` row, inserts it with
-        ``status = 'pending'``, and inserts an ``execution_bindings`` row
-        with the ``afk_run_id`` link — all in a single atomic transaction.
+        **Lifecycle multiplicity (issue #595)**: when ``afk_run_id`` is
+        supplied, the binding attaches to the pre-provisioned lifecycle
+        instead of creating a new one — many execution bindings (e.g. a
+        failed attempt and a later retry with a new ``awx_job_id``) can
+        reference one ``afk_run_id``:
 
-        * **First call** — creates both rows and returns
-          ``is_created=True``.
+        * **Supplied ``afk_run_id`` exists** — the binding is linked to it
+          (no new ``afk_runs`` row) and returns ``is_created=True`` on first
+          insert.
+        * **Supplied ``afk_run_id`` missing** — returns ``run_missing=True``
+          without inserting anything (the caller surfaces a 404).
+        * **No ``afk_run_id``** — legacy behavior preserved: a provisional
+          ``afk_runs`` row is created transactionally with the binding.
+
+        Replay/conflict semantics are unchanged by the addition:
+
+        * **First call** — creates the binding and returns ``is_created=True``.
         * **Identical replay** (same ``awx_job_id``, same payload) — returns
-          existing ``afk_run_id`` and ``binding_id`` without mutation (both
-          ``is_conflict`` and ``is_created`` are ``False``).
-        * **Conflicting replay** (same ``awx_job_id``, different payload) —
-          returns ``is_conflict=True`` without mutation.
+          the existing ``afk_run_id`` and ``binding_id`` without mutation.
+          The supplied ``afk_run_id`` participates in the comparison only
+          when the caller supplied one, so a legacy replay that omits it
+          never conflicts on the stored auto-created run.
+        * **Conflicting replay** (same ``awx_job_id``, different payload,
+          or a different supplied ``afk_run_id``) — returns
+          ``is_conflict=True`` without mutation.
 
         The connection MUST already be in a transaction (the caller owns the
         transaction boundary).  Uses savepoints internally so that a failure
@@ -1825,26 +1845,45 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "trigger_type": trigger_type,
                 }
                 is_match = existing_payload == new_payload
+                # The supplied afk_run_id only participates when the caller
+                # supplied one — a legacy replay that omits it never
+                # conflicts on the stored auto-created run (issue #595).
+                if is_match and afk_run_id is not None:
+                    is_match = existing["afk_run_id"] == afk_run_id
                 return CreateAFKExecutionBindingResult(
                     afk_run_id=existing["afk_run_id"],
                     binding_id=existing["id"],
                     is_conflict=not is_match,
                 )
 
-            # First creation — insert afk_runs then execution_bindings.
-            await self._conn.execute(
-                """
-                INSERT INTO afk_runs
-                    (afk_run_id, provider, status, title, started_at, finished_at,
-                     outcome_status, outcome, first_seen_at, last_seen_at)
-                VALUES ($1, $2, 'pending', $3, $4, $5, NULL, NULL, now(), now())
-                """,
-                new_ulid,
-                provider.value,
-                title,
-                started_at,
-                finished_at,
-            )
+            # First creation — attach to a pre-provisioned lifecycle when one
+            # was supplied, else create the provisional run (legacy behavior).
+            run_id = new_ulid
+            if afk_run_id is not None:
+                existing_run = await self._conn.fetchrow(
+                    "SELECT afk_run_id FROM afk_runs WHERE afk_run_id = $1",
+                    afk_run_id,
+                )
+                if existing_run is None:
+                    return CreateAFKExecutionBindingResult(
+                        afk_run_id=afk_run_id,
+                        run_missing=True,
+                    )
+                run_id = afk_run_id
+            else:
+                await self._conn.execute(
+                    """
+                    INSERT INTO afk_runs
+                        (afk_run_id, provider, status, title, started_at, finished_at,
+                         outcome_status, outcome, first_seen_at, last_seen_at)
+                    VALUES ($1, $2, 'pending', $3, $4, $5, NULL, NULL, now(), now())
+                    """,
+                    run_id,
+                    provider.value,
+                    title,
+                    started_at,
+                    finished_at,
+                )
 
             binding_row = await self._conn.fetch(
                 """
@@ -1872,13 +1911,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 failure_reason,
                 started_at,
                 finished_at,
-                new_ulid,
+                run_id,
                 trigger_type,
             )
 
             if binding_row:
                 return CreateAFKExecutionBindingResult(
-                    afk_run_id=new_ulid,
+                    afk_run_id=run_id,
                     binding_id=binding_row[0]["id"],
                     is_created=True,
                 )
@@ -1894,7 +1933,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 numeric_awx_job_id,
             )
             return CreateAFKExecutionBindingResult(
-                afk_run_id=winner["afk_run_id"] if winner else new_ulid,
+                afk_run_id=winner["afk_run_id"] if winner else run_id,
                 binding_id=winner["id"] if winner else None,
             )
 
@@ -1967,8 +2006,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         any field differs (indicating a conflict rather than a replay).
 
         The comparison covers the fields that define the provisioning contract:
-        ``repository``, ``trigger_type``, ``title``, and
-        ``recovered_from_afk_run_id``.  The idempotency key fields
+        ``repository``, ``trigger_type``, ``title``,
+        ``recovered_from_afk_run_id``, and — the batch-provenance anchor
+        (issue #595) — ``first_delivery_id``.  The idempotency key fields
         (``provider``, ``host``, ``source_event_id``) are assumed to already
         match — the caller is responsible for selecting the existing row by
         those fields.
@@ -1979,6 +2019,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             and existing.get("title") == requested.get("title")
             and existing.get("recovered_from_afk_run_id")
             == requested.get("recovered_from_afk_run_id")
+            and existing.get("first_delivery_id")
+            == requested.get("first_delivery_id")
         )
 
     async def provision_afk_run(
@@ -1991,6 +2033,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         trigger_type: TriggerType,
         title: str | None = None,
         recovered_from_afk_run_id: str | None = None,
+        deliveries: list[str] | None = None,
         ulid_source: ULIDSource,
     ) -> ProvisionAFKRunResult:
         """Idempotently provision one provisional AFK run lifecycle.
@@ -2001,10 +2044,15 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
         * **First call** — inserts the ``afk_runs`` row with status
           ``pending``, the source provenance, the repository identity, the
-          trigger metadata, and the optional recovery reference; returns
+          trigger metadata, the optional recovery reference, and the batch
+          provenance (issue #595: ``deliveries[0]`` becomes
+          ``first_delivery_id`` and every delivery identity is written to
+          ``afk_run_delivery_batches`` in the same transaction); returns
           ``is_created=True``.
         * **Identical replay** — returns the existing ``afk_run_id`` with
-          no flags set and issues **no** INSERT (no mutation).
+          no flags set and issues **no** writes (the batch is compared too:
+          a replay with a different or omitted batch is a conflict, never an
+          erasure).
         * **Conflicting replay** — the same key with a different payload
           returns ``is_conflict=True`` without mutation.
         * **Missing predecessor** — a ``recovered_from_afk_run_id`` that
@@ -2014,17 +2062,38 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         Creating a recovery lifecycle (``recovered_from_afk_run_id`` set)
         never mutates the predecessor row — the predecessor is only read.
 
+        ``deliveries`` is optional for backward compatibility: ``None`` /
+        empty means the run carries no batch provenance (legacy behavior).
+        Duplicates are deduplicated preserving order so the same logical
+        batch always compares equal on replay.
+
         The connection MUST already be in a transaction (the caller owns
         the transaction boundary).  Uses savepoints internally, mirroring
-        :meth:`create_or_replay_afk_execution_binding`.
+        :meth:`create_or_replay_afk_execution_binding`; a failed batch write
+        rolls the run insert back — no orphan batch rows, no orphan run.
         """
         new_ulid = ulid_source.next_ulid()
+        # Batch provenance (issue #595): the ordered, deduplicated identities
+        # of the accepted webhook batch.  ``deliveries[0]`` is the first
+        # triggering delivery, stored on the run row; every identity becomes
+        # a batch row.
+        deliveries = list(dict.fromkeys(deliveries or []))
+        first_delivery_id = deliveries[0] if deliveries else None
+
+        def _requested_payload() -> dict:
+            return {
+                "repository": repository,
+                "trigger_type": trigger_type.value,
+                "title": title,
+                "recovered_from_afk_run_id": recovered_from_afk_run_id,
+                "first_delivery_id": first_delivery_id,
+            }
 
         async with self._conn.transaction():
             existing = await self._conn.fetchrow(
                 """
                 SELECT afk_run_id, repository, trigger_type, title,
-                       recovered_from_afk_run_id
+                       recovered_from_afk_run_id, first_delivery_id
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -2035,14 +2104,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
             if existing is not None:
                 is_match = self.provisioning_payload_matches(
-                    existing,
-                    {
-                        "repository": repository,
-                        "trigger_type": trigger_type.value,
-                        "title": title,
-                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
-                    },
+                    existing, _requested_payload()
                 )
+                if is_match and not await self._batch_provenance_matches(
+                    existing["afk_run_id"], first_delivery_id, deliveries
+                ):
+                    is_match = False
                 return ProvisionAFKRunResult(
                     afk_run_id=existing["afk_run_id"],
                     is_conflict=not is_match,
@@ -2066,9 +2133,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                      outcome_status, outcome, host, source_event_id, repository,
                      trigger_type, change_request_provider, change_request_repository,
                      change_request_external_id, recovered_from_afk_run_id,
-                     first_seen_at, last_seen_at)
+                     first_delivery_id, first_seen_at, last_seen_at)
                 VALUES ($1, $2, 'pending', $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
-                        NULL, NULL, NULL, $8, now(), now())
+                        NULL, NULL, NULL, $8, $9, now(), now())
                 ON CONFLICT (provider, host, source_event_id)
                     WHERE host IS NOT NULL AND source_event_id IS NOT NULL
                     DO NOTHING
@@ -2082,10 +2149,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 repository,
                 trigger_type.value,
                 recovered_from_afk_run_id,
+                first_delivery_id,
             )
             if rows:
+                run_id = rows[0]["afk_run_id"]
+                await self._insert_delivery_batch_rows(run_id, deliveries)
                 return ProvisionAFKRunResult(
-                    afk_run_id=rows[0]["afk_run_id"],
+                    afk_run_id=run_id,
                     is_created=True,
                 )
 
@@ -2094,7 +2164,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             winner = await self._conn.fetchrow(
                 """
                 SELECT afk_run_id, repository, trigger_type, title,
-                       recovered_from_afk_run_id
+                       recovered_from_afk_run_id, first_delivery_id
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -2104,14 +2174,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             )
             if winner is not None:
                 is_match = self.provisioning_payload_matches(
-                    winner,
-                    {
-                        "repository": repository,
-                        "trigger_type": trigger_type.value,
-                        "title": title,
-                        "recovered_from_afk_run_id": recovered_from_afk_run_id,
-                    },
+                    winner, _requested_payload()
                 )
+                if is_match and not await self._batch_provenance_matches(
+                    winner["afk_run_id"], first_delivery_id, deliveries
+                ):
+                    is_match = False
                 return ProvisionAFKRunResult(
                     afk_run_id=winner["afk_run_id"],
                     is_conflict=not is_match,
@@ -2119,6 +2187,84 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             return ProvisionAFKRunResult(
                 afk_run_id=new_ulid,
             )
+
+    async def _insert_delivery_batch_rows(
+        self, afk_run_id: str, deliveries: list[str]
+    ) -> None:
+        """Insert one batch row per contributing delivery identity (issue #595).
+
+        Runs inside the provisioning transaction: a failure here rolls the
+        run INSERT back with it, so a partially-written batch can never
+        outlive its run (no orphan batch rows, no orphan run).
+        """
+        for position, delivery_id in enumerate(deliveries):
+            await self._conn.execute(
+                """
+                INSERT INTO afk_run_delivery_batches
+                    (afk_run_id, delivery_id, position, created_at)
+                VALUES ($1, $2, $3, now())
+                ON CONFLICT (afk_run_id, delivery_id) DO NOTHING
+                """,
+                afk_run_id,
+                delivery_id,
+                position,
+            )
+
+    async def _batch_provenance_matches(
+        self,
+        afk_run_id: str,
+        first_delivery_id: str | None,
+        requested_deliveries: list[str],
+    ) -> bool:
+        """Compare the stored batch provenance against the requested batch.
+
+        Batch provenance is non-erasing: a replay that omits deliveries
+        against a run that carries them (or supplies a different batch) is a
+        conflict, never an erasure.  Runs without provenance on either side
+        compare equal without touching the database.
+        """
+        if first_delivery_id is None and not requested_deliveries:
+            return True
+        rows = await self._conn.fetch(
+            """
+            SELECT delivery_id FROM afk_run_delivery_batches
+            WHERE afk_run_id = $1
+            ORDER BY position ASC, id ASC
+            """,
+            afk_run_id,
+        )
+        stored = [row["delivery_id"] for row in rows]
+        return stored == requested_deliveries
+
+    async def get_afk_run_batch_provenance(
+        self, afk_run_id: str
+    ) -> tuple[str | None, list[str]]:
+        """Return the stored batch provenance for ``afk_run_id`` (issue #595).
+
+        Returns ``(first_delivery_id, delivery_ids)`` — the first triggering
+        delivery stored on the run row plus every contributing delivery
+        identity of the accepted batch, in stored order.  Unknown runs and
+        legacy runs without provenance both return ``(None, [])``.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT r.first_delivery_id, b.delivery_id
+            FROM afk_runs r
+            LEFT JOIN afk_run_delivery_batches b ON b.afk_run_id = r.afk_run_id
+            WHERE r.afk_run_id = $1
+            ORDER BY b.position ASC, b.id ASC
+            """,
+            afk_run_id,
+        )
+        if not rows:
+            return (None, [])
+        first_delivery_id = rows[0].get("first_delivery_id")
+        delivery_ids = [
+            row.get("delivery_id")
+            for row in rows
+            if row.get("delivery_id") is not None
+        ]
+        return (first_delivery_id, delivery_ids)
 
     async def bind_change_request(
         self,

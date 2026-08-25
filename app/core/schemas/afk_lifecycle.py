@@ -16,7 +16,7 @@ columns, so those fields surface as ``None``).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from afk_outcomes.models import (
     AFKRunLifecycle,
@@ -32,12 +32,18 @@ class AFKRunProvisionRequest(BaseModel):
     Carries the source provenance (``provider``, ``host``,
     ``source_event_id``), the provider-qualified repository identity
     (normalized at the API boundary), the trigger metadata, an optional
-    title, and an optional recovery reference.  AWX and change-request
-    fields are deliberately absent — they are populated later by the
-    execution-binding and change-request-binding paths.
+    title, an optional recovery reference, and the optional batch provenance
+    (``deliveries`` — issue #595).  AWX and change-request fields are
+    deliberately absent — they are populated later by the execution-binding
+    and change-request-binding paths.
 
     ``provider + host + source_event_id`` is the idempotency key: replaying
     the same payload returns the existing lifecycle without mutation.
+
+    ``deliveries`` is the ordered list of contributing delivery identities
+    of the accepted webhook batch; the first element is the first triggering
+    delivery.  It is optional for backward compatibility — provisioning
+    without a batch simply carries no batch provenance (legacy behavior).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -62,6 +68,14 @@ class AFKRunProvisionRequest(BaseModel):
         ),
     )
     title: str | None = Field(default=None, description="Optional lifecycle title")
+    deliveries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ordered delivery identities of the accepted webhook batch — the "
+            "first element is the first triggering delivery.  Optional: an "
+            "omitted batch carries no batch provenance on the run."
+        ),
+    )
     recovered_from_afk_run_id: str | None = Field(
         default=None,
         description=(
@@ -69,6 +83,14 @@ class AFKRunProvisionRequest(BaseModel):
             "(never mutates the predecessor)"
         ),
     )
+
+    @field_validator("deliveries")
+    @classmethod
+    def _validate_deliveries(cls, v: list[str]) -> list[str]:
+        """Every delivery identity must be a non-empty string."""
+        if any(not item for item in v):
+            raise ValueError("deliveries entries must be non-empty strings")
+        return v
 
     @model_validator(mode="after")
     def _validate_recovery_reference(self) -> AFKRunProvisionRequest:
@@ -113,8 +135,10 @@ class AFKRunLifecycleResponse(BaseModel):
     The read counterpart of the provisioning request: the same source
     provenance, repository identity, and trigger metadata, plus the
     gateway-assigned ``afk_run_id``, the current ``status``, the bound
-    change request (``None`` until bound), and the recovery reference.
-    Legacy rows surface ``None`` for the lifecycle columns they predate.
+    change request (``None`` until bound), the recovery reference, and the
+    batch provenance (``first_delivery_id`` + ``delivery_ids`` — issue
+    #595).  Legacy rows surface ``None`` for the lifecycle columns they
+    predate and an empty batch.
     """
 
     afk_run_id: str = Field(description="ULID primary key of the run")
@@ -139,6 +163,20 @@ class AFKRunLifecycleResponse(BaseModel):
         ),
     )
     title: str | None = Field(default=None, description="Lifecycle title")
+    first_delivery_id: str | None = Field(
+        default=None,
+        description=(
+            "First triggering delivery identity of the provisioning batch "
+            "(None for legacy rows and runs provisioned without a batch)"
+        ),
+    )
+    delivery_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every contributing delivery identity in the provisioning batch, "
+            "in stored order (empty for legacy rows)"
+        ),
+    )
     change_request: ProviderResourceIdentity | None = Field(
         default=None,
         description=(
@@ -152,12 +190,21 @@ class AFKRunLifecycleResponse(BaseModel):
     )
 
     @classmethod
-    def from_domain(cls, lifecycle: AFKRunLifecycle) -> AFKRunLifecycleResponse:
+    def from_domain(
+        cls,
+        lifecycle: AFKRunLifecycle,
+        *,
+        first_delivery_id: str | None = None,
+        delivery_ids: list[str] | None = None,
+    ) -> AFKRunLifecycleResponse:
         """Build the response from a domain :class:`AFKRunLifecycle`.
 
         The bound change request is surfaced as a nested canonical
         ``ProviderResourceIdentity`` (the domain model stores the three
-        flattened columns).
+        flattened columns).  Batch provenance is surfaced from the stored
+        batch records via the optional ``first_delivery_id`` /
+        ``delivery_ids`` arguments (issue #595); ``None`` arguments render
+        the legacy empty-batch shape.
         """
         return cls(
             afk_run_id=lifecycle.afk_run_id,
@@ -168,6 +215,8 @@ class AFKRunLifecycleResponse(BaseModel):
             repository=lifecycle.repository,
             trigger_type=lifecycle.trigger_type,
             title=lifecycle.title,
+            first_delivery_id=first_delivery_id,
+            delivery_ids=delivery_ids or [],
             change_request=lifecycle.change_request_identity(),
             recovered_from_afk_run_id=lifecycle.recovered_from_afk_run_id,
         )
