@@ -131,11 +131,54 @@ def test_downgrade_restores_not_null_on_resource_columns() -> None:
         ), f"downgrade must restore NOT NULL on {column}"
 
 
-def test_downgrade_backfills_null_placeholders_first() -> None:
-    """Downgrade fills resource-less rows before re-adding NOT NULL."""
-    sql = _render_downgrade_delta_guarded()
-    assert "UPDATE execution_bindings" in sql
-    assert "COALESCE(provider, '')" in sql
+def _downgrade_with_null_count(monkeypatch, count: int):
+    """Run the 0041 ``downgrade()`` with a mocked bind reporting ``count`` NULL rows.
+
+    The downgrade counts NULL rows in the four resource-identity columns and
+    refuses to proceed when any exist, so it cannot be exercised through the
+    offline render (which cannot return a row count).  We drive it directly
+    with a fake connection whose ``execute`` returns the desired count.
+    """
+    module = _load_migration_module()
+
+    class _FakeResult:
+        def __init__(self, count: int) -> None:
+            self._count = count
+
+        def scalar(self) -> int:
+            return self._count
+
+    class _FakeConn:
+        def __init__(self, count: int) -> None:
+            self._count = count
+
+        def execute(self, *args, **kwargs) -> _FakeResult:
+            return _FakeResult(self._count)
+
+    monkeypatch.setattr(module.op, "get_bind", lambda: _FakeConn(count))
+    return module
+
+
+def test_downgrade_refuses_when_null_rows_exist(monkeypatch) -> None:
+    """Downgrade raises RuntimeError when resource-less rows exist."""
+    module = _downgrade_with_null_count(monkeypatch, count=1)
+    with pytest.raises(RuntimeError):
+        module.downgrade()
+
+
+def test_downgrade_succeeds_when_no_null_rows(monkeypatch) -> None:
+    """Downgrade restores NOT NULL on each column when no NULL rows exist."""
+    module = _downgrade_with_null_count(monkeypatch, count=0)
+    alter_calls: list[tuple] = []
+    monkeypatch.setattr(
+        module.op, "alter_column", lambda *args, **kwargs: alter_calls.append((args, kwargs))
+    )
+    module.downgrade()
+    assert len(alter_calls) == len(_RESOURCE_COLUMNS)
+    for (table, column), kwargs in alter_calls:
+        assert table == _EXECUTION_BINDING_TABLE
+        assert column in _RESOURCE_COLUMNS
+        assert kwargs["nullable"] is False
 
 
 # ── ORM model parity ──────────────────────────────────────────────────────────

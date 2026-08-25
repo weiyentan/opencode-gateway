@@ -81,8 +81,8 @@ def redact_failure_summary(value: str) -> str:
     silently truncated).
     """
     value = _BEARER_TOKEN_RE.sub(r"\1***", value)
-    value = _TOKEN_PREFIX_RE.sub(r"\1***", value)
     value = _SECRET_ASSIGNMENT_RE.sub(_redact_secret_assignment, value)
+    value = _TOKEN_PREFIX_RE.sub(r"\1***", value)
     return value
 
 

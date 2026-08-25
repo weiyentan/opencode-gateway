@@ -582,6 +582,20 @@ class TestFailureReasonRedaction:
         assert "ghp_secret" not in request.failure_reason
         assert "hunter2" not in request.failure_reason
 
+    def test_secret_assignment_with_token_prefix_fully_redacted(self) -> None:
+        """A key=value assignment whose value carries a token prefix is fully
+        redacted — the whole value (including the prefix) is replaced, never
+        left as ``key=***abc123``.  The secret-assignment rule must run before
+        the bare token-prefix rule so the prefix is not consumed first."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="env GITHUB_TOKEN=ghp_abc123 leaked",
+            )
+        )
+        assert "ghp_abc123" not in request.failure_reason
+        assert "GITHUB_TOKEN=***" in request.failure_reason
+
     def test_quoted_secret_redacted(self) -> None:
         """Quoted secret values like password=\"my secret\" are fully redacted."""
         request = ExecutionBindingCreateRequest.model_validate(
