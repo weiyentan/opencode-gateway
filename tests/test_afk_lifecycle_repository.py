@@ -20,6 +20,7 @@ import re
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
+import pytest
 
 from afk_outcomes import AsyncpgOutcomeRepository
 from afk_outcomes.models import EntityType, Provider, TriggerType
@@ -39,30 +40,7 @@ _NEW_ULID = "01HF7YAT000000000000000001"
 
 
 def _run(coro):
-    """Run a coroutine synchronously, safe in both sync and async test contexts.
-
-    Uses ``asyncio.run()`` when no event loop is running (sync test context).
-    Falls back to creating a dedicated loop when an event loop is already
-    running (e.g., under ``pytest-asyncio`` with ``asyncio_mode = "auto"``),
-    avoiding ``RuntimeError: asyncio.run() cannot be called from a running
-    event loop`` and the associated ``ResourceWarning``.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop — safe to use asyncio.run() which creates and
-        # closes its own event loop.
-        return asyncio.run(coro)
-
-    # A loop is already running — create a dedicated loop for this
-    # coroutine so we don't interfere with the running context.
-    new_loop = asyncio.new_event_loop()
-    try:
-        return new_loop.run_until_complete(
-            asyncio.ensure_future(coro, loop=new_loop)
-        )
-    finally:
-        new_loop.close()
+    return asyncio.run(coro)
 
 
 def _provision_payload(
@@ -661,28 +639,30 @@ def _lookup_kwargs(
     }
 
 
-def test_lookup_returns_owning_run(mock_conn: AsyncMock) -> None:
+@pytest.mark.asyncio
+async def test_lookup_returns_owning_run(mock_conn: AsyncMock) -> None:
     """A bound change request resolves to its owning afk_run_id."""
     mock_conn.fetch = AsyncMock(
         return_value=[mock_row({"afk_run_id": _NEW_ULID})]
     )
 
     repo = AsyncpgOutcomeRepository(mock_conn)
-    result = _run(repo.get_afk_run_by_change_request(**_lookup_kwargs()))
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
 
     assert isinstance(result, ChangeRequestLookupResult)
     assert result.afk_run_id == _NEW_ULID
     assert result.is_conflict is False
 
 
-def test_lookup_queries_only_change_request_binding_columns(
+@pytest.mark.asyncio
+async def test_lookup_queries_only_change_request_binding_columns(
     mock_conn: AsyncMock,
 ) -> None:
     """The SELECT filters on the three explicit binding columns only."""
     mock_conn.fetch = AsyncMock(return_value=[])
 
     repo = AsyncpgOutcomeRepository(mock_conn)
-    _run(repo.get_afk_run_by_change_request(**_lookup_kwargs()))
+    await repo.get_afk_run_by_change_request(**_lookup_kwargs())
 
     sql, *args = mock_conn.fetch.call_args[0]
     assert "FROM afk_runs" in sql
@@ -692,18 +672,20 @@ def test_lookup_queries_only_change_request_binding_columns(
     assert tuple(args) == ("gitlab", "gitlab.com/cnp/cnp", "6")
 
 
-def test_lookup_unbound_returns_none(mock_conn: AsyncMock) -> None:
+@pytest.mark.asyncio
+async def test_lookup_unbound_returns_none(mock_conn: AsyncMock) -> None:
     """An unknown or unbound change request returns no owning run."""
     mock_conn.fetch = AsyncMock(return_value=[])
 
     repo = AsyncpgOutcomeRepository(mock_conn)
-    result = _run(repo.get_afk_run_by_change_request(**_lookup_kwargs()))
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
 
     assert result.afk_run_id is None
     assert result.is_conflict is False
 
 
-def test_lookup_multiple_owners_is_conflict(mock_conn: AsyncMock) -> None:
+@pytest.mark.asyncio
+async def test_lookup_multiple_owners_is_conflict(mock_conn: AsyncMock) -> None:
     """More than one lifecycle claiming the change request is a conflict."""
     mock_conn.fetch = AsyncMock(
         return_value=[
@@ -713,18 +695,19 @@ def test_lookup_multiple_owners_is_conflict(mock_conn: AsyncMock) -> None:
     )
 
     repo = AsyncpgOutcomeRepository(mock_conn)
-    result = _run(repo.get_afk_run_by_change_request(**_lookup_kwargs()))
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
 
     assert result.is_conflict is True
     assert result.afk_run_id is None
 
 
-def test_lookup_is_read_only(mock_conn: AsyncMock) -> None:
+@pytest.mark.asyncio
+async def test_lookup_is_read_only(mock_conn: AsyncMock) -> None:
     """The lookup issues only a SELECT — no writes."""
     mock_conn.fetch = AsyncMock(return_value=[])
 
     repo = AsyncpgOutcomeRepository(mock_conn)
-    _run(repo.get_afk_run_by_change_request(**_lookup_kwargs()))
+    await repo.get_afk_run_by_change_request(**_lookup_kwargs())
 
     assert mock_conn.execute.call_count == 0
     assert mock_conn.fetchrow.call_count == 0

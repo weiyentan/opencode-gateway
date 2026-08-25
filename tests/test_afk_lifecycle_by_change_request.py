@@ -205,3 +205,50 @@ class TestGetRunByChangeRequest:
 
         resp = await client.get(_lookup_url())
         assert resp.status_code in (401, 403)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "repository", "external_id"),
+        [
+            pytest.param(
+                "github",
+                "https://gitlab.com/group/project",
+                "50",
+                id="provider-mismatch",
+            ),
+            pytest.param(
+                "gitlab",
+                "https://gitlab.com/other/project",
+                "50",
+                id="repository-mismatch",
+            ),
+            pytest.param(
+                "gitlab",
+                "https://gitlab.com/group/project",
+                "51",
+                id="external-id-mismatch",
+            ),
+        ],
+    )
+    async def test_lookup_identity_mismatch_returns_404(
+        self,
+        provider: str,
+        repository: str,
+        external_id: str,
+    ) -> None:
+        """A valid-but-different provider, repository, or PR/MR number returns 404."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(_lookup_url(
+            provider=provider,
+            repository=repository,
+            external_id=external_id,
+        ))
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["status"] == "error"
+        assert "not found" in data["error"]["message"].lower()
