@@ -53,8 +53,14 @@ _BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)\S+")
 _TOKEN_PREFIX_RE = re.compile(r"\b(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)\S+")
 # ``key=value`` / ``key: value`` assignments; the key is classified with the
 # same ``is_secret_key`` vocabulary used elsewhere in the Gateway, so
-# compound keys like ``GITHUB_TOKEN`` are recognized.
-_SECRET_ASSIGNMENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_\-]*)\s*([:=])\s*(\S+)")
+# compound keys like ``GITHUB_TOKEN`` are recognized.  The value matches a
+# quoted string (single or double) in full — so ``password="my secret
+# password"`` redacts the whole value, never just the first word — or a
+# non-whitespace token.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9_\-]*)\s*([:=])\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
 
 
 def _redact_secret_assignment(match: re.Match) -> str:
@@ -317,10 +323,13 @@ class ExecutionBindingUpdateRequest(BaseModel):
 
     Failed or cancelled executions persist without a change request or a
     session — every field other than ``outcome`` is optional for those
-    outcomes.  A ``completed`` update must carry both ``resource`` and
-    ``external_session_id``.  Raw tokens, stdout, prompts, arbitrary AWX
-    payloads, and unbounded ``extra_vars`` are not part of the schema and
-    are rejected as unknown fields.
+    outcomes.  A ``completed`` update may omit ``resource`` and
+    ``external_session_id``: the stored ``running`` row can already hold
+    both identities from phase-one provisioning, and the repository rejects
+    a completed transition that ends without them (issue #600 review).
+    Raw tokens, stdout, prompts, arbitrary AWX payloads, and unbounded
+    ``extra_vars`` are not part of the schema and are rejected as unknown
+    fields.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -379,18 +388,13 @@ class ExecutionBindingUpdateRequest(BaseModel):
     ) -> ExecutionBindingUpdateRequest:
         """A completed execution must carry both a change request and a session.
 
-        The stored ``running`` row may already hold these identities, but the
-        terminal callback for ``completed`` is required to carry them anyway:
-        a completed execution without a proven change-request identity or
-        resolved session is rejected at the boundary (issue #600 review).
+        The stored ``running`` row may already hold these identities from
+        phase-one provisioning, so the terminal callback is not required to
+        repeat them in the body.  The repository enforces the invariant
+        after merge: a completed transition without both a change-request
+        identity and a resolved session (whether stored or supplied) is
+        rejected as a conflict (issue #600 review).
         """
-        if self.outcome is ExecutionOutcome.COMPLETED and (
-            self.resource is None or self.external_session_id is None
-        ):
-            raise ValueError(
-                "completed outcome requires both a change-request identity "
-                "(resource) and an external session id"
-            )
         return self
 
     @field_validator("failure_reason", mode="after")

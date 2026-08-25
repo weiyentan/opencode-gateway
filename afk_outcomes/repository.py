@@ -1821,8 +1821,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         * **Supplied ``afk_run_id`` exists** — the binding is linked to it
           (no new ``afk_runs`` row) and returns ``is_created=True`` on first
           insert.  When the execution also carries a resource identity, its
-          provider must match the run's stored provider — a mismatch returns
-          ``is_conflict=True`` without inserting (issue #600 review).
+          provider must match the run's stored provider, and when the run has
+          a bound change request the full tuple
+          (provider, repository, change-request id) must match — a mismatch
+          returns ``is_conflict=True`` without inserting (issue #600 review).
         * **Supplied ``afk_run_id`` missing** — returns ``run_missing=True``
           without inserting anything (the caller surfaces a 404).
         * **No ``afk_run_id``** — legacy behavior preserved: a provisional
@@ -1904,7 +1906,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             run_id = new_ulid
             if afk_run_id is not None:
                 existing_run = await self._conn.fetchrow(
-                    "SELECT afk_run_id, provider FROM afk_runs WHERE afk_run_id = $1",
+                    """
+                    SELECT afk_run_id, provider, change_request_provider,
+                           change_request_repository, change_request_external_id
+                    FROM afk_runs WHERE afk_run_id = $1
+                    """,
                     afk_run_id,
                 )
                 if existing_run is None:
@@ -1925,6 +1931,26 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                             afk_run_id=afk_run_id,
                             is_conflict=True,
                         )
+                    # When the run already has a bound change request,
+                    # validate the full tuple (provider, repository, change_request_id)
+                    # against the run's stored identity (issue #600 review).
+                    cr_provider = existing_run.get("change_request_provider")
+                    cr_repository = existing_run.get("change_request_repository")
+                    cr_external_id = existing_run.get("change_request_external_id")
+                    if (
+                        cr_provider is not None
+                        and cr_repository is not None
+                        and cr_external_id is not None
+                    ):
+                        if (
+                            cr_provider != provider.value
+                            or cr_repository != repository
+                            or cr_external_id != resource_number
+                        ):
+                            return CreateAFKExecutionBindingResult(
+                                afk_run_id=afk_run_id,
+                                is_conflict=True,
+                            )
 
                 run_id = afk_run_id
             else:

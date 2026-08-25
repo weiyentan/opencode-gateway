@@ -582,6 +582,17 @@ class TestFailureReasonRedaction:
         assert "ghp_secret" not in request.failure_reason
         assert "hunter2" not in request.failure_reason
 
+    def test_quoted_secret_redacted(self) -> None:
+        """Quoted secret values like password=\"my secret\" are fully redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='env PASSWORD="my secret password"',
+            )
+        )
+        assert "my secret password" not in request.failure_reason
+        assert "***" in request.failure_reason
+
     def test_ordinary_text_untouched(self) -> None:
         request = ExecutionBindingCreateRequest.model_validate(
             _valid_request(outcome="failed", failure_reason="Process exited with code 1")
@@ -627,31 +638,40 @@ class TestTerminalUpdateSchema:
         assert request.resource is not None
         assert request.external_session_id == "ses_abc123"
 
-    def test_completed_without_resource_rejected(self) -> None:
-        """A completed terminal update must carry a change-request identity."""
-        with pytest.raises(ValidationError, match="resource"):
-            ExecutionBindingUpdateRequest.model_validate(
-                _valid_update(external_session_id="ses_abc123")
-            )
+    def test_completed_without_resource_validates(self) -> None:
+        """A completed update may omit the change-request identity — the
+        stored row or the repository's post-merge check governs it
+        (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(external_session_id="ses_abc123")
+        )
+        assert request.resource is None
+        assert request.external_session_id == "ses_abc123"
 
-    def test_completed_without_session_rejected(self) -> None:
-        """A completed terminal update must carry an external session id."""
-        with pytest.raises(ValidationError, match="external session id"):
-            ExecutionBindingUpdateRequest.model_validate(
-                _valid_update(
-                    resource={
-                        "provider": "github",
-                        "repository": "owner/repo",
-                        "resource_type": "pull_request",
-                        "resource_number": "101",
-                    }
-                )
+    def test_completed_without_session_validates(self) -> None:
+        """A completed update may omit the session — the repository enforces
+        the completed invariant after merge (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                }
             )
+        )
+        assert request.external_session_id is None
+        assert request.resource is not None
 
-    def test_completed_without_resource_or_session_rejected(self) -> None:
-        """A completed terminal update with neither identity is rejected."""
-        with pytest.raises(ValidationError, match="resource"):
-            ExecutionBindingUpdateRequest.model_validate(_valid_update())
+    def test_completed_without_resource_or_session_validates(self) -> None:
+        """A completed update with neither identity is schema-valid — the
+        repository rejects the transition as a conflict after merge
+        (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(_valid_update())
+        assert request.outcome is ExecutionOutcome.COMPLETED
+        assert request.resource is None
+        assert request.external_session_id is None
 
     def test_running_outcome_rejected(self) -> None:
         with pytest.raises(ValidationError, match="terminal"):

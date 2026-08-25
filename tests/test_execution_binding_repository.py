@@ -1363,7 +1363,13 @@ class TestCreateOrReplayProviderCompatibility:
             side_effect=[
                 None,  # no existing binding
                 mock_row(
-                    {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "gitlab"}
+                    {
+                        "afk_run_id": "01SUPPLIED00000000000000001",
+                        "provider": "gitlab",
+                        "change_request_provider": None,
+                        "change_request_repository": None,
+                        "change_request_external_id": None,
+                    }
                 ),
             ]
         )
@@ -1391,6 +1397,73 @@ class TestCreateOrReplayProviderCompatibility:
                 None,  # no existing binding
                 mock_row(
                     {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "github"}
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_conflict is False
+
+    def test_mismatched_run_change_request_tuple_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A resource contradicting the run's bound change-request tuple is rejected."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {
+                        "afk_run_id": "01SUPPLIED00000000000000001",
+                        "provider": "github",
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/other-repo",
+                        "change_request_external_id": "99",
+                    }
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert result.run_missing is False
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
+
+    def test_matching_run_change_request_tuple_proceeds(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A resource matching the run's bound change-request tuple attaches normally."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {
+                        "afk_run_id": "01SUPPLIED00000000000000001",
+                        "provider": "github",
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "42",
+                    }
                 ),
             ]
         )
