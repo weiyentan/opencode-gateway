@@ -611,11 +611,47 @@ def _valid_update(**overrides) -> dict:
 
 class TestTerminalUpdateSchema:
     def test_minimal_update_validates(self) -> None:
-        request = ExecutionBindingUpdateRequest.model_validate(_valid_update())
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                },
+                external_session_id="ses_abc123",
+            )
+        )
         assert request.outcome is ExecutionOutcome.COMPLETED
         assert request.failure_reason is None
-        assert request.resource is None
-        assert request.external_session_id is None
+        assert request.resource is not None
+        assert request.external_session_id == "ses_abc123"
+
+    def test_completed_without_resource_rejected(self) -> None:
+        """A completed terminal update must carry a change-request identity."""
+        with pytest.raises(ValidationError, match="resource"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(external_session_id="ses_abc123")
+            )
+
+    def test_completed_without_session_rejected(self) -> None:
+        """A completed terminal update must carry an external session id."""
+        with pytest.raises(ValidationError, match="external session id"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(
+                    resource={
+                        "provider": "github",
+                        "repository": "owner/repo",
+                        "resource_type": "pull_request",
+                        "resource_number": "101",
+                    }
+                )
+            )
+
+    def test_completed_without_resource_or_session_rejected(self) -> None:
+        """A completed terminal update with neither identity is rejected."""
+        with pytest.raises(ValidationError, match="resource"):
+            ExecutionBindingUpdateRequest.model_validate(_valid_update())
 
     def test_running_outcome_rejected(self) -> None:
         with pytest.raises(ValidationError, match="terminal"):

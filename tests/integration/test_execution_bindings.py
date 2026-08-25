@@ -647,7 +647,6 @@ async def test_get_nonexistent_returns_404(db_pool: asyncpg.Pool) -> None:
 @pytest.mark.asyncio
 async def test_read_requires_api_key(db_pool: asyncpg.Pool) -> None:
     """GET without API key returns 401/403."""
-    from fastapi import Request
     from httpx import ASGITransport, AsyncClient
 
     from app.core.factory import create_app
@@ -916,7 +915,17 @@ async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> 
         # Phase 2 — terminal update on the same row.
         resp2 = await c.patch(
             f"/api/v1/afk/executions/{awx_job_id}",
-            json={"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"},
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp2.status_code == 200, resp2.text
         assert resp2.json()["data"]["outcome"] == "completed"
@@ -931,8 +940,11 @@ async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> 
         )
         assert row is not None
         assert row["outcome"] == "completed"
-        assert row["provider"] is None
-        assert row["external_session_id"] is None
+        assert row["provider"] == "github"
+        assert row["repository_url"] == "github.com/acme/proj"
+        assert row["entity_type"] == "change_request"
+        assert row["entity_number"] == "99"
+        assert row["external_session_id"] == "ses_terminal"
         assert row["afk_run_id"] == run_id
         assert row["finished_at"] is not None
         count = await conn.fetchval(
@@ -1031,7 +1043,17 @@ async def test_terminal_update_identical_replay_is_noop(db_pool: asyncpg.Pool) -
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
-    update_payload = {"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"}
+    update_payload = {
+        "outcome": "completed",
+        "finished_at": "2026-08-02T12:00:00Z",
+        "external_session_id": "ses_terminal",
+        "resource": {
+            "provider": "github",
+            "repository": "https://github.com/acme/proj",
+            "resource_type": "pull_request",
+            "resource_number": "99",
+        },
+    }
 
     async with client as c:
         provision = _make_two_phase_payload(
@@ -1079,7 +1101,17 @@ async def test_terminal_update_conflicting_replay_rejected(db_pool: asyncpg.Pool
         assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
 
         completed = await c.patch(
-            f"/api/v1/afk/executions/{awx_job_id}", json={"outcome": "completed"}
+            f"/api/v1/afk/executions/{awx_job_id}",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert completed.status_code == 200
 
@@ -1142,7 +1174,17 @@ async def test_concurrent_identical_terminal_updates(db_pool: asyncpg.Pool) -> N
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
-    update_payload = {"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"}
+    update_payload = {
+        "outcome": "completed",
+        "finished_at": "2026-08-02T12:00:00Z",
+        "external_session_id": "ses_terminal",
+        "resource": {
+            "provider": "github",
+            "repository": "https://github.com/acme/proj",
+            "resource_type": "pull_request",
+            "resource_number": "99",
+        },
+    }
 
     async with client as c:
         provision = _make_two_phase_payload(
@@ -1188,7 +1230,17 @@ async def test_concurrent_conflicting_terminal_updates(db_pool: asyncpg.Pool) ->
 
         results = await asyncio.gather(
             c.patch(
-                f"/api/v1/afk/executions/{awx_job_id}", json={"outcome": "completed"}
+                f"/api/v1/afk/executions/{awx_job_id}",
+                json={
+                    "outcome": "completed",
+                    "external_session_id": "ses_terminal",
+                    "resource": {
+                        "provider": "github",
+                        "repository": "https://github.com/acme/proj",
+                        "resource_type": "pull_request",
+                        "resource_number": "99",
+                    },
+                },
             ),
             c.patch(
                 f"/api/v1/afk/executions/{awx_job_id}",

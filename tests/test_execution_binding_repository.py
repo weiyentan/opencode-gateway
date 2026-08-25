@@ -1010,8 +1010,6 @@ def test_create_or_replay_null_outcome_fields(
     assert "outcome_status" in sql
     assert "outcome" in sql
     # Verify NULL values are passed for outcome fields
-    args = afk_runs_calls[0][1]
-    # args: new_ulid, provider.value, title, started_at, finished_at
     # outcome_status and outcome are hardcoded as NULL in the SQL
     assert "NULL" in sql
 
@@ -1184,6 +1182,81 @@ class TestUpdateExecutionBindingTerminal:
         assert result.is_conflict is True
         assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
 
+    def test_running_completed_without_identity_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A completed transition with neither stored nor supplied identity conflicts."""
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(_terminal_row()))
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED)
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_running_completed_with_stored_resource_but_no_session_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A stored resource alone cannot satisfy a completed transition."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    provider="github",
+                    repository_url="org/repo",
+                    entity_type="change_request",
+                    entity_number="7",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED)
+
+        assert result.is_conflict is True
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_running_completed_with_stored_session_but_no_resource_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A stored session alone cannot satisfy a completed transition."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(_terminal_row(external_session_id="ses_stored"))
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED)
+
+        assert result.is_conflict is True
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_running_completed_with_stored_identity_transitions(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A completed transition succeeds when the stored row already has both."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    external_session_id="ses_stored",
+                    provider="github",
+                    repository_url="org/repo",
+                    entity_type="change_request",
+                    entity_number="7",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED)
+
+        assert result.is_updated is True
+        assert result.is_conflict is False
+        assert len(_calls_matching(mock_conn, r"UPDATE execution_bindings")) == 1
+
     def test_terminal_identical_replay_is_idempotent(self, mock_conn: AsyncMock) -> None:
         finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
         mock_conn.fetchrow = AsyncMock(
@@ -1279,3 +1352,82 @@ class TestCreateOrReplayNullableResource:
 
         with pytest.raises(ValueError, match="provider"):
             asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+
+class TestCreateOrReplayProviderCompatibility:
+    """create_or_replay_afk_execution_binding provider vs afk_run provider (issue #600)."""
+
+    def test_mismatched_run_provider_is_conflict(self, mock_conn: AsyncMock) -> None:
+        """A resource whose provider contradicts the run's provider is rejected."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "gitlab"}
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert result.run_missing is False
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
+
+    def test_matching_run_provider_proceeds(self, mock_conn: AsyncMock) -> None:
+        """A resource matching the run's provider attaches normally."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "github"}
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_conflict is False
+
+    def test_run_without_provider_skips_compatibility_check(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A run without a stored provider carries no compatibility constraint."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row({"afk_run_id": "01SUPPLIED00000000000000001"}),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_conflict is False

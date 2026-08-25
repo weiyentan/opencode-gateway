@@ -1820,7 +1820,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
         * **Supplied ``afk_run_id`` exists** — the binding is linked to it
           (no new ``afk_runs`` row) and returns ``is_created=True`` on first
-          insert.
+          insert.  When the execution also carries a resource identity, its
+          provider must match the run's stored provider — a mismatch returns
+          ``is_conflict=True`` without inserting (issue #600 review).
         * **Supplied ``afk_run_id`` missing** — returns ``run_missing=True``
           without inserting anything (the caller surfaces a 404).
         * **No ``afk_run_id``** — legacy behavior preserved: a provisional
@@ -1902,7 +1904,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             run_id = new_ulid
             if afk_run_id is not None:
                 existing_run = await self._conn.fetchrow(
-                    "SELECT afk_run_id FROM afk_runs WHERE afk_run_id = $1",
+                    "SELECT afk_run_id, provider FROM afk_runs WHERE afk_run_id = $1",
                     afk_run_id,
                 )
                 if existing_run is None:
@@ -1910,6 +1912,20 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         afk_run_id=afk_run_id,
                         run_missing=True,
                     )
+
+                # When a resource identity is supplied with the execution,
+                # validate it against the referenced afk_run's provider
+                # (issue #600 review).  The run may already carry a
+                # change-request identity; if so, the execution's resource
+                # must be compatible.
+                if provider is not None:
+                    run_provider = existing_run.get("provider")
+                    if run_provider is not None and run_provider != provider.value:
+                        return CreateAFKExecutionBindingResult(
+                            afk_run_id=afk_run_id,
+                            is_conflict=True,
+                        )
+
                 run_id = afk_run_id
             else:
                 if provider is None:
@@ -2115,6 +2131,23 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_repository = row["repository_url"]
                 new_entity_type = row["entity_type"]
                 new_entity_number = row["entity_number"]
+
+            # A completed execution must carry both a change-request identity and
+            # a resolved session (issue #600 review).  The stored row may have
+            # acquired these during phase one (running provisioning), or the
+            # terminal update may supply them as fill-ins.  If neither path
+            # produced both, reject the transition.
+            if outcome is ExecutionOutcome.COMPLETED:
+                has_resource = (
+                    new_provider is not None
+                    and new_repository is not None
+                    and new_entity_type is not None
+                    and new_entity_number is not None
+                )
+                if not has_resource or new_session is None:
+                    return UpdateExecutionBindingResult(
+                        binding_id=row["id"], is_conflict=True
+                    )
 
             await self._conn.execute(
                 """

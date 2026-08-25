@@ -1240,7 +1240,17 @@ class TestTwoPhaseLifecycle:
 
         resp = await client.patch(
             "/api/v1/afk/executions/42",
-            json={"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"},
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -1266,7 +1276,17 @@ class TestTwoPhaseLifecycle:
 
         resp = await client.patch(
             "/api/v1/afk/executions/42",
-            json={"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"},
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp.status_code == 200
         assert resp.json()["data"]["outcome"] == "completed"
@@ -1301,7 +1321,17 @@ class TestTwoPhaseLifecycle:
         client = create_client(conn)
 
         resp = await client.patch(
-            "/api/v1/afk/executions/99999", json={"outcome": "completed"}
+            "/api/v1/afk/executions/99999",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp.status_code == 404
 
@@ -1330,7 +1360,17 @@ class TestTwoPhaseLifecycle:
         client = create_client(conn)
 
         resp = await client.patch(
-            "/api/v1/afk/executions/abc", json={"outcome": "completed"}
+            "/api/v1/afk/executions/abc",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp.status_code == 400
 

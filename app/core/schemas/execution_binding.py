@@ -316,9 +316,11 @@ class ExecutionBindingUpdateRequest(BaseModel):
     contradicts a stored value is a 409 conflict).
 
     Failed or cancelled executions persist without a change request or a
-    session — every field other than ``outcome`` is optional.  Raw tokens,
-    stdout, prompts, arbitrary AWX payloads, and unbounded ``extra_vars``
-    are not part of the schema and are rejected as unknown fields.
+    session — every field other than ``outcome`` is optional for those
+    outcomes.  A ``completed`` update must carry both ``resource`` and
+    ``external_session_id``.  Raw tokens, stdout, prompts, arbitrary AWX
+    payloads, and unbounded ``extra_vars`` are not part of the schema and
+    are rejected as unknown fields.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -368,6 +370,26 @@ class ExecutionBindingUpdateRequest(BaseModel):
         if self.outcome is ExecutionOutcome.COMPLETED and self.failure_reason is not None:
             raise ValueError(
                 "failure_reason is only valid on non-completed outcomes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_completed_requires_resource_and_session(
+        self,
+    ) -> ExecutionBindingUpdateRequest:
+        """A completed execution must carry both a change request and a session.
+
+        The stored ``running`` row may already hold these identities, but the
+        terminal callback for ``completed`` is required to carry them anyway:
+        a completed execution without a proven change-request identity or
+        resolved session is rejected at the boundary (issue #600 review).
+        """
+        if self.outcome is ExecutionOutcome.COMPLETED and (
+            self.resource is None or self.external_session_id is None
+        ):
+            raise ValueError(
+                "completed outcome requires both a change-request identity "
+                "(resource) and an external session id"
             )
         return self
 

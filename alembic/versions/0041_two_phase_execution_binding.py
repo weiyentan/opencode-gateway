@@ -15,11 +15,11 @@ provider-resource-identity columns become nullable:
 The migration is additive-only: no existing row is affected, no data is
 rewritten, and no constraint beyond nullability changes.
 
-Downgrade restores the 0037/0040 NOT NULL contract after backfilling any
-resource-less rows with placeholders so the constraints can be re-added on
-a database that has stored such rows (placeholder values are never
-produced by the two-phase write path — they exist only to make the
-downgrade mechanical).
+Downgrade restores the 0037/0040 NOT NULL contract, but refuses to proceed
+if resource-less rows exist: backfilling them with empty strings would
+manufacture invalid identities (empty strings are not valid enum values),
+so the operator must delete or backfill such rows manually before
+downgrading.
 
 Revision ID: 0041
 Revises:     0040
@@ -47,15 +47,33 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Restore NOT NULL after backfilling resource-less rows with placeholders."""
-    op.execute(
-        "UPDATE execution_bindings SET "
-        "provider = COALESCE(provider, ''), "
-        "repository_url = COALESCE(repository_url, ''), "
-        "entity_type = COALESCE(entity_type, ''), "
-        "entity_number = COALESCE(entity_number, '') "
-        "WHERE provider IS NULL OR repository_url IS NULL "
-        "OR entity_type IS NULL OR entity_number IS NULL"
+    """Refuse to downgrade if resource-less two-phase rows exist.
+
+    The two-phase lifecycle (issue #590) allows ``execution_bindings``
+    rows with NULL resource-identity columns (``provider``,
+    ``repository_url``, ``entity_type``, ``entity_number``).  A
+    downgrade that backfills these with empty strings would manufacture
+    invalid identities (empty strings are not valid enum values), so
+    the downgrade refuses to proceed when such rows exist.
+
+    The operator must either:
+    * Delete resource-less rows before downgrading, or
+    * Supply valid resource identities for each affected row.
+    """
+    conn = op.get_bind()
+    result = conn.execute(
+        sa.text(
+            "SELECT COUNT(*) FROM execution_bindings "
+            "WHERE provider IS NULL OR repository_url IS NULL "
+            "OR entity_type IS NULL OR entity_number IS NULL"
+        )
     )
+    count = result.scalar()
+    if count > 0:
+        raise RuntimeError(
+            f"Cannot downgrade: {count} execution_binding(s) have NULL "
+            f"resource-identity columns.  Delete or backfill these rows "
+            f"before downgrading, or use a manual migration."
+        )
     for column in _RESOURCE_COLUMNS:
         op.alter_column("execution_bindings", column, existing_type=sa.String(), nullable=False)

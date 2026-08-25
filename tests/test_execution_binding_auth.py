@@ -490,6 +490,16 @@ class TestTerminalUpdateAuth:
         client = create_client(conn)
 
         resp = await client.patch(
-            "/api/v1/afk/executions/42", json={"outcome": "completed"}
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_abc123",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
         )
         assert resp.status_code == 200
