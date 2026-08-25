@@ -31,6 +31,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     String,
     UniqueConstraint,
     text,
@@ -141,6 +142,11 @@ class AFKRun(Base):
         nullable=True,
     )
 
+    # ── Batch provenance (migration 0040, issue #595) — nullable ──
+    first_delivery_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+
 
 class AFKRunSessionLink(Base):
     """An association between an AFK run and an OpenCode session.
@@ -185,6 +191,47 @@ class AFKRunSessionLink(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class AFKRunDeliveryBatch(Base):
+    """One contributing delivery identity of an accepted provisioning batch
+    (migration 0040, issue #595).
+
+    Batch provenance: one row per delivery identity of the webhook batch that
+    provisioned an AFK run, in accepted-batch order (``position``).
+    ``afk_run_id`` is NOT NULL (batch provenance has no meaning without its
+    run); ``delivery_id`` is the provider delivery identity as an opaque
+    string.  Keyed by ``UNIQUE (afk_run_id, delivery_id)`` so the same batch
+    membership never duplicates a row — written with ``ON CONFLICT DO
+    NOTHING`` by the repository, atomically with the run INSERT.
+
+    Retention (issue #483, ADR 0022): metadata tier — 12 months
+    (``GATEWAY_RETENTION_AFK_METADATA_DAYS``).
+    """
+
+    __tablename__ = "afk_run_delivery_batches"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "afk_run_id",
+            "delivery_id",
+            name="uq_afk_run_delivery_batches_run_delivery",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    afk_run_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("afk_runs.afk_run_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    delivery_id: Mapped[str] = mapped_column(String, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
