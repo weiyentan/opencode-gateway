@@ -2006,12 +2006,15 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         any field differs (indicating a conflict rather than a replay).
 
         The comparison covers the fields that define the provisioning contract:
-        ``repository``, ``trigger_type``, ``title``,
-        ``recovered_from_afk_run_id``, and — the batch-provenance anchor
-        (issue #595) — ``first_delivery_id``.  The idempotency key fields
+        ``repository``, ``trigger_type``, ``title``, and
+        ``recovered_from_afk_run_id``.  The idempotency key fields
         (``provider``, ``host``, ``source_event_id``) are assumed to already
         match — the caller is responsible for selecting the existing row by
         those fields.
+
+        Batch-provenance comparison (``first_delivery_id`` + delivery batch)
+        is delegated to :meth:`_batch_provenance_matches`, which is the sole
+        authority on batch-provenance matching.
         """
         return (
             existing.get("repository") == requested.get("repository")
@@ -2019,8 +2022,6 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             and existing.get("title") == requested.get("title")
             and existing.get("recovered_from_afk_run_id")
             == requested.get("recovered_from_afk_run_id")
-            and existing.get("first_delivery_id")
-            == requested.get("first_delivery_id")
         )
 
     async def provision_afk_run(
@@ -2193,22 +2194,28 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
     ) -> None:
         """Insert one batch row per contributing delivery identity (issue #595).
 
+        Uses a single batch INSERT with ``unnest`` and ``WITH ORDINALITY``
+        so positions are assigned by the database from the array index,
+        not by a Python loop — eliminating the ordering mismatch concern
+        raised in the PR #596 review.
+
         Runs inside the provisioning transaction: a failure here rolls the
         run INSERT back with it, so a partially-written batch can never
         outlive its run (no orphan batch rows, no orphan run).
         """
-        for position, delivery_id in enumerate(deliveries):
-            await self._conn.execute(
-                """
-                INSERT INTO afk_run_delivery_batches
-                    (afk_run_id, delivery_id, position, created_at)
-                VALUES ($1, $2, $3, now())
-                ON CONFLICT (afk_run_id, delivery_id) DO NOTHING
-                """,
-                afk_run_id,
-                delivery_id,
-                position,
-            )
+        if not deliveries:
+            return
+        await self._conn.execute(
+            """
+            INSERT INTO afk_run_delivery_batches
+                (afk_run_id, delivery_id, position, created_at)
+            SELECT $1, delivery_id, position, now()
+            FROM unnest($2::text[]) WITH ORDINALITY AS t(delivery_id, position)
+            ON CONFLICT (afk_run_id, delivery_id) DO NOTHING
+            """,
+            afk_run_id,
+            deliveries,
+        )
 
     async def _batch_provenance_matches(
         self,

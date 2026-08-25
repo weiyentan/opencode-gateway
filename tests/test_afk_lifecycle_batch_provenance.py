@@ -29,7 +29,7 @@ import io
 import re
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 import pytest
@@ -207,13 +207,13 @@ class TestProvisionBatchProvenance:
         assert "first_delivery_id" in sql
         assert args[8] == "d1"
 
-        # One batch row per delivery, in order, conflict-idempotent.
+        # One batch INSERT carrying the ordered delivery identities as an
+        # array (unnest ... WITH ORDINALITY), conflict-idempotent.
         batch_inserts = _calls_matching(
             mock_conn, r"INSERT INTO afk_run_delivery_batches"
         )
-        assert len(batch_inserts) == 2
-        assert batch_inserts[0][1][1:] == ("d1", 0)
-        assert batch_inserts[1][1][1:] == ("d2", 1)
+        assert len(batch_inserts) == 1
+        assert batch_inserts[0][1][1:] == (["d1", "d2"],)
         assert "ON CONFLICT (afk_run_id, delivery_id) DO NOTHING" in batch_inserts[0][0]
 
     def test_replay_with_same_batch_is_idempotent(self, mock_conn: AsyncMock) -> None:
@@ -262,7 +262,16 @@ class TestProvisionBatchProvenance:
         )
 
         repo = AsyncpgOutcomeRepository(mock_conn)
-        result = _run(repo.provision_afk_run(**_provision_kwargs(deliveries=None)))
+        # provisioning_payload_matches returns True (all non-batch fields
+        # match); _batch_provenance_matches returns False because the stored
+        # batch carries deliveries ("d1") while the replay omits them — a
+        # conflict, never an erasure.
+        with patch.object(
+            repo, "_batch_provenance_matches", AsyncMock(return_value=False)
+        ):
+            result = _run(
+                repo.provision_afk_run(**_provision_kwargs(deliveries=None))
+            )
 
         assert result.is_conflict is True
         assert result.is_created is False
@@ -298,7 +307,7 @@ class TestProvisionBatchProvenance:
         batch_inserts = _calls_matching(
             mock_conn, r"INSERT INTO afk_run_delivery_batches"
         )
-        assert [c[1][1:] for c in batch_inserts] == [("d1", 0), ("d2", 1)]
+        assert [c[1][1:] for c in batch_inserts] == [(["d1", "d2"],)]
 
     def test_failed_batch_write_rolls_back_the_run(self, mock_conn: AsyncMock) -> None:
         """A batch-write failure propagates — the savepoint rolls the run back."""
