@@ -59,7 +59,30 @@ _BATCH_COLUMNS = ("first_delivery_id",)
 
 
 def _run(coro):
-    return asyncio.run(coro)
+    """Run a coroutine synchronously, safe in both sync and async test contexts.
+
+    Uses ``asyncio.run()`` when no event loop is running (sync test context).
+    Falls back to creating a dedicated loop when an event loop is already
+    running (e.g., under ``pytest-asyncio`` with ``asyncio_mode = "auto"``),
+    avoiding ``RuntimeError: asyncio.run() cannot be called from a running
+    event loop`` and the associated ``ResourceWarning``.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — safe to use asyncio.run() which creates and
+        # closes its own event loop.
+        return asyncio.run(coro)
+
+    # A loop is already running — create a dedicated loop for this
+    # coroutine so we don't interfere with the running context.
+    new_loop = asyncio.new_event_loop()
+    try:
+        return new_loop.run_until_complete(
+            asyncio.ensure_future(coro, loop=new_loop)
+        )
+    finally:
+        new_loop.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
