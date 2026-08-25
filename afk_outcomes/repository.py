@@ -151,7 +151,23 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
 
     Columns added in later migrations (``afk_run_id``, ``trigger_type``) are
     read with ``.get()`` so legacy rows missing them default to ``None``.
+    The provider resource identity (issue #590) reads back as ``None`` when
+    the row carries no change-request identity (failed/cancelled executions
+    persist without one).
     """
+    resource = None
+    if (
+        row["provider"] is not None
+        and row["repository_url"] is not None
+        and row["entity_type"] is not None
+        and row["entity_number"] is not None
+    ):
+        resource = {
+            "provider": row["provider"],
+            "repository": row["repository_url"],
+            "resource_type": row["entity_type"],
+            "resource_number": row["entity_number"],
+        }
     return ExecutionBinding(
         binding_id=str(row["id"]),
         awx_job={
@@ -159,12 +175,7 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
             "job_template_id": row["job_template_id"],
         },
         external_session_id=row["external_session_id"],
-        resource={
-            "provider": row["provider"],
-            "repository": row["repository_url"],
-            "resource_type": row["entity_type"],
-            "resource_number": row["entity_number"],
-        },
+        resource=resource,
         outcome=ExecutionOutcome(row["outcome"]) if row["outcome"] else ExecutionOutcome.COMPLETED,
         source_event_id=row["source_event_id"],
         branch=row["branch"],
@@ -379,6 +390,28 @@ class ProvisionAFKRunResult:
     is_created: bool = False
     is_conflict: bool = False
     predecessor_missing: bool = False
+
+
+@dataclass(frozen=True)
+class UpdateExecutionBindingResult:
+    """Result of a terminal-update attempt (issue #590).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.update_execution_binding_terminal`:
+
+    * ``is_updated=True`` — the stored ``running`` row was transitioned to
+      the requested terminal outcome (with non-erasing fill-ins).
+    * ``is_conflict=True`` — the stored row is already terminal with a
+      different payload, or a supplied fill-in contradicts a stored
+      non-null value; nothing was mutated (history is never overwritten).
+    * ``not_found=True`` — no binding exists for ``awx_job_id``.
+    * Idempotent replay (already terminal, identical payload) sets none of
+      the three flags — the stored row is returned unchanged.
+    """
+
+    binding_id: int | None = None
+    is_updated: bool = False
+    is_conflict: bool = False
+    not_found: bool = False
 
 
 @dataclass(frozen=True)
@@ -1756,9 +1789,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         *,
         awx_job_id: str,
         job_template_id: int,
-        provider: Provider,
-        repository: str,
-        resource_number: str,
+        provider: Provider | None = None,
+        repository: str | None = None,
+        resource_number: str | None = None,
         external_session_id: str | None = None,
         outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED,
         source_event_id: str | None = None,
@@ -1773,6 +1806,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
     ) -> CreateAFKExecutionBindingResult:
         """Transactionally create or attach an AFK execution binding.
 
+        **Two-phase lifecycle (issue #590)**: the resource identity is
+        optional — ``provider``/``repository``/``resource_number`` may all
+        be ``None`` for ``running`` provisioning and for failed/cancelled
+        executions that carry no change request.  The change-request and
+        session columns are then written as NULL.
+
         **Lifecycle multiplicity (issue #595)**: when ``afk_run_id`` is
         supplied, the binding attaches to the pre-provisioned lifecycle
         instead of creating a new one — many execution bindings (e.g. a
@@ -1786,6 +1825,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
           without inserting anything (the caller surfaces a 404).
         * **No ``afk_run_id``** — legacy behavior preserved: a provisional
           ``afk_runs`` row is created transactionally with the binding.
+          This path requires a non-None ``provider`` (the run carries it);
+          the API schema guarantees a resource whenever no run is supplied.
 
         Replay/conflict semantics are unchanged by the addition:
 
@@ -1871,6 +1912,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     )
                 run_id = afk_run_id
             else:
+                if provider is None:
+                    raise ValueError(
+                        "provider is required when auto-provisioning an "
+                        "afk_run (no afk_run_id supplied)"
+                    )
                 await self._conn.execute(
                     """
                     INSERT INTO afk_runs
@@ -1900,9 +1946,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 numeric_awx_job_id,
                 job_template_id,
                 external_session_id,
-                provider.value,
+                provider.value if provider is not None else None,
                 repository,
-                EntityType.CHANGE_REQUEST.value,
+                EntityType.CHANGE_REQUEST.value
+                if resource_number is not None
+                else None,
                 resource_number,
                 outcome.value,
                 source_event_id,
@@ -1935,6 +1983,164 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             return CreateAFKExecutionBindingResult(
                 afk_run_id=winner["afk_run_id"] if winner else run_id,
                 binding_id=winner["id"] if winner else None,
+            )
+
+    async def update_execution_binding_terminal(
+        self,
+        *,
+        awx_job_id: str,
+        outcome: ExecutionOutcome,
+        finished_at: datetime | None = None,
+        failure_reason: str | None = None,
+        external_session_id: str | None = None,
+        provider: Provider | None = None,
+        repository: str | None = None,
+        resource_number: str | None = None,
+    ) -> UpdateExecutionBindingResult:
+        """Atomically transition one binding from ``running`` to terminal (issue #590).
+
+        The terminal update is the second phase of the two-phase lifecycle:
+        the same ``execution_bindings`` row provisioned at AWX start (via
+        :meth:`create_or_replay_afk_execution_binding` with ``running``) is
+        updated in place to ``completed`` / ``failed`` / ``cancelled``.
+        Failed or cancelled updates carry no required change request or
+        session.
+
+        **Serialization** — the row is locked with ``SELECT ... FOR UPDATE``
+        so concurrent updates for the same AWX job are serialized; a second
+        updater re-reads after the first commits and resolves to an
+        idempotent replay or a conflict.
+
+        **Non-erasing fill-ins** — ``external_session_id`` and the resource
+        identity are optional: an omitted (``None``) field never erases a
+        stored value, a supplied field fills a stored NULL, and a supplied
+        field that contradicts a stored non-NULL value is a conflict.
+
+        **History is never overwritten** — an already-terminal row is only
+        re-observed idempotently (identical payload → unchanged row) or
+        rejected (different payload → conflict).  Terminal rows are never
+        mutated.
+
+        Returns :class:`UpdateExecutionBindingResult`; the caller re-reads
+        the row for the response.  A non-terminal ``outcome`` raises
+        ``ValueError`` (the API schema already rejects it).
+        """
+        if not outcome.is_terminal:
+            raise ValueError(
+                "update_execution_binding_terminal requires a terminal outcome"
+            )
+        numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
+
+        async with self._conn.transaction():
+            row = await self._conn.fetchrow(
+                """
+                SELECT id, outcome, finished_at, failure_reason,
+                       external_session_id, provider, repository_url,
+                       entity_type, entity_number
+                FROM execution_bindings
+                WHERE awx_job_id = $1
+                FOR UPDATE
+                """,
+                numeric_awx_job_id,
+            )
+            if row is None:
+                return UpdateExecutionBindingResult(not_found=True)
+
+            stored_terminal = row["outcome"] in {
+                ExecutionOutcome.COMPLETED.value,
+                ExecutionOutcome.FAILED.value,
+                ExecutionOutcome.CANCELLED.value,
+            }
+            stored_has_resource = (
+                row["provider"] is not None
+                and row["repository_url"] is not None
+                and row["entity_type"] is not None
+                and row["entity_number"] is not None
+            )
+            requested_has_resource = (
+                provider is not None
+                and repository is not None
+                and resource_number is not None
+            )
+
+            # A supplied fill-in contradicts a stored non-null value?
+            session_conflict = (
+                external_session_id is not None
+                and row["external_session_id"] is not None
+                and row["external_session_id"] != external_session_id
+            )
+            resource_conflict = (
+                requested_has_resource
+                and stored_has_resource
+                and not (
+                    row["provider"] == provider.value
+                    and row["repository_url"] == repository
+                    and row["entity_number"] == resource_number
+                )
+            )
+
+            if stored_terminal:
+                identical = (
+                    row["outcome"] == outcome.value
+                    and row["finished_at"] == finished_at
+                    and row["failure_reason"] == failure_reason
+                    and not session_conflict
+                    and not resource_conflict
+                )
+                if identical:
+                    return UpdateExecutionBindingResult(binding_id=row["id"])
+                return UpdateExecutionBindingResult(
+                    binding_id=row["id"], is_conflict=True
+                )
+
+            # running (or legacy NULL outcome) → terminal transition.
+            if session_conflict or resource_conflict:
+                return UpdateExecutionBindingResult(
+                    binding_id=row["id"], is_conflict=True
+                )
+
+            new_session = (
+                row["external_session_id"]
+                if external_session_id is None
+                else external_session_id
+            )
+            if requested_has_resource:
+                new_provider = provider.value
+                new_repository = repository
+                new_entity_type = EntityType.CHANGE_REQUEST.value
+                new_entity_number = resource_number
+            else:
+                new_provider = row["provider"]
+                new_repository = row["repository_url"]
+                new_entity_type = row["entity_type"]
+                new_entity_number = row["entity_number"]
+
+            await self._conn.execute(
+                """
+                UPDATE execution_bindings
+                SET outcome = $2,
+                    finished_at = $3,
+                    failure_reason = $4,
+                    external_session_id = $5,
+                    provider = $6,
+                    repository_url = $7,
+                    entity_type = $8,
+                    entity_number = $9,
+                    updated_at = now()
+                WHERE awx_job_id = $1
+                """,
+                numeric_awx_job_id,
+                outcome.value,
+                finished_at,
+                failure_reason,
+                new_session,
+                new_provider,
+                new_repository,
+                new_entity_type,
+                new_entity_number,
+            )
+            return UpdateExecutionBindingResult(
+                binding_id=row["id"], is_updated=True
             )
 
     async def get_execution_binding_by_awx_job_id(

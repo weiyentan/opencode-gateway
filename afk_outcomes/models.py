@@ -637,16 +637,25 @@ _EXECUTION_BINDING_MAX_FAILURE_REASON_LENGTH = 1000
 
 
 class ExecutionOutcome(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
-    """Terminal result of an :class:`ExecutionBinding`.
+    """Lifecycle outcome of an :class:`ExecutionBinding` (issue #590).
 
-    Constrained to the three valid terminal outcomes: ``completed``,
-    ``failed``, and ``cancelled``.  Invalid values are rejected by Pydantic
-    validation on the :class:`ExecutionBinding.outcome` field.
+    The two-phase lifecycle spans a provisional ``running`` outcome
+    (provisioned at AWX start) plus the three terminal outcomes
+    ``completed``, ``failed``, and ``cancelled``.  ``running`` is the only
+    non-terminal member; every terminal update must target one of the three
+    terminal values.  Invalid values are rejected by Pydantic validation on
+    the :class:`ExecutionBinding.outcome` field.
     """
 
+    RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return ``True`` unless this is the provisional ``running`` outcome."""
+        return self is not ExecutionOutcome.RUNNING
 
 
 class TriggerType(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
@@ -715,14 +724,19 @@ class ExecutionBinding(BaseModel):
     external session and one provider resource identity.
 
     Carries the AWX job identity, the external session id, the normalized
-    provider resource identity, the terminal :class:`ExecutionOutcome`,
-    and optional traceability metadata (branch, title, timestamps, source
-    event id).  The optional ``failure_reason`` is bounded and redacted by
-    the model contract — raw secrets, stdout dumps, and arbitrary AWX
-    payloads must never be stored here.
+    provider resource identity, the lifecycle :class:`ExecutionOutcome`
+    (``running`` at provisioning, then a terminal value), and optional
+    traceability metadata (branch, title, timestamps, source event id).
+    The optional ``failure_reason`` is bounded and redacted by the model
+    contract — raw secrets, stdout dumps, and arbitrary AWX payloads must
+    never be stored here.
 
-    GitHub pull requests and GitLab merge requests both use the canonical
-    ``change_request`` entity type in :attr:`resource`.
+    The two-phase lifecycle (issue #590) makes the change-request identity
+    optional: a failed or cancelled execution may persist without a
+    change request or a resolved session, so both ``resource`` and
+    ``external_session_id`` accept ``None``.  GitHub pull requests and
+    GitLab merge requests both use the canonical ``change_request`` entity
+    type in :attr:`resource` when one is known.
     """
 
     binding_id: str = Field(description="ULID primary key of the binding")
@@ -735,10 +749,18 @@ class ExecutionBinding(BaseModel):
         ),
         min_length=1,
     )
-    resource: ProviderResourceIdentity = Field(
-        description="Normalized provider resource identity"
+    resource: ProviderResourceIdentity | None = Field(
+        default=None,
+        description=(
+            "Normalized provider resource identity (canonical "
+            "change_request); None when the execution carries no "
+            "change-request identity (failed/cancelled executions may "
+            "persist without one)"
+        ),
     )
-    outcome: ExecutionOutcome = Field(description="Terminal execution outcome")
+    outcome: ExecutionOutcome = Field(
+        description="Lifecycle execution outcome (running or a terminal value)"
+    )
 
     # Optional traceability metadata — bounded and redacted by model contract.
     failure_reason: str | None = Field(

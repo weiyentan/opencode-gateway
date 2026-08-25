@@ -29,6 +29,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+from fastapi import Request
 
 from app.core.identity import hash_token
 
@@ -69,13 +70,38 @@ async def _can_connect() -> bool:
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
+async def _integration_db_available() -> bool:
+    if not await _can_connect():
         pytest.skip(
             "Test Postgres database not available.  Start it with:\n"
             "  docker compose -f docker-compose.test.yml up -d"
         )
     return True
+
+
+def _migration_script_dir() -> str:
+    """Return a Python-3.9-import-safe copy of the alembic script directory.
+
+    The pre-existing 0024/0025 migrations evaluate ``str | None`` module-level
+    annotations, which cannot import on Python 3.9 (the repo's own migration
+    tests guard this with a skip).  Copy ``env.py`` and the version modules to
+    a temp dir with ``from __future__ import annotations`` injected so the
+    revision map builds on 3.9 without touching the shipped migrations — the
+    migration bodies are byte-for-byte identical.
+    """
+    import shutil
+    import tempfile
+
+    src = _PROJ_ROOT / "alembic"
+    dst = Path(tempfile.mkdtemp(prefix="gateway-alembic-"))
+    shutil.copy(src / "env.py", dst / "env.py")
+    (dst / "versions").mkdir()
+    for version in sorted((src / "versions").glob("*.py")):
+        text = version.read_text()
+        if not text.startswith("from __future__ import annotations"):
+            text = "from __future__ import annotations\n" + text
+        (dst / "versions" / version.name).write_text(text)
+    return str(dst)
 
 
 @pytest.fixture(scope="module")
@@ -88,10 +114,17 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
 
     sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
+    alembic_cfg.set_main_option("script_location", _migration_script_dir())
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
         alembic.command.upgrade(alembic_cfg, "head")
+
+    # alembic/env.py's online path drives asyncpg via ``asyncio.run``, which
+    # cannot execute inside this fixture's running event loop — run the
+    # upgrade in a worker thread where no loop is running.
+    try:
+        await asyncio.to_thread(_upgrade)
     except Exception:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -100,7 +133,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.to_thread(_upgrade)
 
     yield pool
 
@@ -121,12 +154,19 @@ async def _seed_awx_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UU
     """Seed the dedicated AWX execution-binding client + collector credential.
 
     Returns (client_id, credential_id).  The credential hash matches the
-    ``_API_KEY`` bearer token so both layers of auth pass.
+    ``_API_KEY`` bearer token so both layers of auth pass.  Idempotent —
+    ``opencode_clients.name`` carries a UNIQUE constraint, so re-seeding
+    the same module-scoped database across tests reuses the existing row.
     """
     client_id = await conn.fetchval(
-        "INSERT INTO opencode_clients (name) VALUES ($1) RETURNING id",
+        "INSERT INTO opencode_clients (name) VALUES ($1)"
+        " ON CONFLICT (name) DO NOTHING RETURNING id",
         _AWX_CLIENT_NAME,
     )
+    if client_id is None:
+        client_id = await conn.fetchval(
+            "SELECT id FROM opencode_clients WHERE name = $1", _AWX_CLIENT_NAME
+        )
     credential_id = await conn.fetchval(
         "INSERT INTO collector_credentials (client_id, token_hash, token_prefix)"
         " VALUES ($1, $2, $3) RETURNING id",
@@ -142,8 +182,12 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 
     Sends the bearer token matching both the API-key middleware and the
     seeded collector credential.
+
+    ``Request`` must be imported at module level (never locally): FastAPI
+    resolves the string annotation of the ``get_session`` override through
+    the defining module's globals, and a local import would make ``request``
+    fall back to a query parameter (422 on every route).
     """
-    from fastapi import Request
     from httpx import ASGITransport, AsyncClient
 
     from app.core.factory import create_app
@@ -197,6 +241,7 @@ def _make_binding_payload(
             "resource_number": resource_number,
         },
         "outcome": outcome,
+        "trigger_type": "manual",
     }
     if source_event_id is not None:
         payload["source_event_id"] = source_event_id
@@ -294,7 +339,7 @@ async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> 
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": resource_number,
             },
@@ -322,7 +367,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     payload_1 = _make_binding_payload(
         awx_job_id=job_1,
         provider="gitlab",
-        repository="cloudnative-pg/cloudnative-pg",
+        repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
         resource_number=resource_number,
         outcome="completed",
@@ -330,7 +375,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     payload_2 = _make_binding_payload(
         awx_job_id=job_2,
         provider="gitlab",
-        repository="cloudnative-pg/cloudnative-pg",
+        repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
         resource_number=resource_number,
         outcome="completed",
@@ -346,7 +391,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
             "/api/v1/afk/executions",
             params={
                 "provider": "gitlab",
-                "repository_url": "cloudnative-pg/cloudnative-pg",
+                "repository_url": "https://gitlab.com/cloudnative-pg/cloudnative-pg",
                 "entity_type": "change_request",
                 "entity_number": resource_number,
             },
@@ -399,7 +444,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/proj",
+                "repository_url": "https://github.com/acme/proj",
                 "entity_type": "change_request",
                 "entity_number": resource_number,
             },
@@ -654,7 +699,7 @@ async def test_list_bindings_empty_resource(db_pool: asyncpg.Pool) -> None:
             "/api/v1/afk/executions",
             params={
                 "provider": "github",
-                "repository_url": "acme/empty-repo",
+                "repository_url": "https://github.com/acme/empty-repo",
                 "entity_type": "change_request",
                 "entity_number": "0",
             },
@@ -796,3 +841,371 @@ async def test_concurrent_conflicting_callbacks_one_201_one_409(
         else:
             assert row["title"] == "Conflicting"
             assert row["failure_reason"] == "intentional conflict"
+
+
+# ── Two-phase lifecycle tests (issue #590) ───────────────────────────────────
+
+
+def _new_afk_run_id() -> str:
+    """Return a fresh 26-char AFK run ULID for seeding."""
+    return "01J" + uuid.uuid4().hex[:23]
+
+
+async def _seed_afk_run(conn: asyncpg.Connection, run_id: str) -> None:
+    """Insert a provisional afk_runs row the execution can attach to."""
+    await conn.execute(
+        "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
+        " VALUES ($1, 'github', 'pending', now(), now())",
+        run_id,
+    )
+
+
+def _make_two_phase_payload(
+    *,
+    awx_job_id: int,
+    afk_run_id: str,
+    outcome: str,
+    resource: dict | None = None,
+    external_session_id: str | None = None,
+    failure_reason: str | None = None,
+) -> dict:
+    """Build a two-phase POST payload (resource/session optional)."""
+    payload: dict = {
+        "awx_job": {"job_id": str(awx_job_id), "job_template_id": 7},
+        "outcome": outcome,
+        "afk_run_id": afk_run_id,
+        "trigger_type": "manual",
+    }
+    if resource is not None:
+        payload["resource"] = resource
+    if external_session_id is not None:
+        payload["external_session_id"] = external_session_id
+    if failure_reason is not None:
+        payload["failure_reason"] = failure_reason
+    return payload
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> None:
+    """Provision a running binding under an afk_run, then complete it in place."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        # Phase 1 — provisioning at AWX start (no change request/session yet).
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        resp = await c.post("/api/v1/afk/executions", json=provision)
+        assert resp.status_code == 201, resp.text
+        binding = resp.json()["data"]
+        assert binding["outcome"] == "running"
+        assert binding["afk_run_id"] == run_id
+        assert binding["resource"] is None
+        assert binding["external_session_id"] is None
+
+        # Phase 2 — terminal update on the same row.
+        resp2 = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            json={"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"},
+        )
+        assert resp2.status_code == 200, resp2.text
+        assert resp2.json()["data"]["outcome"] == "completed"
+
+    # Same row — transitioned, never duplicated.
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, provider, repository_url, entity_type, entity_number,"
+            " external_session_id, afk_run_id, finished_at"
+            " FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "completed"
+        assert row["provider"] is None
+        assert row["external_session_id"] is None
+        assert row["afk_run_id"] == run_id
+        assert row["finished_at"] is not None
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failed_terminal_update_without_resource_or_session(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A failed execution persists without a change request or session."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
+
+        resp = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            json={"outcome": "failed", "failure_reason": "AWX job crashed"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["outcome"] == "failed"
+        assert resp.json()["data"]["resource"] is None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, failure_reason, provider, external_session_id"
+            " FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "failed"
+        assert row["failure_reason"] == "AWX job crashed"
+        assert row["provider"] is None
+        assert row["external_session_id"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_terminal_callback_without_resource_or_session(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A direct terminal callback (no running phase) may omit resource/session."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        payload = _make_two_phase_payload(
+            awx_job_id=awx_job_id,
+            afk_run_id=run_id,
+            outcome="failed",
+            failure_reason="crashed before launch",
+        )
+        resp = await c.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+        binding = resp.json()["data"]
+        assert binding["outcome"] == "failed"
+        assert binding["resource"] is None
+        assert binding["external_session_id"] is None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, provider, external_session_id FROM execution_bindings"
+            " WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "failed"
+        assert row["provider"] is None
+        assert row["external_session_id"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_terminal_update_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
+    """Repeating an identical terminal update is idempotent (200, no mutation)."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    update_payload = {"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"}
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
+
+        first = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}", json=update_payload
+        )
+        assert first.status_code == 200
+        second = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}", json=update_payload
+        )
+        assert second.status_code == 200
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert count == 1
+        outcome = await conn.fetchval(
+            "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert outcome == "completed"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_terminal_update_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
+    """A conflicting terminal update returns 409 and never overwrites history."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
+
+        completed = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}", json={"outcome": "completed"}
+        )
+        assert completed.status_code == 200
+
+        conflicting = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            json={"outcome": "failed", "failure_reason": "late failure"},
+        )
+        assert conflicting.status_code == 409, conflicting.text
+        body = conflicting.json()
+        assert body["status"] == "error"
+        assert body["error"]["code"] == "CONFLICT"
+
+    # History is never overwritten — the completed outcome stands.
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, failure_reason FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "completed"
+        assert row["failure_reason"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_failure_summary_redacted_before_persist(db_pool: asyncpg.Pool) -> None:
+    """Secret-bearing failure summaries are redacted before persistence."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        payload = _make_two_phase_payload(
+            awx_job_id=awx_job_id,
+            afk_run_id=run_id,
+            outcome="failed",
+            failure_reason="auth failed: Bearer abc123secret and GITHUB_TOKEN=ghp_leak",
+        )
+        resp = await c.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+
+    async with db_pool.acquire() as conn:
+        failure_reason = await conn.fetchval(
+            "SELECT failure_reason FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert failure_reason == "auth failed: Bearer *** and GITHUB_TOKEN=***"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_identical_terminal_updates(db_pool: asyncpg.Pool) -> None:
+    """Concurrent identical terminal updates serialize: both 200, one row."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    update_payload = {"outcome": "completed", "finished_at": "2026-08-02T12:00:00Z"}
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
+
+        results = await asyncio.gather(
+            c.patch(f"/api/v1/afk/executions/{awx_job_id}", json=update_payload),
+            c.patch(f"/api/v1/afk/executions/{awx_job_id}", json=update_payload),
+        )
+        assert sorted(r.status_code for r in results) == [200, 200]
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert count == 1
+        outcome = await conn.fetchval(
+            "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert outcome == "completed"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_conflicting_terminal_updates(db_pool: asyncpg.Pool) -> None:
+    """Concurrent conflicting terminal updates: one 200, one 409, no overwrite."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        assert (await c.post("/api/v1/afk/executions", json=provision)).status_code == 201
+
+        results = await asyncio.gather(
+            c.patch(
+                f"/api/v1/afk/executions/{awx_job_id}", json={"outcome": "completed"}
+            ),
+            c.patch(
+                f"/api/v1/afk/executions/{awx_job_id}",
+                json={"outcome": "failed", "failure_reason": "competing failure"},
+            ),
+        )
+        assert sorted(r.status_code for r in results) == [200, 409]
+        for r in results:
+            if r.status_code == 409:
+                assert r.json()["error"]["code"] == "CONFLICT"
+
+    # The stored outcome must equal the winner's terminal outcome — the
+    # loser's conflicting outcome is never applied.
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, failure_reason FROM execution_bindings WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] in ("completed", "failed")
+        if row["outcome"] == "completed":
+            assert row["failure_reason"] is None
+        else:
+            assert row["failure_reason"] == "competing failure"

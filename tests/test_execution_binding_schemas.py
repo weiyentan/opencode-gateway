@@ -19,6 +19,8 @@ from app.core.schemas.execution_binding import (
     ExecutionBindingHistoryResponse,
     ExecutionBindingReadResponse,
     ExecutionBindingResourceIn,
+    ExecutionBindingUpdateRequest,
+    redact_failure_summary,
 )
 from afk_outcomes.models import (
     EntityType,
@@ -109,11 +111,12 @@ class TestRequiredFields:
         with pytest.raises(ValidationError):
             ExecutionBindingCreateRequest.model_validate(payload)
 
-    def test_missing_session_id_rejected(self) -> None:
+    def test_missing_session_id_now_optional(self) -> None:
+        """Issue #590: the session is optional on the two-phase write path."""
         payload = _valid_request()
         del payload["external_session_id"]
-        with pytest.raises(ValidationError):
-            ExecutionBindingCreateRequest.model_validate(payload)
+        request = ExecutionBindingCreateRequest.model_validate(payload)
+        assert request.external_session_id is None
 
     def test_empty_session_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="external_session_id"):
@@ -152,6 +155,7 @@ class TestOptionalFields:
     def test_optional_metadata_preserved(self) -> None:
         request = ExecutionBindingCreateRequest.model_validate(
             _valid_request(
+                outcome="failed",
                 source_event_id="eda-event-9",
                 branch="feature/execution-binding",
                 title="Implement execution binding",
@@ -200,7 +204,9 @@ class TestInvalidPayloads:
 
     def test_invalid_outcome_rejected(self) -> None:
         with pytest.raises(ValidationError, match="outcome"):
-            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="in_progress")
+            )
 
     def test_outcome_must_be_terminal(self) -> None:
         with pytest.raises(ValidationError):
@@ -474,3 +480,191 @@ class TestExtraForbidPreserved:
         payload["resource"]["bogus"] = "nope"
         with pytest.raises(ValidationError):
             ExecutionBindingCreateRequest.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
+# Two-phase lifecycle create validation (issue #590)
+# ---------------------------------------------------------------------------
+
+
+class TestTwoPhaseCreateValidation:
+    def test_running_with_afk_run_id_validates(self) -> None:
+        """Start-time provisioning attaches to a pre-provisioned lifecycle."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="running",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                external_session_id=None,
+                resource=None,
+                started_at="2026-08-21T01:02:03Z",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.RUNNING
+        assert request.afk_run_id == "01JZABCDEFGHJKLMNPQRSTVWXY"
+        assert request.external_session_id is None
+        assert request.resource is None
+
+    def test_running_requires_afk_run_id(self) -> None:
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+
+    def test_terminal_without_resource_requires_afk_run_id(self) -> None:
+        with pytest.raises(ValidationError, match="resource or afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", resource=None, external_session_id=None)
+            )
+
+    def test_failed_without_resource_or_session_with_run_validates(self) -> None:
+        """Failed executions persist without a change request or session."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                resource=None,
+                external_session_id=None,
+                failure_reason="AWX job crashed before launch",
+            )
+        )
+        assert request.resource is None
+        assert request.external_session_id is None
+        assert request.failure_reason == "AWX job crashed before launch"
+
+    def test_failed_without_session_validates(self) -> None:
+        """A terminal callback may omit the session (still unresolved)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", external_session_id=None)
+        )
+        assert request.external_session_id is None
+        assert request.resource is not None
+
+    def test_completed_with_failure_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="completed", failure_reason="boom")
+            )
+
+    def test_failed_with_failure_reason_accepted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="boom")
+        )
+        assert request.failure_reason == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Failure-summary redaction (issue #590)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureReasonRedaction:
+    def test_bearer_token_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="auth failed: Bearer abc123secret for job",
+            )
+        )
+        assert request.failure_reason == "auth failed: Bearer *** for job"
+
+    def test_provider_token_prefixes_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="token ghp_abc123 leaked")
+        )
+        assert "ghp_abc123" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_secret_assignment_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="env GITHUB_TOKEN=ghp_secret and password: hunter2",
+            )
+        )
+        assert "ghp_secret" not in request.failure_reason
+        assert "hunter2" not in request.failure_reason
+
+    def test_ordinary_text_untouched(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="Process exited with code 1")
+        )
+        assert request.failure_reason == "Process exited with code 1"
+
+    def test_redact_failure_summary_helper_none_handling(self) -> None:
+        assert redact_failure_summary("plain text") == "plain text"
+
+    def test_bounded_length_still_enforced_after_redaction(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", failure_reason="x" * 1001)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Terminal-update schema (issue #590)
+# ---------------------------------------------------------------------------
+
+
+def _valid_update(**overrides) -> dict:
+    payload = {"outcome": "completed", "finished_at": "2026-08-21T01:05:00Z"}
+    payload.update(overrides)
+    return payload
+
+
+class TestTerminalUpdateSchema:
+    def test_minimal_update_validates(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(_valid_update())
+        assert request.outcome is ExecutionOutcome.COMPLETED
+        assert request.failure_reason is None
+        assert request.resource is None
+        assert request.external_session_id is None
+
+    def test_running_outcome_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="terminal"):
+            ExecutionBindingUpdateRequest.model_validate(_valid_update(outcome="running"))
+
+    def test_invalid_outcome_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="outcome"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="in_progress")
+            )
+
+    def test_failed_without_resource_or_session_validates(self) -> None:
+        """Failed/cancelled terminal updates need no change request or session."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_reason="Timeout after 300s")
+        )
+        assert request.outcome is ExecutionOutcome.FAILED
+        assert request.failure_reason == "Timeout after 300s"
+
+    def test_completed_with_failure_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="completed", failure_reason="boom")
+            )
+
+    def test_resource_fill_in_accepted(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                outcome="completed",
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                },
+                external_session_id="ses_abc123",
+            )
+        )
+        assert request.resource is not None
+        assert request.resource.to_provider_resource_identity().resource_number == "101"
+
+    def test_failure_reason_redacted_on_update(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_reason="Bearer glpat-xyz leaked")
+        )
+        assert "glpat-xyz" not in request.failure_reason
+
+    def test_unknown_fields_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(extra_vars={"secret": "x"})
+            )
