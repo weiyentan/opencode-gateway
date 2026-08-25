@@ -330,9 +330,9 @@ async def test_provision_with_batch_persists_provenance(db_pool: asyncpg.Pool) -
             run_id,
         )
         assert [(r["delivery_id"], r["position"]) for r in batch_rows] == [
-            ("d1", 0),
-            ("d2", 1),
-            ("d3", 2),
+            ("d1", 1),
+            ("d2", 2),
+            ("d3", 3),
         ]
 
 
