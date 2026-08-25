@@ -2075,6 +2075,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 and not (
                     row["provider"] == provider.value
                     and row["repository_url"] == repository
+                    and row["entity_type"] == EntityType.CHANGE_REQUEST.value
                     and row["entity_number"] == resource_number
                 )
             )

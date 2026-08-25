@@ -111,10 +111,12 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
 
     import alembic.command
     import alembic.config
+    import shutil
 
     sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", _migration_script_dir())
+    migration_dir = _migration_script_dir()
+    alembic_cfg.set_main_option("script_location", migration_dir)
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
 
     def _upgrade() -> None:
@@ -136,6 +138,8 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
         await asyncio.to_thread(_upgrade)
 
     yield pool
+
+    shutil.rmtree(migration_dir, ignore_errors=True)
 
     async with pool.acquire() as conn:
         await conn.execute(

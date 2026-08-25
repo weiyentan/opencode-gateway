@@ -54,13 +54,13 @@ _TOKEN_PREFIX_RE = re.compile(r"\b(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)\S+")
 # ``key=value`` / ``key: value`` assignments; the key is classified with the
 # same ``is_secret_key`` vocabulary used elsewhere in the Gateway, so
 # compound keys like ``GITHUB_TOKEN`` are recognized.
-_SECRET_ASSIGNMENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_\-]*)\s*[:=]\s*(\S+)")
+_SECRET_ASSIGNMENT_RE = re.compile(r"([A-Za-z][A-Za-z0-9_\-]*)\s*([:=])\s*(\S+)")
 
 
 def _redact_secret_assignment(match: re.Match) -> str:
-    """Redact the value of a secret-key assignment, preserving the key."""
+    """Redact the value of a secret-key assignment, preserving the key and separator."""
     if is_secret_key(match.group(1)):
-        return f"{match.group(1)}={REDACTED}"
+        return f"{match.group(1)}{match.group(2)}{REDACTED}"
     return match.group(0)
 
 
