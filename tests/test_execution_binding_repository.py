@@ -1038,3 +1038,244 @@ def test_create_or_replay_uses_ulid_source(
 
     mock_ulid_source.next_ulid.assert_called_once()
     assert result.afk_run_id == "01TESTULID00000000000000001"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  update_execution_binding_terminal (issue #590)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _terminal_row(**overrides) -> dict:
+    """Build a mock execution_bindings row as seen by the FOR UPDATE select."""
+    row = {
+        "id": uuid.uuid4(),
+        "outcome": "running",
+        "finished_at": None,
+        "failure_reason": None,
+        "external_session_id": None,
+        "provider": None,
+        "repository_url": None,
+        "entity_type": None,
+        "entity_number": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _run_update(repo: AsyncpgOutcomeRepository, **kwargs):
+    import asyncio
+
+    return asyncio.run(repo.update_execution_binding_terminal(**kwargs))
+
+
+class TestUpdateExecutionBindingTerminal:
+    def test_not_found_returns_not_found(self, mock_conn: AsyncMock) -> None:
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED
+        )
+
+        assert result.not_found is True
+        assert result.is_updated is False
+        assert result.is_conflict is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_uses_select_for_update(self, mock_conn: AsyncMock) -> None:
+        """Concurrency is serialized by locking the row with FOR UPDATE."""
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(_terminal_row()))
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.FAILED)
+
+        sql = mock_conn.fetchrow.call_args[0][0]
+        assert "FOR UPDATE" in sql
+
+    def test_running_transition_updates_row(self, mock_conn: AsyncMock) -> None:
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(_terminal_row()))
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            finished_at=datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC),
+            failure_reason="Timeout",
+        )
+
+        assert result.is_updated is True
+        assert result.is_conflict is False
+        updates = _calls_matching(mock_conn, r"UPDATE execution_bindings")
+        assert len(updates) == 1
+        args = updates[0][1]
+        # outcome, finished_at, failure_reason carried in the UPDATE params
+        assert args[1] == "failed"
+        assert args[2] == datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+        assert args[3] == "Timeout"
+
+    def test_running_fills_null_session_and_resource(self, mock_conn: AsyncMock) -> None:
+        """Supplied fill-ins populate stored NULLs without erasing anything."""
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(_terminal_row()))
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_found_later",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="7",
+        )
+
+        assert result.is_updated is True
+        updates = _calls_matching(mock_conn, r"UPDATE execution_bindings")
+        args = updates[0][1]
+        assert args[4] == "ses_found_later"
+        assert args[5] == "github"
+        assert args[6] == "org/repo"
+        assert args[7] == "change_request"
+        assert args[8] == "7"
+
+    def test_running_conflicting_session_is_conflict(self, mock_conn: AsyncMock) -> None:
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(_terminal_row(external_session_id="ses_stored"))
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_different",
+        )
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_running_conflicting_resource_is_conflict(self, mock_conn: AsyncMock) -> None:
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    provider="github",
+                    repository_url="org/repo",
+                    entity_type="change_request",
+                    entity_number="7",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="99",
+        )
+
+        assert result.is_conflict is True
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_terminal_identical_replay_is_idempotent(self, mock_conn: AsyncMock) -> None:
+        finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(outcome="completed", finished_at=finished)
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            finished_at=finished,
+        )
+
+        assert result.is_updated is False
+        assert result.is_conflict is False
+        assert result.not_found is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_terminal_conflicting_outcome_is_conflict(self, mock_conn: AsyncMock) -> None:
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(_terminal_row(outcome="completed"))
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo, awx_job_id="900", outcome=ExecutionOutcome.FAILED
+        )
+
+        assert result.is_conflict is True
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_non_terminal_outcome_raises(self, mock_conn: AsyncMock) -> None:
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        with pytest.raises(ValueError, match="terminal"):
+            _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.RUNNING)
+
+
+class TestCreateOrReplayNullableResource:
+    def test_running_provision_writes_null_resource_columns(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """Issue #590: a resource-less running provision persists NULLs."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[None, mock_row({"afk_run_id": "01SUPPLIED00000000000000001"})]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload(outcome=ExecutionOutcome.RUNNING)
+        payload["provider"] = None
+        payload["repository"] = None
+        payload["resource_number"] = None
+        payload["external_session_id"] = None
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.run_missing is False
+        inserts = _calls_matching(mock_conn, r"INSERT INTO execution_bindings")
+        args = inserts[0][1]
+        # provider / repository_url / entity_type / entity_number are NULL
+        assert args[3] is None
+        assert args[4] is None
+        assert args[5] is None
+        assert args[6] is None
+        assert args[2] is None  # external_session_id
+
+    def test_legacy_auto_provision_without_provider_raises(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """Auto-provisioning a run requires a provider (API schema guarantees)."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["provider"] = None
+        payload["repository"] = None
+        payload["resource_number"] = None
+        payload["afk_run_id"] = None
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        with pytest.raises(ValueError, match="provider"):
+            asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
