@@ -19,6 +19,12 @@ Provisional AFK run lifecycle endpoints (mounted on this router as
 - ``POST /runs/{afk_run_id}/change-request`` — bind one change request to a
   lifecycle.  Idempotent per lifecycle (the 1:1 lifecycle<->change_request
   invariant); conflicts return 409.
+- ``GET /runs/by-change-request`` — resolve a provider-qualified
+  change-request identity (GitHub PR / GitLab MR) to its owning
+  ``afk_run_id`` via the explicit durable binding on ``afk_runs``.
+  Read-only (API-key auth only, no collector token); 400 for invalid
+  identity, 404 for unknown/unbound, 409 for an impossible ownership
+  conflict (issue #597).
 
 All responses use the ``{status, data, error}`` envelope and are protected
 by the global :class:`~app.core.auth.ApiKeyMiddleware`.  The write paths
@@ -62,6 +68,7 @@ from app.core.schemas.afk_lifecycle import (
     AFKRunLifecycleResponse,
     AFKRunProvisionRequest,
     ChangeRequestBindingRequest,
+    ChangeRequestLookupResponse,
 )
 from app.core.schemas.execution_binding import (
     ExecutionBindingCreateRequest,
@@ -660,3 +667,99 @@ async def bind_lifecycle_change_request(
             detail="Failed to retrieve lifecycle after change-request binding",
         )
     return AFKRunLifecycleResponse.from_domain(lifecycle)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/by-change-request — change-request lookup
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/runs/by-change-request",
+    response_model=ChangeRequestLookupResponse,
+)
+async def get_run_by_change_request(
+    request: Request,
+    provider: str = Query(..., description="Source provider: github | gitlab"),
+    repository: str = Query(..., description="Repository URL (normalized)"),
+    external_id: str = Query(
+        ...,
+        description="Provider-scoped change-request id (PR/MR number as opaque string)",
+    ),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> ChangeRequestLookupResponse:
+    """Resolve a provider-qualified change-request identity to its owning run.
+
+    Follow-up GitHub PR / GitLab MR webhooks use this to continue the same
+    durable AFK lifecycle that originally created and bound the change
+    request (issue #597).  Read-only: queries only the explicit durable
+    change-request binding on ``afk_runs`` and issues no writes.
+
+    * ``200`` — the owning ``afk_run_id`` plus the canonical
+      ``change_request`` identity.
+    * ``400`` — invalid provider, repository, or change-request identity.
+    * ``404`` — unknown or unbound PR/MR (no lifecycle owns it).
+    * ``409`` — impossible ownership conflict (more than one lifecycle
+      claims it).
+    """
+    if provider not in _VALID_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid provider: {provider!r}. "
+                f"Valid values: {', '.join(sorted(_VALID_PROVIDERS))}"
+            ),
+        )
+    if not external_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid change-request identity: external_id must be a "
+                "non-empty string"
+            ),
+        )
+    # Normalize the repository identity at the API boundary (same helper as
+    # the write paths); GitHub PRs and GitLab MRs both resolve under the
+    # canonical change_request identity.
+    normalized_repo = _normalize_repository_or_400(repository)
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.query.afk_run.by_change_request", "db"):
+            async with _db_timeout(
+                "db.query.afk_run.by_change_request",
+                settings.database_timeout_seconds,
+            ):
+                result = await repo.get_afk_run_by_change_request(
+                    provider=Provider(provider),
+                    repository=normalized_repo,
+                    external_id=external_id,
+                )
+
+    if result.is_conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Impossible ownership conflict: more than one lifecycle "
+                "claims this change request"
+            ),
+        )
+    if result.afk_run_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Change request not found / unbound: "
+                f"{provider} {normalized_repo} #{external_id}"
+            ),
+        )
+
+    return ChangeRequestLookupResponse(
+        afk_run_id=result.afk_run_id,
+        change_request=ProviderResourceIdentity(
+            provider=Provider(provider),
+            repository=normalized_repo,
+            resource_type=EntityType.CHANGE_REQUEST,
+            resource_number=external_id,
+        ),
+    )

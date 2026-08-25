@@ -129,6 +129,24 @@ class ChangeRequestBindingRequest(BaseModel):
     )
 
 
+class ChangeRequestLookupResponse(BaseModel):
+    """Compact change-request -> owning lifecycle lookup (``GET /runs/by-change-request``).
+
+    Resolves a provider-qualified change-request identity (GitHub PR or
+    GitLab MR, both canonical ``change_request``) to its owning
+    ``afk_run_id`` via the explicit durable binding on ``afk_runs``.  The
+    ``change_request`` echoes the canonical stable resource identity used
+    for the lookup.
+    """
+
+    afk_run_id: str = Field(description="ULID primary key of the owning run")
+    change_request: ProviderResourceIdentity = Field(
+        description=(
+            "The canonical change_request identity that resolved to this run"
+        ),
+    )
+
+
 class AFKRunLifecycleResponse(BaseModel):
     """One provisional lifecycle as surfaced by the write-path responses.
 

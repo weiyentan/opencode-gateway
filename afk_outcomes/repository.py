@@ -402,6 +402,25 @@ class ChangeRequestBindingResult:
     run_missing: bool = False
 
 
+@dataclass(frozen=True)
+class ChangeRequestLookupResult:
+    """Result of a change-request -> owning run lookup (issue #597).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.get_afk_run_by_change_request`:
+
+    * ``afk_run_id`` — the owning lifecycle's ULID when exactly one run is
+      bound to the change request.
+    * ``is_conflict=True`` — more than one lifecycle claims the change
+      request (an impossible ownership conflict — the 1:1 invariant was
+      violated); nothing is chosen arbitrarily.
+    * ``afk_run_id=None`` and ``is_conflict=False`` — no lifecycle is bound
+      to the change request (unknown or unbound).
+    """
+
+    afk_run_id: str | None = None
+    is_conflict: bool = False
+
+
 class AsyncpgOutcomeRepository(OutcomeRepository):
     """Persist and retrieve AFK runs via a raw asyncpg connection.
 
@@ -2449,3 +2468,44 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             first_seen_at=row.get("first_seen_at"),
             last_seen_at=row.get("last_seen_at"),
         )
+
+    async def get_afk_run_by_change_request(
+        self,
+        *,
+        provider: Provider,
+        repository: str,
+        external_id: str,
+    ) -> ChangeRequestLookupResult:
+        """Resolve a provider-qualified change-request identity to its owning run.
+
+        Queries ONLY the explicit durable change-request binding columns on
+        ``afk_runs`` (``change_request_provider`` / ``change_request_repository``
+        / ``change_request_external_id``) — never branch names, issue
+        references, commits, titles, timestamps, sessions, AWX jobs,
+        correlation tables, or event history (issue #597).
+
+        The 1:1 lifecycle<->change_request invariant (partial unique index
+        ``uq_afk_runs_change_request_identity``) guarantees at most one
+        owning run.  A query that nonetheless returns more than one row is
+        an impossible ownership conflict and is surfaced as
+        ``is_conflict=True`` rather than choosing arbitrarily.
+
+        Read-only: issues no writes.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT afk_run_id
+            FROM afk_runs
+            WHERE change_request_provider = $1
+              AND change_request_repository = $2
+              AND change_request_external_id = $3
+            """,
+            provider.value,
+            repository,
+            external_id,
+        )
+        if len(rows) > 1:
+            return ChangeRequestLookupResult(is_conflict=True)
+        if not rows:
+            return ChangeRequestLookupResult()
+        return ChangeRequestLookupResult(afk_run_id=rows[0]["afk_run_id"])
