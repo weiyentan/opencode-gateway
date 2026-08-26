@@ -854,12 +854,15 @@ def _new_afk_run_id() -> str:
     return "01J" + uuid.uuid4().hex[:23]
 
 
-async def _seed_afk_run(conn: asyncpg.Connection, run_id: str) -> None:
+async def _seed_afk_run(
+    conn: asyncpg.Connection, run_id: str, *, provider: str = "github"
+) -> None:
     """Insert a provisional afk_runs row the execution can attach to."""
     await conn.execute(
         "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
-        " VALUES ($1, 'github', 'pending', now(), now())",
+        " VALUES ($1, $2, 'pending', now(), now())",
         run_id,
+        provider,
     )
 
 
@@ -1016,6 +1019,177 @@ async def test_two_phase_terminal_resource_conflicts_with_lifecycle(
         assert row["outcome"] == "running"
         assert row["provider"] is None
         assert row["entity_number"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_auto_created_run_persists_change_request_columns(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Issue #600 review (finding #5): a POST without afk_run_id persists the
+    change-request identity on the freshly-created afk_runs row in the same
+    transaction — the new lifecycle is authoritative for the PR immediately."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    resource_number = f"cr-{uuid.uuid4().hex[:12]}"
+    payload = _make_binding_payload(
+        awx_job_id=awx_job_id, resource_number=resource_number
+    )
+
+    async with client as c:
+        resp = await c.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+        run_id = resp.json()["data"]["afk_run_id"]
+        assert run_id is not None
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT change_request_provider, change_request_repository,"
+            " change_request_external_id FROM afk_runs WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert row is not None
+        assert row["change_request_provider"] == "github"
+        assert row["change_request_repository"] == "github.com/acme/proj"
+        assert row["change_request_external_id"] == resource_number
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_accepts_resource_provider_differing_from_run_provider(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Issue #600 review (finding #7, Option A): afk_runs.provider is
+    trigger/source provenance — a POST with a supplied afk_run_id whose
+    stored provider differs from the resource's provider is accepted, and
+    the change request is bound with its own canonical provider."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id(), provider="gitlab")
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    payload = _make_binding_payload(awx_job_id=awx_job_id, provider="github")
+    payload["afk_run_id"] = run_id
+
+    async with client as c:
+        resp = await c.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT provider, change_request_provider,"
+            " change_request_repository, change_request_external_id"
+            " FROM afk_runs WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert row is not None
+        assert row["provider"] == "gitlab"  # source provenance unchanged
+        assert row["change_request_provider"] == "github"  # canonical CR provider
+        assert row["change_request_repository"] == "github.com/acme/proj"
+        assert row["change_request_external_id"] == "42"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Issue #600 review (finding #6): two concurrent terminal POSTs attaching
+    different AWX jobs to the same lifecycle with the same change request both
+    succeed (201/201) — the loser's pre-check finds the requested lifecycle
+    itself as the owner and resolves to an idempotent replay, never a 409."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id_a = int(uuid.uuid4().int >> 96)
+    awx_job_id_b = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        results = await asyncio.gather(
+            c.post(
+                "/api/v1/afk/executions",
+                json={**_make_binding_payload(awx_job_id=awx_job_id_a),
+                      "afk_run_id": run_id},
+            ),
+            c.post(
+                "/api/v1/afk/executions",
+                json={**_make_binding_payload(awx_job_id=awx_job_id_b),
+                      "afk_run_id": run_id},
+            ),
+        )
+        status_codes = sorted(r.status_code for r in results)
+        assert status_codes == [201, 201], (
+            f"Expected [201, 201], got {status_codes}"
+        )
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT change_request_provider, change_request_repository,"
+            " change_request_external_id FROM afk_runs WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert row is not None
+        assert row["change_request_provider"] == "github"
+        assert row["change_request_repository"] == "github.com/acme/proj"
+        assert row["change_request_external_id"] == "42"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_same_lifecycle_different_change_request_one_conflicts(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Issue #600 review (finding #6): two concurrent terminal POSTs attaching
+    different AWX jobs to the same lifecycle with different change requests —
+    exactly one 201 and one 409; the lifecycle owns exactly one of them."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id_a = int(uuid.uuid4().int >> 96)
+    awx_job_id_b = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        results = await asyncio.gather(
+            c.post(
+                "/api/v1/afk/executions",
+                json={
+                    **_make_binding_payload(
+                        awx_job_id=awx_job_id_a, resource_number="41"
+                    ),
+                    "afk_run_id": run_id,
+                },
+            ),
+            c.post(
+                "/api/v1/afk/executions",
+                json={
+                    **_make_binding_payload(
+                        awx_job_id=awx_job_id_b, resource_number="42"
+                    ),
+                    "afk_run_id": run_id,
+                },
+            ),
+        )
+        status_codes = sorted(r.status_code for r in results)
+        assert status_codes == [201, 409], (
+            f"Expected [201, 409], got {status_codes}"
+        )
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT change_request_external_id FROM afk_runs"
+            " WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert row is not None
+        assert row["change_request_external_id"] in ("41", "42")
 
 
 @pytest.mark.integration

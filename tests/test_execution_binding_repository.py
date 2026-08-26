@@ -1356,10 +1356,22 @@ class TestCreateOrReplayNullableResource:
 
 
 class TestCreateOrReplayProviderCompatibility:
-    """create_or_replay_afk_execution_binding provider vs afk_run provider (issue #600)."""
+    """create_or_replay_afk_execution_binding resource vs afk_run provider
+    (issue #600 review, Option A).
 
-    def test_mismatched_run_provider_is_conflict(self, mock_conn: AsyncMock) -> None:
-        """A resource whose provider contradicts the run's provider is rejected."""
+    ``afk_runs.provider`` records where the lifecycle originated
+    (trigger/source provenance) and is intentionally independent of the
+    canonical change-request provider carried by the binding tuple itself.
+    A supplied ``afk_run_id`` therefore never gates the execution's resource
+    provider against the run's stored provider.
+    """
+
+    def test_run_provider_is_source_provenance_not_a_gate(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A resource whose provider differs from the run's stored provider is
+        accepted — the run's provider is trigger/source provenance, not the
+        canonical change-request provider (issue #600 review)."""
         mock_conn.fetchrow = AsyncMock(
             side_effect=[
                 None,  # no existing binding
@@ -1372,10 +1384,11 @@ class TestCreateOrReplayProviderCompatibility:
                         "change_request_external_id": None,
                     }
                 ),
+                None,  # no other lifecycle owns this change request
             ]
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        mock_conn.execute = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
         repo = AsyncpgOutcomeRepository(mock_conn)
         payload = _binding_payload()
         payload["afk_run_id"] = "01SUPPLIED00000000000000001"
@@ -1385,11 +1398,16 @@ class TestCreateOrReplayProviderCompatibility:
 
         result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
 
-        assert result.is_conflict is True
-        assert result.is_created is False
+        assert result.is_created is True
+        assert result.is_conflict is False
         assert result.run_missing is False
-        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
-        assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
+        # The unbound lifecycle is bound to the execution's change request —
+        # the canonical provider is the tuple's own (github), not the run's.
+        binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
+        assert len(binds) == 1
+        assert binds[0][1][1] == "github"
+        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][3] == "42"
 
     def test_matching_run_provider_proceeds(self, mock_conn: AsyncMock) -> None:
         """A resource matching the run's provider attaches normally and binds the
@@ -1490,11 +1508,11 @@ class TestCreateOrReplayProviderCompatibility:
         assert result.is_created is True
         assert result.is_conflict is False
 
-    def test_run_without_provider_skips_compatibility_check(
+    def test_run_without_stored_provider_is_still_bound(
         self, mock_conn: AsyncMock
     ) -> None:
-        """A run without a stored provider carries no provider constraint, but the
-        unbound lifecycle is still bound to the execution's change request
+        """A run without a stored provider carries no provenance constraint, but
+        the unbound lifecycle is still bound to the execution's change request
         (issue #600 review)."""
         mock_conn.fetchrow = AsyncMock(
             side_effect=[
@@ -1535,6 +1553,226 @@ class TestCreateOrReplayProviderCompatibility:
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        assert _calls_matching(mock_conn, r"UPDATE afk_runs") == []
+
+
+class TestCreateOrReplayAutoProvisionedChangeRequest:
+    """Auto-created lifecycle change-request binding (issue #600 review,
+    finding #5).
+
+    When no ``afk_run_id`` is supplied and the execution carries a complete
+    change-request identity, the freshly-created ``afk_runs`` row persists
+    the change-request columns in the same transaction.  The 1:1 invariant
+    is enforced with a pre-check plus a savepoint-wrapped INSERT that turns
+    a concurrent ``UniqueViolationError`` into ``is_conflict`` — never a 500.
+    """
+
+    def test_auto_created_run_persists_change_request_columns(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """The auto-provisioned afk_runs INSERT carries the change-request
+        identity columns."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        inserts = _calls_matching(mock_conn, r"INSERT INTO afk_runs")
+        assert len(inserts) == 1
+        sql, args = inserts[0]
+        assert "change_request_provider" in sql
+        assert "change_request_repository" in sql
+        assert "change_request_external_id" in sql
+        # args: run_id, provider, title, started_at, finished_at,
+        #       cr_provider, cr_repository, cr_external_id
+        assert args[0] == result.afk_run_id
+        assert args[1] == "github"
+        assert args[5] == "github"
+        assert args[6] == "org/repo"
+        assert args[7] == "42"
+
+    def test_auto_created_run_prechecks_owned_change_request(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A change request already owned by another lifecycle is a conflict
+        without inserting the run or the binding (1:1 invariant)."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row({"afk_run_id": "01SOMEONELSE0000000000000001"}),  # owned
+            ]
+        )
+        mock_conn.fetch = AsyncMock()
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+
+    def test_auto_created_run_unique_violation_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A concurrent owner that slips past the pre-check surfaces as a clean
+        conflict — the UniqueViolationError never escapes as a 500."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock()
+        mock_conn.execute = AsyncMock(
+            side_effect=asyncpg.UniqueViolationError("duplicate key")
+        )
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+
+    def test_auto_created_run_without_resource_writes_no_change_request(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A resource-less auto-provision keeps the legacy INSERT without
+        change-request columns and without the pre-check."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["repository"] = None
+        payload["resource_number"] = None
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        inserts = _calls_matching(mock_conn, r"INSERT INTO afk_runs")
+        assert len(inserts) == 1
+        sql, _args = inserts[0]
+        assert "change_request_provider" not in sql
+
+
+class TestCreateOrReplaySameLifecyclePrecheckReplay:
+    """Same-lifecycle ownership found by the 1:1 pre-check (issue #600
+    review, finding #6).
+
+    When the pre-check finds that the *requested lifecycle itself* owns the
+    change request (a concurrent identical bind committed between our read
+    of the run and the pre-check), the complete tuple is re-read and
+    verified — an identical tuple is an idempotent replay, anything else is
+    a genuine conflict.
+    """
+
+    def test_same_lifecycle_same_change_request_in_precheck_proceeds(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """The pre-check finding the requested lifecycle as the owner of the
+        identical change request is an idempotent replay — the binding
+        proceeds instead of returning a false 409."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {
+                        "afk_run_id": "01SUPPLIED00000000000000001",
+                        "provider": "github",
+                        "change_request_provider": None,
+                        "change_request_repository": None,
+                        "change_request_external_id": None,
+                    }
+                ),
+                # Pre-check: the requested lifecycle itself owns the CR.
+                mock_row({"afk_run_id": "01SUPPLIED00000000000000001"}),
+                # Re-read: the complete tuple matches.
+                mock_row(
+                    {
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "42",
+                    }
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_conflict is False
+        # No UPDATE afk_runs — the idempotent replay never re-binds.
+        assert _calls_matching(mock_conn, r"UPDATE afk_runs") == []
+
+    def test_same_lifecycle_different_change_request_in_precheck_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """The pre-check finding the requested lifecycle as owner, but the
+        re-read tuple differing, is a genuine conflict — the lifecycle was
+        rebound to a different identity."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {
+                        "afk_run_id": "01SUPPLIED00000000000000001",
+                        "provider": "github",
+                        "change_request_provider": None,
+                        "change_request_repository": None,
+                        "change_request_external_id": None,
+                    }
+                ),
+                mock_row({"afk_run_id": "01SUPPLIED00000000000000001"}),
+                # Re-read: a DIFFERENT tuple — the lifecycle was rebound.
+                mock_row(
+                    {
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/other-repo",
+                        "change_request_external_id": "99",
+                    }
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock()
+        mock_conn.execute = AsyncMock()
+
         repo = AsyncpgOutcomeRepository(mock_conn)
         payload = _binding_payload()
         payload["afk_run_id"] = "01SUPPLIED00000000000000001"

@@ -150,7 +150,7 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -174,7 +174,7 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -419,7 +419,7 @@ class TestBearerTokenNonLeakage:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()

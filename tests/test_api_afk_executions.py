@@ -143,9 +143,9 @@ class TestCreateExecutionBinding:
 
         conn = _mk_conn()
         saved_row = _mk_binding_row(awx_job_id=42)
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -192,9 +192,9 @@ class TestCreateExecutionBinding:
             repository_url="gitlab.com/cloudnative-pg/cloudnative-pg",
             entity_number="6",
         )
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -592,9 +592,9 @@ class TestCreateExecutionBinding:
             trigger_type="eda",
             source_event_id="evt_001",
         )
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
