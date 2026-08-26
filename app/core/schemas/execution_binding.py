@@ -63,11 +63,11 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 
 
-def _redact_secret_assignment(match: re.Match) -> str:
+def _redact_secret_assignment(match: re.Match[str]) -> str:
     """Redact the value of a secret-key assignment, preserving the key and separator."""
     if is_secret_key(match.group(1)):
         return f"{match.group(1)}{match.group(2)}{REDACTED}"
-    return match.group(0)
+    return str(match.group(0))
 
 
 def redact_failure_summary(value: str) -> str:
