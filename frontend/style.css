@@ -1654,6 +1654,94 @@ td.clickable:hover {
   box-shadow: inset 0 0 0 2px var(--accent-indigo);
 }
 
+.panel-afk-repos table {
+  table-layout: auto;
+}
+
+.panel-afk-repos th:nth-child(3),
+.panel-afk-repos td:nth-child(3) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-afk-cr .panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.afk-cr-back {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 2px 8px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.afk-cr-back:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.afk-cr-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 0 4px;
+}
+
+.afk-cr-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.afk-cr-toggle {
+  accent-color: var(--accent-indigo);
+}
+
+.afk-cr-linked {
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.afk-cr-badge {
+  display: inline-block;
+  background: var(--accent-indigo);
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.03em;
+}
+
+.repo-row {
+  cursor: pointer;
+  transition: background var(--transition);
+}
+
+.repo-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.repo-row:focus-visible {
+  outline: 2px solid var(--accent-indigo);
+  outline-offset: -2px;
+}
+
+.panel-afk-cr th:nth-child(5),
+.panel-afk-cr td:nth-child(5) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Unresolved Relationships panel (issue #576): dedicated view for correlation
    exceptions independent of the happy-path provenance detail.  Follows the
    existing panel conventions — glass-panel table styling, freshness labels,

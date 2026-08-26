@@ -122,6 +122,8 @@
   let afkRunsData = null;         // latest AFK runs list response
   let afkRunsFetchError = null;   // per-cycle fetch error for AFK runs
   let unresolvedRelationshipsData = null; // latest unresolved relationships data
+  let selectedRepo = null;
+  let afkOnlyFilter = false;
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -176,6 +178,8 @@
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
     'afk-outcomes':  ['afkRuns'],
+    'afk-repos':     ['afkRuns'],
+    'afk-change-requests': ['afkRuns'],
     'unresolved-relationships': ['afkRuns'],
   };
 
@@ -3029,6 +3033,54 @@
     openAgentRunDetail(sessionId);
   }
 
+  // Build a root-to-children tree from the flat session links. Child arrays
+  // intentionally retain the session-object contract used by the API/tests.
+  function buildSessionTree(sessions) {
+    if (!sessions || !sessions.length) return [];
+    var byExtId = {};
+    var roots = [];
+    sessions.forEach(function (session) {
+      var extId = session.external_session_id || session.session_id || '';
+      byExtId[extId] = Object.assign({}, session, { children: [] });
+    });
+    sessions.forEach(function (session) {
+      var extId = session.external_session_id || session.session_id || '';
+      var parentId = session.parent_session_id || '';
+      if (parentId && byExtId[parentId]) {
+        byExtId[parentId].children.push(byExtId[extId]);
+      } else if (parentId) {
+        roots.push({ session: byExtId[extId], children: byExtId[extId].children, missing_parent: parentId });
+      } else {
+        roots.push({ session: byExtId[extId], children: byExtId[extId].children });
+      }
+    });
+    return roots;
+  }
+
+  function renderNestedSessionNode(node, depth) {
+    depth = depth || 0;
+    var html = renderAfkSessionLink(node.session);
+    if (depth > 0) {
+      html = html.replace('afk-chain-item',
+        'afk-chain-item afk-session-nested afk-nesting-depth-' + Math.min(depth, 5));
+    } else {
+      html = html.replace('afk-chain-item', 'afk-chain-item afk-session-root');
+    }
+    if (node.missing_parent) {
+      html = html.replace('afk-chain-item', 'afk-chain-item afk-missing-parent');
+      html += '<div class="afk-missing-parent-note">\u26A0 parent not in this run: ' +
+        escHtml(node.missing_parent) + '</div>';
+    }
+    if (node.children && node.children.length) {
+      html += '<div class="afk-session-children">';
+      node.children.forEach(function (child) {
+        html += renderNestedSessionNode({ session: child, children: child.children || [] }, depth + 1);
+      });
+      html += '</div>';
+    }
+    return html;
+  }
+
   /** Render one chain step (from buildAfkChain) into HTML. */
   function renderAfkChainStep(step) {
     var body = '';
@@ -3077,6 +3129,7 @@
       '<div class="afk-chain-item-head">' +
         '<span class="afk-entity-id">' + escHtml(link.entity_id || '--') + '</span>' +
         '<span class="afk-entity-type">' + escHtml(link.entity_type || '') + '</span>' +
+        (link.repository ? '<span class="afk-entity-repository">' + escHtml(link.repository) + '</span>' : '') +
         badge(link.role || '--', roleCls).outerHTML +
         (provisional ? ' <span class="afk-provisional-mark">\u26A0 provisional</span>' : '') +
       '</div>' +
@@ -3496,6 +3549,8 @@
       }
       renderClientProjectBreakdown(data);
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderRepositorySummaryTable(data.afkRuns);
+      renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
@@ -4385,6 +4440,17 @@
   window.renderAfkRunDetail = renderAfkRunDetail;
   window.renderAfkOutcomesTable = renderAfkOutcomesTable;
   window.openAfkRunDetail = openAfkRunDetail;
+  window.buildSessionTree = buildSessionTree;
+  window.renderNestedSessionNode = renderNestedSessionNode;
+  window.deriveRepositoryLabel = deriveRepositoryLabel;
+  window.buildRepositorySummaries = buildRepositorySummaries;
+  window.renderRepositorySummaryTable = renderRepositorySummaryTable;
+  window.providerCrTerm = providerCrTerm;
+  window.buildChangeRequestList = buildChangeRequestList;
+  window.filterChangeRequests = filterChangeRequests;
+  window.renderChangeRequestList = renderChangeRequestList;
+  window.selectRepository = selectRepository;
+  window.clearSelectedRepo = clearSelectedRepo;
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;

@@ -244,7 +244,11 @@ var historyStub = {
   var sandbox = {
     window: sandboxWindow,
     document: documentStub,
-    console: console,
+    console: {
+      log: console.log.bind(console),
+      error: console.error.bind(console),
+      warn: console.warn.bind(console)
+    },
     setTimeout: setTimeout,
     setInterval: setInterval,
     clearInterval: clearInterval,
@@ -337,6 +341,17 @@ var historyStub = {
   window.renderAfkRunDetail = sandboxWindow.renderAfkRunDetail;
   window.renderAfkOutcomesTable = sandboxWindow.renderAfkOutcomesTable;
   window.openAfkRunDetail = sandboxWindow.openAfkRunDetail;
+  window.buildSessionTree = sandboxWindow.buildSessionTree;
+  window.renderNestedSessionNode = sandboxWindow.renderNestedSessionNode;
+  window.deriveRepositoryLabel = sandboxWindow.deriveRepositoryLabel;
+  window.buildRepositorySummaries = sandboxWindow.buildRepositorySummaries;
+  window.renderRepositorySummaryTable = sandboxWindow.renderRepositorySummaryTable;
+  window.providerCrTerm = sandboxWindow.providerCrTerm;
+  window.buildChangeRequestList = sandboxWindow.buildChangeRequestList;
+  window.filterChangeRequests = sandboxWindow.filterChangeRequests;
+  window.renderChangeRequestList = sandboxWindow.renderChangeRequestList;
+  window.selectRepository = sandboxWindow.selectRepository;
+  window.clearSelectedRepo = sandboxWindow.clearSelectedRepo;
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = sandboxWindow.fmtRelationshipState;
   window.renderRelationshipBadge = sandboxWindow.renderRelationshipBadge;
@@ -4449,6 +4464,11 @@ console.log('\u25B6 AFK Outcomes — last-successful-rows retention + stale indi
 
 console.log('\u25B6 AFK Outcomes — openAfkRunDetail fetch + 404 handling (issue #453)');
 
+var resolveAfkDetailTestsDone;
+var afkDetailTestsDone = new Promise(function (resolve) {
+  resolveAfkDetailTestsDone = resolve;
+});
+
 (function () {
   pendingAsyncBlocks++;
   appJsSandbox.fetch = function (url) {
@@ -4482,6 +4502,7 @@ console.log('\u25B6 AFK Outcomes — openAfkRunDetail fetch + 404 handling (issu
         return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
       };
       pendingAsyncBlocks--;
+      resolveAfkDetailTestsDone();
     });
     pendingAsyncBlocks--;
   });
@@ -5050,6 +5071,8 @@ console.log('\u25B6 issue #577 \u2014 relationship: confidence/method/evidence/r
 
 console.log('\u25B6 issue #577 \u2014 loading state');
 
+var issue577LoadingDone;
+
 (function () {
   // Loading: openAfkRunDetail sets "Loading detail..." before fetch completes
   pendingAsyncBlocks++;
@@ -5057,7 +5080,7 @@ console.log('\u25B6 issue #577 \u2014 loading state');
   appJsSandbox.fetch = function () {
     return new Promise(function (resolve) { resolveFetch = resolve; });
   };
-  window.openAfkRunDetail('loading-test');
+  issue577LoadingDone = window.openAfkRunDetail('loading-test');
   // While loading: the overlay is visible and loading text is shown
   assert(afkDetailOverlayEl.classList.contains('visible'), 'loading: overlay visible');
   assert(afkDetailBodyEl.innerHTML.indexOf('Loading detail') !== -1, 'loading: loading text displayed');
@@ -5066,7 +5089,9 @@ console.log('\u25B6 issue #577 \u2014 loading state');
     ok: true,
     json: function () { return Promise.resolve({ status: 'ok', data: { run: { afk_run_id: 'loading-test', status: 'completed', outcome_status: 'merged' } } }); }
   });
-  pendingAsyncBlocks--;
+  issue577LoadingDone.then(function () {
+    pendingAsyncBlocks--;
+  });
 })();
 
 console.log('\u25B6 issue #577 \u2014 empty detail state');
@@ -5124,17 +5149,20 @@ console.log('\u25B6 issue #577 \u2014 partial data: runs list with mixed field c
 
 console.log('\u25B6 issue #577 \u2014 retry/error: 404 handling');
 
+var issue577AsyncChain = Promise.all([afkDetailTestsDone, issue577LoadingDone]);
+
 (function () {
   pendingAsyncBlocks++;
-  appJsSandbox.fetch = function () {
-    return Promise.resolve({ ok: false, status: 404 });
-  };
-  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
-  var savedConsoleError = appJsSandbox.console.error;
-  appJsSandbox.console.error = function () {};
-  window.openAfkRunDetail('not-found-run').then(function () {
-    // Restore console.error BEFORE assertions so failures are visible
-    appJsSandbox.console.error = savedConsoleError;
+  issue577AsyncChain = issue577AsyncChain.then(function () {
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({ ok: false, status: 404 });
+    };
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    return window.openAfkRunDetail('not-found-run').then(function () {
+      appJsSandbox.console.error = savedConsoleError;
+    });
+  }).then(function () {
     assert(afkDetailBodyEl.innerHTML.indexOf('AFK run not found') !== -1,
       'retry/error: 404 renders not-found message');
     pendingAsyncBlocks--;
@@ -5145,15 +5173,16 @@ console.log('\u25B6 issue #577 \u2014 retry/error: 500 handling');
 
 (function () {
   pendingAsyncBlocks++;
-  appJsSandbox.fetch = function () {
-    return Promise.resolve({ ok: false, status: 500 });
-  };
-  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
-  var savedConsoleError = appJsSandbox.console.error;
-  appJsSandbox.console.error = function () {};
-  window.openAfkRunDetail('error-run').then(function () {
-    // Restore console.error BEFORE assertions so failures are visible
-    appJsSandbox.console.error = savedConsoleError;
+  issue577AsyncChain = issue577AsyncChain.then(function () {
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({ ok: false, status: 500 });
+    };
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    return window.openAfkRunDetail('error-run').then(function () {
+      appJsSandbox.console.error = savedConsoleError;
+    });
+  }).then(function () {
     assert(afkDetailBodyEl.innerHTML.indexOf('Failed to load') !== -1,
       'retry/error: 500 renders failure message');
     assert(afkDetailBodyEl.innerHTML.indexOf('AFK run not found') === -1,
@@ -5167,15 +5196,16 @@ console.log('\u25B6 issue #577 \u2014 retry/error: network failure handling');
 
 (function () {
   pendingAsyncBlocks++;
-  appJsSandbox.fetch = function () {
-    return Promise.reject(new Error('network down'));
-  };
-  // Suppress the EXPECTED console.error from openAfkRunDetail's catch block
-  var savedConsoleError = appJsSandbox.console.error;
-  appJsSandbox.console.error = function () {};
-  window.openAfkRunDetail('network-error').then(function () {
-    // Restore console.error BEFORE assertions so failures are visible
-    appJsSandbox.console.error = savedConsoleError;
+  issue577AsyncChain = issue577AsyncChain.then(function () {
+    appJsSandbox.fetch = function () {
+      return Promise.reject(new Error('network down'));
+    };
+    var savedConsoleError = appJsSandbox.console.error;
+    appJsSandbox.console.error = function () {};
+    return window.openAfkRunDetail('network-error').then(function () {
+      appJsSandbox.console.error = savedConsoleError;
+    });
+  }).then(function () {
     assert(afkDetailBodyEl.innerHTML.indexOf('Failed to load') !== -1,
       'retry/error: network failure renders failure message');
     assert(afkDetailBodyEl.innerHTML.indexOf('network down') !== -1,
@@ -5295,18 +5325,20 @@ console.log('\u25B6 issue #577 \u2014 overlay: open/close lifecycle');
   afkDetailCloseEl.addEventListener('click', function () {
     afkDetailOverlayEl.classList.remove('visible');
   });
-  appJsSandbox.fetch = function () {
-    return Promise.resolve({
-      ok: true,
-      json: function () {
-        return Promise.resolve({
-          status: 'ok',
-          data: { run: { afk_run_id: 'ov-1', status: 'completed', outcome_status: 'merged' } }
-        });
-      }
-    });
-  };
-  window.openAfkRunDetail('ov-1').then(function () {
+  issue577AsyncChain = issue577AsyncChain.then(function () {
+    appJsSandbox.fetch = function () {
+      return Promise.resolve({
+        ok: true,
+        json: function () {
+          return Promise.resolve({
+            status: 'ok',
+            data: { run: { afk_run_id: 'ov-1', status: 'completed', outcome_status: 'merged' } }
+          });
+        }
+      });
+    };
+    return window.openAfkRunDetail('ov-1');
+  }).then(function () {
     assert(afkDetailOverlayEl.classList.contains('visible'), 'overlay: visible after open');
     assert(afkDetailTitleEl.textContent.length > 0, 'overlay: title set');
     assert(afkDetailBodyEl.innerHTML.indexOf('afk-chain') !== -1, 'overlay: chain rendered');
@@ -5708,6 +5740,9 @@ console.log('\u25B6 AFK Outcomes — buildSessionTree: multi-level nesting (issu
   // Grandchild is nested under child in the flat list but the tree builder
   // attaches it to the child's node.
   assert(tree[0].children[0].external_session_id === 'ses_C1', 'multi-level: child is ses_C1');
+  assert(tree[0].children[0].children.length === 1, 'multi-level: child has one grandchild');
+  assert(tree[0].children[0].children[0].external_session_id === 'ses_GC1',
+    'multi-level: grandchild is ses_GC1');
 })();
 
 console.log('\u25B6 AFK Outcomes — renderNestedSessionNode: root vs nested (issue #575)');
