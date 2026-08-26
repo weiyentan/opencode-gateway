@@ -60,3 +60,32 @@ global `ApiKeyMiddleware` boundary alone and accept the Admin API Key.
 **Secrets handling.** Only the SHA-256 `token_hash` is ever persisted
 in `collector_credentials`. Raw bearer tokens are never persisted,
 returned by any endpoint, or written to logs.
+
+## Failure-summary redaction boundary and completed-outcome invariant (issue #564)
+
+The execution binding carries two bounded failure-metadata fields:
+`failure_reason` (a short label; over-length input is rejected) and
+`failure_summary` (truncated text; over-length input is redacted and
+then truncated to 1000 characters).
+
+**Redaction boundary.** Redaction is applied once, at the API schema
+layer (`ExecutionBindingCreateRequest` / `ExecutionBindingUpdateRequest`
+field validators), before the value reaches the domain model or the
+repository. The domain model stores the already-redacted value as-is —
+it does not re-redact. The schema is the sole redaction enforcement
+point; callers that bypass the API (e.g. direct repository access) are
+responsible for their own redaction.
+
+**Redaction then truncation.** Redaction runs first (bearer tokens,
+provider token prefixes, and `key=value` / `key: value` assignments
+whose key matches `app.core.secrets.is_secret_key`), and truncation
+happens afterwards as a Python character slice (`result[:1000]`) — never
+a UTF-8 byte slice, so multi-byte characters are never split
+mid-codepoint.
+
+**Completed-outcome invariant.** A `completed` execution carries no
+failure: a POST or PATCH body combining `outcome == completed` with a
+non-null `failure_reason` or `failure_summary` is rejected with `422`.
+The repository additionally enforces the invariant after merge on the
+PATCH path — a completed transition never ends with failure metadata
+carried over from the stored `running` row (conflict).

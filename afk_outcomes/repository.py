@@ -181,6 +181,7 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
         branch=row["branch"],
         title=row["title"],
         failure_reason=row["failure_reason"],
+        failure_summary=row.get("failure_summary"),
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         afk_run_id=row.get("afk_run_id"),
@@ -1785,10 +1786,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             INSERT INTO execution_bindings
                 (awx_job_id, job_template_id, external_session_id, provider,
                  repository_url, entity_type, entity_number, outcome,
-                 source_event_id, branch, title, failure_reason, started_at,
-                 finished_at, created_at, updated_at)
+                 source_event_id, branch, title, failure_reason, failure_summary,
+                 started_at, finished_at, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                    $14, now(), now())
+                    $14, $15, now(), now())
             ON CONFLICT (awx_job_id) DO NOTHING
             RETURNING id
             """,
@@ -1804,6 +1805,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             binding.branch,
             binding.title,
             binding.failure_reason,
+            binding.failure_summary,
             binding.started_at,
             binding.finished_at,
         )
@@ -1825,6 +1827,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         branch: str | None = None,
         title: str | None = None,
         failure_reason: str | None = None,
+        failure_summary: str | None = None,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         trigger_type: str | None = None,
@@ -1913,8 +1916,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             existing = await self._conn.fetchrow(
                 """
                 SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
-                       failure_reason, source_event_id, external_session_id,
-                       trigger_type
+                       failure_reason, failure_summary, source_event_id,
+                       external_session_id, trigger_type
                 FROM execution_bindings
                 WHERE awx_job_id = $1
                 """,
@@ -1929,6 +1932,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "title": existing["title"],
                     "branch": existing["branch"],
                     "failure_reason": existing["failure_reason"],
+                    "failure_summary": existing.get("failure_summary"),
                     "source_event_id": existing["source_event_id"],
                     "external_session_id": existing["external_session_id"],
                     "trigger_type": existing.get("trigger_type"),
@@ -1938,6 +1942,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "title": title,
                     "branch": branch,
                     "failure_reason": failure_reason,
+                    "failure_summary": failure_summary,
                     "source_event_id": source_event_id,
                     "external_session_id": external_session_id,
                     "trigger_type": trigger_type,
@@ -2139,10 +2144,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 INSERT INTO execution_bindings
                     (awx_job_id, job_template_id, external_session_id, provider,
                      repository_url, entity_type, entity_number, outcome,
-                     source_event_id, branch, title, failure_reason, started_at,
-                     finished_at, afk_run_id, trigger_type, created_at, updated_at)
+                     source_event_id, branch, title, failure_reason,
+                     failure_summary, started_at, finished_at, afk_run_id,
+                     trigger_type, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, now(), now())
+                        $13, $14, $15, $16, $17, now(), now())
                 ON CONFLICT (awx_job_id) DO NOTHING
                 RETURNING id
                 """,
@@ -2160,6 +2166,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 branch,
                 title,
                 failure_reason,
+                failure_summary,
                 started_at,
                 finished_at,
                 run_id,
@@ -2196,6 +2203,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         outcome: ExecutionOutcome,
         finished_at: datetime | None = None,
         failure_reason: str | None = None,
+        failure_summary: str | None = None,
         external_session_id: str | None = None,
         provider: Provider | None = None,
         repository: str | None = None,
@@ -2215,10 +2223,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         updater re-reads after the first commits and resolves to an
         idempotent replay or a conflict.
 
-        **Non-erasing fill-ins** — ``external_session_id`` and the resource
-        identity are optional: an omitted (``None``) field never erases a
-        stored value, a supplied field fills a stored NULL, and a supplied
-        field that contradicts a stored non-NULL value is a conflict.
+        **Non-erasing fill-ins** — ``external_session_id``, the resource
+        identity, and ``failure_summary`` are optional: an omitted
+        (``None``) field never erases a stored value, a supplied field fills
+        a stored NULL, and a supplied field that contradicts a stored
+        non-NULL value is a conflict.  ``failure_reason`` keeps the plain
+        overwrite semantics of the original terminal callback.
 
         **Lifecycle authority (issue #600 review)** — when the owning
         ``afk_run_id`` is present and the terminal merged state carries a
@@ -2247,7 +2257,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         async with self._conn.transaction():
             row = await self._conn.fetchrow(
                 """
-                SELECT id, outcome, finished_at, failure_reason,
+                SELECT id, outcome, finished_at, failure_reason, failure_summary,
                        external_session_id, provider, repository_url,
                        entity_type, entity_number, afk_run_id
                 FROM execution_bindings
@@ -2282,6 +2292,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 and row["external_session_id"] is not None
                 and row["external_session_id"] != external_session_id
             )
+            failure_summary_conflict = (
+                failure_summary is not None
+                and row.get("failure_summary") is not None
+                and row.get("failure_summary") != failure_summary
+            )
             resource_conflict = (
                 requested_has_resource
                 and stored_has_resource
@@ -2300,6 +2315,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     and row["failure_reason"] == failure_reason
                     and not session_conflict
                     and not resource_conflict
+                    and not failure_summary_conflict
                 )
                 if identical:
                     return UpdateExecutionBindingResult(binding_id=row["id"])
@@ -2308,7 +2324,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 )
 
             # running (or legacy NULL outcome) → terminal transition.
-            if session_conflict or resource_conflict:
+            if session_conflict or resource_conflict or failure_summary_conflict:
                 return UpdateExecutionBindingResult(
                     binding_id=row["id"], is_conflict=True
                 )
@@ -2317,6 +2333,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 row["external_session_id"]
                 if external_session_id is None
                 else external_session_id
+            )
+            new_failure_summary = (
+                row.get("failure_summary")
+                if failure_summary is None
+                else failure_summary
             )
             if requested_has_resource:
                 new_provider = provider.value
@@ -2342,6 +2363,18 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     and new_entity_number is not None
                 )
                 if not has_resource or new_session is None:
+                    return UpdateExecutionBindingResult(
+                        binding_id=row["id"], is_conflict=True
+                    )
+                # A completed execution also carries no failure metadata
+                # (issue #564).  ``failure_summary`` is a non-erasing fill-in,
+                # so a stored value from phase one survives an omitted body —
+                # the completed invariant is enforced here after merge: the
+                # transition never ends with failure metadata on a completed
+                # row.  (``failure_reason`` needs no check: it keeps plain
+                # overwrite semantics and the API schema rejects a non-null
+                # ``failure_reason`` on a completed update.)
+                if new_failure_summary is not None:
                     return UpdateExecutionBindingResult(
                         binding_id=row["id"], is_conflict=True
                     )
@@ -2394,6 +2427,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     repository_url = $7,
                     entity_type = $8,
                     entity_number = $9,
+                    failure_summary = $10,
                     updated_at = now()
                 WHERE awx_job_id = $1
                 """,
@@ -2406,6 +2440,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_repository,
                 new_entity_type,
                 new_entity_number,
+                new_failure_summary,
             )
             return UpdateExecutionBindingResult(
                 binding_id=row["id"], is_updated=True
@@ -2424,8 +2459,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             """
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
-                   source_event_id, branch, title, failure_reason, started_at,
-                   finished_at, afk_run_id, trigger_type
+                   source_event_id, branch, title, failure_reason, failure_summary,
+                   started_at, finished_at, afk_run_id, trigger_type
             FROM execution_bindings
             WHERE awx_job_id = $1
             """,
@@ -2454,8 +2489,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             """
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
-                   source_event_id, branch, title, failure_reason, started_at,
-                   finished_at, afk_run_id, trigger_type
+                   source_event_id, branch, title, failure_reason, failure_summary,
+                   started_at, finished_at, afk_run_id, trigger_type
             FROM execution_bindings
             WHERE provider = $1
               AND repository_url = $2

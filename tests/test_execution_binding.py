@@ -172,3 +172,28 @@ class TestExecutionBinding:
                 outcome=ExecutionOutcome.FAILED,
                 failure_reason="x" * 1001,
             )
+
+    def test_failure_summary_defaults_to_none(self) -> None:
+        binding = self._make_binding()
+        assert binding.failure_summary is None
+
+    def test_failure_summary_accepted(self) -> None:
+        binding = self._make_binding(
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Process crashed",
+        )
+        assert binding.failure_summary == "Process crashed"
+
+    def test_failure_summary_bounded(self) -> None:
+        binding = self._make_binding(
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="x" * 1000,
+        )
+        assert len(binding.failure_summary) == 1000
+
+    def test_failure_summary_exceeds_max_rejected(self) -> None:
+        with pytest.raises(ValueError, match="failure_summary"):
+            self._make_binding(
+                outcome=ExecutionOutcome.FAILED,
+                failure_summary="x" * 1001,
+            )

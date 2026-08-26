@@ -72,6 +72,7 @@ def _mk_binding_row(
     branch: str | None = None,
     title: str | None = None,
     failure_reason: str | None = None,
+    failure_summary: str | None = None,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
 ):
@@ -94,6 +95,7 @@ def _mk_binding_row(
             "branch": branch,
             "title": title,
             "failure_reason": failure_reason,
+            "failure_summary": failure_summary,
             "started_at": started_at,
             "finished_at": finished_at,
         }
@@ -455,6 +457,255 @@ class TestCreateExecutionBinding:
         assert resp.status_code == 400
         data = resp.json()
         assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_completed_with_failure_reason_rejected_422(self) -> None:
+        """POST completed + failure_reason is rejected with 422 (issue #564)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+            "trigger_type": "manual",
+            "failure_reason": "boom",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_completed_with_failure_summary_rejected_422(self) -> None:
+        """POST completed + failure_summary is rejected with 422 (issue #564)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+            "trigger_type": "manual",
+            "failure_summary": "boom",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_failed_with_failure_summary_persisted(self) -> None:
+        """POST failed + failure_summary is accepted and returned on read."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="Process crashed",
+        )
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, None, saved_row]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_summary": "Process crashed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        binding = resp.json()["data"]
+        assert binding["outcome"] == "failed"
+        assert binding["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
+    async def test_failed_with_secret_failure_summary_redacted(self) -> None:
+        """Secret-like values in failure_summary are redacted before persistence."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="GITHUB_TOKEN=***",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, None, saved_row]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_summary": "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        binding = resp.json()["data"]
+        assert (
+            "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+            not in binding["failure_summary"]
+        )
+        assert "***" in binding["failure_summary"]
+
+    @pytest.mark.asyncio
+    async def test_failed_with_overlong_failure_summary_truncated(self) -> None:
+        """failure_summary longer than 1000 chars is truncated, not rejected."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="🔥" * 1000,
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, None, saved_row]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_summary": "🔥" * 1200,
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        binding = resp.json()["data"]
+        assert binding["failure_summary"] == "🔥" * 1000
+
+    @pytest.mark.asyncio
+    async def test_idempotent_replay_with_same_failure_summary_returns_200(
+        self,
+    ) -> None:
+        """Identical replay with the same failure_summary returns 200."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        existing_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            trigger_type="manual",
+            failure_reason="timeout",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row, existing_row]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_reason": "timeout",
+            "failure_summary": "Process crashed",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 200
+        binding = resp.json()["data"]
+        assert binding["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
+    async def test_conflicting_failure_summary_returns_409(self) -> None:
+        """A replay with a different failure_summary is a 409 conflict."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        existing_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            trigger_type="manual",
+            failure_summary="Original summary",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row, existing_row]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_summary": "Different summary",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
 
     @pytest.mark.asyncio
     async def test_invalid_outcome_rejected(self) -> None:
@@ -886,6 +1137,40 @@ class TestGetExecutionBinding:
         assert data["data"]["afk_run_id"] is None
         assert data["data"]["trigger_type"] is None
 
+    @pytest.mark.asyncio
+    async def test_get_binding_returns_failure_summary(self) -> None:
+        """A binding with a failure_summary reads it back (issue #564)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(return_value=row)
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["data"]["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
+    async def test_get_binding_legacy_row_failure_summary_null(self) -> None:
+        """A legacy row without a failure_summary reads back None."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        row = _mk_binding_row(awx_job_id=42, failure_summary=None)
+        conn.fetchrow = AsyncMock(return_value=row)
+        client = create_client(conn)
+
+        resp = await client.get("/api/v1/afk/executions/42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["data"]["failure_summary"] is None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GET /api/v1/afk/executions — resource history (filtered)
@@ -982,6 +1267,42 @@ class TestListExecutionBindings:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["data"]["bindings"] == []
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_returns_failure_summary(self) -> None:
+        """History entries surface failure_summary for failed attempts (issue #564)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        rows = [
+            _mk_binding_row(
+                binding_id="00000000-0000-0000-0000-000000000002",
+                awx_job_id=102,
+                outcome="failed",
+                failure_reason="timeout",
+                failure_summary="Process crashed",
+            ),
+            _mk_binding_row(awx_job_id=103, outcome="completed"),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+        client = create_client(conn)
+
+        resp = await client.get(
+            "/api/v1/afk/executions",
+            params={
+                "provider": "github",
+                "repository_url": "https://github.com/acme/proj",
+                "entity_type": "change_request",
+                "entity_number": "99",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        history = data["data"]
+        assert len(history["bindings"]) == 2
+        assert history["bindings"][0]["failure_summary"] == "Process crashed"
+        assert history["bindings"][1]["failure_summary"] is None
 
     @pytest.mark.asyncio
     async def test_invalid_provider_returns_400(self) -> None:
@@ -1171,6 +1492,7 @@ def _update_row(**overrides) -> MagicMock:
         "outcome": "running",
         "finished_at": None,
         "failure_reason": None,
+        "failure_summary": None,
         "external_session_id": None,
         "provider": None,
         "repository_url": None,
@@ -1356,6 +1678,135 @@ class TestTwoPhaseLifecycle:
         resp = await client.patch(
             "/api/v1/afk/executions/42",
             json={"outcome": "failed", "failure_reason": "boom"},
+        )
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_patch_transitions_running_to_failed_with_failure_summary(
+        self,
+    ) -> None:
+        """PATCH failed carries failure_summary through to the read response."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        running_row = _update_row(outcome="running")
+        updated_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_reason="timeout",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), running_row, updated_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "failed",
+                "failure_reason": "timeout",
+                "failure_summary": "Bearer abc123def456 in stdout",
+            },
+        )
+        assert resp.status_code == 200
+        binding = resp.json()["data"]
+        assert binding["outcome"] == "failed"
+        assert binding["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
+    async def test_patch_failed_with_secret_failure_summary_redacted(self) -> None:
+        """The PATCH path redacts secret-like failure summaries (issue #564)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        running_row = _update_row(outcome="running")
+        updated_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="GITHUB_TOKEN=***",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), running_row, updated_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "failed",
+                "failure_summary": "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+            },
+        )
+        assert resp.status_code == 200
+        binding = resp.json()["data"]
+        assert "***" in binding["failure_summary"]
+
+    @pytest.mark.asyncio
+    async def test_patch_completed_with_failure_summary_rejected_422(self) -> None:
+        """A completed update carrying failure_summary is rejected with 422."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={"outcome": "completed", "failure_summary": "boom"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_patch_identical_failed_replay_with_failure_summary_200(
+        self,
+    ) -> None:
+        """An identical failed replay with matching failure_summary is 200."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        terminal_row = _update_row(
+            outcome="failed", failure_summary="Process crashed"
+        )
+        read_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), terminal_row, read_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={"outcome": "failed", "failure_summary": "Process crashed"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
+    async def test_patch_conflicting_failure_summary_409(self) -> None:
+        """A failed replay with a different failure_summary is a 409 conflict."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        terminal_row = _update_row(
+            outcome="failed", failure_summary="Original summary"
+        )
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), terminal_row])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={"outcome": "failed", "failure_summary": "Different summary"},
         )
         assert resp.status_code == 409
         data = resp.json()

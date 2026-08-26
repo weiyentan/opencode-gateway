@@ -112,6 +112,18 @@ afk_run_id: run-001
 
 The provider resource identity is not unique because multiple AWX jobs may execute against the same PR/MR.
 
+`failure_reason` (short label) and `failure_summary` (truncated text) are
+bounded, redacted failure metadata. Redaction is applied once at the API
+schema layer before persistence (the schema is the sole redaction
+enforcement point — direct repository callers are responsible for their
+own redaction), and `failure_summary` truncation is a Python character
+slice (`[:1000]`) applied after redaction. A `completed` execution
+carries no failure metadata: non-null `failure_reason` or
+`failure_summary` alongside `outcome == completed` is rejected with
+`422` on both POST and PATCH, and the repository's after-merge check
+rejects a completed PATCH transition whose merged state still carries a
+stored `failure_summary`.
+
 ### OpenCode sessions
 
 `afk_run_sessions` records the sessions belonging to a lifecycle:
