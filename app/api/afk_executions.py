@@ -311,7 +311,10 @@ async def create_execution_binding(
     bindings (a failed attempt and a later retry with a new ``awx_job_id``)
     can reference one ``afk_run_id``.  A supplied ``afk_run_id`` that
     references no provisioned lifecycle is rejected with ``404``; omitting
-    it preserves the legacy behavior of provisioning a run with the binding.
+    it auto-provisions a run with the binding — and when the canonical PR/MR
+    already owns a lifecycle, that existing lifecycle is reused and the new
+    binding attaches to it with ``201`` (PR #600 blocker, no second
+    lifecycle).
     """
     resource = body.resource
     # Normalize repository URL at the API boundary before any persistence
@@ -336,8 +339,10 @@ async def create_execution_binding(
 
         # Transactional creation — attaches to the pre-provisioned lifecycle
         # when afk_run_id is supplied, else inserts afk_runs +
-        # execution_bindings atomically.  Returns is_created (201),
-        # is_conflict (409), run_missing (404), or idempotent replay (200).
+        # execution_bindings atomically (reusing the existing canonical
+        # lifecycle when one already owns the PR/MR — PR #600 blocker).
+        # Returns is_created/is_reused (201), is_conflict (409),
+        # run_missing (404), or idempotent replay (200).
         async with timed_operation("db.insert.execution_binding", "db"):
             async with _db_timeout(
                 "db.insert.execution_binding", settings.database_timeout_seconds
@@ -369,8 +374,11 @@ async def create_execution_binding(
                 detail=f"AFK run not found: {body.afk_run_id}",
             )
 
-        if result.is_created:
-            # New binding was inserted.
+        if result.is_created or result.is_reused:
+            # New binding was inserted — either attached to a fresh
+            # auto-provisioned lifecycle (is_created) or to an existing
+            # lifecycle the canonical PR/MR already owned (is_reused,
+            # PR #600 blocker).  Both surface as 201.
             saved = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
             if saved is None:
                 # Should not happen — save succeeded — but handle gracefully.

@@ -1059,6 +1059,175 @@ async def test_auto_created_run_persists_change_request_columns(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """PR #600 blocker: a POST without afk_run_id for a canonical PR whose
+    lifecycle already exists reuses that lifecycle (201, same afk_run_id)
+    instead of returning 409 — no second afk_runs row."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    resource_number = f"cr-{uuid.uuid4().hex[:12]}"
+    job_1 = int(uuid.uuid4().int >> 96)
+    job_2 = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        resp1 = await c.post(
+            "/api/v1/afk/executions",
+            json=_make_binding_payload(
+                awx_job_id=job_1, resource_number=resource_number
+            ),
+        )
+        assert resp1.status_code == 201, resp1.text
+        run_id = resp1.json()["data"]["afk_run_id"]
+        assert run_id is not None
+
+        # Second POST, different AWX job, same canonical PR, no afk_run_id.
+        resp2 = await c.post(
+            "/api/v1/afk/executions",
+            json=_make_binding_payload(
+                awx_job_id=job_2,
+                resource_number=resource_number,
+                outcome="completed",
+            ),
+        )
+        assert resp2.status_code == 201, resp2.text
+        assert resp2.json()["data"]["afk_run_id"] == run_id
+
+    # Exactly one lifecycle owns the canonical PR; both bindings attach to it.
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT afk_run_id FROM afk_runs"
+            " WHERE change_request_provider = 'github'"
+            "   AND change_request_repository = 'github.com/acme/proj'"
+            "   AND change_request_external_id = $1",
+            resource_number,
+        )
+        assert len(rows) == 1, f"expected one lifecycle, got {len(rows)}"
+        assert rows[0]["afk_run_id"] == run_id
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert count == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """PR #600 blocker (GitLab MR analogue): a second POST without afk_run_id
+    for the same canonical MR reuses the existing lifecycle."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    resource_number = f"mr-{uuid.uuid4().hex[:12]}"
+    job_1 = int(uuid.uuid4().int >> 96)
+    job_2 = int(uuid.uuid4().int >> 96)
+    repository = "https://gitlab.com/cloudnative-pg/cloudnative-pg"
+
+    async with client as c:
+        resp1 = await c.post(
+            "/api/v1/afk/executions",
+            json=_make_binding_payload(
+                awx_job_id=job_1,
+                provider="gitlab",
+                repository=repository,
+                resource_type="merge_request",
+                resource_number=resource_number,
+            ),
+        )
+        assert resp1.status_code == 201, resp1.text
+        run_id = resp1.json()["data"]["afk_run_id"]
+
+        resp2 = await c.post(
+            "/api/v1/afk/executions",
+            json=_make_binding_payload(
+                awx_job_id=job_2,
+                provider="gitlab",
+                repository=repository,
+                resource_type="merge_request",
+                resource_number=resource_number,
+            ),
+        )
+        assert resp2.status_code == 201, resp2.text
+        assert resp2.json()["data"]["afk_run_id"] == run_id
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT afk_run_id FROM afk_runs"
+            " WHERE change_request_provider = 'gitlab'"
+            "   AND change_request_repository = 'gitlab.com/cloudnative-pg/cloudnative-pg'"
+            "   AND change_request_external_id = $1",
+            resource_number,
+        )
+        assert len(rows) == 1
+        assert rows[0]["afk_run_id"] == run_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_auto_provision_same_pr_one_winner(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """PR #600 blocker: two concurrent first discoveries for the same PR both
+    succeed (201/201) with one shared afk_run_id — the unique-constraint
+    loser adopts the winner's lifecycle; exactly one afk_runs row."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+
+    client = _build_app(db_pool)
+    resource_number = f"cr-{uuid.uuid4().hex[:12]}"
+    job_a = int(uuid.uuid4().int >> 96)
+    job_b = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        results = await asyncio.gather(
+            c.post(
+                "/api/v1/afk/executions",
+                json=_make_binding_payload(
+                    awx_job_id=job_a, resource_number=resource_number
+                ),
+            ),
+            c.post(
+                "/api/v1/afk/executions",
+                json=_make_binding_payload(
+                    awx_job_id=job_b, resource_number=resource_number
+                ),
+            ),
+        )
+        status_codes = sorted(r.status_code for r in results)
+        assert status_codes == [201, 201], (
+            f"Expected [201, 201], got {status_codes}: "
+            + "; ".join(r.text for r in results)
+        )
+        run_ids = {r.json()["data"]["afk_run_id"] for r in results}
+        assert len(run_ids) == 1, f"expected one shared lifecycle, got {run_ids}"
+        run_id = run_ids.pop()
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT afk_run_id FROM afk_runs"
+            " WHERE change_request_provider = 'github'"
+            "   AND change_request_repository = 'github.com/acme/proj'"
+            "   AND change_request_external_id = $1",
+            resource_number,
+        )
+        assert len(rows) == 1, f"expected one lifecycle, got {len(rows)}"
+        assert rows[0]["afk_run_id"] == run_id
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
+            run_id,
+        )
+        assert count == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_post_accepts_resource_provider_differing_from_run_provider(
     db_pool: asyncpg.Pool,
 ) -> None:

@@ -1569,14 +1569,17 @@ class TestCreateOrReplayProviderCompatibility:
 
 
 class TestCreateOrReplayAutoProvisionedChangeRequest:
-    """Auto-created lifecycle change-request binding (issue #600 review,
-    finding #5).
+    """Auto-provisioned lifecycle change-request binding (issue #600 review,
+    finding #5; PR #600 blocker).
 
     When no ``afk_run_id`` is supplied and the execution carries a complete
     change-request identity, the freshly-created ``afk_runs`` row persists
-    the change-request columns in the same transaction.  The 1:1 invariant
-    is enforced with a pre-check plus a savepoint-wrapped INSERT that turns
-    a concurrent ``UniqueViolationError`` into ``is_conflict`` — never a 500.
+    the change-request columns in the same transaction.  When the canonical
+    change request already owns a lifecycle, the pre-check *reuses* that
+    owner (``is_reused=True``, validated through
+    ``_apply_change_request_binding``) instead of returning a conflict, and
+    a savepoint-wrapped INSERT turns a concurrent first-discovery race into
+    winner adoption — never a second lifecycle, never a 500.
     """
 
     def test_auto_created_run_persists_change_request_columns(
@@ -1610,18 +1613,26 @@ class TestCreateOrReplayAutoProvisionedChangeRequest:
         assert args[6] == "org/repo"
         assert args[7] == "42"
 
-    def test_auto_created_run_prechecks_owned_change_request(
+    def test_auto_provision_precheck_hit_reuses_existing_lifecycle(
         self, mock_conn: AsyncMock
     ) -> None:
-        """A change request already owned by another lifecycle is a conflict
-        without inserting the run or the binding (1:1 invariant)."""
+        """A change request already owned by a lifecycle is *reused* — the
+        binding attaches to the owner's afk_run_id (is_reused=True) and no
+        second afk_runs row is inserted (PR #600 blocker)."""
         mock_conn.fetchrow = AsyncMock(
             side_effect=[
                 None,  # no existing binding
-                mock_row({"afk_run_id": "01SOMEONELSE0000000000000001"}),  # owned
+                mock_row(
+                    {
+                        "afk_run_id": "01SOMEONELSE0000000000000001",
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "42",
+                    }
+                ),  # pre-check: the canonical CR owns this lifecycle
             ]
         )
-        mock_conn.fetch = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         mock_conn.execute = AsyncMock()
 
         repo = AsyncpgOutcomeRepository(mock_conn)
@@ -1631,18 +1642,36 @@ class TestCreateOrReplayAutoProvisionedChangeRequest:
 
         result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
 
-        assert result.is_conflict is True
+        assert result.is_reused is True
         assert result.is_created is False
+        assert result.is_conflict is False
+        assert result.afk_run_id == "01SOMEONELSE0000000000000001"
         assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
-        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        inserts = _calls_matching(mock_conn, r"INSERT INTO execution_bindings")
+        assert len(inserts) == 1
+        assert "01SOMEONELSE0000000000000001" in inserts[0][1]
 
-    def test_auto_created_run_unique_violation_is_conflict(
+    def test_auto_provision_unique_violation_loser_adopts_winner(
         self, mock_conn: AsyncMock
     ) -> None:
-        """A concurrent owner that slips past the pre-check surfaces as a clean
-        conflict — the UniqueViolationError never escapes as a 500."""
-        mock_conn.fetchrow = AsyncMock(return_value=None)
-        mock_conn.fetch = AsyncMock()
+        """A concurrent first discovery that slips past the pre-check is not a
+        conflict — the UniqueViolationError loser re-reads the winner
+        lifecycle and attaches its execution to it (PR #600 blocker)."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                None,  # pre-check: no owner yet
+                mock_row(
+                    {
+                        "afk_run_id": "01WINNER0000000000000000001",
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "42",
+                    }
+                ),  # loser re-read: the winner's lifecycle
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         mock_conn.execute = AsyncMock(
             side_effect=asyncpg.UniqueViolationError("duplicate key")
         )
@@ -1654,9 +1683,36 @@ class TestCreateOrReplayAutoProvisionedChangeRequest:
 
         result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
 
-        assert result.is_conflict is True
+        assert result.is_reused is True
         assert result.is_created is False
-        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        assert result.is_conflict is False
+        assert result.afk_run_id == "01WINNER0000000000000000001"
+        inserts = _calls_matching(mock_conn, r"INSERT INTO execution_bindings")
+        assert len(inserts) == 1
+        assert "01WINNER0000000000000000001" in inserts[0][1]
+        # The savepoint pattern is preserved — the afk_runs INSERT ran inside
+        # a savepoint transaction (rolled back on the violation).
+        mock_conn.transaction.assert_called()
+
+    def test_auto_provision_first_discovery_is_created_not_reused(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A first discovery with no pre-check hit and no violation is a
+        normal creation — is_created=True, is_reused=False."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock()
+
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_reused is False
+        assert result.is_conflict is False
 
     def test_auto_created_run_without_resource_writes_no_change_request(
         self, mock_conn: AsyncMock

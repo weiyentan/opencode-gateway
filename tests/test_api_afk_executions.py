@@ -627,6 +627,57 @@ class TestCreateExecutionBinding:
         assert binding["source_event_id"] == "evt_001"
 
     @pytest.mark.asyncio
+    async def test_auto_provision_reuse_returns_201_with_owner_run_id(self) -> None:
+        """PR #600 blocker: a POST without afk_run_id whose canonical PR already
+        owns a lifecycle reuses it — 201 with the owner's afk_run_id, not a 409."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            afk_run_id="01OWNER000000000000000000001",
+        )
+        # Call sequence: auth → create_or_replay (no existing binding →
+        # owner pre-check hit) → re-read after create.
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row(
+                    {
+                        "afk_run_id": "01OWNER000000000000000000001",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+            "trigger_type": "manual",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["afk_run_id"] == "01OWNER000000000000000000001"
+
+    @pytest.mark.asyncio
     async def test_idempotent_replay_returns_same_afk_run_id(self) -> None:
         """200 OK idempotent replay returns the same afk_run_id and binding_id."""
         from tests.conftest import create_client
