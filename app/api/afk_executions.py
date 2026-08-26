@@ -204,6 +204,7 @@ def _binding_conflicts_with(
         or existing.branch != body.branch
         or existing.title != body.title
         or existing.failure_reason != body.failure_reason
+        or existing.failure_summary != body.failure_summary
         or existing.started_at != body.started_at
         or existing.finished_at != body.finished_at
         or existing.trigger_type != body.trigger_type.value
@@ -264,6 +265,7 @@ def _binding_to_read_response(binding: ExecutionBinding) -> ExecutionBindingRead
         started_at=binding.started_at,
         finished_at=binding.finished_at,
         failure_reason=binding.failure_reason,
+        failure_summary=binding.failure_summary,
     )
 
 
@@ -368,6 +370,7 @@ async def create_execution_binding(
                     branch=body.branch,
                     title=body.title,
                     failure_reason=body.failure_reason,
+                    failure_summary=body.failure_summary,
                     started_at=body.started_at,
                     finished_at=body.finished_at,
                     trigger_type=trigger_type_value,
@@ -403,10 +406,10 @@ async def create_execution_binding(
             )
 
         # Idempotent replay — the repository compared a subset of fields
-        # (outcome, title, branch, failure_reason, source_event_id,
-        # external_session_id).  Additional fields (resource identity,
-        # trigger_type, job_template_id) may still differ; check with the
-        # full comparison helper to catch those as 409 conflicts.
+        # (outcome, title, branch, failure_reason, failure_summary,
+        # source_event_id, external_session_id).  Additional fields (resource
+        # identity, trigger_type, job_template_id) may still differ; check
+        # with the full comparison helper to catch those as 409 conflicts.
         existing = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
         if existing is None:
             # Should not happen — the operation returned a result, so a row
@@ -495,6 +498,7 @@ async def update_execution_binding(
                     outcome=body.outcome,
                     finished_at=body.finished_at,
                     failure_reason=body.failure_reason,
+                    failure_summary=body.failure_summary,
                     external_session_id=body.external_session_id,
                     provider=resource.provider if resource is not None else None,
                     repository=normalized_repo,

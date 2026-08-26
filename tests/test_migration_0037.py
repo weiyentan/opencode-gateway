@@ -229,6 +229,24 @@ def test_job_template_id_is_not_nullable() -> None:
     assert col.nullable is False
 
 
+def test_failure_summary_is_nullable_string() -> None:
+    """failure_summary is a nullable String column (issue #564): legacy rows
+    predating the column read back as None and the column carries no
+    NOT NULL constraint."""
+    from app.db.models import ExecutionBinding
+
+    col = ExecutionBinding.__table__.c.failure_summary
+    assert col.nullable is True
+    assert str(col.type).upper() == "VARCHAR"
+    # No dedicated constraint on the column beyond plain String typing.
+    for constraint in ExecutionBinding.__table__.constraints:
+        constraint_cols = {c.name for c in constraint.columns}
+        assert "failure_summary" not in constraint_cols, (
+            f"Constraint {constraint.name} covers failure_summary — the "
+            "column must remain plain nullable String with no extra constraints"
+        )
+
+
 def test_provider_resource_identity_is_not_unique() -> None:
     """The provider resource identity columns must NOT be part of any
     UniqueConstraint — multiple executions per resource are allowed."""

@@ -771,6 +771,16 @@ class ExecutionBinding(BaseModel):
             "dumps, and arbitrary AWX payloads must never be stored here."
         ),
     )
+    failure_summary: str | None = Field(
+        default=None,
+        max_length=_EXECUTION_BINDING_MAX_FAILURE_REASON_LENGTH,
+        description=(
+            "Bounded, redacted failure summary text (max 1000 chars).  "
+            "Recognizable bearer tokens and common token/key/password/secret "
+            "assignments are redacted before persistence; raw secrets, stdout "
+            "dumps, and arbitrary AWX payloads must never be stored here."
+        ),
+    )
     title: str | None = Field(default=None, description="Execution title")
     branch: str | None = Field(default=None, description="Branch or ref")
     started_at: datetime | None = Field(

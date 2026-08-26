@@ -37,6 +37,13 @@ from app.core.secrets import REDACTED, is_secret_key
 # payloads must never be carried here.
 MAX_FAILURE_REASON_LENGTH = 1000
 
+# Maximum length for the ``failure_summary`` free-text field.  Unlike the
+# short ``failure_reason`` label (which rejects over-length input),
+# ``failure_summary`` is truncated text (migration 0037): a longer input is
+# redacted first, then truncated to this bound by Python character count
+# rather than rejected (issue #564).
+MAX_FAILURE_SUMMARY_LENGTH = 1000
+
 # Provider-native resource-type vocabulary accepted on the write path.
 # GitHub ``pull_request`` and GitLab ``merge_request`` both normalize to the
 # canonical ``change_request`` identity (the mapping-bridge rule of ADR 0020);
@@ -89,6 +96,26 @@ def redact_failure_summary(value: str) -> str:
     value = _SECRET_ASSIGNMENT_RE.sub(_redact_secret_assignment, value)
     value = _TOKEN_PREFIX_RE.sub(r"\1***", value)
     return value
+
+
+def redact_and_bound_failure_summary(value: str) -> str:
+    """Redact a failure summary, then truncate it to ``MAX_FAILURE_SUMMARY_LENGTH``.
+
+    ``failure_summary`` (issue #564) is truncated text: redaction runs
+    first so a secret straddling the truncation boundary is replaced as a
+    whole and never survives as a truncated token, then the result is cut
+    with a Python character slice (``result[:1000]``) — never a UTF-8 byte
+    slice, which would split multi-byte characters mid-codepoint.
+
+    Redaction boundary: redaction is applied at the API schema layer
+    (``ExecutionBindingCreateRequest`` / ``ExecutionBindingUpdateRequest``)
+    before the value reaches the domain model or repository.  The domain
+    model stores the already-redacted value as-is — it does not re-redact.
+    This is an intentional API-only invariant: the schema is the sole
+    redaction enforcement point, and callers that bypass the API (e.g.
+    direct repository access) are responsible for their own redaction.
+    """
+    return redact_failure_summary(value)[:MAX_FAILURE_SUMMARY_LENGTH]
 
 
 class ExecutionBindingResourceIn(BaseModel):
@@ -174,8 +201,9 @@ class ExecutionBindingCreateRequest(BaseModel):
     Carries the AWX job identity, the OpenCode external session id, the
     provider resource identity (normalized to the canonical
     ``change_request``), the lifecycle outcome, and optional traceability
-    metadata (EDA source event id, branch, title, timestamps, and a
-    bounded failure summary).  Raw tokens, stdout, prompts, arbitrary AWX
+    metadata (EDA source event id, branch, title, timestamps, a bounded
+    ``failure_reason`` label, and a bounded, redacted, truncated
+    ``failure_summary``).  Raw tokens, stdout, prompts, arbitrary AWX
     payloads, and unbounded ``extra_vars`` are not part of the schema and
     are rejected as unknown fields.
 
@@ -303,11 +331,20 @@ class ExecutionBindingCreateRequest(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_failure_reason_not_on_completed(self) -> ExecutionBindingCreateRequest:
-        """Failure metadata is only valid on non-completed outcomes."""
-        if self.outcome is ExecutionOutcome.COMPLETED and self.failure_reason is not None:
+    def _reject_failure_metadata_on_completed(self) -> ExecutionBindingCreateRequest:
+        """Reject failure metadata on ``completed`` outcomes (issue #564).
+
+        A completed execution carries no failure — non-null
+        ``failure_reason`` or ``failure_summary`` alongside
+        ``outcome == completed`` is a contradictory payload and is rejected
+        with a 422.
+        """
+        if self.outcome is ExecutionOutcome.COMPLETED and (
+            self.failure_reason is not None or self.failure_summary is not None
+        ):
             raise ValueError(
-                "failure_reason is only valid on non-completed outcomes"
+                "failure_reason and failure_summary must be null when "
+                "outcome is 'completed'"
             )
         return self
 
@@ -327,6 +364,17 @@ class ExecutionBindingCreateRequest(BaseModel):
             "dumps, and arbitrary AWX payloads must never be carried here."
         ),
     )
+    failure_summary: str | None = Field(
+        default=None,
+        description=(
+            "Bounded, redacted failure summary text (max 1000 chars, truncated). "
+            "Recognizable bearer tokens and common token/key/password/secret "
+            "assignments are redacted before persistence; over-length input is "
+            "truncated by Python character count rather than rejected.  Raw "
+            "secrets, stdout dumps, and arbitrary AWX payloads must never be "
+            "carried here."
+        ),
+    )
 
     @field_validator("failure_reason", mode="after")
     @classmethod
@@ -336,6 +384,21 @@ class ExecutionBindingCreateRequest(BaseModel):
             return None
         return redact_failure_summary(v)
 
+    @field_validator("failure_summary", mode="after")
+    @classmethod
+    def _redact_and_bound_failure_summary(cls, v: str | None) -> str | None:
+        """Redact secret-like values and truncate ``failure_summary`` to 1000.
+
+        ``failure_summary`` is truncated text (migration 0037): a longer
+        input is redacted and then truncated to the bound rather than
+        rejected, unlike the short ``failure_reason`` label which rejects
+        over-length input.  Truncation is by Python character count, never
+        bytes, and always happens after redaction.
+        """
+        if v is None:
+            return None
+        return redact_and_bound_failure_summary(v)
+
 
 class ExecutionBindingUpdateRequest(BaseModel):
     """Terminal-update payload (``PATCH /api/v1/afk/executions/{awx_job_id}``,
@@ -344,11 +407,12 @@ class ExecutionBindingUpdateRequest(BaseModel):
     Transitions the same ``execution_bindings`` row provisioned at AWX start
     from ``running`` to one of the terminal outcomes.  ``outcome`` must be
     terminal (``running`` is rejected — a start can only be created once).
-    ``finished_at`` and the bounded, redacted ``failure_reason`` carry the
-    terminal facts; ``external_session_id`` and ``resource`` are optional
-    fill-ins for identities that only became known at completion (non-erasing:
-    an omitted field never erases a stored value, a supplied field that
-    contradicts a stored value is a 409 conflict).
+    ``finished_at`` and the bounded, redacted ``failure_reason`` /
+    ``failure_summary`` carry the terminal facts; ``external_session_id``
+    and ``resource`` are optional fill-ins for identities that only became
+    known at completion (non-erasing: an omitted field never erases a
+    stored value, a supplied field that contradicts a stored value is a
+    409 conflict).
 
     Failed or cancelled executions persist without a change request or a
     session — every field other than ``outcome`` is optional for those
@@ -392,6 +456,17 @@ class ExecutionBindingUpdateRequest(BaseModel):
             "dumps, and arbitrary AWX payloads must never be carried here."
         ),
     )
+    failure_summary: str | None = Field(
+        default=None,
+        description=(
+            "Bounded, redacted failure summary text (max 1000 chars, truncated). "
+            "Recognizable bearer tokens and common token/key/password/secret "
+            "assignments are redacted before persistence; over-length input is "
+            "truncated by Python character count rather than rejected.  Raw "
+            "secrets, stdout dumps, and arbitrary AWX payloads must never be "
+            "carried here."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_outcome_is_terminal(self) -> ExecutionBindingUpdateRequest:
@@ -403,11 +478,20 @@ class ExecutionBindingUpdateRequest(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_failure_reason_not_on_completed(self) -> ExecutionBindingUpdateRequest:
-        """Failure metadata is only valid on non-completed outcomes."""
-        if self.outcome is ExecutionOutcome.COMPLETED and self.failure_reason is not None:
+    def _reject_failure_metadata_on_completed(self) -> ExecutionBindingUpdateRequest:
+        """Failure metadata is only valid on non-completed outcomes.
+
+        A completed execution carries no failure — non-null
+        ``failure_reason`` or ``failure_summary`` alongside
+        ``outcome == completed`` is a contradictory payload and is rejected
+        with a 422 (issue #564).
+        """
+        if self.outcome is ExecutionOutcome.COMPLETED and (
+            self.failure_reason is not None or self.failure_summary is not None
+        ):
             raise ValueError(
-                "failure_reason is only valid on non-completed outcomes"
+                "failure_reason and failure_summary are only valid on "
+                "non-completed outcomes"
             )
         return self
 
@@ -433,6 +517,18 @@ class ExecutionBindingUpdateRequest(BaseModel):
         if v is None:
             return None
         return redact_failure_summary(v)
+
+    @field_validator("failure_summary", mode="after")
+    @classmethod
+    def _redact_and_bound_failure_summary(cls, v: str | None) -> str | None:
+        """Redact secret-like values and truncate ``failure_summary`` to 1000.
+
+        Mirrors the POST-path validator: redaction runs first, then a Python
+        character-count truncation to ``MAX_FAILURE_SUMMARY_LENGTH``.
+        """
+        if v is None:
+            return None
+        return redact_and_bound_failure_summary(v)
 
 
 class ExecutionBindingReadResponse(BaseModel):
@@ -491,8 +587,17 @@ class ExecutionBindingReadResponse(BaseModel):
     failure_reason: str | None = Field(
         default=None,
         max_length=MAX_FAILURE_REASON_LENGTH,
-        description="Bounded failure summary (max 1000 chars)",
+        description="Bounded failure reason (label) (max 1000 chars)",
     )
+    failure_summary: str | None = Field(
+        default=None,
+        max_length=MAX_FAILURE_SUMMARY_LENGTH,
+        description="Bounded, redacted failure summary text (max 1000 chars)",
+    )
+    # The read response carries the already-redacted value from the database
+    # as-is — redaction is applied once at the write-path API schema
+    # (ExecutionBindingCreateRequest / ExecutionBindingUpdateRequest),
+    # never re-applied here.
 
 
 class ExecutionBindingHistoryResponse(BaseModel):

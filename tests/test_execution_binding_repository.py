@@ -54,6 +54,7 @@ def _make_binding(
     external_session_id: str = "ses_abc123",
     outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED,
     title: str = "Fix caching bug",
+    failure_summary: str | None = None,
 ) -> ExecutionBinding:
     """Build a minimal ExecutionBinding for testing."""
     return ExecutionBinding(
@@ -63,6 +64,7 @@ def _make_binding(
         resource=RESOURCE,
         outcome=outcome,
         title=title,
+        failure_summary=failure_summary,
     )
 
 
@@ -125,6 +127,7 @@ def test_save_execution_binding_writes_all_identity_fields(mock_conn: AsyncMock)
         "branch",
         "title",
         "failure_reason",
+        "failure_summary",
         "started_at",
         "finished_at",
         "created_at",
@@ -141,6 +144,30 @@ def test_save_execution_binding_writes_all_identity_fields(mock_conn: AsyncMock)
     assert args[6] == "442"  # entity_number
     assert args[7] == "completed"  # outcome
     assert args[10] == "Fix caching bug"  # title
+    assert args[12] is None  # failure_summary (after failure_reason, before started_at)
+
+
+def test_save_execution_binding_writes_failure_summary(mock_conn: AsyncMock) -> None:
+    """The INSERT persists the failure_summary column (issue #564)."""
+    mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    binding = _make_binding(
+        awx_job_id="201",
+        outcome=ExecutionOutcome.FAILED,
+        failure_summary="Process crashed",
+    )
+
+    import asyncio
+
+    asyncio.run(repo.save_execution_binding(binding))
+
+    calls = _calls_matching(mock_conn, r"INSERT INTO execution_bindings")
+    assert len(calls) == 1
+    sql = calls[0][0]
+    assert "failure_summary" in sql
+    args = calls[0][1]
+    # failure_summary is the 13th positional parameter (1-indexed).
+    assert args[12] == "Process crashed"
 
 
 # ── Conflict rejection ───────────────────────────────────────────────────────
@@ -322,6 +349,95 @@ def test_get_execution_binding_select_includes_afk_run_id_and_trigger_type(
     assert "trigger_type" in sql
 
 
+def test_get_execution_binding_select_includes_failure_summary(
+    mock_conn: AsyncMock,
+) -> None:
+    """The SELECT includes the failure_summary column (issue #564)."""
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    asyncio.run(repo.get_execution_binding_by_awx_job_id("100"))
+
+    sql = mock_conn.fetchrow.call_args[0][0]
+    assert "failure_summary" in sql
+
+
+def test_get_execution_binding_reads_failure_summary(mock_conn: AsyncMock) -> None:
+    """The reconstructed binding carries the persisted failure_summary."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "awx_job_id": 501,
+                "job_template_id": 42,
+                "external_session_id": "ses_abc123",
+                "provider": "github",
+                "repository_url": "weiyentan/opencode-gateway",
+                "entity_type": "change_request",
+                "entity_number": "442",
+                "outcome": "failed",
+                "source_event_id": None,
+                "afk_run_id": None,
+                "trigger_type": None,
+                "branch": "main",
+                "title": "Fix caching bug",
+                "failure_reason": "timeout",
+                "failure_summary": "Process crashed",
+                "started_at": None,
+                "finished_at": None,
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    binding = asyncio.run(repo.get_execution_binding_by_awx_job_id("501"))
+    assert binding is not None
+    assert binding.failure_summary == "Process crashed"
+
+
+def test_get_execution_binding_legacy_row_failure_summary_defaults_none(
+    mock_conn: AsyncMock,
+) -> None:
+    """Legacy rows without the failure_summary column read back as None."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "awx_job_id": 502,
+                "job_template_id": 42,
+                "external_session_id": "ses_abc123",
+                "provider": "github",
+                "repository_url": "org/repo",
+                "entity_type": "change_request",
+                "entity_number": "42",
+                "outcome": "completed",
+                "source_event_id": None,
+                "afk_run_id": None,
+                "trigger_type": None,
+                "branch": None,
+                "title": None,
+                "failure_reason": None,
+                # No failure_summary key — legacy row predates the column.
+                "started_at": None,
+                "finished_at": None,
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+
+    import asyncio
+
+    binding = asyncio.run(repo.get_execution_binding_by_awx_job_id("502"))
+    assert binding is not None
+    assert binding.failure_summary is None
+
+
 def test_get_execution_binding_maps_afk_run_id_and_trigger_type(
     mock_conn: AsyncMock,
 ) -> None:
@@ -381,6 +497,7 @@ def test_list_execution_bindings_select_includes_afk_run_id_and_trigger_type(
     sql = mock_conn.fetch.call_args[0][0]
     assert "afk_run_id" in sql
     assert "trigger_type" in sql
+    assert "failure_summary" in sql
 
 
 # ── List by provider resource ────────────────────────────────────────────────
@@ -632,6 +749,7 @@ def _binding_payload(
     branch: str | None = "main",
     source_event_id: str | None = None,
     external_session_id: str | None = "ses_xyz",
+    failure_summary: str | None = None,
 ) -> dict:
     """Build keyword arguments for create_or_replay_afk_execution_binding."""
     return {
@@ -646,6 +764,7 @@ def _binding_payload(
         "branch": branch,
         "title": title,
         "failure_reason": None,
+        "failure_summary": failure_summary,
         "started_at": None,
         "finished_at": None,
         "trigger_type": None,
@@ -931,6 +1050,82 @@ def test_create_or_replay_conflict_detects_outcome_difference(
     assert result.is_conflict is True
 
 
+def test_create_or_replay_conflict_detects_failure_summary_difference(
+    mock_conn: AsyncMock,
+) -> None:
+    """A different failure_summary for the same awx_job_id is a conflict."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "afk_run_id": "01HXYZ0000000000000000006",
+                "awx_job_id": 705,
+                "outcome": "failed",
+                "title": "Test task",
+                "branch": "main",
+                "failure_reason": None,
+                "failure_summary": "Original summary",
+                "source_event_id": None,
+                "external_session_id": "ses_xyz",
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    payload = _binding_payload(
+        awx_job_id="705",
+        outcome=ExecutionOutcome.FAILED,
+        failure_summary="Different summary",
+    )
+
+    import asyncio
+
+    result = asyncio.run(
+        repo.create_or_replay_afk_execution_binding(**payload)
+    )
+
+    assert result.is_conflict is True
+
+
+def test_create_or_replay_idempotent_with_same_failure_summary(
+    mock_conn: AsyncMock,
+) -> None:
+    """Same awx_job_id + same failure_summary is an idempotent replay."""
+    existing_binding_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": existing_binding_id,
+                "afk_run_id": "01HXYZ0000000000000000007",
+                "awx_job_id": 706,
+                "outcome": "failed",
+                "title": "Test task",
+                "branch": "main",
+                "failure_reason": None,
+                "failure_summary": "Process crashed",
+                "source_event_id": None,
+                "external_session_id": "ses_xyz",
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    payload = _binding_payload(
+        awx_job_id="706",
+        outcome=ExecutionOutcome.FAILED,
+        failure_summary="Process crashed",
+    )
+
+    import asyncio
+
+    result = asyncio.run(
+        repo.create_or_replay_afk_execution_binding(**payload)
+    )
+
+    assert result.is_conflict is False
+    assert result.binding_id == existing_binding_id
+
+
 # ── Rollback / no orphaned rows ──────────────────────────────────────────
 
 
@@ -1050,6 +1245,7 @@ def _terminal_row(**overrides) -> dict:
         "outcome": "running",
         "finished_at": None,
         "failure_reason": None,
+        "failure_summary": None,
         "external_session_id": None,
         "provider": None,
         "repository_url": None,
@@ -1278,6 +1474,140 @@ class TestUpdateExecutionBindingTerminal:
         assert result.is_updated is False
         assert result.is_conflict is False
         assert result.not_found is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_running_fills_null_failure_summary(self, mock_conn: AsyncMock) -> None:
+        """A supplied failure_summary fills a stored NULL (issue #564)."""
+        mock_conn.fetchrow = AsyncMock(return_value=mock_row(_terminal_row()))
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Process crashed",
+        )
+
+        assert result.is_updated is True
+        assert result.is_conflict is False
+        updates = _calls_matching(mock_conn, r"UPDATE execution_bindings")
+        args = updates[0][1]
+        # failure_summary carried in the UPDATE params (position 10).
+        assert args[9] == "Process crashed"
+
+    def test_running_omitted_failure_summary_keeps_stored(self, mock_conn: AsyncMock) -> None:
+        """An omitted failure_summary never erases a stored value (non-erasing)."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(_terminal_row(failure_summary="Stored summary"))
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_reason="Timeout",
+        )
+
+        assert result.is_updated is True
+        assert result.is_conflict is False
+        updates = _calls_matching(mock_conn, r"UPDATE execution_bindings")
+        args = updates[0][1]
+        # The stored failure_summary is preserved, not erased by None.
+        assert args[9] == "Stored summary"
+
+    def test_running_conflicting_failure_summary_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A supplied failure_summary contradicting a stored value is a conflict."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(_terminal_row(failure_summary="Original summary"))
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Different summary",
+        )
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_terminal_replay_with_matching_failure_summary_is_idempotent(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A terminal replay repeating the stored failure_summary is idempotent."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(outcome="failed", failure_summary="Process crashed")
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Process crashed",
+        )
+
+        assert result.is_updated is False
+        assert result.is_conflict is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_terminal_replay_with_different_failure_summary_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A terminal replay with a different failure_summary is a conflict."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(outcome="failed", failure_summary="Original summary")
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Different summary",
+        )
+
+        assert result.is_conflict is True
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+    def test_completed_transition_with_stored_failure_summary_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A completed transition never ends with failure metadata: a stored
+        failure_summary (from phase one) is rejected after merge (issue #564)."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    failure_summary="Stored summary",
+                    external_session_id="ses_stored",
+                    provider="github",
+                    repository_url="org/repo",
+                    entity_type="change_request",
+                    entity_number="7",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(repo, awx_job_id="900", outcome=ExecutionOutcome.COMPLETED)
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
         assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
 
     def test_terminal_conflicting_outcome_is_conflict(self, mock_conn: AsyncMock) -> None:
