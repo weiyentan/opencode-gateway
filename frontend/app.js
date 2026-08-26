@@ -858,7 +858,7 @@
           repository: repository,
           lastSeenAt: r.last_seen_at || null,
           startedAt: r.started_at || null,
-          afkLinked: true // every AFK run is AFK-linked by definition
+          afkLinked: !!(outcome && outcome.change_request_ids && outcome.change_request_ids.length > 0)
         };
       })
       .sort(function (a, b) {

@@ -6533,6 +6533,26 @@ console.log('\u25B6 AFK Change Request List \u2014 buildChangeRequestList (issue
   assert(noOutcome.length === 1, 'run without outcome: still produces a CR row');
   assert(noOutcome[0].outcomeStatus === '--', 'missing outcome renders as --');
   assert(noOutcome[0].changeRequestIds.length === 0, 'missing outcome: no CR IDs');
+
+  // Run with outcome but no change_request_ids -> afkLinked should be false
+  var noCrIds = window.buildChangeRequestList([
+    { afk_run_id: 'no-cr', provider: 'github', title: 'owner/repo-y Manual PR', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: [] },
+      last_seen_at: '2026-07-18T10:00:00Z', started_at: '2026-07-18T09:00:00Z' }
+  ], 'github', 'owner/repo-y');
+  assert(noCrIds.length === 1, 'run with empty CR IDs: still produces a CR row');
+  assert(noCrIds[0].afkLinked === false, 'empty change_request_ids: afkLinked is false');
+  assert(noCrIds[0].changeRequestIds.length === 0, 'empty change_request_ids: CR IDs empty');
+
+  // Run with outcome but null change_request_ids -> afkLinked should be false
+  var nullCrIds = window.buildChangeRequestList([
+    { afk_run_id: 'null-cr', provider: 'github', title: 'owner/repo-z External PR', status: 'completed',
+      outcome: { status: 'merged', change_request_ids: null },
+      last_seen_at: '2026-07-19T10:00:00Z', started_at: '2026-07-19T09:00:00Z' }
+  ], 'github', 'owner/repo-z');
+  assert(nullCrIds.length === 1, 'run with null CR IDs: still produces a CR row');
+  assert(nullCrIds[0].afkLinked === false, 'null change_request_ids: afkLinked is false');
+  assert(nullCrIds[0].changeRequestIds.length === 0, 'null change_request_ids: CR IDs empty');
 })();
 
 // ── filterChangeRequests (issue #573) ───────────────────────────────────────
