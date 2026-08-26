@@ -30,8 +30,16 @@ class TestExecutionOutcome:
         assert ExecutionOutcome.FAILED == "failed"
         assert ExecutionOutcome.CANCELLED == "cancelled"
 
-    def test_only_three_members(self) -> None:
-        assert len(ExecutionOutcome) == 3
+    def test_running_member_for_two_phase_lifecycle(self) -> None:
+        """Issue #590: the two-phase lifecycle adds a provisional ``running``."""
+        assert ExecutionOutcome.RUNNING == "running"
+        assert ExecutionOutcome.RUNNING.is_terminal is False
+        assert ExecutionOutcome.COMPLETED.is_terminal is True
+        assert ExecutionOutcome.FAILED.is_terminal is True
+        assert ExecutionOutcome.CANCELLED.is_terminal is True
+
+    def test_four_members(self) -> None:
+        assert len(ExecutionOutcome) == 4
 
 
 # ---------------------------------------------------------------------------

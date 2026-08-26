@@ -124,8 +124,17 @@ timeline, not an accounting summary. Exposed read-only via the
 _Avoid_: replay blob, transcript (in the usage-aggregate sense)
 
 **Execution Binding**:
-A durable Gateway record linking one AWX execution to one OpenCode external
-session and one provider resource identity.
+A durable Gateway record linking one **AWX Execution** to a Gateway-owned
+**AFK Run** (`afk_run_id`) and, when known, one **Stable Resource Identity**
+(the `change_request`) and one **External Session ID**. Provisioned at AWX
+start with `outcome=running` (attached to a pre-provisioned `afk_run_id`;
+change request and session may be absent) and transitioned to a terminal
+outcome via `PATCH /api/v1/afk/executions/{awx_job_id}` or persisted directly
+as a terminal outcome via `POST /api/v1/afk/executions`. Failed or cancelled
+executions may persist without a change request or a session; readback returns
+`null` for absent identities. Idempotent by AWX job identity — identical
+replays return the stored row, conflicting data returns `409` without
+overwriting history.
 _Avoid_: attempt, inferred correlation
 
 **AWX Execution**:
@@ -133,8 +142,11 @@ One externally identified AWX job run that invokes an OpenCode execution.
 _Avoid_: AWX attempt (unless explicitly describing a separate job run)
 
 **Execution Outcome**:
-The terminal result of an Execution Binding, such as `completed`, `failed`,
-or `cancelled`.
+The lifecycle result of an Execution Binding. `running` is the provisional
+outcome provisioned at AWX start; `completed`, `failed`, and `cancelled` are
+the three terminal outcomes. A `running` binding is transitioned to a terminal
+outcome via `PATCH /api/v1/afk/executions/{awx_job_id}`; `running` never
+reappears after a terminal outcome.
 _Avoid_: AFK Run status
 
 **Failure Summary**:
@@ -1377,11 +1389,11 @@ manages.
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 - An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
-- An **Execution Binding** belongs to exactly one **AWX Execution**, one **External Session ID**, and one **Stable Resource Identity**; a resource may have many bindings, including failed and later successful executions
-- An **Execution Binding** is idempotent by AWX job identity: repeating the same binding is a no-op, conflicting data for the same AWX job is rejected, and a new AWX job for the same resource creates a separate binding
-- A GitHub pull request and GitLab merge request are both represented as a `change_request` **Stable Resource Identity**; provider identity is supplied at the API boundary rather than an internal Gateway database ID
-- An **Execution Binding** may carry the originating EDA `source_event_id`, branch metadata, title, terminal timestamps, and a bounded redacted failure summary; it never stores raw `extra_vars`, stdout, prompts, tokens, or arbitrary AWX payloads
-- The execution-binding API exposes a write path for final bindings and read paths by AWX job identity or stable provider resource identity; read results preserve the full failed-to-successful execution history
+- An **Execution Binding** belongs to exactly one **AWX Execution** and one **afk_run_id**; its **Stable Resource Identity** (the `change_request`) and **External Session ID** are optional — `running` provisioning and `failed`/`cancelled` executions may persist without either, and readback returns `null` for absent identities. A resource may have many bindings, including failed and later successful executions
+- An **Execution Binding** is idempotent by AWX job identity: repeating the same binding is a no-op, conflicting data for the same AWX job is rejected, and a new AWX job for the same resource creates a separate binding (applies to both `POST /api/v1/afk/executions` and `PATCH /api/v1/afk/executions/{awx_job_id}`; `PATCH` uses non-erasing fill-ins for late-discovered session/resource and never overwrites terminal history)
+- A GitHub pull request and GitLab merge request are both represented as a `change_request` **Stable Resource Identity** when a resource is present; provider identity is supplied at the API boundary rather than an internal Gateway database ID
+- An **Execution Binding** may carry the originating EDA `source_event_id` (required when `trigger_type=eda`), `trigger_type`, branch metadata, title, `started_at`/`finished_at`, and a bounded redacted failure summary (only on non-completed outcomes); it never stores raw `extra_vars`, stdout, prompts, tokens, or arbitrary AWX payloads
+- The execution-binding API exposes a two-phase write path — `POST /api/v1/afk/executions` for `running` provisioning or direct terminal persistence and `PATCH /api/v1/afk/executions/{awx_job_id}` for `running`→terminal transitions — plus read paths by AWX job identity or stable provider resource identity; read results preserve the full history including `running` and failed-to-successful retries
 - The execution-binding write path uses a dedicated **Collector Credential** for the AWX integration; it does not reuse the `opencode-collector` credential or the **Admin API Key**
 - A **Retention Tier** groups the AFK/reporting data into aggregates (indefinite), metadata (12 months), redacted payload (90 days), and the **DLQ Operational Max** (30 days), each configurable via `GATEWAY_RETENTION_*` (ADR 0022)
 - The **DLQ Operational Max** stamps every `afk.events-dlq` record with `dead_lettered_at` + `max_age_days` and escalates records strictly older than the max to `afk.events-dlq-expired` — never unbounded, never silently dropped

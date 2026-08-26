@@ -150,7 +150,7 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -174,7 +174,7 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -419,7 +419,7 @@ class TestBearerTokenNonLeakage:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, _saved_row()]
+            side_effect=[_auth_row(), None, None, _saved_row()]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -437,3 +437,69 @@ class TestBearerTokenNonLeakage:
         auth_call = conn.fetchrow.call_args_list[0]
         assert auth_call.args[1] == hash_token(_COLLECTOR_BEARER)
         assert _COLLECTOR_BEARER not in str(auth_call)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PATCH terminal-update auth (issue #590)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTerminalUpdateAuth:
+    """The PATCH write path enforces the same dedicated-client credential."""
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_other_client_credential_403(self) -> None:
+        """A valid credential owned by another client is rejected with 403."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=_auth_row(client_name="other-client"))
+
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42", json={"outcome": "completed"}
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_patch_accepts_dedicated_client_credential(self) -> None:
+        """The dedicated AWX client passes the gate and reaches persistence."""
+        conn = AsyncMock()
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
+        running_row = mock_row(
+            {
+                "id": uuid.uuid4(),
+                "outcome": "running",
+                "finished_at": None,
+                "failure_reason": None,
+                "external_session_id": None,
+                "provider": None,
+                "repository_url": None,
+                "entity_type": None,
+                "entity_number": None,
+            }
+        )
+        saved_row = _saved_row()
+        saved_row["afk_run_id"] = None
+        saved_row["trigger_type"] = None
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), running_row, saved_row])
+        conn.execute = AsyncMock()
+
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_abc123",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 200

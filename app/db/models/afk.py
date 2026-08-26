@@ -526,6 +526,11 @@ class ExecutionBinding(Base):
     ``entity_number``) is NOT unique — multiple failed and successful
     executions for the same change request are allowed.
 
+    The two-phase lifecycle (issue #590, migration 0041) makes the
+    change-request identity nullable: a failed or cancelled execution may
+    persist without a change request, so the four resource-identity columns
+    accept NULL (``external_session_id`` was already nullable).
+
     ``failure_reason`` and ``failure_summary`` carry bounded diagnostic
     information.  Raw ``extra_vars``, stdout, prompts, tokens, or
     arbitrary AWX payloads are never stored.
@@ -546,10 +551,10 @@ class ExecutionBinding(Base):
     awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     job_template_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     external_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    provider: Mapped[str] = mapped_column(String, nullable=False)
-    repository_url: Mapped[str] = mapped_column(String, nullable=False)
-    entity_type: Mapped[str] = mapped_column(String, nullable=False)
-    entity_number: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    repository_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    entity_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    entity_number: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     source_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     branch: Mapped[Optional[str]] = mapped_column(String, nullable=True)

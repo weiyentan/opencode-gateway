@@ -143,9 +143,9 @@ class TestCreateExecutionBinding:
 
         conn = _mk_conn()
         saved_row = _mk_binding_row(awx_job_id=42)
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -192,9 +192,9 @@ class TestCreateExecutionBinding:
             repository_url="gitlab.com/cloudnative-pg/cloudnative-pg",
             entity_number="6",
         )
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -475,7 +475,33 @@ class TestCreateExecutionBinding:
                 "resource_type": "pull_request",
                 "resource_number": "99",
             },
-            "outcome": "running",  # Invalid — not a terminal outcome
+            "outcome": "in_progress",  # Invalid — not in the outcome vocabulary
+            "trigger_type": "manual",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_running_without_afk_run_id_rejected(self) -> None:
+        """Start-time provisioning requires afk_run_id (issue #590)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "running",
             "trigger_type": "manual",
         }
 
@@ -566,9 +592,9 @@ class TestCreateExecutionBinding:
             trigger_type="eda",
             source_event_id="evt_001",
         )
-        # Call sequence: auth → create_or_replay (fetchrow→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, saved_row]
+            side_effect=[_auth_row(), None, None, saved_row]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -599,6 +625,57 @@ class TestCreateExecutionBinding:
         assert binding["binding_id"] is not None
         assert binding["trigger_type"] == "eda"
         assert binding["source_event_id"] == "evt_001"
+
+    @pytest.mark.asyncio
+    async def test_auto_provision_reuse_returns_201_with_owner_run_id(self) -> None:
+        """PR #600 blocker: a POST without afk_run_id whose canonical PR already
+        owns a lifecycle reuses it — 201 with the owner's afk_run_id, not a 409."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            afk_run_id="01OWNER000000000000000000001",
+        )
+        # Call sequence: auth → create_or_replay (no existing binding →
+        # owner pre-check hit) → re-read after create.
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row(
+                    {
+                        "afk_run_id": "01OWNER000000000000000000001",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "external_session_id": "ses_abc123",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "completed",
+            "trigger_type": "manual",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["afk_run_id"] == "01OWNER000000000000000000001"
 
     @pytest.mark.asyncio
     async def test_idempotent_replay_returns_same_afk_run_id(self) -> None:
@@ -1080,3 +1157,376 @@ class TestAuth:
 
         resp = await client.get("/api/v1/afk/executions/42")
         assert resp.status_code in (401, 403)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Two-phase lifecycle (issue #590)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _update_row(**overrides) -> MagicMock:
+    """Build a mock row as seen by update_execution_binding_terminal's FOR UPDATE."""
+    row = {
+        "id": uuid.uuid4(),
+        "outcome": "running",
+        "finished_at": None,
+        "failure_reason": None,
+        "external_session_id": None,
+        "provider": None,
+        "repository_url": None,
+        "entity_type": None,
+        "entity_number": None,
+    }
+    row.update(overrides)
+    return mock_row(row)
+
+
+class TestTwoPhaseLifecycle:
+    """POST running provisioning + PATCH terminal update (issue #590)."""
+
+    @pytest.mark.asyncio
+    async def test_running_provision_under_existing_afk_run(self) -> None:
+        """Start-time provisioning attaches a running binding to afk_run_id."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="running",
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+            external_session_id=None,
+            provider=None,
+            repository_url=None,
+            entity_type=None,
+            entity_number=None,
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row({"afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY"}),  # run exists
+                saved_row,  # re-read after create
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+            "outcome": "running",
+            "trigger_type": "eda",
+            "source_event_id": "evt_001",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["status"] == "ok"
+        binding = data["data"]
+        assert binding["outcome"] == "running"
+        assert binding["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWXY"
+        assert binding["resource"] is None
+        assert binding["external_session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_failed_terminal_callback_without_resource_or_session(self) -> None:
+        """A failed execution persists without a change request or session."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_reason="AWX job crashed before launch",
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+            external_session_id=None,
+            provider=None,
+            repository_url=None,
+            entity_type=None,
+            entity_number=None,
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row({"afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY"}),  # run exists
+                saved_row,  # re-read after create
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_reason": "AWX job crashed before launch",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        binding = resp.json()["data"]
+        assert binding["outcome"] == "failed"
+        assert binding["resource"] is None
+        assert binding["external_session_id"] is None
+        assert binding["failure_reason"] == "AWX job crashed before launch"
+
+    @pytest.mark.asyncio
+    async def test_patch_transitions_running_to_completed(self) -> None:
+        """PATCH transitions the same row from running to a terminal outcome."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        running_row = _update_row(outcome="running")
+        updated_row = _mk_binding_row(awx_job_id=42, outcome="completed")
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), running_row, updated_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_patch_identical_terminal_replay_is_200(self) -> None:
+        """Repeating an identical terminal update is idempotent (200, no mutation)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
+        terminal_row = _update_row(outcome="completed", finished_at=finished)
+        read_row = _mk_binding_row(
+            awx_job_id=42, outcome="completed", finished_at=finished
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), terminal_row, read_row]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_patch_conflicting_terminal_update_returns_409(self) -> None:
+        """A conflicting terminal update never overwrites history."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        terminal_row = _update_row(outcome="completed")
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), terminal_row])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={"outcome": "failed", "failure_reason": "boom"},
+        )
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_patch_unknown_awx_job_returns_404(self) -> None:
+        """PATCH on an unknown AWX job returns 404."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), None])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/99999",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_patch_running_outcome_rejected_422(self) -> None:
+        """A terminal update must target a terminal outcome — running is 422."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42", json={"outcome": "running"}
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_patch_non_numeric_awx_job_id_returns_400(self) -> None:
+        """A non-numeric path awx_job_id is rejected with 400."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/abc",
+            json={
+                "outcome": "completed",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_requires_collector_token(self) -> None:
+        """The terminal-update write path requires the collector credential."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=None)
+        client = create_client(conn, api_key=None)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42", json={"outcome": "completed"}
+        )
+        assert resp.status_code in (401, 403)
+
+    @pytest.mark.asyncio
+    async def test_post_completed_without_resource_or_session_rejected_422(self) -> None:
+        """Issue #600 review: a completed POST with afk_run_id but neither a
+        change request nor a session is rejected before touching the DB."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions",
+            json={
+                "awx_job": {"job_id": "42", "job_template_id": 7},
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                "outcome": "completed",
+                "trigger_type": "manual",
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        # The repository was never reached.
+        assert not conn.fetch.called
+
+    @pytest.mark.asyncio
+    async def test_post_completed_without_session_rejected_422(self) -> None:
+        """A completed POST with a change request but no session is rejected."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions",
+            json={
+                "awx_job": {"job_id": "42", "job_template_id": 7},
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                "outcome": "completed",
+                "trigger_type": "manual",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.asyncio
+    async def test_patch_resource_conflicting_with_lifecycle_returns_409(self) -> None:
+        """Issue #600 review scenario: the owning lifecycle is bound to PR #5 but
+        the terminal update fills PR #99 — 409, and the execution row is never
+        mutated so run and execution cannot diverge."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        running_row = _update_row(
+            outcome="running", afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY"
+        )
+        run_row = mock_row(
+            {
+                "change_request_provider": "github",
+                "change_request_repository": "acme/proj",
+                "change_request_external_id": "5",
+            }
+        )
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), running_row, run_row])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 409, resp.text
+        # Neither the bind nor the execution row was mutated.
+        exec_sql = [c.args[0] for c in conn.execute.call_args_list]
+        assert not any(
+            "UPDATE execution_bindings" in s or "UPDATE afk_runs" in s for s in exec_sql
+        )

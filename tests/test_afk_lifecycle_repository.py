@@ -512,6 +512,55 @@ def test_bind_lost_race_reclassifies_as_replay(mock_conn: AsyncMock) -> None:
     assert result.is_bound is False
 
 
+def test_bind_same_lifecycle_same_cr_found_in_precheck_is_replay(
+    mock_conn: AsyncMock,
+) -> None:
+    """Issue #600 review: the pre-check finding the requested lifecycle itself
+    as the owner of the identical change request is re-read, verified, and
+    classified as an idempotent replay — never a false 409."""
+    unbound = _bound_run_row()
+    same_run_owner = _bound_run_row()
+    rebound = _bound_run_row(
+        cr_provider="gitlab",
+        cr_repository="gitlab.com/cnp/cnp",
+        cr_external_id="6",
+    )
+    mock_conn.fetchrow = AsyncMock(side_effect=[unbound, same_run_owner, rebound])
+    mock_conn.execute = AsyncMock()
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.bind_change_request(**_binding_kwargs()))
+
+    assert result.is_conflict is False
+    assert result.is_bound is False
+    assert result.run_missing is False
+    assert _update_calls(mock_conn) == []
+
+
+def test_bind_same_lifecycle_rebound_to_different_cr_is_conflict(
+    mock_conn: AsyncMock,
+) -> None:
+    """Issue #600 review: the pre-check finding the requested lifecycle as
+    owner, but the re-read tuple differing, is a genuine conflict — the
+    lifecycle was rebound to a different identity."""
+    unbound = _bound_run_row()
+    same_run_owner = _bound_run_row()
+    rebound = _bound_run_row(
+        cr_provider="gitlab",
+        cr_repository="gitlab.com/cnp/other",
+        cr_external_id="9",
+    )
+    mock_conn.fetchrow = AsyncMock(side_effect=[unbound, same_run_owner, rebound])
+    mock_conn.execute = AsyncMock()
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.bind_change_request(**_binding_kwargs()))
+
+    assert result.is_conflict is True
+    assert result.is_bound is False
+    assert _update_calls(mock_conn) == []
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  get_afk_run_lifecycle
 # ══════════════════════════════════════════════════════════════════════════
