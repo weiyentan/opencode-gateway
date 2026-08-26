@@ -956,6 +956,70 @@ async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_two_phase_terminal_resource_conflicts_with_lifecycle(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """Issue #600 review: a terminal update filling a resource that contradicts
+    the owning lifecycle's change request is a 409 that never mutates the
+    execution row."""
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+        # The lifecycle is authoritative for PR #5 (as the correlator bound it).
+        await conn.execute(
+            """
+            UPDATE afk_runs
+            SET change_request_provider = 'github',
+                change_request_repository = 'github.com/acme/proj',
+                change_request_external_id = '5'
+            WHERE afk_run_id = $1
+            """,
+            run_id,
+        )
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+
+    async with client as c:
+        provision = _make_two_phase_payload(
+            awx_job_id=awx_job_id, afk_run_id=run_id, outcome="running"
+        )
+        resp = await c.post("/api/v1/afk/executions", json=provision)
+        assert resp.status_code == 201, resp.text
+
+        # Terminal update fills PR #99 — contradicts the lifecycle's PR #5.
+        resp2 = await c.patch(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp2.status_code == 409, resp2.text
+        assert resp2.json()["error"]["code"] == "CONFLICT"
+
+    # The execution row is untouched — still running, never diverged to PR #99.
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT outcome, provider, entity_number FROM execution_bindings"
+            " WHERE awx_job_id = $1",
+            awx_job_id,
+        )
+        assert row is not None
+        assert row["outcome"] == "running"
+        assert row["provider"] is None
+        assert row["entity_number"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_failed_terminal_update_without_resource_or_session(
     db_pool: asyncpg.Pool,
 ) -> None:

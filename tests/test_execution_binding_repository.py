@@ -1055,6 +1055,7 @@ def _terminal_row(**overrides) -> dict:
         "repository_url": None,
         "entity_type": None,
         "entity_number": None,
+        "afk_run_id": None,
     }
     row.update(overrides)
     return row
@@ -1391,17 +1392,19 @@ class TestCreateOrReplayProviderCompatibility:
         assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
 
     def test_matching_run_provider_proceeds(self, mock_conn: AsyncMock) -> None:
-        """A resource matching the run's provider attaches normally."""
+        """A resource matching the run's provider attaches normally and binds the
+        unbound lifecycle to the change request (issue #600 review)."""
         mock_conn.fetchrow = AsyncMock(
             side_effect=[
                 None,  # no existing binding
                 mock_row(
                     {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "github"}
                 ),
+                None,  # no other lifecycle owns this change request
             ]
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        mock_conn.execute = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
         repo = AsyncpgOutcomeRepository(mock_conn)
         payload = _binding_payload()
         payload["afk_run_id"] = "01SUPPLIED00000000000000001"
@@ -1413,6 +1416,12 @@ class TestCreateOrReplayProviderCompatibility:
 
         assert result.is_created is True
         assert result.is_conflict is False
+        # The unbound lifecycle is made authoritative for the execution's PR.
+        binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
+        assert len(binds) == 1
+        assert binds[0][1][1] == "github"
+        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][3] == "42"
 
     def test_mismatched_run_change_request_tuple_is_conflict(
         self, mock_conn: AsyncMock
@@ -1484,11 +1493,44 @@ class TestCreateOrReplayProviderCompatibility:
     def test_run_without_provider_skips_compatibility_check(
         self, mock_conn: AsyncMock
     ) -> None:
-        """A run without a stored provider carries no compatibility constraint."""
+        """A run without a stored provider carries no provider constraint, but the
+        unbound lifecycle is still bound to the execution's change request
+        (issue #600 review)."""
         mock_conn.fetchrow = AsyncMock(
             side_effect=[
                 None,  # no existing binding
                 mock_row({"afk_run_id": "01SUPPLIED00000000000000001"}),
+                None,  # no other lifecycle owns this change request
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.is_created is True
+        assert result.is_conflict is False
+        assert len(_calls_matching(mock_conn, r"UPDATE afk_runs")) == 1
+
+    def test_change_request_owned_by_another_lifecycle_is_conflict(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A resource already owned by another lifecycle is a conflict (1:1
+        invariant) — the execution cannot introduce it on this run (issue #600
+        review)."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row(
+                    {"afk_run_id": "01SUPPLIED00000000000000001", "provider": "github"}
+                ),
+                mock_row({"afk_run_id": "01SOMEONELSE0000000000000001"}),  # owned
             ]
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
@@ -1502,5 +1544,143 @@ class TestCreateOrReplayProviderCompatibility:
 
         result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
 
-        assert result.is_created is True
+        assert result.is_conflict is True
+        assert result.is_created is False
+        assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
+        assert _calls_matching(mock_conn, r"UPDATE afk_runs") == []
+
+
+class TestUpdateExecutionBindingTerminalLifecycleAuthority:
+    """update_execution_binding_terminal lifecycle change-request authority
+    (issue #600 review)."""
+
+    def test_patch_binds_unbound_lifecycle(self, mock_conn: AsyncMock) -> None:
+        """A resource filled by the terminal update binds an unbound owning
+        lifecycle to it."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(_terminal_row(afk_run_id="01SUPPLIED00000000000000001")),
+                mock_row(
+                    {
+                        "change_request_provider": None,
+                        "change_request_repository": None,
+                        "change_request_external_id": None,
+                    }
+                ),
+                None,  # no other lifecycle owns this change request
+            ]
+        )
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_terminal",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="7",
+        )
+
+        assert result.is_updated is True
         assert result.is_conflict is False
+        # The unbound lifecycle is bound to the execution's change request.
+        binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
+        assert len(binds) == 1
+        assert binds[0][1][1] == "github"
+        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][3] == "7"
+        assert len(_calls_matching(mock_conn, r"UPDATE execution_bindings")) == 1
+
+    def test_patch_resource_conflicts_with_lifecycle(self, mock_conn: AsyncMock) -> None:
+        """Issue #600 review scenario: the owning lifecycle is bound to PR #5 but
+        the terminal update fills PR #99 — a conflict that never mutates the
+        execution row."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(_terminal_row(afk_run_id="01SUPPLIED00000000000000001")),
+                mock_row(
+                    {
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "5",
+                    }
+                ),
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_terminal",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="99",
+        )
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+        assert _calls_matching(mock_conn, r"UPDATE afk_runs") == []
+
+    def test_patch_resource_matches_lifecycle_proceeds(self, mock_conn: AsyncMock) -> None:
+        """A filled resource matching the owning lifecycle's bound change request
+        proceeds."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(_terminal_row(afk_run_id="01SUPPLIED00000000000000001")),
+                mock_row(
+                    {
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "7",
+                    }
+                ),
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_terminal",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="7",
+        )
+
+        assert result.is_updated is True
+        assert result.is_conflict is False
+        assert len(_calls_matching(mock_conn, r"UPDATE execution_bindings")) == 1
+
+    def test_patch_orphaned_afk_run_id_is_conflict(self, mock_conn: AsyncMock) -> None:
+        """A terminal update whose afk_run_id resolves to no lifecycle conflicts —
+        authority cannot be established."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(_terminal_row(afk_run_id="01ORPHANED0000000000000000")),
+                None,  # no such run
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_terminal",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="7",
+        )
+
+        assert result.is_conflict is True
+        assert result.is_updated is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []

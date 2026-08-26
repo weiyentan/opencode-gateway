@@ -111,12 +111,13 @@ class TestRequiredFields:
         with pytest.raises(ValidationError):
             ExecutionBindingCreateRequest.model_validate(payload)
 
-    def test_missing_session_id_now_optional(self) -> None:
-        """Issue #590: the session is optional on the two-phase write path."""
+    def test_missing_session_id_on_completed_rejected(self) -> None:
+        """Issue #600 review: a completed POST must carry a session — the direct
+        terminal callback has no staged running row to draw it from."""
         payload = _valid_request()
         del payload["external_session_id"]
-        request = ExecutionBindingCreateRequest.model_validate(payload)
-        assert request.external_session_id is None
+        with pytest.raises(ValidationError, match="external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(payload)
 
     def test_empty_session_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="external_session_id"):
@@ -537,6 +538,42 @@ class TestTwoPhaseCreateValidation:
         assert request.external_session_id is None
         assert request.resource is not None
 
+    def test_completed_without_resource_rejected_even_with_run(self) -> None:
+        """Issue #600 review: a completed POST must carry a change request —
+        supplying ``afk_run_id`` alone does not excuse a resource-less
+        completed execution."""
+        with pytest.raises(ValidationError, match="resource and external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    outcome="completed",
+                    afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                    resource=None,
+                    external_session_id="ses_known",
+                )
+            )
+
+    def test_completed_without_session_rejected_even_with_run(self) -> None:
+        """Issue #600 review: a completed POST must carry a session even when
+        the change request is present."""
+        with pytest.raises(ValidationError, match="resource and external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    outcome="completed",
+                    afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                    external_session_id=None,
+                )
+            )
+
+    def test_completed_with_resource_and_session_validates(self) -> None:
+        """A completed POST carrying both identities is accepted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="completed",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.COMPLETED
+
     def test_completed_with_failure_reason_rejected(self) -> None:
         with pytest.raises(ValidationError, match="failure_reason"):
             ExecutionBindingCreateRequest.model_validate(
@@ -606,6 +643,63 @@ class TestFailureReasonRedaction:
         )
         assert "my secret password" not in request.failure_reason
         assert "***" in request.failure_reason
+
+    def test_json_style_double_quoted_key_redacted(self) -> None:
+        """JSON-style payloads with double-quoted secret keys are redacted
+        (issue #600 review: ``{\"password\": \"my secret\"}`` never persists
+        the raw value)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"password": "my secret password"}',
+            )
+        )
+        assert "my secret password" not in request.failure_reason
+        assert request.failure_reason == '{"password": ***}'
+
+    def test_json_style_single_quoted_key_redacted(self) -> None:
+        """Single-quoted JSON-style secret keys are redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="{ 'password': 'secret value' }",
+            )
+        )
+        assert "secret value" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_json_style_api_key_redacted(self) -> None:
+        """``\"api_key\": \"...\"`` — a quoted plain value with no known token
+        prefix — is redacted (previously leaked)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"api_key": "api-key-value-1"}',
+            )
+        )
+        assert "api-key-value-1" not in request.failure_reason
+        assert request.failure_reason == '{"api_key": ***}'
+
+    def test_json_style_token_value_redacted(self) -> None:
+        """A known token prefix inside a JSON-style quoted value is redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"token": "ghp_abc123secret"}',
+            )
+        )
+        assert "ghp_abc123secret" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_json_style_spaced_key_redacted(self) -> None:
+        """A space between the quoted key and the colon is still redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"password" : "spaced key"}',
+            )
+        )
+        assert "spaced key" not in request.failure_reason
 
     def test_ordinary_text_untouched(self) -> None:
         request = ExecutionBindingCreateRequest.model_validate(

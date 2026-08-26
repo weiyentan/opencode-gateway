@@ -1387,3 +1387,95 @@ class TestTwoPhaseLifecycle:
             "/api/v1/afk/executions/42", json={"outcome": "completed"}
         )
         assert resp.status_code in (401, 403)
+
+    @pytest.mark.asyncio
+    async def test_post_completed_without_resource_or_session_rejected_422(self) -> None:
+        """Issue #600 review: a completed POST with afk_run_id but neither a
+        change request nor a session is rejected before touching the DB."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions",
+            json={
+                "awx_job": {"job_id": "42", "job_template_id": 7},
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                "outcome": "completed",
+                "trigger_type": "manual",
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        # The repository was never reached.
+        assert not conn.fetch.called
+
+    @pytest.mark.asyncio
+    async def test_post_completed_without_session_rejected_422(self) -> None:
+        """A completed POST with a change request but no session is rejected."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions",
+            json={
+                "awx_job": {"job_id": "42", "job_template_id": 7},
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                "outcome": "completed",
+                "trigger_type": "manual",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.asyncio
+    async def test_patch_resource_conflicting_with_lifecycle_returns_409(self) -> None:
+        """Issue #600 review scenario: the owning lifecycle is bound to PR #5 but
+        the terminal update fills PR #99 — 409, and the execution row is never
+        mutated so run and execution cannot diverge."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        running_row = _update_row(
+            outcome="running", afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY"
+        )
+        run_row = mock_row(
+            {
+                "change_request_provider": "github",
+                "change_request_repository": "acme/proj",
+                "change_request_external_id": "5",
+            }
+        )
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), running_row, run_row])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={
+                "outcome": "completed",
+                "finished_at": "2026-08-02T12:00:00Z",
+                "external_session_id": "ses_terminal",
+                "resource": {
+                    "provider": "github",
+                    "repository": "https://github.com/acme/proj",
+                    "resource_type": "pull_request",
+                    "resource_number": "99",
+                },
+            },
+        )
+        assert resp.status_code == 409, resp.text
+        # Neither the bind nor the execution row was mutated.
+        exec_sql = [c.args[0] for c in conn.execute.call_args_list]
+        assert not any(
+            "UPDATE execution_bindings" in s or "UPDATE afk_runs" in s for s in exec_sql
+        )

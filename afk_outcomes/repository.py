@@ -1821,10 +1821,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         * **Supplied ``afk_run_id`` exists** — the binding is linked to it
           (no new ``afk_runs`` row) and returns ``is_created=True`` on first
           insert.  When the execution also carries a resource identity, its
-          provider must match the run's stored provider, and when the run has
-          a bound change request the full tuple
-          (provider, repository, change-request id) must match — a mismatch
-          returns ``is_conflict=True`` without inserting (issue #600 review).
+          provider must match the run's stored provider, and the run's
+          change-request relationship is made authoritative via the shared
+          lifecycle-binding rule: an unbound lifecycle is bound to the
+          execution's change request, a matching bound one is accepted, and
+          a differing bound one — or a change request already owned by
+          another lifecycle — returns ``is_conflict=True`` without inserting
+          (issue #600 review).
         * **Supplied ``afk_run_id`` missing** — returns ``run_missing=True``
           without inserting anything (the caller surfaces a 404).
         * **No ``afk_run_id``** — legacy behavior preserved: a provisional
@@ -1921,9 +1924,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
                 # When a resource identity is supplied with the execution,
                 # validate it against the referenced afk_run's provider
-                # (issue #600 review).  The run may already carry a
-                # change-request identity; if so, the execution's resource
-                # must be compatible.
+                # (issue #600 review) and make the lifecycle authoritative
+                # for the change request: an unbound lifecycle is bound, a
+                # matching one is accepted idempotently, and a differing one
+                # — or a change request owned by another lifecycle — is a
+                # conflict (issue #600 review).  The execution must never
+                # introduce a PR/MR that contradicts its owning lifecycle.
                 if provider is not None:
                     run_provider = existing_run.get("provider")
                     if run_provider is not None and run_provider != provider.value:
@@ -1931,26 +1937,18 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                             afk_run_id=afk_run_id,
                             is_conflict=True,
                         )
-                    # When the run already has a bound change request,
-                    # validate the full tuple (provider, repository, change_request_id)
-                    # against the run's stored identity (issue #600 review).
-                    cr_provider = existing_run.get("change_request_provider")
-                    cr_repository = existing_run.get("change_request_repository")
-                    cr_external_id = existing_run.get("change_request_external_id")
-                    if (
-                        cr_provider is not None
-                        and cr_repository is not None
-                        and cr_external_id is not None
-                    ):
-                        if (
-                            cr_provider != provider.value
-                            or cr_repository != repository
-                            or cr_external_id != resource_number
-                        ):
-                            return CreateAFKExecutionBindingResult(
-                                afk_run_id=afk_run_id,
-                                is_conflict=True,
-                            )
+                    bind_result = await self._apply_change_request_binding(
+                        afk_run_id=afk_run_id,
+                        provider=provider,
+                        repository=repository,
+                        external_id=resource_number,
+                        run=existing_run,
+                    )
+                    if bind_result.is_conflict:
+                        return CreateAFKExecutionBindingResult(
+                            afk_run_id=afk_run_id,
+                            is_conflict=True,
+                        )
 
                 run_id = afk_run_id
             else:
@@ -2058,6 +2056,15 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         stored value, a supplied field fills a stored NULL, and a supplied
         field that contradicts a stored non-NULL value is a conflict.
 
+        **Lifecycle authority (issue #600 review)** — when the owning
+        ``afk_run_id`` is present and the terminal merged state carries a
+        resource, the resource is validated against the owning lifecycle's
+        change request with the same shared binding rule used on POST: an
+        unbound lifecycle is bound, a matching one is accepted, and a
+        differing one (or one owned by another lifecycle) is a 409 conflict
+        that never mutates the execution row.  The execution can therefore
+        never hold a PR/MR that contradicts ``afk_runs``.
+
         **History is never overwritten** — an already-terminal row is only
         re-observed idempotently (identical payload → unchanged row) or
         rejected (different payload → conflict).  Terminal rows are never
@@ -2078,7 +2085,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 """
                 SELECT id, outcome, finished_at, failure_reason,
                        external_session_id, provider, repository_url,
-                       entity_type, entity_number
+                       entity_type, entity_number, afk_run_id
                 FROM execution_bindings
                 WHERE awx_job_id = $1
                 FOR UPDATE
@@ -2171,6 +2178,43 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     and new_entity_number is not None
                 )
                 if not has_resource or new_session is None:
+                    return UpdateExecutionBindingResult(
+                        binding_id=row["id"], is_conflict=True
+                    )
+
+            # Lifecycle authority (issue #600 review): a resource on the
+            # terminal execution — whether stored from phase one or filled by
+            # this update — must be consistent with the owning lifecycle's
+            # change request.  Apply the shared binding rule so the execution
+            # row can never diverge from ``afk_runs``: an unbound lifecycle is
+            # bound to the resource, a matching one is accepted, and a differing
+            # one (or a resource owned by another lifecycle) is a conflict that
+            # leaves the execution row untouched.  Rows without an owning
+            # lifecycle (legacy ``afk_run_id`` NULL) carry no such constraint.
+            afk_run_id = row.get("afk_run_id")
+            if afk_run_id is not None and new_provider is not None:
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT change_request_provider, change_request_repository,
+                           change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+                if run is None:
+                    # Orphaned run reference — cannot establish authority.
+                    return UpdateExecutionBindingResult(
+                        binding_id=row["id"], is_conflict=True
+                    )
+                bind_result = await self._apply_change_request_binding(
+                    afk_run_id=afk_run_id,
+                    provider=Provider(new_provider),
+                    repository=new_repository,
+                    external_id=new_entity_number,
+                    run=run,
+                )
+                if bind_result.is_conflict:
                     return UpdateExecutionBindingResult(
                         binding_id=row["id"], is_conflict=True
                     )
@@ -2539,6 +2583,135 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         ]
         return (first_delivery_id, delivery_ids)
 
+    async def _apply_change_request_binding(
+        self,
+        *,
+        afk_run_id: str,
+        provider: Provider,
+        repository: str,
+        external_id: str,
+        run: asyncpg.Record,
+    ) -> ChangeRequestBindingResult:
+        """Apply the canonical 1:1 lifecycle<->change_request binding rule.
+
+        The single implementation of the lifecycle invariant (issue #600
+        review), shared by :meth:`bind_change_request` and the execution
+        write paths (:meth:`create_or_replay_afk_execution_binding` and
+        :meth:`update_execution_binding_terminal`):
+
+        * **Unbound lifecycle** — binds the requested change request
+          (``is_bound=True``).
+        * **Identical replay** — the same identity is already bound; returns
+          no flags (no UPDATE issued).
+        * **Different identity already bound** — returns ``is_conflict=True``
+          without mutation.
+        * **Change request owned by another lifecycle** — returns
+          ``is_conflict=True`` without mutation (the 1:1 invariant).
+        * **Lost race** — a concurrent bind of the same lifecycle is re-read
+          and classified as replay or conflict, and a concurrent bind of the
+          same change request to another lifecycle (a
+          ``UniqueViolationError`` on the partial unique index) is rolled
+          back to a savepoint and surfaced as ``is_conflict=True`` — never
+          a 500.
+
+        ``run`` must be the lifecycle row (with the ``change_request_*``
+        columns); callers own loading it, so this helper never issues its
+        own ``afk_runs`` SELECT and can reuse the row the host method has
+        already fetched.
+        """
+        existing_tuple = (
+            run.get("change_request_provider"),
+            run.get("change_request_repository"),
+            run.get("change_request_external_id"),
+        )
+        if existing_tuple[0] is not None:
+            is_match = existing_tuple == (provider.value, repository, external_id)
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=not is_match,
+            )
+
+        # 1:1 invariant — the change request must not already belong to
+        # another lifecycle.  The partial unique index also enforces this
+        # under concurrency; this pre-check turns the common case into a
+        # clean conflict instead of a constraint violation.
+        other = await self._conn.fetchrow(
+            """
+            SELECT afk_run_id FROM afk_runs
+            WHERE change_request_provider = $1
+              AND change_request_repository = $2
+              AND change_request_external_id = $3
+            """,
+            provider.value,
+            repository,
+            external_id,
+        )
+        if other is not None:
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=True,
+            )
+
+        # Bind inside a savepoint so a concurrent bind of the same change
+        # request to another lifecycle rolls back only the savepoint and
+        # surfaces as a clean conflict (the ``uq_afk_runs_change_request_identity``
+        # partial unique index is the hard guarantee; the pre-check above just
+        # turns the common case into a clean conflict without a constraint
+        # violation).  Catching OUTSIDE the ``async with`` lets the context
+        # manager roll the savepoint back first — a failed savepoint would
+        # otherwise poison the caller's outer transaction.
+        try:
+            async with self._conn.transaction():
+                result = await self._conn.execute(
+                    """
+                    UPDATE afk_runs
+                    SET change_request_provider = $2,
+                        change_request_repository = $3,
+                        change_request_external_id = $4,
+                        last_seen_at = now()
+                    WHERE afk_run_id = $1
+                      AND change_request_provider IS NULL
+                    """,
+                    afk_run_id,
+                    provider.value,
+                    repository,
+                    external_id,
+                )
+
+                if result == "UPDATE 1":
+                    return ChangeRequestBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_bound=True,
+                    )
+
+                # Lost a race against a concurrent bind of this same lifecycle —
+                # re-read and classify as replay or conflict.
+                run = await self._conn.fetchrow(
+                    """
+                    SELECT change_request_provider, change_request_repository,
+                           change_request_external_id
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+                is_match = run is not None and (
+                    run["change_request_provider"],
+                    run["change_request_repository"],
+                    run["change_request_external_id"],
+                ) == (provider.value, repository, external_id)
+                return ChangeRequestBindingResult(
+                    afk_run_id=afk_run_id,
+                    is_conflict=not is_match,
+                )
+        except asyncpg.UniqueViolationError:
+            # Concurrent bind of the same change request to another lifecycle
+            # won the race — the 1:1 invariant holds.
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=True,
+            )
+
     async def bind_change_request(
         self,
         *,
@@ -2566,112 +2739,31 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         Binding is available before review processing — it never depends on
         the correlation engine.  The connection MUST already be in a
         transaction (the caller owns the transaction boundary).
+
+        Delegates the invariant to :meth:`_apply_change_request_binding` so
+        the execution write paths enforce the exact same rule.
         """
-        provider_value = provider.value
-
-        try:
-            async with self._conn.transaction():
-                run = await self._conn.fetchrow(
-                    """
-                    SELECT afk_run_id, change_request_provider,
-                           change_request_repository, change_request_external_id
-                    FROM afk_runs
-                    WHERE afk_run_id = $1
-                    """,
-                    afk_run_id,
-                )
-                if run is None:
-                    return ChangeRequestBindingResult(
-                        afk_run_id=afk_run_id,
-                        run_missing=True,
-                    )
-
-                existing_tuple = (
-                    run["change_request_provider"],
-                    run["change_request_repository"],
-                    run["change_request_external_id"],
-                )
-                if existing_tuple[0] is not None:
-                    is_match = existing_tuple == (provider_value, repository, external_id)
-                    return ChangeRequestBindingResult(
-                        afk_run_id=afk_run_id,
-                        is_conflict=not is_match,
-                    )
-
-                # 1:1 invariant — the change request must not already belong to
-                # another lifecycle.  The partial unique index also enforces this
-                # under concurrency; this pre-check turns the common case into a
-                # clean conflict instead of a constraint violation.
-                other = await self._conn.fetchrow(
-                    """
-                    SELECT afk_run_id FROM afk_runs
-                    WHERE change_request_provider = $1
-                      AND change_request_repository = $2
-                      AND change_request_external_id = $3
-                    """,
-                    provider_value,
-                    repository,
-                    external_id,
-                )
-                if other is not None:
-                    return ChangeRequestBindingResult(
-                        afk_run_id=afk_run_id,
-                        is_conflict=True,
-                    )
-
-                result = await self._conn.execute(
-                    """
-                    UPDATE afk_runs
-                    SET change_request_provider = $2,
-                        change_request_repository = $3,
-                        change_request_external_id = $4,
-                        last_seen_at = now()
-                    WHERE afk_run_id = $1
-                      AND change_request_provider IS NULL
-                    """,
-                    afk_run_id,
-                    provider_value,
-                    repository,
-                    external_id,
-                )
-
-                if result == "UPDATE 1":
-                    return ChangeRequestBindingResult(
-                        afk_run_id=afk_run_id,
-                        is_bound=True,
-                    )
-
-                # Lost a race against a concurrent bind of this same lifecycle —
-                # re-read and classify as replay or conflict.
-                run = await self._conn.fetchrow(
-                    """
-                    SELECT change_request_provider, change_request_repository,
-                           change_request_external_id
-                    FROM afk_runs
-                    WHERE afk_run_id = $1
-                    """,
-                    afk_run_id,
-                )
-                is_match = run is not None and (
-                    run["change_request_provider"],
-                    run["change_request_repository"],
-                    run["change_request_external_id"],
-                ) == (provider_value, repository, external_id)
+        async with self._conn.transaction():
+            run = await self._conn.fetchrow(
+                """
+                SELECT afk_run_id, change_request_provider,
+                       change_request_repository, change_request_external_id
+                FROM afk_runs
+                WHERE afk_run_id = $1
+                """,
+                afk_run_id,
+            )
+            if run is None:
                 return ChangeRequestBindingResult(
                     afk_run_id=afk_run_id,
-                    is_conflict=not is_match,
+                    run_missing=True,
                 )
-        except asyncpg.UniqueViolationError:
-            # Concurrent bind of the same change request to another lifecycle
-            # won the race — the 1:1 invariant holds.  The exception is caught
-            # OUTSIDE the ``async with self._conn.transaction()`` block so the
-            # context manager rolls the savepoint back first (a constraint
-            # violation leaves a savepoint failed until rollback, so catching
-            # inside would poison the caller's outer transaction), and the
-            # conflict is surfaced cleanly instead of as a 500.
-            return ChangeRequestBindingResult(
+            return await self._apply_change_request_binding(
                 afk_run_id=afk_run_id,
-                is_conflict=True,
+                provider=provider,
+                repository=repository,
+                external_id=external_id,
+                run=run,
             )
 
     async def get_afk_run_lifecycle(self, afk_run_id: str) -> AFKRunLifecycle | None:

@@ -53,21 +53,26 @@ _BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)\S+")
 _TOKEN_PREFIX_RE = re.compile(r"\b(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-)\S+")
 # ``key=value`` / ``key: value`` assignments; the key is classified with the
 # same ``is_secret_key`` vocabulary used elsewhere in the Gateway, so
-# compound keys like ``GITHUB_TOKEN`` are recognized.  The value matches a
-# quoted string (single or double) in full — so ``password="my secret
-# password"`` redacts the whole value, never just the first word — or a
-# non-whitespace token.
+# compound keys like ``GITHUB_TOKEN`` are recognized.  The key may be quoted
+# — matching JSON-style payloads like ``{"password": "value"}`` and
+# ``'api_key' : 'value'``.  The value matches a quoted string (single or
+# double) in full — so ``password="my secret password"`` redacts the whole
+# value, never just the first word — or a non-whitespace token.
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9_\-]*)\s*([:=])\s*"
-    r"(?:\"[^\"]*\"|'[^']*'|\S+)"
+    r'(?P<q>["\']?)(?P<key>[A-Za-z][A-Za-z0-9_\-]*)(?P=q)'
+    r"(?P<sep>\s*[:=]\s*)"
+    r'(?:"[^"]*"|\'[^\']*\'|\S+)'
 )
 
 
 def _redact_secret_assignment(match: re.Match[str]) -> str:
     """Redact the value of a secret-key assignment, preserving the key and separator."""
-    if is_secret_key(match.group(1)):
-        return f"{match.group(1)}{match.group(2)}{REDACTED}"
-    return str(match.group(0))
+    if is_secret_key(match.group("key")):
+        return (
+            f"{match.group('q')}{match.group('key')}{match.group('q')}"
+            f"{match.group('sep')}{REDACTED}"
+        )
+    return match.group(0)
 
 
 def redact_failure_summary(value: str) -> str:
@@ -181,8 +186,10 @@ class ExecutionBindingCreateRequest(BaseModel):
       the execution attaches to); the change request and session are
       optional and may still be unknown.
     * **Terminal callback** — ``completed`` / ``failed`` / ``cancelled``
-      keep the legacy terminal-only flow.  Failed or cancelled executions
-      persist without a change request or a session: when ``resource`` is
+      keep the legacy terminal-only flow.  A ``completed`` callback must
+      carry both a change request and a session (the execution is only
+      meaningful once it resolved both); failed or cancelled executions
+      persist without a change request or a session — when ``resource`` is
       omitted the caller must supply ``afk_run_id`` (the repository needs
       the run's provider to auto-provision only when no run is supplied).
     """
@@ -270,6 +277,28 @@ class ExecutionBindingCreateRequest(BaseModel):
         ):
             raise ValueError(
                 "resource or afk_run_id is required for a terminal execution binding"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_completed_requires_resource_and_session(
+        self,
+    ) -> ExecutionBindingCreateRequest:
+        """A completed execution must carry both a change request and a session.
+
+        There is no staged ``running`` row to draw identities from on the
+        direct terminal POST — the callback arrives with everything known at
+        completion.  A ``completed`` execution is only meaningful when it
+        names both the change request it resolved and the OpenCode session
+        it ran in.  Failed and cancelled executions may remain
+        resource/session-less (issue #600 review).
+        """
+        if self.outcome is ExecutionOutcome.COMPLETED and (
+            self.resource is None or self.external_session_id is None
+        ):
+            raise ValueError(
+                "resource and external_session_id are required when "
+                "outcome is 'completed'"
             )
         return self
 
