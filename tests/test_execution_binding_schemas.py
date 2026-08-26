@@ -281,13 +281,22 @@ class TestResponseSchemas:
             _valid_read_binding(
                 outcome="failed",
                 failure_reason="Transient AWX failure",
+                failure_summary="Process crashed",
                 source_event_id="eda-event-2",
             )
         )
         assert response.binding_id == "01HZX7S0KQ00000000000000"
         assert response.outcome is ExecutionOutcome.FAILED
         assert response.failure_reason == "Transient AWX failure"
+        assert response.failure_summary == "Process crashed"
         assert response.resource.resource_type is EntityType.CHANGE_REQUEST
+
+    def test_read_response_failure_summary_nullable(self) -> None:
+        """A binding without a failure_summary reads back with None."""
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding()
+        )
+        assert response.failure_summary is None
 
     def test_read_response_nullable_session_id(self) -> None:
         """A binding without a resolved session reads back with None."""
@@ -718,6 +727,122 @@ class TestFailureReasonRedaction:
 
 
 # ---------------------------------------------------------------------------
+# Failure-summary redaction + truncation (issue #564)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureSummary:
+    def test_failure_summary_defaults_to_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed")
+        )
+        assert request.failure_summary is None
+
+    def test_failed_with_failure_summary_accepted(self) -> None:
+        """A failed outcome accepts a bounded failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="Process crashed")
+        )
+        assert request.failure_summary == "Process crashed"
+
+    def test_completed_with_failure_summary_rejected(self) -> None:
+        """failure_summary is rejected on a completed outcome (issue #564)."""
+        with pytest.raises(ValidationError, match="failure_summary"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="completed", failure_summary="boom")
+            )
+
+    def test_failure_summary_redacts_bearer_token(self) -> None:
+        """A bare Bearer token is redacted regardless of key name."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="auth failed with Bearer abc123def456",
+            )
+        )
+        assert "abc123def456" not in request.failure_summary
+        assert "Bearer ***" in request.failure_summary
+
+    def test_failure_summary_redacts_provider_tokens(self) -> None:
+        """Common provider PAT prefixes are redacted regardless of key name."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="leaked ghp_abcdefghijklmnopqrstuvwxyz1234567890 token",
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_redacts_secret_assignments(self) -> None:
+        """Secret-like KEY=VALUE assignments are redacted in failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary=(
+                    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890 "
+                    "and DATABASE_PASSWORD=hunter2"
+                ),
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "hunter2" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_quoted_secret_redacted(self) -> None:
+        """JSON-style quoted secret values are redacted in failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary='{"password": "my secret password"}',
+            )
+        )
+        assert "my secret password" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_non_secret_assignment_untouched(self) -> None:
+        """A non-secret key's value is never redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="retries=3 and duration: 42s",
+            )
+        )
+        assert request.failure_summary == "retries=3 and duration: 42s"
+
+    def test_failure_summary_truncated_to_max_length(self) -> None:
+        """failure_summary is truncated (not rejected) beyond 1000 chars."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="x" * 2000)
+        )
+        assert request.failure_summary is not None
+        assert len(request.failure_summary) == 1000
+
+    def test_failure_summary_truncated_unicode(self) -> None:
+        """Unicode multi-byte chars are truncated by character count, not bytes."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="🔥" * 1200)
+        )
+        assert request.failure_summary is not None
+        assert len(request.failure_summary) == 1000
+        # Each 🔥 is a single character (4 bytes in UTF-8), so 1200 of them
+        # must truncate to exactly 1000 characters, not 250 (1000/4).
+        assert request.failure_summary == "🔥" * 1000
+
+    def test_failure_summary_redacted_before_truncated(self) -> None:
+        """Redaction runs before truncation so a secret straddling the
+        1000-character boundary never survives as a truncated token."""
+        secret = "Bearer " + "a" * 1500
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary=secret)
+        )
+        assert request.failure_summary is not None
+        assert "Bearer" not in request.failure_summary.replace("Bearer ***", "")
+        assert "Bearer ***" in request.failure_summary
+        assert len(request.failure_summary) <= 1000
+
+
+# ---------------------------------------------------------------------------
 # Terminal-update schema (issue #590)
 # ---------------------------------------------------------------------------
 
@@ -826,6 +951,38 @@ class TestTerminalUpdateSchema:
             _valid_update(outcome="failed", failure_reason="Bearer glpat-xyz leaked")
         )
         assert "glpat-xyz" not in request.failure_reason
+
+    def test_failed_with_failure_summary_accepted(self) -> None:
+        """A failed terminal update accepts a bounded failure_summary."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_summary="Process crashed")
+        )
+        assert request.failure_summary == "Process crashed"
+
+    def test_completed_with_failure_summary_rejected(self) -> None:
+        """failure_summary is rejected on a completed update (issue #564)."""
+        with pytest.raises(ValidationError, match="failure_summary"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="completed", failure_summary="boom")
+            )
+
+    def test_failure_summary_redacted_on_update(self) -> None:
+        """The PATCH path applies the same redaction as the POST path."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                outcome="failed",
+                failure_summary="env GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_truncated_on_update(self) -> None:
+        """The PATCH path truncates over-long failure summaries like POST."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_summary="🔥" * 1200)
+        )
+        assert request.failure_summary == "🔥" * 1000
 
     def test_unknown_fields_rejected(self) -> None:
         with pytest.raises(ValidationError):
