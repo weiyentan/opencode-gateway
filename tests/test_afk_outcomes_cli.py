@@ -377,6 +377,9 @@ async def test_show_evidence_emits_per_match_evidence_lines() -> None:
     assert "title_match" in joined
     assert "commit_reference" in joined
     assert "temporal_overlap" in joined
+    assert "afk_run_id=" in joined
+    assert "external_session_id='ses_111111'" in joined
+    assert "method='temporal_overlap'" in joined
 
 
 async def test_ambiguous_and_unmatched_are_reported() -> None:

@@ -129,6 +129,20 @@ class RedactingFormatter(logging.Formatter):
         return self._redact_message(formatted)
 
 
+def redact_text(message: str) -> str:
+    """Redact secret-like values from an arbitrary string.
+
+    Public wrapper around the formatter's message scanner for callers that
+    persist user-controlled text (e.g. opt-in backfill evidence lines): the
+    string is scanned for token formats and ``KEY=VALUE`` patterns whose key
+    looks secret-like, and matched values are replaced with ``***``.
+
+    >>> redact_text("Authorization: Bearer abc123")
+    'Authorization: Bearer ***'
+    """
+    return _REDACTOR._redact_message(message)
+
+
 def configure_root_logger(level: int = logging.INFO) -> None:
     """Install the :class:`RedactingFormatter` on the root logger.
 
@@ -154,3 +168,9 @@ def configure_root_logger(level: int = logging.INFO) -> None:
     ))
     root.addHandler(handler)
     root.setLevel(level)
+
+
+# Module-level formatter instance reused by :func:`redact_text` — the regexes
+# are compiled once in ``RedactingFormatter.__init__`` and the instance is
+# stateless afterwards.
+_REDACTOR = RedactingFormatter()

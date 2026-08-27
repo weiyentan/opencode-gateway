@@ -171,6 +171,35 @@ class Settings(BaseSettings):
             )
         return self
 
+    # AFK backfill API + worker (API-triggered AFK backfill).
+    # The dedicated ``backfill_api_key`` gates the /api/v1/backfill/* routes:
+    # configuring it enables the endpoints (clients present it in the
+    # ``X-Backfill-Key`` header).  The key value is never stored — job audit
+    # rows record ``backfill_api_key_label`` (the caller/key label) instead.
+    # Provider tokens remain server-side environment secrets.
+    backfill_api_key: str = ""
+    backfill_api_key_label: str = "backfill-api-key"
+    backfill_max_window_days: int = 31
+    backfill_retention_days: int = 90
+    backfill_worker_poll_seconds: float = 5.0
+    backfill_max_concurrent_jobs: int = 2
+    backfill_max_retries: int = 3
+    backfill_max_evidence_lines: int = 200
+    backfill_stale_running_hours: float = 24.0
+
+    @model_validator(mode="after")
+    def _validate_backfill_settings(self) -> Settings:
+        """Fail fast on nonsensical backfill bounds."""
+        if self.backfill_max_window_days < 1:
+            raise ValueError("GATEWAY_BACKFILL_MAX_WINDOW_DAYS must be at least 1")
+        if self.backfill_retention_days < 1:
+            raise ValueError("GATEWAY_BACKFILL_RETENTION_DAYS must be at least 1")
+        if self.backfill_max_retries < 0:
+            raise ValueError("GATEWAY_BACKFILL_MAX_RETRIES must be >= 0")
+        if self.backfill_max_concurrent_jobs < 1:
+            raise ValueError("GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS must be at least 1")
+        return self
+
 
 def get_settings() -> Settings:
     """Return a Settings instance for use as a FastAPI dependency."""

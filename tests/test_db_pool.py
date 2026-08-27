@@ -93,6 +93,70 @@ class TestDatabasePoolConnect:
             assert kwargs["max_inactive_connection_lifetime"] == 1800
 
 
+class TestDatabasePoolSsl:
+    """GATEWAY_DATABASE_SSL must reach asyncpg.create_pool for CNPG TLS."""
+
+    def test_gateway_database_ssl_env_maps_to_database_ssl(self, monkeypatch):
+        """Settings.database_ssl is fed by the GATEWAY_DATABASE_SSL env var."""
+        from app.core.config import Settings
+
+        monkeypatch.setenv("GATEWAY_DATABASE_SSL", "require")
+        assert Settings().database_ssl == "require"
+
+    @pytest.mark.asyncio
+    async def test_connect_passes_ssl_when_database_ssl_set(self):
+        """connect() forwards settings.database_ssl as the asyncpg ssl kwarg."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(database_ssl="require")
+
+        mock_pool = AsyncMock()
+        mock_create_pool = AsyncMock(return_value=mock_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+        _, kwargs = mock_create_pool.call_args
+        assert kwargs["ssl"] == "require"
+
+    @pytest.mark.asyncio
+    async def test_connect_omits_ssl_when_not_set(self):
+        """connect() passes no ssl kwarg when database_ssl is unset."""
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        settings = Settings(database_ssl=None)
+
+        mock_pool = AsyncMock()
+        mock_create_pool = AsyncMock(return_value=mock_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(settings)
+            await db_pool.connect()
+
+        _, kwargs = mock_create_pool.call_args
+        assert "ssl" not in kwargs
+
+
+class TestBackfillCliPoolSsl:
+    """The backfill CLI pool (scripts.afk_backfill._get_pool) also honors
+    GATEWAY_DATABASE_SSL so operator runs against CNPG require-TLS work."""
+
+    @pytest.mark.asyncio
+    async def test_backfill_cli_pool_passes_ssl(self, monkeypatch):
+        from unittest.mock import AsyncMock, patch
+
+        monkeypatch.setenv("GATEWAY_DATABASE_SSL", "require")
+        mock_create_pool = AsyncMock(return_value=AsyncMock())
+        with patch("scripts.afk_backfill.asyncpg.create_pool", mock_create_pool):
+            from scripts.afk_backfill import _get_pool
+
+            await _get_pool()
+
+        _, kwargs = mock_create_pool.call_args
+        assert kwargs["ssl"] == "require"
+
+
 class TestDatabasePoolEdgeCases:
     """Edge-case tests for DatabasePool methods."""
 

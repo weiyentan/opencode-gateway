@@ -62,6 +62,8 @@ LEGACY_RECORDS_QUERY = """
     ORDER BY our.id
 """
 
+LEGACY_RECORDS_BATCH_QUERY = LEGACY_RECORDS_QUERY + " LIMIT $1 OFFSET $2"
+
 INSERT_USAGE_EVENT_SQL = """
     INSERT INTO usage_events
         (id, canonical_source_identity_id, source_record_id,
@@ -122,6 +124,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Process at most N records (useful for phased backfill).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Commit progress after this many records (default: 1000).",
     )
     return parser.parse_args(argv)
 
@@ -357,32 +365,43 @@ async def main(argv: list[str] | None = None) -> int:
             # ── Step 3: Create synthetic ingest batch ────────────────
             batch_id = await _create_synthetic_batch(conn)
 
-            # ── Step 4: Stream records and backfill ──────────────────
+            # ── Step 4: Fetch and backfill in committed batches ───────
             limit = args.limit
+            if args.batch_size < 1:
+                raise ValueError("--batch-size must be at least 1")
             quarantine_skip_count = [0]  # mutable to share across calls
             records_processed = [0]
             records_skipped = 0
 
-            async for row in conn.cursor(LEGACY_RECORDS_QUERY):
-                if limit is not None and records_processed[0] >= limit:
-                    logger.info("Reached limit of %d record(s).", limit)
-                    break
-
-                inserted = await _backfill_record(
-                    conn, row, batch_id,
-                    quarantine_skip_count=quarantine_skip_count,
-                    records_processed=records_processed,
+            offset = 0
+            target = limit if limit is not None else mismatch_count
+            while True:
+                batch = await conn.fetch(
+                    LEGACY_RECORDS_BATCH_QUERY,
+                    args.batch_size if limit is None else min(args.batch_size, target - offset),
+                    offset,
                 )
-                if not inserted:
-                    records_skipped += 1
+                if not batch:
+                    break
+                async with conn.transaction():
+                    for row in batch:
+                        inserted = await _backfill_record(
+                            conn, row, batch_id,
+                            quarantine_skip_count=quarantine_skip_count,
+                            records_processed=records_processed,
+                        )
+                        if not inserted:
+                            records_skipped += 1
 
-                # Progress every 1000 records
                 total = records_processed[0] + records_skipped
-                if total % 1000 == 0:
-                    logger.info(
-                        "Progress: %d processed, %d skipped, %d quarantined.",
-                        records_processed[0], records_skipped, quarantine_skip_count[0],
-                    )
+                logger.info(
+                    "Committed batch: %d/%d records; %d created, %d skipped, %d quarantined.",
+                    total, target, records_processed[0], records_skipped,
+                    quarantine_skip_count[0],
+                )
+                offset += len(batch)
+                if limit is not None and offset >= target:
+                    break
 
             # ── Step 5: Summary ─────────────────────────────────────
             logger.info(

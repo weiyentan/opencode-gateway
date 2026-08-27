@@ -39,6 +39,11 @@ COPY app/ /app/app/
 # image before the build-time import check below.
 COPY afk_outcomes/ /app/afk_outcomes/
 
+# Copy the backfill engine — the API executes synchronous dry-runs through
+# ``scripts.afk_backfill.run_backfill`` (write jobs run in the dedicated
+# backfill worker container).
+COPY scripts/afk_backfill.py /app/scripts/afk_backfill.py
+
 # Copy Alembic migration configuration (needed for startup auto-migration).
 COPY alembic.ini /app/alembic.ini
 COPY alembic/ /app/alembic/

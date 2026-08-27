@@ -1,0 +1,105 @@
+---
+# Kubernetes Deployment for the OpenCode Gateway AFK Backfill Worker.
+#
+# This worker claims queued jobs from the durable ``afk_backfill_jobs`` table
+# (submitted through ``POST /api/v1/backfill/jobs``) and executes the existing
+# backfill orchestration (``scripts.afk_backfill.run_backfill``) with bounded
+# retries.  Jobs for the same provider/repository are serialized via a
+# session-level advisory lock; unrelated repositories may run concurrently
+# (bounded by GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS, and by scaling replicas).
+#
+# Provider tokens stay server-side secrets, mounted from
+# ``opencode-gateway-secrets`` — never accepted from API callers.
+#
+#   kubectl apply -f k8s/backfill-worker-deployment.yaml
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencode-backfill-worker
+  labels:
+    app: opencode-gateway
+    component: backfill-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode-gateway
+      component: backfill-worker
+  template:
+    metadata:
+      labels:
+        app: opencode-gateway
+        component: backfill-worker
+    spec:
+      containers:
+        - name: opencode-backfill-worker
+          image: ${REGISTRY}/opencode-gateway-backfill-worker:${IMAGE_TAG}
+          command: ["python", "-m", "app.backfill.worker"]
+          env:
+            - name: GATEWAY_DATABASE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-host
+            - name: GATEWAY_DATABASE_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-port
+            - name: GATEWAY_DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-name
+            - name: GATEWAY_DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-user
+            - name: GATEWAY_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-password
+            - name: GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS
+              value: "2"
+            - name: GATEWAY_BACKFILL_MAX_RETRIES
+              value: "3"
+            - name: GATEWAY_BACKFILL_RETENTION_DAYS
+              value: "90"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: github-token
+                  optional: true
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: gitlab-token
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Liveness probe: verifies PID 1 is alive AND its /proc/1/cmdline
+          # contains "app.backfill.worker". The exec-form `command` above
+          # makes the worker PID 1 by construction, so the probe checks the
+          # worker process itself.
+          #
+          # This probe command MUST stay byte-identical with the
+          # Dockerfile.backfill-worker HEALTHCHECK command.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os,sys; os.kill(1,0); sys.exit(0 if b'app.backfill.worker' in open('/proc/1/cmdline','rb').read() else 1)"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      restartPolicy: Always

@@ -146,7 +146,8 @@ CANONICAL_EVENT_LOCK_CLASS = 47_005
 
 Follows the ``app/db/lock.py`` convention (``PORT_LOCK_KEY`` = 47_001,
 ``CLEANUP_LOCK_CLASS`` = 47_002, ``REPLAY_LOCK_CLASS`` = 47_003,
-``RECONCILE_LOCK_CLASS`` = 47_004).  The low 32 bits are derived from
+``RECONCILE_LOCK_CLASS`` = 47_004, ``BACKFILL_LOCK_CLASS`` = 47_006).
+The low 32 bits are derived from
 ``hashtext(canonical_source_identity_id || source_record_id)`` so that
 concurrent first-delivery attempts for the same canonical identity and
 source record are serialised — the second blocks until the first commits,
@@ -608,8 +609,9 @@ RECONCILE_LOCK_CLASS = 47_004
 """High 32 bits of the two-arg reconciliation serialisation lock.
 
 Follows the ``app/db/lock.py`` convention (``PORT_LOCK_KEY`` = 47_001,
-``CLEANUP_LOCK_CLASS`` = 47_002, ``REPLAY_LOCK_CLASS`` = 47_003).
-The low 32 bits are derived from ``client_id.int & 0xFFFFFFFF`` to
+``CLEANUP_LOCK_CLASS`` = 47_002, ``REPLAY_LOCK_CLASS`` = 47_003,
+``BACKFILL_LOCK_CLASS`` = 47_006).  The low 32 bits are derived from
+``client_id.int & 0xFFFFFFFF`` to
 serialise concurrent reconciliation runs per client.
 """
 

@@ -107,10 +107,19 @@ All configuration uses the `GATEWAY_` prefix and is loaded via `pydantic-setting
 | `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Provider-events topic for the AFK outcome consumer (external; not created here) |
 | `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Dead-letter queue topic for poison AFK outcome messages |
 | `GATEWAY_AFK_OUTCOMES_CONSUMER_GROUP_ID` | `opencode-outcomes` | Kafka consumer group ID for the AFK outcome consumer (never shared with the usage consumer's `opencode-gateway` group) |
-| `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for reconciliation windows (`github` or `gitlab`) |
-| `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer reconciles |
-| `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Seconds between scheduled reconciliation windows |
-| `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds |
+| `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for backfill/reconciliation windows (`github` or `gitlab`) |
+| `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK backfill/reconciliation targets |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS` | `3600` | Preserved reconciliation cadence setting (no longer used by the consumer; retained for archival/reference) |
+| `GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS` | `86400` | Bounded reconciliation window size in seconds (used by the operator-invoked backfill) |
+| `GATEWAY_BACKFILL_API_KEY` | *(empty)* | Dedicated API key for `/api/v1/backfill/*` (clients send it in the `X-Backfill-Key` header). Configuring it enables the backfill endpoints; the key value is never stored — job audit rows record the label below |
+| `GATEWAY_BACKFILL_API_KEY_LABEL` | `backfill-api-key` | Caller/key label recorded in backfill job audit metadata |
+| `GATEWAY_BACKFILL_MAX_WINDOW_DAYS` | `31` | Maximum accepted backfill window (`from` → `until`) in days |
+| `GATEWAY_BACKFILL_RETENTION_DAYS` | `90` | Retention of completed/failed/cancelled backfill job rows before the worker prunes them |
+| `GATEWAY_BACKFILL_WORKER_POLL_SECONDS` | `5` | Worker poll interval for claiming queued jobs |
+| `GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS` | `2` | Maximum concurrently running backfill jobs per worker instance (unrelated repositories) |
+| `GATEWAY_BACKFILL_MAX_RETRIES` | `3` | Bounded retries with backoff for transient provider/database failures |
+| `GATEWAY_BACKFILL_MAX_EVIDENCE_LINES` | `200` | Bound on persisted opt-in evidence lines per job |
+| `GATEWAY_BACKFILL_STALE_RUNNING_HOURS` | `24` | Age after which a `running` job is reclaimed as `failed` (`interrupted`) by the worker sweep |
 | `GATEWAY_BASE_URL` | `http://localhost:8000` | Gateway base URL (used by the consumer to POST to `/ingest`) |
 | `GATEWAY_COLLECTOR_TOKEN` | | Collector bearer token for Gateway auth (used by the consumer) |
 
@@ -176,7 +185,8 @@ curl -f http://localhost:8080/health    # proxied to gateway by frontend nginx
 | **gateway** | `opencode-gateway`      | —         | 8000          | FastAPI application (internal — no host ports)         |
 | **postgres**| `opencode-gateway-db`   | 5432      | 5432          | PostgreSQL 15 (Alpine) with persistent volume          |
 | **kafka**   | `opencode-gateway-kafka`| —         | 9092          | Local KRaft Kafka broker (single node; internal — no host ports). Backstops both streaming consumers; the provider-events topic is external |
-| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the provider-events topic in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres, plus scheduled reconciliation |
+| **afk-outcomes-consumer** | `opencode-afk-outcomes-consumer` | — | — | AFK outcome consumer — reads the provider-events topic in its own group (`opencode-outcomes`) and writes canonical engineering events to Postgres. Live Kafka ingestion only; no scheduled reconciliation (terminal-state convergence is operator-invoked via the backfill CLI or API) |
+| **backfill-worker** | `opencode-backfill-worker` | — | — | AFK backfill worker — claims queued jobs from the durable `afk_backfill_jobs` table (submitted via the backfill API) and executes the existing backfill orchestration with bounded retries, per-repository serialization, and 90-day retention sweeps |
 
 > **Same-origin architecture:** The frontend nginx serves static files at `/` and proxies `/api/*`, `/health`, `/admin/*`, `/docs` and `/openapi.json` to `http://gateway:8000`. This avoids CORS entirely — the browser talks to a single origin. The Gateway is not directly accessible from the host; all traffic flows through the frontend proxy.
 
@@ -251,8 +261,9 @@ from provider engineering activity, correlated against Gateway sessions. The
 AFK outcome vocabulary is described in `CONTEXT.md` (AFK Run, `afk_run_id`,
 RunStatus, EngineeringOutcome, EngineeringOutcomeStatus, change_request,
 correlation_confidence, correlation_method, resolver_version, Provisional
-Link). Backfill remains CLI-only (`scripts/afk_backfill.py`); these endpoints
-never write.
+Link). These endpoints never write — backfill runs through the CLI
+(`scripts/afk_backfill.py`) or the authenticated AFK Backfill API
+(`/api/v1/backfill`).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -263,6 +274,29 @@ never write.
 
 All responses use the `{status, data, error}` envelope and are protected by the
 global API-key middleware, like every other non-`/health` route.
+
+### AFK Backfill
+
+Authenticated, API-triggered AFK backfill — the same windowed backfill
+orchestration as `scripts/afk_backfill.py`, submitted over HTTP instead of the
+CLI. Requires the dedicated `GATEWAY_BACKFILL_API_KEY` in the
+`X-Backfill-Key` header; configuring that key enables the endpoints (503 when
+unset). Provider credentials are never accepted in request data — tokens stay
+server-side environment secrets.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/backfill/jobs` | Submit a bounded backfill for one provider (`github`/`gitlab`) and repository with explicit `from`/`until` ISO-8601 bounds (max 31 days). `dry_run: true` (default) executes synchronously and returns the reused report counters without writing outcome rows; `dry_run: false` queues a durable job and returns `202` + job id. `show_evidence` opts into bounded, redacted evidence lines. |
+| `GET` | `/api/v1/backfill/jobs` | Paginated list of submitted jobs, optionally filtered by `status` (queued/running/completed/failed/cancelled). |
+| `GET` | `/api/v1/backfill/jobs/{job_id}` | One job's status, audit metadata (requested-by label, window, flags, retry count, failure category/message), and report counters on completion. 404 for unknown ids. |
+| `POST` | `/api/v1/backfill/jobs/{job_id}/cancel` | Cancel a queued job. Running jobs are not forcibly interrupted in v1 — cancelling anything but a queued job returns 409. |
+
+Jobs persist in PostgreSQL (`afk_backfill_jobs`) and survive Gateway restarts.
+The dedicated worker (`python -m app.backfill.worker`, container
+`Dockerfile.backfill-worker`) claims queued jobs, serializes per
+provider/repository via advisory locks, retries transient failures at most
+three times with backoff, reclaims stale `running` jobs after a crash, and
+prunes terminal rows after 90 days.
 
 ---
 

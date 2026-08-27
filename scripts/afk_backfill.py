@@ -313,6 +313,17 @@ def _evidence_lines(results: Sequence[ResolutionResult]) -> list[str]:
     """Per-match evidence lines: one per correlation and unresolved outcome."""
     lines: list[str] = []
     for result in results:
+        session_links = " ".join(
+            "session(" 
+            f"session_id={link.session_id!r},"
+            f"external_session_id={link.external_session_id!r},"
+            f"method={link.method!r},"
+            f"inferred={link.inferred},"
+            f"started_at={link.started_at.isoformat() if link.started_at else None!r},"
+            f"finished_at={link.finished_at.isoformat() if link.finished_at else None!r}"
+            ")"
+            for link in result.run.session_links
+        ) or "(none)"
         for c in sorted(result.run.correlations, key=lambda c: c.entity_id):
             evidence = " ".join(
                 f"{e.kind}(source={e.source_entity_id}, detail={e.detail!r},"
@@ -321,7 +332,9 @@ def _evidence_lines(results: Sequence[ResolutionResult]) -> list[str]:
             ) or "(none)"
             lines.append(
                 f"match {c.entity_id} method={c.method}"
-                f" confidence={c.correlation_confidence:g} evidence=[{evidence}]"
+                f" confidence={c.correlation_confidence:g}"
+                f" afk_run_id={result.run.afk_run_id}"
+                f" sessions=[{session_links}] evidence=[{evidence}]"
             )
         for item in result.unresolved:
             candidates = ", ".join(item.candidates) or "(none)"
@@ -574,9 +587,13 @@ def _build_adapter(provider: str) -> tuple[ProviderAdapter, _Closable]:
 
 
 async def _get_pool() -> asyncpg.Pool:
-    """Create a database connection pool from application settings."""
+    """Create a database connection pool from application settings.
+
+    Honors ``GATEWAY_DATABASE_SSL`` (settings.database_ssl) so backfill runs
+    against production CNPG clusters with ``ssl='require'`` work.
+    """
     settings = get_settings()
-    return await asyncpg.create_pool(
+    pool_kwargs = dict(
         host=settings.database_host,
         port=settings.database_port,
         database=settings.database_name,
@@ -585,6 +602,9 @@ async def _get_pool() -> asyncpg.Pool:
         min_size=1,
         max_size=2,
     )
+    if settings.database_ssl:
+        pool_kwargs["ssl"] = settings.database_ssl
+    return await asyncpg.create_pool(**pool_kwargs)
 
 
 async def main(argv: list[str] | None = None) -> int:

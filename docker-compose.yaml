@@ -27,6 +27,10 @@ services:
       GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
       GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
       GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      GATEWAY_BACKFILL_API_KEY: ${GATEWAY_BACKFILL_API_KEY:-}
+      GATEWAY_BACKFILL_API_KEY_LABEL: ${GATEWAY_BACKFILL_API_KEY_LABEL:-backfill-api-key}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
       GATEWAY_STATIC_DIR: /nonexistent
     depends_on:
       postgres:
@@ -143,6 +147,36 @@ services:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    restart: unless-stopped
+
+  # ── AFK Backfill Worker ──────────────────────────────────────────────
+  # Claims queued API-submitted backfill jobs from ``afk_backfill_jobs`` and
+  # executes the existing backfill orchestration.  Provider tokens come from
+  # the host environment (server-side secrets); per-repository serialization
+  # is enforced via advisory locks, and terminal job rows are pruned after
+  # GATEWAY_BACKFILL_RETENTION_DAYS.
+  backfill-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backfill-worker
+    container_name: opencode-backfill-worker
+    environment:
+      GATEWAY_DATABASE_HOST: postgres
+      GATEWAY_DATABASE_PORT: "5432"
+      GATEWAY_DATABASE_NAME: ${POSTGRES_DB:-opencode_gateway}
+      GATEWAY_DATABASE_USER: ${POSTGRES_USER:-opencode}
+      GATEWAY_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-opencode}
+      GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS: ${GATEWAY_BACKFILL_MAX_CONCURRENT_JOBS:-2}
+      GATEWAY_BACKFILL_MAX_RETRIES: ${GATEWAY_BACKFILL_MAX_RETRIES:-3}
+      GATEWAY_BACKFILL_RETENTION_DAYS: ${GATEWAY_BACKFILL_RETENTION_DAYS:-90}
+      GATEWAY_BACKFILL_WORKER_POLL_SECONDS: ${GATEWAY_BACKFILL_WORKER_POLL_SECONDS:-5}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+    depends_on:
+      postgres:
         condition: service_healthy
     networks:
       - gateway-net

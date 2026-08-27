@@ -14,7 +14,8 @@ read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
 
 All responses use the existing ``{status, data, error}`` envelope and are
 protected by the global :class:`~app.core.auth.ApiKeyMiddleware`.  This router
-is strictly read-only — backfill remains CLI-only (#449).
+is strictly read-only — backfill runs through the CLI (``scripts/afk_backfill``)
+or the authenticated AFK backfill API (``/api/v1/backfill``), never here.
 
 The read path maps 1:1 to stored columns and follows the ``app/api/usage.py``
 convention: raw asyncpg via ``Depends(get_session)``, explicit-column SELECTs,

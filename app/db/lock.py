@@ -25,6 +25,14 @@ CLEANUP_LOCK_CLASS = 47_002
 The low 32 bits are derived from the workspace UUID (``int & 0xFFFFFFFF``).
 """
 
+BACKFILL_LOCK_CLASS = 47_006
+"""High 32 bits of the two-arg per-repository backfill lock.
+
+The low 32 bits are derived from the (provider, repository) identity hash
+(see :func:`app.backfill.worker.repo_lock_key`); the session-level lock
+serializes backfill jobs per repository across worker instances.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Key generation
