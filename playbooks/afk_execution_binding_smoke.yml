@@ -1,0 +1,200 @@
+---
+# AWX smoke test for AFK run creation from an execution binding
+# (issue #581).
+#
+# Exercises the full identity chain the execution-binding write path
+# produces:
+#
+#   trigger event → awx_job_id → execution binding → AFK run (afk_run_id)
+#
+# Flow:
+#   1. POST /api/v1/afk/executions with trigger_type + source_event_id
+#      and assert the response carries a Gateway-owned 26-character ULID
+#      afk_run_id (first creation returns 201; a re-run of the same
+#      payload replays idempotently with 200).
+#   2. Replay the identical payload — must return 200 with the SAME
+#      afk_run_id (no duplicate row, no mutation).
+#   3. POST the same awx_job_id with a different payload — must return
+#      409 Conflict without mutating the stored binding.
+#   4. GET /api/v1/afk/executions/{awx_job_id} — must return the same
+#      afk_run_id plus the trigger_type / source_event_id readback.
+#   5. GET /api/v1/afk/executions resource history — must include the
+#      binding carrying the recorded afk_run_id.
+#
+# Requires (env vars or AWX extra_vars):
+#   - GATEWAY_URL          (default: http://localhost:8000)
+#   - GATEWAY_API_KEY      (Authorization: Bearer — the Admin API Key)
+#   - COLLECTOR_TOKEN      (X-Collector-Token — a collector credential
+#                           attributable to the dedicated
+#                           "awx-execution-bindings" client; never the
+#                           opencode-collector credential)
+#   - AWX_JOB_ID           (default: 1 — the idempotency key)
+#   - AWX_JOB_TEMPLATE_ID  (default: 7)
+#   - SOURCE_EVENT_ID      (default: smoke-evtest-0001 — required when
+#                           trigger_type is 'eda')
+#
+# Never logs or echoes the API key or collector token.
+
+- name: "AWX smoke — AFK run creation from execution binding (issue #581)"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    gateway_url: "{{ lookup('env', 'GATEWAY_URL') | default('http://localhost:8000', true) }}"
+    gateway_api_key: "{{ lookup('env', 'GATEWAY_API_KEY') | default('', true) }}"
+    collector_token: "{{ lookup('env', 'COLLECTOR_TOKEN') | default('', true) }}"
+    awx_job_id: "{{ lookup('env', 'AWX_JOB_ID') | default('1', true) }}"
+    job_template_id: "{{ lookup('env', 'AWX_JOB_TEMPLATE_ID') | default('7', true) | int }}"
+    external_session_id: "{{ lookup('env', 'EXTERNAL_SESSION_ID') | default('ses_smoke_0001', true) }}"
+    provider: "{{ lookup('env', 'PROVIDER') | default('github', true) }}"
+    repository: "{{ lookup('env', 'REPOSITORY_URL') | default('https://github.com/acme/proj', true) }}"
+    resource_type: "{{ lookup('env', 'RESOURCE_TYPE') | default('pull_request', true) }}"
+    resource_number: "{{ lookup('env', 'RESOURCE_NUMBER') | default('99', true) }}"
+    outcome: "{{ lookup('env', 'OUTCOME') | default('completed', true) }}"
+    trigger_type: "{{ lookup('env', 'TRIGGER_TYPE') | default('eda', true) }}"
+    source_event_id: "{{ lookup('env', 'SOURCE_EVENT_ID') | default('smoke-evtest-0001', true) }}"
+    branch: "{{ lookup('env', 'BRANCH') | default('smoke/afk-run-creation', true) }}"
+    title: "{{ lookup('env', 'TITLE') | default('AFK run creation smoke test', true) }}"
+    execution_binding_payload:
+      awx_job:
+        job_id: "{{ awx_job_id }}"
+        job_template_id: "{{ job_template_id }}"
+      external_session_id: "{{ external_session_id }}"
+      resource:
+        provider: "{{ provider }}"
+        repository: "{{ repository }}"
+        resource_type: "{{ resource_type }}"
+        resource_number: "{{ resource_number }}"
+      outcome: "{{ outcome }}"
+      trigger_type: "{{ trigger_type }}"
+      source_event_id: "{{ source_event_id }}"
+      branch: "{{ branch }}"
+      title: "{{ title }}"
+    conflicting_payload: "{{ execution_binding_payload | combine({'outcome': 'failed'}) }}"
+    repository_url_encoded: "{{ repository | replace('/', '%2F') | replace(':', '%3A') }}"
+    history_url: "{{ gateway_url }}/api/v1/afk/executions?provider={{ provider }}&repository_url={{ repository_url_encoded }}&entity_type=change_request&entity_number={{ resource_number }}"
+
+  tasks:
+    - name: Validate required credentials are provided
+      ansible.builtin.fail:
+        msg: "gateway_api_key and collector_token must be provided via env vars or extra_vars"
+      when: gateway_api_key == '' or collector_token == ''
+
+    - name: Validate event-driven triggers carry a source event id
+      ansible.builtin.fail:
+        msg: "source_event_id is required when trigger_type is 'eda'"
+      when: trigger_type == 'eda' and source_event_id == ''
+
+    - name: POST execution binding (create or idempotent replay)
+      ansible.builtin.uri:
+        url: "{{ gateway_url }}/api/v1/afk/executions"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+          X-Collector-Token: "{{ collector_token }}"
+        body_format: json
+        body: "{{ execution_binding_payload }}"
+        status_code: [200, 201]
+        return_content: true
+        validate_certs: false
+      register: first_post
+
+    - name: Assert provisional afk_run_id is a 26-character ULID
+      ansible.builtin.assert:
+        that:
+          - first_post.json.status == "ok"
+          - first_post.json.data.afk_run_id is regex('^[0-9A-HJKMNP-TV-Z]{26}$')
+          - first_post.json.data.awx_job.job_id == (awx_job_id | string)
+        fail_msg: "POST did not return a Gateway-owned 26-char ULID afk_run_id"
+        success_msg: "Gateway returned afk_run_id {{ first_post.json.data.afk_run_id }} for awx_job_id {{ awx_job_id }}"
+
+    - name: Replay identical payload (idempotency)
+      ansible.builtin.uri:
+        url: "{{ gateway_url }}/api/v1/afk/executions"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+          X-Collector-Token: "{{ collector_token }}"
+        body_format: json
+        body: "{{ execution_binding_payload }}"
+        status_code: 200
+        return_content: true
+        validate_certs: false
+      register: replay_post
+
+    - name: Assert identical replay returns the same afk_run_id
+      ansible.builtin.assert:
+        that:
+          - replay_post.json.status == "ok"
+          - replay_post.json.data.afk_run_id == first_post.json.data.afk_run_id
+        fail_msg: "Idempotent replay returned a different afk_run_id"
+        success_msg: "Idempotent replay preserved afk_run_id {{ replay_post.json.data.afk_run_id }}"
+
+    - name: POST conflicting payload for the same awx_job_id (expect 409)
+      ansible.builtin.uri:
+        url: "{{ gateway_url }}/api/v1/afk/executions"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+          X-Collector-Token: "{{ collector_token }}"
+        body_format: json
+        body: "{{ conflicting_payload }}"
+        status_code: 409
+        return_content: true
+        validate_certs: false
+      register: conflict_post
+
+    - name: Assert conflicting payload was rejected without mutation
+      ansible.builtin.assert:
+        that:
+          - conflict_post.status == 409
+        fail_msg: "Conflicting payload was not rejected with 409 Conflict"
+        success_msg: "Conflicting payload rejected with 409 Conflict (no mutation)"
+
+    - name: GET execution binding by AWX job id (readback)
+      ansible.builtin.uri:
+        url: "{{ gateway_url }}/api/v1/afk/executions/{{ awx_job_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+        status_code: 200
+        return_content: true
+        validate_certs: false
+      register: readback
+
+    - name: Assert GET readback returns the same afk_run_id and trigger metadata
+      ansible.builtin.assert:
+        that:
+          - readback.json.status == "ok"
+          - readback.json.data.afk_run_id == first_post.json.data.afk_run_id
+          - readback.json.data.trigger_type == trigger_type
+          - readback.json.data.source_event_id == source_event_id
+        fail_msg: "GET readback did not preserve afk_run_id / trigger provenance"
+        success_msg: "GET readback preserved afk_run_id and trigger provenance"
+
+    - name: GET resource history (execution bindings for the resource)
+      ansible.builtin.uri:
+        url: "{{ history_url }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+        status_code: 200
+        return_content: true
+        validate_certs: false
+      register: history
+
+    - name: Assert resource history includes the binding with the recorded afk_run_id
+      ansible.builtin.assert:
+        that:
+          - history.json.status == "ok"
+          - history.json.data.bindings | selectattr('afk_run_id', 'equalto', first_post.json.data.afk_run_id) | list | length > 0
+        fail_msg: "Resource history does not expose the recorded afk_run_id"
+        success_msg: "Resource history exposes the recorded afk_run_id"
+
+    - name: Summarize smoke result
+      ansible.builtin.debug:
+        msg: >-
+          AFK run creation smoke passed: awx_job_id={{ awx_job_id }},
+          afk_run_id={{ first_post.json.data.afk_run_id }},
+          trigger_type={{ trigger_type }},
+          source_event_id={{ source_event_id }},
+          binding_id={{ first_post.json.data.binding_id }}

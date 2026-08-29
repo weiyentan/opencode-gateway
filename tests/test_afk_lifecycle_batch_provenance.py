@@ -366,10 +366,14 @@ class TestExecutionBindingMultiplicity:
     ) -> None:
         """A supplied afk_run_id links the binding to the existing lifecycle."""
         mock_conn.fetchrow = AsyncMock(
-            side_effect=[None, mock_row({"afk_run_id": _SUPPLIED_RUN_ID})]
+            side_effect=[
+                None,  # no existing binding
+                mock_row({"afk_run_id": _SUPPLIED_RUN_ID}),
+                None,  # no other lifecycle owns this change request
+            ]
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        mock_conn.execute = AsyncMock()
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
 
         repo = AsyncpgOutcomeRepository(mock_conn)
         result = _run(
@@ -628,12 +632,19 @@ class TestExecutionBindingApiMultiplicity:
         """A callback with a pre-provisioned afk_run_id attaches to it (201)."""
         conn = _mk_conn()
         saved_row = _mk_binding_row(afk_run_id=_RUN_ID)
-        # auth → existing binding (None) → run lookup → re-read after insert
+        # auth → existing binding (None) → run lookup → ownership check (None)
+        # → re-read after insert
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, mock_row({"afk_run_id": _RUN_ID}), saved_row]
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row({"afk_run_id": _RUN_ID}),
+                None,
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        conn.execute = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
         client = create_client(conn)
 
         resp = await client.post(

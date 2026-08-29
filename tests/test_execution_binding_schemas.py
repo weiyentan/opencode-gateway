@@ -19,6 +19,8 @@ from app.core.schemas.execution_binding import (
     ExecutionBindingHistoryResponse,
     ExecutionBindingReadResponse,
     ExecutionBindingResourceIn,
+    ExecutionBindingUpdateRequest,
+    redact_failure_summary,
 )
 from afk_outcomes.models import (
     EntityType,
@@ -109,10 +111,12 @@ class TestRequiredFields:
         with pytest.raises(ValidationError):
             ExecutionBindingCreateRequest.model_validate(payload)
 
-    def test_missing_session_id_rejected(self) -> None:
+    def test_missing_session_id_on_completed_rejected(self) -> None:
+        """Issue #600 review: a completed POST must carry a session — the direct
+        terminal callback has no staged running row to draw it from."""
         payload = _valid_request()
         del payload["external_session_id"]
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match="external_session_id"):
             ExecutionBindingCreateRequest.model_validate(payload)
 
     def test_empty_session_id_rejected(self) -> None:
@@ -152,6 +156,7 @@ class TestOptionalFields:
     def test_optional_metadata_preserved(self) -> None:
         request = ExecutionBindingCreateRequest.model_validate(
             _valid_request(
+                outcome="failed",
                 source_event_id="eda-event-9",
                 branch="feature/execution-binding",
                 title="Implement execution binding",
@@ -200,7 +205,9 @@ class TestInvalidPayloads:
 
     def test_invalid_outcome_rejected(self) -> None:
         with pytest.raises(ValidationError, match="outcome"):
-            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="in_progress")
+            )
 
     def test_outcome_must_be_terminal(self) -> None:
         with pytest.raises(ValidationError):
@@ -274,13 +281,22 @@ class TestResponseSchemas:
             _valid_read_binding(
                 outcome="failed",
                 failure_reason="Transient AWX failure",
+                failure_summary="Process crashed",
                 source_event_id="eda-event-2",
             )
         )
         assert response.binding_id == "01HZX7S0KQ00000000000000"
         assert response.outcome is ExecutionOutcome.FAILED
         assert response.failure_reason == "Transient AWX failure"
+        assert response.failure_summary == "Process crashed"
         assert response.resource.resource_type is EntityType.CHANGE_REQUEST
+
+    def test_read_response_failure_summary_nullable(self) -> None:
+        """A binding without a failure_summary reads back with None."""
+        response = ExecutionBindingReadResponse.model_validate(
+            _valid_read_binding()
+        )
+        assert response.failure_summary is None
 
     def test_read_response_nullable_session_id(self) -> None:
         """A binding without a resolved session reads back with None."""
@@ -474,3 +490,502 @@ class TestExtraForbidPreserved:
         payload["resource"]["bogus"] = "nope"
         with pytest.raises(ValidationError):
             ExecutionBindingCreateRequest.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
+# Two-phase lifecycle create validation (issue #590)
+# ---------------------------------------------------------------------------
+
+
+class TestTwoPhaseCreateValidation:
+    def test_running_with_afk_run_id_validates(self) -> None:
+        """Start-time provisioning attaches to a pre-provisioned lifecycle."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="running",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                external_session_id=None,
+                resource=None,
+                started_at="2026-08-21T01:02:03Z",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.RUNNING
+        assert request.afk_run_id == "01JZABCDEFGHJKLMNPQRSTVWXY"
+        assert request.external_session_id is None
+        assert request.resource is None
+
+    def test_running_requires_afk_run_id(self) -> None:
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+
+    def test_terminal_without_resource_requires_afk_run_id(self) -> None:
+        with pytest.raises(ValidationError, match="resource or afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", resource=None, external_session_id=None)
+            )
+
+    def test_failed_without_resource_or_session_with_run_validates(self) -> None:
+        """Failed executions persist without a change request or session."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                resource=None,
+                external_session_id=None,
+                failure_reason="AWX job crashed before launch",
+            )
+        )
+        assert request.resource is None
+        assert request.external_session_id is None
+        assert request.failure_reason == "AWX job crashed before launch"
+
+    def test_failed_without_session_validates(self) -> None:
+        """A terminal callback may omit the session (still unresolved)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", external_session_id=None)
+        )
+        assert request.external_session_id is None
+        assert request.resource is not None
+
+    def test_completed_without_resource_rejected_even_with_run(self) -> None:
+        """Issue #600 review: a completed POST must carry a change request —
+        supplying ``afk_run_id`` alone does not excuse a resource-less
+        completed execution."""
+        with pytest.raises(ValidationError, match="resource and external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    outcome="completed",
+                    afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                    resource=None,
+                    external_session_id="ses_known",
+                )
+            )
+
+    def test_completed_without_session_rejected_even_with_run(self) -> None:
+        """Issue #600 review: a completed POST must carry a session even when
+        the change request is present."""
+        with pytest.raises(ValidationError, match="resource and external_session_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(
+                    outcome="completed",
+                    afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+                    external_session_id=None,
+                )
+            )
+
+    def test_completed_with_resource_and_session_validates(self) -> None:
+        """A completed POST carrying both identities is accepted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="completed",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.COMPLETED
+
+    def test_completed_with_failure_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="completed", failure_reason="boom")
+            )
+
+    def test_failed_with_failure_reason_accepted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="boom")
+        )
+        assert request.failure_reason == "boom"
+
+
+# ---------------------------------------------------------------------------
+# Failure-summary redaction (issue #590)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureReasonRedaction:
+    def test_bearer_token_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="auth failed: Bearer abc123secret for job",
+            )
+        )
+        assert request.failure_reason == "auth failed: Bearer *** for job"
+
+    def test_provider_token_prefixes_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="token ghp_abc123 leaked")
+        )
+        assert "ghp_abc123" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_secret_assignment_redacted(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="env GITHUB_TOKEN=ghp_secret and password: hunter2",
+            )
+        )
+        assert "ghp_secret" not in request.failure_reason
+        assert "hunter2" not in request.failure_reason
+
+    def test_secret_assignment_with_token_prefix_fully_redacted(self) -> None:
+        """A key=value assignment whose value carries a token prefix is fully
+        redacted — the whole value (including the prefix) is replaced, never
+        left as ``key=***abc123``.  The secret-assignment rule must run before
+        the bare token-prefix rule so the prefix is not consumed first."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="env GITHUB_TOKEN=ghp_abc123 leaked",
+            )
+        )
+        assert "ghp_abc123" not in request.failure_reason
+        assert "GITHUB_TOKEN=***" in request.failure_reason
+
+    def test_quoted_secret_redacted(self) -> None:
+        """Quoted secret values like password=\"my secret\" are fully redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='env PASSWORD="my secret password"',
+            )
+        )
+        assert "my secret password" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_json_style_double_quoted_key_redacted(self) -> None:
+        """JSON-style payloads with double-quoted secret keys are redacted
+        (issue #600 review: ``{\"password\": \"my secret\"}`` never persists
+        the raw value)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"password": "my secret password"}',
+            )
+        )
+        assert "my secret password" not in request.failure_reason
+        assert request.failure_reason == '{"password": ***}'
+
+    def test_json_style_single_quoted_key_redacted(self) -> None:
+        """Single-quoted JSON-style secret keys are redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason="{ 'password': 'secret value' }",
+            )
+        )
+        assert "secret value" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_json_style_api_key_redacted(self) -> None:
+        """``\"api_key\": \"...\"`` — a quoted plain value with no known token
+        prefix — is redacted (previously leaked)."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"api_key": "api-key-value-1"}',
+            )
+        )
+        assert "api-key-value-1" not in request.failure_reason
+        assert request.failure_reason == '{"api_key": ***}'
+
+    def test_json_style_token_value_redacted(self) -> None:
+        """A known token prefix inside a JSON-style quoted value is redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"token": "ghp_abc123secret"}',
+            )
+        )
+        assert "ghp_abc123secret" not in request.failure_reason
+        assert "***" in request.failure_reason
+
+    def test_json_style_spaced_key_redacted(self) -> None:
+        """A space between the quoted key and the colon is still redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_reason='{"password" : "spaced key"}',
+            )
+        )
+        assert "spaced key" not in request.failure_reason
+
+    def test_ordinary_text_untouched(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_reason="Process exited with code 1")
+        )
+        assert request.failure_reason == "Process exited with code 1"
+
+    def test_redact_failure_summary_helper_none_handling(self) -> None:
+        assert redact_failure_summary("plain text") == "plain text"
+
+    def test_bounded_length_still_enforced_after_redaction(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", failure_reason="x" * 1001)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Failure-summary redaction + truncation (issue #564)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureSummary:
+    def test_failure_summary_defaults_to_none(self) -> None:
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed")
+        )
+        assert request.failure_summary is None
+
+    def test_failed_with_failure_summary_accepted(self) -> None:
+        """A failed outcome accepts a bounded failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="Process crashed")
+        )
+        assert request.failure_summary == "Process crashed"
+
+    def test_completed_with_failure_summary_rejected(self) -> None:
+        """failure_summary is rejected on a completed outcome (issue #564)."""
+        with pytest.raises(ValidationError, match="failure_summary"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="completed", failure_summary="boom")
+            )
+
+    def test_failure_summary_redacts_bearer_token(self) -> None:
+        """A bare Bearer token is redacted regardless of key name."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="auth failed with Bearer abc123def456",
+            )
+        )
+        assert "abc123def456" not in request.failure_summary
+        assert "Bearer ***" in request.failure_summary
+
+    def test_failure_summary_redacts_provider_tokens(self) -> None:
+        """Common provider PAT prefixes are redacted regardless of key name."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="leaked ghp_abcdefghijklmnopqrstuvwxyz1234567890 token",
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_redacts_secret_assignments(self) -> None:
+        """Secret-like KEY=VALUE assignments are redacted in failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary=(
+                    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890 "
+                    "and DATABASE_PASSWORD=hunter2"
+                ),
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "hunter2" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_quoted_secret_redacted(self) -> None:
+        """JSON-style quoted secret values are redacted in failure_summary."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary='{"password": "my secret password"}',
+            )
+        )
+        assert "my secret password" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_non_secret_assignment_untouched(self) -> None:
+        """A non-secret key's value is never redacted."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="failed",
+                failure_summary="retries=3 and duration: 42s",
+            )
+        )
+        assert request.failure_summary == "retries=3 and duration: 42s"
+
+    def test_failure_summary_truncated_to_max_length(self) -> None:
+        """failure_summary is truncated (not rejected) beyond 1000 chars."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="x" * 2000)
+        )
+        assert request.failure_summary is not None
+        assert len(request.failure_summary) == 1000
+
+    def test_failure_summary_truncated_unicode(self) -> None:
+        """Unicode multi-byte chars are truncated by character count, not bytes."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary="🔥" * 1200)
+        )
+        assert request.failure_summary is not None
+        assert len(request.failure_summary) == 1000
+        # Each 🔥 is a single character (4 bytes in UTF-8), so 1200 of them
+        # must truncate to exactly 1000 characters, not 250 (1000/4).
+        assert request.failure_summary == "🔥" * 1000
+
+    def test_failure_summary_redacted_before_truncated(self) -> None:
+        """Redaction runs before truncation so a secret straddling the
+        1000-character boundary never survives as a truncated token."""
+        secret = "Bearer " + "a" * 1500
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(outcome="failed", failure_summary=secret)
+        )
+        assert request.failure_summary is not None
+        assert "Bearer" not in request.failure_summary.replace("Bearer ***", "")
+        assert "Bearer ***" in request.failure_summary
+        assert len(request.failure_summary) <= 1000
+
+
+# ---------------------------------------------------------------------------
+# Terminal-update schema (issue #590)
+# ---------------------------------------------------------------------------
+
+
+def _valid_update(**overrides) -> dict:
+    payload = {"outcome": "completed", "finished_at": "2026-08-21T01:05:00Z"}
+    payload.update(overrides)
+    return payload
+
+
+class TestTerminalUpdateSchema:
+    def test_minimal_update_validates(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                },
+                external_session_id="ses_abc123",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.COMPLETED
+        assert request.failure_reason is None
+        assert request.resource is not None
+        assert request.external_session_id == "ses_abc123"
+
+    def test_completed_without_resource_validates(self) -> None:
+        """A completed update may omit the change-request identity — the
+        stored row or the repository's post-merge check governs it
+        (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(external_session_id="ses_abc123")
+        )
+        assert request.resource is None
+        assert request.external_session_id == "ses_abc123"
+
+    def test_completed_without_session_validates(self) -> None:
+        """A completed update may omit the session — the repository enforces
+        the completed invariant after merge (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                }
+            )
+        )
+        assert request.external_session_id is None
+        assert request.resource is not None
+
+    def test_completed_without_resource_or_session_validates(self) -> None:
+        """A completed update with neither identity is schema-valid — the
+        repository rejects the transition as a conflict after merge
+        (issue #600 review)."""
+        request = ExecutionBindingUpdateRequest.model_validate(_valid_update())
+        assert request.outcome is ExecutionOutcome.COMPLETED
+        assert request.resource is None
+        assert request.external_session_id is None
+
+    def test_running_outcome_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="terminal"):
+            ExecutionBindingUpdateRequest.model_validate(_valid_update(outcome="running"))
+
+    def test_invalid_outcome_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="outcome"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="in_progress")
+            )
+
+    def test_failed_without_resource_or_session_validates(self) -> None:
+        """Failed/cancelled terminal updates need no change request or session."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_reason="Timeout after 300s")
+        )
+        assert request.outcome is ExecutionOutcome.FAILED
+        assert request.failure_reason == "Timeout after 300s"
+
+    def test_completed_with_failure_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="failure_reason"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="completed", failure_reason="boom")
+            )
+
+    def test_resource_fill_in_accepted(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                outcome="completed",
+                resource={
+                    "provider": "github",
+                    "repository": "owner/repo",
+                    "resource_type": "pull_request",
+                    "resource_number": "101",
+                },
+                external_session_id="ses_abc123",
+            )
+        )
+        assert request.resource is not None
+        assert request.resource.to_provider_resource_identity().resource_number == "101"
+
+    def test_failure_reason_redacted_on_update(self) -> None:
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_reason="Bearer glpat-xyz leaked")
+        )
+        assert "glpat-xyz" not in request.failure_reason
+
+    def test_failed_with_failure_summary_accepted(self) -> None:
+        """A failed terminal update accepts a bounded failure_summary."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_summary="Process crashed")
+        )
+        assert request.failure_summary == "Process crashed"
+
+    def test_completed_with_failure_summary_rejected(self) -> None:
+        """failure_summary is rejected on a completed update (issue #564)."""
+        with pytest.raises(ValidationError, match="failure_summary"):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(outcome="completed", failure_summary="boom")
+            )
+
+    def test_failure_summary_redacted_on_update(self) -> None:
+        """The PATCH path applies the same redaction as the POST path."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(
+                outcome="failed",
+                failure_summary="env GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+            )
+        )
+        assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in request.failure_summary
+        assert "***" in request.failure_summary
+
+    def test_failure_summary_truncated_on_update(self) -> None:
+        """The PATCH path truncates over-long failure summaries like POST."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            _valid_update(outcome="failed", failure_summary="🔥" * 1200)
+        )
+        assert request.failure_summary == "🔥" * 1000
+
+    def test_unknown_fields_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionBindingUpdateRequest.model_validate(
+                _valid_update(extra_vars={"secret": "x"})
+            )

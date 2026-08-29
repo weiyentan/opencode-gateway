@@ -20,11 +20,13 @@ import re
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
+import pytest
 
 from afk_outcomes import AsyncpgOutcomeRepository
 from afk_outcomes.models import EntityType, Provider, TriggerType
 from afk_outcomes.repository import (
     ChangeRequestBindingResult,
+    ChangeRequestLookupResult,
     ProvisionAFKRunResult,
 )
 from afk_outcomes.serialization import SequenceULID
@@ -510,6 +512,55 @@ def test_bind_lost_race_reclassifies_as_replay(mock_conn: AsyncMock) -> None:
     assert result.is_bound is False
 
 
+def test_bind_same_lifecycle_same_cr_found_in_precheck_is_replay(
+    mock_conn: AsyncMock,
+) -> None:
+    """Issue #600 review: the pre-check finding the requested lifecycle itself
+    as the owner of the identical change request is re-read, verified, and
+    classified as an idempotent replay — never a false 409."""
+    unbound = _bound_run_row()
+    same_run_owner = _bound_run_row()
+    rebound = _bound_run_row(
+        cr_provider="gitlab",
+        cr_repository="gitlab.com/cnp/cnp",
+        cr_external_id="6",
+    )
+    mock_conn.fetchrow = AsyncMock(side_effect=[unbound, same_run_owner, rebound])
+    mock_conn.execute = AsyncMock()
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.bind_change_request(**_binding_kwargs()))
+
+    assert result.is_conflict is False
+    assert result.is_bound is False
+    assert result.run_missing is False
+    assert _update_calls(mock_conn) == []
+
+
+def test_bind_same_lifecycle_rebound_to_different_cr_is_conflict(
+    mock_conn: AsyncMock,
+) -> None:
+    """Issue #600 review: the pre-check finding the requested lifecycle as
+    owner, but the re-read tuple differing, is a genuine conflict — the
+    lifecycle was rebound to a different identity."""
+    unbound = _bound_run_row()
+    same_run_owner = _bound_run_row()
+    rebound = _bound_run_row(
+        cr_provider="gitlab",
+        cr_repository="gitlab.com/cnp/other",
+        cr_external_id="9",
+    )
+    mock_conn.fetchrow = AsyncMock(side_effect=[unbound, same_run_owner, rebound])
+    mock_conn.execute = AsyncMock()
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.bind_change_request(**_binding_kwargs()))
+
+    assert result.is_conflict is True
+    assert result.is_bound is False
+    assert _update_calls(mock_conn) == []
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  get_afk_run_lifecycle
 # ══════════════════════════════════════════════════════════════════════════
@@ -617,3 +668,95 @@ def test_get_lifecycle_select_includes_all_lifecycle_columns(
     ):
         assert col in sql, f"SELECT missing column: {col}"
     assert "WHERE afk_run_id = $1" in sql
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  get_afk_run_by_change_request — change-request -> owning run lookup
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _lookup_kwargs(
+    *,
+    provider: Provider = Provider.GITLAB,
+    repository: str = "gitlab.com/cnp/cnp",
+    external_id: str = "6",
+) -> dict:
+    return {
+        "provider": provider,
+        "repository": repository,
+        "external_id": external_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lookup_returns_owning_run(mock_conn: AsyncMock) -> None:
+    """A bound change request resolves to its owning afk_run_id."""
+    mock_conn.fetch = AsyncMock(
+        return_value=[mock_row({"afk_run_id": _NEW_ULID})]
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
+
+    assert isinstance(result, ChangeRequestLookupResult)
+    assert result.afk_run_id == _NEW_ULID
+    assert result.is_conflict is False
+
+
+@pytest.mark.asyncio
+async def test_lookup_queries_only_change_request_binding_columns(
+    mock_conn: AsyncMock,
+) -> None:
+    """The SELECT filters on the three explicit binding columns only."""
+    mock_conn.fetch = AsyncMock(return_value=[])
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    await repo.get_afk_run_by_change_request(**_lookup_kwargs())
+
+    sql, *args = mock_conn.fetch.call_args[0]
+    assert "FROM afk_runs" in sql
+    assert "WHERE change_request_provider = $1" in sql
+    assert "AND change_request_repository = $2" in sql
+    assert "AND change_request_external_id = $3" in sql
+    assert tuple(args) == ("gitlab", "gitlab.com/cnp/cnp", "6")
+
+
+@pytest.mark.asyncio
+async def test_lookup_unbound_returns_none(mock_conn: AsyncMock) -> None:
+    """An unknown or unbound change request returns no owning run."""
+    mock_conn.fetch = AsyncMock(return_value=[])
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
+
+    assert result.afk_run_id is None
+    assert result.is_conflict is False
+
+
+@pytest.mark.asyncio
+async def test_lookup_multiple_owners_is_conflict(mock_conn: AsyncMock) -> None:
+    """More than one lifecycle claiming the change request is a conflict."""
+    mock_conn.fetch = AsyncMock(
+        return_value=[
+            mock_row({"afk_run_id": _NEW_ULID}),
+            mock_row({"afk_run_id": "01HOTHER000000000000000001"}),
+        ]
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = await repo.get_afk_run_by_change_request(**_lookup_kwargs())
+
+    assert result.is_conflict is True
+    assert result.afk_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_lookup_is_read_only(mock_conn: AsyncMock) -> None:
+    """The lookup issues only a SELECT — no writes."""
+    mock_conn.fetch = AsyncMock(return_value=[])
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    await repo.get_afk_run_by_change_request(**_lookup_kwargs())
+
+    assert mock_conn.execute.call_count == 0
+    assert mock_conn.fetchrow.call_count == 0

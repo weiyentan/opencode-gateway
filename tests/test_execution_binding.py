@@ -30,8 +30,16 @@ class TestExecutionOutcome:
         assert ExecutionOutcome.FAILED == "failed"
         assert ExecutionOutcome.CANCELLED == "cancelled"
 
-    def test_only_three_members(self) -> None:
-        assert len(ExecutionOutcome) == 3
+    def test_running_member_for_two_phase_lifecycle(self) -> None:
+        """Issue #590: the two-phase lifecycle adds a provisional ``running``."""
+        assert ExecutionOutcome.RUNNING == "running"
+        assert ExecutionOutcome.RUNNING.is_terminal is False
+        assert ExecutionOutcome.COMPLETED.is_terminal is True
+        assert ExecutionOutcome.FAILED.is_terminal is True
+        assert ExecutionOutcome.CANCELLED.is_terminal is True
+
+    def test_four_members(self) -> None:
+        assert len(ExecutionOutcome) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -163,4 +171,29 @@ class TestExecutionBinding:
             self._make_binding(
                 outcome=ExecutionOutcome.FAILED,
                 failure_reason="x" * 1001,
+            )
+
+    def test_failure_summary_defaults_to_none(self) -> None:
+        binding = self._make_binding()
+        assert binding.failure_summary is None
+
+    def test_failure_summary_accepted(self) -> None:
+        binding = self._make_binding(
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="Process crashed",
+        )
+        assert binding.failure_summary == "Process crashed"
+
+    def test_failure_summary_bounded(self) -> None:
+        binding = self._make_binding(
+            outcome=ExecutionOutcome.FAILED,
+            failure_summary="x" * 1000,
+        )
+        assert len(binding.failure_summary) == 1000
+
+    def test_failure_summary_exceeds_max_rejected(self) -> None:
+        with pytest.raises(ValueError, match="failure_summary"):
+            self._make_binding(
+                outcome=ExecutionOutcome.FAILED,
+                failure_summary="x" * 1001,
             )
