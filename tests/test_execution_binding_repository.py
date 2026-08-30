@@ -1562,6 +1562,32 @@ class TestUpdateExecutionBindingTerminal:
         assert result.is_conflict is False
         assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
 
+    def test_terminal_replay_omitting_failure_metadata_is_idempotent(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """Omitted optional failure metadata does not conflict with stored values."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    outcome="failed",
+                    failure_reason="Timeout",
+                    failure_summary="Process crashed",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+        )
+
+        assert result.is_updated is False
+        assert result.is_conflict is False
+        assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
     def test_terminal_replay_with_different_failure_summary_is_conflict(
         self, mock_conn: AsyncMock
     ) -> None:
@@ -1632,6 +1658,32 @@ class TestUpdateExecutionBindingTerminal:
 
 
 class TestCreateOrReplayNullableResource:
+    def test_concurrent_binding_loser_cleans_up_auto_provisioned_run(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A losing concurrent binding insert must not leave an orphan run."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                None,  # no existing change-request owner
+                mock_row({"id": uuid.uuid4(), "afk_run_id": "01WINNER00000000000000001"}),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        payload = _binding_payload(awx_job_id="900")
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert result.afk_run_id == "01WINNER00000000000000001"
+        deletes = _calls_matching(mock_conn, r"DELETE FROM afk_runs")
+        assert len(deletes) == 1
+
     def test_running_provision_writes_null_resource_columns(
         self, mock_conn: AsyncMock
     ) -> None:

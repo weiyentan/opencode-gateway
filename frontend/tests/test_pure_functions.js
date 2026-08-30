@@ -2128,9 +2128,7 @@ agentRunsLastUpdatedTestsDone = new Promise(function (resolve) {
     appJsSandbox.fetch = function () {
       return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: rows }); } });
     };
-    arFilterClearEl._handlers.click();
-
-    setTimeout(function () {
+    arFilterClearEl._handlers.click().then(function () {
       var html = arTbodyEl.innerHTML;
       assert(html.indexOf('data-id="run-abs-1"') !== -1 && html.indexOf('data-id="run-missing-2"') !== -1,
         'render: both fixture rows written to the tbody');
@@ -2163,16 +2161,15 @@ agentRunsLastUpdatedTestsDone = new Promise(function (resolve) {
       appJsSandbox.fetch = function () {
         return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
       };
-      arFilterClearEl._handlers.click();
-      setTimeout(function () {
+      return arFilterClearEl._handlers.click().then(function () {
         assert(arTbodyEl.innerHTML.indexOf('colspan="15"') !== -1,
           'empty state: colspan="15" preserved');
         assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
           'empty state: "No agent runs" message intact');
         pendingAsyncBlocks--; // balances the block's single increment (above)
         resolveAgentRunsLastUpdatedTestsDone();
-      }, 10);
-    }, 10);
+      });
+    });
   })();
 })();
 
@@ -4189,7 +4186,7 @@ console.log('\u25B6 AFK Outcomes — run status badge mapping (issue #453)');
   assert(window.afkRunStatusBadgeClass('blocked') === 'badge-blocked', 'blocked \u2192 badge-blocked');
   assert(window.afkRunStatusBadgeClass('stale') === 'badge-stale', 'stale \u2192 badge-stale');
   assert(window.afkRunStatusBadgeClass('failed') === 'badge-failed', 'failed \u2192 badge-failed');
-  assert(window.afkRunStatusBadgeClass('cancelled') === 'badge-unknown', 'cancelled \u2192 badge-unknown');
+  assert(window.afkRunStatusBadgeClass('cancelled') === 'badge-cancelled', 'cancelled \u2192 badge-cancelled');
   assert(window.afkRunStatusBadgeClass('timed_out') === 'badge-stale', 'timed_out \u2192 badge-stale');
   assert(window.afkRunStatusBadgeClass('nonsense') === 'badge-unknown', 'unknown \u2192 badge-unknown');
 })();

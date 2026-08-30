@@ -1813,6 +1813,36 @@ class TestTwoPhaseLifecycle:
         assert data["status"] == "error"
 
     @pytest.mark.asyncio
+    async def test_patch_omitted_failure_metadata_replays_idempotently(self) -> None:
+        """Omitted failure metadata does not conflict with stored terminal data."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        terminal_row = _update_row(
+            outcome="failed",
+            failure_reason="Timeout",
+            failure_summary="Process crashed",
+        )
+        read_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_reason="Timeout",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), terminal_row, read_row])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.patch(
+            "/api/v1/afk/executions/42",
+            json={"outcome": "failed"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["data"]["failure_reason"] == "Timeout"
+        assert resp.json()["data"]["failure_summary"] == "Process crashed"
+
+    @pytest.mark.asyncio
     async def test_patch_unknown_awx_job_returns_404(self) -> None:
         """PATCH on an unknown AWX job returns 404."""
         from tests.conftest import create_client

@@ -996,7 +996,7 @@
     if (status === 'completed') return 'badge-completed';
     if (status === 'blocked') return 'badge-blocked';
     if (status === 'failed') return 'badge-failed';
-    if (status === 'cancelled') return 'badge-unknown';
+    if (status === 'cancelled') return 'badge-cancelled';
     if (status === 'timed_out') return 'badge-stale';
     return 'badge-unknown';
   }
@@ -3595,7 +3595,7 @@
     if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
       history.replaceState({}, '', agentRunsUrlWithPagination(agentRunPage, agentRunPageSize));
     }
-    fetchAgentRunsAndRender();
+    return fetchAgentRunsAndRender();
   }
 
   /** Fetch the Agent Runs page described by the current filter + pagination
@@ -3611,7 +3611,7 @@
     setPanelState('agent-runs', 'refreshing', prev ? prev.updatedAt : null);
     // Re-fetch agent runs with current filters + page state, update table
     var url = buildAgentRunsUrl();
-    apiFetch(url).then(function (data) {
+    return apiFetch(url).then(function (data) {
       agentRunsData = data;
       agentRunsFetchError = null;
       setPanelState('agent-runs', 'ok', Date.now());
@@ -3621,8 +3621,7 @@
       // renders until the corrected page resolves, so the previously
       // displayed rows stay visible while the new page loads.
       if (applyAgentRunPageFallback(data)) {
-        fetchAgentRunsAndRender();
-        return;
+        return fetchAgentRunsAndRender();
       }
       renderAgentRunsTable(data);
       renderAgentRunPagination(data);
@@ -3700,7 +3699,7 @@
         // label unchanged).
         if (!Number.isInteger(page) || page < 1 || page === agentRunPage) return;
         setAgentRunPage(page);
-        fetchAgentRunsAndRender();
+        return fetchAgentRunsAndRender();
       });
     });
   }
@@ -3746,7 +3745,7 @@
     if (els.arFilterFrom) els.arFilterFrom.value = '';
     if (els.arFilterTo) els.arFilterTo.value = '';
     syncArDateFilterUI();
-    applyFilters();
+    return applyFilters();
   }
 
   /** Wire the Agent Runs filter-bar/detail DOM events against the captured
