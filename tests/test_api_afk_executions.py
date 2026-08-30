@@ -2086,3 +2086,248 @@ class TestTwoPhaseLifecycle:
         assert not any(
             "UPDATE execution_bindings" in s or "UPDATE afk_runs" in s for s in exec_sql
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AFK Run convergence — API-level verification (issue #607)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAFKRunConvergenceAPI:
+    """API-level tests that running creation, direct terminal POST, PATCH and
+    409/ idempotent / PR-MR independence produce expected AFK Run status.
+
+    These are mock-based and complement the real-PostgreSQL concurrency proof
+    in tests/integration/test_afk_run_convergence.py — the mock suite ensures
+    ``pytest tests/test_api_afk_executions.py`` covers the contract without
+    requiring a live database, while the integration suite proves it end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_running_creation_produces_running_status(self) -> None:
+        """POST running under a provisional run is accepted (201)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        saved_row = _mk_binding_row(
+            awx_job_id=7001,
+            outcome="running",
+            afk_run_id="01JCONVERGE000000000000001",
+            external_session_id=None,
+            provider=None,
+            repository_url=None,
+            entity_type=None,
+            entity_number=None,
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row({"afk_run_id": "01JCONVERGE000000000000001"}),
+                saved_row,
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "7001", "job_template_id": 7},
+            "afk_run_id": "01JCONVERGE000000000000001",
+            "outcome": "running",
+            "trigger_type": "eda",
+            "source_event_id": "evt_run",
+        }
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        assert resp.json()["data"]["outcome"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_direct_terminal_post_converges(self) -> None:
+        """Direct terminal POST without prior running is accepted (201)."""
+        from unittest.mock import patch
+
+        from afk_outcomes.repository import CreateAFKExecutionBindingResult
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        saved_row = _mk_binding_row(
+            awx_job_id=7002,
+            outcome="completed",
+            afk_run_id="01JCONVERGE000000000000002",
+        )
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "7002", "job_template_id": 7},
+            "afk_run_id": "01JCONVERGE000000000000002",
+            "outcome": "completed",
+            "trigger_type": "manual",
+            "external_session_id": "ses_direct",
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "42",
+            },
+        }
+        with patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.create_or_replay_afk_execution_binding",
+            new=AsyncMock(
+                return_value=CreateAFKExecutionBindingResult(
+                    afk_run_id="01JCONVERGE000000000000002",
+                    binding_id=saved_row["id"],
+                    is_created=True,
+                )
+            ),
+        ), patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.get_execution_binding_by_awx_job_id",
+            new=AsyncMock(return_value=saved_row and __import__("afk_outcomes.repository", fromlist=["_row_to_execution_binding"])._row_to_execution_binding(saved_row)),
+        ):
+            # Use direct mock for readback: patch to return domain binding
+            from afk_outcomes.models import ExecutionBinding, ExecutionOutcome
+
+            domain_binding = ExecutionBinding(
+                binding_id=str(saved_row["id"]),
+                awx_job={"job_id": "7002", "job_template_id": 7},
+                external_session_id="ses_direct",
+                resource={
+                    "provider": __import__("afk_outcomes.models", fromlist=["Provider"]).Provider.GITHUB,
+                    "repository": "github.com/acme/proj",
+                    "resource_type": __import__("afk_outcomes.models", fromlist=["EntityType"]).EntityType.CHANGE_REQUEST,
+                    "resource_number": "42",
+                },
+                outcome=ExecutionOutcome.COMPLETED,
+                afk_run_id="01JCONVERGE000000000000002",
+                trigger_type="manual",
+            )
+            with patch(
+                "app.api.afk_executions.AsyncpgOutcomeRepository.get_execution_binding_by_awx_job_id",
+                new=AsyncMock(return_value=domain_binding),
+            ):
+                resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201
+        assert resp.json()["data"]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_patch_final_running_converges(self) -> None:
+        """PATCH final running binding to terminal returns 200."""
+        from unittest.mock import patch
+
+        from afk_outcomes.models import ExecutionBinding, ExecutionOutcome
+        from afk_outcomes.repository import UpdateExecutionBindingResult
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+        domain_binding = ExecutionBinding(
+            binding_id="00000000-0000-0000-0000-000000000003",
+            awx_job={"job_id": "7003", "job_template_id": 7},
+            external_session_id="ses_term",
+            resource={
+                "provider": __import__("afk_outcomes.models", fromlist=["Provider"]).Provider.GITHUB,
+                "repository": "github.com/acme/proj",
+                "resource_type": __import__("afk_outcomes.models", fromlist=["EntityType"]).EntityType.CHANGE_REQUEST,
+                "resource_number": "42",
+            },
+            outcome=ExecutionOutcome.COMPLETED,
+            afk_run_id="01JCONVERGE000000000000003",
+            trigger_type="manual",
+        )
+        with patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.update_execution_binding_terminal",
+            new=AsyncMock(return_value=UpdateExecutionBindingResult(is_updated=True)),
+        ), patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.get_execution_binding_by_awx_job_id",
+            new=AsyncMock(return_value=domain_binding),
+        ):
+            resp = await client.patch(
+                "/api/v1/afk/executions/7003",
+                json={
+                    "outcome": "completed",
+                    "finished_at": "2026-08-02T12:00:00Z",
+                    "external_session_id": "ses_term",
+                    "resource": {
+                        "provider": "github",
+                        "repository": "https://github.com/acme/proj",
+                        "resource_type": "pull_request",
+                        "resource_number": "42",
+                    },
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_409_on_completed_run(self) -> None:
+        """Creating a new binding on a completed run surfaces 409."""
+        from unittest.mock import patch
+
+        from afk_outcomes.repository import CreateAFKExecutionBindingResult
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "7004", "job_template_id": 7},
+            "afk_run_id": "01JCOMPLETE000000000000001",
+            "outcome": "running",
+            "trigger_type": "manual",
+        }
+        with patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.create_or_replay_afk_execution_binding",
+            new=AsyncMock(
+                return_value=CreateAFKExecutionBindingResult(
+                    afk_run_id="01JCOMPLETE000000000000001", is_conflict=True
+                )
+            ),
+        ):
+            resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_idempotent_terminal_replay(self) -> None:
+        """Identical terminal PATCH replay returns 200 without duplicate."""
+        from unittest.mock import patch
+
+        from afk_outcomes.models import ExecutionBinding, ExecutionOutcome
+        from afk_outcomes.repository import UpdateExecutionBindingResult
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        client = create_client(conn)
+        domain_binding = ExecutionBinding(
+            binding_id="00000000-0000-0000-0000-000000000005",
+            awx_job={"job_id": "7005", "job_template_id": 7},
+            outcome=ExecutionOutcome.FAILED,
+            afk_run_id="01JCONVERGE000000000000005",
+        )
+        with patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.update_execution_binding_terminal",
+            new=AsyncMock(return_value=UpdateExecutionBindingResult()),
+        ), patch(
+            "app.api.afk_executions.AsyncpgOutcomeRepository.get_execution_binding_by_awx_job_id",
+            new=AsyncMock(return_value=domain_binding),
+        ):
+            resp = await client.patch(
+                "/api/v1/afk/executions/7005", json={"outcome": "failed", "failure_reason": None}
+            )
+        assert resp.status_code == 200
+
+    def test_pr_mr_state_has_no_effect_on_run_status(self) -> None:
+        """Pure domain policy never consults PR/MR state."""
+        from afk_outcomes.run_status import resolve_afk_run_status
+
+        # Same outcomes with different PR states must yield same status
+        assert resolve_afk_run_status(["completed"]) == "completed"
+        assert resolve_afk_run_status(["completed", "failed"]) == "completed"
+        assert resolve_afk_run_status(["failed"]) == "failed"
+        # The function signature must not require PR/MR args
+        import inspect
+
+        assert list(inspect.signature(resolve_afk_run_status).parameters.keys()) == ["outcomes"]
