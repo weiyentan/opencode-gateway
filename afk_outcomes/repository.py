@@ -1832,6 +1832,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         finished_at: datetime | None = None,
         trigger_type: str | None = None,
         afk_run_id: str | None = None,
+        supplied_fields: set[str] | None = None,
         ulid_source: ULIDSource,
     ) -> CreateAFKExecutionBindingResult:
         """Transactionally create or attach an AFK execution binding.
@@ -1917,7 +1918,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 """
                 SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
                        failure_reason, failure_summary, source_event_id,
-                       external_session_id, trigger_type
+                       external_session_id, started_at, finished_at, trigger_type
                 FROM execution_bindings
                 WHERE awx_job_id = $1
                 """,
@@ -1929,25 +1930,50 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 # (idempotent replay) or conflicts.
                 existing_payload = {
                     "outcome": existing["outcome"],
-                    "title": existing["title"],
-                    "branch": existing["branch"],
-                    "failure_reason": existing["failure_reason"],
-                    "failure_summary": existing.get("failure_summary"),
-                    "source_event_id": existing["source_event_id"],
-                    "external_session_id": existing["external_session_id"],
                     "trigger_type": existing.get("trigger_type"),
                 }
                 new_payload = {
                     "outcome": outcome.value,
-                    "title": title,
-                    "branch": branch,
-                    "failure_reason": failure_reason,
-                    "failure_summary": failure_summary,
-                    "source_event_id": source_event_id,
-                    "external_session_id": external_session_id,
                     "trigger_type": trigger_type,
                 }
                 is_match = existing_payload == new_payload
+                supplied = supplied_fields
+                if supplied is None:
+                    # Direct repository callers predate presence tracking; infer
+                    # presence from non-null values for that compatibility path.
+                    supplied = {
+                        field
+                        for field, value in {
+                            "title": title,
+                            "branch": branch,
+                            "failure_reason": failure_reason,
+                            "failure_summary": failure_summary,
+                            "source_event_id": source_event_id,
+                            "external_session_id": external_session_id,
+                            "started_at": started_at,
+                            "finished_at": finished_at,
+                            "afk_run_id": afk_run_id,
+                        }.items()
+                        if value is not None
+                    }
+                optional_values = {
+                    "title": (existing["title"], title),
+                    "branch": (existing["branch"], branch),
+                    "failure_reason": (existing["failure_reason"], failure_reason),
+                    "failure_summary": (existing.get("failure_summary"), failure_summary),
+                    "source_event_id": (existing["source_event_id"], source_event_id),
+                    "external_session_id": (
+                        existing["external_session_id"],
+                        external_session_id,
+                    ),
+                    "started_at": (existing.get("started_at"), started_at),
+                    "finished_at": (existing.get("finished_at"), finished_at),
+                }
+                if is_match and any(
+                    field in supplied and existing_value != new_value
+                    for field, (existing_value, new_value) in optional_values.items()
+                ):
+                    is_match = False
                 # The supplied afk_run_id only participates when the caller
                 # supplied one — a legacy replay that omits it never
                 # conflicts on the stored auto-created run (issue #595).
@@ -2181,9 +2207,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     is_reused=reused,
                 )
 
-            # Extremely rare: concurrent insert between our SELECT and INSERT.
-            # Roll back the savepoint — the outer transaction picks up the
-            # existing row on retry.  Read back what the winner wrote.
+            # A binding conflict does not roll back the outer transaction.
+            # Remove a provisional run created by this request before reading
+            # the winner, otherwise the losing request leaves an orphan run.
+            if not reused:
+                await self._conn.execute(
+                    "DELETE FROM afk_runs WHERE afk_run_id = $1",
+                    run_id,
+                )
             winner = await self._conn.fetchrow(
                 """
                 SELECT id, afk_run_id FROM execution_bindings
@@ -2203,7 +2234,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         outcome: ExecutionOutcome,
         finished_at: datetime | None = None,
         failure_reason: str | None = None,
+        failure_reason_provided: bool | None = None,
         failure_summary: str | None = None,
+        failure_summary_provided: bool | None = None,
         external_session_id: str | None = None,
         provider: Provider | None = None,
         repository: str | None = None,
@@ -2227,8 +2260,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         identity, and ``failure_summary`` are optional: an omitted
         (``None``) field never erases a stored value, a supplied field fills
         a stored NULL, and a supplied field that contradicts a stored
-        non-NULL value is a conflict.  ``failure_reason`` keeps the plain
-        overwrite semantics of the original terminal callback.
+        non-NULL value is a conflict.  Both failure fields are
+        presence-aware: omitted values preserve stored metadata, while
+        supplied values may fill NULLs during the transition.
 
         **Lifecycle authority (issue #600 review)** — when the owning
         ``afk_run_id`` is present and the terminal merged state carries a
@@ -2252,6 +2286,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             raise ValueError(
                 "update_execution_binding_terminal requires a terminal outcome"
             )
+        if failure_reason_provided is None:
+            failure_reason_provided = failure_reason is not None
+        if failure_summary_provided is None:
+            failure_summary_provided = failure_summary is not None
         numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
 
         async with self._conn.transaction():
@@ -2293,9 +2331,16 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 and row["external_session_id"] != external_session_id
             )
             failure_summary_conflict = (
-                failure_summary is not None
+                failure_summary_provided
+                and failure_summary is not None
                 and row.get("failure_summary") is not None
                 and row.get("failure_summary") != failure_summary
+            )
+            failure_reason_conflict = (
+                failure_reason_provided
+                and failure_reason is not None
+                and row["failure_reason"] is not None
+                and row["failure_reason"] != failure_reason
             )
             resource_conflict = (
                 requested_has_resource
@@ -2312,7 +2357,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 identical = (
                     row["outcome"] == outcome.value
                     and row["finished_at"] == finished_at
-                    and row["failure_reason"] == failure_reason
+                    and (
+                        not failure_reason_provided
+                        or row["failure_reason"] == failure_reason
+                    )
                     and not session_conflict
                     and not resource_conflict
                     and not failure_summary_conflict
@@ -2324,7 +2372,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 )
 
             # running (or legacy NULL outcome) → terminal transition.
-            if session_conflict or resource_conflict or failure_summary_conflict:
+            if (
+                session_conflict
+                or resource_conflict
+                or failure_reason_conflict
+                or failure_summary_conflict
+            ):
                 return UpdateExecutionBindingResult(
                     binding_id=row["id"], is_conflict=True
                 )
@@ -2334,9 +2387,14 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 if external_session_id is None
                 else external_session_id
             )
+            new_failure_reason = (
+                row["failure_reason"]
+                if not failure_reason_provided
+                else failure_reason
+            )
             new_failure_summary = (
                 row.get("failure_summary")
-                if failure_summary is None
+                if not failure_summary_provided
                 else failure_summary
             )
             if requested_has_resource:
@@ -2371,10 +2429,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 # so a stored value from phase one survives an omitted body —
                 # the completed invariant is enforced here after merge: the
                 # transition never ends with failure metadata on a completed
-                # row.  (``failure_reason`` needs no check: it keeps plain
-                # overwrite semantics and the API schema rejects a non-null
-                # ``failure_reason`` on a completed update.)
-                if new_failure_summary is not None:
+                # row.  The API schema rejects explicit failure metadata on
+                # completed updates, and this check also protects rows that
+                # already carried metadata from phase one.
+                if new_failure_reason is not None or new_failure_summary is not None:
                     return UpdateExecutionBindingResult(
                         binding_id=row["id"], is_conflict=True
                     )
@@ -2434,7 +2492,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 numeric_awx_job_id,
                 outcome.value,
                 finished_at,
-                failure_reason,
+                new_failure_reason,
                 new_session,
                 new_provider,
                 new_repository,

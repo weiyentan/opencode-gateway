@@ -197,29 +197,34 @@ def _binding_conflicts_with(
     that omits them never conflicts on the stored auto-created run
     (issue #595).
     """
+    supplied = body.model_fields_set
     conflict = (
         existing.awx_job.job_template_id != body.awx_job.job_template_id
         or existing.outcome != body.outcome
-        or existing.source_event_id != body.source_event_id
-        or existing.branch != body.branch
-        or existing.title != body.title
-        or existing.failure_reason != body.failure_reason
-        or existing.failure_summary != body.failure_summary
-        or existing.started_at != body.started_at
-        or existing.finished_at != body.finished_at
         or existing.trigger_type != body.trigger_type.value
     )
     if conflict:
         return True
-    if (
-        body.external_session_id is not None
-        and existing.external_session_id != body.external_session_id
+    optional_values = {
+        "external_session_id": (existing.external_session_id, body.external_session_id),
+        "source_event_id": (existing.source_event_id, body.source_event_id),
+        "branch": (existing.branch, body.branch),
+        "title": (existing.title, body.title),
+        "failure_reason": (existing.failure_reason, body.failure_reason),
+        "failure_summary": (existing.failure_summary, body.failure_summary),
+        "started_at": (existing.started_at, body.started_at),
+        "finished_at": (existing.finished_at, body.finished_at),
+        "afk_run_id": (existing.afk_run_id, body.afk_run_id),
+    }
+    if any(
+        field in supplied and existing_value != body_value
+        for field, (existing_value, body_value) in optional_values.items()
     ):
         return True
-    if body.afk_run_id is not None and existing.afk_run_id != body.afk_run_id:
-        return True
-    resource = body.resource
-    if resource is not None:
+    if "resource" in supplied:
+        resource = body.resource
+        if resource is None:
+            return existing.resource is not None
         if existing.resource is None:
             return True
         if (
@@ -375,6 +380,7 @@ async def create_execution_binding(
                     finished_at=body.finished_at,
                     trigger_type=trigger_type_value,
                     afk_run_id=body.afk_run_id,
+                    supplied_fields=body.model_fields_set,
                     ulid_source=MonotonicULID(),
                 )
 
@@ -498,7 +504,9 @@ async def update_execution_binding(
                     outcome=body.outcome,
                     finished_at=body.finished_at,
                     failure_reason=body.failure_reason,
+                    failure_reason_provided="failure_reason" in body.model_fields_set,
                     failure_summary=body.failure_summary,
+                    failure_summary_provided="failure_summary" in body.model_fields_set,
                     external_session_id=body.external_session_id,
                     provider=resource.provider if resource is not None else None,
                     repository=normalized_repo,

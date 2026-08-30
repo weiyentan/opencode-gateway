@@ -2031,6 +2031,12 @@ console.log('\u25B6 agent-runs date filters — Clear control wiring (issue #7)'
 
 console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted relative secondary (issue #5)');
 
+var agentRunsLastUpdatedTestsDone;
+var resolveAgentRunsLastUpdatedTestsDone;
+agentRunsLastUpdatedTestsDone = new Promise(function (resolve) {
+  resolveAgentRunsLastUpdatedTestsDone = resolve;
+});
+
 (function () {
   // Deterministic fixture: a 2025 timestamp is safely in the past for any
   // wall clock, so the issue #4 formatter's future-clamp never fires and
@@ -2087,14 +2093,24 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
   // pendingAsyncBlocks === 0 while any nested callback is still pending.
   pendingAsyncBlocks++;
   var clearWaitAttempts = 0;
+  var prerequisiteWaitStarted = false;
   (function proceedWhenClearWiringDone() {
-    if (!arClearWiringCompleted) {
+    if (!arClearWiringCompleted ||
+        typeof afkDetailTestsDone === 'undefined' ||
+        typeof issue577LoadingDone === 'undefined') {
       clearWaitAttempts++;
       if (clearWaitAttempts > 200) {
         throw new Error('issue #5 block: arClearWiringCompleted never set ' +
           '(issue #7 Clear-wiring block did not complete within 1s)');
       }
       setTimeout(proceedWhenClearWiringDone, 5);
+      return;
+    }
+    if (!prerequisiteWaitStarted) {
+      prerequisiteWaitStarted = true;
+      Promise.all([afkDetailTestsDone, issue577LoadingDone]).then(
+        proceedWhenClearWiringDone
+      );
       return;
     }
     // Reset the fakes and wire the Clear handler like the app bootstrap does.
@@ -2112,9 +2128,7 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
     appJsSandbox.fetch = function () {
       return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: rows }); } });
     };
-    arFilterClearEl._handlers.click();
-
-    setTimeout(function () {
+    arFilterClearEl._handlers.click().then(function () {
       var html = arTbodyEl.innerHTML;
       assert(html.indexOf('data-id="run-abs-1"') !== -1 && html.indexOf('data-id="run-missing-2"') !== -1,
         'render: both fixture rows written to the tbody');
@@ -2147,15 +2161,15 @@ console.log('\u25B6 Agent Runs Last Updated cell — absolute primary + muted re
       appJsSandbox.fetch = function () {
         return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ items: [] }); } });
       };
-      arFilterClearEl._handlers.click();
-      setTimeout(function () {
+      return arFilterClearEl._handlers.click().then(function () {
         assert(arTbodyEl.innerHTML.indexOf('colspan="15"') !== -1,
           'empty state: colspan="15" preserved');
         assert(arTbodyEl.innerHTML.indexOf('No agent runs') !== -1,
           'empty state: "No agent runs" message intact');
         pendingAsyncBlocks--; // balances the block's single increment (above)
-      }, 10);
-    }, 10);
+        resolveAgentRunsLastUpdatedTestsDone();
+      });
+    });
   })();
 })();
 
@@ -4172,7 +4186,7 @@ console.log('\u25B6 AFK Outcomes — run status badge mapping (issue #453)');
   assert(window.afkRunStatusBadgeClass('blocked') === 'badge-blocked', 'blocked \u2192 badge-blocked');
   assert(window.afkRunStatusBadgeClass('stale') === 'badge-stale', 'stale \u2192 badge-stale');
   assert(window.afkRunStatusBadgeClass('failed') === 'badge-failed', 'failed \u2192 badge-failed');
-  assert(window.afkRunStatusBadgeClass('cancelled') === 'badge-unknown', 'cancelled \u2192 badge-unknown');
+  assert(window.afkRunStatusBadgeClass('cancelled') === 'badge-cancelled', 'cancelled \u2192 badge-cancelled');
   assert(window.afkRunStatusBadgeClass('timed_out') === 'badge-stale', 'timed_out \u2192 badge-stale');
   assert(window.afkRunStatusBadgeClass('nonsense') === 'badge-unknown', 'unknown \u2192 badge-unknown');
 })();
@@ -5149,7 +5163,11 @@ console.log('\u25B6 issue #577 \u2014 partial data: runs list with mixed field c
 
 console.log('\u25B6 issue #577 \u2014 retry/error: 404 handling');
 
-var issue577AsyncChain = Promise.all([afkDetailTestsDone, issue577LoadingDone]);
+var issue577AsyncChain = Promise.all([
+  afkDetailTestsDone,
+  issue577LoadingDone,
+  agentRunsLastUpdatedTestsDone
+]);
 
 (function () {
   pendingAsyncBlocks++;

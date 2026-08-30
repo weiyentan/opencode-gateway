@@ -881,6 +881,7 @@ tbody tr:hover td {
 .badge-healthy  { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-stale    { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown  { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
+.badge-cancelled { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 
 /* Provider badge (issue #557) — compact outlined badge with a text label.
    Neutral palette: transparent fill, muted text, hairline glass border.
@@ -1249,6 +1250,7 @@ td.clickable:hover {
 .badge-completed { background: rgba(74, 222, 128, 0.15); color: var(--status-healthy); }
 .badge-blocked   { background: rgba(251, 191, 36, 0.15); color: var(--status-stale); }
 .badge-unknown   { background: rgba(148, 163, 184, 0.15); color: var(--status-unknown); }
+.badge-cancelled { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 
 /* AFK outcome status badges (issue #453): the locked EngineeringOutcomeStatus
    vocabulary (merged / closed / abandoned / open) plus the RunStatus "failed"
