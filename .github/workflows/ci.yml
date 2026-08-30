@@ -43,6 +43,15 @@ jobs:
 
       - run: pytest --maxfail=5 -v -m "not integration"
 
+      - name: Run AFK convergence PostgreSQL integration tests
+        env:
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5432"
+          GATEWAY_DATABASE_NAME: opencode_gateway_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+        run: pytest tests/integration/test_afk_run_convergence.py -v -m integration
+
       - name: Lint Python
         run: ruff check .
 
