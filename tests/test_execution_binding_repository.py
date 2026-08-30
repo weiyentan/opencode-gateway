@@ -1864,11 +1864,14 @@ class TestCreateOrReplayProviderCompatibility:
         assert result.run_missing is False
         # The unbound lifecycle is bound to the execution's change request —
         # the canonical provider is the tuple's own (github), not the run's.
+        # Issue #606 adds a second UPDATE afk_runs: the transactional
+        # status convergence.
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
-        assert len(binds) == 1
+        assert len(binds) == 2
         assert binds[0][1][1] == "github"
         assert binds[0][1][2] == "org/repo"
         assert binds[0][1][3] == "42"
+        assert "SET status" in binds[1][0]
 
     def test_matching_run_provider_proceeds(self, mock_conn: AsyncMock) -> None:
         """A resource matching the run's provider attaches normally and binds the
@@ -1896,11 +1899,14 @@ class TestCreateOrReplayProviderCompatibility:
         assert result.is_created is True
         assert result.is_conflict is False
         # The unbound lifecycle is made authoritative for the execution's PR.
+        # Issue #606 adds a second UPDATE afk_runs: the transactional
+        # status convergence.
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
-        assert len(binds) == 1
+        assert len(binds) == 2
         assert binds[0][1][1] == "github"
         assert binds[0][1][2] == "org/repo"
         assert binds[0][1][3] == "42"
+        assert "SET status" in binds[1][0]
 
     def test_mismatched_run_change_request_tuple_is_conflict(
         self, mock_conn: AsyncMock
@@ -1995,7 +2001,9 @@ class TestCreateOrReplayProviderCompatibility:
 
         assert result.is_created is True
         assert result.is_conflict is False
-        assert len(_calls_matching(mock_conn, r"UPDATE afk_runs")) == 1
+        # Issue #606: the change-request bind plus the transactional status
+        # convergence are the only afk_runs UPDATEs.
+        assert len(_calls_matching(mock_conn, r"UPDATE afk_runs")) == 2
 
     def test_change_request_owned_by_another_lifecycle_is_conflict(
         self, mock_conn: AsyncMock
@@ -2134,7 +2142,10 @@ class TestCreateOrReplayAutoProvisionedChangeRequest:
         )
         mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         mock_conn.execute = AsyncMock(
-            side_effect=asyncpg.UniqueViolationError("duplicate key")
+            side_effect=[
+                asyncpg.UniqueViolationError("duplicate key"),  # afk_runs INSERT
+                "UPDATE 1",  # issue #606 status convergence UPDATE
+            ]
         )
 
         repo = AsyncpgOutcomeRepository(mock_conn)
@@ -2255,8 +2266,11 @@ class TestCreateOrReplaySameLifecyclePrecheckReplay:
 
         assert result.is_created is True
         assert result.is_conflict is False
-        # No UPDATE afk_runs — the idempotent replay never re-binds.
-        assert _calls_matching(mock_conn, r"UPDATE afk_runs") == []
+        # The idempotent replay never re-binds; the only afk_runs UPDATE is
+        # the issue #606 transactional status convergence.
+        binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
+        assert len(binds) == 1
+        assert "SET status" in binds[0][0]
 
     def test_same_lifecycle_different_change_request_in_precheck_is_conflict(
         self, mock_conn: AsyncMock
@@ -2341,11 +2355,14 @@ class TestUpdateExecutionBindingTerminalLifecycleAuthority:
         assert result.is_updated is True
         assert result.is_conflict is False
         # The unbound lifecycle is bound to the execution's change request.
+        # Issue #606 adds a second UPDATE afk_runs: the transactional
+        # status convergence.
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
-        assert len(binds) == 1
+        assert len(binds) == 2
         assert binds[0][1][1] == "github"
         assert binds[0][1][2] == "org/repo"
         assert binds[0][1][3] == "7"
+        assert "SET status" in binds[1][0]
         assert len(_calls_matching(mock_conn, r"UPDATE execution_bindings")) == 1
 
     def test_patch_resource_conflicts_with_lifecycle(self, mock_conn: AsyncMock) -> None:

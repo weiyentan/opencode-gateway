@@ -51,6 +51,7 @@ from afk_outcomes.models import (
 from afk_outcomes.repository import (
     AsyncpgOutcomeRepository,
 )
+from afk_outcomes.run_status import resolve_afk_run_status
 from afk_outcomes.serialization import (
     CANONICAL_SCHEMA_VERSION,
     MonotonicULID,
@@ -105,4 +106,5 @@ __all__ = [
     "dumps_canonical",
     "loads_canonical",
     "make_ulid",
+    "resolve_afk_run_status",
 ]
