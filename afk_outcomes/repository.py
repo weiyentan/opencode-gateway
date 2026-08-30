@@ -47,6 +47,7 @@ import asyncpg
 
 from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.interfaces import OutcomeRepository
+from afk_outcomes.run_status import resolve_afk_run_status
 from afk_outcomes.serialization import ULIDSource
 from afk_outcomes.models import (
     AFKRun,
@@ -1813,6 +1814,42 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             return rows[0]["id"]
         return None
 
+    async def _project_afk_run_status(self, afk_run_id: str) -> str:
+        """Project one run's status from its binding outcomes (issue #606).
+
+        Reads the outcome multiset for the run and applies the pure-domain
+        policy :func:`afk_outcomes.run_status.resolve_afk_run_status`.  The
+        caller must already hold the parent ``afk_runs`` lock so the
+        multiset is stable while the projection computes.  Legacy rows with
+        a NULL outcome carry no trusted signal and are excluded — the
+        policy rejects unknown values, so they are never passed to it.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT outcome FROM execution_bindings
+            WHERE afk_run_id = $1 AND outcome IS NOT NULL
+            """,
+            afk_run_id,
+        )
+        outcomes = [row.get("outcome") for row in rows if row.get("outcome") is not None]
+        return resolve_afk_run_status(outcomes)
+
+    async def _converge_afk_run_status(self, afk_run_id: str) -> None:
+        """Converge ``afk_runs.status`` to the binding-driven projection (issue #606).
+
+        Only ``status`` is projected — ``finished_at``, ``outcome_status``,
+        ``outcome``, and the change-request columns are never touched.
+        Runs inside the caller's transaction with the parent row already
+        locked, so the projection and the write are atomic with the binding
+        mutation that triggered them.
+        """
+        projected = await self._project_afk_run_status(afk_run_id)
+        await self._conn.execute(
+            "UPDATE afk_runs SET status = $2 WHERE afk_run_id = $1",
+            afk_run_id,
+            projected,
+        )
+
     async def create_or_replay_afk_execution_binding(
         self,
         *,
@@ -1901,6 +1938,29 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
           or a different supplied ``afk_run_id``) — returns
           ``is_conflict=True`` without mutation.
 
+        **Transactional status convergence (issue #606 / ADR 0027)** — every
+        path that touches an existing lifecycle locks the owning ``afk_runs``
+        row (``SELECT ... FOR UPDATE``) before the binding is mutated, and
+        converges ``afk_runs.status`` to the binding-derived projection in
+        the same transaction:
+
+        * the first ``running`` binding moves its run ``pending`` → ``running``;
+        * a direct terminal creation converges the run straight to its
+          aggregate terminal status (``completed`` / ``failed`` /
+          ``cancelled``);
+        * a new ``running`` binding on a ``failed`` / ``cancelled`` run
+          reopens it to ``running`` (retry, new AWX job identity);
+        * a **completed** run rejects any new binding with
+          ``is_conflict=True`` without inserting, without touching the
+          stored binding history, and without changing ``status``;
+        * an identical replay stays idempotent and re-converges its touched
+          parent (correcting a stale status) without duplicating or
+          changing terminal history.
+
+        Only ``afk_runs.status`` is projected — ``finished_at``,
+        ``outcome_status``, ``outcome``, and the change-request columns are
+        never touched by the convergence.
+
         The connection MUST already be in a transaction (the caller owns the
         transaction boundary).  Uses savepoints internally so that a failure
         within this operation rolls back cleanly without leaving orphaned
@@ -1913,14 +1973,28 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         new_ulid = ulid_source.next_ulid()
 
         async with self._conn.transaction():
-            # Check for an existing binding with this AWX job ID.
+            # Check for an existing binding with this AWX job ID.  The
+            # owning AFK Run (when one exists) is locked in the same
+            # statement (``FOR UPDATE OF r`` inside the lateral subquery,
+            # issue #606 / ADR 0027) so an identical replay converges its
+            # parent under the parent lock without a second round-trip —
+            # never duplicating or changing terminal binding history.
+            # ``FOR UPDATE`` cannot lock the nullable side of an outer
+            # join, and the lateral form keeps legacy rows (``afk_run_id``
+            # NULL, which carry no aggregation signal) in the result.
             existing = await self._conn.fetchrow(
                 """
-                SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
-                       failure_reason, failure_summary, source_event_id,
-                       external_session_id, started_at, finished_at, trigger_type
-                FROM execution_bindings
-                WHERE awx_job_id = $1
+                SELECT b.id, b.afk_run_id, b.awx_job_id, b.outcome, b.title,
+                       b.branch, b.failure_reason, b.failure_summary,
+                       b.source_event_id, b.external_session_id,
+                       b.started_at, b.finished_at, b.trigger_type
+                FROM execution_bindings b
+                LEFT JOIN LATERAL (
+                    SELECT r.afk_run_id
+                    FROM afk_runs r WHERE r.afk_run_id = b.afk_run_id
+                    FOR UPDATE OF r
+                ) l ON TRUE
+                WHERE b.awx_job_id = $1
                 """,
                 numeric_awx_job_id,
             )
@@ -1979,6 +2053,15 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 # conflicts on the stored auto-created run (issue #595).
                 if is_match and afk_run_id is not None:
                     is_match = existing["afk_run_id"] == afk_run_id
+                # An identical replay is never rejected (it creates no new
+                # binding), but it still converges its touched parent
+                # (issue #606 / ADR 0027): the parent lock was already taken
+                # by the SELECT above, so the projection is race-free.  The
+                # replay never duplicates or changes terminal binding
+                # history, while a stale parent status is corrected toward
+                # the binding-derived projection.
+                if is_match and existing["afk_run_id"] is not None:
+                    await self._converge_afk_run_status(existing["afk_run_id"])
                 return CreateAFKExecutionBindingResult(
                     afk_run_id=existing["afk_run_id"],
                     binding_id=existing["id"],
@@ -1992,11 +2075,16 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             # instead of inserting a fresh afk_runs row (PR #600 blocker).
             reused = False
             if afk_run_id is not None:
+                # Lock the owning AFK Run BEFORE any binding mutation
+                # (issue #606 / ADR 0027): the parent lock serializes this
+                # write against concurrent terminal transitions so the
+                # projected status below is stable.
                 existing_run = await self._conn.fetchrow(
                     """
                     SELECT afk_run_id, provider, change_request_provider,
                            change_request_repository, change_request_external_id
                     FROM afk_runs WHERE afk_run_id = $1
+                    FOR UPDATE
                     """,
                     afk_run_id,
                 )
@@ -2004,6 +2092,20 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     return CreateAFKExecutionBindingResult(
                         afk_run_id=afk_run_id,
                         run_missing=True,
+                    )
+
+                # Completed-run rejection (issue #606 / ADR 0027): a
+                # completed lifecycle is closed to new AWX Execution
+                # Bindings.  The projection is computed under the parent
+                # lock held above, so a racing terminal transition commits
+                # before this check runs or blocks until it finishes.
+                if (
+                    await self._project_afk_run_status(afk_run_id)
+                    == ExecutionOutcome.COMPLETED.value
+                ):
+                    return CreateAFKExecutionBindingResult(
+                        afk_run_id=afk_run_id,
+                        is_conflict=True,
                     )
 
                 # When a resource identity is supplied with the execution,
@@ -2051,12 +2153,25 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         WHERE change_request_provider = $1
                           AND change_request_repository = $2
                           AND change_request_external_id = $3
+                        FOR UPDATE
                         """,
                         provider.value,
                         repository,
                         resource_number,
                     )
                     if owner is not None:
+                        # Completed-run rejection (issue #606 / ADR 0027):
+                        # the canonical PR/MR's lifecycle is closed — a new
+                        # execution binding is rejected before adoption,
+                        # never attached to a completed lifecycle.
+                        if (
+                            await self._project_afk_run_status(owner["afk_run_id"])
+                            == ExecutionOutcome.COMPLETED.value
+                        ):
+                            return CreateAFKExecutionBindingResult(
+                                afk_run_id=owner["afk_run_id"],
+                                is_conflict=True,
+                            )
                         # The canonical PR/MR already owns a lifecycle —
                         # reuse it and attach this execution instead of
                         # returning 409 (PR #600 blocker).  The shared 1:1
@@ -2120,6 +2235,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                                 WHERE change_request_provider = $1
                                   AND change_request_repository = $2
                                   AND change_request_external_id = $3
+                                FOR UPDATE
                                 """,
                                 provider.value,
                                 repository,
@@ -2131,6 +2247,20 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                                 # clean conflict rather than a crash.
                                 return CreateAFKExecutionBindingResult(
                                     afk_run_id=run_id,
+                                    is_conflict=True,
+                                )
+                            # Completed-run rejection (issue #606 / ADR 0027):
+                            # the concurrent winner's lifecycle is closed — a
+                            # new execution binding is rejected before
+                            # adoption.
+                            if (
+                                await self._project_afk_run_status(
+                                    winner["afk_run_id"]
+                                )
+                                == ExecutionOutcome.COMPLETED.value
+                            ):
+                                return CreateAFKExecutionBindingResult(
+                                    afk_run_id=winner["afk_run_id"],
                                     is_conflict=True,
                                 )
                             bind_result = await self._apply_change_request_binding(
@@ -2200,6 +2330,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             )
 
             if binding_row:
+                # Converge the parent toward the binding-derived projection
+                # in the same transaction (issue #606 / ADR 0027): the
+                # freshly-inserted binding participates in the outcome
+                # multiset — first running binding → running, direct
+                # terminal creation → its terminal status, retry reopening
+                # → running.
+                await self._converge_afk_run_status(run_id)
                 return CreateAFKExecutionBindingResult(
                     afk_run_id=run_id,
                     binding_id=binding_row[0]["id"],
@@ -2254,7 +2391,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         **Serialization** — the row is locked with ``SELECT ... FOR UPDATE``
         so concurrent updates for the same AWX job are serialized; a second
         updater re-reads after the first commits and resolves to an
-        idempotent replay or a conflict.
+        idempotent replay or a conflict.  The owning ``afk_runs`` row (when
+        one exists) is locked in the same statement *before* any binding
+        mutation, and ``afk_runs.status`` is converged to the
+        binding-derived projection in the same transaction (issue #606 /
+        ADR 0027).
 
         **Non-erasing fill-ins** — ``external_session_id``, the resource
         identity, and ``failure_summary`` are optional: an omitted
@@ -2293,14 +2434,29 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
 
         async with self._conn.transaction():
+            # Lock the binding row (``FOR UPDATE OF b``) and its owning AFK
+            # Run (``FOR UPDATE OF r`` inside the lateral subquery) in a
+            # single statement (issue #606 / ADR 0027): the parent lock is
+            # held before any binding mutation or outcome-multiset read, so
+            # a concurrent write to the same parent serializes here.
+            # ``FOR UPDATE`` cannot lock the nullable side of an outer
+            # join, and the lateral form keeps legacy rows (``afk_run_id``
+            # NULL, which carry no aggregation signal) in the result while
+            # still locking the binding row itself.
             row = await self._conn.fetchrow(
                 """
-                SELECT id, outcome, finished_at, failure_reason, failure_summary,
-                       external_session_id, provider, repository_url,
-                       entity_type, entity_number, afk_run_id
-                FROM execution_bindings
-                WHERE awx_job_id = $1
-                FOR UPDATE
+                SELECT b.id, b.outcome, b.finished_at, b.failure_reason,
+                       b.failure_summary, b.external_session_id, b.provider,
+                       b.repository_url, b.entity_type, b.entity_number,
+                       b.afk_run_id
+                FROM execution_bindings b
+                LEFT JOIN LATERAL (
+                    SELECT r.afk_run_id
+                    FROM afk_runs r WHERE r.afk_run_id = b.afk_run_id
+                    FOR UPDATE OF r
+                ) l ON TRUE
+                WHERE b.awx_job_id = $1
+                FOR UPDATE OF b
                 """,
                 numeric_awx_job_id,
             )
@@ -2366,6 +2522,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     and not failure_summary_conflict
                 )
                 if identical:
+                    # An identical terminal replay is never rejected and
+                    # never mutates terminal history, but it still converges
+                    # its touched parent (issue #606 / ADR 0027) — the
+                    # parent lock held by the statement above makes the
+                    # projection race-free.
+                    if row.get("afk_run_id") is not None:
+                        await self._converge_afk_run_status(row["afk_run_id"])
                     return UpdateExecutionBindingResult(binding_id=row["id"])
                 return UpdateExecutionBindingResult(
                     binding_id=row["id"], is_conflict=True
@@ -2500,6 +2663,13 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_entity_number,
                 new_failure_summary,
             )
+            # Converge the parent toward the binding-derived projection in
+            # the same transaction (issue #606 / ADR 0027): the just-
+            # transitioned binding participates in the outcome multiset —
+            # the final running binding transitioning to terminal converges
+            # the run to its aggregate terminal status.
+            if row.get("afk_run_id") is not None:
+                await self._converge_afk_run_status(row["afk_run_id"])
             return UpdateExecutionBindingResult(
                 binding_id=row["id"], is_updated=True
             )
