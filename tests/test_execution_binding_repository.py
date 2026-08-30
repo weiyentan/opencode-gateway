@@ -1126,6 +1126,85 @@ def test_create_or_replay_idempotent_with_same_failure_summary(
     assert result.binding_id == existing_binding_id
 
 
+def test_create_or_replay_omitted_optional_values_are_idempotent(
+    mock_conn: AsyncMock,
+) -> None:
+    """Omitted optional fields do not conflict with stored callback values."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "afk_run_id": "01HXYZ0000000000000000008",
+                "awx_job_id": 707,
+                "outcome": "failed",
+                "title": "Test task",
+                "branch": "main",
+                "failure_reason": "runner_failed",
+                "failure_summary": "Process crashed",
+                "source_event_id": None,
+                "external_session_id": "ses_xyz",
+                "started_at": datetime(2026, 8, 1, tzinfo=UTC),
+                "finished_at": datetime(2026, 8, 2, tzinfo=UTC),
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    payload = _binding_payload(awx_job_id="707", outcome=ExecutionOutcome.FAILED)
+    payload["supplied_fields"] = {
+        "awx_job",
+        "outcome",
+        "trigger_type",
+        "provider",
+        "repository",
+        "resource_number",
+    }
+
+    import asyncio
+
+    result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+    assert result.is_conflict is False
+
+
+def test_create_or_replay_explicit_null_optional_value_conflicts(
+    mock_conn: AsyncMock,
+) -> None:
+    """An explicitly supplied null conflicts with a stored non-null value."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=mock_row(
+            {
+                "id": uuid.uuid4(),
+                "afk_run_id": "01HXYZ0000000000000000009",
+                "awx_job_id": 708,
+                "outcome": "failed",
+                "title": "Test task",
+                "branch": "main",
+                "failure_reason": None,
+                "failure_summary": "Process crashed",
+                "source_event_id": None,
+                "external_session_id": "ses_xyz",
+            }
+        )
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    payload = _binding_payload(awx_job_id="708", outcome=ExecutionOutcome.FAILED)
+    payload["supplied_fields"] = {
+        "outcome",
+        "title",
+        "branch",
+        "external_session_id",
+        "failure_summary",
+    }
+
+    import asyncio
+
+    result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+    assert result.is_conflict is True
+
+
 # ── Rollback / no orphaned rows ──────────────────────────────────────────
 
 

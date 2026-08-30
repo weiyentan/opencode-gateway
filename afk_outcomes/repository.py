@@ -1832,6 +1832,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         finished_at: datetime | None = None,
         trigger_type: str | None = None,
         afk_run_id: str | None = None,
+        supplied_fields: set[str] | None = None,
         ulid_source: ULIDSource,
     ) -> CreateAFKExecutionBindingResult:
         """Transactionally create or attach an AFK execution binding.
@@ -1917,7 +1918,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 """
                 SELECT id, afk_run_id, awx_job_id, outcome, title, branch,
                        failure_reason, failure_summary, source_event_id,
-                       external_session_id, trigger_type
+                       external_session_id, started_at, finished_at, trigger_type
                 FROM execution_bindings
                 WHERE awx_job_id = $1
                 """,
@@ -1929,25 +1930,50 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 # (idempotent replay) or conflicts.
                 existing_payload = {
                     "outcome": existing["outcome"],
-                    "title": existing["title"],
-                    "branch": existing["branch"],
-                    "failure_reason": existing["failure_reason"],
-                    "failure_summary": existing.get("failure_summary"),
-                    "source_event_id": existing["source_event_id"],
-                    "external_session_id": existing["external_session_id"],
                     "trigger_type": existing.get("trigger_type"),
                 }
                 new_payload = {
                     "outcome": outcome.value,
-                    "title": title,
-                    "branch": branch,
-                    "failure_reason": failure_reason,
-                    "failure_summary": failure_summary,
-                    "source_event_id": source_event_id,
-                    "external_session_id": external_session_id,
                     "trigger_type": trigger_type,
                 }
                 is_match = existing_payload == new_payload
+                supplied = supplied_fields
+                if supplied is None:
+                    # Direct repository callers predate presence tracking; infer
+                    # presence from non-null values for that compatibility path.
+                    supplied = {
+                        field
+                        for field, value in {
+                            "title": title,
+                            "branch": branch,
+                            "failure_reason": failure_reason,
+                            "failure_summary": failure_summary,
+                            "source_event_id": source_event_id,
+                            "external_session_id": external_session_id,
+                            "started_at": started_at,
+                            "finished_at": finished_at,
+                            "afk_run_id": afk_run_id,
+                        }.items()
+                        if value is not None
+                    }
+                optional_values = {
+                    "title": (existing["title"], title),
+                    "branch": (existing["branch"], branch),
+                    "failure_reason": (existing["failure_reason"], failure_reason),
+                    "failure_summary": (existing.get("failure_summary"), failure_summary),
+                    "source_event_id": (existing["source_event_id"], source_event_id),
+                    "external_session_id": (
+                        existing["external_session_id"],
+                        external_session_id,
+                    ),
+                    "started_at": (existing.get("started_at"), started_at),
+                    "finished_at": (existing.get("finished_at"), finished_at),
+                }
+                if is_match and any(
+                    field in supplied and existing_value != new_value
+                    for field, (existing_value, new_value) in optional_values.items()
+                ):
+                    is_match = False
                 # The supplied afk_run_id only participates when the caller
                 # supplied one — a legacy replay that omits it never
                 # conflicts on the stored auto-created run (issue #595).

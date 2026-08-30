@@ -265,6 +265,81 @@ class TestCreateExecutionBinding:
         assert data["data"]["awx_job"]["job_id"] == "42"
 
     @pytest.mark.asyncio
+    async def test_omitted_optional_values_do_not_conflict_with_stored_values(
+        self,
+    ) -> None:
+        """Omitted optional callback fields are absent from replay comparison."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        existing_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_reason="runner_failed",
+            failure_summary="Process crashed",
+            started_at=_A_TS,
+            finished_at=_B_TS,
+            trigger_type="manual",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row, existing_row]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_optional_value_conflicts_with_stored_value(
+        self,
+    ) -> None:
+        """An explicit null remains distinct from an omitted optional field."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        existing_row = _mk_binding_row(
+            awx_job_id=42,
+            outcome="failed",
+            failure_summary="Process crashed",
+        )
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), existing_row, existing_row]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        payload = {
+            "awx_job": {"job_id": "42", "job_template_id": 7},
+            "resource": {
+                "provider": "github",
+                "repository": "https://github.com/acme/proj",
+                "resource_type": "pull_request",
+                "resource_number": "99",
+            },
+            "outcome": "failed",
+            "trigger_type": "manual",
+            "failure_summary": None,
+        }
+
+        resp = await client.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
     async def test_conflicting_data_returns_409(self) -> None:
         """Different data for same AWX job ID returns 409 Conflict."""
         from tests.conftest import create_client
