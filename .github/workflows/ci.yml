@@ -50,7 +50,10 @@ jobs:
           GATEWAY_DATABASE_NAME: opencode_gateway_test
           GATEWAY_DATABASE_USER: test
           GATEWAY_DATABASE_PASSWORD: test
-        run: pytest tests/integration/test_afk_run_convergence.py -v -m integration
+        run: |
+          set -euo pipefail
+          pytest tests/integration/test_afk_run_convergence.py -v -m integration 2>&1 | tee /tmp/afk-convergence.log
+          grep -q "8 passed" /tmp/afk-convergence.log
 
       - name: Lint Python
         run: ruff check .
