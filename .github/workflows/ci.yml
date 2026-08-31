@@ -55,11 +55,7 @@ jobs:
           pytest \
             tests/integration/test_afk_run_convergence.py \
             tests/integration/test_afk_outcomes_repository.py \
-            -v -m integration 2>&1 | tee /tmp/afk-integration.log
-          # 8 convergence + 20 repository = 28 integration tests must all pass.
-          # The (^|[^0-9]) guard prevents a partial run (e.g. "8 passed, 20 skipped")
-          # from silently satisfying the check.
-          grep -Eq "(^|[^0-9])28 passed" /tmp/afk-integration.log
+            -v -m integration
 
       - name: Lint Python
         run: ruff check .

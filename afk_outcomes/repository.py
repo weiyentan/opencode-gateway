@@ -1527,6 +1527,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             """
             SELECT id FROM sessions
             WHERE external_session_id = $1
+            LIMIT 2
             """,
             external_session_id,
         )
