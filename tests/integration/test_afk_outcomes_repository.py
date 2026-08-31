@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from afk_outcomes import (
     EngineeringEvent,
     EngineeringOutcome,
     EngineeringOutcomeStatus,
+    ExecutionOutcome,
     EntityType,
     Provider,
     ReferenceSource,
