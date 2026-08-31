@@ -2144,6 +2144,8 @@ class TestCreateOrReplayAutoProvisionedChangeRequest:
         mock_conn.execute = AsyncMock(
             side_effect=[
                 asyncpg.UniqueViolationError("duplicate key"),  # afk_runs INSERT
+                "UPDATE 1",  # _apply_change_request_binding UPDATE
+                "INSERT 0 1",  # afk_run_sessions upsert (issue #618)
                 "UPDATE 1",  # issue #606 status convergence UPDATE
             ]
         )
@@ -2456,3 +2458,276 @@ class TestUpdateExecutionBindingTerminalLifecycleAuthority:
         assert result.is_conflict is True
         assert result.is_updated is False
         assert _calls_matching(mock_conn, r"UPDATE execution_bindings") == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  afk_run_sessions persistence from execution bindings (issue #618)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _session_link_calls(mock_conn: AsyncMock) -> list[tuple]:
+    """Return (sql, params) for every call that inserts into afk_run_sessions."""
+    return _calls_matching(mock_conn, r"INSERT INTO afk_run_sessions")
+
+
+def _session_resolution_calls(mock_conn: AsyncMock) -> list[tuple]:
+    """Return (sql, params) for every call that resolves a sessions.id."""
+    return _calls_matching(mock_conn, r"SELECT id FROM sessions")
+
+
+class TestCreateOrReplaySessionLink:
+    """create_or_replay_afk_execution_binding persists afk_run_sessions (issue #618)."""
+
+    def test_creation_upserts_session_link_when_session_supplied(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A binding created with both afk_run_id and external_session_id writes
+        an afk_run_sessions row in the same transaction."""
+        internal_session_id = uuid.uuid4()
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [mock_row({"id": uuid.uuid4()})],  # execution_bindings INSERT
+                [mock_row({"id": internal_session_id})],  # session resolution
+                [],  # _project_afk_run_status outcome read
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload(external_session_id="ses_618")
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+        assert result.is_created is True
+
+        # The internal session id was resolved from the sessions table.
+        resolution = _session_resolution_calls(mock_conn)
+        assert len(resolution) == 1
+        assert "WHERE external_session_id = $1" in resolution[0][0]
+        assert resolution[0][1][0] == "ses_618"
+
+        # The enrich-only upsert carries the run id + external + internal id.
+        links = _session_link_calls(mock_conn)
+        assert len(links) == 1
+        sql, args = links[0]
+        assert "ON CONFLICT (afk_run_id, external_session_id) DO UPDATE" in sql
+        assert args[0] == result.afk_run_id
+        assert args[1] == str(internal_session_id)
+        assert args[2] == "ses_618"
+
+    def test_creation_keeps_external_session_id_when_unresolved(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """No matching Gateway session -> session_id stays None, external id kept."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [mock_row({"id": uuid.uuid4()})],  # execution_bindings INSERT
+                [],  # session resolution -- no match
+                [],  # _project_afk_run_status outcome read
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload(external_session_id="ses_unresolved_618")
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+        assert result.is_created is True
+
+        links = _session_link_calls(mock_conn)
+        assert len(links) == 1
+        sql, args = links[0]
+        assert args[0] == result.afk_run_id
+        assert args[1] is None  # unresolved internal session id
+        assert args[2] == "ses_unresolved_618"
+
+    def test_creation_skips_session_link_when_no_session_supplied(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """Running provisioning without a session creates no afk_run_sessions row."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                None,  # no existing binding
+                mock_row({"afk_run_id": "01SUPPLIED00000000000000001"}),  # run exists
+            ]
+        )
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [],  # _project_afk_run_status completed-rejection read
+                [mock_row({"id": uuid.uuid4()})],  # execution_bindings INSERT
+                [],  # _project_afk_run_status outcome read (converge)
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload(
+            outcome=ExecutionOutcome.RUNNING,
+            external_session_id=None,
+        )
+        payload["provider"] = None
+        payload["repository"] = None
+        payload["resource_number"] = None
+        payload["afk_run_id"] = "01SUPPLIED00000000000000001"
+        payload["ulid_source"] = _ULID_SOURCE
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+        assert result.is_created is True
+        assert _session_link_calls(mock_conn) == []
+        assert _session_resolution_calls(mock_conn) == []
+
+    def test_idempotent_replay_never_writes_session_link(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """An identical replay returns early and issues no afk_run_sessions write."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                {
+                    "id": uuid.uuid4(),
+                    "afk_run_id": "01HXYZ0000000000000000001",
+                    "awx_job_id": 700,
+                    "outcome": "completed",
+                    "title": "Test task",
+                    "branch": "main",
+                    "failure_reason": None,
+                    "failure_summary": None,
+                    "source_event_id": None,
+                    "external_session_id": "ses_xyz",
+                }
+            )
+        )
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload()
+
+        import asyncio
+
+        asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+
+        assert _session_link_calls(mock_conn) == []
+        assert _session_resolution_calls(mock_conn) == []
+
+
+class TestUpdateTerminalSessionLink:
+    """update_execution_binding_terminal persists afk_run_sessions (issue #618)."""
+
+    def test_terminal_fill_in_upserts_session_link(self, mock_conn: AsyncMock) -> None:
+        """A terminal update filling a previously-missing session writes the
+        afk_run_sessions row in the same transaction (enrich-only)."""
+        internal_session_id = uuid.uuid4()
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(
+                    _terminal_row(
+                        afk_run_id="01SUPPLIED00000000000000001",
+                        provider="github",
+                        repository_url="org/repo",
+                        entity_type="change_request",
+                        entity_number="7",
+                    )
+                ),
+                mock_row(
+                    {
+                        "change_request_provider": "github",
+                        "change_request_repository": "org/repo",
+                        "change_request_external_id": "7",
+                    }
+                ),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [mock_row({"id": internal_session_id})],  # session resolution
+                [],  # _project_afk_run_status outcome read
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            external_session_id="ses_terminal_618",
+            provider=Provider.GITHUB,
+            repository="org/repo",
+            resource_number="7",
+        )
+
+        assert result.is_updated is True
+        resolution = _session_resolution_calls(mock_conn)
+        assert len(resolution) == 1
+        assert resolution[0][1][0] == "ses_terminal_618"
+
+        links = _session_link_calls(mock_conn)
+        assert len(links) == 1
+        sql, args = links[0]
+        assert "ON CONFLICT (afk_run_id, external_session_id) DO UPDATE" in sql
+        assert args[0] == "01SUPPLIED00000000000000001"
+        assert args[1] == str(internal_session_id)
+        assert args[2] == "ses_terminal_618"
+
+    def test_terminal_update_without_session_writes_no_link(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """A failed/cancelled transition without a session never writes a link."""
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[
+                mock_row(_terminal_row(afk_run_id="01SUPPLIED00000000000000001")),
+            ]
+        )
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [],  # _project_afk_run_status outcome read
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.FAILED,
+            failure_reason="Timeout",
+        )
+
+        assert result.is_updated is True
+        assert _session_link_calls(mock_conn) == []
+        assert _session_resolution_calls(mock_conn) == []
+
+    def test_identical_terminal_replay_writes_no_link(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """An idempotent terminal replay never re-writes the session link."""
+        finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+        mock_conn.fetchrow = AsyncMock(
+            return_value=mock_row(
+                _terminal_row(
+                    outcome="completed",
+                    finished_at=finished,
+                    external_session_id="ses_stored",
+                    provider="github",
+                    repository_url="org/repo",
+                    entity_type="change_request",
+                    entity_number="7",
+                    afk_run_id="01SUPPLIED00000000000000001",
+                )
+            )
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+
+        result = _run_update(
+            repo,
+            awx_job_id="900",
+            outcome=ExecutionOutcome.COMPLETED,
+            finished_at=finished,
+        )
+
+        assert result.is_updated is False
+        assert result.is_conflict is False
+        assert _session_link_calls(mock_conn) == []
+        assert _session_resolution_calls(mock_conn) == []

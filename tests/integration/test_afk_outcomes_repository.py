@@ -848,3 +848,218 @@ async def test_association_unique_constraint_enforced_at_sql_level(
                 "change_request",
                 "9002",
             )
+
+
+# ── Execution-binding session links (issue #618) ─────────────────────────────
+
+
+async def _seed_gateway_session(
+    conn: asyncpg.Connection, *, external_session_id: str
+) -> uuid.UUID:
+    """Insert one client/credential/source-database/session chain; return the
+    internal ``sessions.id`` UUID."""
+    client_id = await conn.fetchval(
+        "INSERT INTO opencode_clients (name) VALUES ($1) RETURNING id",
+        f"cli-{uuid.uuid4()}",
+    )
+    credential_id = await conn.fetchval(
+        "INSERT INTO collector_credentials (client_id, token_hash, token_prefix)"
+        " VALUES ($1, $2, $3) RETURNING id",
+        client_id,
+        "dummy-token-hash",
+        "pref",
+    )
+    database_id = await conn.fetchval(
+        "INSERT INTO source_databases (collector_credential_id, client_id)"
+        " VALUES ($1, $2) RETURNING id",
+        credential_id,
+        client_id,
+    )
+    started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
+    return await conn.fetchval(
+        "INSERT INTO sessions"
+        " (client_id, source_database_id, external_session_id,"
+        "  first_message_at, last_message_at)"
+        " VALUES ($1, $2, $3, $4, $4) RETURNING id",
+        client_id,
+        database_id,
+        external_session_id,
+        started,
+    )
+
+
+async def _seed_execution_afk_run(conn: asyncpg.Connection, run_id: str) -> None:
+    """Insert a provisional afk_runs row the execution can attach to."""
+    await conn.execute(
+        "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
+        " VALUES ($1, $2, 'pending', now(), now())",
+        run_id,
+        "github",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_creation_persists_afk_run_session_link(db_pool: asyncpg.Pool) -> None:
+    """Creating an execution binding with afk_run_id + external_session_id
+    persists the afk_run_sessions row with the resolved internal session id."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_{uuid.uuid4().hex[:8]}"
+        internal_session_id = await _seed_gateway_session(
+            conn, external_session_id=external_session_id
+        )
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000001")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        result = await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618001",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6181",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 test",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=1
+            ),
+        )
+        assert result.is_created is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["external_session_id"] == external_session_id
+        assert row["session_id"] == internal_session_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_creation_unresolved_session_keeps_external_id(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A binding whose external session id matches no Gateway session persists
+    the link with session_id NULL, retaining the external id."""
+    async with db_pool.acquire() as conn:
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000002")
+        external_session_id = f"ses_618_unresolved_{uuid.uuid4().hex[:8]}"
+
+        repo = AsyncpgOutcomeRepository(conn)
+        result = await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618002",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6182",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 unresolved",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=2
+            ),
+        )
+        assert result.is_created is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["session_id"] is None
+        assert row["external_session_id"] == external_session_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_creation_replay_is_idempotent(db_pool: asyncpg.Pool) -> None:
+    """Replaying the identical binding never duplicates the afk_run_sessions row."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_replay_{uuid.uuid4().hex[:8]}"
+        await _seed_gateway_session(conn, external_session_id=external_session_id)
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000003")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        ulid_source = __import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+            1_700_000_000_000, start=3
+        )
+        kwargs = dict(
+            awx_job_id="618003",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6183",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 replay",
+            afk_run_id=run_id,
+            ulid_source=ulid_source,
+        )
+        await repo.create_or_replay_afk_execution_binding(**kwargs)
+        await repo.create_or_replay_afk_execution_binding(**kwargs)
+
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert count == 1, f"expected 1 session link after replay, got {count}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_terminal_fill_in_persists_afk_run_session_link(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A terminal PATCH supplying a previously-missing session persists the
+    afk_run_sessions row without erasing existing values (enrich-only)."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_terminal_{uuid.uuid4().hex[:8]}"
+        internal_session_id = await _seed_gateway_session(
+            conn, external_session_id=external_session_id
+        )
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000004")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        # Phase 1 — running provisioning, no session yet.
+        await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618004",
+            job_template_id=7,
+            external_session_id=None,
+            outcome=ExecutionOutcome.RUNNING,
+            title="Issue 618 two-phase",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=4
+            ),
+        )
+
+        # Phase 2 — terminal update fills the session + resource.
+        update = await repo.update_execution_binding_terminal(
+            awx_job_id="618004",
+            outcome=ExecutionOutcome.COMPLETED,
+            finished_at=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+            external_session_id=external_session_id,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6184",
+        )
+        assert update.is_updated is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["session_id"] == internal_session_id
+        assert row["external_session_id"] == external_session_id
