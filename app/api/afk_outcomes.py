@@ -16,6 +16,12 @@ read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
   facts, AFK automation state, total estimated cost, latest linked activity,
   and aggregated execution counts; filterable by provider, repository,
   provider state, automation state, and activity window; paginated.
+- ``GET /change-requests/{provider}/{repository}/{external_number}`` — the
+  provider-scoped change-request detail (issue #611): the summary block plus
+  linked AFK runs (with link provenance), ordered AWX execution bindings
+  (purpose, per-execution session telemetry, cost, duration), deduplicated
+  linked sessions, aggregate usage/cost, provider merge state, and the
+  optional provenance timeline.
 
 All responses use the existing ``{status, data, error}`` envelope and are
 protected by the global :class:`~app.core.auth.ApiKeyMiddleware`.  This router
@@ -36,6 +42,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from afk_outcomes.models import (
+    AWXJobIdentity,
     CorrelationEvidence,
     EngineeringOutcome,
     EngineeringOutcomeStatus,
@@ -45,8 +52,15 @@ from afk_outcomes.models import (
 )
 from app.core.config import get_settings
 from app.core.schemas.afk import (
+    ChangeRequestDetail,
+    ChangeRequestDetailSummary,
     ChangeRequestExecutionCounts,
+    ChangeRequestExecutionItem,
+    ChangeRequestLinkedRun,
+    ChangeRequestMergeState,
     ChangeRequestSummaryRow,
+    ChangeRequestTimeline,
+    ChangeRequestTimelineEvent,
     EntityLink,
     EntityRow,
     RunDetail,
@@ -783,6 +797,511 @@ async def _fetch_change_request_summaries(
     return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
 
 
+# ── Change-request detail query (issue #611) ────────────────────────────────
+
+# The provider-scoped detail resolves one flattened stable resource identity
+# ``(provider, repository, external_id)`` across the same three durable
+# identity sources as the summary (observed facts, explicit change-request
+# bindings on ``afk_runs``, and execution bindings) and composes the full
+# change-request lifecycle: the summary block (with merge/freshness
+# enrichment), every linked AFK run (with its link provenance), the ordered
+# AWX execution bindings (with per-execution session telemetry), the
+# deduplicated linked sessions and usage/cost aggregate, and the optional
+# provenance timeline.  An identity known to none of the three sources is a
+# not-found.
+#
+# Aggregation rules mirror the summary query: provider state prefers
+# ``merged`` over ``closed`` over ``open`` (observed facts only — never a
+# provider API claim); automation state mirrors ``resolve_afk_run_status``'s
+# success-aware precedence; cost is a plain SUM that stays NULL when no
+# linked session carries cost telemetry (unavailable, never zero).
+#
+# Execution purpose is surfaced only when an explicit stored signal carries
+# it: a binding whose execution (or owning run) is an explicitly recorded
+# re-attempt (``trigger_type = 'recovery'`` or a run with a
+# ``recovered_from_afk_run_id``) is ``retry``; every other purpose is
+# unavailable (NULL) — the Gateway never invents an implementation/review
+# classification from data that does not carry it.
+
+#: The three durable run-linkage paths for one change-request identity.
+#: Embedded as the ``run_sources`` CTE body in the queries below.
+_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY = """
+            SELECT afk_run_id, 'change_request_binding' AS link_source
+            FROM afk_runs
+            WHERE change_request_provider = $1
+              AND change_request_repository = $2
+              AND change_request_external_id = $3
+            UNION ALL
+            SELECT afk_run_id, 'entity_link'
+            FROM afk_run_entities
+            WHERE entity_type = 'change_request'
+              AND provider = $1
+              AND repository = $2
+              AND external_id = $3
+            UNION ALL
+            SELECT afk_run_id, 'execution'
+            FROM execution_bindings
+            WHERE entity_type = 'change_request'
+              AND provider = $1
+              AND repository_url = $2
+              AND entity_number = $3
+              AND afk_run_id IS NOT NULL
+"""
+
+#: Identity existence across the three durable identity sources.
+_CHANGE_REQUEST_DETAIL_EXISTS_SQL = """
+    SELECT EXISTS (
+        SELECT 1 FROM engineering_events
+        WHERE entity_type = 'change_request'
+          AND provider = $1 AND repository = $2 AND external_id = $3
+        UNION ALL
+        SELECT 1 FROM afk_runs
+        WHERE change_request_provider = $1
+          AND change_request_repository = $2
+          AND change_request_external_id = $3
+        UNION ALL
+        SELECT 1 FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider = $1 AND repository_url = $2 AND entity_number = $3
+    )
+"""
+
+_CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
+    WITH run_sources AS (
+{_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
+    ),
+    run_ids AS (
+        SELECT afk_run_id FROM run_sources GROUP BY afk_run_id
+    ),
+    event_state AS (
+        SELECT
+            BOOL_OR(event_type = 'change_request.merged') AS merged,
+            BOOL_OR(event_type = 'change_request.closed') AS closed,
+            BOOL_OR(event_type IN ({_OPEN_EVENT_TYPES})) AS opened,
+            MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
+                AS merged_at,
+            MAX(occurred_at) AS latest_event_at
+        FROM engineering_events
+        WHERE entity_type = 'change_request'
+          AND provider = $1 AND repository = $2 AND external_id = $3
+    ),
+    exec_counts AS (
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE outcome = 'running') AS running,
+            COUNT(*) FILTER (WHERE outcome = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE outcome = 'failed') AS failed,
+            COUNT(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
+            MAX(COALESCE(finished_at, started_at, created_at)) AS latest_exec_at
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider = $1 AND repository_url = $2 AND entity_number = $3
+    ),
+    latest_binding_titles AS (
+        SELECT title
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider = $1 AND repository_url = $2 AND entity_number = $3
+          AND title IS NOT NULL
+        ORDER BY COALESCE(started_at, created_at) DESC, awx_job_id DESC
+        LIMIT 1
+    ),
+    latest_run_titles AS (
+        SELECT r.title
+        FROM run_ids ri
+        JOIN afk_runs r ON r.afk_run_id = ri.afk_run_id
+        WHERE r.title IS NOT NULL
+        ORDER BY r.last_seen_at DESC, r.afk_run_id DESC
+        LIMIT 1
+    )
+    SELECT
+        $1::text AS provider,
+        $2::text AS repository,
+        $3::text AS external_id,
+        CASE
+            WHEN BOOL_OR(es.merged) THEN 'merged'
+            WHEN BOOL_OR(es.closed) THEN 'closed'
+            WHEN BOOL_OR(es.opened) THEN 'open'
+            ELSE NULL
+        END AS provider_state,
+        CASE
+            WHEN BOOL_OR(r.status = 'running') THEN 'running'
+            WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
+            WHEN BOOL_OR(r.status = 'failed') THEN 'failed'
+            WHEN BOOL_OR(r.status = 'cancelled') THEN 'cancelled'
+            WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
+            ELSE NULL
+        END AS automation_state,
+        COALESCE(
+            MAX(r.last_seen_at),
+            MAX(es.latest_event_at),
+            MAX(ec.latest_exec_at)
+        ) AS latest_activity_at,
+        COALESCE(MAX(ec.total), 0) AS execution_total,
+        COALESCE(MAX(ec.running), 0) AS execution_running,
+        COALESCE(MAX(ec.completed), 0) AS execution_completed,
+        COALESCE(MAX(ec.failed), 0) AS execution_failed,
+        COALESCE(MAX(ec.cancelled), 0) AS execution_cancelled,
+        SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd,
+        MAX(es.merged_at) AS merged_at,
+        MAX(es.latest_event_at) AS provider_state_observed_at,
+        COALESCE(
+            (SELECT title FROM latest_binding_titles),
+            (SELECT title FROM latest_run_titles)
+        ) AS title
+    FROM (VALUES (1)) AS seed(n)
+    LEFT JOIN run_ids ri ON TRUE
+    LEFT JOIN afk_runs r ON r.afk_run_id = ri.afk_run_id
+    LEFT JOIN afk_run_sessions ars ON ars.afk_run_id = ri.afk_run_id
+    LEFT JOIN sessions s ON s.id = ars.session_id
+    CROSS JOIN event_state es
+    CROSS JOIN exec_counts ec
+    GROUP BY es.merged, es.closed, es.opened, es.latest_event_at, es.merged_at,
+             ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
+             ec.latest_exec_at
+"""
+
+_CHANGE_REQUEST_DETAIL_RUNS_SQL = f"""
+    WITH run_sources AS (
+{_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
+    )
+    SELECT r.afk_run_id, r.provider, r.status, r.title, r.started_at,
+           r.finished_at, r.outcome_status, r.first_seen_at, r.last_seen_at,
+           ARRAY_AGG(DISTINCT rs.link_source ORDER BY rs.link_source)
+               AS link_sources
+    FROM run_sources rs
+    JOIN afk_runs r ON r.afk_run_id = rs.afk_run_id
+    GROUP BY r.afk_run_id, r.provider, r.status, r.title, r.started_at,
+             r.finished_at, r.outcome_status, r.first_seen_at, r.last_seen_at
+    ORDER BY r.last_seen_at DESC NULLS LAST, r.afk_run_id ASC
+"""
+
+_CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = """
+    SELECT eb.awx_job_id, eb.job_template_id, eb.external_session_id,
+           eb.afk_run_id, eb.outcome, eb.trigger_type, eb.source_event_id,
+           eb.branch, eb.title, eb.started_at, eb.finished_at,
+           eb.failure_reason, eb.failure_summary,
+           CASE
+               WHEN eb.trigger_type = 'recovery'
+                 OR r.trigger_type = 'recovery'
+                 OR r.recovered_from_afk_run_id IS NOT NULL
+               THEN 'retry'
+               ELSE NULL
+           END AS purpose,
+           s.id AS session_id,
+           s.total_input_tokens,
+           s.total_output_tokens,
+           s.total_cache_read_tokens,
+           s.total_cache_write_tokens,
+           s.total_estimated_cost_usd AS estimated_cost_usd
+    FROM execution_bindings eb
+    LEFT JOIN afk_runs r ON r.afk_run_id = eb.afk_run_id
+    LEFT JOIN LATERAL (
+        SELECT id, total_input_tokens, total_output_tokens,
+               total_cache_read_tokens, total_cache_write_tokens,
+               total_estimated_cost_usd
+        FROM sessions
+        WHERE sessions.external_session_id = eb.external_session_id
+          AND eb.external_session_id IS NOT NULL
+        ORDER BY sessions.first_message_at DESC
+        LIMIT 1
+    ) s ON TRUE
+    WHERE eb.entity_type = 'change_request'
+      AND eb.provider = $1
+      AND eb.repository_url = $2
+      AND eb.entity_number = $3
+    ORDER BY COALESCE(eb.started_at, eb.created_at) ASC, eb.awx_job_id ASC
+"""
+
+_CHANGE_REQUEST_DETAIL_SESSIONS_SQL = f"""
+    WITH run_sources AS (
+{_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
+    )
+    SELECT ars.session_id, ars.external_session_id, ars.started_at,
+           ars.finished_at, s.agent, s.total_input_tokens,
+           s.total_output_tokens, s.total_cache_read_tokens,
+           s.total_cache_write_tokens, s.total_estimated_cost_usd,
+           s.message_count, s.parent_session_id
+    FROM run_sources rs
+    JOIN afk_run_sessions ars ON ars.afk_run_id = rs.afk_run_id
+    LEFT JOIN sessions s ON s.id = ars.session_id
+    ORDER BY ars.started_at NULLS LAST, ars.external_session_id ASC
+"""
+
+_CHANGE_REQUEST_DETAIL_TIMELINE_SQL = """
+    SELECT event_type, occurred_at, observed_via, snapshot_at, actor
+    FROM engineering_events
+    WHERE entity_type = 'change_request'
+      AND provider = $1
+      AND repository = $2
+      AND external_id = $3
+    ORDER BY occurred_at ASC, observation_key ASC
+"""
+
+
+def _change_request_detail_summary_row(
+    row: asyncpg.Record,
+) -> ChangeRequestDetailSummary:
+    """Build the detail summary block from the aggregated query row."""
+    return ChangeRequestDetailSummary(
+        provider=row["provider"],
+        repository=row["repository"],
+        external_id=row["external_id"],
+        provider_state=row["provider_state"],
+        automation_state=row["automation_state"],
+        total_estimated_cost_usd=row["total_estimated_cost_usd"],
+        latest_linked_activity=row["latest_activity_at"],
+        executions=ChangeRequestExecutionCounts(
+            total=row["execution_total"] or 0,
+            running=row["execution_running"] or 0,
+            completed=row["execution_completed"] or 0,
+            failed=row["execution_failed"] or 0,
+            cancelled=row["execution_cancelled"] or 0,
+        ),
+        title=row["title"],
+        merged_at=row["merged_at"],
+        provider_state_observed_at=row["provider_state_observed_at"],
+    )
+
+
+def _change_request_linked_run_row(row: asyncpg.Record) -> ChangeRequestLinkedRun:
+    """Build one linked AFK run row (with link provenance)."""
+    return ChangeRequestLinkedRun(
+        afk_run_id=row["afk_run_id"],
+        provider=row["provider"],
+        status=row["status"],
+        title=row["title"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        outcome_status=row["outcome_status"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        link_sources=list(row["link_sources"]),
+    )
+
+
+def _change_request_execution_item(
+    row: asyncpg.Record,
+) -> ChangeRequestExecutionItem:
+    """Build one execution item from an ``execution_bindings`` row joined to
+    its resolved session (per-execution telemetry)."""
+    started_at = row["started_at"]
+    finished_at = row["finished_at"]
+    duration = None
+    if started_at is not None and finished_at is not None:
+        duration = (finished_at - started_at).total_seconds()
+    return ChangeRequestExecutionItem(
+        awx_job=AWXJobIdentity(
+            job_id=str(row["awx_job_id"]),
+            job_template_id=row["job_template_id"],
+        ),
+        external_session_id=row["external_session_id"],
+        session_id=str(row["session_id"]) if row["session_id"] else None,
+        afk_run_id=row["afk_run_id"],
+        outcome=row["outcome"],
+        purpose=row["purpose"],
+        trigger_type=row["trigger_type"],
+        source_event_id=row["source_event_id"],
+        branch=row["branch"],
+        title=row["title"],
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=duration,
+        failure_reason=row["failure_reason"],
+        failure_summary=row["failure_summary"],
+        total_input_tokens=row["total_input_tokens"],
+        total_output_tokens=row["total_output_tokens"],
+        total_cache_read_tokens=row["total_cache_read_tokens"],
+        total_cache_write_tokens=row["total_cache_write_tokens"],
+        estimated_cost_usd=row["estimated_cost_usd"],
+    )
+
+
+def _change_request_timeline_event(
+    row: asyncpg.Record,
+) -> ChangeRequestTimelineEvent:
+    """Build one provenance-timeline event from an ``engineering_events`` fact."""
+    return ChangeRequestTimelineEvent(
+        event_type=row["event_type"],
+        occurred_at=row["occurred_at"],
+        observed_via=row["observed_via"],
+        snapshot_at=row["snapshot_at"],
+        actor=row["actor"],
+    )
+
+
+def _session_link(row: asyncpg.Record) -> SessionLink:
+    """Build a :class:`SessionLink` from a joined ``afk_run_sessions`` row."""
+    return SessionLink(
+        session_id=str(row["session_id"]) if row["session_id"] else None,
+        external_session_id=row["external_session_id"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        inferred=True,
+        agent=row["agent"],
+        message_count=row["message_count"] or 0,
+        total_input_tokens=row["total_input_tokens"] or 0,
+        total_output_tokens=row["total_output_tokens"] or 0,
+        total_cache_read_tokens=row["total_cache_read_tokens"] or 0,
+        total_cache_write_tokens=row["total_cache_write_tokens"] or 0,
+        total_estimated_cost_usd=row["total_estimated_cost_usd"],
+        parent_session_id=row.get("parent_session_id"),
+    )
+
+
+async def _fetch_change_request_detail(
+    conn: asyncpg.Connection,
+    provider: str,
+    repository: str,
+    external_number: str,
+    *,
+    db_timeout_seconds: int,
+) -> ChangeRequestDetail | None:
+    """Compose the provider-scoped change-request detail (issue #611).
+
+    Six bounded queries, no N+1:
+
+    1. identity existence across the three durable identity sources;
+    2. the summary block (states, freshness, aggregate cost/counts, title);
+    3. linked AFK runs with every durable link source;
+    4. ordered AWX execution bindings with per-execution session telemetry;
+    5. linked sessions (deduplicated) for the usage/cost aggregate;
+    6. the optional provenance-timeline facts.
+    """
+    async with timed_operation("db.query.afk.change_request.detail.exists", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.exists", db_timeout_seconds
+        ):
+            exists = await conn.fetchval(
+                _CHANGE_REQUEST_DETAIL_EXISTS_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+    if not exists:
+        return None
+
+    async with timed_operation("db.query.afk.change_request.detail.summary", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.summary", db_timeout_seconds
+        ):
+            summary_row = await conn.fetchrow(
+                _CHANGE_REQUEST_DETAIL_SUMMARY_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+
+    async with timed_operation("db.query.afk.change_request.detail.runs", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.runs", db_timeout_seconds
+        ):
+            run_rows = await conn.fetch(
+                _CHANGE_REQUEST_DETAIL_RUNS_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+
+    async with timed_operation("db.query.afk.change_request.detail.executions", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.executions", db_timeout_seconds
+        ):
+            execution_rows = await conn.fetch(
+                _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+
+    async with timed_operation("db.query.afk.change_request.detail.sessions", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.sessions", db_timeout_seconds
+        ):
+            session_rows = await conn.fetch(
+                _CHANGE_REQUEST_DETAIL_SESSIONS_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+
+    async with timed_operation("db.query.afk.change_request.detail.timeline", "db"):
+        async with _db_timeout(
+            "db.query.afk.change_request.detail.timeline", db_timeout_seconds
+        ):
+            timeline_rows = await conn.fetch(
+                _CHANGE_REQUEST_DETAIL_TIMELINE_SQL,
+                provider,
+                repository,
+                external_number,
+            )
+
+    summary = _change_request_detail_summary_row(summary_row)
+
+    merge_state = None
+    if summary.provider_state is not None or summary.merged_at is not None:
+        merge_state = ChangeRequestMergeState(
+            state="merged" if summary.merged_at is not None else "not_merged",
+            merged_at=summary.merged_at,
+        )
+
+    sessions: list[SessionLink] = []
+    seen_sessions: set[str] = set()
+    totals = {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "message_count": 0,
+        "session_count": 0,
+    }
+    cost: Decimal | None = None
+    for row in session_rows:
+        key = (
+            str(row["session_id"])
+            if row["session_id"] is not None
+            else f"external:{row['external_session_id']}"
+        )
+        if key in seen_sessions:
+            continue
+        seen_sessions.add(key)
+        sessions.append(_session_link(row))
+        totals["input"] += row["total_input_tokens"] or 0
+        totals["output"] += row["total_output_tokens"] or 0
+        totals["cache_read"] += row["total_cache_read_tokens"] or 0
+        totals["cache_write"] += row["total_cache_write_tokens"] or 0
+        totals["message_count"] += row["message_count"] or 0
+        totals["session_count"] += 1
+        if row["total_estimated_cost_usd"] is not None:
+            cost = (cost or Decimal("0")) + row["total_estimated_cost_usd"]
+
+    return ChangeRequestDetail(
+        change_request=summary,
+        afk_runs=[_change_request_linked_run_row(r) for r in run_rows],
+        executions=[_change_request_execution_item(r) for r in execution_rows],
+        sessions=sessions,
+        usage=UsageAggregate(
+            active_tokens=totals["input"] + totals["output"],
+            input_tokens=totals["input"],
+            output_tokens=totals["output"],
+            cache_read_tokens=totals["cache_read"],
+            cache_write_tokens=totals["cache_write"],
+            estimated_cost_usd=cost,
+            message_count=totals["message_count"],
+            session_count=totals["session_count"],
+        ),
+        total_estimated_cost_usd=summary.total_estimated_cost_usd,
+        merge_state=merge_state,
+        timeline=(
+            ChangeRequestTimeline(
+                events=[_change_request_timeline_event(r) for r in timeline_rows]
+            )
+            if timeline_rows
+            else None
+        ),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
@@ -944,3 +1463,69 @@ async def list_change_requests(
             offset,
             db_timeout_seconds=settings.database_timeout_seconds,
         )
+
+
+@router.get("/change-requests/{provider}/{repository:path}/{external_number}")
+async def get_change_request_detail(
+    request: Request,
+    provider: str,
+    repository: str,
+    external_number: str,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> ChangeRequestDetail:
+    """Return the provider-scoped change-request detail (issue #611).
+
+    Resolves the change request directly by ``(provider, repository,
+    external number)`` — no internal AFK Run ID discovery required — and
+    returns one composite read model: the summary block (provider state,
+    AFK automation state, merge/freshness enrichment, aggregate cost),
+    the linked AFK runs with link provenance, the ordered AWX execution
+    bindings (purpose, per-execution session telemetry, cost, duration,
+    failure metadata), the deduplicated linked sessions, the aggregate
+    usage/cost, and the optional provenance timeline.
+
+    * ``200`` — the detail.
+    * ``400`` — invalid provider or an empty repository/external-number
+      identity segment.
+    * ``404`` — the identity is unknown to every durable source (observed
+      facts, explicit change-request bindings, and execution bindings).
+
+    Strictly read-only — reads stored facts/projections only and makes no
+    provider API calls (PRD #609).
+    """
+    _require_enum_value(provider, _VALID_ORIGIN, "provider")
+    if not repository or not repository.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid change-request identity: repository must be a "
+                "non-empty string"
+            ),
+        )
+    if not external_number or not external_number.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid change-request identity: external number must be a "
+                "non-empty string"
+            ),
+        )
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        detail = await _fetch_change_request_detail(
+            conn,
+            provider,
+            repository,
+            external_number,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
+    if detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Change request not found: {provider} {repository} "
+                f"#{external_number}"
+            ),
+        )
+    return detail
