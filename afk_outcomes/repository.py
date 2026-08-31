@@ -1510,6 +1510,31 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             link.finished_at,
         )
 
+    async def _resolve_internal_session_id(self, external_session_id: str) -> str | None:
+        """Resolve an external session id to the internal ``sessions.id`` UUID.
+
+        Best-effort enrichment for execution-binding session links (issue
+        #618): multiple internal sessions may share one external session id
+        (they are scoped by ``source_database_id``, which is not available at
+        this call site).  When exactly one Gateway session matches, its
+        ``sessions.id`` is returned.  When zero match, ``None`` is returned.
+        When 2+ match, ``None`` is returned as a fail-safe — the caller never
+        guesses between competing internal sessions, and the link is
+        persisted with the ``external_session_id`` only and ``session_id``
+        NULL.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT id FROM sessions
+            WHERE external_session_id = $1
+            LIMIT 2
+            """,
+            external_session_id,
+        )
+        if len(rows) == 1:
+            return str(rows[0]["id"])
+        return None
+
     async def _upsert_unresolved_correlation(
         self,
         run: AFKRun,
@@ -1717,6 +1742,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         events: list[EngineeringEvent] = []
         for row in event_rows:
             entity_id = f"{row['entity_type']}:{row['external_id']}"
+            raw_payload = row["payload"] or {}
+            if isinstance(raw_payload, str):
+                # asyncpg returns JSONB as str unless a codec is registered.
+                raw_payload = json.loads(raw_payload)
             events.append(
                 EngineeringEvent(
                     event_id=f"{entity_id}:{row['event_type']}",
@@ -1725,7 +1754,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     entity_id=entity_id,
                     occurred_at=row["occurred_at"],
                     actor=row["actor"],
-                    payload=row["payload"] or {},
+                    payload=raw_payload,
                 )
             )
 
@@ -2330,6 +2359,23 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             )
 
             if binding_row:
+                # Persist the afk_run_sessions link in the same transaction
+                # when the binding carries both an owning lifecycle and an
+                # external session id (issue #618).  The internal Gateway
+                # session id is resolved best-effort; an unresolved external
+                # session id is retained on the link with session_id NULL.
+                if external_session_id is not None:
+                    await self._upsert_session_link(
+                        RunSessionLink(
+                            afk_run_id=run_id,
+                            session_id=await self._resolve_internal_session_id(
+                                external_session_id
+                            ),
+                            external_session_id=external_session_id,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                        )
+                    )
                 # Converge the parent toward the binding-derived projection
                 # in the same transaction (issue #606 / ADR 0027): the
                 # freshly-inserted binding participates in the outcome
@@ -2663,6 +2709,23 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_entity_number,
                 new_failure_summary,
             )
+            # Persist the afk_run_sessions link in the same transaction when
+            # the terminal binding carries both an owning lifecycle and an
+            # external session id — including a session supplied as a
+            # terminal fill-in (issue #618).  The internal Gateway session id
+            # is resolved best-effort; an unresolved external session id is
+            # retained on the link with session_id NULL.  The enrich-only
+            # upsert never erases an existing link.
+            if row.get("afk_run_id") is not None and new_session is not None:
+                await self._upsert_session_link(
+                    RunSessionLink(
+                        afk_run_id=row["afk_run_id"],
+                        session_id=await self._resolve_internal_session_id(new_session),
+                        external_session_id=new_session,
+                        started_at=None,
+                        finished_at=finished_at,
+                    )
+                )
             # Converge the parent toward the binding-derived projection in
             # the same transaction (issue #606 / ADR 0027): the just-
             # transitioned binding participates in the outcome multiset —

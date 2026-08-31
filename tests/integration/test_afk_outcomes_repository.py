@@ -25,12 +25,15 @@ Connection parameters come from the standard Gateway environment variables
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from afk_outcomes import (
     AFKRun,
@@ -41,6 +44,7 @@ from afk_outcomes import (
     EngineeringEvent,
     EngineeringOutcome,
     EngineeringOutcomeStatus,
+    ExecutionOutcome,
     EntityType,
     Provider,
     ReferenceSource,
@@ -92,7 +96,7 @@ def _integration_db_available() -> bool:
     return True
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
@@ -104,8 +108,15 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
+        # alembic/env.py calls asyncio.run(), which cannot run inside this
+        # fixture's event loop (pytest-asyncio auto mode) — execute it on a
+        # plain worker thread so env.py gets its own event loop.
         alembic.command.upgrade(alembic_cfg, "head")
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _upgrade)
     except Exception:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -114,7 +125,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.get_running_loop().run_in_executor(None, _upgrade)
 
     yield pool
 
@@ -213,11 +224,11 @@ def _make_run(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000001")
+        run = _make_run("01J00000000000000000000001")
 
         await repo.save(run)
         await repo.save(run)  # re-delivery
@@ -230,27 +241,27 @@ async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_delivery_log_replay_safe(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000002")
+        run = _make_run("01J00000000000000000000002")
 
         await repo.save(run)
         await repo.save(run)  # re-delivery
 
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = '01J0000000000000000000000002'"
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = '01J00000000000000000000002'"
         )
         assert count == 1, f"expected 1 delivery-log row after re-delivery, got {count}"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000003"
+        run_id = "01J00000000000000000000003"
 
         await repo.save(_make_run(run_id, confidence=0.5))
         await repo.save(_make_run(run_id, confidence=0.9))  # raise
@@ -266,11 +277,11 @@ async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_evidence_appended_not_erased(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000004"
+        run_id = "01J00000000000000000000004"
 
         await repo.save(_make_run(run_id, method="issue_resolved", confidence=1.0))
         await repo.save(_make_run(run_id, method="change_request_merged", confidence=1.0))
@@ -284,49 +295,51 @@ async def test_evidence_appended_not_erased(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
 
         # Run A links the entity weakly; run B links it more confidently.
         await repo.save(
-            _make_run("01J0000000000000000000000005", confidence=0.5, role="referenced")
+            _make_run("01J00000000000000000000005", confidence=0.5, role="referenced")
         )
         await repo.save(
-            _make_run("01J0000000000000000000000006", confidence=0.9, role="resolved")
+            _make_run("01J00000000000000000000006", confidence=0.9, role="resolved")
         )
 
         # Both rows still exist (no hard-delete) …
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM afk_run_entities WHERE external_id = '437'"
+            "SELECT COUNT(*) FROM afk_run_entities WHERE external_id = '437' "
+            "AND afk_run_id IN ('01J00000000000000000000005', "
+            "'01J00000000000000000000006')"
         )
         assert count == 2, f"expected 2 entity links (superseded not deleted), got {count}"
 
         # … but run A's weaker link is marked superseded.
         superseded = await conn.fetchval(
             "SELECT superseded_at FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000005'"
+            "WHERE afk_run_id = '01J00000000000000000000005'"
         )
         assert superseded is not None, "run A's weaker link should be marked superseded"
 
         active = await conn.fetchval(
             "SELECT superseded_at FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000006'"
+            "WHERE afk_run_id = '01J00000000000000000000006'"
         )
         assert active is None, "run B's stronger link should remain active"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_superseded_link_not_reactivated_on_redelivery(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
 
-        run_a = "01J0000000000000000000000008"
-        run_b = "01J0000000000000000000000009"
+        run_a = "01J00000000000000000000008"
+        run_b = "01J00000000000000000000009"
 
         # Run A links the entity weakly; run B links it more confidently.
         await repo.save(_make_run(run_a, confidence=0.5, role="referenced"))
@@ -354,13 +367,13 @@ async def test_superseded_link_not_reactivated_on_redelivery(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_afk_run_entities_afk_run_id_not_null_enforced(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000007")
+        run = _make_run("01J00000000000000000000007")
         await repo.save(run)
 
         with pytest.raises(asyncpg.NotNullViolationError):
@@ -374,7 +387,7 @@ async def test_afk_run_entities_afk_run_id_not_null_enforced(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_correlations_stored_only_in_unresolved_table(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -382,7 +395,7 @@ async def test_unresolved_correlations_stored_only_in_unresolved_table(
         repo = AsyncpgOutcomeRepository(conn)
         # a run whose only link is a low-confidence "referenced" mention
         run = _make_run(
-            "01J0000000000000000000000008",
+            "01J00000000000000000000008",
             role="referenced",
             confidence=0.1,
             method="issue_mention",
@@ -400,7 +413,7 @@ async def test_unresolved_correlations_stored_only_in_unresolved_table(
         # …and NOT promoted to a resolved entity link's correlation_method.
         link_method = await conn.fetchval(
             "SELECT correlation_method FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000008'"
+            "WHERE afk_run_id = '01J00000000000000000000008'"
         )
         assert link_method is not None  # the link still carries the (weak) method
 
@@ -432,13 +445,13 @@ def _build_unresolved_item(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_same_run_upsert_enriches_single_row(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000099"
+        run_id = "01J00000000000000000000099"
 
         await repo.save(
             _make_run(
@@ -469,18 +482,19 @@ async def test_unresolved_same_run_upsert_enriches_single_row(
         )
         assert len(rows) == 1, f"same-run re-save must enrich one row, got {len(rows)}"
         assert rows[0]["afk_run_id"] == run_id
-        assert len(rows[0]["evidence"]) == 2, "evidence should be appended across re-saves"
+        evidence = json.loads(rows[0]["evidence"])
+        assert len(evidence) == 2, "evidence should be appended across re-saves"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_different_runs_produce_independent_rows(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000100"
-        run_b = "01J0000000000000000000000101"
+        run_a = "01J00000000000000000000100"
+        run_b = "01J00000000000000000000101"
 
         await repo.save(
             _make_run(
@@ -515,18 +529,19 @@ async def test_unresolved_different_runs_produce_independent_rows(
         )
         assert {r["afk_run_id"] for r in rows} == {run_a, run_b}
         for row in rows:
-            assert len(row["evidence"]) == 1, "evidence must be isolated per run"
+            evidence = json.loads(row["evidence"])
+            assert len(evidence) == 1, "evidence must be isolated per run"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_ambiguous_rows_across_runs_independent(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000200"
-        run_b = "01J0000000000000000000000201"
+        run_a = "01J00000000000000000000200"
+        run_b = "01J00000000000000000000201"
 
         await repo.save_unresolved(
             AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
@@ -552,14 +567,14 @@ async def test_unresolved_ambiguous_rows_across_runs_independent(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_unmatched_rows_across_runs_independent(
     db_pool: asyncpg.Pool,
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000300"
-        run_b = "01J0000000000000000000000301"
+        run_a = "01J00000000000000000000300"
+        run_b = "01J00000000000000000000301"
 
         await repo.save_unresolved(
             AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
@@ -583,7 +598,7 @@ async def test_unresolved_unmatched_rows_across_runs_independent(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_run_scoped_unique_constraint_exists_post_upgrade(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -620,7 +635,7 @@ def _make_association(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) -> None:
     """Saving the same (resource, session) pair twice persists exactly one row.
 
@@ -676,7 +691,9 @@ async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) ->
             REPO,
         )
         # write-once provenance: the first insert's source_reference wins
-        assert row["source_reference"] == [{"field": "title", "detail": "9001"}]
+        assert json.loads(row["source_reference"]) == [
+            {"field": "title", "detail": "9001"}
+        ]
         # recency: the conflict update advanced last_seen_at past first_seen_at
         assert row["last_seen_at"] > row["first_seen_at"]
 
@@ -685,7 +702,7 @@ async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -> None:
     """Two repositories with the same entity_id (issue:437) must produce
     isolated event sets when retrieved via get().
@@ -695,8 +712,8 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
     """
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        repo_a_id = "01J0000000000000000000000R1"
-        repo_b_id = "01J0000000000000000000000R2"
+        repo_a_id = "01J000000000000000000000R1"
+        repo_b_id = "01J000000000000000000000R2"
         repo_a = "org/repo-a"
         repo_b = "org/repo-b"
         started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
@@ -785,11 +802,16 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         await repo.save(run_a)
         await repo.save(run_b)
 
-        # Verify raw storage: both events exist in engineering_events
+        # Verify raw storage: both events exist in engineering_events.
+        # Scoped to this test's repositories — earlier tests in this module
+        # also write issue-437 events (for the shared REPO).
         all_events = await conn.fetch(
             "SELECT repository, event_type FROM engineering_events "
             "WHERE entity_type = 'issue' AND external_id = '437' "
-            "ORDER BY repository"
+            "AND repository IN ($1, $2) "
+            "ORDER BY repository",
+            repo_a,
+            repo_b,
         )
         assert len(all_events) == 2, (
             f"expected 2 events total (one per repo), got {len(all_events)}"
@@ -802,8 +824,9 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         assert len(fetched_a.events) == 1, (
             f"Run A expected 1 event, got {len(fetched_a.events)}"
         )
-        assert fetched_a.events[0].repository == repo_a
         assert fetched_a.events[0].event_type == "opened"
+        # EngineeringEvent carries no repository attribute; isolation is
+        # verified by the event_type difference between the two repos.
 
         # Verify get() isolation: Run B sees only repo-b's event
         fetched_b = await repo.get(repo_b_id)
@@ -811,12 +834,11 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         assert len(fetched_b.events) == 1, (
             f"Run B expected 1 event, got {len(fetched_b.events)}"
         )
-        assert fetched_b.events[0].repository == repo_b
         assert fetched_b.events[0].event_type == "closed"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_association_unique_constraint_enforced_at_sql_level(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -848,3 +870,218 @@ async def test_association_unique_constraint_enforced_at_sql_level(
                 "change_request",
                 "9002",
             )
+
+
+# ── Execution-binding session links (issue #618) ─────────────────────────────
+
+
+async def _seed_gateway_session(
+    conn: asyncpg.Connection, *, external_session_id: str
+) -> uuid.UUID:
+    """Insert one client/credential/source-database/session chain; return the
+    internal ``sessions.id`` UUID."""
+    client_id = await conn.fetchval(
+        "INSERT INTO opencode_clients (name) VALUES ($1) RETURNING id",
+        f"cli-{uuid.uuid4()}",
+    )
+    credential_id = await conn.fetchval(
+        "INSERT INTO collector_credentials (client_id, token_hash, token_prefix)"
+        " VALUES ($1, $2, $3) RETURNING id",
+        client_id,
+        "dummy-token-hash",
+        "pref",
+    )
+    database_id = await conn.fetchval(
+        "INSERT INTO source_databases (collector_credential_id, client_id)"
+        " VALUES ($1, $2) RETURNING id",
+        credential_id,
+        client_id,
+    )
+    started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
+    return await conn.fetchval(
+        "INSERT INTO sessions"
+        " (client_id, source_database_id, external_session_id,"
+        "  first_message_at, last_message_at)"
+        " VALUES ($1, $2, $3, $4, $4) RETURNING id",
+        client_id,
+        database_id,
+        external_session_id,
+        started,
+    )
+
+
+async def _seed_execution_afk_run(conn: asyncpg.Connection, run_id: str) -> None:
+    """Insert a provisional afk_runs row the execution can attach to."""
+    await conn.execute(
+        "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
+        " VALUES ($1, $2, 'pending', now(), now())",
+        run_id,
+        "github",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_creation_persists_afk_run_session_link(db_pool: asyncpg.Pool) -> None:
+    """Creating an execution binding with afk_run_id + external_session_id
+    persists the afk_run_sessions row with the resolved internal session id."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_{uuid.uuid4().hex[:8]}"
+        internal_session_id = await _seed_gateway_session(
+            conn, external_session_id=external_session_id
+        )
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000001")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        result = await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618001",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6181",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 test",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=1
+            ),
+        )
+        assert result.is_created is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["external_session_id"] == external_session_id
+        assert row["session_id"] == internal_session_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_creation_unresolved_session_keeps_external_id(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A binding whose external session id matches no Gateway session persists
+    the link with session_id NULL, retaining the external id."""
+    async with db_pool.acquire() as conn:
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000002")
+        external_session_id = f"ses_618_unresolved_{uuid.uuid4().hex[:8]}"
+
+        repo = AsyncpgOutcomeRepository(conn)
+        result = await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618002",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6182",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 unresolved",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=2
+            ),
+        )
+        assert result.is_created is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["session_id"] is None
+        assert row["external_session_id"] == external_session_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_creation_replay_is_idempotent(db_pool: asyncpg.Pool) -> None:
+    """Replaying the identical binding never duplicates the afk_run_sessions row."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_replay_{uuid.uuid4().hex[:8]}"
+        await _seed_gateway_session(conn, external_session_id=external_session_id)
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000003")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        ulid_source = __import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+            1_700_000_000_000, start=3
+        )
+        kwargs = dict(
+            awx_job_id="618003",
+            job_template_id=7,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6183",
+            external_session_id=external_session_id,
+            outcome=ExecutionOutcome.COMPLETED,
+            title="Issue 618 replay",
+            afk_run_id=run_id,
+            ulid_source=ulid_source,
+        )
+        await repo.create_or_replay_afk_execution_binding(**kwargs)
+        await repo.create_or_replay_afk_execution_binding(**kwargs)
+
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert count == 1, f"expected 1 session link after replay, got {count}"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_terminal_fill_in_persists_afk_run_session_link(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """A terminal PATCH supplying a previously-missing session persists the
+    afk_run_sessions row without erasing existing values (enrich-only)."""
+    async with db_pool.acquire() as conn:
+        external_session_id = f"ses_618_terminal_{uuid.uuid4().hex[:8]}"
+        internal_session_id = await _seed_gateway_session(
+            conn, external_session_id=external_session_id
+        )
+        await _seed_execution_afk_run(conn, run_id := "01J61800000000000000000004")
+
+        repo = AsyncpgOutcomeRepository(conn)
+        # Phase 1 — running provisioning, no session yet.
+        await repo.create_or_replay_afk_execution_binding(
+            awx_job_id="618004",
+            job_template_id=7,
+            external_session_id=None,
+            outcome=ExecutionOutcome.RUNNING,
+            title="Issue 618 two-phase",
+            afk_run_id=run_id,
+            ulid_source=__import__("afk_outcomes.serialization", fromlist=["SequenceULID"]).SequenceULID(
+                1_700_000_000_000, start=4
+            ),
+        )
+
+        # Phase 2 — terminal update fills the session + resource.
+        update = await repo.update_execution_binding_terminal(
+            awx_job_id="618004",
+            outcome=ExecutionOutcome.COMPLETED,
+            finished_at=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+            external_session_id=external_session_id,
+            provider=Provider.GITHUB,
+            repository=REPO,
+            resource_number="6184",
+        )
+        assert update.is_updated is True
+
+        row = await conn.fetchrow(
+            "SELECT session_id, external_session_id FROM afk_run_sessions"
+            " WHERE afk_run_id = $1 AND external_session_id = $2",
+            run_id,
+            external_session_id,
+        )
+        assert row is not None
+        assert row["session_id"] == internal_session_id
+        assert row["external_session_id"] == external_session_id

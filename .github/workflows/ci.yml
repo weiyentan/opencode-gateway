@@ -43,7 +43,7 @@ jobs:
 
       - run: pytest --maxfail=5 -v -m "not integration"
 
-      - name: Run AFK convergence PostgreSQL integration tests
+      - name: Run AFK PostgreSQL integration tests
         env:
           GATEWAY_DATABASE_HOST: localhost
           GATEWAY_DATABASE_PORT: "5432"
@@ -52,8 +52,10 @@ jobs:
           GATEWAY_DATABASE_PASSWORD: test
         run: |
           set -euo pipefail
-          pytest tests/integration/test_afk_run_convergence.py -v -m integration 2>&1 | tee /tmp/afk-convergence.log
-          grep -q "8 passed" /tmp/afk-convergence.log
+          pytest \
+            tests/integration/test_afk_run_convergence.py \
+            tests/integration/test_afk_outcomes_repository.py \
+            -v -m integration
 
       - name: Lint Python
         run: ruff check .

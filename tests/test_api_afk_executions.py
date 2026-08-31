@@ -2331,3 +2331,118 @@ class TestAFKRunConvergenceAPI:
         import inspect
 
         assert list(inspect.signature(resolve_afk_run_status).parameters.keys()) == ["outcomes"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AFK run detail exposes session links from execution bindings (issue #618)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRunDetailSessionLinks:
+    """GET /api/v1/afk-outcomes/runs/{afk_run_id} surfaces the session links
+    that execution bindings now persist to afk_run_sessions (issue #618)."""
+
+    @pytest.mark.asyncio
+    async def test_run_detail_returns_session_and_nonzero_session_count(
+        self,
+    ) -> None:
+        """A run whose binding carried an external session id exposes the
+        linked session and a non-zero usage.session_count."""
+        from decimal import Decimal
+
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        run_id = "01JZABCDEFGHJKLMNPQRSTVWX"
+        session_uuid = uuid.uuid4()
+        run_row = mock_row(
+            {
+                "afk_run_id": run_id,
+                "provider": "github",
+                "status": "completed",
+                "title": "Fix login bug",
+                "started_at": _A_TS,
+                "finished_at": _B_TS,
+                "outcome_status": "merged",
+                "outcome": {
+                    "status": "merged",
+                    "change_request_ids": ["change_request:42"],
+                    "resolved_issue_ids": [],
+                    "merge_event_id": None,
+                    "merged_at": None,
+                },
+                "first_seen_at": _A_TS,
+                "last_seen_at": _B_TS,
+            }
+        )
+        session_row = mock_row(
+            {
+                "session_id": session_uuid,
+                "external_session_id": "ses_abc123",
+                "started_at": _A_TS,
+                "finished_at": _B_TS,
+                "agent": "code-editor",
+                "total_input_tokens": 500,
+                "total_output_tokens": 250,
+                "total_cache_read_tokens": 100,
+                "total_cache_write_tokens": 50,
+                "total_estimated_cost_usd": Decimal("0.0175"),
+                "message_count": 5,
+                "parent_session_id": None,
+            }
+        )
+        conn.fetchrow = AsyncMock(return_value=run_row)
+        conn.fetch = AsyncMock(
+            side_effect=[
+                [],  # entity rows
+                [session_row],  # afk_run_sessions rows
+            ]
+        )
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk-outcomes/runs/{run_id}")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert len(data["sessions"]) == 1
+        assert data["sessions"][0]["external_session_id"] == "ses_abc123"
+        assert data["sessions"][0]["session_id"] == str(session_uuid)
+        assert data["usage"]["session_count"] == 1
+        assert data["usage"]["active_tokens"] == 750
+
+    @pytest.mark.asyncio
+    async def test_run_detail_without_session_links_has_zero_count(
+        self,
+    ) -> None:
+        """A run with no persisted session links reports session_count 0."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        run_id = "01JZABCDEFGHJKLMNPQRSTVWY"
+        run_row = mock_row(
+            {
+                "afk_run_id": run_id,
+                "provider": "github",
+                "status": "completed",
+                "title": "Fix login bug",
+                "started_at": _A_TS,
+                "finished_at": _B_TS,
+                "outcome_status": "merged",
+                "outcome": None,
+                "first_seen_at": _A_TS,
+                "last_seen_at": _B_TS,
+            }
+        )
+        conn.fetchrow = AsyncMock(return_value=run_row)
+        conn.fetch = AsyncMock(
+            side_effect=[
+                [],  # entity rows
+                [],  # afk_run_sessions rows — none
+            ]
+        )
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk-outcomes/runs/{run_id}")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["sessions"] == []
+        assert data["usage"]["session_count"] == 0
