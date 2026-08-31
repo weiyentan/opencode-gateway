@@ -25,6 +25,7 @@ Connection parameters come from the standard Gateway environment variables
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -309,7 +310,9 @@ async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> Non
 
         # Both rows still exist (no hard-delete) …
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM afk_run_entities WHERE external_id = '437'"
+            "SELECT COUNT(*) FROM afk_run_entities WHERE external_id = '437' "
+            "AND afk_run_id IN ('01J00000000000000000000005', "
+            "'01J00000000000000000000006')"
         )
         assert count == 2, f"expected 2 entity links (superseded not deleted), got {count}"
 
@@ -479,7 +482,8 @@ async def test_unresolved_same_run_upsert_enriches_single_row(
         )
         assert len(rows) == 1, f"same-run re-save must enrich one row, got {len(rows)}"
         assert rows[0]["afk_run_id"] == run_id
-        assert len(rows[0]["evidence"]) == 2, "evidence should be appended across re-saves"
+        evidence = json.loads(rows[0]["evidence"])
+        assert len(evidence) == 2, "evidence should be appended across re-saves"
 
 
 @pytest.mark.integration
@@ -525,7 +529,8 @@ async def test_unresolved_different_runs_produce_independent_rows(
         )
         assert {r["afk_run_id"] for r in rows} == {run_a, run_b}
         for row in rows:
-            assert len(row["evidence"]) == 1, "evidence must be isolated per run"
+            evidence = json.loads(row["evidence"])
+            assert len(evidence) == 1, "evidence must be isolated per run"
 
 
 @pytest.mark.integration
@@ -686,7 +691,9 @@ async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) ->
             REPO,
         )
         # write-once provenance: the first insert's source_reference wins
-        assert row["source_reference"] == [{"field": "title", "detail": "9001"}]
+        assert json.loads(row["source_reference"]) == [
+            {"field": "title", "detail": "9001"}
+        ]
         # recency: the conflict update advanced last_seen_at past first_seen_at
         assert row["last_seen_at"] > row["first_seen_at"]
 
@@ -795,11 +802,16 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         await repo.save(run_a)
         await repo.save(run_b)
 
-        # Verify raw storage: both events exist in engineering_events
+        # Verify raw storage: both events exist in engineering_events.
+        # Scoped to this test's repositories — earlier tests in this module
+        # also write issue-437 events (for the shared REPO).
         all_events = await conn.fetch(
             "SELECT repository, event_type FROM engineering_events "
             "WHERE entity_type = 'issue' AND external_id = '437' "
-            "ORDER BY repository"
+            "AND repository IN ($1, $2) "
+            "ORDER BY repository",
+            repo_a,
+            repo_b,
         )
         assert len(all_events) == 2, (
             f"expected 2 events total (one per repo), got {len(all_events)}"
