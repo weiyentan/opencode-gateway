@@ -247,6 +247,7 @@ _SUMMARY_ROW_VOCABULARY = {
     "automation_state": "string",
     "total_estimated_cost_usd": "number",
     "latest_linked_activity": "string",
+    "provider_state_observed_at": "string",
     "executions": "object",
 }
 

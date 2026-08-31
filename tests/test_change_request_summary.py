@@ -50,6 +50,7 @@ def _mk_summary_row(
     provider_state: str | None = "merged",
     automation_state: str | None = "completed",
     latest_activity_at: datetime | None = _B_TS,
+    provider_state_observed_at: datetime | None = _B_TS,
     total_estimated_cost_usd: Decimal | None = Decimal("0.08"),
     execution_total: int = 3,
     execution_running: int = 0,
@@ -66,6 +67,7 @@ def _mk_summary_row(
             "provider_state": provider_state,
             "automation_state": automation_state,
             "latest_activity_at": latest_activity_at,
+            "provider_state_observed_at": provider_state_observed_at,
             "total_estimated_cost_usd": total_estimated_cost_usd,
             "execution_total": execution_total,
             "execution_running": execution_running,
@@ -152,6 +154,7 @@ class TestListChangeRequests:
         assert github_row["provider_state"] == "merged"
         assert github_row["automation_state"] == "completed"
         assert github_row["latest_linked_activity"] is not None
+        assert github_row["provider_state_observed_at"] is not None
         assert github_row["executions"] == {
             "total": 3,
             "running": 0,
@@ -435,6 +438,43 @@ class TestChangeRequestSummaryQueries:
         assert "MAX(ec.latest_exec_at)" in data_sql
         assert "COALESCE(\n                MAX(r.last_seen_at)" not in data_sql
 
+    def test_provider_state_observed_at_surfaces_fact_freshness(self):
+        build = self._builder()
+        _, data_sql, _ = build(None, None, None, None, None, None)
+        # The summary exposes the freshness of the derived provider state:
+        # the occurred_at of the most recent observed change_request fact.
+        assert "MAX(es.latest_event_at) AS provider_state_observed_at" in data_sql
+
+    def test_default_order_is_execution_activity_only(self):
+        build = self._builder()
+        _, data_sql, _ = build(None, None, None, None, None, None)
+        # #613: rows are ordered by newest linked AWX activity by default.
+        # The ORDER BY must use execution-only activity (the #610/#613
+        # acceptance criterion), never the combined latest_activity_at which
+        # also includes provider facts and run last_seen timestamps.
+        assert "latest_execution_activity" in data_sql
+        assert "MAX(ec.latest_exec_at) AS latest_execution_activity" in data_sql
+        assert (
+            "ORDER BY summary.latest_execution_activity DESC NULLS LAST" in data_sql
+        )
+        assert "ORDER BY summary.latest_activity_at" not in data_sql
+        # The display field latest_linked_activity still derives from the
+        # combined GREATEST — ordering changed, display did not.
+        assert "GREATEST(" in data_sql
+        assert "AS latest_activity_at" in data_sql
+
+    def test_activity_window_filter_still_uses_combined_activity(self):
+        build = self._builder()
+        _, data_sql, _ = build(
+            None, None, None, None,
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+        )
+        # The optional activity window is a display/filter concern and keeps
+        # filtering on the combined latest_activity_at, unchanged.
+        assert "summary.latest_activity_at >= $1" in data_sql
+        assert "summary.latest_activity_at <= $2" in data_sql
+
     def test_automation_state_precedence_mirrors_run_status_policy(self):
         build = self._builder()
         _, data_sql, _ = build(None, None, None, None, None, None)
@@ -480,6 +520,7 @@ class TestChangeRequestSummaryQueries:
         assert mapped.provider_state == "merged"
         assert mapped.automation_state == "completed"
         assert mapped.latest_linked_activity == _B_TS
+        assert mapped.provider_state_observed_at == _B_TS
         assert mapped.total_estimated_cost_usd == Decimal("0.08")
         assert mapped.executions.total == 3
         assert mapped.executions.completed == 2

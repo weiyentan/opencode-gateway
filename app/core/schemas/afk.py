@@ -219,6 +219,9 @@ class ChangeRequestSummaryRow(BaseModel):
       zero.
     * ``latest_linked_activity`` is the most recent timestamp across linked
       runs, observed facts, and executions.
+    * ``provider_state_observed_at`` is the ``occurred_at`` of the most
+      recent observed ``change_request`` lifecycle fact — the freshness of
+      the derived ``provider_state`` (``None`` when no fact is observed).
     """
 
     provider: str = Field(description="Source provider: github | gitlab")
@@ -248,6 +251,13 @@ class ChangeRequestSummaryRow(BaseModel):
         default=None,
         description="Most recent activity among linked runs, facts, and executions",
     )
+    provider_state_observed_at: datetime | None = Field(
+        default=None,
+        description=(
+            "occurred_at of the most recent observed change_request lifecycle "
+            "fact — freshness of the derived provider state"
+        ),
+    )
     executions: ChangeRequestExecutionCounts = Field(
         default_factory=ChangeRequestExecutionCounts
     )
@@ -261,21 +271,15 @@ class ChangeRequestDetailSummary(ChangeRequestSummaryRow):
     * ``title`` — the most recent linked execution/run title, ``None`` when
       no linked title is stored;
     * ``merged_at`` — the provider occurrence time of the observed
-      ``change_request.merged`` fact, ``None`` when never observed merged;
-    * ``provider_state_observed_at`` — the ``occurred_at`` of the most
-      recent observed ``change_request`` lifecycle fact, i.e. the freshness
-      of the derived ``provider_state`` (``None`` when no fact is observed).
+      ``change_request.merged`` fact, ``None`` when never observed merged.
+
+    ``provider_state_observed_at`` (the ``occurred_at`` of the most recent
+    observed ``change_request`` lifecycle fact — the freshness of the derived
+    ``provider_state``) is inherited from :class:`ChangeRequestSummaryRow`.
     """
 
     title: str | None = None
     merged_at: datetime | None = None
-    provider_state_observed_at: datetime | None = Field(
-        default=None,
-        description=(
-            "occurred_at of the most recent observed change_request lifecycle "
-            "fact — freshness of the derived provider state"
-        ),
-    )
 
 
 class ChangeRequestLinkedRun(BaseModel):
