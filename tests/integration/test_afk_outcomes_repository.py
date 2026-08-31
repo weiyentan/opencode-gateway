@@ -824,8 +824,9 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         assert len(fetched_a.events) == 1, (
             f"Run A expected 1 event, got {len(fetched_a.events)}"
         )
-        assert fetched_a.events[0].repository == repo_a
         assert fetched_a.events[0].event_type == "opened"
+        # EngineeringEvent carries no repository attribute; isolation is
+        # verified by the event_type difference between the two repos.
 
         # Verify get() isolation: Run B sees only repo-b's event
         fetched_b = await repo.get(repo_b_id)
@@ -833,7 +834,6 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         assert len(fetched_b.events) == 1, (
             f"Run B expected 1 event, got {len(fetched_b.events)}"
         )
-        assert fetched_b.events[0].repository == repo_b
         assert fetched_b.events[0].event_type == "closed"
 
 
