@@ -386,11 +386,78 @@
     </div><!-- #tab-clients-projects -->
 
     <!-- ── Tab: AFK Outcomes ────────────────────────────────────────────── -->
-    <!-- The first UI for the AFK outcomes domain (issue #453): a runs list
-         driven by GET /api/v1/afk-outcomes/runs (Status = RunStatus badge,
-         Outcome = EngineeringOutcomeStatus badge) whose rows open the
-         #afk-detail-overlay rendering the full chain. -->
+    <!-- The primary view is the Change Requests list (issue #613): one row
+         per change request driven by GET /api/v1/afk-outcomes/change-requests.
+         The runs list (GET /api/v1/afk-outcomes/runs) and the chain detail
+         overlay (GET /api/v1/afk-outcomes/runs/{afk_run_id}) remain available
+         as secondary run-centric behavior (issue #453). -->
     <div class="tab-content" id="tab-afk-outcomes">
+
+    <!-- Change Requests (issue #613): the PRIMARY AFK Outcomes view — one row
+         per change request (provider + repository + PR/MR number) from
+         GET /api/v1/afk-outcomes/change-requests.  Provider state and AFK
+         automation state render as independent badges; cost shows USD or
+         "Cost unavailable"; rows open the identity-keyed detail overlay.
+         Filtering is served through the summary contract query params; the
+         shared dashboard date range scopes the activity window. -->
+    <section class="glass-panel panel-afk-cr-list">
+      <h2 class="panel-title">Change Requests<span class="panel-freshness" id="freshness-afk-cr-list"></span></h2>
+      <div class="afk-cr-list-controls">
+        <label class="afk-cr-list-filter">
+          <span>Provider</span>
+          <select id="afk-cr-filter-provider">
+            <option value="">All</option>
+            <option value="github">github</option>
+            <option value="gitlab">gitlab</option>
+          </select>
+        </label>
+        <label class="afk-cr-list-filter">
+          <span>Repository</span>
+          <input type="text" id="afk-cr-filter-repository" class="afk-cr-filter-repository"
+                 placeholder="owner/repo" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="afk-cr-list-filter">
+          <span>Provider State</span>
+          <select id="afk-cr-filter-provider-state">
+            <option value="">All</option>
+            <option value="merged">merged</option>
+            <option value="closed">closed</option>
+            <option value="open">open</option>
+          </select>
+        </label>
+        <label class="afk-cr-list-filter">
+          <span>AFK Automation</span>
+          <select id="afk-cr-filter-automation-state">
+            <option value="">All</option>
+            <option value="pending">pending</option>
+            <option value="running">running</option>
+            <option value="completed">completed</option>
+            <option value="failed">failed</option>
+            <option value="cancelled">cancelled</option>
+          </select>
+        </label>
+        <button type="button" class="filter-clear" id="afk-cr-filter-apply">Apply</button>
+        <button type="button" class="filter-clear" id="afk-cr-filter-clear">Clear</button>
+      </div>
+      <div class="table-scroll">
+        <table id="afk-cr-list-table">
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>Repository</th>
+              <th>PR / MR</th>
+              <th>Provider State</th>
+              <th>AFK Automation</th>
+              <th>Cost</th>
+              <th>Latest Activity</th>
+            </tr>
+          </thead>
+          <tbody id="afk-cr-list-tbody">
+            <tr><td colspan="7" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <!-- Repository Summary (issue #572): repository-first entry view -->
     <section class="glass-panel panel-afk-repos">
@@ -596,6 +663,24 @@
     </div>
   </div>
 
+  <!-- Change Request Detail (issue #613): the identity-keyed detail flow
+       opened from a Change Requests list row.  Shows PR/MR identity, the
+       dual statuses (provider state + AFK automation state), total cost,
+       purpose-grouped AWX executions, linked sessions, and a collapsed
+       activity timeline.  Keyed by (provider, repository, external id) —
+       never an internal AFK Run ID. -->
+  <div class="detail-overlay" id="cr-list-detail-overlay">
+    <div class="detail-panel glass-panel" id="cr-list-detail-panel">
+      <div class="detail-header">
+        <h2 class="detail-title" id="cr-list-detail-title">Change Request</h2>
+        <button class="detail-close" id="cr-list-detail-close">&times;</button>
+      </div>
+      <div class="detail-body" id="cr-list-detail-body">
+        <p class="empty-state">Loading detail&hellip;</p>
+      </div>
+    </div>
+  </div>
+
   </div><!-- .app-layout -->
 
   <footer class="footer">
@@ -604,6 +689,7 @@
     <span>Auto-refresh every <strong id="footer-interval">30</strong>s</span>
   </footer>
 
-  <script src="/app.js?v=20260811-cache-control"></script>
+  <script src="/adapters/change_request_adapters.js?v=20260831-cache-control"></script>
+  <script src="/app.js?v=20260831-cache-control"></script>
 </body>
 </html>
