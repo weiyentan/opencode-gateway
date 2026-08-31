@@ -3405,23 +3405,41 @@
     return html + '</div>';
   }
 
-  /** Render one execution entry: AWX job id, purpose and status badges,
-   *  session, timestamps, duration, cost, and the bounded failure summary
+  /** Render one execution entry: AWX job id, purpose and status/outcome
+   *  badges, AWX job metadata (job template, trigger type, branch), linked
+   *  session, timestamps, duration, token usage (compact Token Breakdown
+   *  when telemetry exists), per-run cost, and the bounded failure summary
    *  when present.  Pure — returns an HTML string. */
   function renderChangeRequestExecution(execution) {
+    var tokens = execution.tokens || {};
+    var tokensAvailable = !!tokens && [tokens.inputTokens, tokens.outputTokens,
+      tokens.cacheReadTokens, tokens.cacheWriteTokens].some(function (t) {
+        return t != null && t !== '' && !isNaN(Number(t)) && Number(t) > 0;
+      });
     var html = '<div class="afk-cr-execution">' +
       '<div class="afk-cr-execution-head">' +
         '<span class="afk-entity-id">' + escHtml(execution.awxJobId || '--') + '</span>' +
         badge(execution.purpose.label, execution.purpose.badgeClass).outerHTML +
         badge(execution.status.label, execution.status.badgeClass).outerHTML +
+        (execution.outcome && execution.outcome !== execution.status.value
+          ? badge(execution.outcome, afkRunStatusBadgeClass(execution.outcome)).outerHTML : '') +
       '</div>' +
       '<div class="afk-cr-execution-meta">' +
         (execution.externalSessionId ? 'session: ' + escHtml(execution.externalSessionId) : '') +
+        (execution.jobTemplateId != null ? ' &middot; template: ' + escHtml(String(execution.jobTemplateId)) : '') +
+        (execution.triggerType ? ' &middot; trigger: ' + escHtml(execution.triggerType) : '') +
+        (execution.branch ? ' &middot; branch: ' + escHtml(execution.branch) : '') +
         (execution.startedAt ? ' &middot; started ' + fmtDT(execution.startedAt) : '') +
         (execution.finishedAt ? ' &middot; finished ' + fmtDT(execution.finishedAt) : '') +
         ' &middot; duration: ' + escHtml(execution.duration) +
         ' &middot; cost: ' + escHtml(execution.cost.label) +
       '</div>';
+    if (tokensAvailable) {
+      html += '<div class="afk-tokens">' +
+        fmtTokenBreakdownCompact(tokens.inputTokens, tokens.outputTokens,
+          tokens.cacheReadTokens, tokens.cacheWriteTokens) +
+      '</div>';
+    }
     if (execution.failureSummary) {
       html += '<div class="afk-cr-execution-failure">' + escHtml(execution.failureSummary) + '</div>';
     }
@@ -4891,6 +4909,10 @@
   window.syncArDateFilterUI = syncArDateFilterUI;
   window.clearArDateFilters = clearArDateFilters;
   window.setupAgentRunEventHandlers = setupAgentRunEventHandlers;
+  // AFK Outcomes (issue #613/#614): the change-request detail overlay wiring
+  // (close button, backdrop, ESC) as a test seam — mirrors the
+  // setupAgentRunEventHandlers export used by the Node harness.
+  window.setupAfkOutcomesEventHandlers = setupAfkOutcomesEventHandlers;
   // Agent Runs URL builder + state hooks (issue #412): buildAgentRunsUrl
   // derives from_date/to_date from the closure state (agentRunFilters,
   // dateRangeState), so the node harness gets the builder itself plus

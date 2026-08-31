@@ -437,6 +437,16 @@
       : execution.cost_usd;
     var startedAt = execution.started_at || null;
     var finishedAt = execution.finished_at || null;
+    var inputTokens = execution.total_input_tokens != null ? execution.total_input_tokens
+      : execution.input_tokens;
+    var outputTokens = execution.total_output_tokens != null ? execution.total_output_tokens
+      : execution.output_tokens;
+    var cacheReadTokens = execution.total_cache_read_tokens != null ? execution.total_cache_read_tokens
+      : execution.cache_read_tokens;
+    var cacheWriteTokens = execution.total_cache_write_tokens != null ? execution.total_cache_write_tokens
+      : execution.cache_write_tokens;
+    var hasTokens = [inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens]
+      .some(function (t) { return t != null && t !== '' && !isNaN(Number(t)) && Number(t) > 0; });
     return {
       awxJobId: awxJobId,
       jobTemplateId: awx.job_template_id != null ? awx.job_template_id : execution.job_template_id,
@@ -461,6 +471,13 @@
         available: costUsd != null && !isNaN(Number(costUsd)),
         usd: costUsd != null && !isNaN(Number(costUsd)) ? Number(costUsd) : null,
         label: fmtCrCost(costUsd)
+      },
+      tokens: {
+        available: hasTokens,
+        inputTokens: inputTokens != null ? Number(inputTokens) : null,
+        outputTokens: outputTokens != null ? Number(outputTokens) : null,
+        cacheReadTokens: cacheReadTokens != null ? Number(cacheReadTokens) : null,
+        cacheWriteTokens: cacheWriteTokens != null ? Number(cacheWriteTokens) : null
       },
       title: execution.title || null,
       branch: execution.branch || null,
@@ -584,6 +601,12 @@
     crLatestActivityAt: crLatestActivityAt,
     fmtCrTimestamp: fmtCrTimestamp,
     fmtCrDuration: fmtCrDuration,
+    // execution tokens
+    executionTokensAvailable: function (execution) {
+      var t = (execution && execution.tokens) || {};
+      return !!(t && (t.inputTokens != null || t.outputTokens != null ||
+        t.cacheReadTokens != null || t.cacheWriteTokens != null));
+    },
     // execution purpose + status
     executionPurpose: executionPurpose,
     executionPurposeLabel: executionPurposeLabel,
