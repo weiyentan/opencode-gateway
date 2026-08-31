@@ -24,6 +24,9 @@
   const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
   const AGENT_RUN_LIMIT = 50;
   const AFK_RUN_LIMIT = 50;
+  // Change-request summary list (issue #613): page size for the primary
+  // change-request-per-row view (GET /api/v1/afk-outcomes/change-requests).
+  const AFK_CR_LIMIT = 100;
 
   // ── Element refs ───────────────────────────────────────────────────────
 
@@ -87,6 +90,20 @@
     // Unresolved Relationships (issue #576)
     unresolvedTbody: $('unresolved-relationships-tbody'),
 
+    // Change Request List (issue #613): the primary change-request-per-row
+    // AFK Outcomes view (summary contract + filters) and its detail overlay.
+    afkCrListTbody:  $('afk-cr-list-tbody'),
+    afkCrFilterProvider: $('afk-cr-filter-provider'),
+    afkCrFilterRepository: $('afk-cr-filter-repository'),
+    afkCrFilterProviderState: $('afk-cr-filter-provider-state'),
+    afkCrFilterAutomationState: $('afk-cr-filter-automation-state'),
+    afkCrFilterApply: $('afk-cr-filter-apply'),
+    afkCrFilterClear: $('afk-cr-filter-clear'),
+    crListDetailOverlay: $('cr-list-detail-overlay'),
+    crListDetailTitle:   $('cr-list-detail-title'),
+    crListDetailBody:    $('cr-list-detail-body'),
+    crListDetailClose:   $('cr-list-detail-close'),
+
     // Date range bar
     drPreset:       $('dr-preset'),
     drCustomInputs: $('dr-custom-inputs'),
@@ -124,6 +141,22 @@
   let unresolvedRelationshipsData = null; // latest unresolved relationships data
   let selectedRepo = null;
   let afkOnlyFilter = false;
+  // Change-request summary list state (issue #613): the latest summary
+  // response, the per-cycle fetch error, the active filter set (served
+  // through the summary contract — never client-side re-filtering), and the
+  // change-request identity of the currently opened detail row.  Selection
+  // is keyed by (provider, repository, external_id) — never an internal
+  // AFK Run ID (PRD story 14).
+  let afkCrData = null;
+  let afkCrFetchError = null;
+  let afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+  let selectedChangeRequest = null;
+
+  // The #612 adapter/formatter module loads before app.js in index.html and
+  // exposes itself on window.ChangeRequestAdapters.  Captured once at load
+  // time; absent in environments that don't load the module (guarded at
+  // every call site so nothing crashes at IIFE evaluation).
+  var ChangeRequestAdapters = (typeof window !== 'undefined' && window.ChangeRequestAdapters) || null;
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -181,6 +214,7 @@
     'afk-repos':     ['afkRuns'],
     'afk-change-requests': ['afkRuns'],
     'unresolved-relationships': ['afkRuns'],
+    'afk-cr-list':   ['afkChangeRequests'], // primary change-request view (issue #613)
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -1586,7 +1620,7 @@
       // Sessions + Agent Runs view (issue #402): the merged table is driven
       // by the agent-runs endpoint (a superset), and the Sessions KPI reads
       // the aggregates total row's session_count.
-      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns] =
+      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns, afkChangeRequests] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -1603,6 +1637,11 @@
           // Outcomes tab.  List-only; the full chain is fetched on demand by
           // openAfkRunDetail (GET /api/v1/afk-outcomes/runs/{afk_run_id}).
           apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
+          // Change-request summary list (issue #613): the primary AFK
+          // Outcomes view — one row per provider/repository/change-request
+          // identity from GET /api/v1/afk-outcomes/change-requests, scoped
+          // by the active filters and the shared dashboard date range.
+          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT)),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -1614,6 +1653,8 @@
       results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
       results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
       results.afkRuns   = afkRuns.status   === 'fulfilled' ? afkRuns.value   : null;
+      results.afkChangeRequests = afkChangeRequests.status === 'fulfilled' ? afkChangeRequests.value : null;
+      afkCrData = results.afkChangeRequests; // latest change-request summary response (issue #613)
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -1626,6 +1667,7 @@
       fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
       if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
       afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
+      afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
 
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
@@ -3033,6 +3075,429 @@
     openAgentRunDetail(sessionId);
   }
 
+  // ── Change Request list view (issue #613) ───────────────────────────────
+  // The primary AFK Outcomes presentation: one row per change request
+  // (provider + repository + PR/MR number) served by the Gateway-owned
+  // summary contract (GET /api/v1/afk-outcomes/change-requests).  Data
+  // composition happens in the #612 adapters; this layer only builds the
+  // request URL, renders rows, and opens the identity-keyed detail flow.
+  // Ordering, aggregation, and unlinked-execution exclusion belong to the
+  // query layer — the browser never re-sorts or re-aggregates rows.
+
+  /** Build the change-request summary list URL from the active filters and
+   *  the shared dashboard date range (activity window).  Filter names use
+   *  the #610 query contract exactly (provider / repository /
+   *  provider_state / automation_state); the shared date range feeds
+   *  activity_from/activity_to — no second date picker (PRD).  Pure — no
+   *  DOM or fetch access.
+   *  @param {Object|null} filters - {provider, repository, providerState,
+   *                                 automationState}; empty values omitted
+   *  @param {Object|null} dateRangeState - the shared dashboard date range
+   *  @param {number} [limit] - page size (default AFK_CR_LIMIT)
+   *  @param {number} [offset] - page offset (default 0)
+   *  @returns {string} the API path with query string */
+  function buildChangeRequestListUrl(filters, dateRangeState, limit, offset) {
+    var f = filters || {};
+    var params = [];
+    if (f.provider) params.push('provider=' + encodeURIComponent(f.provider));
+    if (f.repository) params.push('repository=' + encodeURIComponent(f.repository));
+    if (f.providerState) params.push('provider_state=' + encodeURIComponent(f.providerState));
+    if (f.automationState) params.push('automation_state=' + encodeURIComponent(f.automationState));
+    var range = resolveDateRange(dateRangeState || { preset: 'this-month' });
+    if (range && range.startDate && !isNaN(range.startDate.getTime())) {
+      params.push('activity_from=' + encodeURIComponent(range.startDate.toISOString()));
+    }
+    if (range && range.endDate && !isNaN(range.endDate.getTime())) {
+      params.push('activity_to=' + encodeURIComponent(range.endDate.toISOString()));
+    }
+    params.push('limit=' + (limit != null ? limit : AFK_CR_LIMIT));
+    if (offset) params.push('offset=' + offset);
+    return '/api/v1/afk-outcomes/change-requests' + (params.length ? '?' + params.join('&') : '');
+  }
+
+  /** Build the provider-scoped change-request detail path (planned #611
+   *  contract): the identity tuple is the navigation key — never an
+   *  internal AFK Run ID (PRD story 14).  Pure — no DOM or fetch access.
+   *  @param {string|null} provider
+   *  @param {string|null} repository
+   *  @param {*} externalId
+   *  @returns {string} the API path */
+  function buildChangeRequestDetailPath(provider, repository, externalId) {
+    return '/api/v1/afk-outcomes/change-requests/' +
+      encodeURIComponent(provider || '') + '/' +
+      encodeURIComponent(repository || '') + '/' +
+      encodeURIComponent(externalId != null ? String(externalId) : '');
+  }
+
+  /** Compose the flat identity key of one change request (used for row
+   *  data-attributes and selection identity).  Pure. */
+  function changeRequestKey(provider, repository, externalId) {
+    return [provider || '', repository || '', externalId != null ? String(externalId) : ''].join('/');
+  }
+
+  /** Adapt a summary list response into stable view models through the #612
+   *  adapter module.  Returns [] when the module is absent (defensive — the
+   *  render layer then shows the empty state rather than crashing).
+   *  A field-vocabulary bridge normalizes the #610 contract's freshness
+   *  column name (`latest_linked_activity`) onto the adapter's expected
+   *  name (`latest_activity_at`), filling only when absent (non-erasing:
+   *  a present value always wins) — a pure alias, never a browser-side
+   *  join.
+   *  @param {Object|Array|null} data
+   *  @returns {Array} stable change-request view models */
+  function adaptChangeRequestSummaries(data) {
+    if (!(ChangeRequestAdapters && typeof ChangeRequestAdapters.adaptChangeRequestSummaryList === 'function')) {
+      return [];
+    }
+    var items = Array.isArray(data) ? data : ((data && data.items) || []);
+    var bridged = items.map(function (item) {
+      if (!item || item.latest_activity_at != null || item.latest_linked_activity == null) {
+        return item;
+      }
+      return Object.assign({}, item, { latest_activity_at: item.latest_linked_activity });
+    });
+    return ChangeRequestAdapters.adaptChangeRequestSummaryList(bridged);
+  }
+
+  /** Render one change-request summary row: provider, repository, PR/MR
+   *  identity, provider state, AFK automation state (dual statuses rendered
+   *  independently), total cost (USD or 'Cost unavailable'), and latest
+   *  linked activity.  Pure — returns an HTML string; every interpolated
+   *  value is escaped. */
+  function renderChangeRequestSummaryRow(view) {
+    var id = view.identity;
+    var crLabel = (id.external_id)
+      ? view.providerTerm + ' #' + id.external_id
+      : view.providerTerm + ' ' + (view.displayId !== '--' ? view.displayId : '--');
+    return '<tr class="afk-cr-list-row" tabindex="0" ' +
+        'data-provider="' + escHtml(id.provider) + '" ' +
+        'data-repository="' + escHtml(id.repository) + '" ' +
+        'data-external-id="' + escHtml(id.external_id) + '">' +
+      '<td data-label="Provider">' + badge(id.provider || '--', 'badge-provider').outerHTML + '</td>' +
+      '<td data-label="Repository">' + escHtml(id.repository || '--') + '</td>' +
+      '<td data-label="' + escHtml(view.providerTerm) + '">' + escHtml(crLabel) + '</td>' +
+      '<td data-label="Provider State">' +
+        badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</td>' +
+      '<td data-label="AFK Automation">' +
+        badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</td>' +
+      '<td data-label="Cost" class="afk-cr-cost-cell">' + escHtml(view.cost.label) + '</td>' +
+      '<td data-label="Latest Activity">' + fmtDT(view.latestActivityAt) + '</td>' +
+      '</tr>';
+  }
+
+  /** Render the primary change-request list: one row per change request in
+   *  the exact order the Gateway returned it (newest linked activity first —
+   *  the query layer's ordering policy).  Follows the shared panel
+   *  conventions: freshness guard, empty/error states, escHtml on every
+   *  interpolated value.  Rows open the identity-keyed detail flow. */
+  function renderChangeRequestSummaryTable(data) {
+    applyPanelFreshness('afk-cr-list');
+    if (!shouldRenderPanel(panelStates, 'afk-cr-list')) return; // failed fetch → keep previous rows
+    if (!els.afkCrListTbody) return;
+
+    var views = adaptChangeRequestSummaries(data);
+    if (views.length === 0) {
+      var errSuffix = afkCrFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkCrFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      els.afkCrListTbody.innerHTML =
+        '<tr><td colspan="7" class="empty-state">No change requests' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = views.map(renderChangeRequestSummaryRow).join('');
+    els.afkCrListTbody.innerHTML = html;
+
+    var rows = els.afkCrListTbody.querySelectorAll('.afk-cr-list-row');
+    rows.forEach(function (row) {
+      var provider = row.getAttribute('data-provider');
+      var repository = row.getAttribute('data-repository');
+      var externalId = row.getAttribute('data-external-id');
+      function activate() {
+        if (provider && repository && externalId) {
+          openChangeRequestDetail(provider, repository, externalId);
+        }
+      }
+      row.addEventListener('click', activate);
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          activate();
+        }
+      });
+    });
+  }
+
+  /** Read the change-request filter controls into the filter state shape.
+   *  Empty controls are omitted (the contract returns the unfiltered set). */
+  function readChangeRequestFiltersFromUI() {
+    var filters = {};
+    if (els.afkCrFilterProvider && els.afkCrFilterProvider.value) {
+      filters.provider = els.afkCrFilterProvider.value;
+    }
+    if (els.afkCrFilterRepository && els.afkCrFilterRepository.value) {
+      filters.repository = els.afkCrFilterRepository.value.trim();
+    }
+    if (els.afkCrFilterProviderState && els.afkCrFilterProviderState.value) {
+      filters.providerState = els.afkCrFilterProviderState.value;
+    }
+    if (els.afkCrFilterAutomationState && els.afkCrFilterAutomationState.value) {
+      filters.automationState = els.afkCrFilterAutomationState.value;
+    }
+    return filters;
+  }
+
+  /** Sync the filter controls to a filter state (used by Clear). */
+  function syncChangeRequestFilterUI(filters) {
+    var f = filters || {};
+    if (els.afkCrFilterProvider) els.afkCrFilterProvider.value = f.provider || '';
+    if (els.afkCrFilterRepository) els.afkCrFilterRepository.value = f.repository || '';
+    if (els.afkCrFilterProviderState) els.afkCrFilterProviderState.value = f.providerState || '';
+    if (els.afkCrFilterAutomationState) els.afkCrFilterAutomationState.value = f.automationState || '';
+  }
+
+  /** Apply the current filter controls and re-fetch the summary list through
+   *  the contract (filters ride the query — never client-side re-filtering). */
+  function applyChangeRequestFilters() {
+    afkCrFilters = readChangeRequestFiltersFromUI();
+    return fetchChangeRequestsAndRender();
+  }
+
+  /** Clear the change-request filters (back to the full list) and re-fetch. */
+  function clearChangeRequestFilters() {
+    afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+    syncChangeRequestFilterUI(afkCrFilters);
+    return fetchChangeRequestsAndRender();
+  }
+
+  /** Fetch the change-request summary page described by the current filter
+   *  state and re-render the table (issue #613).  Mirrors
+   *  fetchAgentRunsAndRender: an independent fetch keeps the panel's
+   *  freshness state, preserves the previous rows during loading and
+   *  failures, and never blocks the rest of the dashboard. */
+  function fetchChangeRequestsAndRender() {
+    var prev = panelStates['afk-cr-list'];
+    setPanelState('afk-cr-list', 'refreshing', prev ? prev.updatedAt : null);
+    var url = buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT);
+    return apiFetch(url).then(function (data) {
+      afkCrData = data;
+      afkCrFetchError = null;
+      setPanelState('afk-cr-list', 'ok', Date.now());
+      renderChangeRequestSummaryTable(data);
+    }).catch(function (e) {
+      afkCrFetchError = e.message || 'Change-request query failed';
+      var prevState = panelStates['afk-cr-list'];
+      setPanelState('afk-cr-list', 'stale', prevState ? prevState.updatedAt : null);
+      renderChangeRequestSummaryTable(null); // keeps previous rows; label shows "Showing previous data"
+      console.error('Change-request list fetch error:', e);
+    });
+  }
+
+  /** Open the change-request detail overlay for one row, keyed by the
+   *  change-request identity tuple (never an internal AFK Run ID — PRD
+   *  story 14).  A 404 (unknown change request) renders a distinct
+   *  "not found" empty state; other failures render the generic error
+   *  state — no unhandled exception breaks the dashboard.  Returns the
+   *  fetch promise so tests can await it. */
+  function openChangeRequestDetail(provider, repository, externalId) {
+    selectedChangeRequest = {
+      provider: provider,
+      repository: repository,
+      externalId: String(externalId)
+    };
+    if (els.crListDetailOverlay) els.crListDetailOverlay.classList.add('visible');
+    if (els.crListDetailBody) els.crListDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    if (els.crListDetailTitle) els.crListDetailTitle.textContent = 'Change Request';
+
+    var path = buildChangeRequestDetailPath(provider, repository, externalId);
+    return apiFetch(path).then(function (detail) {
+      renderChangeRequestDetail(detail);
+    }).catch(function (e) {
+      var notFound = /404/.test(e && e.message);
+      if (els.crListDetailBody) {
+        els.crListDetailBody.innerHTML = '<p class="empty-state">' +
+          (notFound ? 'Change request not found' : 'Failed to load change-request detail: ' + escHtml(e.message)) +
+          '</p>';
+      }
+      console.error('Change-request detail fetch error:', e);
+    });
+  }
+
+  /** Render the change-request detail flow (issue #613): PR/MR identity and
+   *  dual statuses first, then the execution-focused summary (grouped by
+   *  purpose), linked sessions, and a collapsed activity timeline.  Consumes
+   *  the #612 detail adapter — the Gateway-owned composite payload, never
+   *  browser-side joins. */
+  function renderChangeRequestDetail(detail) {
+    if (!els.crListDetailBody) return;
+    var view = (ChangeRequestAdapters && typeof ChangeRequestAdapters.adaptChangeRequestDetail === 'function')
+      ? ChangeRequestAdapters.adaptChangeRequestDetail(detail)
+      : null;
+    if (!view) {
+      els.crListDetailBody.innerHTML = '<p class="empty-state">No change-request detail data available</p>';
+      return;
+    }
+    if (els.crListDetailTitle) {
+      els.crListDetailTitle.textContent = view.displayId || 'Change Request';
+    }
+    var html = '<div class="afk-cr-detail">' +
+      renderChangeRequestDetailHeader(view) +
+      renderChangeRequestExecutions(view) +
+      renderChangeRequestSessions(view) +
+      renderChangeRequestTimeline(view) +
+      '</div>';
+    els.crListDetailBody.innerHTML = html;
+    wireCrDetailSessionDrilldown();
+  }
+
+  /** Render the detail header: PR/MR identity, title, provider state and
+   *  AFK automation state as independent badges, and the aggregate cost.
+   *  Pure — returns an HTML string. */
+  function renderChangeRequestDetailHeader(view) {
+    var html = '<div class="afk-cr-detail-header">' +
+      '<div class="afk-cr-detail-head">' +
+        '<span class="afk-cr-detail-term">' + escHtml(view.providerTerm) + '</span>' +
+        '<span class="afk-cr-detail-id">' + escHtml(view.displayId) + '</span>' +
+        (view.title ? ' <span class="afk-cr-detail-title">' + escHtml(view.title) + '</span>' : '') +
+      '</div>' +
+      '<div class="afk-cr-detail-statuses">' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">Provider</span>' +
+          badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Automation</span>' +
+          badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">Total Cost</span>' +
+          '<span class="afk-cr-cost">' + escHtml(view.aggregateCost.label) + '</span></span>' +
+      '</div>' +
+      '</div>';
+    return html;
+  }
+
+  /** Render the execution-focused summary: implementation, review, and
+   *  retry executions grouped by purpose (distinct sections — PRD story
+   *  17), with an explicit "no linked executions" empty state.  Any
+   *  execution purpose outside the locked vocabulary is preserved under
+   *  "Other" rather than hidden.  Pure — returns an HTML string. */
+  function renderChangeRequestExecutions(view) {
+    var html = '<div class="afk-cr-section">' +
+      '<h3 class="afk-cr-section-title">Executions (' + fmtNum(view.executionCounts.total) + ')</h3>';
+    var groups = [
+      { key: 'implementation', label: 'Implementation' },
+      { key: 'review', label: 'Review' },
+      { key: 'retry', label: 'Retry' }
+    ];
+    var any = false;
+    groups.forEach(function (g) {
+      var execs = view.executions.filter(function (e) { return e.purpose.value === g.key; });
+      if (!execs.length) return;
+      any = true;
+      html += '<div class="afk-cr-exec-group"><h4 class="afk-cr-exec-group-title">' + escHtml(g.label) + '</h4>' +
+        execs.map(renderChangeRequestExecution).join('') + '</div>';
+    });
+    var rest = view.executions.filter(function (e) {
+      return groups.every(function (g) { return e.purpose.value !== g.key; });
+    });
+    if (rest.length) {
+      any = true;
+      html += '<div class="afk-cr-exec-group"><h4 class="afk-cr-exec-group-title">Other</h4>' +
+        rest.map(renderChangeRequestExecution).join('') + '</div>';
+    }
+    if (!any) html += '<div class="afk-empty">No linked executions</div>';
+    return html + '</div>';
+  }
+
+  /** Render one execution entry: AWX job id, purpose and status badges,
+   *  session, timestamps, duration, cost, and the bounded failure summary
+   *  when present.  Pure — returns an HTML string. */
+  function renderChangeRequestExecution(execution) {
+    var html = '<div class="afk-cr-execution">' +
+      '<div class="afk-cr-execution-head">' +
+        '<span class="afk-entity-id">' + escHtml(execution.awxJobId || '--') + '</span>' +
+        badge(execution.purpose.label, execution.purpose.badgeClass).outerHTML +
+        badge(execution.status.label, execution.status.badgeClass).outerHTML +
+      '</div>' +
+      '<div class="afk-cr-execution-meta">' +
+        (execution.externalSessionId ? 'session: ' + escHtml(execution.externalSessionId) : '') +
+        (execution.startedAt ? ' &middot; started ' + fmtDT(execution.startedAt) : '') +
+        (execution.finishedAt ? ' &middot; finished ' + fmtDT(execution.finishedAt) : '') +
+        ' &middot; duration: ' + escHtml(execution.duration) +
+        ' &middot; cost: ' + escHtml(execution.cost.label) +
+      '</div>';
+    if (execution.failureSummary) {
+      html += '<div class="afk-cr-execution-failure">' + escHtml(execution.failureSummary) + '</div>';
+    }
+    return html + '</div>';
+  }
+
+  /** Render the linked sessions (reusing the AFK chain session-link
+   *  renderer: compact Token Breakdown, inferred markers, and Agent Run
+   *  drill-down where a resolvable internal session id exists). */
+  function renderChangeRequestSessions(view) {
+    var sessions = view.sessions || [];
+    var html = '<div class="afk-cr-section">' +
+      '<h3 class="afk-cr-section-title">Sessions (' + fmtNum(sessions.length) + ')</h3>';
+    if (!sessions.length) {
+      html += '<div class="afk-empty">No sessions linked</div>';
+    } else {
+      html += sessions.map(renderAfkSessionLink).join('');
+    }
+    return html + '</div>';
+  }
+
+  /** Render the provenance/activity timeline, collapsed by default
+   *  (<details> without open — PRD story 24/25).  Timeline entries are
+   *  structured facts; every interpolated value is escaped. */
+  function renderChangeRequestTimeline(view) {
+    var timeline = view.timeline;
+    var html = '<div class="afk-cr-section">' +
+      '<details class="afk-cr-timeline">' +
+      '<summary class="afk-cr-timeline-summary">Activity timeline</summary>' +
+      '<div class="afk-cr-timeline-body">';
+    if (!timeline || !timeline.length) {
+      html += '<div class="afk-empty">No timeline data</div>';
+    } else {
+      timeline.forEach(function (item) {
+        html += '<div class="afk-cr-timeline-item">' +
+          '<span class="afk-cr-timeline-time">' +
+            fmtDT(item.occurred_at || item.timestamp || item.at) + '</span>' +
+          '<span class="afk-cr-timeline-type">' +
+            escHtml(item.event_type || item.type || 'event') + '</span>' +
+          '<span class="afk-cr-timeline-text">' +
+            escHtml(item.summary || item.description || '') + '</span>' +
+          '</div>';
+      });
+    }
+    return html + '</div></details></div>';
+  }
+
+  /** Wire the change-request detail session drill-down: a session with a
+   *  resolvable internal id opens the existing Agent Run detail experience
+   *  (closing the change-request overlay first, mirroring
+   *  openAfkSessionDrilldown). */
+  function wireCrDetailSessionDrilldown() {
+    if (!els.crListDetailBody) return;
+    var links = els.crListDetailBody.querySelectorAll('.afk-session-clickable');
+    links.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var sid = item.getAttribute('data-session-id');
+        if (sid) openCrSessionDrilldown(sid);
+      });
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var sid = item.getAttribute('data-session-id');
+          if (sid) openCrSessionDrilldown(sid);
+        }
+      });
+    });
+  }
+
+  /** Close the change-request detail overlay, then open the Agent Run
+   *  detail overlay for the given internal session id. */
+  function openCrSessionDrilldown(sessionId) {
+    if (els.crListDetailOverlay) els.crListDetailOverlay.classList.remove('visible');
+    openAgentRunDetail(sessionId);
+  }
+
   // Build a root-to-children tree from the flat session links. Child arrays
   // intentionally retain the session-object contract used by the API/tests.
   function buildSessionTree(sessions) {
@@ -3496,7 +3961,7 @@
    *  A failed panel keeps its previous updatedAt (data on screen is the
    *  previous successful render); a successful one records the cycle time. */
   function resolvePanelStatesAfterFetch() {
-    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError });
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError, afkChangeRequests: afkCrFetchError });
     var statuses = resolvePanelStatuses(errors);
     var nowMs = Date.now();
     Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
@@ -3548,7 +4013,8 @@
         renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
       }
       renderClientProjectBreakdown(data);
-      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderChangeRequestSummaryTable(data.afkChangeRequests); // Change Request list (issue #613) — primary view
+      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453) — secondary run-centric view
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
@@ -3891,6 +4357,55 @@
         renderChangeRequestList(afkRunsData);
       });
     }
+
+    // Change Request list (issue #613): filter bar (selects apply on change,
+    // repository text input on Enter, plus explicit Apply/Clear buttons) and
+    // the identity-keyed detail overlay (close button, backdrop, ESC) —
+    // mirroring the existing overlay wiring.
+    var crFilterApply = $('afk-cr-filter-apply');
+    if (crFilterApply) {
+      crFilterApply.addEventListener('click', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterClear = $('afk-cr-filter-clear');
+    if (crFilterClear) {
+      crFilterClear.addEventListener('click', function () { clearChangeRequestFilters(); });
+    }
+    var crFilterProvider = $('afk-cr-filter-provider');
+    if (crFilterProvider) {
+      crFilterProvider.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterProviderState = $('afk-cr-filter-provider-state');
+    if (crFilterProviderState) {
+      crFilterProviderState.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterAutomationState = $('afk-cr-filter-automation-state');
+    if (crFilterAutomationState) {
+      crFilterAutomationState.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterRepository = $('afk-cr-filter-repository');
+    if (crFilterRepository) {
+      crFilterRepository.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') applyChangeRequestFilters();
+      });
+    }
+    if (els.crListDetailClose) {
+      els.crListDetailClose.addEventListener('click', function () {
+        els.crListDetailOverlay.classList.remove('visible');
+      });
+    }
+    if (els.crListDetailOverlay) {
+      els.crListDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.crListDetailOverlay) {
+          els.crListDetailOverlay.classList.remove('visible');
+        }
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' &&
+          els.crListDetailOverlay && els.crListDetailOverlay.classList.contains('visible')) {
+        els.crListDetailOverlay.classList.remove('visible');
+      }
+    });
   }
 
   // ── Transcript view (issue #469) ───────────────────────────────────────
@@ -4450,6 +4965,26 @@
   window.renderChangeRequestList = renderChangeRequestList;
   window.selectRepository = selectRepository;
   window.clearSelectedRepo = clearSelectedRepo;
+  // Change Request list (issue #613): the URL builders, filter state hooks,
+  // render functions, and the identity-keyed selection/detail flow — the
+  // pure helpers (URL builders, row/detail renderers) plus the fetch-driven
+  // paths (apply/clear filters, open detail) exercised by the Node harness.
+  window.buildChangeRequestListUrl = buildChangeRequestListUrl;
+  window.buildChangeRequestDetailPath = buildChangeRequestDetailPath;
+  window.changeRequestKey = changeRequestKey;
+  window.renderChangeRequestSummaryRow = renderChangeRequestSummaryRow;
+  window.renderChangeRequestSummaryTable = renderChangeRequestSummaryTable;
+  window.readChangeRequestFiltersFromUI = readChangeRequestFiltersFromUI;
+  window.syncChangeRequestFilterUI = syncChangeRequestFilterUI;
+  window.applyChangeRequestFilters = applyChangeRequestFilters;
+  window.clearChangeRequestFilters = clearChangeRequestFilters;
+  window.fetchChangeRequestsAndRender = fetchChangeRequestsAndRender;
+  window.openChangeRequestDetail = openChangeRequestDetail;
+  window.renderChangeRequestDetail = renderChangeRequestDetail;
+  window.renderChangeRequestExecution = renderChangeRequestExecution;
+  window.setChangeRequestFilters = function (filters) { afkCrFilters = filters || {}; };
+  window.setSelectedChangeRequest = function (cr) { selectedChangeRequest = cr; };
+  window.getSelectedChangeRequest = function () { return selectedChangeRequest; };
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;
