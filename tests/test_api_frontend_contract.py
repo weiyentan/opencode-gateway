@@ -39,7 +39,7 @@ import types
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Union, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel
@@ -63,6 +63,13 @@ from app.core.schemas.usage import PaginatedResponse
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_DIR / "frontend" / "fixtures"
+
+# ``types.UnionType`` (the PEP 604 ``X | Y`` origin) only exists on Python
+# 3.10+; build the union-origin tuple dynamically so this module imports and
+# runs on Python 3.9.
+_UNION_TYPES = (Union,)
+if hasattr(types, "UnionType"):
+    _UNION_TYPES = (Union, types.UnionType)
 
 # ── Fixture registry (deterministic, committed) ──────────────────────────────
 
@@ -158,7 +165,7 @@ def _json_type_tag(annotation: Any) -> str:
     * Pydantic models → ``object``.
     """
     origin = get_origin(annotation)
-    if origin in (Union, types.UnionType):
+    if origin in _UNION_TYPES:
         args = [a for a in get_args(annotation) if a is not type(None)]
         if not args:
             return "null"
@@ -183,7 +190,13 @@ def _json_type_tag(annotation: Any) -> str:
 def _assert_vocabulary(model: type[BaseModel], vocabulary: dict[str, str], label: str) -> None:
     """Assert every canonical adapter field exists on the backend model with a
     compatible JSON type."""
-    resolved_annotations = get_type_hints(model)
+    # Build resolved annotations from Pydantic's own field metadata.
+    # get_type_hints() fails on Python 3.9 when the schema uses X | None
+    # syntax (PEP 604) behind from __future__ import annotations.
+    resolved_annotations = {
+        name: field.annotation
+        for name, field in model.model_fields.items()
+    }
     missing = sorted(f for f in vocabulary if f not in model.model_fields)
     assert not missing, (
         f"{label}: backend schema {model.__name__} is missing adapter-required "
