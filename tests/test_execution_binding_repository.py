@@ -2544,6 +2544,38 @@ class TestCreateOrReplaySessionLink:
         assert args[1] is None  # unresolved internal session id
         assert args[2] == "ses_unresolved_618"
 
+    def test_creation_keeps_external_session_id_when_multiple_matches(
+        self, mock_conn: AsyncMock
+    ) -> None:
+        """2+ Gateway sessions share one external id (different source DBs) ->
+        session_id stays None (fail-safe, never a guess)."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+        mock_conn.fetch = AsyncMock(
+            side_effect=[
+                [mock_row({"id": uuid.uuid4()})],  # execution_bindings INSERT
+                [  # session resolution -- ambiguous, multiple matches
+                    mock_row({"id": uuid.uuid4()}),
+                    mock_row({"id": uuid.uuid4()}),
+                ],
+                [],  # _project_afk_run_status outcome read
+            ]
+        )
+        mock_conn.execute = AsyncMock()
+        repo = AsyncpgOutcomeRepository(mock_conn)
+        payload = _binding_payload(external_session_id="ses_ambiguous_618")
+
+        import asyncio
+
+        result = asyncio.run(repo.create_or_replay_afk_execution_binding(**payload))
+        assert result.is_created is True
+
+        links = _session_link_calls(mock_conn)
+        assert len(links) == 1
+        sql, args = links[0]
+        assert args[0] == result.afk_run_id
+        assert args[1] is None  # ambiguous internal session id
+        assert args[2] == "ses_ambiguous_618"
+
     def test_creation_skips_session_link_when_no_session_supplied(
         self, mock_conn: AsyncMock
     ) -> None:

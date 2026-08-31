@@ -1515,24 +1515,24 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
         Best-effort enrichment for execution-binding session links (issue
         #618): multiple internal sessions may share one external session id
-        (they are scoped by ``source_database_id``), so the most recently
-        active match is selected deterministically (``last_message_at DESC``
-        with ``id`` as the tie-breaker).  Returns ``None`` when no matching
-        Gateway session exists — the caller then persists the link with the
-        ``external_session_id`` only and ``session_id`` NULL.
+        (they are scoped by ``source_database_id``, which is not available at
+        this call site).  When exactly one Gateway session matches, its
+        ``sessions.id`` is returned.  When zero match, ``None`` is returned.
+        When 2+ match, ``None`` is returned as a fail-safe — the caller never
+        guesses between competing internal sessions, and the link is
+        persisted with the ``external_session_id`` only and ``session_id``
+        NULL.
         """
         rows = await self._conn.fetch(
             """
             SELECT id FROM sessions
             WHERE external_session_id = $1
-            ORDER BY last_message_at DESC, id
-            LIMIT 1
             """,
             external_session_id,
         )
-        if not rows:
-            return None
-        return str(rows[0]["id"])
+        if len(rows) == 1:
+            return str(rows[0]["id"])
+        return None
 
     async def _upsert_unresolved_correlation(
         self,
