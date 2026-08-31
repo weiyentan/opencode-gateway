@@ -1,6 +1,6 @@
 """AFK outcomes read-only REST API (issue #452).
 
-Four GET endpoints under the versioned namespace expose the AFK outcome
+Five GET endpoints under the versioned namespace expose the AFK outcome
 read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
 
 - ``GET /runs``        — list runs, filterable by repository, window
@@ -11,6 +11,11 @@ read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
   provenance, and superseded state.
 - ``GET /correlations`` — unresolved correlations with method/confidence/
   evidence/resolver_version and provisional markers.
+- ``GET /change-requests`` — one summary row per provider/repository/
+  change-request identity (issue #610): provider state derived from observed
+  facts, AFK automation state, total estimated cost, latest linked activity,
+  and aggregated execution counts; filterable by provider, repository,
+  provider state, automation state, and activity window; paginated.
 
 All responses use the existing ``{status, data, error}`` envelope and are
 protected by the global :class:`~app.core.auth.ApiKeyMiddleware`.  This router
@@ -40,6 +45,8 @@ from afk_outcomes.models import (
 )
 from app.core.config import get_settings
 from app.core.schemas.afk import (
+    ChangeRequestExecutionCounts,
+    ChangeRequestSummaryRow,
     EntityLink,
     EntityRow,
     RunDetail,
@@ -62,6 +69,18 @@ _VALID_STATUS = frozenset(m.value for m in RunStatus)
 _VALID_OUTCOME = frozenset(m.value for m in EngineeringOutcomeStatus)
 _VALID_ORIGIN = frozenset(m.value for m in Provider)
 _VALID_REASON = frozenset(m.value for m in UnresolvedReason)
+
+# Provider state derived from observed change-request facts (issue #610).
+# It is a fact-derived display vocabulary, NOT EngineeringOutcomeStatus:
+# only merged/closed/open are determinable from event types.
+_VALID_PROVIDER_STATE = frozenset({"merged", "closed", "open"})
+
+# AFK automation state is the owning lifecycle's ``afk_runs.status`` — the
+# aggregate lifecycle vocabulary from ``resolve_afk_run_status`` (including
+# the provisional ``pending``), not the agent-run ``RunStatus`` enum.
+_VALID_AUTOMATION_STATE = frozenset(
+    {"pending", "running", "completed", "failed", "cancelled"}
+)
 
 # Entity-type → detail response field name grouping.
 _ENTITY_TYPE_FIELDS = {
@@ -512,10 +531,261 @@ async def _fetch_correlations(
     return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
 
 
+# ── Change-request summary query (issue #610) ───────────────────────────────
+
+# The change-request summary derives one row per flattened stable resource
+# identity ``(provider, repository, external_id)`` from three sources:
+#
+# * ``engineering_events`` — ``change_request`` facts (provider-state source);
+# * ``afk_runs`` / ``afk_run_entities`` — the owning lifecycle (automation
+#   state and, through ``afk_run_sessions`` → ``sessions``, cost);
+# * ``execution_bindings`` — AWX execution counts, only for bindings with a
+#   durable change-request identity (every resource-identity column present).
+#
+# Aggregation rules are deterministic and documented on the SQL below:
+# provider state prefers ``merged`` over ``closed`` over ``open`` (observed
+# facts only — never a provider API claim); automation state mirrors
+# ``resolve_afk_run_status``'s success-aware precedence; cost is a plain SUM
+# that stays NULL when no linked session carries cost telemetry (unavailable,
+# never zero).
+
+#: Provider lifecycle fact types that denote an open change request.
+_OPEN_EVENT_TYPES = (
+    "'change_request.opened', 'change_request.updated', 'change_request.reopened'"
+)
+
+#: The grouped aggregation body shared by the count and data queries.  Built
+#: with the identity filters (``{inner_where}``) applied pre-aggregation;
+#: state/activity filters are applied on the outer ``summary`` wrapper.
+_CHANGE_REQUEST_GROUPED_SQL = """
+        SELECT
+            i.provider AS provider,
+            i.repository AS repository,
+            i.external_id AS external_id,
+            CASE
+                WHEN BOOL_OR(es.merged) THEN 'merged'
+                WHEN BOOL_OR(es.closed) THEN 'closed'
+                WHEN BOOL_OR(es.opened) THEN 'open'
+                ELSE NULL
+            END AS provider_state,
+            CASE
+                WHEN BOOL_OR(r.status = 'running') THEN 'running'
+                WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
+                WHEN BOOL_OR(r.status = 'failed') THEN 'failed'
+                WHEN BOOL_OR(r.status = 'cancelled') THEN 'cancelled'
+                WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
+                ELSE NULL
+            END AS automation_state,
+            COALESCE(
+                MAX(r.last_seen_at),
+                MAX(es.latest_event_at),
+                MAX(ec.latest_exec_at)
+            ) AS latest_activity_at,
+            COALESCE(ec.total, 0) AS execution_total,
+            COALESCE(ec.running, 0) AS execution_running,
+            COALESCE(ec.completed, 0) AS execution_completed,
+            COALESCE(ec.failed, 0) AS execution_failed,
+            COALESCE(ec.cancelled, 0) AS execution_cancelled,
+            SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd
+        FROM identities i
+        LEFT JOIN event_state es
+            ON es.provider = i.provider
+           AND es.repository = i.repository
+           AND es.external_id = i.external_id
+        LEFT JOIN run_refs rr
+            ON rr.provider = i.provider
+           AND rr.repository = i.repository
+           AND rr.external_id = i.external_id
+        LEFT JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
+        LEFT JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+        LEFT JOIN sessions s ON s.id = ars.session_id
+        LEFT JOIN exec_counts ec
+            ON ec.provider = i.provider
+           AND ec.repository = i.repository
+           AND ec.external_id = i.external_id
+        {inner_where}
+        GROUP BY i.provider, i.repository, i.external_id,
+                 es.merged, es.closed, es.opened, es.latest_event_at,
+                 ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
+                 ec.latest_exec_at
+"""
+
+_CHANGE_REQUEST_CTES = """
+    WITH identities AS (
+        SELECT provider, repository, external_id
+        FROM engineering_events
+        WHERE entity_type = 'change_request'
+        UNION
+        SELECT change_request_provider, change_request_repository,
+               change_request_external_id
+        FROM afk_runs
+        WHERE change_request_provider IS NOT NULL
+          AND change_request_repository IS NOT NULL
+          AND change_request_external_id IS NOT NULL
+        UNION
+        SELECT provider, repository_url, entity_number
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider IS NOT NULL
+          AND repository_url IS NOT NULL
+          AND entity_number IS NOT NULL
+    ),
+    run_refs AS (
+        SELECT change_request_provider AS provider,
+               change_request_repository AS repository,
+               change_request_external_id AS external_id,
+               afk_run_id
+        FROM afk_runs
+        WHERE change_request_provider IS NOT NULL
+          AND change_request_repository IS NOT NULL
+          AND change_request_external_id IS NOT NULL
+        UNION
+        SELECT provider, repository, external_id, afk_run_id
+        FROM afk_run_entities
+        WHERE entity_type = 'change_request'
+    ),
+    event_state AS (
+        SELECT provider, repository, external_id,
+               BOOL_OR(event_type = 'change_request.merged') AS merged,
+               BOOL_OR(event_type = 'change_request.closed') AS closed,
+               BOOL_OR(event_type IN ({open_types})) AS opened,
+               MAX(occurred_at) AS latest_event_at
+        FROM engineering_events
+        WHERE entity_type = 'change_request'
+        GROUP BY provider, repository, external_id
+    ),
+    exec_counts AS (
+        SELECT provider, repository_url AS repository, entity_number AS external_id,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE outcome = 'running') AS running,
+               COUNT(*) FILTER (WHERE outcome = 'completed') AS completed,
+               COUNT(*) FILTER (WHERE outcome = 'failed') AS failed,
+               COUNT(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
+               MAX(COALESCE(finished_at, started_at, created_at)) AS latest_exec_at
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider IS NOT NULL
+          AND repository_url IS NOT NULL
+          AND entity_number IS NOT NULL
+        GROUP BY provider, repository_url, entity_number
+    )
+"""
+
+
+def _build_change_request_queries(
+    provider: str | None,
+    repository: str | None,
+    provider_state: str | None,
+    automation_state: str | None,
+    activity_from: datetime | None,
+    activity_to: datetime | None,
+) -> tuple[str, str, list[object]]:
+    """Build the count and data SQL (plus params) for the change-request summary.
+
+    Identity filters (provider, repository) apply pre-aggregation on the
+    ``identities`` CTE; derived-state filters (provider state, automation
+    state) and the activity window apply post-aggregation on the ``summary``
+    wrapper, so the paginated ``total`` reflects the full filter set.
+    """
+    params: list[object] = []
+    inner_filters: list[str] = []
+    if provider is not None:
+        inner_filters.append(f"i.provider = ${len(params) + 1}")
+        params.append(provider)
+    if repository is not None:
+        inner_filters.append(f"i.repository = ${len(params) + 1}")
+        params.append(repository)
+    inner_where = f"WHERE {' AND '.join(inner_filters)}" if inner_filters else ""
+
+    post_filters: list[str] = []
+    if provider_state is not None:
+        post_filters.append(f"summary.provider_state = ${len(params) + 1}")
+        params.append(provider_state)
+    if automation_state is not None:
+        post_filters.append(f"summary.automation_state = ${len(params) + 1}")
+        params.append(automation_state)
+    if activity_from is not None:
+        post_filters.append(f"summary.latest_activity_at >= ${len(params) + 1}")
+        params.append(activity_from)
+    if activity_to is not None:
+        post_filters.append(f"summary.latest_activity_at <= ${len(params) + 1}")
+        params.append(activity_to)
+    post_where = f"WHERE {' AND '.join(post_filters)}" if post_filters else ""
+
+    ctes = _CHANGE_REQUEST_CTES.format(open_types=_OPEN_EVENT_TYPES)
+    grouped = _CHANGE_REQUEST_GROUPED_SQL.format(inner_where=inner_where)
+
+    count_sql = f"SELECT COUNT(*) FROM (\n{ctes}{grouped}\n) AS summary {post_where}"
+    data_sql = f"""
+{ctes}SELECT * FROM (
+{grouped}
+) AS summary
+{post_where}
+ORDER BY summary.latest_activity_at DESC NULLS LAST,
+         summary.provider ASC, summary.repository ASC, summary.external_id ASC
+LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+"""
+    return count_sql, data_sql, params
+
+
+def _change_request_summary_row(row: asyncpg.Record) -> ChangeRequestSummaryRow:
+    """Build a :class:`ChangeRequestSummaryRow` from an aggregated query row."""
+    return ChangeRequestSummaryRow(
+        provider=row["provider"],
+        repository=row["repository"],
+        external_id=row["external_id"],
+        provider_state=row["provider_state"],
+        automation_state=row["automation_state"],
+        total_estimated_cost_usd=row["total_estimated_cost_usd"],
+        latest_linked_activity=row["latest_activity_at"],
+        executions=ChangeRequestExecutionCounts(
+            total=row["execution_total"] or 0,
+            running=row["execution_running"] or 0,
+            completed=row["execution_completed"] or 0,
+            failed=row["execution_failed"] or 0,
+            cancelled=row["execution_cancelled"] or 0,
+        ),
+    )
+
+
+async def _fetch_change_request_summaries(
+    conn: asyncpg.Connection,
+    provider: str | None,
+    repository: str | None,
+    provider_state: str | None,
+    automation_state: str | None,
+    activity_from: datetime | None,
+    activity_to: datetime | None,
+    limit: int,
+    offset: int,
+    *,
+    db_timeout_seconds: int,
+) -> PaginatedResponse[ChangeRequestSummaryRow]:
+    """Execute count + data queries for the change-request summary endpoint."""
+    count_sql, data_sql, params = _build_change_request_queries(
+        provider,
+        repository,
+        provider_state,
+        automation_state,
+        activity_from,
+        activity_to,
+    )
+
+    async with timed_operation("db.query.afk.change_requests.count", "db"):
+        async with _db_timeout("db.query.afk.change_requests.count", db_timeout_seconds):
+            total = await conn.fetchval(count_sql, *params)
+
+    async with timed_operation("db.query.afk.change_requests.data", "db"):
+        async with _db_timeout("db.query.afk.change_requests.data", db_timeout_seconds):
+            rows = await conn.fetch(data_sql, *params, limit, offset)
+
+    items = [_change_request_summary_row(r) for r in rows]
+    return PaginatedResponse(items=items, total=total, limit=limit, offset=offset)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
-
 
 @router.get("/runs")
 async def list_runs(
@@ -627,5 +897,50 @@ async def list_correlations(
             limit,
             offset,
             reason=reason,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
+
+
+@router.get("/change-requests")
+async def list_change_requests(
+    request: Request,
+    provider: str | None = Query(default=None),
+    repository: str | None = Query(default=None),
+    provider_state: str | None = Query(default=None),
+    automation_state: str | None = Query(default=None),
+    activity_from: str | None = Query(default=None),
+    activity_to: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> PaginatedResponse[ChangeRequestSummaryRow]:
+    """List change-request summaries — one row per provider/repository/identity.
+
+    Each row aggregates provider state (derived from observed facts),
+    AFK automation state, total estimated USD cost (``null`` when no cost
+    telemetry is available — never zero), latest linked activity, and AWX
+    execution counts.  Executions without a durable change-request identity
+    are excluded from the row universe and never contribute counts.
+    """
+    _require_enum_value(provider, _VALID_ORIGIN, "provider")
+    _require_enum_value(provider_state, _VALID_PROVIDER_STATE, "provider_state")
+    _require_enum_value(automation_state, _VALID_AUTOMATION_STATE, "automation_state")
+
+    activity_from_dt = _parse_datetime(activity_from, "activity_from")
+    activity_to_dt = _parse_datetime(activity_to, "activity_to")
+    _validate_window(activity_from_dt, activity_to_dt, "activity_from")
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _fetch_change_request_summaries(
+            conn,
+            provider,
+            repository,
+            provider_state,
+            automation_state,
+            activity_from_dt,
+            activity_to_dt,
+            limit,
+            offset,
             db_timeout_seconds=settings.database_timeout_seconds,
         )

@@ -183,6 +183,76 @@ class RunDetail(BaseModel):
     usage: UsageAggregate = Field(default_factory=UsageAggregate)
 
 
+class ChangeRequestExecutionCounts(BaseModel):
+    """Aggregated AWX execution counts for one change request (issue #610).
+
+    Counts use the locked :class:`~afk_outcomes.models.ExecutionOutcome`
+    vocabulary (``running`` / ``completed`` / ``failed`` / ``cancelled``) and
+    are aggregated per change-request identity — implementation, review, and
+    retry executions all converge on one row.  Executions without a durable
+    change-request identity (any NULL resource identity column) are excluded
+    at the query layer and never contribute counts.
+    """
+
+    total: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
+class ChangeRequestSummaryRow(BaseModel):
+    """One change-request summary row returned by ``GET /change-requests``.
+
+    Identity is the flattened stable resource identity
+    ``(provider, repository, external_id)`` with ``resource_type`` fixed to
+    ``change_request`` (GitHub PRs and GitLab MRs both normalize there).
+
+    * ``provider_state`` is derived from observed ``engineering_events``
+      facts — ``merged`` / ``closed`` / ``open`` — never a provider API
+      claim; ``None`` when no lifecycle fact is observed.
+    * ``automation_state`` is the owning lifecycle's ``afk_runs.status``
+      (``pending`` / ``running`` / ``completed`` / ``failed`` /
+      ``cancelled``); ``None`` when no AFK run is linked.
+    * ``total_estimated_cost_usd`` sums linked session cost and is ``None``
+      when no linked session carries cost telemetry — unavailable, never
+      zero.
+    * ``latest_linked_activity`` is the most recent timestamp across linked
+      runs, observed facts, and executions.
+    """
+
+    provider: str = Field(description="Source provider: github | gitlab")
+    repository: str = Field(description="Full owner/repo (or group/project) name")
+    external_id: str = Field(
+        description="Provider-scoped change-request number (opaque string)"
+    )
+    resource_type: str = Field(
+        default="change_request",
+        description="Fixed resource type — GitHub PRs and GitLab MRs both normalize to change_request",
+    )
+    provider_state: str | None = Field(
+        default=None,
+        description="Derived from observed facts: merged | closed | open",
+    )
+    automation_state: str | None = Field(
+        default=None,
+        description=(
+            "AFK run lifecycle status: pending | running | completed | failed | cancelled"
+        ),
+    )
+    total_estimated_cost_usd: Decimal | None = Field(
+        default=None,
+        description="Sum of linked session costs; null when no cost telemetry is available",
+    )
+    latest_linked_activity: datetime | None = Field(
+        default=None,
+        description="Most recent activity among linked runs, facts, and executions",
+    )
+    executions: ChangeRequestExecutionCounts = Field(
+        default_factory=ChangeRequestExecutionCounts
+    )
+
+
 class UnresolvedCorrelationRow(BaseModel):
     """One ``unresolved_correlations`` row returned by the list-correlations
     endpoint.
