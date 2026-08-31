@@ -106,8 +106,15 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
+        # alembic/env.py calls asyncio.run(), which cannot run inside this
+        # fixture's event loop (pytest-asyncio auto mode) — execute it on a
+        # plain worker thread so env.py gets its own event loop.
         alembic.command.upgrade(alembic_cfg, "head")
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _upgrade)
     except Exception:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -116,7 +123,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.get_running_loop().run_in_executor(None, _upgrade)
 
     yield pool
 
