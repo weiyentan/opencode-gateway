@@ -459,6 +459,16 @@
       </div>
     </section>
 
+    <!-- Change Request list pagination control block: Previous / Next +
+         numbered page buttons (ellipses for large page counts), rendered
+         into this container by renderChangeRequestPagination() in app.js.
+         Lives BELOW the panel (outside the panel box), following the
+         Agent Runs pagination convention (issue #427).  The
+         .agent-runs-pagination class provides the flex layout; the
+         .filter-clear button styling gives the neutral secondary look with
+         a disabled state. -->
+    <nav class="agent-runs-pagination" id="afk-cr-pagination" aria-label="Change Request pages"></nav>
+
     <!-- Repository Summary (issue #572): repository-first entry view -->
     <section class="glass-panel panel-afk-repos">
       <h2 class="panel-title">Repository Summary<span class="panel-freshness" id="freshness-afk-repos"></span></h2>

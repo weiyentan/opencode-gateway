@@ -327,35 +327,69 @@
     return (v != null && !isNaN(n) && n >= 0) ? n : 0;
   }
 
-  /** Normalize an execution-counts aggregate into the stable
-   *  { implementation, review, retry, total } shape.  Accepts an object
-   *  ({implementation, review, retry, total}) or a plain number (total only,
-   *  purpose splits unknown).  A missing explicit total is derived as the
-   *  sum of the three purpose buckets.
+  /** Normalize an execution-counts aggregate into the stable shape.  The
+   *  Gateway summary contract carries the outcome-state vocabulary —
+   *  ``{ total, running, completed, failed, cancelled }`` (issue #610, the
+   *  canonical ``executions`` property) — while the detail adapter derives
+   *  the purpose vocabulary — ``{ implementation, review, retry, total }``
+   *  — from per-execution purposes WITHIN the same payload.  The normalizer
+   *  accepts either vocabulary and preserves it verbatim; a plain number is
+   *  treated as ``total`` only.  A missing explicit total is derived as the
+   *  sum of the present bucket values.
    *  @param {Object|number|null} counts
-   *  @returns {{implementation: number, review: number, retry: number, total: number}} */
+   *  @returns {{total: number, running: number, completed: number,
+   *             failed: number, cancelled: number,
+   *             implementation: number, review: number, retry: number}} */
   function normalizeExecutionCounts(counts) {
+    var zero = {
+      total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0
+    };
     if (counts == null) {
-      return { implementation: 0, review: 0, retry: 0, total: 0 };
+      return zero;
     }
     if (typeof counts === 'number' || typeof counts === 'string') {
-      return { implementation: 0, review: 0, retry: 0, total: toCount(counts) };
+      return { total: toCount(counts), running: 0, completed: 0,
+        failed: 0, cancelled: 0, implementation: 0, review: 0, retry: 0 };
     }
+    // Outcome-state vocabulary (canonical summary `executions`).
+    if (counts.running != null || counts.completed != null ||
+        counts.failed != null || counts.cancelled != null) {
+      var running = toCount(counts.running);
+      var completed = toCount(counts.completed);
+      var failed = toCount(counts.failed);
+      var cancelled = toCount(counts.cancelled);
+      var total = toCount(counts.total);
+      if (total === 0 && (running + completed + failed + cancelled) > 0) {
+        total = running + completed + failed + cancelled;
+      }
+      return {
+        total: total, running: running, completed: completed,
+        failed: failed, cancelled: cancelled,
+        implementation: 0, review: 0, retry: 0
+      };
+    }
+    // Purpose vocabulary (detail adapter aggregation).
     var impl = toCount(counts.implementation);
     var review = toCount(counts.review);
     var retry = toCount(counts.retry);
-    var total = toCount(counts.total);
+    total = toCount(counts.total);
     if (total === 0 && (impl + review + retry) > 0) {
       total = impl + review + retry;
     }
-    return { implementation: impl, review: review, retry: retry, total: total };
+    return {
+      total: total, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: impl, review: review, retry: retry
+    };
   }
 
   // ── Summary adapter ────────────────────────────────────────────────────
   // One summary contract row -> one stable UI view model.  The Gateway
-  // aggregates implementation/review/retry executions into a single row per
-  // (provider, repository, external_id); the adapter preserves that
-  // aggregation and never creates duplicate top-level rows.
+  // aggregates AWX executions into a single row per
+  // (provider, repository, external_id) and carries the outcome-state
+  // execution counts (`executions: { total, running, completed, failed,
+  // cancelled }`, issue #610); the adapter preserves that aggregation and
+  // never creates duplicate top-level rows.
 
   /** Adapt one change-request summary contract row into a stable UI view
    *  model.  Pure — data composition only, no rendering, no joins.
@@ -368,9 +402,8 @@
     var afkState = afkStateValue(item);
     var costUsd = crCostUsd(item);
     var counts = normalizeExecutionCounts(
-      item.execution_counts != null ? item.execution_counts
-      : (item.counts != null ? item.counts
-      : (item.execution_count != null ? item.execution_count : null))
+      item.executions != null ? item.executions
+      : (item.execution_count != null ? item.execution_count : null)
     );
     return {
       identity: identity,
@@ -416,6 +449,23 @@
   // timeline data as ONE composite payload.  The adapter preserves those
   // relationships exactly as the Gateway composed them — it never joins
   // unrelated partial payloads in the browser.
+
+  /** Flatten the Gateway timeline contract into the event array the render
+   *  layer iterates.  The backend wraps the events in a
+   *  `{ timeline: { events: [...] } }` object (ChangeRequestTimeline, issue
+   *  #611); the renderer (renderChangeRequestTimeline) calls
+   *  `timeline.forEach(...)` directly, so the adapter surfaces the ARRAY —
+   *  never the envelope.  Null/absent timelines and empty event lists all
+   *  normalize to `[]` (the renderer's empty state); a legacy bare-array
+   *  timeline is passed through untouched.
+   *  @param {Object|Array|null} timeline - `{events: [...]}`, a bare array,
+   *      or null/undefined
+   *  @returns {Array} the event array (empty when the envelope is absent) */
+  function timelineEvents(timeline) {
+    if (Array.isArray(timeline)) return timeline;
+    if (timeline && Array.isArray(timeline.events)) return timeline.events;
+    return [];
+  }
 
   /** Adapt one execution binding / provenance execution into a stable view
    *  model.  Accepts both the execution-binding shape (`awx_job.job_id`,
@@ -573,7 +623,7 @@
         : (Array.isArray(detail.session_links) ? detail.session_links : []),
       usage: detail.usage || null,
       mergeState: mergeStateValue(detail, cr),
-      timeline: detail.timeline || detail.provenance || null
+      timeline: timelineEvents(detail.timeline != null ? detail.timeline : detail.provenance)
     };
   }
 
@@ -619,7 +669,8 @@
     adaptChangeRequestSummary: adaptChangeRequestSummary,
     adaptChangeRequestSummaryList: adaptChangeRequestSummaryList,
     adaptExecution: adaptExecution,
-    adaptChangeRequestDetail: adaptChangeRequestDetail
+    adaptChangeRequestDetail: adaptChangeRequestDetail,
+    timelineEvents: timelineEvents
   };
 
   if (typeof module !== 'undefined' && module.exports) {

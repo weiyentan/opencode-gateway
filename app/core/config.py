@@ -188,6 +188,21 @@ class Settings(BaseSettings):
     afk_outcomes_initial_backoff_seconds: float = 1.0
     afk_outcomes_max_backoff_seconds: float = 60.0
 
+    # Execution-purpose classification (change-request detail, issue #611).
+    # The detail read path derives an execution's purpose (implementation /
+    # review / retry) from available stored signals.  ``retry`` is derived
+    # from an explicit recovery signal (``trigger_type='recovery'`` or a run
+    # with ``recovered_from_afk_run_id``); ``implementation`` and ``review``
+    # are derived from the AWX job template that launched the execution —
+    # the develop-loop and review runners are distinct AWX templates, so the
+    # operator configures their numeric template IDs here.  Comma-separated
+    # integers; empty (default) means the purpose is unavailable (NULL — the
+    # Gateway never invents a classification from data that does not carry
+    # it).  Maps to GATEWAY_AFK_IMPLEMENTATION_JOB_TEMPLATE_IDS and
+    # GATEWAY_AFK_REVIEW_JOB_TEMPLATE_IDS.
+    afk_implementation_job_template_ids: str = ""
+    afk_review_job_template_ids: str = ""
+
     # Whether the AFK outcome consumer/backfill is in use for this process.
     # The Gateway API is read-only over the AFK read-model, so it does not
     # require ``afk_outcomes_repository``; the companion consumer/backfill

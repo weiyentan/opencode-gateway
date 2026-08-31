@@ -85,10 +85,12 @@ function buildDetail() {
         started_at: '2026-08-17T09:00:00Z', finished_at: '2026-08-17T09:40:00Z'
       }
     ],
-    timeline: [
-      { event_type: 'change_request.opened', occurred_at: TS.MR_6_OPEN, summary: 'MR opened' },
-      { event_type: 'change_request.merged', occurred_at: TS.MR_6_MERGE, summary: 'MR merged' }
-    ]
+    timeline: {
+      events: [
+        { event_type: 'change_request.opened', occurred_at: TS.MR_6_OPEN, summary: 'MR opened' },
+        { event_type: 'change_request.merged', occurred_at: TS.MR_6_MERGE, summary: 'MR merged' }
+      ]
+    }
   };
 }
 

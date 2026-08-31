@@ -163,6 +163,27 @@ def _parse_evidence(raw: object) -> list[CorrelationEvidence]:
     return [CorrelationEvidence.model_validate(item) for item in raw]
 
 
+def _parse_job_template_ids(raw: str) -> list[int]:
+    """Parse a comma-separated AWX job-template-id list from settings.
+
+    Empty/whitespace-only input yields ``[]`` (purpose unavailable).  Non-
+    integer tokens are skipped rather than raising — a single misconfigured
+    ID must not take down the read path; the remaining IDs still classify.
+    """
+    if not raw or not raw.strip():
+        return []
+    ids: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            continue
+    return ids
+
+
 def _build_run_filters(
     repository: str | None,
     started_from: datetime | None,
@@ -557,8 +578,11 @@ async def _fetch_correlations(
 #   durable change-request identity (every resource-identity column present).
 #
 # Aggregation rules are deterministic and documented on the SQL below:
-# provider state prefers ``merged`` over ``closed`` over ``open`` (observed
-# facts only — never a provider API claim); automation state mirrors
+# provider state is derived from the chronologically latest observed
+# ``change_request`` lifecycle fact (``merged`` / ``closed`` / ``open`` —
+# observed facts only, never a provider API claim), with the historical
+# ``merged > closed > open`` precedence retained only as the deterministic
+# tie-breaker for equal ``occurred_at`` timestamps; automation state mirrors
 # ``resolve_afk_run_status``'s success-aware precedence; cost is a plain SUM
 # that stays NULL when no linked session carries cost telemetry (unavailable,
 # never zero).
@@ -568,6 +592,24 @@ _OPEN_EVENT_TYPES = (
     "'change_request.opened', 'change_request.updated', 'change_request.reopened'"
 )
 
+#: Event type → provider state for the chronologically latest lifecycle fact.
+#: The deterministic ``MAX(...) >= ...`` tie-break (equal ``occurred_at``)
+#: prefers ``merged`` over ``closed`` over ``open`` (issue #613).
+_PROVIDER_STATE_SQL = """
+            CASE
+                WHEN es.latest_merged_at IS NOT NULL
+                 AND es.latest_merged_at >= GREATEST(
+                     COALESCE(es.latest_closed_at, es.latest_merged_at),
+                     COALESCE(es.latest_opened_at, es.latest_merged_at))
+                    THEN 'merged'
+                WHEN es.latest_closed_at IS NOT NULL
+                 AND es.latest_closed_at >= COALESCE(es.latest_opened_at, es.latest_closed_at)
+                    THEN 'closed'
+                WHEN es.latest_opened_at IS NOT NULL THEN 'open'
+                ELSE NULL
+            END
+"""
+
 #: The grouped aggregation body shared by the count and data queries.  Built
 #: with the identity filters (``{inner_where}``) applied pre-aggregation;
 #: state/activity filters are applied on the outer ``summary`` wrapper.
@@ -576,12 +618,7 @@ _CHANGE_REQUEST_GROUPED_SQL = """
             i.provider AS provider,
             i.repository AS repository,
             i.external_id AS external_id,
-            CASE
-                WHEN BOOL_OR(es.merged) THEN 'merged'
-                WHEN BOOL_OR(es.closed) THEN 'closed'
-                WHEN BOOL_OR(es.opened) THEN 'open'
-                ELSE NULL
-            END AS provider_state,
+{provider_state_sql}            AS provider_state,
             CASE
                 WHEN BOOL_OR(r.status = 'running') THEN 'running'
                 WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
@@ -590,7 +627,7 @@ _CHANGE_REQUEST_GROUPED_SQL = """
                 WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
                 ELSE NULL
             END AS automation_state,
-            COALESCE(
+            GREATEST(
                 MAX(r.last_seen_at),
                 MAX(es.latest_event_at),
                 MAX(ec.latest_exec_at)
@@ -619,7 +656,8 @@ _CHANGE_REQUEST_GROUPED_SQL = """
            AND ec.external_id = i.external_id
         {inner_where}
         GROUP BY i.provider, i.repository, i.external_id,
-                 es.merged, es.closed, es.opened, es.latest_event_at,
+                 es.latest_merged_at, es.latest_closed_at, es.latest_opened_at,
+                 es.latest_event_at,
                  ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
                  ec.latest_exec_at
 """
@@ -660,9 +698,12 @@ _CHANGE_REQUEST_CTES = """
     ),
     event_state AS (
         SELECT provider, repository, external_id,
-               BOOL_OR(event_type = 'change_request.merged') AS merged,
-               BOOL_OR(event_type = 'change_request.closed') AS closed,
-               BOOL_OR(event_type IN ({open_types})) AS opened,
+               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
+                   AS latest_merged_at,
+               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.closed')
+                   AS latest_closed_at,
+               MAX(occurred_at) FILTER (WHERE event_type IN ({open_types}))
+                   AS latest_opened_at,
                MAX(occurred_at) AS latest_event_at
         FROM engineering_events
         WHERE entity_type = 'change_request'
@@ -727,7 +768,9 @@ def _build_change_request_queries(
     post_where = f"WHERE {' AND '.join(post_filters)}" if post_filters else ""
 
     ctes = _CHANGE_REQUEST_CTES.format(open_types=_OPEN_EVENT_TYPES)
-    grouped = _CHANGE_REQUEST_GROUPED_SQL.format(inner_where=inner_where)
+    grouped = _CHANGE_REQUEST_GROUPED_SQL.format(
+        inner_where=inner_where, provider_state_sql=_PROVIDER_STATE_SQL
+    )
 
     count_sql = f"SELECT COUNT(*) FROM (\n{ctes}{grouped}\n) AS summary {post_where}"
     data_sql = f"""
@@ -817,11 +860,20 @@ async def _fetch_change_request_summaries(
 # linked session carries cost telemetry (unavailable, never zero).
 #
 # Execution purpose is surfaced only when an explicit stored signal carries
-# it: a binding whose execution (or owning run) is an explicitly recorded
-# re-attempt (``trigger_type = 'recovery'`` or a run with a
-# ``recovered_from_afk_run_id``) is ``retry``; every other purpose is
-# unavailable (NULL) — the Gateway never invents an implementation/review
-# classification from data that does not carry it.
+# it, with a fixed precedence:
+#
+# 1. ``retry`` — a binding whose execution (or owning run) is an explicitly
+#    recorded re-attempt (``trigger_type = 'recovery'`` or a run with a
+#    ``recovered_from_afk_run_id``);
+# 2. ``implementation`` — the binding's AWX ``job_template_id`` is in the
+#    operator-configured implementation template set
+#    (``GATEWAY_AFK_IMPLEMENTATION_JOB_TEMPLATE_IDS`` — the develop-loop
+#    runner);
+# 3. ``review`` — the binding's ``job_template_id`` is in the configured
+#    review template set (``GATEWAY_AFK_REVIEW_JOB_TEMPLATE_IDS`` — the
+#    review runner);
+# 4. otherwise unavailable (NULL) — the Gateway never invents a purpose
+#    from data that does not carry it.
 
 #: The three durable run-linkage paths for one change-request identity.
 #: Embedded as the ``run_sources`` CTE body in the queries below.
@@ -875,9 +927,12 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
     ),
     event_state AS (
         SELECT
-            BOOL_OR(event_type = 'change_request.merged') AS merged,
-            BOOL_OR(event_type = 'change_request.closed') AS closed,
-            BOOL_OR(event_type IN ({_OPEN_EVENT_TYPES})) AS opened,
+            MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
+                AS latest_merged_at,
+            MAX(occurred_at) FILTER (WHERE event_type = 'change_request.closed')
+                AS latest_closed_at,
+            MAX(occurred_at) FILTER (WHERE event_type IN ({_OPEN_EVENT_TYPES}))
+                AS latest_opened_at,
             MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
                 AS merged_at,
             MAX(occurred_at) AS latest_event_at
@@ -918,12 +973,7 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
         $1::text AS provider,
         $2::text AS repository,
         $3::text AS external_id,
-        CASE
-            WHEN BOOL_OR(es.merged) THEN 'merged'
-            WHEN BOOL_OR(es.closed) THEN 'closed'
-            WHEN BOOL_OR(es.opened) THEN 'open'
-            ELSE NULL
-        END AS provider_state,
+{_PROVIDER_STATE_SQL}        AS provider_state,
         CASE
             WHEN BOOL_OR(r.status = 'running') THEN 'running'
             WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
@@ -932,7 +982,7 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
             WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
             ELSE NULL
         END AS automation_state,
-        COALESCE(
+        GREATEST(
             MAX(r.last_seen_at),
             MAX(es.latest_event_at),
             MAX(ec.latest_exec_at)
@@ -956,7 +1006,8 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
     LEFT JOIN sessions s ON s.id = ars.session_id
     CROSS JOIN event_state es
     CROSS JOIN exec_counts ec
-    GROUP BY es.merged, es.closed, es.opened, es.latest_event_at, es.merged_at,
+    GROUP BY es.latest_merged_at, es.latest_closed_at, es.latest_opened_at,
+             es.latest_event_at, es.merged_at,
              ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
              ec.latest_exec_at
 """
@@ -986,6 +1037,10 @@ _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = """
                  OR r.trigger_type = 'recovery'
                  OR r.recovered_from_afk_run_id IS NOT NULL
                THEN 'retry'
+               WHEN eb.job_template_id = ANY($4::bigint[])
+               THEN 'implementation'
+               WHEN eb.job_template_id = ANY($5::bigint[])
+               THEN 'review'
                ELSE NULL
            END AS purpose,
            s.id AS session_id,
@@ -1155,6 +1210,8 @@ async def _fetch_change_request_detail(
     repository: str,
     external_number: str,
     *,
+    implementation_template_ids: list[int],
+    review_template_ids: list[int],
     db_timeout_seconds: int,
 ) -> ChangeRequestDetail | None:
     """Compose the provider-scoped change-request detail (issue #611).
@@ -1212,6 +1269,8 @@ async def _fetch_change_request_detail(
                 provider,
                 repository,
                 external_number,
+                implementation_template_ids,
+                review_template_ids,
             )
 
     async with timed_operation("db.query.afk.change_request.detail.sessions", "db"):
@@ -1518,6 +1577,12 @@ async def get_change_request_detail(
             provider,
             repository,
             external_number,
+            implementation_template_ids=_parse_job_template_ids(
+                settings.afk_implementation_job_template_ids
+            ),
+            review_template_ids=_parse_job_template_ids(
+                settings.afk_review_job_template_ids
+            ),
             db_timeout_seconds=settings.database_timeout_seconds,
         )
     if detail is None:

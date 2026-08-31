@@ -526,6 +526,39 @@ class TestChangeRequestDetail:
         assert executions[1]["purpose"] == "retry"
 
     @pytest.mark.asyncio
+    async def test_template_id_purpose_params_reach_execution_query(
+        self, client: AsyncClient, mock_conn: AsyncMock, monkeypatch
+    ):
+        """Configured implementation/review template IDs are passed to the
+        execution SQL as $4 / $5 (the SQL classifies on them)."""
+        from app.core.config import Settings
+
+        _wire(mock_conn, executions=[_mk_execution_row()])
+
+        monkeypatch.setattr(
+            "app.api.afk_outcomes.get_settings",
+            lambda: Settings(
+                afk_implementation_job_template_ids="7, 42",
+                afk_review_job_template_ids="99",
+            ),
+        )
+
+        async with client as c:
+            response = await c.get(_ENDPOINT)
+
+        assert response.status_code == 200
+        # The executions query is the third fetch (index 1 after runs at 0).
+        executions_sql, provider, repository, number, impl_ids, review_ids = (
+            mock_conn.fetch.call_args_list[1][0]
+        )
+        assert "job_template_id = ANY($4::bigint[])" in executions_sql
+        assert provider == "github"
+        assert repository == "acme/proj"
+        assert number == "42"
+        assert impl_ids == [7, 42]
+        assert review_ids == [99]
+
+    @pytest.mark.asyncio
     async def test_merge_state_none_when_no_facts(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
@@ -676,15 +709,37 @@ class TestChangeRequestDetailQueries:
         assert "'execution'" in sql
         assert "FROM afk_run_entities" in sql
 
-    def test_purpose_derived_only_from_explicit_recovery_signal(self):
+    def test_purpose_derived_from_recovery_and_template_signals(self):
+        """Purpose classification: recovery → retry, configured templates →
+        implementation / review, everything else NULL."""
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
 
         sql = _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+        # Recovery signal → retry (first precedence).
         assert "WHEN eb.trigger_type = 'recovery'" in sql
         assert "OR r.trigger_type = 'recovery'" in sql
         assert "OR r.recovered_from_afk_run_id IS NOT NULL" in sql
         assert "THEN 'retry'" in sql
+        # Configured AWX job-template sets classify implementation / review.
+        assert "eb.job_template_id = ANY($4::bigint[])" in sql
+        assert "THEN 'implementation'" in sql
+        assert "eb.job_template_id = ANY($5::bigint[])" in sql
+        assert "THEN 'review'" in sql
+        # No signal → unavailable, never invented.
         assert "ELSE NULL" in sql
+
+    def test_parse_job_template_ids(self):
+        """Comma-separated template-ID settings parse to a list of ints."""
+        from app.api.afk_outcomes import _parse_job_template_ids
+
+        assert _parse_job_template_ids("") == []
+        assert _parse_job_template_ids("  ") == []
+        assert _parse_job_template_ids("7") == [7]
+        assert _parse_job_template_ids("7, 42, 99") == [7, 42, 99]
+        assert _parse_job_template_ids("7, , 42") == [7, 42]
+        # Non-integer tokens are skipped, never fatal.
+        assert _parse_job_template_ids("7, dev-loop, 42") == [7, 42]
+        assert _parse_job_template_ids("dev-loop") == []
 
     def test_execution_ordering_is_deterministic_earliest_first(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
@@ -699,13 +754,32 @@ class TestChangeRequestDetailQueries:
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
 
         sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
-        assert "WHEN BOOL_OR(es.merged) THEN 'merged'" in sql
-        assert "WHEN BOOL_OR(es.closed) THEN 'closed'" in sql
-        assert "WHEN BOOL_OR(es.opened) THEN 'open'" in sql
+        # Provider state derives from the chronologically latest lifecycle
+        # fact (a reopened PR/MR reports ``open`` again); the merged >
+        # closed > open precedence survives only as the deterministic
+        # tie-breaker for equal timestamps.
+        assert "es.latest_merged_at" in sql
+        assert "es.latest_closed_at" in sql
+        assert "es.latest_opened_at" in sql
+        assert "THEN 'merged'" in sql
+        assert "THEN 'closed'" in sql
+        assert "THEN 'open'" in sql
+        assert "WHEN BOOL_OR(es.merged) THEN 'merged'" not in sql
+        assert "WHEN BOOL_OR(es.closed) THEN 'closed'" not in sql
+        assert "WHEN BOOL_OR(es.opened) THEN 'open'" not in sql
         # Success-aware automation precedence, mirroring #610's summary.
         assert "WHEN BOOL_OR(r.status = 'running') THEN 'running'" in sql
         assert "WHEN BOOL_OR(r.status = 'completed') THEN 'completed'" in sql
         assert "WHEN BOOL_OR(r.status = 'pending') THEN 'pending'" in sql
+
+    def test_latest_activity_at_is_null_safe_greatest(self):
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+        assert "GREATEST(" in sql
+        assert "MAX(r.last_seen_at)" in sql
+        assert "MAX(es.latest_event_at)" in sql
+        assert "MAX(ec.latest_exec_at)" in sql
 
     def test_cost_sum_never_coalesces_null_to_zero(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL

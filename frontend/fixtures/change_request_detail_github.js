@@ -118,11 +118,13 @@ function buildDetail() {
         started_at: '2026-08-17T09:45:00Z', finished_at: '2026-08-17T09:55:00Z'
       }
     ],
-    timeline: [
-      { event_type: 'change_request.opened', occurred_at: TS.PR_142_OPEN, observed_via: 'webhook', actor: 'alice', summary: 'PR opened' },
-      { event_type: 'change_request.updated', occurred_at: '2026-08-17T09:00:00Z', observed_via: 'webhook', actor: 'alice', summary: 'Commit pushed' },
-      { event_type: 'change_request.merged', occurred_at: TS.PR_142_MERGE, observed_via: 'webhook', actor: 'bob', summary: 'PR merged' }
-    ]
+    timeline: {
+      events: [
+        { event_type: 'change_request.opened', occurred_at: TS.PR_142_OPEN, observed_via: 'webhook', actor: 'alice', summary: 'PR opened' },
+        { event_type: 'change_request.updated', occurred_at: '2026-08-17T09:00:00Z', observed_via: 'webhook', actor: 'alice', summary: 'Commit pushed' },
+        { event_type: 'change_request.merged', occurred_at: TS.PR_142_MERGE, observed_via: 'webhook', actor: 'bob', summary: 'PR merged' }
+      ]
+    }
   };
 }
 

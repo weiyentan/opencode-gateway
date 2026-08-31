@@ -104,10 +104,12 @@ function buildDetail() {
         started_at: '2026-08-17T09:00:00Z', finished_at: '2026-08-17T09:40:00Z'
       }
     ],
-    timeline: [
-      { event_type: 'change_request.opened', occurred_at: TS.PR_142_OPEN, summary: 'PR opened' },
-      { event_type: 'change_request.merged', occurred_at: TS.PR_142_MERGE, summary: 'PR merged' }
-    ]
+    timeline: {
+      events: [
+        { event_type: 'change_request.opened', occurred_at: TS.PR_142_OPEN, summary: 'PR opened' },
+        { event_type: 'change_request.merged', occurred_at: TS.PR_142_MERGE, summary: 'PR merged' }
+      ]
+    }
   };
 }
 

@@ -248,17 +248,33 @@ console.log('\u25B6 aggregate data');
 
 (function () {
   assertDeepEqual(A.normalizeExecutionCounts(null),
-    { implementation: 0, review: 0, retry: 0, total: 0 }, 'counts: null -> zeros');
+    { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 }, 'counts: null -> zeros');
   assertDeepEqual(A.normalizeExecutionCounts(5),
-    { implementation: 0, review: 0, retry: 0, total: 5 }, 'counts: plain number -> total only');
+    { total: 5, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 }, 'counts: plain number -> total only');
+  // Outcome-state vocabulary (canonical summary `executions`, issue #610)
+  assertDeepEqual(A.normalizeExecutionCounts({ total: 6, running: 1, completed: 3, failed: 1, cancelled: 1 }),
+    { total: 6, running: 1, completed: 3, failed: 1, cancelled: 1,
+      implementation: 0, review: 0, retry: 0 },
+    'counts: outcome-state vocabulary preserved');
+  assertDeepEqual(A.normalizeExecutionCounts({ running: 1, completed: 3, failed: 1, cancelled: 1 }),
+    { total: 6, running: 1, completed: 3, failed: 1, cancelled: 1,
+      implementation: 0, review: 0, retry: 0 },
+    'counts: outcome-state total derived from buckets');
+  // Purpose vocabulary (detail adapter aggregation)
   assertDeepEqual(A.normalizeExecutionCounts({ implementation: 2, review: 1, retry: 3, total: 6 }),
-    { implementation: 2, review: 1, retry: 3, total: 6 }, 'counts: explicit buckets preserved');
+    { total: 6, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 2, review: 1, retry: 3 }, 'counts: explicit buckets preserved');
   assertDeepEqual(A.normalizeExecutionCounts({ implementation: 2, review: 1, retry: 3 }),
-    { implementation: 2, review: 1, retry: 3, total: 6 }, 'counts: total derived from buckets');
+    { total: 6, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 2, review: 1, retry: 3 }, 'counts: total derived from buckets');
   assertDeepEqual(A.normalizeExecutionCounts({ implementation: -1, review: 0, retry: 0 }),
-    { implementation: 0, review: 0, retry: 0, total: 0 }, 'counts: negative clamped to 0');
+    { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 }, 'counts: negative clamped to 0');
   assertDeepEqual(A.normalizeExecutionCounts({}),
-    { implementation: 0, review: 0, retry: 0, total: 0 }, 'counts: empty object -> zeros');
+    { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 }, 'counts: empty object -> zeros');
 })();
 
 // ── Summary adapter ─────────────────────────────────────────────────────
@@ -273,7 +289,7 @@ console.log('\u25B6 summary adapter');
     automation_state: 'completed',
     total_estimated_cost_usd: 4.5,
     latest_activity_at: '2026-08-05T14:30:00Z',
-    execution_counts: { implementation: 2, review: 1, retry: 1, total: 4 },
+    executions: { total: 4, running: 0, completed: 3, failed: 1, cancelled: 0 },
     run_count: 1
   });
   assertDeepEqual(gh.identity, { provider: 'github', repository: 'acme/web-app', external_id: '142' },
@@ -289,8 +305,9 @@ console.log('\u25B6 summary adapter');
   assertEqual(gh.cost.usd, 4.5, 'summary: cost usd');
   assertEqual(gh.cost.label, '$4.50', 'summary: cost label');
   assertEqual(gh.latestActivityAt, '2026-08-05T14:30:00Z', 'summary: latest activity');
-  assertDeepEqual(gh.executionCounts, { implementation: 2, review: 1, retry: 1, total: 4 },
-    'summary: execution counts');
+  assertDeepEqual(gh.executionCounts, { total: 4, running: 0, completed: 3, failed: 1, cancelled: 0,
+    implementation: 0, review: 0, retry: 0 },
+    'summary: execution counts from canonical executions property');
   assertEqual(gh.runCount, 1, 'summary: run count');
 
   // GitLab parity: same shape, MR term, gitlab identity
@@ -310,7 +327,8 @@ console.log('\u25B6 summary adapter');
   assertEqual(gl.cost.available, false, 'summary: missing cost unavailable');
   assertEqual(gl.cost.label, 'Cost unavailable', 'summary: missing cost label');
   assertEqual(gl.cost.usd, null, 'summary: missing cost usd null');
-  assertDeepEqual(gl.executionCounts, { implementation: 0, review: 0, retry: 0, total: 3 },
+  assertDeepEqual(gl.executionCounts, { total: 3, running: 0, completed: 0, failed: 0, cancelled: 0,
+    implementation: 0, review: 0, retry: 0 },
     'summary: plain execution_count -> total only');
 
   // Zero cost is available, never unavailable
@@ -324,11 +342,39 @@ console.log('\u25B6 summary adapter');
   assertEqual(partial.providerState.value, '', 'summary: partial provider state empty');
   assertEqual(partial.afkAutomationState.value, '', 'summary: partial afk state empty');
   assertEqual(partial.cost.available, false, 'summary: partial cost unavailable');
-  assertDeepEqual(partial.executionCounts, { implementation: 0, review: 0, retry: 0, total: 0 },
+  assertDeepEqual(partial.executionCounts, { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+    implementation: 0, review: 0, retry: 0 },
     'summary: partial counts zeros');
 
   assertEqual(A.adaptChangeRequestSummary(null).identity.provider, 'unknown',
     'summary: null item -> unknown identity');
+
+  // The canonical summary contract carries `executions` (outcome-state
+  // counts, issue #610).  The legacy aliases (`execution_counts` / `counts`)
+  // are NOT part of the contract and must never be consumed — an item that
+  // carries ONLY the wrong aliases has no canonical counts (zeros).
+  var onlyAliases = A.adaptChangeRequestSummary({
+    provider: 'github', repository: 'acme/web-app', external_id: '1',
+    execution_counts: { implementation: 2, review: 1, retry: 1, total: 4 },
+    counts: { total: 9 }
+  });
+  assertDeepEqual(onlyAliases.executionCounts,
+    { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 },
+    'summary: legacy aliases are not consumed (canonical executions only)');
+
+  // The canonical `executions` property wins over the aliases when both are
+  // present — the adapter reads the Gateway-owned contract, never a legacy
+  // side-channel.
+  var canonicalWins = A.adaptChangeRequestSummary({
+    provider: 'github', repository: 'acme/web-app', external_id: '2',
+    executions: { total: 5, running: 1, completed: 3, failed: 1, cancelled: 0 },
+    execution_counts: { implementation: 2, review: 1, retry: 1, total: 4 }
+  });
+  assertDeepEqual(canonicalWins.executionCounts,
+    { total: 5, running: 1, completed: 3, failed: 1, cancelled: 0,
+      implementation: 0, review: 0, retry: 0 },
+    'summary: canonical executions property wins over legacy aliases');
 })();
 
 console.log('\u25B6 summary list adapter');
@@ -465,12 +511,16 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
   assertEqual(detail.aggregateCost.available, true, 'detail: aggregate cost available');
   assertEqual(detail.aggregateCost.usd, 0.12, 'detail: aggregate cost uses gateway value');
   assertEqual(detail.executions.length, 4, 'detail: 4 executions preserved (duplicates kept)');
-  assertDeepEqual(detail.executionCounts, { implementation: 2, review: 1, retry: 1, total: 4 },
+  assertDeepEqual(detail.executionCounts, { total: 4, running: 0, completed: 0, failed: 0, cancelled: 0,
+    implementation: 2, review: 1, retry: 1 },
     'detail: purpose buckets aggregated from same-payload executions');
   assertEqual(detail.sessions.length, 2, 'detail: sessions preserved');
   assertEqual(detail.usage.input_tokens, 1000, 'detail: usage preserved');
   assertEqual(detail.mergeState, 'merged', 'detail: merge state');
-  assertEqual(detail.timeline.events.length, 0, 'detail: optional timeline preserved');
+  // The Gateway wraps the timeline in a `{ events: [...] }` object
+  // (ChangeRequestTimeline); the adapter must flatten it to the event array
+  // the renderer iterates (renderChangeRequestTimeline calls timeline.forEach).
+  assertEqual(detail.timeline.length, 0, 'detail: timeline envelope flattened to event array');
 
   // Duplicate attempts: two AWX jobs for the same change request are kept
   // as separate executions (never collapsed into one row).
@@ -534,6 +584,61 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
   assertEqual(empty.executions.length, 0, 'detail: null executions -> empty array');
   assertEqual(empty.identity.provider, 'unknown', 'detail: missing change_request -> unknown identity');
   assertEqual(empty.sessions.length, 0, 'detail: missing sessions -> empty array');
+})();
+
+console.log('\u25B6 detail adapter — timeline envelope flattening');
+
+(function () {
+  // Backend contract: timeline is `{ events: [...] }` or null (issue #611
+  // ChangeRequestTimeline).  The adapter must surface the EVENTS ARRAY to the
+  // renderer, which iterates view.timeline.forEach(...) directly.
+  var wrapped = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r', external_id: '5' },
+    timeline: {
+      events: [
+        { event_type: 'change_request.opened', occurred_at: '2026-08-17T08:05:00Z', actor: 'alice', summary: 'PR opened' },
+        { event_type: 'change_request.merged', occurred_at: '2026-08-17T10:35:00Z', actor: 'bob', summary: 'PR merged' }
+      ]
+    }
+  });
+  assert(Array.isArray(wrapped.timeline), 'detail: timeline flattened to an array');
+  assertEqual(wrapped.timeline.length, 2, 'detail: timeline array preserves every event');
+  assertEqual(wrapped.timeline[0].event_type, 'change_request.opened', 'detail: first timeline event preserved');
+  assertEqual(wrapped.timeline[1].event_type, 'change_request.merged', 'detail: last timeline event preserved');
+  assertEqual(typeof wrapped.timeline.forEach, 'function',
+    'detail: flattened timeline is iterable by the renderer (forEach)');
+
+  // Empty events array stays an empty array (renderer shows the empty state).
+  var emptyEvents = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r', external_id: '6' },
+    timeline: { events: [] }
+  });
+  assert(Array.isArray(emptyEvents.timeline), 'detail: empty events array stays an array');
+  assertEqual(emptyEvents.timeline.length, 0, 'detail: empty events array length 0');
+
+  // timeline null/undefined must not throw and must yield [] for the renderer.
+  var nullTimeline = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r', external_id: '7' },
+    timeline: null
+  });
+  assert(Array.isArray(nullTimeline.timeline), 'detail: null timeline -> empty array (no throw)');
+  assertEqual(nullTimeline.timeline.length, 0, 'detail: null timeline -> length 0');
+
+  var absentTimeline = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r', external_id: '8' }
+  });
+  assert(Array.isArray(absentTimeline.timeline), 'detail: absent timeline -> empty array (no throw)');
+  assertEqual(absentTimeline.timeline.length, 0, 'detail: absent timeline -> length 0');
+
+  // Defensive fallback: a legacy bare-array timeline is passed through as-is.
+  var bare = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r', external_id: '9' },
+    timeline: [
+      { event_type: 'change_request.opened', occurred_at: '2026-08-17T08:05:00Z', summary: 'PR opened' }
+    ]
+  });
+  assert(Array.isArray(bare.timeline), 'detail: bare-array timeline accepted (legacy)');
+  assertEqual(bare.timeline.length, 1, 'detail: bare-array timeline length preserved');
 })();
 
 // ── No browser-side join / purity guarantees ────────────────────────────

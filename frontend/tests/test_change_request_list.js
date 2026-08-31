@@ -117,6 +117,42 @@ function makeCrListTbody(id) {
   return el;
 }
 
+// Button-aware pagination nav fake: parses the rendered pagination buttons
+// (<button data-page=N ...>) into clickable fakes so the pagination wiring
+// (renderChangeRequestPagination) can be driven like a real <nav>.
+function makePaginationNav(id) {
+  var el = makeFakeElement(id);
+  el._buttonsHtml = null;
+  el._buttonsCache = null;
+  el.querySelectorAll = function (selector) {
+    if (selector !== 'button') return [];
+    if (this._buttonsHtml === this.innerHTML && this._buttonsCache) return this._buttonsCache;
+    var buttons = [];
+    var btnRe = /<button\b([^>]*)>/g;
+    var m;
+    while ((m = btnRe.exec(this.innerHTML)) !== null) {
+      var btn = makeFakeElement(id + '-btn-' + buttons.length);
+      var attrRe = /(data-page|aria-label|aria-current)="([^"]*)"/g;
+      var am;
+      while ((am = attrRe.exec(m[1])) !== null) {
+        if (am[1] === 'data-page') {
+          btn.setAttribute('data-page', am[2]);
+        } else if (am[1] === 'aria-current') {
+          btn.setAttribute('aria-current', am[2]);
+        } else {
+          btn.setAttribute('aria-label', am[2]);
+        }
+      }
+      if (/disabled/.test(m[1])) btn.disabled = true;
+      buttons.push(btn);
+    }
+    this._buttonsHtml = this.innerHTML;
+    this._buttonsCache = buttons;
+    return buttons;
+  };
+  return el;
+}
+
 function buildSandbox(withAdapters) {
   var registry = {};
   Object.keys(elementRegistry).forEach(function (id) {
@@ -193,6 +229,7 @@ function settleDeep(times) {
 // ── Sandbox setup ────────────────────────────────────────────────────────
 
 var crListTbodyEl = makeCrListTbody('afk-cr-list-tbody');
+var crPaginationNavEl = makePaginationNav('afk-cr-pagination');
 var crFilterProviderEl = makeFakeElement('afk-cr-filter-provider');
 var crFilterRepositoryEl = makeFakeElement('afk-cr-filter-repository');
 var crFilterProviderStateEl = makeFakeElement('afk-cr-filter-provider-state');
@@ -206,6 +243,7 @@ var crDetailBodyEl = makeFakeElement('cr-list-detail-body');
 var crDetailCloseEl = makeFakeElement('cr-list-detail-close');
 var afkRunsTbodyEl = makeFakeElement('afk-runs-tbody');
 elementRegistry['afk-cr-list-tbody'] = crListTbodyEl;
+elementRegistry['afk-cr-pagination'] = crPaginationNavEl;
 elementRegistry['afk-cr-filter-provider'] = crFilterProviderEl;
 elementRegistry['afk-cr-filter-repository'] = crFilterRepositoryEl;
 elementRegistry['afk-cr-filter-provider-state'] = crFilterProviderStateEl;
@@ -577,6 +615,191 @@ test('defensive: app.js renders the empty state when the adapter module is absen
   }
   assert(threw === false, 'defensive: no crash without the adapter module');
   assertContains(tbody2.innerHTML, 'No change requests', 'defensive: empty state without the adapter module');
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// Pagination — previous/next, page count, limit/offset URL, edge cases
+// ═════════════════════════════════════════════════════════════════════════
+
+function buildPagedSummaryList(total, offset) {
+  // Builds `total` rows (page-sized by limit) so the pagination renderer has
+  // deterministic totals to derive the page count from.
+  var items = [];
+  for (var i = 1; i <= total; i++) {
+    items.push({
+      provider: 'github', repository: 'acme/web-app', external_id: String(i),
+      resource_type: 'change_request',
+      provider_state: 'open', automation_state: 'running',
+      total_estimated_cost_usd: 1.0,
+      latest_linked_activity: null,
+      executions: { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0 }
+    });
+  }
+  return { items: items, total: total, limit: 100, offset: offset || 0 };
+}
+
+test('pagination: URL builder emits offset when supplied', function () {
+  var url = W.buildChangeRequestListUrl({}, { preset: 'this-month' }, 100, 250);
+  assertContains(url, 'limit=100', 'pagination URL: limit present');
+  assertContains(url, 'offset=250', 'pagination URL: offset present');
+});
+
+test('pagination: parseChangeRequestPagination derives page from limit/offset', function () {
+  var p0 = W.parseChangeRequestPagination('');
+  assertEqual(p0.page, 1, 'pagination parse: empty query defaults to page 1');
+  assertEqual(p0.pageSize, 100, 'pagination parse: empty query defaults to AFK_CR_LIMIT page size');
+  var p1 = W.parseChangeRequestPagination('limit=100&offset=100');
+  assertEqual(p1.page, 2, 'pagination parse: offset 100 with limit 100 is page 2');
+  assertEqual(p1.pageSize, 100, 'pagination parse: limit carried');
+  var p2 = W.parseChangeRequestPagination('limit=50&offset=125');
+  assertEqual(p2.page, 3, 'pagination parse: offset 125 with limit 50 is page 3 (floor(125/50)+1)');
+  assertEqual(p2.pageSize, 50, 'pagination parse: custom limit carried');
+  var p3 = W.parseChangeRequestPagination('limit=0&offset=abc');
+  assertEqual(p3.page, 1, 'pagination parse: malformed values fall back to page 1');
+});
+
+test('pagination: changeRequestsUrlWithPagination round-trips limit/offset', function () {
+  var url = W.changeRequestsUrlWithPagination(3, 100);
+  assertContains(url, 'limit=100', 'URL with pagination: limit param');
+  assertContains(url, 'offset=200', 'URL with pagination: offset = (page-1) * size');
+});
+
+test('pagination: nearestValidChangeRequestPage clamps to the result set', function () {
+  assertEqual(W.nearestValidChangeRequestPage(0, 5, 100), 1, 'nearest page: empty result resolves to page 1');
+  assertEqual(W.nearestValidChangeRequestPage(250, 5, 100), 3, 'nearest page: overshoot clamps to last page');
+  assertEqual(W.nearestValidChangeRequestPage(250, 2, 100), 2, 'nearest page: valid page unchanged');
+});
+
+test('pagination: renderChangeRequestPagination shows prev/next + page numbers', function () {
+  W.setChangeRequestPage(1);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 0));
+  var html = crPaginationNavEl.innerHTML;
+  assertContains(html, 'Previous', 'pagination render: Previous button');
+  assertContains(html, 'Next', 'pagination render: Next button');
+  assertContains(html, 'data-page="1"', 'pagination render: page 1 button');
+  assertContains(html, 'data-page="2"', 'pagination render: page 2 button');
+  assertContains(html, 'data-page="3"', 'pagination render: page 3 button (250 total / 100 size)');
+  assertContains(html, 'aria-current="page"', 'pagination render: current page marked');
+});
+
+test('pagination: first page disables Previous; last page disables Next', function () {
+  // First page: page 1 of 250 total → Previous disabled, Next enabled.
+  W.setChangeRequestPage(1);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 0));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  var prev = buttons[0];
+  var next = buttons[buttons.length - 1];
+  assert(prev.disabled === true, 'pagination first page: Previous disabled on page 1');
+  assert(prev.getAttribute('data-page') === '0', 'pagination first page: Previous data-page is page 0');
+  assert(next.disabled === false, 'pagination first page: Next enabled on page 1');
+});
+
+test('pagination: last page disables Next', function () {
+  // Move to page 3 (the last of 250 @ 100) via the state hook then render.
+  W.setChangeRequestPage(3);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 200));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  var prev = buttons[0];
+  var next = buttons[buttons.length - 1];
+  assert(prev.disabled === false, 'pagination last page: Previous enabled on page 3');
+  assert(next.disabled === true, 'pagination last page: Next disabled on the final page');
+  assert(prev.getAttribute('data-page') === '2', 'pagination last page: Previous points at page 2');
+});
+
+test('pagination: no pages renders empty control (no results)', function () {
+  W.setChangeRequestPage(1);
+  W.renderChangeRequestPagination({ items: [], total: 0, limit: 100, offset: 0 });
+  assertEqual(crPaginationNavEl.innerHTML, '', 'pagination empty: control block cleared for no results');
+});
+
+test('pagination: single-page result renders one page, both controls disabled', function () {
+  W.setChangeRequestPage(1);
+  W.renderChangeRequestPagination(buildPagedSummaryList(3, 0));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  assertEqual(buttons.length, 3, 'pagination single page: prev + one page + next = 3 buttons');
+  assert(buttons[0].disabled === true, 'pagination single page: Previous disabled');
+  assert(buttons[2].disabled === true, 'pagination single page: Next disabled');
+  assertContains(buttons[1].getAttribute('aria-label') || '', 'Page 1, current page', 'pagination single page: aria-current label');
+});
+
+test('pagination: clicking Next fetches the next page with offset', function () {
+  W.setChangeRequestPage(1);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 0));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  var next = buttons[buttons.length - 1];
+  var lastUrl = null;
+  fetchImpl = function (url) {
+    lastUrl = url;
+    // total 250 covers page 2 (offset 100) — no fallback refetch.
+    return okJson({ status: 'ok', data: buildPagedSummaryList(250, 100) });
+  };
+  next._handlers.click();
+  return settleDeep(4).then(function () {
+    assertContains(lastUrl, 'limit=100', 'pagination next click: limit carried');
+    assertContains(lastUrl, 'offset=100', 'pagination next click: offset advanced to 100');
+  });
+});
+
+test('pagination: clicking Previous fetches the previous page with offset', function () {
+  W.setChangeRequestPage(3);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 200));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  var prev = buttons[0];
+  var lastUrl = null;
+  fetchImpl = function (url) {
+    lastUrl = url;
+    return okJson({ status: 'ok', data: buildPagedSummaryList(250, 100) });
+  };
+  prev._handlers.click();
+  return settleDeep(4).then(function () {
+    assertContains(lastUrl, 'limit=100', 'pagination prev click: limit carried');
+    assertContains(lastUrl, 'offset=100', 'pagination prev click: offset rewound to 100');
+  });
+});
+
+test('pagination: clicking the current page is a no-op (no refetch, no history entry)', function () {
+  W.setChangeRequestPage(2);
+  W.renderChangeRequestPagination(buildPagedSummaryList(250, 100));
+  var buttons = crPaginationNavEl.querySelectorAll('button');
+  var current = buttons[2]; // page 2 of [prev,1,2,3,next]
+  var fetchCount = 0;
+  fetchImpl = function () {
+    fetchCount++;
+    return okJson({ status: 'ok', data: buildPagedSummaryList(100, 100) });
+  };
+  current._handlers.click();
+  return settleDeep(4).then(function () {
+    assertEqual(fetchCount, 0, 'pagination no-op: current-page click never refetches');
+  });
+});
+
+test('pagination: fetch path applies the page fallback when the total shrank', function () {
+  W.setChangeRequestPage(3); // page 3 of an assumed 250
+  fetchImpl = function (url) {
+    if (url.indexOf('offset=200') !== -1) {
+      // The fetched total (150) only covers 2 pages — page 3 is invalid.
+      return okJson({ status: 'ok', data: { items: [], total: 150, limit: 100, offset: 200 } });
+    }
+    return okJson({ status: 'ok', data: { items: buildPagedSummaryList(50, 100).items, total: 150, limit: 100, offset: 100 } });
+  };
+  return W.fetchChangeRequestsAndRender().then(function () {
+    assertEqual(crListTbodyEl.querySelectorAll('.afk-cr-list-row').length, 50,
+      'pagination fallback: corrected page 2 rows rendered');
+  });
+});
+
+test('pagination: filter apply resets to page 1 and replaces URL state', function () {
+  W.setChangeRequestPage(3);
+  crFilterProviderEl.value = 'gitlab';
+  var lastUrl = null;
+  fetchImpl = function (url) {
+    lastUrl = url;
+    return okJson({ status: 'ok', data: { items: [], total: 0, limit: 100, offset: 0 } });
+  };
+  return W.applyChangeRequestFilters().then(function () {
+    assertContains(lastUrl, 'provider=gitlab', 'pagination filter apply: filters carried');
+    assertContains(lastUrl, 'offset=0', 'pagination filter apply: offset reset to 0 (page 1)');
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════

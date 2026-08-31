@@ -93,6 +93,7 @@
     // Change Request List (issue #613): the primary change-request-per-row
     // AFK Outcomes view (summary contract + filters) and its detail overlay.
     afkCrListTbody:  $('afk-cr-list-tbody'),
+    afkCrPagination: $('afk-cr-pagination'), // control block below the panel
     afkCrFilterProvider: $('afk-cr-filter-provider'),
     afkCrFilterRepository: $('afk-cr-filter-repository'),
     afkCrFilterProviderState: $('afk-cr-filter-provider-state'),
@@ -151,6 +152,12 @@
   let afkCrFetchError = null;
   let afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
   let selectedChangeRequest = null;
+  // Change-request list pagination state: the current page (1-indexed) and
+  // the page size (AFK_CR_LIMIT).  The page is read from the URL
+  // (?limit / ?offset) on dashboard load and translated to the summary
+  // contract's limit/offset at request time — offset = (page - 1) * limit.
+  let afkCrPage = 1;
+  let afkCrPageSize = AFK_CR_LIMIT;
 
   // The #612 adapter/formatter module loads before app.js in index.html and
   // exposes itself on window.ChangeRequestAdapters.  Captured once at load
@@ -1551,6 +1558,20 @@
     readAgentRunPaginationFromUrl();
     if (agentRunPage !== prevPage || agentRunPageSize !== prevSize) {
       fetchAgentRunsAndRender();
+    }
+  }
+
+  /** Re-sync the change-request list page after a Back/Forward navigation
+   *  (popstate).  Reads ?limit / ?offset from the URL and, when the page
+   *  changed, re-fetches through the shared fetch path so the address bar,
+   *  visible rows, and in-memory state stay consistent.  The URL read
+   *  itself never pushes history, so this cannot add entries or loop. */
+  function handleChangeRequestPopstate() {
+    var prevPage = afkCrPage;
+    var prevSize = afkCrPageSize;
+    readChangeRequestPaginationFromUrl();
+    if (afkCrPage !== prevPage || afkCrPageSize !== prevSize) {
+      fetchChangeRequestsAndRender();
     }
   }
 
@@ -3111,8 +3132,109 @@
       params.push('activity_to=' + encodeURIComponent(range.endDate.toISOString()));
     }
     params.push('limit=' + (limit != null ? limit : AFK_CR_LIMIT));
-    if (offset) params.push('offset=' + offset);
+    // Always emit offset when it is a valid non-negative number (0 included)
+    // so the URL mirrors the server-side page (offset = (page-1) * limit),
+    // matching the agent-runs builder's always-emit convention.
+    if (typeof offset === 'number' && offset >= 0 && Number.isInteger(offset)) {
+      params.push('offset=' + offset);
+    }
     return '/api/v1/afk-outcomes/change-requests' + (params.length ? '?' + params.join('&') : '');
+  }
+
+  /** Parse change-request list pagination from a URL query string.
+   *  Reads `limit` (page size) and `offset` (zero-based row offset); the
+   *  current page is derived as floor(offset / limit) + 1.  Missing or
+   *  malformed values fall back to the defaults: page 1 of AFK_CR_LIMIT
+   *  (100) rows.  Pure — no DOM, location, or fetch access. */
+  function parseChangeRequestPagination(queryString) {
+    var page = 1;
+    var pageSize = AFK_CR_LIMIT;
+    var params = new URLSearchParams(queryString || '');
+    var rawLimit = params.get('limit');
+    var rawOffset = params.get('offset');
+    var nLimit = Number(rawLimit);
+    var nOffset = Number(rawOffset);
+    if (rawLimit !== null && Number.isInteger(nLimit) && nLimit >= 1) {
+      pageSize = nLimit;
+    }
+    if (rawOffset !== null && Number.isInteger(nOffset) && nOffset >= 0) {
+      page = Math.floor(nOffset / pageSize) + 1;
+    }
+    return { page: page, pageSize: pageSize };
+  }
+
+  /** Read `limit`/`offset` from the current URL into the change-request
+   *  pagination closure state.  Called on dashboard load so a deep link
+   *  such as ?limit=100&offset=100 loads the corresponding change-request
+   *  page; the translation happens in fetchChangeRequestsAndRender on the
+   *  next fetch. */
+  function readChangeRequestPaginationFromUrl() {
+    var query = (typeof location !== 'undefined' && location.search) || '';
+    var pagination = parseChangeRequestPagination(query);
+    afkCrPage = pagination.page;
+    afkCrPageSize = pagination.pageSize;
+  }
+
+  /** Build the dashboard URL carrying the given change-request pagination
+   *  state, keeping any other query parameters already present in the URL. */
+  function changeRequestsUrlWithPagination(page, pageSize) {
+    var params = new URLSearchParams(
+      (typeof location !== 'undefined' && location.search) || '');
+    params.set('limit', String(pageSize));
+    params.set('offset', String((page - 1) * pageSize));
+    var path = (typeof location !== 'undefined' && location.pathname) || '';
+    return path + '?' + params.toString();
+  }
+
+  /** Set the change-request list page and persist it in the URL via browser
+   *  history.  Invalid page values fall back to page 1.  The URL update
+   *  itself never changes rows — rows only change through the normal fetch
+   *  path (buildChangeRequestListUrl → fetchChangeRequestsAndRender). */
+  function setChangeRequestPage(page) {
+    var parsed = parseChangeRequestPagination(
+      'limit=' + afkCrPageSize + '&offset=' + ((page - 1) * afkCrPageSize));
+    afkCrPage = parsed.page;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
+      history.pushState({}, '', url);
+    }
+  }
+
+  /** Compute the nearest valid change-request page for a fetched result
+   *  total.  When the result set shrinks — change requests deleted, or the
+   *  list narrowed elsewhere — the currently selected page may exceed the
+   *  new page count; the UI must land on the nearest valid page instead of
+   *  rendering an empty offset.  An empty result (total=0) resolves to
+   *  page 1.  Pure — no DOM, location, or fetch access. */
+  function nearestValidChangeRequestPage(total, currentPage, pageSize) {
+    var pageCount = Math.ceil(total / pageSize);
+    var current = Math.max(currentPage, 1);
+    return Math.min(current, Math.max(1, pageCount));
+  }
+
+  /** Correct the change-request page state after a fetch when the result
+   *  total no longer covers the current page.  When the fetched total
+   *  implies fewer pages than the current page, the closure page state
+   *  moves to the nearest valid page and the URL is REPLACED
+   *  (history.replaceState) so the fallback does not add a browser-history
+   *  entry.  The caller then refetches the corrected page through the
+   *  normal fetch path — this hook only fixes state + URL.  Returns true
+   *  when a fallback was applied, false otherwise (no data, a still-valid
+   *  page, or an empty result already on page 1 — so a refetch can never
+   *  loop). */
+  function applyChangeRequestPageFallback(data) {
+    if (!data) return false;
+    var total = (typeof data.total === 'number')
+      ? data.total
+      : (data.items ? data.items.length : 0);
+    var nearest = nearestValidChangeRequestPage(total, afkCrPage, afkCrPageSize);
+    if (nearest === afkCrPage) return false;
+    afkCrPage = nearest;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
+    return true;
   }
 
   /** Build the provider-scoped change-request detail path (planned #611
@@ -3257,16 +3379,30 @@
   }
 
   /** Apply the current filter controls and re-fetch the summary list through
-   *  the contract (filters ride the query — never client-side re-filtering). */
+   *  the contract (filters ride the query — never client-side re-filtering).
+   *  A filter change re-scopes the result set, so pagination resets to
+   *  page 1 and the URL state is REPLACED rather than pushed. */
   function applyChangeRequestFilters() {
     afkCrFilters = readChangeRequestFiltersFromUI();
+    afkCrPage = 1;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
     return fetchChangeRequestsAndRender();
   }
 
-  /** Clear the change-request filters (back to the full list) and re-fetch. */
+  /** Clear the change-request filters (back to the full list) and re-fetch.
+   *  Resets pagination to page 1 and replaces the URL state, mirroring
+   *  applyChangeRequestFilters. */
   function clearChangeRequestFilters() {
     afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
     syncChangeRequestFilterUI(afkCrFilters);
+    afkCrPage = 1;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
     return fetchChangeRequestsAndRender();
   }
 
@@ -3274,22 +3410,102 @@
    *  state and re-render the table (issue #613).  Mirrors
    *  fetchAgentRunsAndRender: an independent fetch keeps the panel's
    *  freshness state, preserves the previous rows during loading and
-   *  failures, and never blocks the rest of the dashboard. */
+   *  failures, and never blocks the rest of the dashboard.  The fetch
+   *  carries the current pagination state — offset = (page - 1) * limit —
+   *  so paging, filtering, and the dashboard refresh all ride the same
+   *  path. */
   function fetchChangeRequestsAndRender() {
     var prev = panelStates['afk-cr-list'];
     setPanelState('afk-cr-list', 'refreshing', prev ? prev.updatedAt : null);
-    var url = buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT);
+    var offset = (afkCrPage - 1) * afkCrPageSize;
+    var url = buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize, offset);
     return apiFetch(url).then(function (data) {
       afkCrData = data;
       afkCrFetchError = null;
       setPanelState('afk-cr-list', 'ok', Date.now());
+      // Issue #429 pattern: when the fetched total no longer covers the
+      // current page (the result set shrank), correct the page state + URL
+      // and re-fetch the nearest valid page through this same path.
+      if (applyChangeRequestPageFallback(data)) {
+        return fetchChangeRequestsAndRender();
+      }
       renderChangeRequestSummaryTable(data);
+      renderChangeRequestPagination(data);
     }).catch(function (e) {
       afkCrFetchError = e.message || 'Change-request query failed';
       var prevState = panelStates['afk-cr-list'];
       setPanelState('afk-cr-list', 'stale', prevState ? prevState.updatedAt : null);
       renderChangeRequestSummaryTable(null); // keeps previous rows; label shows "Showing previous data"
+      renderChangeRequestPagination(afkCrData); // keeps the last-known page info
       console.error('Change-request list fetch error:', e);
+    });
+  }
+
+  /** Render the Change Request list pagination control block below the
+   *  panel: Previous / Next plus the numbered page items computed by
+   *  computePageItems from the API response `total` and the current page
+   *  size (AFK_CR_LIMIT).  Previous is disabled on page 1, Next on the
+   *  final page, and the current page carries aria-current="page".
+   *  Clicking a control persists the page via setChangeRequestPage and
+   *  re-fetches that server-side page through fetchChangeRequestsAndRender,
+   *  preserving active filters.  Change-request row content, columns,
+   *  ordering, and detail interactions are untouched — this block only
+   *  re-requests the same endpoint with a different offset. */
+  function renderChangeRequestPagination(data) {
+    if (!els.afkCrPagination) return;
+    // Failed fetch → keep the previous control state (mirrors the table's
+    // "keep previous rows" behavior via the same panel guard).
+    if (!shouldRenderPanel(panelStates, 'afk-cr-list')) return;
+
+    var total = (data && typeof data.total === 'number')
+      ? data.total
+      : (data && data.items ? data.items.length : 0);
+    var pageCount = Math.ceil(total / afkCrPageSize);
+    var items = computePageItems(afkCrPage, pageCount);
+    if (items.length === 0) {
+      els.afkCrPagination.innerHTML = '';
+      return;
+    }
+
+    var html = '';
+    var prevPage = afkCrPage - 1;
+    var nextPage = afkCrPage + 1;
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + prevPage + '"' +
+      (prevPage < 1 ? ' disabled' : '') + ' aria-label="Previous page">\u2190 Previous</button>';
+
+    items.forEach(function (item) {
+      if (item.type === 'ellipsis') {
+        html += '<span class="pagination-ellipsis" aria-hidden="true">\u2026</span>';
+        return;
+      }
+      var isCurrent = item.page === afkCrPage;
+      html += '<button type="button" class="filter-clear pagination-btn' +
+        (isCurrent ? ' pagination-current' : '') + '" data-page="' + item.page + '"' +
+        ' aria-label="' + (isCurrent ? 'Page ' + item.page + ', current page' : 'Page ' + item.page) + '"' +
+        (isCurrent ? ' aria-current="page"' : '') + '>' + item.page + '</button>';
+    });
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + nextPage + '"' +
+      (nextPage > pageCount ? ' disabled' : '') + ' aria-label="Next page">Next \u2192</button>';
+
+    els.afkCrPagination.innerHTML = html;
+
+    // Wire the page controls: selecting a page updates the pagination
+    // state (setChangeRequestPage → URL history) and re-fetches that page
+    // via the shared path so the active filters ride along.
+    var buttons = els.afkCrPagination.querySelectorAll('button');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return; // disabled buttons never fire in browsers; belt-and-braces
+        var page = Number(btn.getAttribute('data-page'));
+        // Clicking the already-current page is a no-op — no duplicate
+        // history entry, no redundant refetch.  The current page stays
+        // focusable (aria-current="page" + "current page" label unchanged).
+        if (!Number.isInteger(page) || page < 1 || page === afkCrPage) return;
+        setChangeRequestPage(page);
+        return fetchChangeRequestsAndRender();
+      });
     });
   }
 
@@ -4032,6 +4248,7 @@
       }
       renderClientProjectBreakdown(data);
       renderChangeRequestSummaryTable(data.afkChangeRequests); // Change Request list (issue #613) — primary view
+      renderChangeRequestPagination(data.afkChangeRequests); // pagination control below the panel
       renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453) — secondary run-centric view
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
@@ -4863,12 +5080,17 @@
     // fetch so a deep link such as ?page=2&page_size=100 loads the
     // corresponding Agent Runs page on dashboard load.
     readAgentRunPaginationFromUrl();
+    // Change Request list: read ?limit / ?offset from the URL before the
+    // initial fetch so a deep link such as ?limit=100&offset=100 loads the
+    // corresponding change-request page on dashboard load.
+    readChangeRequestPaginationFromUrl();
     // PR #431 review (finding 4): keep Back/Forward navigation in sync with
     // the in-memory page state.  Guarded so non-browser environments (the
     // Node sandbox, which never calls startAutoRefresh) can't crash on a
     // missing window.addEventListener.
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('popstate', handleAgentRunPopstate);
+      window.addEventListener('popstate', handleChangeRequestPopstate);
     }
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
@@ -5001,6 +5223,18 @@
   window.applyChangeRequestFilters = applyChangeRequestFilters;
   window.clearChangeRequestFilters = clearChangeRequestFilters;
   window.fetchChangeRequestsAndRender = fetchChangeRequestsAndRender;
+  // Change Request list pagination (mirrors the Agent Runs pagination test
+  // seam): the pure URL-param parser, the on-load URL reader, the page-set
+  // history hook, the nearest-valid-page calculator, the page-fallback
+  // hook, and the control renderer.
+  window.parseChangeRequestPagination = parseChangeRequestPagination;
+  window.readChangeRequestPaginationFromUrl = readChangeRequestPaginationFromUrl;
+  window.setChangeRequestPage = setChangeRequestPage;
+  window.changeRequestsUrlWithPagination = changeRequestsUrlWithPagination;
+  window.nearestValidChangeRequestPage = nearestValidChangeRequestPage;
+  window.applyChangeRequestPageFallback = applyChangeRequestPageFallback;
+  window.renderChangeRequestPagination = renderChangeRequestPagination;
+  window.handleChangeRequestPopstate = handleChangeRequestPopstate;
   window.openChangeRequestDetail = openChangeRequestDetail;
   window.renderChangeRequestDetail = renderChangeRequestDetail;
   window.renderChangeRequestExecution = renderChangeRequestExecution;

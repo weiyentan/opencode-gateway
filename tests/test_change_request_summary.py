@@ -406,12 +406,34 @@ class TestChangeRequestSummaryQueries:
             "AND entity_number IS NOT NULL"
         ) in normalized
 
-    def test_provider_state_precedence_merged_over_closed_over_open(self):
+    def test_provider_state_derived_from_latest_event_chronologically(self):
         build = self._builder()
         _, data_sql, _ = build(None, None, None, None, None, None)
-        assert "WHEN BOOL_OR(es.merged) THEN 'merged'" in data_sql
-        assert "WHEN BOOL_OR(es.closed) THEN 'closed'" in data_sql
-        assert "WHEN BOOL_OR(es.opened) THEN 'open'" in data_sql
+        # Provider state is derived from the chronologically latest observed
+        # lifecycle fact (a reopened PR/MR reports ``open`` again), with the
+        # historical merged > closed > open precedence kept only as the
+        # deterministic tie-breaker for equal timestamps.
+        assert "es.latest_merged_at" in data_sql
+        assert "es.latest_closed_at" in data_sql
+        assert "es.latest_opened_at" in data_sql
+        assert "THEN 'merged'" in data_sql
+        assert "THEN 'closed'" in data_sql
+        assert "THEN 'open'" in data_sql
+        # The historical precedence CASE (BOOL_OR-based) is gone.
+        assert "WHEN BOOL_OR(es.merged) THEN 'merged'" not in data_sql
+        assert "WHEN BOOL_OR(es.closed) THEN 'closed'" not in data_sql
+        assert "WHEN BOOL_OR(es.opened) THEN 'open'" not in data_sql
+
+    def test_latest_activity_at_is_null_safe_greatest(self):
+        build = self._builder()
+        _, data_sql, _ = build(None, None, None, None, None, None)
+        # Null-safe maximum across run, fact, and execution timestamps — a
+        # COALESCE would stop at the first non-null source and hide newer ones.
+        assert "GREATEST(" in data_sql
+        assert "MAX(r.last_seen_at)" in data_sql
+        assert "MAX(es.latest_event_at)" in data_sql
+        assert "MAX(ec.latest_exec_at)" in data_sql
+        assert "COALESCE(\n                MAX(r.last_seen_at)" not in data_sql
 
     def test_automation_state_precedence_mirrors_run_status_policy(self):
         build = self._builder()
