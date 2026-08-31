@@ -28,6 +28,7 @@ function buildSummaryList() {
         provider_state: 'merged', automation_state: 'completed',
         total_estimated_cost_usd: 3.40,
         latest_linked_activity: TS.MR_6_MERGE,
+        provider_state_observed_at: TS.MR_6_MERGE,
         executions: { total: 2, running: 0, completed: 2, failed: 0, cancelled: 0 }
       },
       {
@@ -36,6 +37,7 @@ function buildSummaryList() {
         provider_state: 'open', automation_state: 'failed',
         total_estimated_cost_usd: null,
         latest_linked_activity: TS.MR_4_OPEN,
+        provider_state_observed_at: TS.MR_4_OPEN,
         executions: { total: 2, running: 0, completed: 0, failed: 2, cancelled: 0 }
       }
     ],

@@ -634,6 +634,8 @@ _CHANGE_REQUEST_GROUPED_SQL = """
                 MAX(es.latest_event_at),
                 MAX(ec.latest_exec_at)
             ) AS latest_activity_at,
+            MAX(es.latest_event_at) AS provider_state_observed_at,
+            MAX(ec.latest_exec_at) AS latest_execution_activity,
             COALESCE(ec.total, 0) AS execution_total,
             COALESCE(ec.running, 0) AS execution_running,
             COALESCE(ec.completed, 0) AS execution_completed,
@@ -798,7 +800,7 @@ def _build_change_request_queries(
 {grouped}
 ) AS summary
 {post_where}
-ORDER BY summary.latest_activity_at DESC NULLS LAST,
+ORDER BY summary.latest_execution_activity DESC NULLS LAST,
          summary.provider ASC, summary.repository ASC, summary.external_id ASC
 LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
 """
@@ -815,6 +817,7 @@ def _change_request_summary_row(row: asyncpg.Record) -> ChangeRequestSummaryRow:
         automation_state=row["automation_state"],
         total_estimated_cost_usd=row["total_estimated_cost_usd"],
         latest_linked_activity=row["latest_activity_at"],
+        provider_state_observed_at=row["provider_state_observed_at"],
         executions=ChangeRequestExecutionCounts(
             total=row["execution_total"] or 0,
             running=row["execution_running"] or 0,
