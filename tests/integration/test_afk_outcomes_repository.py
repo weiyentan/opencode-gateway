@@ -227,7 +227,7 @@ def _make_run(
 async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000001")
+        run = _make_run("01J00000000000000000000001")
 
         await repo.save(run)
         await repo.save(run)  # re-delivery
@@ -244,13 +244,13 @@ async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) ->
 async def test_delivery_log_replay_safe(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000002")
+        run = _make_run("01J00000000000000000000002")
 
         await repo.save(run)
         await repo.save(run)  # re-delivery
 
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = '01J0000000000000000000000002'"
+            "SELECT COUNT(*) FROM delivery_log WHERE delivery_id = '01J00000000000000000000002'"
         )
         assert count == 1, f"expected 1 delivery-log row after re-delivery, got {count}"
 
@@ -260,7 +260,7 @@ async def test_delivery_log_replay_safe(db_pool: asyncpg.Pool) -> None:
 async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000003"
+        run_id = "01J00000000000000000000003"
 
         await repo.save(_make_run(run_id, confidence=0.5))
         await repo.save(_make_run(run_id, confidence=0.9))  # raise
@@ -280,7 +280,7 @@ async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
 async def test_evidence_appended_not_erased(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000004"
+        run_id = "01J00000000000000000000004"
 
         await repo.save(_make_run(run_id, method="issue_resolved", confidence=1.0))
         await repo.save(_make_run(run_id, method="change_request_merged", confidence=1.0))
@@ -301,10 +301,10 @@ async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> Non
 
         # Run A links the entity weakly; run B links it more confidently.
         await repo.save(
-            _make_run("01J0000000000000000000000005", confidence=0.5, role="referenced")
+            _make_run("01J00000000000000000000005", confidence=0.5, role="referenced")
         )
         await repo.save(
-            _make_run("01J0000000000000000000000006", confidence=0.9, role="resolved")
+            _make_run("01J00000000000000000000006", confidence=0.9, role="resolved")
         )
 
         # Both rows still exist (no hard-delete) …
@@ -316,13 +316,13 @@ async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> Non
         # … but run A's weaker link is marked superseded.
         superseded = await conn.fetchval(
             "SELECT superseded_at FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000005'"
+            "WHERE afk_run_id = '01J00000000000000000000005'"
         )
         assert superseded is not None, "run A's weaker link should be marked superseded"
 
         active = await conn.fetchval(
             "SELECT superseded_at FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000006'"
+            "WHERE afk_run_id = '01J00000000000000000000006'"
         )
         assert active is None, "run B's stronger link should remain active"
 
@@ -335,8 +335,8 @@ async def test_superseded_link_not_reactivated_on_redelivery(
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
 
-        run_a = "01J0000000000000000000000008"
-        run_b = "01J0000000000000000000000009"
+        run_a = "01J00000000000000000000008"
+        run_b = "01J00000000000000000000009"
 
         # Run A links the entity weakly; run B links it more confidently.
         await repo.save(_make_run(run_a, confidence=0.5, role="referenced"))
@@ -370,7 +370,7 @@ async def test_afk_run_entities_afk_run_id_not_null_enforced(
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run = _make_run("01J0000000000000000000000007")
+        run = _make_run("01J00000000000000000000007")
         await repo.save(run)
 
         with pytest.raises(asyncpg.NotNullViolationError):
@@ -392,7 +392,7 @@ async def test_unresolved_correlations_stored_only_in_unresolved_table(
         repo = AsyncpgOutcomeRepository(conn)
         # a run whose only link is a low-confidence "referenced" mention
         run = _make_run(
-            "01J0000000000000000000000008",
+            "01J00000000000000000000008",
             role="referenced",
             confidence=0.1,
             method="issue_mention",
@@ -410,7 +410,7 @@ async def test_unresolved_correlations_stored_only_in_unresolved_table(
         # …and NOT promoted to a resolved entity link's correlation_method.
         link_method = await conn.fetchval(
             "SELECT correlation_method FROM afk_run_entities "
-            "WHERE afk_run_id = '01J0000000000000000000000008'"
+            "WHERE afk_run_id = '01J00000000000000000000008'"
         )
         assert link_method is not None  # the link still carries the (weak) method
 
@@ -448,7 +448,7 @@ async def test_unresolved_same_run_upsert_enriches_single_row(
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_id = "01J0000000000000000000000099"
+        run_id = "01J00000000000000000000099"
 
         await repo.save(
             _make_run(
@@ -489,8 +489,8 @@ async def test_unresolved_different_runs_produce_independent_rows(
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000100"
-        run_b = "01J0000000000000000000000101"
+        run_a = "01J00000000000000000000100"
+        run_b = "01J00000000000000000000101"
 
         await repo.save(
             _make_run(
@@ -535,8 +535,8 @@ async def test_unresolved_ambiguous_rows_across_runs_independent(
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000200"
-        run_b = "01J0000000000000000000000201"
+        run_a = "01J00000000000000000000200"
+        run_b = "01J00000000000000000000201"
 
         await repo.save_unresolved(
             AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
@@ -568,8 +568,8 @@ async def test_unresolved_unmatched_rows_across_runs_independent(
 ) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        run_a = "01J0000000000000000000000300"
-        run_b = "01J0000000000000000000000301"
+        run_a = "01J00000000000000000000300"
+        run_b = "01J00000000000000000000301"
 
         await repo.save_unresolved(
             AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
@@ -705,8 +705,8 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
     """
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
-        repo_a_id = "01J0000000000000000000000R1"
-        repo_b_id = "01J0000000000000000000000R2"
+        repo_a_id = "01J000000000000000000000R1"
+        repo_b_id = "01J000000000000000000000R2"
         repo_a = "org/repo-a"
         repo_b = "org/repo-b"
         started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
