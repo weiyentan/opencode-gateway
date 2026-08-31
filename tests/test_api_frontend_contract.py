@@ -35,10 +35,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import types
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, get_args, get_origin, Union
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import pytest
 from pydantic import BaseModel
@@ -157,7 +158,7 @@ def _json_type_tag(annotation: Any) -> str:
     * Pydantic models → ``object``.
     """
     origin = get_origin(annotation)
-    if origin is Union:
+    if origin in (Union, types.UnionType):
         args = [a for a in get_args(annotation) if a is not type(None)]
         if not args:
             return "null"
@@ -182,6 +183,7 @@ def _json_type_tag(annotation: Any) -> str:
 def _assert_vocabulary(model: type[BaseModel], vocabulary: dict[str, str], label: str) -> None:
     """Assert every canonical adapter field exists on the backend model with a
     compatible JSON type."""
+    resolved_annotations = get_type_hints(model)
     missing = sorted(f for f in vocabulary if f not in model.model_fields)
     assert not missing, (
         f"{label}: backend schema {model.__name__} is missing adapter-required "
@@ -189,7 +191,7 @@ def _assert_vocabulary(model: type[BaseModel], vocabulary: dict[str, str], label
     )
     mismatched = []
     for field, expected in sorted(vocabulary.items()):
-        actual = _json_type_tag(model.model_fields[field].annotation)
+        actual = _json_type_tag(resolved_annotations[field])
         if actual != expected:
             mismatched.append(
                 f"{field}: schema type {actual} != adapter expectation {expected}"
