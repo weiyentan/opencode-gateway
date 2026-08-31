@@ -32,6 +32,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from afk_outcomes import (
     AFKRun,
@@ -94,7 +95,7 @@ def _integration_db_available() -> bool:
     return True
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
@@ -222,7 +223,7 @@ def _make_run(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
@@ -239,7 +240,7 @@ async def test_event_identity_rejects_duplicate_events(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_delivery_log_replay_safe(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
@@ -255,7 +256,7 @@ async def test_delivery_log_replay_safe(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
@@ -275,7 +276,7 @@ async def test_confidence_raised_never_lowered(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_evidence_appended_not_erased(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
@@ -293,7 +294,7 @@ async def test_evidence_appended_not_erased(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         repo = AsyncpgOutcomeRepository(conn)
@@ -327,7 +328,7 @@ async def test_superseded_links_marked_not_deleted(db_pool: asyncpg.Pool) -> Non
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_superseded_link_not_reactivated_on_redelivery(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -363,7 +364,7 @@ async def test_superseded_link_not_reactivated_on_redelivery(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_afk_run_entities_afk_run_id_not_null_enforced(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -383,7 +384,7 @@ async def test_afk_run_entities_afk_run_id_not_null_enforced(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_correlations_stored_only_in_unresolved_table(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -441,7 +442,7 @@ def _build_unresolved_item(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_same_run_upsert_enriches_single_row(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -482,7 +483,7 @@ async def test_unresolved_same_run_upsert_enriches_single_row(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_different_runs_produce_independent_rows(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -528,7 +529,7 @@ async def test_unresolved_different_runs_produce_independent_rows(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_ambiguous_rows_across_runs_independent(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -561,7 +562,7 @@ async def test_unresolved_ambiguous_rows_across_runs_independent(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unresolved_unmatched_rows_across_runs_independent(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -592,7 +593,7 @@ async def test_unresolved_unmatched_rows_across_runs_independent(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_run_scoped_unique_constraint_exists_post_upgrade(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -629,7 +630,7 @@ def _make_association(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) -> None:
     """Saving the same (resource, session) pair twice persists exactly one row.
 
@@ -694,7 +695,7 @@ async def test_same_association_twice_persists_one_row(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -> None:
     """Two repositories with the same entity_id (issue:437) must produce
     isolated event sets when retrieved via get().
@@ -825,7 +826,7 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_association_unique_constraint_enforced_at_sql_level(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -908,7 +909,7 @@ async def _seed_execution_afk_run(conn: asyncpg.Connection, run_id: str) -> None
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_creation_persists_afk_run_session_link(db_pool: asyncpg.Pool) -> None:
     """Creating an execution binding with afk_run_id + external_session_id
     persists the afk_run_sessions row with the resolved internal session id."""
@@ -948,7 +949,7 @@ async def test_creation_persists_afk_run_session_link(db_pool: asyncpg.Pool) -> 
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_creation_unresolved_session_keeps_external_id(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -987,7 +988,7 @@ async def test_creation_unresolved_session_keeps_external_id(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_creation_replay_is_idempotent(db_pool: asyncpg.Pool) -> None:
     """Replaying the identical binding never duplicates the afk_run_sessions row."""
     async with db_pool.acquire() as conn:
@@ -1024,7 +1025,7 @@ async def test_creation_replay_is_idempotent(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_terminal_fill_in_persists_afk_run_session_link(
     db_pool: asyncpg.Pool,
 ) -> None:
