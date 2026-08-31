@@ -1742,6 +1742,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         events: list[EngineeringEvent] = []
         for row in event_rows:
             entity_id = f"{row['entity_type']}:{row['external_id']}"
+            raw_payload = row["payload"] or {}
+            if isinstance(raw_payload, str):
+                # asyncpg returns JSONB as str unless a codec is registered.
+                raw_payload = json.loads(raw_payload)
             events.append(
                 EngineeringEvent(
                     event_id=f"{entity_id}:{row['event_type']}",
@@ -1750,7 +1754,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     entity_id=entity_id,
                     occurred_at=row["occurred_at"],
                     actor=row["actor"],
-                    payload=row["payload"] or {},
+                    payload=raw_payload,
                 )
             )
 
