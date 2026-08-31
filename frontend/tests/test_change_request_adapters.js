@@ -559,7 +559,10 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
   assertEqual(noCost.aggregateCost.label, 'Cost unavailable', 'detail: missing aggregate cost label');
   assertEqual(noCost.aggregateCost.usd, null, 'detail: missing aggregate cost usd null');
 
-  // Partial telemetry: one known cost, one missing -> aggregate = known sum
+  // Missing gateway aggregate: per-execution costs present, but the Gateway
+  // aggregate is null -> the aggregate is unavailable (null), never a
+  // browser-side sum that could invent or double-count cost (issue #617
+  // review finding HIGH-1).
   var partial = A.adaptChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r', external_id: '4' },
     executions: [
@@ -567,8 +570,9 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
       { awx_job: { job_id: '2' }, purpose: 'review', outcome: 'failed', estimated_cost_usd: null }
     ]
   });
-  assertEqual(partial.aggregateCost.available, true, 'detail: partial telemetry still aggregates known costs');
-  assertEqual(partial.aggregateCost.usd, 0.30, 'detail: partial aggregate = sum of known costs');
+  assertEqual(partial.aggregateCost.available, false, 'detail: missing gateway aggregate -> unavailable');
+  assertEqual(partial.aggregateCost.usd, null, 'detail: no browser-side fallback sum');
+  assertEqual(partial.aggregateCost.label, 'Cost unavailable', 'detail: missing gateway aggregate label');
 
   // Summary-nested detail contract (detail = { summary: {...} })
   var nested = A.adaptChangeRequestDetail({

@@ -538,26 +538,19 @@
 
   /** Resolve the aggregate cost for a change-request detail contract.  The
    *  Gateway-owned aggregate (`total_estimated_cost_usd` /
-   *  `aggregate_cost_usd`) is authoritative; when the detail contract omits
-   *  it, the adapter sums the per-execution costs WITHIN THE SAME payload
-   *  (no browser-side join).  Missing everywhere → null (unavailable).
+   *  `aggregate_cost_usd` / `estimated_cost_usd`) is authoritative; when the
+   *  detail contract omits it the adapter returns null (unavailable) — it
+   *  never invents or double-counts a browser-side sum of per-execution costs.
    *  @param {Object} detail
-   *  @param {Array} executions - adapted execution view models
+   *  @param {Array} executions - adapted execution view models (unused; kept
+   *  for interface stability)
    *  @returns {number|null} */
   function aggregateCostUsd(detail, executions) {
     var v = detail.total_estimated_cost_usd != null ? detail.total_estimated_cost_usd
       : (detail.aggregate_cost_usd != null ? detail.aggregate_cost_usd
       : (detail.estimated_cost_usd != null ? detail.estimated_cost_usd : null));
     if (v != null && v !== '' && !isNaN(Number(v))) return Number(v);
-    var sum = 0;
-    var any = false;
-    executions.forEach(function (e) {
-      if (e.cost.available) {
-        sum += e.cost.usd;
-        any = true;
-      }
-    });
-    return any ? sum : null;
+    return null;
   }
 
   /** Resolve the provider merge state from a detail contract.

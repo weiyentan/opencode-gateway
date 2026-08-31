@@ -385,7 +385,7 @@ test('aggregate cost: gateway-owned total wins over per-execution sum', function
   assertNotContains(html, '$5.60', 'aggregate: per-run sum not substituted when gateway total exists');
 });
 
-test('aggregate cost: missing gateway total sums per-execution costs exactly once', function () {
+test('aggregate cost: missing gateway total is unavailable, never a per-execution sum', function () {
   var html = '';
   W.renderChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r/x', external_id: '2', provider_state: 'open', automation_state: 'running' },
@@ -397,8 +397,11 @@ test('aggregate cost: missing gateway total sums per-execution costs exactly onc
     ]
   });
   html = crDetailBodyEl.innerHTML;
-  assertContains(html, '$0.60', 'aggregate: missing gateway total sums known per-execution costs');
-  assertContains(html, 'Cost unavailable', 'aggregate: unavailable execution cost still labeled');
+  // The Gateway aggregate is authoritative: without it the aggregate cost is
+  // unavailable (null) — the adapter never invents a browser-side sum that
+  // could double-count cost (issue #617 review finding HIGH-1).
+  assertNotContains(html, '$0.60', 'aggregate: per-execution sum not substituted when gateway total missing');
+  assertContains(html, 'Cost unavailable', 'aggregate: unavailable aggregate labeled');
 });
 
 // ═════════════════════════════════════════════════════════════════════════

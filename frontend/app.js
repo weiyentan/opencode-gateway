@@ -1662,7 +1662,10 @@
           // Outcomes view — one row per provider/repository/change-request
           // identity from GET /api/v1/afk-outcomes/change-requests, scoped
           // by the active filters and the shared dashboard date range.
-          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT)),
+          // The current page offset is carried through so auto-refresh never
+          // silently resets the list to page 1 (issue #617 review finding).
+          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT,
+            (afkCrPage - 1) * afkCrPageSize)),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
