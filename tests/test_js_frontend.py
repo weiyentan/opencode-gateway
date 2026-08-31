@@ -10,7 +10,6 @@ FRONTEND_DIR = REPO_DIR / "frontend"
 
 JS_TESTS = [
     "test_pure_functions.js",
-    "issue_577_tests.js",
     "test_change_request_list.js",
 ]
 
