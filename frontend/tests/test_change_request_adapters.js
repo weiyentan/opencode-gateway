@@ -400,6 +400,12 @@ console.log('\u25B6 detail adapter — executions');
   assertEqual(prov.purpose.label, 'Review', 'exec: purpose label Review');
   assertEqual(prov.status.value, 'completed', 'exec: status from status field');
   assertEqual(prov.duration, '15m', 'exec: flat duration');
+  // Per-execution token telemetry (flat token fields — #614)
+  assertEqual(prov.tokens.available, true, 'exec: flat token telemetry available');
+  assertEqual(prov.tokens.inputTokens, 5000, 'exec: input tokens');
+  assertEqual(prov.tokens.outputTokens, 800, 'exec: output tokens');
+  assertEqual(prov.tokens.cacheReadTokens, null, 'exec: absent cache read tokens null');
+  assertEqual(prov.tokens.cacheWriteTokens, null, 'exec: absent cache write tokens null');
 
   // Retry purpose
   var retry = A.adaptExecution({ purpose: 'retry', outcome: 'failed', awx_job: { job_id: '3004' } });
@@ -417,6 +423,8 @@ console.log('\u25B6 detail adapter — executions');
   var noCost = A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'completed' });
   assertEqual(noCost.cost.available, false, 'exec: missing cost unavailable');
   assertEqual(noCost.cost.label, 'Cost unavailable', 'exec: missing cost label');
+  assertEqual(noCost.tokens.available, false, 'exec: missing token telemetry unavailable');
+  assertEqual(noCost.tokens.inputTokens, null, 'exec: missing input tokens null');
 
   // Malformed execution
   var bad = A.adaptExecution(null);
@@ -425,6 +433,7 @@ console.log('\u25B6 detail adapter — executions');
   assertEqual(bad.status.label, '--', 'exec: null execution -> -- status');
   assertEqual(bad.cost.available, false, 'exec: null execution -> cost unavailable');
   assertEqual(bad.duration, '--', 'exec: null execution -> no duration');
+  assertEqual(bad.tokens.available, false, 'exec: null execution -> no token telemetry');
 })();
 
 console.log('\u25B6 detail adapter — aggregate + sessions + usage');
