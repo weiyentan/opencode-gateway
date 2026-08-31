@@ -2539,7 +2539,7 @@ class TestCreateOrReplaySessionLink:
 
         links = _session_link_calls(mock_conn)
         assert len(links) == 1
-        sql, args = links[0]
+        _, args = links[0]
         assert args[0] == result.afk_run_id
         assert args[1] is None  # unresolved internal session id
         assert args[2] == "ses_unresolved_618"
@@ -2571,7 +2571,7 @@ class TestCreateOrReplaySessionLink:
 
         links = _session_link_calls(mock_conn)
         assert len(links) == 1
-        sql, args = links[0]
+        _, args = links[0]
         assert args[0] == result.afk_run_id
         assert args[1] is None  # ambiguous internal session id
         assert args[2] == "ses_ambiguous_618"
