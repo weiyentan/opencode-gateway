@@ -24,6 +24,9 @@
   const CLIENT_CACHE_TTL_MS = 600000; // 10 minutes
   const AGENT_RUN_LIMIT = 50;
   const AFK_RUN_LIMIT = 50;
+  // Change-request summary list (issue #613): page size for the primary
+  // change-request-per-row view (GET /api/v1/afk-outcomes/change-requests).
+  const AFK_CR_LIMIT = 100;
 
   // ── Element refs ───────────────────────────────────────────────────────
 
@@ -87,6 +90,21 @@
     // Unresolved Relationships (issue #576)
     unresolvedTbody: $('unresolved-relationships-tbody'),
 
+    // Change Request List (issue #613): the primary change-request-per-row
+    // AFK Outcomes view (summary contract + filters) and its detail overlay.
+    afkCrListTbody:  $('afk-cr-list-tbody'),
+    afkCrPagination: $('afk-cr-pagination'), // control block below the panel
+    afkCrFilterProvider: $('afk-cr-filter-provider'),
+    afkCrFilterRepository: $('afk-cr-filter-repository'),
+    afkCrFilterProviderState: $('afk-cr-filter-provider-state'),
+    afkCrFilterAutomationState: $('afk-cr-filter-automation-state'),
+    afkCrFilterApply: $('afk-cr-filter-apply'),
+    afkCrFilterClear: $('afk-cr-filter-clear'),
+    crListDetailOverlay: $('cr-list-detail-overlay'),
+    crListDetailTitle:   $('cr-list-detail-title'),
+    crListDetailBody:    $('cr-list-detail-body'),
+    crListDetailClose:   $('cr-list-detail-close'),
+
     // Date range bar
     drPreset:       $('dr-preset'),
     drCustomInputs: $('dr-custom-inputs'),
@@ -124,6 +142,28 @@
   let unresolvedRelationshipsData = null; // latest unresolved relationships data
   let selectedRepo = null;
   let afkOnlyFilter = false;
+  // Change-request summary list state (issue #613): the latest summary
+  // response, the per-cycle fetch error, the active filter set (served
+  // through the summary contract — never client-side re-filtering), and the
+  // change-request identity of the currently opened detail row.  Selection
+  // is keyed by (provider, repository, external_id) — never an internal
+  // AFK Run ID (PRD story 14).
+  let afkCrData = null;
+  let afkCrFetchError = null;
+  let afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+  let selectedChangeRequest = null;
+  // Change-request list pagination state: the current page (1-indexed) and
+  // the page size (AFK_CR_LIMIT).  The page is read from the URL
+  // (?limit / ?offset) on dashboard load and translated to the summary
+  // contract's limit/offset at request time — offset = (page - 1) * limit.
+  let afkCrPage = 1;
+  let afkCrPageSize = AFK_CR_LIMIT;
+
+  // The #612 adapter/formatter module loads before app.js in index.html and
+  // exposes itself on window.ChangeRequestAdapters.  Captured once at load
+  // time; absent in environments that don't load the module (guarded at
+  // every call site so nothing crashes at IIFE evaluation).
+  var ChangeRequestAdapters = (typeof window !== 'undefined' && window.ChangeRequestAdapters) || null;
   // Agent Runs pagination state (issue #426): the current page and page
   // size, read from the URL (?page / ?page_size) on dashboard load and
   // translated to the existing agent-runs API's limit/offset at request
@@ -181,6 +221,7 @@
     'afk-repos':     ['afkRuns'],
     'afk-change-requests': ['afkRuns'],
     'unresolved-relationships': ['afkRuns'],
+    'afk-cr-list':   ['afkChangeRequests'], // primary change-request view (issue #613)
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -1520,6 +1561,20 @@
     }
   }
 
+  /** Re-sync the change-request list page after a Back/Forward navigation
+   *  (popstate).  Reads ?limit / ?offset from the URL and, when the page
+   *  changed, re-fetches through the shared fetch path so the address bar,
+   *  visible rows, and in-memory state stay consistent.  The URL read
+   *  itself never pushes history, so this cannot add entries or loop. */
+  function handleChangeRequestPopstate() {
+    var prevPage = afkCrPage;
+    var prevSize = afkCrPageSize;
+    readChangeRequestPaginationFromUrl();
+    if (afkCrPage !== prevPage || afkCrPageSize !== prevSize) {
+      fetchChangeRequestsAndRender();
+    }
+  }
+
   /** Build the agent runs URL from current filter state.
    *  Issue #412: when the user has NOT explicitly set From/To filter dates,
    *  from_date/to_date fall back to the shared dashboard date range
@@ -1586,7 +1641,7 @@
       // Sessions + Agent Runs view (issue #402): the merged table is driven
       // by the agent-runs endpoint (a superset), and the Sessions KPI reads
       // the aggregates total row's session_count.
-      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns] =
+      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns, afkChangeRequests] =
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
@@ -1603,6 +1658,19 @@
           // Outcomes tab.  List-only; the full chain is fetched on demand by
           // openAfkRunDetail (GET /api/v1/afk-outcomes/runs/{afk_run_id}).
           apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
+          // Change-request summary list (issue #613): the primary AFK
+          // Outcomes view — one row per provider/repository/change-request
+          // identity from GET /api/v1/afk-outcomes/change-requests, scoped
+          // by the active filters and the shared dashboard date range.
+          // The current page offset is carried through so auto-refresh never
+          // silently resets the list to page 1 (issue #617 review finding).
+          // The limit (page size) comes from the same pagination state as the
+          // offset — afkCrPageSize, not the hardcoded AFK_CR_LIMIT — so a
+          // deep link such as ?limit=50&offset=50 keeps limit=50 on refresh
+          // instead of reverting to limit=100 while offset stays at 50
+          // (issue #617 pagination page-size consistency bug).
+          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize,
+            (afkCrPage - 1) * afkCrPageSize)),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
@@ -1614,6 +1682,8 @@
       results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
       results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
       results.afkRuns   = afkRuns.status   === 'fulfilled' ? afkRuns.value   : null;
+      results.afkChangeRequests = afkChangeRequests.status === 'fulfilled' ? afkChangeRequests.value : null;
+      afkCrData = results.afkChangeRequests; // latest change-request summary response (issue #613)
 
       // Track per-endpoint errors
       fetchErrors = {};
@@ -1626,6 +1696,7 @@
       fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
       if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
       afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
+      afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
 
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
@@ -3033,6 +3104,642 @@
     openAgentRunDetail(sessionId);
   }
 
+  // ── Change Request list view (issue #613) ───────────────────────────────
+  // The primary AFK Outcomes presentation: one row per change request
+  // (provider + repository + PR/MR number) served by the Gateway-owned
+  // summary contract (GET /api/v1/afk-outcomes/change-requests).  Data
+  // composition happens in the #612 adapters; this layer only builds the
+  // request URL, renders rows, and opens the identity-keyed detail flow.
+  // Ordering, aggregation, and unlinked-execution exclusion belong to the
+  // query layer — the browser never re-sorts or re-aggregates rows.
+
+  /** Build the change-request summary list URL from the active filters and
+   *  the shared dashboard date range (activity window).  Filter names use
+   *  the #610 query contract exactly (provider / repository /
+   *  provider_state / automation_state); the shared date range feeds
+   *  activity_from/activity_to — no second date picker (PRD).  Pure — no
+   *  DOM or fetch access.
+   *  @param {Object|null} filters - {provider, repository, providerState,
+   *                                 automationState}; empty values omitted
+   *  @param {Object|null} dateRangeState - the shared dashboard date range
+   *  @param {number} [limit] - page size (default AFK_CR_LIMIT)
+   *  @param {number} [offset] - page offset (default 0)
+   *  @returns {string} the API path with query string */
+  function buildChangeRequestListUrl(filters, dateRangeState, limit, offset) {
+    var f = filters || {};
+    var params = [];
+    if (f.provider) params.push('provider=' + encodeURIComponent(f.provider));
+    if (f.repository) params.push('repository=' + encodeURIComponent(f.repository));
+    if (f.providerState) params.push('provider_state=' + encodeURIComponent(f.providerState));
+    if (f.automationState) params.push('automation_state=' + encodeURIComponent(f.automationState));
+    var range = resolveDateRange(dateRangeState || { preset: 'this-month' });
+    if (range && range.startDate && !isNaN(range.startDate.getTime())) {
+      params.push('activity_from=' + encodeURIComponent(range.startDate.toISOString()));
+    }
+    if (range && range.endDate && !isNaN(range.endDate.getTime())) {
+      params.push('activity_to=' + encodeURIComponent(range.endDate.toISOString()));
+    }
+    params.push('limit=' + (limit != null ? limit : AFK_CR_LIMIT));
+    // Always emit offset when it is a valid non-negative number (0 included)
+    // so the URL mirrors the server-side page (offset = (page-1) * limit),
+    // matching the agent-runs builder's always-emit convention.
+    if (typeof offset === 'number' && offset >= 0 && Number.isInteger(offset)) {
+      params.push('offset=' + offset);
+    }
+    return '/api/v1/afk-outcomes/change-requests' + (params.length ? '?' + params.join('&') : '');
+  }
+
+  /** Parse change-request list pagination from a URL query string.
+   *  Reads `limit` (page size) and `offset` (zero-based row offset); the
+   *  current page is derived as floor(offset / limit) + 1.  Missing or
+   *  malformed values fall back to the defaults: page 1 of AFK_CR_LIMIT
+   *  (100) rows.  Pure — no DOM, location, or fetch access. */
+  function parseChangeRequestPagination(queryString) {
+    var page = 1;
+    var pageSize = AFK_CR_LIMIT;
+    var params = new URLSearchParams(queryString || '');
+    var rawLimit = params.get('limit');
+    var rawOffset = params.get('offset');
+    var nLimit = Number(rawLimit);
+    var nOffset = Number(rawOffset);
+    if (rawLimit !== null && Number.isInteger(nLimit) && nLimit >= 1) {
+      pageSize = nLimit;
+    }
+    if (rawOffset !== null && Number.isInteger(nOffset) && nOffset >= 0) {
+      page = Math.floor(nOffset / pageSize) + 1;
+    }
+    return { page: page, pageSize: pageSize };
+  }
+
+  /** Read `limit`/`offset` from the current URL into the change-request
+   *  pagination closure state.  Called on dashboard load so a deep link
+   *  such as ?limit=100&offset=100 loads the corresponding change-request
+   *  page; the translation happens in fetchChangeRequestsAndRender on the
+   *  next fetch. */
+  function readChangeRequestPaginationFromUrl() {
+    var query = (typeof location !== 'undefined' && location.search) || '';
+    var pagination = parseChangeRequestPagination(query);
+    afkCrPage = pagination.page;
+    afkCrPageSize = pagination.pageSize;
+  }
+
+  /** Build the dashboard URL carrying the given change-request pagination
+   *  state, keeping any other query parameters already present in the URL. */
+  function changeRequestsUrlWithPagination(page, pageSize) {
+    var params = new URLSearchParams(
+      (typeof location !== 'undefined' && location.search) || '');
+    params.set('limit', String(pageSize));
+    params.set('offset', String((page - 1) * pageSize));
+    var path = (typeof location !== 'undefined' && location.pathname) || '';
+    return path + '?' + params.toString();
+  }
+
+  /** Set the change-request list page and persist it in the URL via browser
+   *  history.  Invalid page values fall back to page 1.  The URL update
+   *  itself never changes rows — rows only change through the normal fetch
+   *  path (buildChangeRequestListUrl → fetchChangeRequestsAndRender). */
+  function setChangeRequestPage(page) {
+    var parsed = parseChangeRequestPagination(
+      'limit=' + afkCrPageSize + '&offset=' + ((page - 1) * afkCrPageSize));
+    afkCrPage = parsed.page;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.pushState === 'function') {
+      history.pushState({}, '', url);
+    }
+  }
+
+  /** Compute the nearest valid change-request page for a fetched result
+   *  total.  When the result set shrinks — change requests deleted, or the
+   *  list narrowed elsewhere — the currently selected page may exceed the
+   *  new page count; the UI must land on the nearest valid page instead of
+   *  rendering an empty offset.  An empty result (total=0) resolves to
+   *  page 1.  Pure — no DOM, location, or fetch access. */
+  function nearestValidChangeRequestPage(total, currentPage, pageSize) {
+    var pageCount = Math.ceil(total / pageSize);
+    var current = Math.max(currentPage, 1);
+    return Math.min(current, Math.max(1, pageCount));
+  }
+
+  /** Correct the change-request page state after a fetch when the result
+   *  total no longer covers the current page.  When the fetched total
+   *  implies fewer pages than the current page, the closure page state
+   *  moves to the nearest valid page and the URL is REPLACED
+   *  (history.replaceState) so the fallback does not add a browser-history
+   *  entry.  The caller then refetches the corrected page through the
+   *  normal fetch path — this hook only fixes state + URL.  Returns true
+   *  when a fallback was applied, false otherwise (no data, a still-valid
+   *  page, or an empty result already on page 1 — so a refetch can never
+   *  loop). */
+  function applyChangeRequestPageFallback(data) {
+    if (!data) return false;
+    var total = (typeof data.total === 'number')
+      ? data.total
+      : (data.items ? data.items.length : 0);
+    var nearest = nearestValidChangeRequestPage(total, afkCrPage, afkCrPageSize);
+    if (nearest === afkCrPage) return false;
+    afkCrPage = nearest;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
+    return true;
+  }
+
+  /** Build the provider-scoped change-request detail path (planned #611
+   *  contract): the identity tuple is the navigation key — never an
+   *  internal AFK Run ID (PRD story 14).  Pure — no DOM or fetch access.
+   *  @param {string|null} provider
+   *  @param {string|null} repository
+   *  @param {*} externalId
+   *  @returns {string} the API path */
+  function buildChangeRequestDetailPath(provider, repository, externalId) {
+    return '/api/v1/afk-outcomes/change-requests/' +
+      encodeURIComponent(provider || '') + '/' +
+      encodeURIComponent(repository || '') + '/' +
+      encodeURIComponent(externalId != null ? String(externalId) : '');
+  }
+
+  /** Compose the flat identity key of one change request (used for row
+   *  data-attributes and selection identity).  Pure. */
+  function changeRequestKey(provider, repository, externalId) {
+    return [provider || '', repository || '', externalId != null ? String(externalId) : ''].join('/');
+  }
+
+  /** Adapt a summary list response into stable view models through the #612
+   *  adapter module.  Returns [] when the module is absent (defensive — the
+   *  render layer then shows the empty state rather than crashing).
+   *  A field-vocabulary bridge normalizes the #610 contract's freshness
+   *  column name (`latest_linked_activity`) onto the adapter's expected
+   *  name (`latest_activity_at`), filling only when absent (non-erasing:
+   *  a present value always wins) — a pure alias, never a browser-side
+   *  join.
+   *  @param {Object|Array|null} data
+   *  @returns {Array} stable change-request view models */
+  function adaptChangeRequestSummaries(data) {
+    if (!(ChangeRequestAdapters && typeof ChangeRequestAdapters.adaptChangeRequestSummaryList === 'function')) {
+      return [];
+    }
+    var items = Array.isArray(data) ? data : ((data && data.items) || []);
+    var bridged = items.map(function (item) {
+      if (!item || item.latest_activity_at != null || item.latest_linked_activity == null) {
+        return item;
+      }
+      return Object.assign({}, item, { latest_activity_at: item.latest_linked_activity });
+    });
+    return ChangeRequestAdapters.adaptChangeRequestSummaryList(bridged);
+  }
+
+  /** Render one change-request summary row: provider, repository, PR/MR
+   *  identity, provider state, AFK automation state (dual statuses rendered
+   *  independently), total cost (USD or 'Cost unavailable'), and latest
+   *  linked activity.  Pure — returns an HTML string; every interpolated
+   *  value is escaped. */
+  function renderChangeRequestSummaryRow(view) {
+    var id = view.identity;
+    var crLabel = (id.external_id)
+      ? view.providerTerm + ' #' + id.external_id
+      : view.providerTerm + ' ' + (view.displayId !== '--' ? view.displayId : '--');
+    return '<tr class="afk-cr-list-row" tabindex="0" ' +
+        'data-provider="' + escHtml(id.provider) + '" ' +
+        'data-repository="' + escHtml(id.repository) + '" ' +
+        'data-external-id="' + escHtml(id.external_id) + '">' +
+      '<td data-label="Provider">' + badge(id.provider || '--', 'badge-provider').outerHTML + '</td>' +
+      '<td data-label="Repository">' + escHtml(id.repository || '--') + '</td>' +
+      '<td data-label="' + escHtml(view.providerTerm) + '">' + escHtml(crLabel) + '</td>' +
+      '<td data-label="Provider State">' +
+        badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</td>' +
+      '<td data-label="AFK Automation">' +
+        badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</td>' +
+      '<td data-label="Cost" class="afk-cr-cost-cell">' + escHtml(view.cost.label) + '</td>' +
+      '<td data-label="Latest Activity">' + fmtDT(view.latestActivityAt) + '</td>' +
+      '</tr>';
+  }
+
+  /** Render the primary change-request list: one row per change request in
+   *  the exact order the Gateway returned it (newest linked activity first —
+   *  the query layer's ordering policy).  Follows the shared panel
+   *  conventions: freshness guard, empty/error states, escHtml on every
+   *  interpolated value.  Rows open the identity-keyed detail flow. */
+  function renderChangeRequestSummaryTable(data) {
+    applyPanelFreshness('afk-cr-list');
+    if (!shouldRenderPanel(panelStates, 'afk-cr-list')) return; // failed fetch → keep previous rows
+    if (!els.afkCrListTbody) return;
+
+    var views = adaptChangeRequestSummaries(data);
+    if (views.length === 0) {
+      var errSuffix = afkCrFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkCrFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      els.afkCrListTbody.innerHTML =
+        '<tr><td colspan="7" class="empty-state">No change requests' + errSuffix + '</td></tr>';
+      return;
+    }
+
+    var html = views.map(renderChangeRequestSummaryRow).join('');
+    els.afkCrListTbody.innerHTML = html;
+
+    var rows = els.afkCrListTbody.querySelectorAll('.afk-cr-list-row');
+    rows.forEach(function (row) {
+      var provider = row.getAttribute('data-provider');
+      var repository = row.getAttribute('data-repository');
+      var externalId = row.getAttribute('data-external-id');
+      function activate() {
+        if (provider && repository && externalId) {
+          openChangeRequestDetail(provider, repository, externalId);
+        }
+      }
+      row.addEventListener('click', activate);
+      row.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          activate();
+        }
+      });
+    });
+  }
+
+  /** Read the change-request filter controls into the filter state shape.
+   *  Empty controls are omitted (the contract returns the unfiltered set). */
+  function readChangeRequestFiltersFromUI() {
+    var filters = {};
+    if (els.afkCrFilterProvider && els.afkCrFilterProvider.value) {
+      filters.provider = els.afkCrFilterProvider.value;
+    }
+    if (els.afkCrFilterRepository && els.afkCrFilterRepository.value) {
+      filters.repository = els.afkCrFilterRepository.value.trim();
+    }
+    if (els.afkCrFilterProviderState && els.afkCrFilterProviderState.value) {
+      filters.providerState = els.afkCrFilterProviderState.value;
+    }
+    if (els.afkCrFilterAutomationState && els.afkCrFilterAutomationState.value) {
+      filters.automationState = els.afkCrFilterAutomationState.value;
+    }
+    return filters;
+  }
+
+  /** Sync the filter controls to a filter state (used by Clear). */
+  function syncChangeRequestFilterUI(filters) {
+    var f = filters || {};
+    if (els.afkCrFilterProvider) els.afkCrFilterProvider.value = f.provider || '';
+    if (els.afkCrFilterRepository) els.afkCrFilterRepository.value = f.repository || '';
+    if (els.afkCrFilterProviderState) els.afkCrFilterProviderState.value = f.providerState || '';
+    if (els.afkCrFilterAutomationState) els.afkCrFilterAutomationState.value = f.automationState || '';
+  }
+
+  /** Apply the current filter controls and re-fetch the summary list through
+   *  the contract (filters ride the query — never client-side re-filtering).
+   *  A filter change re-scopes the result set, so pagination resets to
+   *  page 1 and the URL state is REPLACED rather than pushed. */
+  function applyChangeRequestFilters() {
+    afkCrFilters = readChangeRequestFiltersFromUI();
+    afkCrPage = 1;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
+    return fetchChangeRequestsAndRender();
+  }
+
+  /** Clear the change-request filters (back to the full list) and re-fetch.
+   *  Resets pagination to page 1 and replaces the URL state, mirroring
+   *  applyChangeRequestFilters. */
+  function clearChangeRequestFilters() {
+    afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+    syncChangeRequestFilterUI(afkCrFilters);
+    afkCrPage = 1;
+    var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
+    if (typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+      history.replaceState({}, '', url);
+    }
+    return fetchChangeRequestsAndRender();
+  }
+
+  /** Fetch the change-request summary page described by the current filter
+   *  state and re-render the table (issue #613).  Mirrors
+   *  fetchAgentRunsAndRender: an independent fetch keeps the panel's
+   *  freshness state, preserves the previous rows during loading and
+   *  failures, and never blocks the rest of the dashboard.  The fetch
+   *  carries the current pagination state — offset = (page - 1) * limit —
+   *  so paging, filtering, and the dashboard refresh all ride the same
+   *  path. */
+  function fetchChangeRequestsAndRender() {
+    var prev = panelStates['afk-cr-list'];
+    setPanelState('afk-cr-list', 'refreshing', prev ? prev.updatedAt : null);
+    var offset = (afkCrPage - 1) * afkCrPageSize;
+    var url = buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize, offset);
+    return apiFetch(url).then(function (data) {
+      afkCrData = data;
+      afkCrFetchError = null;
+      setPanelState('afk-cr-list', 'ok', Date.now());
+      // Issue #429 pattern: when the fetched total no longer covers the
+      // current page (the result set shrank), correct the page state + URL
+      // and re-fetch the nearest valid page through this same path.
+      if (applyChangeRequestPageFallback(data)) {
+        return fetchChangeRequestsAndRender();
+      }
+      renderChangeRequestSummaryTable(data);
+      renderChangeRequestPagination(data);
+    }).catch(function (e) {
+      afkCrFetchError = e.message || 'Change-request query failed';
+      var prevState = panelStates['afk-cr-list'];
+      setPanelState('afk-cr-list', 'stale', prevState ? prevState.updatedAt : null);
+      renderChangeRequestSummaryTable(null); // keeps previous rows; label shows "Showing previous data"
+      renderChangeRequestPagination(afkCrData); // keeps the last-known page info
+      console.error('Change-request list fetch error:', e);
+    });
+  }
+
+  /** Render the Change Request list pagination control block below the
+   *  panel: Previous / Next plus the numbered page items computed by
+   *  computePageItems from the API response `total` and the current page
+   *  size (AFK_CR_LIMIT).  Previous is disabled on page 1, Next on the
+   *  final page, and the current page carries aria-current="page".
+   *  Clicking a control persists the page via setChangeRequestPage and
+   *  re-fetches that server-side page through fetchChangeRequestsAndRender,
+   *  preserving active filters.  Change-request row content, columns,
+   *  ordering, and detail interactions are untouched — this block only
+   *  re-requests the same endpoint with a different offset. */
+  function renderChangeRequestPagination(data) {
+    if (!els.afkCrPagination) return;
+    // Failed fetch → keep the previous control state (mirrors the table's
+    // "keep previous rows" behavior via the same panel guard).
+    if (!shouldRenderPanel(panelStates, 'afk-cr-list')) return;
+
+    var total = (data && typeof data.total === 'number')
+      ? data.total
+      : (data && data.items ? data.items.length : 0);
+    var pageCount = Math.ceil(total / afkCrPageSize);
+    var items = computePageItems(afkCrPage, pageCount);
+    if (items.length === 0) {
+      els.afkCrPagination.innerHTML = '';
+      return;
+    }
+
+    var html = '';
+    var prevPage = afkCrPage - 1;
+    var nextPage = afkCrPage + 1;
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + prevPage + '"' +
+      (prevPage < 1 ? ' disabled' : '') + ' aria-label="Previous page">\u2190 Previous</button>';
+
+    items.forEach(function (item) {
+      if (item.type === 'ellipsis') {
+        html += '<span class="pagination-ellipsis" aria-hidden="true">\u2026</span>';
+        return;
+      }
+      var isCurrent = item.page === afkCrPage;
+      html += '<button type="button" class="filter-clear pagination-btn' +
+        (isCurrent ? ' pagination-current' : '') + '" data-page="' + item.page + '"' +
+        ' aria-label="' + (isCurrent ? 'Page ' + item.page + ', current page' : 'Page ' + item.page) + '"' +
+        (isCurrent ? ' aria-current="page"' : '') + '>' + item.page + '</button>';
+    });
+
+    html += '<button type="button" class="filter-clear pagination-btn" data-page="' + nextPage + '"' +
+      (nextPage > pageCount ? ' disabled' : '') + ' aria-label="Next page">Next \u2192</button>';
+
+    els.afkCrPagination.innerHTML = html;
+
+    // Wire the page controls: selecting a page updates the pagination
+    // state (setChangeRequestPage → URL history) and re-fetches that page
+    // via the shared path so the active filters ride along.
+    var buttons = els.afkCrPagination.querySelectorAll('button');
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return; // disabled buttons never fire in browsers; belt-and-braces
+        var page = Number(btn.getAttribute('data-page'));
+        // Clicking the already-current page is a no-op — no duplicate
+        // history entry, no redundant refetch.  The current page stays
+        // focusable (aria-current="page" + "current page" label unchanged).
+        if (!Number.isInteger(page) || page < 1 || page === afkCrPage) return;
+        setChangeRequestPage(page);
+        return fetchChangeRequestsAndRender();
+      });
+    });
+  }
+
+  /** Open the change-request detail overlay for one row, keyed by the
+   *  change-request identity tuple (never an internal AFK Run ID — PRD
+   *  story 14).  A 404 (unknown change request) renders a distinct
+   *  "not found" empty state; other failures render the generic error
+   *  state — no unhandled exception breaks the dashboard.  Returns the
+   *  fetch promise so tests can await it. */
+  function openChangeRequestDetail(provider, repository, externalId) {
+    selectedChangeRequest = {
+      provider: provider,
+      repository: repository,
+      externalId: String(externalId)
+    };
+    if (els.crListDetailOverlay) els.crListDetailOverlay.classList.add('visible');
+    if (els.crListDetailBody) els.crListDetailBody.innerHTML = '<p class="empty-state">Loading detail&hellip;</p>';
+    if (els.crListDetailTitle) els.crListDetailTitle.textContent = 'Change Request';
+
+    var path = buildChangeRequestDetailPath(provider, repository, externalId);
+    return apiFetch(path).then(function (detail) {
+      renderChangeRequestDetail(detail);
+    }).catch(function (e) {
+      var notFound = /404/.test(e && e.message);
+      if (els.crListDetailBody) {
+        els.crListDetailBody.innerHTML = '<p class="empty-state">' +
+          (notFound ? 'Change request not found' : 'Failed to load change-request detail: ' + escHtml(e.message)) +
+          '</p>';
+      }
+      console.error('Change-request detail fetch error:', e);
+    });
+  }
+
+  /** Render the change-request detail flow (issue #613): PR/MR identity and
+   *  dual statuses first, then the execution-focused summary (grouped by
+   *  purpose), linked sessions, and a collapsed activity timeline.  Consumes
+   *  the #612 detail adapter — the Gateway-owned composite payload, never
+   *  browser-side joins. */
+  function renderChangeRequestDetail(detail) {
+    if (!els.crListDetailBody) return;
+    var view = (ChangeRequestAdapters && typeof ChangeRequestAdapters.adaptChangeRequestDetail === 'function')
+      ? ChangeRequestAdapters.adaptChangeRequestDetail(detail)
+      : null;
+    if (!view) {
+      els.crListDetailBody.innerHTML = '<p class="empty-state">No change-request detail data available</p>';
+      return;
+    }
+    if (els.crListDetailTitle) {
+      els.crListDetailTitle.textContent = view.displayId || 'Change Request';
+    }
+    var html = '<div class="afk-cr-detail">' +
+      renderChangeRequestDetailHeader(view) +
+      renderChangeRequestExecutions(view) +
+      renderChangeRequestSessions(view) +
+      renderChangeRequestTimeline(view) +
+      '</div>';
+    els.crListDetailBody.innerHTML = html;
+    wireCrDetailSessionDrilldown();
+  }
+
+  /** Render the detail header: PR/MR identity, title, provider state and
+   *  AFK automation state as independent badges, and the aggregate cost.
+   *  Pure — returns an HTML string. */
+  function renderChangeRequestDetailHeader(view) {
+    var html = '<div class="afk-cr-detail-header">' +
+      '<div class="afk-cr-detail-head">' +
+        '<span class="afk-cr-detail-term">' + escHtml(view.providerTerm) + '</span>' +
+        '<span class="afk-cr-detail-id">' + escHtml(view.displayId) + '</span>' +
+        (view.title ? ' <span class="afk-cr-detail-title">' + escHtml(view.title) + '</span>' : '') +
+      '</div>' +
+      '<div class="afk-cr-detail-statuses">' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">Provider</span>' +
+          badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Automation</span>' +
+          badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">Total Cost</span>' +
+          '<span class="afk-cr-cost">' + escHtml(view.aggregateCost.label) + '</span></span>' +
+      '</div>' +
+      '</div>';
+    return html;
+  }
+
+  /** Render the execution-focused summary: implementation, review, and
+   *  retry executions grouped by purpose (distinct sections — PRD story
+   *  17), with an explicit "no linked executions" empty state.  Any
+   *  execution purpose outside the locked vocabulary is preserved under
+   *  "Other" rather than hidden.  Pure — returns an HTML string. */
+  function renderChangeRequestExecutions(view) {
+    var html = '<div class="afk-cr-section">' +
+      '<h3 class="afk-cr-section-title">Executions (' + fmtNum(view.executionCounts.total) + ')</h3>';
+    var groups = [
+      { key: 'implementation', label: 'Implementation' },
+      { key: 'review', label: 'Review' },
+      { key: 'retry', label: 'Retry' }
+    ];
+    var any = false;
+    groups.forEach(function (g) {
+      var execs = view.executions.filter(function (e) { return e.purpose.value === g.key; });
+      if (!execs.length) return;
+      any = true;
+      html += '<div class="afk-cr-exec-group"><h4 class="afk-cr-exec-group-title">' + escHtml(g.label) + '</h4>' +
+        execs.map(renderChangeRequestExecution).join('') + '</div>';
+    });
+    var rest = view.executions.filter(function (e) {
+      return groups.every(function (g) { return e.purpose.value !== g.key; });
+    });
+    if (rest.length) {
+      any = true;
+      html += '<div class="afk-cr-exec-group"><h4 class="afk-cr-exec-group-title">Other</h4>' +
+        rest.map(renderChangeRequestExecution).join('') + '</div>';
+    }
+    if (!any) html += '<div class="afk-empty">No linked executions</div>';
+    return html + '</div>';
+  }
+
+  /** Render one execution entry: AWX job id, purpose and status/outcome
+   *  badges, AWX job metadata (job template, trigger type, branch), linked
+   *  session, timestamps, duration, token usage (compact Token Breakdown
+   *  when telemetry exists), per-run cost, and the bounded failure summary
+   *  when present.  Pure — returns an HTML string. */
+  function renderChangeRequestExecution(execution) {
+    var tokens = execution.tokens || {};
+    var tokensAvailable = !!tokens && [tokens.inputTokens, tokens.outputTokens,
+      tokens.cacheReadTokens, tokens.cacheWriteTokens].some(function (t) {
+        return t != null && t !== '' && !isNaN(Number(t)) && Number(t) > 0;
+      });
+    var html = '<div class="afk-cr-execution">' +
+      '<div class="afk-cr-execution-head">' +
+        '<span class="afk-entity-id">' + escHtml(execution.awxJobId || '--') + '</span>' +
+        badge(execution.purpose.label, execution.purpose.badgeClass).outerHTML +
+        badge(execution.status.label, execution.status.badgeClass).outerHTML +
+        (execution.outcome && execution.outcome !== execution.status.value
+          ? badge(execution.outcome, afkRunStatusBadgeClass(execution.outcome)).outerHTML : '') +
+      '</div>' +
+      '<div class="afk-cr-execution-meta">' +
+        (execution.externalSessionId ? 'session: ' + escHtml(execution.externalSessionId) : '') +
+        (execution.jobTemplateId != null ? ' &middot; template: ' + escHtml(String(execution.jobTemplateId)) : '') +
+        (execution.triggerType ? ' &middot; trigger: ' + escHtml(execution.triggerType) : '') +
+        (execution.branch ? ' &middot; branch: ' + escHtml(execution.branch) : '') +
+        (execution.startedAt ? ' &middot; started ' + fmtDT(execution.startedAt) : '') +
+        (execution.finishedAt ? ' &middot; finished ' + fmtDT(execution.finishedAt) : '') +
+        ' &middot; duration: ' + escHtml(execution.duration) +
+        ' &middot; cost: ' + escHtml(execution.cost.label) +
+      '</div>';
+    if (tokensAvailable) {
+      html += '<div class="afk-tokens">' +
+        fmtTokenBreakdownCompact(tokens.inputTokens, tokens.outputTokens,
+          tokens.cacheReadTokens, tokens.cacheWriteTokens) +
+      '</div>';
+    }
+    if (execution.failureSummary) {
+      html += '<div class="afk-cr-execution-failure">' + escHtml(execution.failureSummary) + '</div>';
+    }
+    return html + '</div>';
+  }
+
+  /** Render the linked sessions (reusing the AFK chain session-link
+   *  renderer: compact Token Breakdown, inferred markers, and Agent Run
+   *  drill-down where a resolvable internal session id exists). */
+  function renderChangeRequestSessions(view) {
+    var sessions = view.sessions || [];
+    var html = '<div class="afk-cr-section">' +
+      '<h3 class="afk-cr-section-title">Sessions (' + fmtNum(sessions.length) + ')</h3>';
+    if (!sessions.length) {
+      html += '<div class="afk-empty">No sessions linked</div>';
+    } else {
+      html += sessions.map(renderAfkSessionLink).join('');
+    }
+    return html + '</div>';
+  }
+
+  /** Render the provenance/activity timeline, collapsed by default
+   *  (<details> without open — PRD story 24/25).  Timeline entries are
+   *  structured facts; every interpolated value is escaped. */
+  function renderChangeRequestTimeline(view) {
+    var timeline = view.timeline;
+    var html = '<div class="afk-cr-section">' +
+      '<details class="afk-cr-timeline">' +
+      '<summary class="afk-cr-timeline-summary">Activity timeline</summary>' +
+      '<div class="afk-cr-timeline-body">';
+    if (!timeline || !timeline.length) {
+      html += '<div class="afk-empty">No timeline data</div>';
+    } else {
+      timeline.forEach(function (item) {
+        html += '<div class="afk-cr-timeline-item">' +
+          '<span class="afk-cr-timeline-time">' +
+            fmtDT(item.occurred_at || item.timestamp || item.at) + '</span>' +
+          '<span class="afk-cr-timeline-type">' +
+            escHtml(item.event_type || item.type || 'event') + '</span>' +
+          '<span class="afk-cr-timeline-text">' +
+            escHtml(item.summary || item.description || '') + '</span>' +
+          '</div>';
+      });
+    }
+    return html + '</div></details></div>';
+  }
+
+  /** Wire the change-request detail session drill-down: a session with a
+   *  resolvable internal id opens the existing Agent Run detail experience
+   *  (closing the change-request overlay first, mirroring
+   *  openAfkSessionDrilldown). */
+  function wireCrDetailSessionDrilldown() {
+    if (!els.crListDetailBody) return;
+    var links = els.crListDetailBody.querySelectorAll('.afk-session-clickable');
+    links.forEach(function (item) {
+      item.addEventListener('click', function () {
+        var sid = item.getAttribute('data-session-id');
+        if (sid) openCrSessionDrilldown(sid);
+      });
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          var sid = item.getAttribute('data-session-id');
+          if (sid) openCrSessionDrilldown(sid);
+        }
+      });
+    });
+  }
+
+  /** Close the change-request detail overlay, then open the Agent Run
+   *  detail overlay for the given internal session id. */
+  function openCrSessionDrilldown(sessionId) {
+    if (els.crListDetailOverlay) els.crListDetailOverlay.classList.remove('visible');
+    openAgentRunDetail(sessionId);
+  }
+
   // Build a root-to-children tree from the flat session links. Child arrays
   // intentionally retain the session-object contract used by the API/tests.
   function buildSessionTree(sessions) {
@@ -3496,7 +4203,7 @@
    *  A failed panel keeps its previous updatedAt (data on screen is the
    *  previous successful render); a successful one records the cycle time. */
   function resolvePanelStatesAfterFetch() {
-    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError });
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError, afkChangeRequests: afkCrFetchError });
     var statuses = resolvePanelStatuses(errors);
     var nowMs = Date.now();
     Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
@@ -3548,7 +4255,9 @@
         renderAgentRunPagination(data.agentRuns); // pagination control below the panel (issue #427)
       }
       renderClientProjectBreakdown(data);
-      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453)
+      renderChangeRequestSummaryTable(data.afkChangeRequests); // Change Request list (issue #613) — primary view
+      renderChangeRequestPagination(data.afkChangeRequests); // pagination control below the panel
+      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453) — secondary run-centric view
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
@@ -3891,6 +4600,55 @@
         renderChangeRequestList(afkRunsData);
       });
     }
+
+    // Change Request list (issue #613): filter bar (selects apply on change,
+    // repository text input on Enter, plus explicit Apply/Clear buttons) and
+    // the identity-keyed detail overlay (close button, backdrop, ESC) —
+    // mirroring the existing overlay wiring.
+    var crFilterApply = $('afk-cr-filter-apply');
+    if (crFilterApply) {
+      crFilterApply.addEventListener('click', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterClear = $('afk-cr-filter-clear');
+    if (crFilterClear) {
+      crFilterClear.addEventListener('click', function () { clearChangeRequestFilters(); });
+    }
+    var crFilterProvider = $('afk-cr-filter-provider');
+    if (crFilterProvider) {
+      crFilterProvider.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterProviderState = $('afk-cr-filter-provider-state');
+    if (crFilterProviderState) {
+      crFilterProviderState.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterAutomationState = $('afk-cr-filter-automation-state');
+    if (crFilterAutomationState) {
+      crFilterAutomationState.addEventListener('change', function () { applyChangeRequestFilters(); });
+    }
+    var crFilterRepository = $('afk-cr-filter-repository');
+    if (crFilterRepository) {
+      crFilterRepository.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') applyChangeRequestFilters();
+      });
+    }
+    if (els.crListDetailClose) {
+      els.crListDetailClose.addEventListener('click', function () {
+        els.crListDetailOverlay.classList.remove('visible');
+      });
+    }
+    if (els.crListDetailOverlay) {
+      els.crListDetailOverlay.addEventListener('click', function (e) {
+        if (e.target === els.crListDetailOverlay) {
+          els.crListDetailOverlay.classList.remove('visible');
+        }
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' &&
+          els.crListDetailOverlay && els.crListDetailOverlay.classList.contains('visible')) {
+        els.crListDetailOverlay.classList.remove('visible');
+      }
+    });
   }
 
   // ── Transcript view (issue #469) ───────────────────────────────────────
@@ -4330,12 +5088,17 @@
     // fetch so a deep link such as ?page=2&page_size=100 loads the
     // corresponding Agent Runs page on dashboard load.
     readAgentRunPaginationFromUrl();
+    // Change Request list: read ?limit / ?offset from the URL before the
+    // initial fetch so a deep link such as ?limit=100&offset=100 loads the
+    // corresponding change-request page on dashboard load.
+    readChangeRequestPaginationFromUrl();
     // PR #431 review (finding 4): keep Back/Forward navigation in sync with
     // the in-memory page state.  Guarded so non-browser environments (the
     // Node sandbox, which never calls startAutoRefresh) can't crash on a
     // missing window.addEventListener.
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('popstate', handleAgentRunPopstate);
+      window.addEventListener('popstate', handleChangeRequestPopstate);
     }
     refreshDashboard(); // initial load
     refreshTimer = setInterval(refreshDashboard, REFRESH_INTERVAL_MS);
@@ -4376,6 +5139,10 @@
   window.syncArDateFilterUI = syncArDateFilterUI;
   window.clearArDateFilters = clearArDateFilters;
   window.setupAgentRunEventHandlers = setupAgentRunEventHandlers;
+  // AFK Outcomes (issue #613/#614): the change-request detail overlay wiring
+  // (close button, backdrop, ESC) as a test seam — mirrors the
+  // setupAgentRunEventHandlers export used by the Node harness.
+  window.setupAfkOutcomesEventHandlers = setupAfkOutcomesEventHandlers;
   // Agent Runs URL builder + state hooks (issue #412): buildAgentRunsUrl
   // derives from_date/to_date from the closure state (agentRunFilters,
   // dateRangeState), so the node harness gets the builder itself plus
@@ -4450,6 +5217,43 @@
   window.renderChangeRequestList = renderChangeRequestList;
   window.selectRepository = selectRepository;
   window.clearSelectedRepo = clearSelectedRepo;
+  // Change Request list (issue #613): the URL builders, filter state hooks,
+  // render functions, and the identity-keyed selection/detail flow — the
+  // pure helpers (URL builders, row/detail renderers) plus the fetch-driven
+  // paths (apply/clear filters, open detail) exercised by the Node harness.
+  window.buildChangeRequestListUrl = buildChangeRequestListUrl;
+  window.buildChangeRequestDetailPath = buildChangeRequestDetailPath;
+  window.changeRequestKey = changeRequestKey;
+  window.renderChangeRequestSummaryRow = renderChangeRequestSummaryRow;
+  window.renderChangeRequestSummaryTable = renderChangeRequestSummaryTable;
+  window.readChangeRequestFiltersFromUI = readChangeRequestFiltersFromUI;
+  window.syncChangeRequestFilterUI = syncChangeRequestFilterUI;
+  window.applyChangeRequestFilters = applyChangeRequestFilters;
+  window.clearChangeRequestFilters = clearChangeRequestFilters;
+  window.fetchChangeRequestsAndRender = fetchChangeRequestsAndRender;
+  // Change Request list pagination (mirrors the Agent Runs pagination test
+  // seam): the pure URL-param parser, the on-load URL reader, the page-set
+  // history hook, the nearest-valid-page calculator, the page-fallback
+  // hook, and the control renderer.
+  window.parseChangeRequestPagination = parseChangeRequestPagination;
+  window.readChangeRequestPaginationFromUrl = readChangeRequestPaginationFromUrl;
+  window.setChangeRequestPage = setChangeRequestPage;
+  window.changeRequestsUrlWithPagination = changeRequestsUrlWithPagination;
+  window.nearestValidChangeRequestPage = nearestValidChangeRequestPage;
+  window.applyChangeRequestPageFallback = applyChangeRequestPageFallback;
+  window.renderChangeRequestPagination = renderChangeRequestPagination;
+  window.handleChangeRequestPopstate = handleChangeRequestPopstate;
+  window.openChangeRequestDetail = openChangeRequestDetail;
+  window.renderChangeRequestDetail = renderChangeRequestDetail;
+  window.renderChangeRequestExecution = renderChangeRequestExecution;
+  window.setChangeRequestFilters = function (filters) { afkCrFilters = filters || {}; };
+  window.setSelectedChangeRequest = function (cr) { selectedChangeRequest = cr; };
+  window.getSelectedChangeRequest = function () { return selectedChangeRequest; };
+  // Dashboard refresh path (issue #617): fetchAll is the data-fetch core of
+  // refreshDashboard() — the parallel fetch cycle that builds the
+  // change-request summary URL.  Exposed so the Node harness can drive the
+  // exact refresh URL-building path and pin the pagination consistency.
+  window.fetchAll = fetchAll;
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;
