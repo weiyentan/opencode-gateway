@@ -803,5 +803,63 @@ test('pagination: filter apply resets to page 1 and replaces URL state', functio
 });
 
 // ═════════════════════════════════════════════════════════════════════════
+// Dashboard refresh — page-size consistency (issue #617)
+// The dashboard refresh data path (fetchAll, the fetch core of
+// refreshDashboard) builds the change-request list URL from the CURRENT
+// pagination state — page size afkCrPageSize, offset (page - 1) * size — so
+// a deep link like ?limit=50&offset=50 survives an auto-refresh instead of
+// silently reverting to the hardcoded AFK_CR_LIMIT (100).  Before the fix
+// the refresh used AFK_CR_LIMIT as the limit but afkCrPageSize for the
+// offset, so a non-default page size produced a mismatched limit/offset
+// pair (e.g. limit=100&offset=50) on every refresh cycle.
+// ═════════════════════════════════════════════════════════════════════════
+
+test('dashboard refresh: non-default page size preserved on refresh (issue #617)', function () {
+  if (typeof W.fetchAll !== 'function') {
+    assert(false, 'app.js: fetchAll exposed on the window test seam');
+    return;
+  }
+  // URL state: page 2 of 50 rows (?limit=50&offset=50).
+  main.sandbox.location.search = '?limit=50&offset=50';
+  W.readChangeRequestPaginationFromUrl();
+  var crUrl = null;
+  fetchImpl = function (url) {
+    if (String(url).indexOf('/api/v1/afk-outcomes/change-requests') === 0) {
+      crUrl = url;
+    }
+    return okJson({ status: 'ok', data: { items: [], total: 0, limit: 50, offset: 50 } });
+  };
+  return W.fetchAll().then(function () {
+    assert(crUrl !== null, 'dashboard refresh: change-request summary fetched in the refresh cycle');
+    assertContains(crUrl, 'limit=50&offset=50',
+      'dashboard refresh: page size 50 carried as limit=50&offset=50');
+    assertNotContains(crUrl, 'limit=100&offset=50',
+      'dashboard refresh: refresh never falls back to the hardcoded AFK_CR_LIMIT (100)');
+  });
+});
+
+test('dashboard refresh: deep page with non-default page size preserved on refresh (issue #617)', function () {
+  if (typeof W.fetchAll !== 'function') {
+    assert(false, 'app.js: fetchAll exposed on the window test seam');
+    return;
+  }
+  // URL state: page 3 of 25 rows (?limit=25&offset=50 → floor(50/25)+1 = 3).
+  main.sandbox.location.search = '?limit=25&offset=50';
+  W.readChangeRequestPaginationFromUrl();
+  var crUrl = null;
+  fetchImpl = function (url) {
+    if (String(url).indexOf('/api/v1/afk-outcomes/change-requests') === 0) {
+      crUrl = url;
+    }
+    return okJson({ status: 'ok', data: { items: [], total: 0, limit: 25, offset: 50 } });
+  };
+  return W.fetchAll().then(function () {
+    assert(crUrl !== null, 'dashboard refresh: change-request summary fetched in the refresh cycle');
+    assertContains(crUrl, 'limit=25&offset=50',
+      'dashboard refresh: deep-page size 25 carried as limit=25&offset=50');
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
 
 runTests();

@@ -1664,7 +1664,12 @@
           // by the active filters and the shared dashboard date range.
           // The current page offset is carried through so auto-refresh never
           // silently resets the list to page 1 (issue #617 review finding).
-          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, AFK_CR_LIMIT,
+          // The limit (page size) comes from the same pagination state as the
+          // offset — afkCrPageSize, not the hardcoded AFK_CR_LIMIT — so a
+          // deep link such as ?limit=50&offset=50 keeps limit=50 on refresh
+          // instead of reverting to limit=100 while offset stays at 50
+          // (issue #617 pagination page-size consistency bug).
+          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize,
             (afkCrPage - 1) * afkCrPageSize)),
         ]);
 
@@ -5244,6 +5249,11 @@
   window.setChangeRequestFilters = function (filters) { afkCrFilters = filters || {}; };
   window.setSelectedChangeRequest = function (cr) { selectedChangeRequest = cr; };
   window.getSelectedChangeRequest = function () { return selectedChangeRequest; };
+  // Dashboard refresh path (issue #617): fetchAll is the data-fetch core of
+  // refreshDashboard() — the parallel fetch cycle that builds the
+  // change-request summary URL.  Exposed so the Node harness can drive the
+  // exact refresh URL-building path and pin the pagination consistency.
+  window.fetchAll = fetchAll;
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;
