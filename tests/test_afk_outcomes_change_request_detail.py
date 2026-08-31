@@ -785,8 +785,24 @@ class TestChangeRequestDetailQueries:
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
 
         sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
-        assert "SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd" in sql
-        assert "COALESCE(SUM(s.total_estimated_cost_usd)" not in sql
+        # Missing cost telemetry must surface as SQL NULL (unavailable), so the
+        # mapper yields None — the cost column derives from the deduplicated
+        # ``session_cost`` aggregate, never wrapped in a COALESCE that would
+        # rewrite missing telemetry to 0.
+        assert "total_estimated_cost_usd" in sql
+        assert "COALESCE(SUM(" not in sql
+        assert "COALESCE(s.total_estimated_cost_usd" not in sql
+
+    def test_cost_deduplicates_sessions_across_runs(self):
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+        # The same session linked to several AFK runs for one change request
+        # (retries) must contribute its cost once — dedupe by internal session
+        # UUID (``afk_run_sessions.session_id``) before SUMming.
+        assert "SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd" not in sql
+        assert "DISTINCT" in sql
+        assert "session_id" in sql
 
     def test_timeline_ordered_by_occurrence_time(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_TIMELINE_SQL

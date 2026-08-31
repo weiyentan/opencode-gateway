@@ -583,9 +583,11 @@ async def _fetch_correlations(
 # observed facts only, never a provider API claim), with the historical
 # ``merged > closed > open`` precedence retained only as the deterministic
 # tie-breaker for equal ``occurred_at`` timestamps; automation state mirrors
-# ``resolve_afk_run_status``'s success-aware precedence; cost is a plain SUM
-# that stays NULL when no linked session carries cost telemetry (unavailable,
-# never zero).
+# ``resolve_afk_run_status``'s success-aware precedence; cost is summed
+# over **deduplicated** linked sessions (one internal session UUID per
+# change-request identity — a retry that reuses the same session across
+# runs must never double-count) and stays NULL when no linked session
+# carries cost telemetry (unavailable, never zero).
 
 #: Provider lifecycle fact types that denote an open change request.
 _OPEN_EVENT_TYPES = (
@@ -637,7 +639,13 @@ _CHANGE_REQUEST_GROUPED_SQL = """
             COALESCE(ec.completed, 0) AS execution_completed,
             COALESCE(ec.failed, 0) AS execution_failed,
             COALESCE(ec.cancelled, 0) AS execution_cancelled,
-            SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd
+            (
+                SELECT ts.total_estimated_cost_usd
+                FROM session_cost ts
+                WHERE ts.provider = i.provider
+                  AND ts.repository = i.repository
+                  AND ts.external_id = i.external_id
+            ) AS total_estimated_cost_usd
         FROM identities i
         LEFT JOIN event_state es
             ON es.provider = i.provider
@@ -648,8 +656,6 @@ _CHANGE_REQUEST_GROUPED_SQL = """
            AND rr.repository = i.repository
            AND rr.external_id = i.external_id
         LEFT JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
-        LEFT JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
-        LEFT JOIN sessions s ON s.id = ars.session_id
         LEFT JOIN exec_counts ec
             ON ec.provider = i.provider
            AND ec.repository = i.repository
@@ -695,6 +701,20 @@ _CHANGE_REQUEST_CTES = """
         SELECT provider, repository, external_id, afk_run_id
         FROM afk_run_entities
         WHERE entity_type = 'change_request'
+    ),
+    session_cost AS (
+        SELECT sc.provider, sc.repository, sc.external_id,
+               SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
+        FROM (
+            SELECT DISTINCT rr.provider, rr.repository, rr.external_id,
+                            ars.session_id AS session_id
+            FROM run_refs rr
+            JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
+            JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+            WHERE ars.session_id IS NOT NULL
+        ) sc
+        LEFT JOIN sessions sess ON sess.id = sc.session_id
+        GROUP BY sc.provider, sc.repository, sc.external_id
     ),
     event_state AS (
         SELECT provider, repository, external_id,
@@ -856,8 +876,10 @@ async def _fetch_change_request_summaries(
 # Aggregation rules mirror the summary query: provider state prefers
 # ``merged`` over ``closed`` over ``open`` (observed facts only — never a
 # provider API claim); automation state mirrors ``resolve_afk_run_status``'s
-# success-aware precedence; cost is a plain SUM that stays NULL when no
-# linked session carries cost telemetry (unavailable, never zero).
+# success-aware precedence; cost is summed over deduplicated linked sessions
+# (one internal session UUID — a retry that reuses the same session across
+# runs must never double-count) and stays NULL when no linked session
+# carries cost telemetry (unavailable, never zero).
 #
 # Execution purpose is surfaced only when an explicit stored signal carries
 # it, with a fixed precedence:
@@ -968,6 +990,17 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
         WHERE r.title IS NOT NULL
         ORDER BY r.last_seen_at DESC, r.afk_run_id DESC
         LIMIT 1
+    ),
+    session_cost AS (
+        SELECT SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
+        FROM (
+            SELECT DISTINCT ars.session_id AS session_id
+            FROM run_ids ri
+            JOIN afk_runs r ON r.afk_run_id = ri.afk_run_id
+            JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+            WHERE ars.session_id IS NOT NULL
+        ) sc
+        LEFT JOIN sessions sess ON sess.id = sc.session_id
     )
     SELECT
         $1::text AS provider,
@@ -992,7 +1025,8 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
         COALESCE(MAX(ec.completed), 0) AS execution_completed,
         COALESCE(MAX(ec.failed), 0) AS execution_failed,
         COALESCE(MAX(ec.cancelled), 0) AS execution_cancelled,
-        SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd,
+        (SELECT total_estimated_cost_usd FROM session_cost)
+            AS total_estimated_cost_usd,
         MAX(es.merged_at) AS merged_at,
         MAX(es.latest_event_at) AS provider_state_observed_at,
         COALESCE(
@@ -1002,8 +1036,6 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
     FROM (VALUES (1)) AS seed(n)
     LEFT JOIN run_ids ri ON TRUE
     LEFT JOIN afk_runs r ON r.afk_run_id = ri.afk_run_id
-    LEFT JOIN afk_run_sessions ars ON ars.afk_run_id = ri.afk_run_id
-    LEFT JOIN sessions s ON s.id = ars.session_id
     CROSS JOIN event_state es
     CROSS JOIN exec_counts ec
     GROUP BY es.latest_merged_at, es.latest_closed_at, es.latest_opened_at,

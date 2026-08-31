@@ -1,6 +1,5 @@
 """Run the JS frontend tests via pytest."""
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest

@@ -449,10 +449,24 @@ class TestChangeRequestSummaryQueries:
         build = self._builder()
         _, data_sql, _ = build(None, None, None, None, None, None)
         # Missing cost telemetry must surface as SQL NULL (unavailable), so the
-        # mapper yields None — the cost column itself is a plain SUM, never
-        # wrapped in a COALESCE that would rewrite missing telemetry to 0.
-        assert "SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd" in data_sql
-        assert "COALESCE(SUM(s.total_estimated_cost_usd)" not in data_sql
+        # mapper yields None — the cost column derives from the deduplicated
+        # ``session_cost`` aggregate, never wrapped in a COALESCE that would
+        # rewrite missing telemetry to 0.
+        assert "total_estimated_cost_usd" in data_sql
+        assert "COALESCE(SUM(" not in data_sql
+        assert "COALESCE(s.total_estimated_cost_usd" not in data_sql
+
+    def test_cost_deduplicates_sessions_across_runs(self):
+        build = self._builder()
+        _, data_sql, _ = build(None, None, None, None, None, None)
+        # A session linked to multiple AFK runs for one change request (a
+        # retry reuses the same internal session UUID) must contribute its
+        # cost exactly once — the raw run→session join would double-count.
+        # The summary therefore deduplicates sessions by internal session
+        # UUID (``afk_run_sessions.session_id``) before SUMming cost.
+        assert "SUM(s.total_estimated_cost_usd) AS total_estimated_cost_usd" not in data_sql
+        assert "DISTINCT" in data_sql
+        assert "session_id" in data_sql
 
     def test_mapper_maps_row_columns(self):
         from app.api.afk_outcomes import _change_request_summary_row
