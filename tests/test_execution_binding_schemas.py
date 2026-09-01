@@ -30,8 +30,15 @@ from afk_outcomes.models import (
 )
 
 
+_AFK_RUN_ID = "01JZABCDEFGHJKLMNPQRSTVWXY"
+
+
 def _valid_request(**overrides) -> dict:
-    """A minimal valid write request (GitHub PR → change_request)."""
+    """A minimal valid write request (GitHub PR → change_request).
+
+    ``afk_run_id`` is required for every new binding (issue #626) so the
+    AWX job joins directly to its logical AFK Run.
+    """
     payload = {
         "awx_job": {"job_id": "awx-job-42", "job_template_id": 7},
         "external_session_id": "ses_abc123",
@@ -43,6 +50,7 @@ def _valid_request(**overrides) -> dict:
         },
         "outcome": "completed",
         "trigger_type": "manual",
+        "afk_run_id": _AFK_RUN_ID,
     }
     payload.update(overrides)
     return payload
@@ -515,14 +523,20 @@ class TestTwoPhaseCreateValidation:
         assert request.resource is None
 
     def test_running_requires_afk_run_id(self) -> None:
+        """Subsumed by the issue #626 blanket rule — running still rejected
+        without afk_run_id."""
+        payload = _valid_request(outcome="running")
+        del payload["afk_run_id"]
         with pytest.raises(ValidationError, match="afk_run_id"):
-            ExecutionBindingCreateRequest.model_validate(_valid_request(outcome="running"))
+            ExecutionBindingCreateRequest.model_validate(payload)
 
     def test_terminal_without_resource_requires_afk_run_id(self) -> None:
-        with pytest.raises(ValidationError, match="resource or afk_run_id"):
-            ExecutionBindingCreateRequest.model_validate(
-                _valid_request(outcome="failed", resource=None, external_session_id=None)
-            )
+        """Subsumed by the issue #626 blanket rule — a terminal binding
+        without a resource is rejected without afk_run_id."""
+        payload = _valid_request(outcome="failed", resource=None, external_session_id=None)
+        del payload["afk_run_id"]
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(payload)
 
     def test_failed_without_resource_or_session_with_run_validates(self) -> None:
         """Failed executions persist without a change request or session."""
@@ -594,6 +608,87 @@ class TestTwoPhaseCreateValidation:
             _valid_request(outcome="failed", failure_reason="boom")
         )
         assert request.failure_reason == "boom"
+
+
+# ---------------------------------------------------------------------------
+# afk_run_id required for new bindings (issue #626)
+# ---------------------------------------------------------------------------
+
+
+class TestAfkRunIdRequiredForNewBindings:
+    """Every new execution binding must carry ``afk_run_id`` (issue #626).
+
+    The AWX job must join directly to its logical AFK Run; the legacy
+    auto-provisioning path (POST without ``afk_run_id``) is closed.  This
+    applies uniformly to start-time provisioning (``running``) and to
+    direct terminal POSTs.  The terminal-update path (``PATCH``) is
+    unaffected — it transitions an existing row and never creates a
+    binding.  Legacy persisted rows remain readable with a null
+    ``afk_run_id`` (no historical backfill).
+    """
+
+    def test_valid_binding_with_afk_run_id_accepted(self) -> None:
+        """A valid binding carrying afk_run_id validates (accepted case)."""
+        request = ExecutionBindingCreateRequest.model_validate(_valid_request())
+        assert request.afk_run_id == _AFK_RUN_ID
+
+    def test_running_with_afk_run_id_accepted(self) -> None:
+        """Start-time provisioning with afk_run_id continues to validate."""
+        request = ExecutionBindingCreateRequest.model_validate(
+            _valid_request(
+                outcome="running",
+                external_session_id=None,
+                resource=None,
+                started_at="2026-08-21T01:02:03Z",
+            )
+        )
+        assert request.outcome is ExecutionOutcome.RUNNING
+        assert request.afk_run_id == _AFK_RUN_ID
+
+    def test_completed_without_afk_run_id_rejected(self) -> None:
+        """A terminal POST without afk_run_id is rejected (rejected case)."""
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(afk_run_id=None)
+            )
+
+    def test_failed_without_afk_run_id_rejected(self) -> None:
+        """A failed terminal POST without afk_run_id is rejected."""
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="failed", afk_run_id=None)
+            )
+
+    def test_cancelled_without_afk_run_id_rejected(self) -> None:
+        """A cancelled terminal POST without afk_run_id is rejected."""
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(outcome="cancelled", afk_run_id=None)
+            )
+
+    def test_omitted_afk_run_id_rejected(self) -> None:
+        """Omitting afk_run_id entirely is rejected — the legacy
+        auto-provisioning path is closed for new bindings."""
+        payload = _valid_request()
+        del payload["afk_run_id"]
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(payload)
+
+    def test_resource_without_afk_run_id_rejected(self) -> None:
+        """A resource-carrying terminal POST without afk_run_id is rejected
+        even though the legacy path would auto-provision from the PR/MR."""
+        with pytest.raises(ValidationError, match="afk_run_id"):
+            ExecutionBindingCreateRequest.model_validate(
+                _valid_request(afk_run_id=None)
+            )
+
+    def test_terminal_update_request_does_not_require_afk_run_id(self) -> None:
+        """PATCH transitions an existing row — afk_run_id is not part of its
+        contract (terminal path via PATCH stays legacy-compatible)."""
+        request = ExecutionBindingUpdateRequest.model_validate(
+            {"outcome": "completed"}
+        )
+        assert request.outcome is ExecutionOutcome.COMPLETED
 
 
 # ---------------------------------------------------------------------------

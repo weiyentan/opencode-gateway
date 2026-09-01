@@ -1,4 +1,4 @@
-"""Execution-binding and provisional AFK lifecycle REST API (issues #549, #589, #590).
+"""Execution-binding and provisional AFK lifecycle REST API (issues #549, #589, #590, #626).
 
 Execution-binding endpoints (``/api/v1/afk/executions``):
 
@@ -6,8 +6,12 @@ Execution-binding endpoints (``/api/v1/afk/executions``):
   Two-phase lifecycle (issue #590): ``outcome="running"`` provisions the
   execution at AWX start (attached to a pre-provisioned ``afk_run_id``,
   optional change request/session); terminal outcomes keep the legacy
-  final-callback flow.  Idempotent by AWX job identity; conflicting data
-  returns 409.
+  final-callback flow.  ``afk_run_id`` is required for every new binding
+  (issue #626) so the AWX job joins directly to its logical AFK Run — the
+  legacy auto-provisioning path is closed and a POST without
+  ``afk_run_id`` is rejected with 422.  Idempotent by AWX job identity;
+  conflicting data returns 409.  Legacy persisted rows without
+  ``afk_run_id`` remain readable (null on readback) with no backfill.
 - ``PATCH /executions/{awx_job_id}`` — transition the same row from
   ``running`` to a terminal outcome (``completed``/``failed``/``cancelled``).
   Idempotent identical replay returns 200; conflicting payloads return 409

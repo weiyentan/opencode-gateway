@@ -250,18 +250,17 @@ class ExecutionBindingCreateRequest(BaseModel):
             "backfill, or recovery"
         ),
     )
-    afk_run_id: str | None = Field(
-        default=None,
+    afk_run_id: str = Field(
         min_length=26,
         max_length=26,
         description=(
-            "Optional gateway-assigned AFK run ULID (26 chars), pre-provisioned "
-            "via POST /api/v1/afk/executions/runs.  When supplied, the binding "
-            "attaches to that lifecycle (validated against afk_runs — an "
-            "unknown run is rejected with 404) so many execution bindings can "
-            "reference one lifecycle; when omitted, the gateway provisions a "
-            "run for the binding (legacy behavior preserved).  Required when "
-            "outcome is 'running' or when no resource is supplied (issue #590)."
+            "Gateway-assigned AFK run ULID (26 chars), pre-provisioned "
+            "via POST /api/v1/afk/executions/runs.  Required for every "
+            "new binding (issue #626): the binding attaches to that "
+            "lifecycle (validated against afk_runs — an unknown run is "
+            "rejected with 404) so many execution bindings can reference "
+            "one lifecycle.  Legacy persisted rows without it remain "
+            "readable with a null afk_run_id."
         ),
     )
 
@@ -288,6 +287,29 @@ class ExecutionBindingCreateRequest(BaseModel):
         """Start-time provisioning must attach to a pre-provisioned lifecycle."""
         if self.outcome is ExecutionOutcome.RUNNING and self.afk_run_id is None:
             raise ValueError("afk_run_id is required when outcome is 'running'")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_afk_run_id_required_for_new_bindings(
+        self,
+    ) -> ExecutionBindingCreateRequest:
+        """Every new execution binding must carry ``afk_run_id`` (issue #626).
+
+        The AWX job must join directly to its logical AFK Run — the legacy
+        auto-provisioning path (POST without ``afk_run_id``, issue #595)
+        is closed for new bindings.  The rule applies uniformly to
+        start-time provisioning (``running``) and to direct terminal
+        POSTs, covering all outcomes.  Legacy persisted rows are
+        unaffected: reads return their null ``afk_run_id`` as-is and the
+        ``PATCH`` terminal-update path never re-validates the create
+        contract.
+        """
+        if self.afk_run_id is None:
+            raise ValueError(
+                "afk_run_id is required for new execution bindings; "
+                "pre-provision the lifecycle via POST "
+                "/api/v1/afk/executions/runs first"
+            )
         return self
 
     @model_validator(mode="after")
