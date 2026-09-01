@@ -148,6 +148,7 @@ class TestSchemaContract:
             resource=_resource(),
             outcome="completed",
             trigger_type="manual",
+            afk_run_id="01JZ0123456789ABCDEFGHJKMN",
         )
         assert req.normalized_session_ids() == ["ses_a", "ses_b"]
 
@@ -160,6 +161,7 @@ class TestSchemaContract:
             resource=_resource(),
             outcome="completed",
             trigger_type="manual",
+            afk_run_id="01JZ0123456789ABCDEFGHJKMN",
         )
         assert req.normalized_session_ids() == ["ses_legacy"]
 
@@ -176,6 +178,7 @@ class TestSchemaContract:
                 resource=_resource(),
                 outcome="completed",
                 trigger_type="manual",
+                afk_run_id="01JZ0123456789ABCDEFGHJKMN",
             )
 
     def test_empty_collection_rejected(self) -> None:
@@ -190,6 +193,7 @@ class TestSchemaContract:
                 resource=_resource(),
                 outcome="completed",
                 trigger_type="manual",
+                afk_run_id="01JZ0123456789ABCDEFGHJKMN",
             )
 
     def test_empty_string_entry_rejected(self) -> None:
@@ -204,6 +208,7 @@ class TestSchemaContract:
                 resource=_resource(),
                 outcome="completed",
                 trigger_type="manual",
+                afk_run_id="01JZ0123456789ABCDEFGHJKMN",
             )
 
     def test_duplicates_deduplicated_preserving_order(self) -> None:
@@ -215,6 +220,7 @@ class TestSchemaContract:
             resource=_resource(),
             outcome="completed",
             trigger_type="manual",
+            afk_run_id="01JZ0123456789ABCDEFGHJKMN",
         )
         assert req.normalized_session_ids() == ["ses_a", "ses_b", "ses_c"]
 
@@ -230,6 +236,7 @@ class TestSchemaContract:
                 resource=_resource(),
                 outcome="completed",
                 trigger_type="manual",
+                afk_run_id="01JZ0123456789ABCDEFGHJKMN",
             )
 
     def test_update_request_plural_accepted_and_singular_normalizes(self) -> None:
@@ -278,7 +285,19 @@ class TestPostSessionAttributionPersistence:
         conn = _mk_conn()
         saved_row = _mk_binding_row(awx_job_id=42)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row(  # run exists (change request matches the resource)
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -290,6 +309,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
@@ -310,7 +330,19 @@ class TestPostSessionAttributionPersistence:
         conn = _mk_conn()
         saved_row = _mk_binding_row(awx_job_id=43)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row(  # run exists (change request matches the resource)
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -322,6 +354,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
@@ -338,7 +371,19 @@ class TestPostSessionAttributionPersistence:
         conn = _mk_conn()
         saved_row = _mk_binding_row(awx_job_id=44)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row(  # run exists (change request matches the resource)
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -350,6 +395,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
@@ -410,6 +456,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 422
@@ -432,6 +479,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 422
@@ -446,10 +494,23 @@ class TestPostSessionAttributionPersistence:
         saved_row = _mk_binding_row(awx_job_id=48)
         internal_uuid = uuid.uuid4()
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding
+                mock_row(  # run exists (change request matches the resource)
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(
             side_effect=[
+                [],  # project completed-run status (no bindings yet)
                 [mock_row({"id": uuid.uuid4()})],  # binding RETURNING id
                 [mock_row({"id": internal_uuid})],  # resolve ses_a → 1 match
                 [],  # resolve ses_b → 0 matches
@@ -465,6 +526,7 @@ class TestPostSessionAttributionPersistence:
             "resource": _resource(),
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
         }
         resp = await client.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text

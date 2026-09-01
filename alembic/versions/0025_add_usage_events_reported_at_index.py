@@ -22,6 +22,8 @@ Revises:     0024
 Create Date: 2026-08-13
 """
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 
 from alembic import op

@@ -123,13 +123,28 @@ class TestPostPersistsAttributionCollection:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), None, None, _mk_saved_row(42)])
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row(
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                _mk_saved_row(42),
+            ]
+        )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
         payload = {
             "awx_job": {"job_id": "42", "job_template_id": 7},
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
             "external_session_ids": ["ses_a", "ses_b"],
             "resource": _resource(),
             "outcome": "completed",
@@ -149,13 +164,28 @@ class TestPostPersistsAttributionCollection:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), None, None, _mk_saved_row(43)])
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                mock_row(
+                    {
+                        "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                _mk_saved_row(43),
+            ]
+        )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
         payload = {
             "awx_job": {"job_id": "43", "job_template_id": 7},
+            "afk_run_id": "01JZ0123456789ABCDEFGHJKMN",
             "external_session_id": "ses_legacy",
             "resource": _resource(),
             "outcome": "completed",

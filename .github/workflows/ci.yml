@@ -55,6 +55,7 @@ jobs:
           pytest \
             tests/integration/test_afk_run_convergence.py \
             tests/integration/test_afk_outcomes_repository.py \
+            tests/integration/test_execution_cost_attribution.py \
             -v -m integration
 
       - name: Lint Python
