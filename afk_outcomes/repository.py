@@ -147,6 +147,29 @@ def _parse_awx_job_id(awx_job_id: str) -> int:
         raise ValueError(f"Invalid AWX job id: {awx_job_id!r}") from exc
 
 
+def _decode_session_ids(raw: object) -> list[str]:
+    """Decode the JSONB ``external_session_ids`` column value.
+
+    Accepts an already-decoded list or a JSON string (asyncpg returns JSONB
+    as ``str`` here), returning the deduplicated collection of non-empty
+    string session ids preserving first-occurrence order.  Anything else
+    (``None``, legacy rows before migration 0042, malformed payloads)
+    decodes to an empty collection.
+    """
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            return []
+    else:
+        decoded = raw
+    if not isinstance(decoded, list):
+        return []
+    return list(
+        dict.fromkeys(s for s in decoded if isinstance(s, str) and s)
+    )
+
+
 def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
     """Convert an ``execution_bindings`` row to an :class:`ExecutionBinding`.
 
@@ -174,19 +197,8 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
     # legacy rows without the column fall back to the singular nullable
     # column, normalized to a one-element collection.  A binding with no
     # resolved session reads back an empty collection.
-    raw_session_ids = row.get("external_session_ids_json")
-    if isinstance(raw_session_ids, str):
-        try:
-            decoded = json.loads(raw_session_ids)
-        except ValueError:
-            decoded = None
-    else:
-        decoded = raw_session_ids
-    if isinstance(decoded, list):
-        session_ids = [s for s in decoded if isinstance(s, str) and s]
-        # Deduplicate preserving first-occurrence order.
-        session_ids = list(dict.fromkeys(session_ids))
-    else:
+    session_ids = _decode_session_ids(row.get("external_session_ids_json"))
+    if not session_ids:
         singular = row["external_session_id"]
         session_ids = [singular] if singular else []
     primary_session = session_ids[0] if session_ids else None
@@ -2363,9 +2375,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                      repository_url, entity_type, entity_number, outcome,
                      source_event_id, branch, title, failure_reason,
                      failure_summary, started_at, finished_at, afk_run_id,
-                     trigger_type, created_at, updated_at)
+                     trigger_type, external_session_ids, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, now(), now())
+                        $13, $14, $15, $16, $17, $18, now(), now())
                 ON CONFLICT (awx_job_id) DO NOTHING
                 RETURNING id
                 """,
@@ -2388,6 +2400,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 finished_at,
                 run_id,
                 trigger_type,
+                # Normalized per-execution attribution (issue #628, extends
+                # #627): the JSONB collection column carries every attributed
+                # session id so execution cost subtotals can aggregate over
+                # the explicit associations.  NULL when there is none —
+                # legacy semantics preserved.
+                json.dumps(session_ids) if session_ids else None,
             )
 
             if binding_row:
@@ -2545,7 +2563,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 SELECT b.id, b.outcome, b.finished_at, b.failure_reason,
                        b.failure_summary, b.external_session_id, b.provider,
                        b.repository_url, b.entity_type, b.entity_number,
-                       b.afk_run_id
+                       b.afk_run_id,
+                       b.external_session_ids AS external_session_ids_json
                 FROM execution_bindings b
                 LEFT JOIN LATERAL (
                     SELECT r.afk_run_id
@@ -2734,6 +2753,21 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         binding_id=row["id"], is_conflict=True
                     )
 
+            # Per-execution attribution for the JSONB collection column
+            # (issue #628, extends #627): when the terminal update supplies
+            # a collection, merge it into the stored one (the enrich-only
+            # fill-in never erases stored attribution); otherwise keep the
+            # stored value untouched (NULL stays NULL for legacy rows).
+            stored_session_ids = _decode_session_ids(
+                row.get("external_session_ids_json")
+            )
+            if supplied_session_ids:
+                new_session_ids = list(
+                    dict.fromkeys([*stored_session_ids, *supplied_session_ids])
+                )
+            else:
+                new_session_ids = stored_session_ids
+
             await self._conn.execute(
                 """
                 UPDATE execution_bindings
@@ -2746,6 +2780,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     entity_type = $8,
                     entity_number = $9,
                     failure_summary = $10,
+                    external_session_ids = $11,
                     updated_at = now()
                 WHERE awx_job_id = $1
                 """,
@@ -2759,6 +2794,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_entity_type,
                 new_entity_number,
                 new_failure_summary,
+                json.dumps(new_session_ids) if new_session_ids else None,
             )
             # Persist the afk_run_sessions links in the same transaction when
             # the terminal binding carries an owning lifecycle and session

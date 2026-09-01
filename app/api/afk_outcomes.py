@@ -1102,15 +1102,115 @@ _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = f"""
                THEN 'review'
                ELSE NULL
            END AS purpose,
-           s.id AS session_id,
-           s.total_input_tokens,
-           s.total_output_tokens,
-           s.total_cache_read_tokens,
-           s.total_cache_write_tokens,
-           s.total_estimated_cost_usd AS estimated_cost_usd
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.primary_session_id
+               ELSE legacy.id
+           END AS session_id,
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.total_input_tokens
+               ELSE legacy.total_input_tokens
+           END AS total_input_tokens,
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.total_output_tokens
+               ELSE legacy.total_output_tokens
+           END AS total_output_tokens,
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.total_cache_read_tokens
+               ELSE legacy.total_cache_read_tokens
+           END AS total_cache_read_tokens,
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.total_cache_write_tokens
+               ELSE legacy.total_cache_write_tokens
+           END AS total_cache_write_tokens,
+           CASE
+               WHEN eb.external_session_ids IS NOT NULL
+               THEN agg.estimated_cost_usd
+               ELSE legacy.total_estimated_cost_usd
+           END AS estimated_cost_usd
     FROM matched_jobs m
     JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id
     LEFT JOIN afk_runs r ON r.afk_run_id = eb.afk_run_id
+    -- Explicit-attribution subtotal (issue #628): the AWX Execution Cost
+    -- aggregates the canonical ``sessions`` aggregates over every OpenCode
+    -- session explicitly attributed to this execution (the
+    -- ``external_session_ids`` JSONB column, migration 0042).  Each
+    -- attributed external session id must resolve to exactly one internal
+    -- session (the same fail-safe rule as the write path's session
+    -- resolver: zero matches or 2+ matches leave the identity unknown);
+    -- sessions are deduplicated by internal UUID before summing, and one
+    -- unknown session cost poisons the whole subtotal to NULL —
+    -- unavailable, never zero, never a partial amount.
+    LEFT JOIN LATERAL (
+        WITH attributed AS (
+            SELECT DISTINCT j.value AS external_session_id
+            FROM jsonb_array_elements_text(eb.external_session_ids) AS j(value)
+        ),
+        per_id AS (
+            SELECT a.external_session_id,
+                   COUNT(s.id) AS session_matches,
+                   MIN(s.id::text) AS session_id_text
+            FROM attributed a
+            LEFT JOIN sessions s
+              ON s.external_session_id = a.external_session_id
+            GROUP BY a.external_session_id
+        ),
+        resolved AS (
+            SELECT s.id AS session_id
+            FROM per_id p
+            JOIN sessions s
+              ON s.external_session_id = p.external_session_id
+             AND s.id::text = p.session_id_text
+            WHERE p.session_matches = 1
+        ),
+        unresolved AS (
+            SELECT COUNT(*) AS n
+            FROM per_id p
+            WHERE p.session_matches <> 1
+        ),
+        totals AS (
+            SELECT SUM(s.total_input_tokens) AS total_input_tokens,
+                   SUM(s.total_output_tokens) AS total_output_tokens,
+                   SUM(s.total_cache_read_tokens)
+                       AS total_cache_read_tokens,
+                   SUM(s.total_cache_write_tokens)
+                       AS total_cache_write_tokens,
+                   CASE
+                       WHEN BOOL_OR(s.total_estimated_cost_usd IS NULL)
+                       THEN NULL
+                       ELSE SUM(s.total_estimated_cost_usd)
+                   END AS estimated_cost_usd
+            FROM resolved rs
+            JOIN sessions s ON s.id = rs.session_id
+        )
+        SELECT
+            CASE WHEN u.n > 0 THEN NULL
+                 ELSE t.total_input_tokens END AS total_input_tokens,
+            CASE WHEN u.n > 0 THEN NULL
+                 ELSE t.total_output_tokens END AS total_output_tokens,
+            CASE WHEN u.n > 0 THEN NULL
+                 ELSE t.total_cache_read_tokens END AS total_cache_read_tokens,
+            CASE WHEN u.n > 0 THEN NULL
+                 ELSE t.total_cache_write_tokens END AS total_cache_write_tokens,
+            CASE WHEN u.n > 0 THEN NULL
+                 ELSE t.estimated_cost_usd END AS estimated_cost_usd,
+             (SELECT s.id
+              FROM per_id p
+              JOIN sessions s
+                ON s.external_session_id = p.external_session_id
+               AND s.id::text = p.session_id_text
+              WHERE p.external_session_id = eb.external_session_ids ->> 0
+                AND p.session_matches = 1) AS primary_session_id
+        FROM totals t
+        CROSS JOIN unresolved u
+    ) agg ON eb.external_session_ids IS NOT NULL
+    -- Legacy fallback (issue #628 compatibility path): pre-#627 bindings
+    -- carry no explicit attribution (JSONB NULL) and keep the historical
+    -- singular-session telemetry resolution unchanged.
     LEFT JOIN LATERAL (
         SELECT id, total_input_tokens, total_output_tokens,
                total_cache_read_tokens, total_cache_write_tokens,
@@ -1120,7 +1220,7 @@ _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = f"""
           AND eb.external_session_id IS NOT NULL
         ORDER BY sessions.first_message_at DESC
         LIMIT 1
-    ) s ON TRUE
+    ) legacy ON eb.external_session_ids IS NULL
     ORDER BY COALESCE(eb.started_at, eb.created_at) ASC, eb.awx_job_id ASC
 """
 
