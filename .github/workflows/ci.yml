@@ -66,3 +66,9 @@ jobs:
 
       - name: Test frontend pure functions
         run: node frontend/tests/test_pure_functions.js
+
+      - name: Test change-request adapters
+        run: node frontend/tests/test_change_request_adapters.js
+
+      - name: Test issue 614 change-request detail
+        run: node frontend/tests/issue_614_tests.js
