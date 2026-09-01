@@ -922,6 +922,39 @@ class TestChangeRequestDetailQueries:
         assert "UNION" in sql
         assert "JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id" in sql
 
+    def test_summary_exec_counts_uses_matched_jobs_cte(self):
+        """The summary exec_counts CTE counts from the shared matched_jobs
+        CTE (which resolves linked AFK runs) instead of directly from
+        execution_bindings with a change-request identity filter."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+        # The matched_jobs CTE is embedded in the summary SQL
+        assert "matched_jobs AS (" in sql
+        # exec_counts counts from matched_jobs joined to execution_bindings
+        assert "FROM matched_jobs m" in sql
+        assert "JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id" in sql
+
+    def test_summary_exec_counts_includes_direct_change_request_bindings(self):
+        """The matched_jobs CTE inside the summary SQL includes direct
+        change-request bindings alongside run-linked bindings."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+        assert "eb.entity_type = 'change_request'" in sql
+        assert "eb.provider = $1" in sql
+        assert "eb.repository_url = $2" in sql
+        assert "eb.entity_number = $3" in sql
+
+    def test_summary_exec_counts_deduplicates_by_awx_job_id(self):
+        """The matched_jobs CTE unions by awx_job_id so the same job
+        reachable through multiple paths is counted once."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
+        assert "UNION" in sql
+        assert "JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id" in sql
+
     def test_summary_state_precedence(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
 
