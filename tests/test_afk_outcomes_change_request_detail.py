@@ -750,6 +750,42 @@ class TestChangeRequestDetailQueries:
             "eb.awx_job_id ASC"
         ) in sql
 
+    def test_executions_resolve_linked_runs_via_run_sources_cte(self):
+        """Executions now resolve every linked AFK run through the shared
+        three-source run_sources CTE (change_request_binding, entity_link,
+        execution) and select bindings attached to those runs."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+        assert "WITH run_sources AS (" in sql
+        assert "'change_request_binding'" in sql
+        assert "'entity_link'" in sql
+        assert "'execution'" in sql
+        # The run-sources body is embedded (f-string interpolation), then the
+        # matched-job set joins bindings on the resolved run IDs.
+        assert "JOIN execution_bindings eb ON eb.afk_run_id = ri.afk_run_id" in sql
+
+    def test_executions_include_direct_change_request_bindings(self):
+        """Direct change-request bindings (even those not reachable through a
+        run linkage path) are included in the matched job set."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+        assert "eb.entity_type = 'change_request'" in sql
+        assert "eb.provider = $1" in sql
+        assert "eb.repository_url = $2" in sql
+        assert "eb.entity_number = $3" in sql
+
+    def test_executions_deduplicate_by_awx_job_id(self):
+        """The same AWX job reachable through several linkage paths appears
+        exactly once: the matched set unions by awx_job_id and the final join
+        back to execution_bindings is keyed on that unique job identity."""
+        from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+
+        sql = _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL
+        assert "UNION" in sql
+        assert "JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id" in sql
+
     def test_summary_state_precedence(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
 
