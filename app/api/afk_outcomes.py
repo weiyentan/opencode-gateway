@@ -943,6 +943,19 @@ _CHANGE_REQUEST_DETAIL_EXISTS_SQL = """
     )
 """
 
+_MATCHED_JOBS_BODY = """\
+        SELECT eb.awx_job_id
+        FROM run_ids ri
+        JOIN execution_bindings eb ON eb.afk_run_id = ri.afk_run_id
+        UNION
+        SELECT eb.awx_job_id
+        FROM execution_bindings eb
+        WHERE eb.entity_type = 'change_request'
+          AND eb.provider = $1
+          AND eb.repository_url = $2
+          AND eb.entity_number = $3\
+"""
+
 _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
     WITH run_sources AS (
 {_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
@@ -965,17 +978,19 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
         WHERE entity_type = 'change_request'
           AND provider = $1 AND repository = $2 AND external_id = $3
     ),
+    matched_jobs AS (
+{_MATCHED_JOBS_BODY}
+    ),
     exec_counts AS (
         SELECT
             COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE outcome = 'running') AS running,
-            COUNT(*) FILTER (WHERE outcome = 'completed') AS completed,
-            COUNT(*) FILTER (WHERE outcome = 'failed') AS failed,
-            COUNT(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
-            MAX(COALESCE(finished_at, started_at, created_at)) AS latest_exec_at
-        FROM execution_bindings
-        WHERE entity_type = 'change_request'
-          AND provider = $1 AND repository_url = $2 AND entity_number = $3
+            COUNT(*) FILTER (WHERE eb.outcome = 'running') AS running,
+            COUNT(*) FILTER (WHERE eb.outcome = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE eb.outcome = 'failed') AS failed,
+            COUNT(*) FILTER (WHERE eb.outcome = 'cancelled') AS cancelled,
+            MAX(COALESCE(eb.finished_at, eb.started_at, eb.created_at)) AS latest_exec_at
+        FROM matched_jobs m
+        JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id
     ),
     latest_binding_titles AS (
         SELECT title
@@ -1062,7 +1077,16 @@ _CHANGE_REQUEST_DETAIL_RUNS_SQL = f"""
     ORDER BY r.last_seen_at DESC NULLS LAST, r.afk_run_id ASC
 """
 
-_CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = """
+_CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = f"""
+    WITH run_sources AS (
+{_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
+    ),
+    run_ids AS (
+        SELECT afk_run_id FROM run_sources GROUP BY afk_run_id
+    ),
+    matched_jobs AS (
+{_MATCHED_JOBS_BODY}
+    )
     SELECT eb.awx_job_id, eb.job_template_id, eb.external_session_id,
            eb.afk_run_id, eb.outcome, eb.trigger_type, eb.source_event_id,
            eb.branch, eb.title, eb.started_at, eb.finished_at,
@@ -1084,7 +1108,8 @@ _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = """
            s.total_cache_read_tokens,
            s.total_cache_write_tokens,
            s.total_estimated_cost_usd AS estimated_cost_usd
-    FROM execution_bindings eb
+    FROM matched_jobs m
+    JOIN execution_bindings eb ON eb.awx_job_id = m.awx_job_id
     LEFT JOIN afk_runs r ON r.afk_run_id = eb.afk_run_id
     LEFT JOIN LATERAL (
         SELECT id, total_input_tokens, total_output_tokens,
@@ -1096,10 +1121,6 @@ _CHANGE_REQUEST_DETAIL_EXECUTIONS_SQL = """
         ORDER BY sessions.first_message_at DESC
         LIMIT 1
     ) s ON TRUE
-    WHERE eb.entity_type = 'change_request'
-      AND eb.provider = $1
-      AND eb.repository_url = $2
-      AND eb.entity_number = $3
     ORDER BY COALESCE(eb.started_at, eb.created_at) ASC, eb.awx_job_id ASC
 """
 
