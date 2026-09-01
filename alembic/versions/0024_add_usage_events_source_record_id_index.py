@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from alembic import op
+
 """Add the source-record lookup index used by batch overlap checks.
 
 Revision ID: 0024
 Revises:     0023
 Create Date: 2026-08-12
 """
-
-from collections.abc import Sequence
-
-from alembic import op
 
 revision: str = "0024"
 down_revision: str | None = "0023"
