@@ -536,16 +536,22 @@
     };
   }
 
-  /** Resolve the aggregate cost for a change-request detail contract.  The
-   *  Gateway-owned aggregate (`total_estimated_cost_usd` /
-   *  `aggregate_cost_usd` / `estimated_cost_usd`) is authoritative; when the
-   *  detail contract omits it the adapter returns null (unavailable) — it
-   *  never invents or double-counts a browser-side sum of per-execution costs.
+  /** Resolve the Gateway-owned AFK Run Cost for a change-request detail
+   *  contract (issue #629).  The AFK Run Cost is the Gateway-computed
+   *  aggregate over every session in the linked AFK runs — it is an
+   *  aggregate of session usage, never the cost of a single AWX Execution
+   *  and never a presentation-layer estimate.  The Gateway-owned value
+   *  (`total_estimated_cost_usd` / `aggregate_cost_usd` /
+   *  `estimated_cost_usd`) is authoritative; when the detail contract omits
+   *  it (or any included session has unknown cost, which poisons the
+   *  Gateway's own total to null) the adapter returns null (unavailable) —
+   *  it never invents or double-counts a browser-side sum of per-execution
+   *  costs.
    *  @param {Object} detail
    *  @param {Array} executions - adapted execution view models (unused; kept
    *  for interface stability)
    *  @returns {number|null} */
-  function aggregateCostUsd(detail, executions) {
+  function runCostUsd(detail, executions) {
     var v = detail.total_estimated_cost_usd != null ? detail.total_estimated_cost_usd
       : (detail.aggregate_cost_usd != null ? detail.aggregate_cost_usd
       : (detail.estimated_cost_usd != null ? detail.estimated_cost_usd : null));
@@ -577,7 +583,7 @@
     var executions = Array.isArray(executionsRaw) ? executionsRaw.map(adaptExecution) : [];
     var providerState = providerStateValue(cr);
     var afkState = afkStateValue(cr);
-    var aggUsd = aggregateCostUsd(detail, executions);
+    var runUsd = runCostUsd(detail, executions);
     var purposeCounts = { implementation: 0, review: 0, retry: 0 };
     executions.forEach(function (e) {
       if (e.purpose.value === 'implementation') purposeCounts.implementation++;
@@ -605,10 +611,19 @@
         label: afkStateLabel(afkState),
         badgeClass: afkStateBadgeClass(afkState)
       },
+      runCost: {
+        available: runUsd !== null,
+        usd: runUsd,
+        label: fmtCrCost(runUsd)
+      },
+      // Legacy alias (pre-#629 view-model shape): kept so older render code
+      // keeps working until it is fully migrated to `runCost`.  The AFK Run
+      // Cost and the AWX Execution Cost must never be conflated — this alias
+      // exposes the SAME Gateway-owned run total, never a recomputed value.
       aggregateCost: {
-        available: aggUsd !== null,
-        usd: aggUsd,
-        label: fmtCrCost(aggUsd)
+        available: runUsd !== null,
+        usd: runUsd,
+        label: fmtCrCost(runUsd)
       },
       executions: executions,
       executionCounts: counts,
@@ -640,6 +655,7 @@
     crCostUsd: crCostUsd,
     crCostAvailable: crCostAvailable,
     fmtCrCost: fmtCrCost,
+    runCostUsd: runCostUsd,
     // timestamps
     crLatestActivityAt: crLatestActivityAt,
     fmtCrTimestamp: fmtCrTimestamp,

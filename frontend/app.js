@@ -3575,9 +3575,13 @@
   }
 
   /** Render the detail header: PR/MR identity, title, provider state and
-   *  AFK automation state as independent badges, and the aggregate cost.
+   *  AFK automation state as independent badges, and the Gateway-owned AFK
+   *  Run Cost (issue #629).  The AFK Run Cost is the lifecycle total over
+   *  every session in the linked runs — distinct from any individual AWX
+   *  Execution Cost subtotal, and never summed or derived in the browser.
    *  Pure — returns an HTML string. */
   function renderChangeRequestDetailHeader(view) {
+    var runCost = view.runCost || view.aggregateCost;
     var html = '<div class="afk-cr-detail-header">' +
       '<div class="afk-cr-detail-head">' +
         '<span class="afk-cr-detail-term">' + escHtml(view.providerTerm) + '</span>' +
@@ -3589,8 +3593,8 @@
           badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</span>' +
         '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Automation</span>' +
           badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</span>' +
-        '<span class="afk-cr-status"><span class="afk-cr-status-label">Total Cost</span>' +
-          '<span class="afk-cr-cost">' + escHtml(view.aggregateCost.label) + '</span></span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Run Cost</span>' +
+          '<span class="afk-cr-cost">' + escHtml(runCost.label) + '</span></span>' +
       '</div>' +
       '</div>';
     return html;
@@ -3632,7 +3636,11 @@
   /** Render one execution entry: AWX job id, purpose and status/outcome
    *  badges, AWX job metadata (job template, trigger type, branch), linked
    *  session, timestamps, duration, token usage (compact Token Breakdown
-   *  when telemetry exists), per-run cost, and the bounded failure summary
+   *  when telemetry exists), the Gateway-computed AWX Execution Cost
+   *  subtotal (issue #629 — a per-execution subtotal of the canonical usage
+   *  events attributable to this one execution, distinct from the header's
+   *  AFK Run Cost; unavailable — never zero — when the execution's session
+   *  attribution or cost data is unknown), and the bounded failure summary
    *  when present.  Pure — returns an HTML string. */
   function renderChangeRequestExecution(execution) {
     var tokens = execution.tokens || {};
@@ -3656,7 +3664,7 @@
         (execution.startedAt ? ' &middot; started ' + fmtDT(execution.startedAt) : '') +
         (execution.finishedAt ? ' &middot; finished ' + fmtDT(execution.finishedAt) : '') +
         ' &middot; duration: ' + escHtml(execution.duration) +
-        ' &middot; cost: ' + escHtml(execution.cost.label) +
+        ' &middot; AWX Execution Cost: ' + escHtml(execution.cost.label) +
       '</div>';
     if (tokensAvailable) {
       html += '<div class="afk-tokens">' +
