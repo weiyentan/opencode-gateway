@@ -559,6 +559,142 @@ class TestChangeRequestDetail:
         assert review_ids == [99]
 
     @pytest.mark.asyncio
+    async def test_regression_mr138_lifecycle_shape(
+        self, client: AsyncClient, mock_conn: AsyncMock, monkeypatch
+    ):
+        """MR !138 lifecycle (PRD #620): three AWX jobs across one AFK run.
+
+        The production scenario that motivated the PRD: the Develop-Loop job
+        (AWX 9209, JT 132) is linked to the lifecycle only through
+        ``afk_run_id`` — it does not carry ``pr_number`` directly — while the
+        two MR Review Runner jobs (AWX 9210, JT 222, and its rerun AWX 9213,
+        JT 222) carry the direct change-request identity.  All three share
+        ``afk_run_id`` ``01M1DSQ0SNR6WZ1BJC11ZTTK3D``.
+
+        The detail endpoint must return all three as separate executions —
+        never deduplicated by the shared ``afk_run_id`` — with the correct
+        purpose classification (implementation for JT 132, review for JT
+        222), summary counts matching the distinct job set, and Gateway
+        ordering (earliest first, rerun after the first review).
+        """
+        from app.core.config import Settings
+
+        afk_run_id = "01M1DSQ0SNR6WZ1BJC11ZTTK3D"
+        _wire(
+            mock_conn,
+            summary=_mk_summary_row(
+                execution_total=3,
+                execution_running=0,
+                execution_completed=3,
+                execution_failed=0,
+                execution_cancelled=0,
+            ),
+            runs=[
+                _mk_run_row(
+                    afk_run_id=afk_run_id,
+                    link_sources=["change_request_binding", "execution"],
+                )
+            ],
+            executions=[
+                # Develop-Loop job: implementation, linked only via afk_run_id.
+                _mk_execution_row(
+                    awx_job_id=9209,
+                    job_template_id=132,
+                    afk_run_id=afk_run_id,
+                    outcome="completed",
+                    purpose="implementation",
+                    started_at=datetime(
+                        2026, 8, 1, 9, 0, 0, tzinfo=timezone.utc
+                    ),
+                    title="Develop-Loop: Implemented issues #343-#347",
+                ),
+                # First MR Review Runner job: direct change-request identity.
+                _mk_execution_row(
+                    awx_job_id=9210,
+                    job_template_id=222,
+                    afk_run_id=afk_run_id,
+                    outcome="completed",
+                    purpose="review",
+                    started_at=datetime(
+                        2026, 8, 1, 11, 0, 0, tzinfo=timezone.utc
+                    ),
+                    title="MR Review Runner",
+                ),
+                # MR Review Runner rerun: same afk_run_id, distinct job.
+                _mk_execution_row(
+                    awx_job_id=9213,
+                    job_template_id=222,
+                    afk_run_id=afk_run_id,
+                    outcome="completed",
+                    purpose="review",
+                    started_at=datetime(
+                        2026, 8, 1, 13, 0, 0, tzinfo=timezone.utc
+                    ),
+                    title="MR Review Runner rerun",
+                ),
+            ],
+        )
+
+        monkeypatch.setattr(
+            "app.api.afk_outcomes.get_settings",
+            lambda: Settings(
+                afk_implementation_job_template_ids="132",
+                afk_review_job_template_ids="222",
+            ),
+        )
+
+        async with client as c:
+            response = await c.get(_ENDPOINT)
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+
+        # All three AWX job IDs returned as separate executions, Gateway-
+        # ordered earliest first — the rerun (9213) after the first review
+        # (9210), and the implementation (9209) before both.
+        executions = data["executions"]
+        assert [e["awx_job"]["job_id"] for e in executions] == [
+            "9209",
+            "9210",
+            "9213",
+        ]
+        assert [e["outcome"] for e in executions] == [
+            "completed",
+            "completed",
+            "completed",
+        ]
+
+        # Purpose classification: implementation for the develop-loop JT,
+        # review for both review-runner jobs.
+        assert [e["purpose"] for e in executions] == [
+            "implementation",
+            "review",
+            "review",
+        ]
+
+        # Shared afk_run_id is relationship metadata, never dedup identity.
+        assert all(e["afk_run_id"] == afk_run_id for e in executions)
+        assert [e["awx_job"]["job_template_id"] for e in executions] == [
+            132,
+            222,
+            222,
+        ]
+
+        # Execution count matches the distinct job set, in the summary too.
+        assert len(executions) == 3
+        assert data["change_request"]["executions"]["total"] == 3
+        assert data["change_request"]["executions"]["completed"] == 3
+
+        # The configured template IDs reach the execution SQL ($4/$5) so the
+        # classification above is backed by the operator configuration.
+        executions_sql, _provider, _repo, _number, impl_ids, review_ids = (
+            mock_conn.fetch.call_args_list[1][0]
+        )
+        assert "job_template_id = ANY($4::bigint[])" in executions_sql
+        assert impl_ids == [132]
+        assert review_ids == [222]
+
+    @pytest.mark.asyncio
     async def test_merge_state_none_when_no_facts(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
