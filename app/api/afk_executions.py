@@ -221,6 +221,12 @@ def _binding_conflicts_with(
         for field, (existing_value, body_value) in optional_values.items()
     ):
         return True
+    # Session attribution (issue #627): the normalized collection participates
+    # only when the caller supplied one — an omitted collection never
+    # conflicts on the stored attribution.
+    if "external_session_ids" in supplied:
+        if existing.external_session_ids != body.normalized_session_ids():
+            return True
     if "resource" in supplied:
         resource = body.resource
         if resource is None:
@@ -249,10 +255,16 @@ def _binding_to_read_response(binding: ExecutionBinding) -> ExecutionBindingRead
     identity (failed/cancelled executions, issue #590).
     """
     resource = binding.resource
+    # Normalized session attribution (issue #627): the stored singular
+    # column is the primary session; the JSONB collection (when present)
+    # carries the full deduplicated attribution.  Bindings with no resolved
+    # session read back an empty collection — never fabricated ownership.
+    session_ids = list(binding.external_session_ids)
     return ExecutionBindingReadResponse(
         binding_id=binding.binding_id,
         awx_job=binding.awx_job,
         external_session_id=binding.external_session_id,
+        external_session_ids=session_ids,
         resource=ProviderResourceIdentity(
             provider=resource.provider,
             repository=resource.repository,
@@ -370,6 +382,7 @@ async def create_execution_binding(
                         resource.resource_number if resource is not None else None
                     ),
                     external_session_id=body.external_session_id,
+                    external_session_ids=body.normalized_session_ids(),
                     outcome=body.outcome,
                     source_event_id=body.source_event_id,
                     branch=body.branch,
@@ -508,6 +521,10 @@ async def update_execution_binding(
                     failure_summary=body.failure_summary,
                     failure_summary_provided="failure_summary" in body.model_fields_set,
                     external_session_id=body.external_session_id,
+                    external_session_ids=body.normalized_session_ids()
+                    if "external_session_ids" in body.model_fields_set
+                    or "external_session_id" in body.model_fields_set
+                    else None,
                     provider=resource.provider if resource is not None else None,
                     repository=normalized_repo,
                     resource_number=(

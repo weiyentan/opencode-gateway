@@ -169,13 +169,35 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
             "resource_type": row["entity_type"],
             "resource_number": row["entity_number"],
         }
+    # Normalized session attribution (issue #627): the additive JSONB column
+    # (migration 0042) carries the full deduplicated collection when present;
+    # legacy rows without the column fall back to the singular nullable
+    # column, normalized to a one-element collection.  A binding with no
+    # resolved session reads back an empty collection.
+    raw_session_ids = row.get("external_session_ids_json")
+    if isinstance(raw_session_ids, str):
+        try:
+            decoded = json.loads(raw_session_ids)
+        except ValueError:
+            decoded = None
+    else:
+        decoded = raw_session_ids
+    if isinstance(decoded, list):
+        session_ids = [s for s in decoded if isinstance(s, str) and s]
+        # Deduplicate preserving first-occurrence order.
+        session_ids = list(dict.fromkeys(session_ids))
+    else:
+        singular = row["external_session_id"]
+        session_ids = [singular] if singular else []
+    primary_session = session_ids[0] if session_ids else None
     return ExecutionBinding(
         binding_id=str(row["id"]),
         awx_job={
             "job_id": str(row["awx_job_id"]),
             "job_template_id": row["job_template_id"],
         },
-        external_session_id=row["external_session_id"],
+        external_session_id=primary_session,
+        external_session_ids=session_ids,
         resource=resource,
         outcome=ExecutionOutcome(row["outcome"]) if row["outcome"] else ExecutionOutcome.COMPLETED,
         source_event_id=row["source_event_id"],
@@ -1888,6 +1910,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         repository: str | None = None,
         resource_number: str | None = None,
         external_session_id: str | None = None,
+        external_session_ids: list[str] | None = None,
         outcome: ExecutionOutcome = ExecutionOutcome.COMPLETED,
         source_event_id: str | None = None,
         branch: str | None = None,
@@ -2000,6 +2023,15 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         """
         numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
         new_ulid = ulid_source.next_ulid()
+        # Normalized session attribution (issue #627): the caller supplies the
+        # already-normalized collection; a direct repository caller that
+        # passes only the legacy singular form falls back to it.
+        session_ids = list(
+            dict.fromkeys(external_session_ids or [])
+        ) if external_session_ids is not None else (
+            [external_session_id] if external_session_id else []
+        )
+        primary_session = session_ids[0] if session_ids else None
 
         async with self._conn.transaction():
             # Check for an existing binding with this AWX job ID.  The
@@ -2067,7 +2099,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                     "source_event_id": (existing["source_event_id"], source_event_id),
                     "external_session_id": (
                         existing["external_session_id"],
-                        external_session_id,
+                        primary_session,
                     ),
                     "started_at": (existing.get("started_at"), started_at),
                     "finished_at": (existing.get("finished_at"), finished_at),
@@ -2339,7 +2371,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 """,
                 numeric_awx_job_id,
                 job_template_id,
-                external_session_id,
+                primary_session,
                 provider.value if provider is not None else None,
                 repository,
                 EntityType.CHANGE_REQUEST.value
@@ -2359,23 +2391,27 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             )
 
             if binding_row:
-                # Persist the afk_run_sessions link in the same transaction
-                # when the binding carries both an owning lifecycle and an
-                # external session id (issue #618).  The internal Gateway
-                # session id is resolved best-effort; an unresolved external
-                # session id is retained on the link with session_id NULL.
-                if external_session_id is not None:
-                    await self._upsert_session_link(
-                        RunSessionLink(
-                            afk_run_id=run_id,
-                            session_id=await self._resolve_internal_session_id(
-                                external_session_id
-                            ),
-                            external_session_id=external_session_id,
-                            started_at=started_at,
-                            finished_at=finished_at,
+                # Persist the afk_run_sessions links in the same transaction
+                # when the binding carries an owning lifecycle and session
+                # attribution (issue #618, pluralized by issue #627).  One
+                # link per unique external session id, in first-occurrence
+                # order (the first entry is the primary session).  The
+                # internal Gateway session id is resolved best-effort; an
+                # unresolved external session id is retained on the link
+                # with session_id NULL.
+                if session_ids:
+                    for session_id_external in session_ids:
+                        await self._upsert_session_link(
+                            RunSessionLink(
+                                afk_run_id=run_id,
+                                session_id=await self._resolve_internal_session_id(
+                                    session_id_external
+                                ),
+                                external_session_id=session_id_external,
+                                started_at=started_at,
+                                finished_at=finished_at,
+                            )
                         )
-                    )
                 # Converge the parent toward the binding-derived projection
                 # in the same transaction (issue #606 / ADR 0027): the
                 # freshly-inserted binding participates in the outcome
@@ -2421,6 +2457,7 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         failure_summary: str | None = None,
         failure_summary_provided: bool | None = None,
         external_session_id: str | None = None,
+        external_session_ids: list[str] | None = None,
         provider: Provider | None = None,
         repository: str | None = None,
         resource_number: str | None = None,
@@ -2477,6 +2514,20 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             failure_reason_provided = failure_reason is not None
         if failure_summary_provided is None:
             failure_summary_provided = failure_summary is not None
+        # Normalized session attribution (issue #627): the API layer supplies
+        # the already-normalized, deduplicated collection; a direct repository
+        # caller that passes only the legacy singular form falls back to it.
+        # ``None`` means "no session attribution supplied" (non-erasing);
+        # an empty list is treated the same way here — the API schema rejects
+        # empty collections before the repository is reached.
+        supplied_session_ids: list[str] | None
+        if external_session_ids is not None:
+            supplied_session_ids = list(dict.fromkeys(external_session_ids))
+        elif external_session_id is not None:
+            supplied_session_ids = [external_session_id]
+        else:
+            supplied_session_ids = None
+        fill_session = supplied_session_ids[0] if supplied_session_ids else None
         numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
 
         async with self._conn.transaction():
@@ -2528,9 +2579,9 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
             # A supplied fill-in contradicts a stored non-null value?
             session_conflict = (
-                external_session_id is not None
+                fill_session is not None
                 and row["external_session_id"] is not None
-                and row["external_session_id"] != external_session_id
+                and row["external_session_id"] != fill_session
             )
             failure_summary_conflict = (
                 failure_summary_provided
@@ -2593,8 +2644,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
             new_session = (
                 row["external_session_id"]
-                if external_session_id is None
-                else external_session_id
+                if fill_session is None
+                else fill_session
             )
             new_failure_reason = (
                 row["failure_reason"]
@@ -2709,23 +2760,36 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 new_entity_number,
                 new_failure_summary,
             )
-            # Persist the afk_run_sessions link in the same transaction when
-            # the terminal binding carries both an owning lifecycle and an
-            # external session id — including a session supplied as a
-            # terminal fill-in (issue #618).  The internal Gateway session id
-            # is resolved best-effort; an unresolved external session id is
-            # retained on the link with session_id NULL.  The enrich-only
-            # upsert never erases an existing link.
-            if row.get("afk_run_id") is not None and new_session is not None:
-                await self._upsert_session_link(
-                    RunSessionLink(
-                        afk_run_id=row["afk_run_id"],
-                        session_id=await self._resolve_internal_session_id(new_session),
-                        external_session_id=new_session,
-                        started_at=None,
-                        finished_at=finished_at,
-                    )
+            # Persist the afk_run_sessions links in the same transaction when
+            # the terminal binding carries an owning lifecycle and session
+            # attribution — including sessions supplied as terminal fill-ins
+            # (issue #618, pluralized by issue #627).  When the terminal
+            # update supplies a collection, every unique session id gets a
+            # link (the enrich-only upsert never erases an existing link);
+            # with no supplied attribution the stored primary session still
+            # gets its link.  The internal Gateway session id is resolved
+            # best-effort; an unresolved external session id is retained on
+            # the link with session_id NULL.
+            if row.get("afk_run_id") is not None and (
+                new_session is not None or supplied_session_ids
+            ):
+                link_session_ids = (
+                    supplied_session_ids
+                    if supplied_session_ids
+                    else [new_session]
                 )
+                for link_external_id in link_session_ids:
+                    await self._upsert_session_link(
+                        RunSessionLink(
+                            afk_run_id=row["afk_run_id"],
+                            session_id=await self._resolve_internal_session_id(
+                                link_external_id
+                            ),
+                            external_session_id=link_external_id,
+                            started_at=None,
+                            finished_at=finished_at,
+                        )
+                    )
             # Converge the parent toward the binding-derived projection in
             # the same transaction (issue #606 / ADR 0027): the just-
             # transitioned binding participates in the outcome multiset —
@@ -2751,7 +2815,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
                    source_event_id, branch, title, failure_reason, failure_summary,
-                   started_at, finished_at, afk_run_id, trigger_type
+                   started_at, finished_at, afk_run_id, trigger_type,
+                   external_session_ids AS external_session_ids_json
             FROM execution_bindings
             WHERE awx_job_id = $1
             """,
@@ -2781,7 +2846,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
                    source_event_id, branch, title, failure_reason, failure_summary,
-                   started_at, finished_at, afk_run_id, trigger_type
+                   started_at, finished_at, afk_run_id, trigger_type,
+                   external_session_ids AS external_session_ids_json
             FROM execution_bindings
             WHERE provider = $1
               AND repository_url = $2

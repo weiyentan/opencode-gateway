@@ -551,6 +551,13 @@ class ExecutionBinding(Base):
     awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     job_template_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     external_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Normalized session attribution collection (issue #627, migration 0042):
+    # every external OpenCode session id attributed to the execution,
+    # deduplicated with the first entry as the primary session.  Nullable —
+    # historical / run-level-only bindings carry no collection.
+    external_session_ids: Mapped[Optional[list]] = mapped_column(
+        JSONB, nullable=True
+    )
     provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     repository_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     entity_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)

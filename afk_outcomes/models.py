@@ -745,9 +745,20 @@ class ExecutionBinding(BaseModel):
         default=None,
         description=(
             "External OpenCode session id (e.g. ses_* id); None when the "
-            "binding has no resolved session (the DB column is nullable)"
+            "binding has no resolved session (the DB column is nullable).  "
+            "Legacy singular readback — the first entry of "
+            "external_session_ids when one exists."
         ),
         min_length=1,
+    )
+    external_session_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Normalized session attribution (issue #627): every external "
+            "OpenCode session id attributed to this execution, deduplicated "
+            "with the first entry as the primary session.  Empty for "
+            "historical / run-level-only bindings with no resolved session."
+        ),
     )
     resource: ProviderResourceIdentity | None = Field(
         default=None,
@@ -807,6 +818,30 @@ class ExecutionBinding(BaseModel):
             "backfill, recovery); None for legacy rows without the column"
         ),
     )
+
+    @model_validator(mode="after")
+    def _normalize_session_attribution(self) -> ExecutionBinding:
+        """Keep the singular session id and the collection consistent.
+
+        The collection is the normalized attribution (issue #627): entries
+        are deduplicated preserving first-occurrence order, and the singular
+        ``external_session_id`` always mirrors the first entry (the primary
+        session).  A singular value with an empty collection seeds the
+        collection from it, so both shapes read back consistently.
+        """
+        if self.external_session_ids:
+            session_ids = list(dict.fromkeys(self.external_session_ids))
+            object.__setattr__(
+                self, "external_session_ids", session_ids
+            )
+            object.__setattr__(
+                self, "external_session_id", session_ids[0]
+            )
+        elif self.external_session_id:
+            object.__setattr__(
+                self, "external_session_ids", [self.external_session_id]
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
