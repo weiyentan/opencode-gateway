@@ -620,6 +620,21 @@ lifecycle is closed to new AWX Execution Bindings; related additional work
 requires a new AFK Run.
 _Avoid_: Outcome record, engineering task (generic)
 
+**AFK Run Cost**:
+The estimated cost of all canonical usage events belonging to every OpenCode
+session in one AFK Run. It is an aggregate of session usage, not the cost of a
+single AWX Execution or a presentation-layer estimate. The total is unavailable
+when any included session has unknown cost; known lower-level costs remain
+displayable.
+_Avoid_: execution cost when the lifecycle total is meant, session cost when
+the lifecycle total is meant
+
+**AWX Execution Cost**:
+The estimated cost of canonical usage events belonging to the OpenCode sessions
+explicitly attributable to one AWX Execution. It is a subtotal and is
+unavailable when that execution's session attribution or cost data is unknown.
+_Avoid_: AFK Run Cost when the individual AWX job subtotal is meant
+
 **afk_run_id**:
 The Gateway-owned ULID primary key of an AFK Run (``afk_runs.afk_run_id``),
 assigned at reconstruction time by the resolver. The run carries no
