@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+from alembic import op
+
 """Add an index on ``usage_events.reported_at``.
 
 The Records view always filters by a date range on ``reported_at``
@@ -21,10 +27,6 @@ Revision ID: 0025
 Revises:     0024
 Create Date: 2026-08-13
 """
-
-from collections.abc import Sequence
-
-from alembic import op
 
 revision: str = "0025"
 down_revision: str | None = "0024"

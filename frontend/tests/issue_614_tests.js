@@ -242,14 +242,16 @@ function runTests() {
 // Header: identity + dual statuses + aggregate cost (GitHub)
 // ═════════════════════════════════════════════════════════════════════════
 
-test('header: identity, dual statuses, and total cost render first (GitHub)', function () {
+test('header: identity, dual statuses, and AFK Run Cost render first (GitHub)', function () {
   W.renderChangeRequestDetail(githubFixture.buildDetail());
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'acme/web-app#142', 'header: display identity rendered');
   assertContains(html, 'feat: wire up web-app dashboard', 'header: title rendered');
   assertContains(html, 'badge-merged', 'header: provider state badge');
   assertContains(html, 'badge-completed', 'header: AFK automation state badge');
-  assertContains(html, '$6.35', 'header: total estimated USD cost rendered');
+  assertContains(html, 'AFK Run Cost', 'header: Gateway-owned AFK Run Cost label rendered');
+  assertContains(html, '$6.35', 'header: AFK Run Cost value rendered');
+  assertNotContains(html, '>Total Cost<', 'header: legacy Total Cost label retired');
   // Independent badges: provider label and AFK automation label both present.
   assertContains(html, '>Provider<', 'header: provider status label');
   assertContains(html, '>AFK Automation<', 'header: AFK automation status label');
@@ -261,7 +263,8 @@ test('header: GitLab parity — MR identity, same lifecycle semantics', function
   assertContains(html, 'group/cloudnative#6', 'header: GitLab MR identity');
   assertContains(html, 'badge-merged', 'header: GitLab provider state badge');
   assertContains(html, 'badge-completed', 'header: GitLab AFK automation badge');
-  assertContains(html, '$4.80', 'header: GitLab aggregate cost');
+  assertContains(html, 'AFK Run Cost', 'header: GitLab AFK Run Cost label');
+  assertContains(html, '$4.80', 'header: GitLab AFK Run Cost value');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -334,8 +337,16 @@ test('execution: AWX job metadata, status, outcome, timestamps, tokens, cost', f
   assertContains(html, 'started', 'exec: started timestamp rendered');
   assertContains(html, 'finished', 'exec: finished timestamp rendered');
   assertContains(html, 'duration: 40m', 'exec: duration computed');
-  // Per-run cost
-  assertContains(html, 'cost: $2.10', 'exec: per-run cost rendered');
+  // Per-execution AWX Execution Cost (Gateway-computed subtotal — issue #629)
+  assertContains(html, 'AWX Execution Cost: $2.10', 'exec: AWX Execution Cost subtotal rendered');
+  // The retired 'cost:' label must not appear in any EXECUTION block (session
+  // links legitimately keep their own session-cost 'cost:' line).
+  var execBlocks = html.split('afk-cr-execution-meta').slice(1);
+  var retiredInExec = execBlocks.some(function (b) {
+    var meta = b.split('</div>')[0];
+    return / &middot; cost: /.test(meta);
+  });
+  assert(!retiredInExec, 'exec: legacy per-run cost label retired from execution meta');
   // Token usage via compact Token Breakdown
   assertContains(html, '13.8K total', 'exec: token breakdown total');
   assertContains(html, '8.0K in | 4.0K out', 'exec: token breakdown input/output');
@@ -372,21 +383,21 @@ test('execution: distinct outcome badge renders when different from status', fun
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// Aggregate cost
+// AFK Run Cost vs AWX Execution Cost (issue #629)
 // ═════════════════════════════════════════════════════════════════════════
 
-test('aggregate cost: gateway-owned total wins over per-execution sum', function () {
+test('run cost: gateway-owned AFK Run Cost wins over per-execution sum', function () {
   W.renderChangeRequestDetail(githubFixture.buildDetail());
   var html = crDetailBodyEl.innerHTML;
-  assertContains(html, '$6.35', 'aggregate: gateway-owned aggregate rendered');
-  // The aggregate equals the sum of all available per-run costs exactly once:
-  // 2.10 (impl) + 0.85 (failed impl) + 0.75 (retry) + 1.90 (review) = 5.60
-  // — plus the cancelled review has no cost telemetry, so it is not double-counted.
-  assertNotContains(html, '$5.60', 'aggregate: per-run sum not substituted when gateway total exists');
+  assertContains(html, '$6.35', 'run cost: Gateway-owned AFK Run Cost rendered');
+  // The run total equals the sum of all available per-execution subtotals
+  // exactly once: 2.10 (impl) + 0.85 (failed impl) + 0.75 (retry) + 1.90
+  // (review) = 5.60 — the cancelled review has no cost telemetry.  The
+  // browser must never derive that sum itself; it displays the Gateway value.
+  assertNotContains(html, '$5.60', 'run cost: per-execution sum not substituted when gateway total exists');
 });
 
-test('aggregate cost: missing gateway total is unavailable, never a per-execution sum', function () {
-  var html = '';
+test('run cost: missing gateway total is unavailable, never a per-execution sum', function () {
   W.renderChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r/x', external_id: '2', provider_state: 'open', automation_state: 'running' },
     executions: [
@@ -396,12 +407,83 @@ test('aggregate cost: missing gateway total is unavailable, never a per-executio
       { awx_job: { job_id: '4' }, purpose: 'implementation', outcome: 'completed', estimated_cost_usd: 0.10 }
     ]
   });
-  html = crDetailBodyEl.innerHTML;
-  // The Gateway aggregate is authoritative: without it the aggregate cost is
+  var html = crDetailBodyEl.innerHTML;
+  // The Gateway AFK Run Cost is authoritative: without it the run total is
   // unavailable (null) — the adapter never invents a browser-side sum that
   // could double-count cost (issue #617 review finding HIGH-1).
-  assertNotContains(html, '$0.60', 'aggregate: per-execution sum not substituted when gateway total missing');
-  assertContains(html, 'Cost unavailable', 'aggregate: unavailable aggregate labeled');
+  assertNotContains(html, '$0.60', 'run cost: per-execution sum not substituted when gateway total missing');
+  assertContains(html, 'Cost unavailable', 'run cost: unavailable run total labeled');
+  // Known lower-level costs stay visible alongside the unavailable total.
+  assertContains(html, 'AWX Execution Cost: $0.30', 'run cost: known execution subtotal stays visible');
+  assertContains(html, 'AWX Execution Cost: $0.20', 'run cost: second known subtotal stays visible');
+  assertContains(html, 'AWX Execution Cost: $0.10', 'run cost: third known subtotal stays visible');
+  assertContains(html, 'AWX Execution Cost: Cost unavailable', 'run cost: unknown subtotal labeled, never zero');
+  assertNotContains(html, 'AWX Execution Cost: $0.00', 'run cost: unknown subtotal never coerced to zero');
+});
+
+test('run cost: header shows AFK Run Cost while executions show AWX Execution Cost', function () {
+  W.renderChangeRequestDetail(githubFixture.buildDetail());
+  var html = crDetailBodyEl.innerHTML;
+  // The two cost scopes are distinct and visibly labeled (issue #629):
+  // the header carries the lifecycle-total (AFK Run Cost); each execution
+  // carries its own AWX Execution Cost subtotal.  Neither is derived in the
+  // browser from the other.
+  assertContains(html, 'AFK Run Cost', 'cost scopes: AFK Run Cost in the header');
+  assertContains(html, 'AWX Execution Cost', 'cost scopes: AWX Execution Cost on executions');
+  assertContains(html, '$6.35', 'cost scopes: run total rendered');
+  assertContains(html, 'AWX Execution Cost: $2.10', 'cost scopes: execution subtotal rendered');
+});
+
+test('run cost: one unknown session cost renders unavailable total, subtotals stay visible', function () {
+  // A run whose sessions include one unknown cost has NO authoritative run
+  // total (the Gateway poisons the aggregate to null) — the UI must not
+  // display a partial total, and must not coerce anything to $0.00.
+  W.renderChangeRequestDetail({
+    change_request: { provider: 'gitlab', repository: 'g/p', external_id: '7', provider_state: 'merged', automation_state: 'completed' },
+    total_estimated_cost_usd: null,
+    executions: [
+      { awx_job: { job_id: 'a1' }, purpose: 'implementation', outcome: 'completed', estimated_cost_usd: 1.25 },
+      { awx_job: { job_id: 'a2' }, purpose: 'review', outcome: 'completed', estimated_cost_usd: null }
+    ]
+  });
+  var html = crDetailBodyEl.innerHTML;
+  assertContains(html, 'AFK Run Cost', 'partial run: header still labeled AFK Run Cost');
+  assertContains(html, 'Cost unavailable', 'partial run: unavailable run total labeled');
+  assertNotContains(html, '$1.25 total', 'partial run: no partial authoritative total fabricated');
+  assertContains(html, 'AWX Execution Cost: $1.25', 'partial run: known subtotal visible');
+  assertContains(html, 'AWX Execution Cost: Cost unavailable', 'partial run: unknown subtotal visible');
+});
+
+test('run cost: all cost data missing renders Cost unavailable everywhere', function () {
+  W.renderChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r/x', external_id: '8', provider_state: 'open', automation_state: 'running' },
+    executions: [
+      { awx_job: { job_id: 'b1' }, purpose: 'implementation', outcome: 'completed' },
+      { awx_job: { job_id: 'b2' }, purpose: 'review', outcome: 'failed' }
+    ]
+  });
+  var html = crDetailBodyEl.innerHTML;
+  assertContains(html, 'AFK Run Cost', 'all missing: header label present');
+  assertContains(html, 'AWX Execution Cost: Cost unavailable', 'all missing: execution subtotals labeled');
+  assertNotContains(html, '$0.00', 'all missing: no coerced zero anywhere');
+});
+
+test('run cost: legacy aggregateCost alias maps to the same gateway run total', function () {
+  // Legacy payloads carry no #629 vocabulary; the legacy `aggregateCost`
+  // view-model alias must expose the SAME Gateway-owned run total — never a
+  // recomputed or independently summed value.
+  var legacy = {
+    change_request: { provider: 'github', repository: 'r/x', external_id: '9', provider_state: 'merged', automation_state: 'completed' },
+    total_estimated_cost_usd: 3.75,
+    executions: [
+      { awx_job: { job_id: 'c1' }, purpose: 'implementation', outcome: 'completed', estimated_cost_usd: 3.75 },
+      { awx_job: { job_id: 'c2' }, purpose: 'review', outcome: 'completed', estimated_cost_usd: 1.00 }
+    ]
+  };
+  W.renderChangeRequestDetail(legacy);
+  var html = crDetailBodyEl.innerHTML;
+  assertContains(html, '$3.75', 'legacy: gateway run total rendered as-is');
+  assertNotContains(html, '$4.75', 'legacy: no browser-side sum of execution subtotals');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -502,7 +584,7 @@ test('detail: partial data renders unavailable cost and empty sections', functio
   assertContains(html, 'g/p#3', 'partial: identity rendered');
   assertContains(html, 'badge-open', 'partial: provider state badge');
   assertContains(html, 'badge-failed', 'partial: automation state badge');
-  assertContains(html, 'Cost unavailable', 'partial: missing aggregate cost renders Cost unavailable');
+  assertContains(html, 'Cost unavailable', 'partial: missing run cost renders Cost unavailable');
   assertContains(html, 'No linked executions', 'partial: empty executions section');
   assertContains(html, 'No sessions linked', 'partial: empty sessions section');
   assertContains(html, 'No timeline data', 'partial: empty timeline section');

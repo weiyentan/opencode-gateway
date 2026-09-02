@@ -8,17 +8,22 @@
 #   trigger event → awx_job_id → execution binding → AFK run (afk_run_id)
 #
 # Flow:
-#   1. POST /api/v1/afk/executions with trigger_type + source_event_id
-#      and assert the response carries a Gateway-owned 26-character ULID
-#      afk_run_id (first creation returns 201; a re-run of the same
-#      payload replays idempotently with 200).
-#   2. Replay the identical payload — must return 200 with the SAME
+#   1. POST /api/v1/afk/executions/runs — pre-provision a provisional
+#      lifecycle (afk_run_id is required for every new binding, issue
+#      #626; a re-run of the same provisioning payload replays
+#      idempotently with 200).
+#   2. POST /api/v1/afk/executions with the provisioned afk_run_id and
+#      trigger_type + source_event_id and assert the response carries the
+#      SAME Gateway-owned 26-character ULID afk_run_id (first creation
+#      returns 201; a re-run of the same payload replays idempotently
+#      with 200).
+#   3. Replay the identical payload — must return 200 with the SAME
 #      afk_run_id (no duplicate row, no mutation).
-#   3. POST the same awx_job_id with a different payload — must return
+#   4. POST the same awx_job_id with a different payload — must return
 #      409 Conflict without mutating the stored binding.
-#   4. GET /api/v1/afk/executions/{awx_job_id} — must return the same
+#   5. GET /api/v1/afk/executions/{awx_job_id} — must return the same
 #      afk_run_id plus the trigger_type / source_event_id readback.
-#   5. GET /api/v1/afk/executions resource history — must include the
+#   6. GET /api/v1/afk/executions resource history — must include the
 #      binding carrying the recorded afk_run_id.
 #
 # Requires (env vars or AWX extra_vars):
@@ -49,6 +54,7 @@
     repository: "{{ lookup('env', 'REPOSITORY_URL') | default('https://github.com/acme/proj', true) }}"
     resource_type: "{{ lookup('env', 'RESOURCE_TYPE') | default('pull_request', true) }}"
     resource_number: "{{ lookup('env', 'RESOURCE_NUMBER') | default('99', true) }}"
+    host: "{{ lookup('env', 'HOST') | default('github.com', true) }}"
     outcome: "{{ lookup('env', 'OUTCOME') | default('completed', true) }}"
     trigger_type: "{{ lookup('env', 'TRIGGER_TYPE') | default('eda', true) }}"
     source_event_id: "{{ lookup('env', 'SOURCE_EVENT_ID') | default('smoke-evtest-0001', true) }}"
@@ -69,6 +75,14 @@
       source_event_id: "{{ source_event_id }}"
       branch: "{{ branch }}"
       title: "{{ title }}"
+      afk_run_id: ""
+    lifecycle_provision_payload:
+      provider: "{{ provider }}"
+      host: "{{ host }}"
+      source_event_id: "{{ source_event_id }}"
+      repository: "{{ repository }}"
+      trigger_type: "{{ trigger_type }}"
+      title: "{{ title }}"
     conflicting_payload: "{{ execution_binding_payload | combine({'outcome': 'failed'}) }}"
     repository_url_encoded: "{{ repository | replace('/', '%2F') | replace(':', '%3A') }}"
     history_url: "{{ gateway_url }}/api/v1/afk/executions?provider={{ provider }}&repository_url={{ repository_url_encoded }}&entity_type=change_request&entity_number={{ resource_number }}"
@@ -83,6 +97,32 @@
       ansible.builtin.fail:
         msg: "source_event_id is required when trigger_type is 'eda'"
       when: trigger_type == 'eda' and source_event_id == ''
+
+    - name: Pre-provision the AFK run lifecycle (issue #626 — afk_run_id is required)
+      ansible.builtin.uri:
+        url: "{{ gateway_url }}/api/v1/afk/executions/runs"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ gateway_api_key }}"
+          X-Collector-Token: "{{ collector_token }}"
+        body_format: json
+        body: "{{ lifecycle_provision_payload }}"
+        status_code: [200, 201]
+        return_content: true
+        validate_certs: false
+      register: provision_post
+
+    - name: Assert provisioning returned a 26-character ULID afk_run_id
+      ansible.builtin.assert:
+        that:
+          - provision_post.json.status == "ok"
+          - provision_post.json.data.afk_run_id is regex('^[0-9A-HJKMNP-TV-Z]{26}$')
+        fail_msg: "Lifecycle provisioning did not return a Gateway-owned 26-char ULID afk_run_id"
+        success_msg: "Provisioned lifecycle afk_run_id {{ provision_post.json.data.afk_run_id }}"
+
+    - name: Carry the provisioned afk_run_id into the binding payload
+      ansible.builtin.set_fact:
+        execution_binding_payload: "{{ execution_binding_payload | combine({'afk_run_id': provision_post.json.data.afk_run_id}) }}"
 
     - name: POST execution binding (create or idempotent replay)
       ansible.builtin.uri:

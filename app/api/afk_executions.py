@@ -1,4 +1,4 @@
-"""Execution-binding and provisional AFK lifecycle REST API (issues #549, #589, #590).
+"""Execution-binding and provisional AFK lifecycle REST API (issues #549, #589, #590, #626).
 
 Execution-binding endpoints (``/api/v1/afk/executions``):
 
@@ -6,8 +6,12 @@ Execution-binding endpoints (``/api/v1/afk/executions``):
   Two-phase lifecycle (issue #590): ``outcome="running"`` provisions the
   execution at AWX start (attached to a pre-provisioned ``afk_run_id``,
   optional change request/session); terminal outcomes keep the legacy
-  final-callback flow.  Idempotent by AWX job identity; conflicting data
-  returns 409.
+  final-callback flow.  ``afk_run_id`` is required for every new binding
+  (issue #626) so the AWX job joins directly to its logical AFK Run — the
+  legacy auto-provisioning path is closed and a POST without
+  ``afk_run_id`` is rejected with 422.  Idempotent by AWX job identity;
+  conflicting data returns 409.  Legacy persisted rows without
+  ``afk_run_id`` remain readable (null on readback) with no backfill.
 - ``PATCH /executions/{awx_job_id}`` — transition the same row from
   ``running`` to a terminal outcome (``completed``/``failed``/``cancelled``).
   Idempotent identical replay returns 200; conflicting payloads return 409
@@ -221,6 +225,12 @@ def _binding_conflicts_with(
         for field, (existing_value, body_value) in optional_values.items()
     ):
         return True
+    # Session attribution (issue #627): the normalized collection participates
+    # only when the caller supplied one — an omitted collection never
+    # conflicts on the stored attribution.
+    if "external_session_ids" in supplied:
+        if existing.external_session_ids != body.normalized_session_ids():
+            return True
     if "resource" in supplied:
         resource = body.resource
         if resource is None:
@@ -249,10 +259,16 @@ def _binding_to_read_response(binding: ExecutionBinding) -> ExecutionBindingRead
     identity (failed/cancelled executions, issue #590).
     """
     resource = binding.resource
+    # Normalized session attribution (issue #627): the stored singular
+    # column is the primary session; the JSONB collection (when present)
+    # carries the full deduplicated attribution.  Bindings with no resolved
+    # session read back an empty collection — never fabricated ownership.
+    session_ids = list(binding.external_session_ids)
     return ExecutionBindingReadResponse(
         binding_id=binding.binding_id,
         awx_job=binding.awx_job,
         external_session_id=binding.external_session_id,
+        external_session_ids=session_ids,
         resource=ProviderResourceIdentity(
             provider=resource.provider,
             repository=resource.repository,
@@ -370,6 +386,7 @@ async def create_execution_binding(
                         resource.resource_number if resource is not None else None
                     ),
                     external_session_id=body.external_session_id,
+                    external_session_ids=body.normalized_session_ids(),
                     outcome=body.outcome,
                     source_event_id=body.source_event_id,
                     branch=body.branch,
@@ -508,6 +525,10 @@ async def update_execution_binding(
                     failure_summary=body.failure_summary,
                     failure_summary_provided="failure_summary" in body.model_fields_set,
                     external_session_id=body.external_session_id,
+                    external_session_ids=body.normalized_session_ids()
+                    if "external_session_ids" in body.model_fields_set
+                    or "external_session_id" in body.model_fields_set
+                    else None,
                     provider=resource.provider if resource is not None else None,
                     repository=normalized_repo,
                     resource_number=(

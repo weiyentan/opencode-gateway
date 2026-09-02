@@ -482,7 +482,7 @@ console.log('\u25B6 detail adapter — executions');
   assertEqual(bad.tokens.available, false, 'exec: null execution -> no token telemetry');
 })();
 
-console.log('\u25B6 detail adapter — aggregate + sessions + usage');
+console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
 
 (function () {
   var detail = A.adaptChangeRequestDetail({
@@ -508,8 +508,8 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
   assertEqual(detail.providerTerm, 'MR', 'detail: MR term');
   assertEqual(detail.providerState.value, 'merged', 'detail: provider state merged');
   assertEqual(detail.afkAutomationState.value, 'completed', 'detail: afk state completed');
-  assertEqual(detail.aggregateCost.available, true, 'detail: aggregate cost available');
-  assertEqual(detail.aggregateCost.usd, 0.12, 'detail: aggregate cost uses gateway value');
+  assertEqual(detail.runCost.available, true, 'detail: AFK Run Cost available');
+  assertEqual(detail.runCost.usd, 0.12, 'detail: AFK Run Cost uses gateway value');
   assertEqual(detail.executions.length, 4, 'detail: 4 executions preserved (duplicates kept)');
   assertDeepEqual(detail.executionCounts, { total: 4, running: 0, completed: 0, failed: 0, cancelled: 0,
     implementation: 2, review: 1, retry: 1 },
@@ -548,21 +548,21 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
   assertDeepEqual(mixed.executions.map(function (e) { return e.status.value; }),
     ['completed', 'failed', 'cancelled', 'running'], 'detail: mixed outcomes preserved');
 
-  // Missing cost telemetry: no gateway aggregate, per-execution costs absent
+  // Missing cost telemetry: no gateway run total, per-execution costs absent
   var noCost = A.adaptChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r', external_id: '3' },
     executions: [
       { awx_job: { job_id: '1' }, purpose: 'implementation', outcome: 'completed' }
     ]
   });
-  assertEqual(noCost.aggregateCost.available, false, 'detail: missing aggregate cost unavailable');
-  assertEqual(noCost.aggregateCost.label, 'Cost unavailable', 'detail: missing aggregate cost label');
-  assertEqual(noCost.aggregateCost.usd, null, 'detail: missing aggregate cost usd null');
+  assertEqual(noCost.runCost.available, false, 'detail: missing run cost unavailable');
+  assertEqual(noCost.runCost.label, 'Cost unavailable', 'detail: missing run cost label');
+  assertEqual(noCost.runCost.usd, null, 'detail: missing run cost usd null');
 
-  // Missing gateway aggregate: per-execution costs present, but the Gateway
-  // aggregate is null -> the aggregate is unavailable (null), never a
-  // browser-side sum that could invent or double-count cost (issue #617
-  // review finding HIGH-1).
+  // Missing gateway run total: per-execution (AWX Execution Cost) subtotals
+  // present, but the Gateway aggregate is null -> the run total is
+  // unavailable (null), never a browser-side sum that could invent or
+  // double-count cost (issue #617 review finding HIGH-1).
   var partial = A.adaptChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r', external_id: '4' },
     executions: [
@@ -570,9 +570,18 @@ console.log('\u25B6 detail adapter — aggregate + sessions + usage');
       { awx_job: { job_id: '2' }, purpose: 'review', outcome: 'failed', estimated_cost_usd: null }
     ]
   });
-  assertEqual(partial.aggregateCost.available, false, 'detail: missing gateway aggregate -> unavailable');
-  assertEqual(partial.aggregateCost.usd, null, 'detail: no browser-side fallback sum');
-  assertEqual(partial.aggregateCost.label, 'Cost unavailable', 'detail: missing gateway aggregate label');
+  assertEqual(partial.runCost.available, false, 'detail: missing gateway run total -> unavailable');
+  assertEqual(partial.runCost.usd, null, 'detail: no browser-side fallback sum');
+  assertEqual(partial.runCost.label, 'Cost unavailable', 'detail: missing gateway run total label');
+  // Known lower-level costs remain visible when the run total is unavailable:
+  // each execution keeps its Gateway-computed AWX Execution Cost subtotal,
+  // and the execution with unknown cost renders 'Cost unavailable' (never $0).
+  assertEqual(partial.executions[0].cost.available, true, 'detail: known execution subtotal stays available');
+  assertEqual(partial.executions[0].cost.usd, 0.30, 'detail: known execution subtotal value preserved');
+  assertEqual(partial.executions[0].cost.label, '$0.30', 'detail: known execution subtotal label');
+  assertEqual(partial.executions[1].cost.available, false, 'detail: unknown execution subtotal unavailable');
+  assertEqual(partial.executions[1].cost.label, 'Cost unavailable', 'detail: unknown execution subtotal label');
+  assertEqual(partial.executions[1].cost.usd, null, 'detail: unknown execution subtotal never coerced to zero');
 
   // Summary-nested detail contract (detail = { summary: {...} })
   var nested = A.adaptChangeRequestDetail({

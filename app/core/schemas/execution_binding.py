@@ -118,6 +118,26 @@ def redact_and_bound_failure_summary(value: str) -> str:
     return redact_failure_summary(value)[:MAX_FAILURE_SUMMARY_LENGTH]
 
 
+def _clean_session_id_collection(v: list[str] | None) -> list[str] | None:
+    """Validate and normalize an ``external_session_ids`` collection.
+
+    Every entry must be a non-empty string; duplicates are removed while
+    preserving first-occurrence order (the first entry is the primary
+    session).  ``None`` passes through untouched (the field is optional).
+    """
+    if v is None:
+        return None
+    cleaned: list[str] = []
+    for item in v:
+        if not item:
+            raise ValueError(
+                "external_session_ids entries must be non-empty strings"
+            )
+        if item not in cleaned:
+            cleaned.append(item)
+    return cleaned
+
+
 class ExecutionBindingResourceIn(BaseModel):
     """Provider resource identity as supplied by the AWX integration.
 
@@ -229,9 +249,22 @@ class ExecutionBindingCreateRequest(BaseModel):
         default=None,
         description=(
             "External OpenCode session id (e.g. ses_* id); optional for "
-            "running provisioning and failed/cancelled executions (issue #590)"
+            "running provisioning and failed/cancelled executions (issue #590).  "
+            "Kept for backward compatibility — normalized into "
+            "external_session_ids as a single-element collection."
         ),
         min_length=1,
+    )
+    external_session_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "External OpenCode session ids attributed to this execution "
+            "(issue #627).  Non-empty collection; duplicates are removed "
+            "preserving first-occurrence order (the first entry is the "
+            "primary session).  Optional for running provisioning and "
+            "failed/cancelled executions.  Mutually exclusive with the "
+            "singular external_session_id."
+        ),
     )
     resource: ExecutionBindingResourceIn | None = Field(
         default=None,
@@ -250,18 +283,17 @@ class ExecutionBindingCreateRequest(BaseModel):
             "backfill, or recovery"
         ),
     )
-    afk_run_id: str | None = Field(
-        default=None,
+    afk_run_id: str = Field(
         min_length=26,
         max_length=26,
         description=(
-            "Optional gateway-assigned AFK run ULID (26 chars), pre-provisioned "
-            "via POST /api/v1/afk/executions/runs.  When supplied, the binding "
-            "attaches to that lifecycle (validated against afk_runs — an "
-            "unknown run is rejected with 404) so many execution bindings can "
-            "reference one lifecycle; when omitted, the gateway provisions a "
-            "run for the binding (legacy behavior preserved).  Required when "
-            "outcome is 'running' or when no resource is supplied (issue #590)."
+            "Gateway-assigned AFK run ULID (26 chars), pre-provisioned "
+            "via POST /api/v1/afk/executions/runs.  Required for every "
+            "new binding (issue #626): the binding attaches to that "
+            "lifecycle (validated against afk_runs — an unknown run is "
+            "rejected with 404) so many execution bindings can reference "
+            "one lifecycle.  Legacy persisted rows without it remain "
+            "readable with a null afk_run_id."
         ),
     )
 
@@ -288,6 +320,29 @@ class ExecutionBindingCreateRequest(BaseModel):
         """Start-time provisioning must attach to a pre-provisioned lifecycle."""
         if self.outcome is ExecutionOutcome.RUNNING and self.afk_run_id is None:
             raise ValueError("afk_run_id is required when outcome is 'running'")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_afk_run_id_required_for_new_bindings(
+        self,
+    ) -> ExecutionBindingCreateRequest:
+        """Every new execution binding must carry ``afk_run_id`` (issue #626).
+
+        The AWX job must join directly to its logical AFK Run — the legacy
+        auto-provisioning path (POST without ``afk_run_id``, issue #595)
+        is closed for new bindings.  The rule applies uniformly to
+        start-time provisioning (``running``) and to direct terminal
+        POSTs, covering all outcomes.  Legacy persisted rows are
+        unaffected: reads return their null ``afk_run_id`` as-is and the
+        ``PATCH`` terminal-update path never re-validates the create
+        contract.
+        """
+        if self.afk_run_id is None:
+            raise ValueError(
+                "afk_run_id is required for new execution bindings; "
+                "pre-provision the lifecycle via POST "
+                "/api/v1/afk/executions/runs first"
+            )
         return self
 
     @model_validator(mode="after")
@@ -322,11 +377,50 @@ class ExecutionBindingCreateRequest(BaseModel):
         resource/session-less (issue #600 review).
         """
         if self.outcome is ExecutionOutcome.COMPLETED and (
-            self.resource is None or self.external_session_id is None
+            self.resource is None
+            or (
+                self.external_session_id is None
+                and self.external_session_ids is None
+            )
         ):
             raise ValueError(
-                "resource and external_session_id are required when "
-                "outcome is 'completed'"
+                "resource and external_session_id (or external_session_ids) "
+                "are required when outcome is 'completed'"
+            )
+        return self
+
+    @field_validator("external_session_ids")
+    @classmethod
+    def _validate_session_collection_entries(
+        cls, v: list[str] | None
+    ) -> list[str] | None:
+        """Every session id entry must be a non-empty string (issue #627)."""
+        return _clean_session_id_collection(v)
+
+    @model_validator(mode="after")
+    def _validate_session_collection(self) -> ExecutionBindingCreateRequest:
+        """Normalize the session attribution input (issue #627).
+
+        The new plural field and the legacy singular field are mutually
+        exclusive: supplying both is a contradictory payload (422).  A
+        singular ``external_session_id`` is accepted for backward
+        compatibility and normalizes to a one-element collection.
+        The plural collection may be omitted entirely, but when supplied
+        it must be non-empty (an empty collection is invalid input, not
+        "no sessions" — omit the field instead).
+        """
+        if (
+            self.external_session_id is not None
+            and self.external_session_ids is not None
+        ):
+            raise ValueError(
+                "external_session_id and external_session_ids are mutually "
+                "exclusive; supply only one"
+            )
+        if self.external_session_ids is not None and not self.external_session_ids:
+            raise ValueError(
+                "external_session_ids must be a non-empty collection when "
+                "supplied; omit the field to attribute no sessions"
             )
         return self
 
@@ -399,6 +493,21 @@ class ExecutionBindingCreateRequest(BaseModel):
             return None
         return redact_and_bound_failure_summary(v)
 
+    def normalized_session_ids(self) -> list[str]:
+        """Return the deduplicated, order-preserving session attribution.
+
+        The plural collection wins when supplied (the schema validator makes
+        the two forms mutually exclusive); a legacy singular
+        ``external_session_id`` normalizes to a one-element collection.
+        Empty when the execution carries no session attribution.
+        """
+        if self.external_session_ids is not None:
+            cleaned = _clean_session_id_collection(self.external_session_ids)
+            return cleaned or []
+        if self.external_session_id is not None:
+            return [self.external_session_id]
+        return []
+
 
 class ExecutionBindingUpdateRequest(BaseModel):
     """Terminal-update payload (``PATCH /api/v1/afk/executions/{awx_job_id}``,
@@ -438,7 +547,19 @@ class ExecutionBindingUpdateRequest(BaseModel):
         min_length=1,
         description=(
             "External OpenCode session id discovered at completion "
-            "(non-erasing fill-in); omitted leaves the stored value untouched"
+            "(non-erasing fill-in); omitted leaves the stored value untouched.  "
+            "Kept for backward compatibility — normalized into "
+            "external_session_ids as a single-element collection."
+        ),
+    )
+    external_session_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "External OpenCode session ids attributed to this execution "
+            "(issue #627), discovered at completion (non-erasing fill-in).  "
+            "Duplicates are removed preserving first-occurrence order.  "
+            "Mutually exclusive with the singular external_session_id; an "
+            "empty collection is invalid — omit the field instead."
         ),
     )
     resource: ExecutionBindingResourceIn | None = Field(
@@ -474,6 +595,37 @@ class ExecutionBindingUpdateRequest(BaseModel):
         if not self.outcome.is_terminal:
             raise ValueError(
                 "outcome must be a terminal outcome: completed, failed, or cancelled"
+            )
+        return self
+
+    @field_validator("external_session_ids")
+    @classmethod
+    def _validate_session_collection_entries(
+        cls, v: list[str] | None
+    ) -> list[str] | None:
+        """Every session id entry must be a non-empty string (issue #627)."""
+        return _clean_session_id_collection(v)
+
+    @model_validator(mode="after")
+    def _validate_session_collection(self) -> ExecutionBindingUpdateRequest:
+        """Normalize the session attribution input (issue #627).
+
+        Same contract as the POST path: the plural collection and the legacy
+        singular field are mutually exclusive, and a supplied collection must
+        be non-empty (omitting the field attributes no new sessions).
+        """
+        if (
+            self.external_session_id is not None
+            and self.external_session_ids is not None
+        ):
+            raise ValueError(
+                "external_session_id and external_session_ids are mutually "
+                "exclusive; supply only one"
+            )
+        if self.external_session_ids is not None and not self.external_session_ids:
+            raise ValueError(
+                "external_session_ids must be a non-empty collection when "
+                "supplied; omit the field to attribute no sessions"
             )
         return self
 
@@ -530,6 +682,21 @@ class ExecutionBindingUpdateRequest(BaseModel):
             return None
         return redact_and_bound_failure_summary(v)
 
+    def normalized_session_ids(self) -> list[str]:
+        """Return the deduplicated, order-preserving session attribution.
+
+        Mirrors the POST-path helper: the plural collection wins when
+        supplied; a legacy singular ``external_session_id`` normalizes to a
+        one-element collection.  Empty when the update attributes no
+        sessions.
+        """
+        if self.external_session_ids is not None:
+            cleaned = _clean_session_id_collection(self.external_session_ids)
+            return cleaned or []
+        if self.external_session_id is not None:
+            return [self.external_session_id]
+        return []
+
 
 class ExecutionBindingReadResponse(BaseModel):
     """One execution binding (single-binding read by AWX job id).
@@ -547,7 +714,17 @@ class ExecutionBindingReadResponse(BaseModel):
         default=None,
         description=(
             "External OpenCode session id (e.g. ses_* id); None when the "
-            "binding has no resolved session"
+            "binding has no resolved session.  Legacy singular readback — "
+            "the first entry of external_session_ids when one exists."
+        ),
+    )
+    external_session_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Normalized session attribution (issue #627): every external "
+            "OpenCode session id attributed to this execution, deduplicated "
+            "with the first entry as the primary session.  Empty for "
+            "historical / run-level-only bindings with no resolved session."
         ),
     )
     resource: ProviderResourceIdentity | None = Field(

@@ -30,6 +30,10 @@ _B_TS = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)  # noqa: UP017
 _CLIENT_ID = uuid.uuid4()
 _CREDENTIAL_ID = uuid.uuid4()
 
+# afk_run_id is required for every new binding (issue #626); pre-provisioned
+# lifecycles are referenced by this 26-char ULID in all write-path payloads.
+_RUN_ULID = "01JZABCDEFGHJKLMNPQRSTVWXY"
+
 
 # ── Mock helpers ─────────────────────────────────────────────────────────────
 
@@ -144,10 +148,23 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        saved_row = _mk_binding_row(awx_job_id=42)
-        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
+        saved_row = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ULID)
+        # Call sequence: auth → create_or_replay (fetchrow→run-exists pre-check
+        # → re-read) — afk_run_id supplied, no auto-provision (issue #626)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -171,6 +188,7 @@ class TestCreateExecutionBinding:
             "title": "Implement auth",
             "started_at": "2026-08-01T12:00:00Z",
             "finished_at": "2026-08-02T12:00:00Z",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -181,6 +199,7 @@ class TestCreateExecutionBinding:
         assert binding["awx_job"]["job_id"] == "42"
         assert binding["resource"]["resource_type"] == "change_request"
         assert binding["outcome"] == "completed"
+        assert binding["afk_run_id"] == _RUN_ULID
 
     @pytest.mark.asyncio
     async def test_create_gitlab_mr_binding(self) -> None:
@@ -193,10 +212,26 @@ class TestCreateExecutionBinding:
             provider="gitlab",
             repository_url="gitlab.com/cloudnative-pg/cloudnative-pg",
             entity_number="6",
+            afk_run_id=_RUN_ULID,
         )
-        # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
+        # Call sequence: auth → create_or_replay (fetchrow→run-exists pre-check
+        # → re-read) — afk_run_id supplied, no auto-provision (issue #626)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "gitlab",
+                        "change_request_repository": (
+                            "gitlab.com/cloudnative-pg/cloudnative-pg"
+                        ),
+                        "change_request_external_id": "6",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -215,6 +250,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -235,6 +271,7 @@ class TestCreateExecutionBinding:
             awx_job_id=42,
             external_session_id="ses_abc123",
             trigger_type="manual",
+            afk_run_id=_RUN_ULID,
         )
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read
         conn.fetchrow = AsyncMock(
@@ -255,6 +292,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -280,6 +318,7 @@ class TestCreateExecutionBinding:
             started_at=_A_TS,
             finished_at=_B_TS,
             trigger_type="manual",
+            afk_run_id=_RUN_ULID,
         )
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -298,6 +337,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -315,6 +355,7 @@ class TestCreateExecutionBinding:
             awx_job_id=42,
             outcome="failed",
             failure_summary="Process crashed",
+            afk_run_id=_RUN_ULID,
         )
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -333,6 +374,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": None,
         }
 
@@ -345,7 +387,7 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        existing_row = _mk_binding_row(awx_job_id=42)
+        existing_row = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ULID)
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -365,6 +407,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -378,7 +421,7 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        existing_row = _mk_binding_row(awx_job_id=42)
+        existing_row = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ULID)
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -398,6 +441,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -411,7 +455,7 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        existing_row = _mk_binding_row(awx_job_id=42, outcome="completed")
+        existing_row = _mk_binding_row(awx_job_id=42, outcome="completed", afk_run_id=_RUN_ULID)
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -431,6 +475,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -444,7 +489,7 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        existing_row = _mk_binding_row(awx_job_id=42)
+        existing_row = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ULID)
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -464,6 +509,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -477,7 +523,7 @@ class TestCreateExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        existing_row = _mk_binding_row(awx_job_id=42)
+        existing_row = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ULID)
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -497,6 +543,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "source_event_id": "evt_changed",
         }
 
@@ -526,6 +573,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -554,6 +602,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_reason": "boom",
         }
 
@@ -581,6 +630,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": "boom",
         }
 
@@ -600,7 +650,19 @@ class TestCreateExecutionBinding:
         )
         # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -617,6 +679,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": "Process crashed",
         }
 
@@ -638,7 +701,19 @@ class TestCreateExecutionBinding:
             failure_summary="GITHUB_TOKEN=***",
         )
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -655,6 +730,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
         }
 
@@ -679,7 +755,19 @@ class TestCreateExecutionBinding:
             failure_summary="🔥" * 1000,
         )
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -696,6 +784,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": "🔥" * 1200,
         }
 
@@ -718,6 +807,7 @@ class TestCreateExecutionBinding:
             trigger_type="manual",
             failure_reason="timeout",
             failure_summary="Process crashed",
+            afk_run_id=_RUN_ULID,
         )
         conn.fetchrow = AsyncMock(
             side_effect=[_auth_row(), existing_row, existing_row]
@@ -737,6 +827,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_reason": "timeout",
             "failure_summary": "Process crashed",
         }
@@ -776,6 +867,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "failed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
             "failure_summary": "Different summary",
         }
 
@@ -870,6 +962,7 @@ class TestCreateExecutionBinding:
             awx_job_id=42,
             external_session_id="ses_abc123",
             trigger_type="manual",
+            afk_run_id=_RUN_ULID,
         )
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read
         conn.fetchrow = AsyncMock(
@@ -890,6 +983,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -914,13 +1008,25 @@ class TestCreateExecutionBinding:
         conn = _mk_conn()
         saved_row = _mk_binding_row(
             awx_job_id=42,
-            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
             trigger_type="eda",
             source_event_id="evt_001",
         )
         # Call sequence: auth → create_or_replay (fetchrow→pre-check→execute→fetch) → re-read
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, saved_row]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": _RUN_ULID,
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                saved_row,
+            ]
         )
         conn.fetch = AsyncMock(
             return_value=[mock_row({"id": uuid.uuid4()})]
@@ -940,6 +1046,7 @@ class TestCreateExecutionBinding:
             "outcome": "completed",
             "trigger_type": "eda",
             "source_event_id": "evt_001",
+            "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -947,41 +1054,20 @@ class TestCreateExecutionBinding:
         data = resp.json()
         assert data["status"] == "ok"
         binding = data["data"]
-        assert binding["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert binding["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWXY"
         assert binding["binding_id"] is not None
         assert binding["trigger_type"] == "eda"
         assert binding["source_event_id"] == "evt_001"
 
     @pytest.mark.asyncio
-    async def test_auto_provision_reuse_returns_201_with_owner_run_id(self) -> None:
-        """PR #600 blocker: a POST without afk_run_id whose canonical PR already
-        owns a lifecycle reuses it — 201 with the owner's afk_run_id, not a 409."""
+    async def test_post_without_afk_run_id_rejected_422(self) -> None:
+        """Issue #626: a POST without afk_run_id is rejected with 422 — the
+        legacy auto-provisioning path (PR #600 blocker reuse) is closed for
+        new bindings, even when the canonical PR already owns a lifecycle."""
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        saved_row = _mk_binding_row(
-            awx_job_id=42,
-            afk_run_id="01OWNER000000000000000000001",
-        )
-        # Call sequence: auth → create_or_replay (no existing binding →
-        # owner pre-check hit) → re-read after create.
-        conn.fetchrow = AsyncMock(
-            side_effect=[
-                _auth_row(),
-                None,
-                mock_row(
-                    {
-                        "afk_run_id": "01OWNER000000000000000000001",
-                        "change_request_provider": "github",
-                        "change_request_repository": "github.com/acme/proj",
-                        "change_request_external_id": "99",
-                    }
-                ),
-                saved_row,
-            ]
-        )
-        conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        conn.execute = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
         client = create_client(conn)
 
         payload = {
@@ -998,10 +1084,10 @@ class TestCreateExecutionBinding:
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
-        assert resp.status_code == 201, resp.text
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["data"]["afk_run_id"] == "01OWNER000000000000000000001"
+        assert resp.status_code == 422, resp.text
+        # Rejected at the schema boundary — the repository was never reached.
+        assert not conn.fetch.called
+        assert conn.fetchrow.call_count == 1  # credential lookup only
 
     @pytest.mark.asyncio
     async def test_idempotent_replay_returns_same_afk_run_id(self) -> None:
@@ -1011,7 +1097,7 @@ class TestCreateExecutionBinding:
         conn = _mk_conn()
         existing_row = _mk_binding_row(
             awx_job_id=42,
-            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
             trigger_type="eda",
             source_event_id="evt_001",
         )
@@ -1035,6 +1121,7 @@ class TestCreateExecutionBinding:
             "outcome": "completed",
             "trigger_type": "eda",
             "source_event_id": "evt_001",
+            "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -1042,7 +1129,7 @@ class TestCreateExecutionBinding:
         data = resp.json()
         assert data["status"] == "ok"
         binding = data["data"]
-        assert binding["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert binding["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWXY"
         assert binding["binding_id"] is not None
         assert binding["trigger_type"] == "eda"
 
@@ -1055,6 +1142,7 @@ class TestCreateExecutionBinding:
         existing_row = _mk_binding_row(
             awx_job_id=42,
             trigger_type="eda",
+            afk_run_id=_RUN_ULID,
         )
         # Call sequence: auth → create_or_replay (fetchrow→existing) → re-read → conflict
         conn.fetchrow = AsyncMock(
@@ -1075,6 +1163,7 @@ class TestCreateExecutionBinding:
             },
             "outcome": "completed",
             "trigger_type": "manual",
+            "afk_run_id": _RUN_ULID,
         }
 
         resp = await client.post("/api/v1/afk/executions", json=payload)
@@ -1182,7 +1271,7 @@ class TestGetExecutionBinding:
         conn = _mk_conn()
         row = _mk_binding_row(
             awx_job_id=42,
-            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+            afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
             trigger_type="eda",
         )
         conn.fetchrow = AsyncMock(return_value=row)
@@ -1192,7 +1281,7 @@ class TestGetExecutionBinding:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["data"]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert data["data"]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWXY"
         assert data["data"]["trigger_type"] == "eda"
 
     @pytest.mark.asyncio
@@ -1481,7 +1570,7 @@ class TestListExecutionBindings:
             _mk_binding_row(
                 awx_job_id=20,
                 outcome="completed",
-                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWX",
+                afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
                 trigger_type="manual",
             ),
         ]
@@ -1505,7 +1594,7 @@ class TestListExecutionBindings:
         assert bindings[0]["afk_run_id"] is None
         assert bindings[0]["trigger_type"] is None
         # New row — populated values
-        assert bindings[1]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWX"
+        assert bindings[1]["afk_run_id"] == "01JZABCDEFGHJKLMNPQRSTVWXY"
         assert bindings[1]["trigger_type"] == "manual"
 
 
@@ -2353,7 +2442,7 @@ class TestRunDetailSessionLinks:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        run_id = "01JZABCDEFGHJKLMNPQRSTVWX"
+        run_id = "01JZABCDEFGHJKLMNPQRSTVWXY"
         session_uuid = uuid.uuid4()
         run_row = mock_row(
             {

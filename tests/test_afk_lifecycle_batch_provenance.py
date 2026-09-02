@@ -552,6 +552,9 @@ def _execution_payload(**overrides) -> dict:
         },
         "outcome": "completed",
         "trigger_type": "manual",
+        # afk_run_id is required for every new binding (issue #626); tests
+        # that exercise the omitted-field behavior pass afk_run_id=None.
+        "afk_run_id": _RUN_ID,
     }
     payload.update(overrides)
     return payload
@@ -688,21 +691,30 @@ class TestExecutionBindingApiMultiplicity:
         assert resp.status_code == 409, resp.text
 
     @pytest.mark.asyncio
-    async def test_legacy_replay_omitting_afk_run_id_returns_200(self) -> None:
-        """A legacy replay (no afk_run_id) stays idempotent against a stored run."""
+    async def test_post_omitting_afk_run_id_rejected_422(self) -> None:
+        """Issue #626: a POST without afk_run_id is rejected with 422 — the
+        legacy auto-provision path is closed, even when replaying a stored
+        binding that references a run.  Existing bindings remain readable
+        via GET with their stored afk_run_id (no backfill needed)."""
         conn = _mk_conn()
         existing = _mk_binding_row(awx_job_id=42, afk_run_id=_RUN_ID, trigger_type="manual")
-        # auth → existing binding (replay) → re-read for the 200 response
-        conn.fetchrow = AsyncMock(side_effect=[_auth_row(), existing, existing])
+        # auth → schema rejects the payload before any business query
+        conn.fetchrow = AsyncMock(side_effect=[_auth_row()])
         conn.fetch = AsyncMock(return_value=[])
         conn.execute = AsyncMock()
         client = create_client(conn)
 
+        payload = _execution_payload()
+        del payload["afk_run_id"]
         resp = await client.post(
-            "/api/v1/afk/executions", json=_execution_payload()
+            "/api/v1/afk/executions", json=payload
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["data"]["afk_run_id"] == _RUN_ID
+        assert resp.status_code == 422, resp.text
+        # The stored binding (with its afk_run_id) is still readable.
+        conn.fetchrow = AsyncMock(side_effect=[existing])
+        readback = await client.get("/api/v1/afk/executions/42")
+        assert readback.status_code == 200, readback.text
+        assert readback.json()["data"]["afk_run_id"] == _RUN_ID
 
     @pytest.mark.asyncio
     async def test_malformed_afk_run_id_returns_422(self) -> None:

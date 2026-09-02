@@ -79,12 +79,16 @@ def _saved_row() -> MagicMock:
             "failure_reason": None,
             "started_at": None,
             "finished_at": None,
+            "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
         }
     )
 
 
 def _valid_binding_payload() -> dict:
-    """Minimal valid execution-binding POST body."""
+    """Minimal valid execution-binding POST body.
+
+    ``afk_run_id`` is required for every new binding (issue #626).
+    """
     return {
         "awx_job": {"job_id": "42", "job_template_id": 7},
         "external_session_id": "ses_abc123",
@@ -96,6 +100,7 @@ def _valid_binding_payload() -> dict:
         },
         "outcome": "completed",
         "trigger_type": "manual",
+        "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
     }
 
 
@@ -150,7 +155,19 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, _saved_row()]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                _saved_row(),
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -174,7 +191,19 @@ class TestDedicatedCredentialEnforcement:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, _saved_row()]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                _saved_row(),
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
@@ -419,7 +448,19 @@ class TestBearerTokenNonLeakage:
         mock_tx.__aexit__ = AsyncMock(return_value=None)
         conn.transaction = MagicMock(return_value=mock_tx)
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), None, None, _saved_row()]
+            side_effect=[
+                _auth_row(),
+                None,  # no existing binding for this AWX job
+                mock_row(
+                    {
+                        "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                        "change_request_provider": "github",
+                        "change_request_repository": "github.com/acme/proj",
+                        "change_request_external_id": "99",
+                    }
+                ),
+                _saved_row(),
+            ]
         )
         conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
         conn.execute = AsyncMock()
