@@ -99,17 +99,122 @@ def test_upsert_closure_link_is_deterministic_conflict_update(mock_conn: AsyncMo
     assert "DELETE" not in normalized.upper()
 
 
-# ── regression: AmbiguousParameterError (issue #559) ──────────────────────
+# ── focused: $8 type consistency for both active and revoked states ─────────
+
+
+def test_upsert_closure_link_active_state_produces_null_revoked_at(
+    mock_conn: AsyncMock,
+) -> None:
+    """An ACTIVE link inserts with revoked_at=NULL: the CASE WHEN must not
+    stamp revoked_at when state is 'active'."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    link = ClosureLink(
+        change_request_provider=Provider.GITHUB,
+        change_request_repository="github.com/org/repo",
+        change_request_external_id="100",
+        issue_provider=Provider.GITHUB,
+        issue_repository="github.com/org/repo",
+        issue_external_id="1",
+        kind=ClosureLinkKind.DECLARES_CLOSURE,
+        state=ClosureLinkState.ACTIVE,
+    )
+
+    asyncio.run(repo._upsert_closure_link(link))
+
+    calls = [
+        call.args
+        for call in mock_conn.execute.call_args_list
+        if "closure_links" in call.args[0]
+    ]
+    assert len(calls) == 1
+    sql, *args = calls[0]
+    normalized = " ".join(sql.split())
+    # state parameter is the 8th positional arg (index 7)
+    assert args[7] == "active"
+    # The VALUES CASE WHEN must evaluate to NULL for active state.
+    assert "CASE WHEN $8::varchar = 'revoked' THEN now() ELSE NULL END" in normalized
+    assert "$8::varchar" in normalized
+    assert "$8::text" not in normalized
+
+
+def test_upsert_closure_link_revoked_state_stamps_revoked_at(
+    mock_conn: AsyncMock,
+) -> None:
+    """A REVOKED link inserts with revoked_at=now(): the CASE WHEN must
+    stamp revoked_at when state is 'revoked'."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    link = ClosureLink(
+        change_request_provider=Provider.GITHUB,
+        change_request_repository="github.com/org/repo",
+        change_request_external_id="100",
+        issue_provider=Provider.GITHUB,
+        issue_repository="github.com/org/repo",
+        issue_external_id="1",
+        kind=ClosureLinkKind.DECLARES_CLOSURE,
+        state=ClosureLinkState.REVOKED,
+    )
+
+    asyncio.run(repo._upsert_closure_link(link))
+
+    calls = [
+        call.args
+        for call in mock_conn.execute.call_args_list
+        if "closure_links" in call.args[0]
+    ]
+    assert len(calls) == 1
+    sql, *args = calls[0]
+    normalized = " ".join(sql.split())
+    # state parameter is the 8th positional arg (index 7)
+    assert args[7] == "revoked"
+    # The VALUES CASE WHEN must evaluate to now() for revoked state.
+    assert "CASE WHEN $8::varchar = 'revoked' THEN now() ELSE NULL END" in normalized
+    assert "$8::varchar" in normalized
+    assert "$8::text" not in normalized
+
+
+def test_upsert_closure_link_on_conflict_clears_revoked_at_for_active(
+    mock_conn: AsyncMock,
+) -> None:
+    """On conflict, an ACTIVE state must clear revoked_at (re-activation)."""
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    link = ClosureLink(
+        change_request_provider=Provider.GITHUB,
+        change_request_repository="github.com/org/repo",
+        change_request_external_id="200",
+        issue_provider=Provider.GITHUB,
+        issue_repository="github.com/org/repo",
+        issue_external_id="2",
+        kind=ClosureLinkKind.REFERENCES,
+        state=ClosureLinkState.ACTIVE,
+    )
+
+    asyncio.run(repo._upsert_closure_link(link))
+
+    calls = [
+        call.args[0]
+        for call in mock_conn.execute.call_args_list
+        if "closure_links" in call.args[0]
+    ]
+    assert len(calls) == 1
+    normalized = " ".join(calls[0].split())
+    # DO UPDATE SET must clear revoked_at on re-activation
+    assert (
+        "revoked_at = CASE WHEN EXCLUDED.state = 'revoked' THEN now() ELSE NULL END"
+        in normalized
+    )
 
 
 def test_upsert_closure_link_state_parameter_has_consistent_type(
     mock_conn: AsyncMock,
 ) -> None:
-    """Regression: $8 used in both VALUES and CASE WHEN caused
+    """Regression: $8 used in both VALUES and CASE WHEN must use one consistent
+    type so PostgreSQL does not raise ``AmbiguousParameterError``.
 
-    ``AmbiguousParameterError: text versus character varying``.  The SQL
-    must cast the parameter consistently so PostgreSQL sees one type.
+    The fix explicitly casts $8 as varchar in both the INSERT VALUES and the
+    CASE WHEN comparison, so PostgreSQL sees one consistent type.
     """
+    import re
+
     repo = AsyncpgOutcomeRepository(mock_conn)
     for state in (ClosureLinkState.ACTIVE, ClosureLinkState.REVOKED):
         mock_conn.reset_mock()
@@ -133,23 +238,16 @@ def test_upsert_closure_link_state_parameter_has_consistent_type(
         assert len(sql_calls) == 1, f"expected one closure_links call for state={state}"
         normalized = " ".join(sql_calls[0].split())
 
-        # The VALUES clause must not use a bare ``$8`` in the CASE WHEN
-        # comparison — that causes PostgreSQL to infer conflicting types
-        # (text vs varchar) for the same parameter.  Either cast to
-        # ``$8::text`` or use the column reference ``EXCLUDED.state``.
-        # The ``EXCLUDED.state = 'revoked'`` in the DO UPDATE clause is
-        # already fine (column reference), so we only check that there is
-        # NO bare ``$8 = 'revoked'`` (without ``::text``) in the SQL.
-        import re
+        # $8 must be explicitly typed consistently in both usages.
+        assert "$8::text" not in normalized, (
+            f"spurious ::text cast on $8 reintroduces type ambiguity:\n{normalized}"
+        )
 
-        # Find all CASE WHEN comparisons involving the state parameter
+        assert normalized.count("$8::varchar") >= 2
         case_matches = re.findall(r"CASE WHEN (\S+) = 'revoked'", normalized)
-        for match in case_matches:
-            # match should be "$8::text" or "EXCLUDED.state" — never bare "$8"
-            assert match != "$8", (
-                f"bare $8 in CASE WHEN causes AmbiguousParameterError; "
-                f"expected $8::text or EXCLUDED.state, got: {match} in\n{normalized}"
-            )
+        assert any(
+            m == "$8::varchar" for m in case_matches
+        ), f"typed $8 must appear in CASE WHEN: {case_matches}"
 
 
 def test_upsert_closure_unresolved_is_versioned_conflict_update(mock_conn: AsyncMock) -> None:
@@ -1057,3 +1155,131 @@ async def test_recompute_is_idempotent(db_pool) -> None:
         assert await conn.fetchval("SELECT count(*) FROM closure_links") == 1
         episode = await conn.fetchrow("SELECT status FROM closure_episodes")
         assert episode["status"] == ClosureEpisodeStatus.PENDING.value
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Real-Postgres: $8 type-consistency regression (issue #559)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_closure_link_active_state_revoked_at_is_null(db_pool) -> None:
+    """Against real PostgreSQL: an ACTIVE closure link inserts with
+    revoked_at=NULL — the $8 parameter must be consistently typed so
+    the CASE WHEN evaluates correctly."""
+    cr_repo = "gitlab.com/org/cr"
+    issue_repo = "gitlab.com/org/issue"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        link = ClosureLink(
+            change_request_provider=Provider.GITLAB,
+            change_request_repository=cr_repo,
+            change_request_external_id="50",
+            issue_provider=Provider.GITLAB,
+            issue_repository=issue_repo,
+            issue_external_id="1",
+            kind=ClosureLinkKind.DECLARES_CLOSURE,
+            state=ClosureLinkState.ACTIVE,
+        )
+        await repo._upsert_closure_link(link)
+
+        row = await conn.fetchrow(
+            "SELECT state, revoked_at FROM closure_links "
+            "WHERE change_request_external_id = '50' AND issue_external_id = '1'"
+        )
+        assert row is not None, "ACTIVE closure link not inserted"
+        assert row["state"] == ClosureLinkState.ACTIVE.value
+        assert row["revoked_at"] is None, (
+            "revoked_at must be NULL for ACTIVE links"
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_closure_link_revoked_state_revoked_at_is_stamped(db_pool) -> None:
+    """Against real PostgreSQL: a REVOKED closure link inserts with
+    revoked_at=now() — the $8 parameter must be consistently typed so
+    the CASE WHEN evaluates correctly."""
+    cr_repo = "gitlab.com/org/cr"
+    issue_repo = "gitlab.com/org/issue"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+        link = ClosureLink(
+            change_request_provider=Provider.GITLAB,
+            change_request_repository=cr_repo,
+            change_request_external_id="51",
+            issue_provider=Provider.GITLAB,
+            issue_repository=issue_repo,
+            issue_external_id="1",
+            kind=ClosureLinkKind.DECLARES_CLOSURE,
+            state=ClosureLinkState.REVOKED,
+        )
+        await repo._upsert_closure_link(link)
+
+        row = await conn.fetchrow(
+            "SELECT state, revoked_at FROM closure_links "
+            "WHERE change_request_external_id = '51' AND issue_external_id = '1'"
+        )
+        assert row is not None, "REVOKED closure link not inserted"
+        assert row["state"] == ClosureLinkState.REVOKED.value
+        assert row["revoked_at"] is not None, (
+            "revoked_at must be stamped for REVOKED links"
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_closure_link_revoked_to_active_clears_revoked_at(db_pool) -> None:
+    """Against real PostgreSQL: re-activating a REVOKED link clears revoked_at.
+    This exercises both the INSERT CASE WHEN and the DO UPDATE CASE WHEN
+    with the same $8 parameter type."""
+    cr_repo = "gitlab.com/org/cr"
+    issue_repo = "gitlab.com/org/issue"
+
+    async with db_pool.acquire() as conn:
+        repo = AsyncpgOutcomeRepository(conn)
+
+        # First: insert as REVOKED
+        revoked_link = ClosureLink(
+            change_request_provider=Provider.GITLAB,
+            change_request_repository=cr_repo,
+            change_request_external_id="52",
+            issue_provider=Provider.GITLAB,
+            issue_repository=issue_repo,
+            issue_external_id="1",
+            kind=ClosureLinkKind.DECLARES_CLOSURE,
+            state=ClosureLinkState.REVOKED,
+        )
+        await repo._upsert_closure_link(revoked_link)
+
+        row = await conn.fetchrow(
+            "SELECT state, revoked_at FROM closure_links "
+            "WHERE change_request_external_id = '52' AND issue_external_id = '1'"
+        )
+        assert row["state"] == ClosureLinkState.REVOKED.value
+        assert row["revoked_at"] is not None
+
+        # Second: upsert as ACTIVE (re-activation)
+        active_link = ClosureLink(
+            change_request_provider=Provider.GITLAB,
+            change_request_repository=cr_repo,
+            change_request_external_id="52",
+            issue_provider=Provider.GITLAB,
+            issue_repository=issue_repo,
+            issue_external_id="1",
+            kind=ClosureLinkKind.DECLARES_CLOSURE,
+            state=ClosureLinkState.ACTIVE,
+        )
+        await repo._upsert_closure_link(active_link)
+
+        row = await conn.fetchrow(
+            "SELECT state, revoked_at FROM closure_links "
+            "WHERE change_request_external_id = '52' AND issue_external_id = '1'"
+        )
+        assert row["state"] == ClosureLinkState.ACTIVE.value
+        assert row["revoked_at"] is None, (
+            "revoked_at must be cleared on re-activation (ACTIVE state)"
+        )
