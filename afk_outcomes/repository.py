@@ -1026,8 +1026,8 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                  change_request_external_id, issue_provider, issue_repository,
                  issue_external_id, kind, state, revoked_at, resolver_version,
                  first_seen_at, last_seen_at, derived_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                    CASE WHEN $8::text = 'revoked' THEN now() ELSE NULL END,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::varchar,
+                    CASE WHEN $8::varchar = 'revoked' THEN now() ELSE NULL END,
                     $9, now(), now(), now())
             ON CONFLICT (change_request_provider, change_request_repository,
                          change_request_external_id, issue_provider,
