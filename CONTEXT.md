@@ -124,31 +124,20 @@ timeline, not an accounting summary. Exposed read-only via the
 _Avoid_: replay blob, transcript (in the usage-aggregate sense)
 
 **AWX Execution Binding**:
-A durable Gateway record representing one **AWX Execution** within a
-Gateway-owned **AFK Run** (`afk_run_id`) and, when known, linking it to one
-**Stable Resource Identity** (the `change_request`) and one **External Session
-ID**. Multiple bindings under the same AFK Run are execution attempts to
-realize that one logical lifecycle; any completed binding means the AFK Run's
-execution succeeded, while earlier failed or cancelled bindings remain
-history. Provisioned at AWX
-start with `outcome=running` (attached to a pre-provisioned `afk_run_id`;
-change request and session may be absent) and transitioned to a terminal
-outcome via `PATCH /api/v1/afk/executions/{awx_job_id}` or persisted directly
-as a terminal outcome via `POST /api/v1/afk/executions`. This direct terminal
-binding is still an AWX Execution Binding for one AWX Execution; it simply has
-no previously persisted running state. Failed or cancelled
-executions may persist without a change request or a session; readback returns
-`null` for absent identities. Idempotent by AWX job identity — identical
-replays return the stored row, conflicting data returns `409` without
-overwriting history.
+A durable Gateway association between one **AFK Run** (`afk_run_id`) and its
+AWX job history. One AFK Run currently has exactly one AWX Execution Binding;
+the binding contains many uniquely identified **AWX Executions**. The outcome
+of any individual execution has no authority over the AFK Run lifecycle.
+_Avoid_: AFK Run, inferred correlation
 _Avoid_: AFK Run, inferred correlation
 
 **AWX Execution**:
-One externally identified AWX job run that invokes an OpenCode execution.
+One externally identified AWX job run that invokes an OpenCode execution and
+belongs to the AFK Run's single AWX Execution Binding.
 _Avoid_: AWX attempt (unless explicitly describing a separate job run)
 
 **Execution Outcome**:
-The lifecycle result of an AWX Execution Binding. `running` is the provisional
+The lifecycle result of an individual AWX Execution. `running` is the provisional
 outcome provisioned at AWX start; `completed`, `failed`, and `cancelled` are
 the three terminal outcomes. A `running` binding is transitioned to a terminal
 outcome via `PATCH /api/v1/afk/executions/{awx_job_id}`; `running` never
@@ -606,18 +595,14 @@ merge on base totals
 **AFK Run**:
 The aggregate root of the AFK outcome read-model (``afk_runs`` table,
 ``afk_outcomes.models.AFKRun``). Represents one logical AFK engineering
-lifecycle. It may contain multiple AWX Execution Bindings because retries
-create new AWX Executions without creating a new lifecycle. Sessions,
-engineering entities, correlations, and the resulting EngineeringOutcome
-enrich that lifecycle without defining its execution identity. While any AWX
-Execution Binding is running, the lifecycle has not reached an aggregate
-terminal result. Once all bindings are terminal, any completed binding makes
-the AFK Run completed; otherwise any failed binding makes it failed; otherwise
-it is cancelled. A failed or cancelled lifecycle may be retried by attaching a
-new AWX Execution Binding with a new AWX job identity, which returns the AFK
-Run to running while preserving its terminal binding history. A completed
-lifecycle is closed to new AWX Execution Bindings; related additional work
-requires a new AFK Run.
+life cycle anchored by one canonical **change_request**. It has one AWX
+Execution Binding containing many AWX executions, including development,
+review, and fixes.
+The child outcomes are historical execution facts. Sessions, engineering
+entities, correlations, and the resulting EngineeringOutcome enrich that lifecycle
+without defining its execution identity. The AFK Run remains open while its
+change request is open and becomes terminal when that change request is merged
+or closed. Individual execution outcomes do not reopen or close the AFK Run.
 _Avoid_: Outcome record, engineering task (generic)
 
 **AFK Run Cost**:
@@ -642,11 +627,11 @@ pre-existing identifier from the provider.
 _Avoid_: Run ID (ambiguous — collides with agent-run session IDs)
 
 **RunStatus**:
-The lifecycle status of an AFK Run. ``pending`` means the AFK Run exists but
-has no AWX Execution Bindings. Its first running binding changes it to
-``running``; a direct terminal binding may instead change it directly to
-``completed``, ``failed``, or ``cancelled``. Never conflate this aggregate
-lifecycle status with an individual Execution Outcome, the agent-run
+The lifecycle status of an AFK Run, independent of its AWX Execution Outcomes.
+The AFK Run remains open while its canonical change request is open and is
+completed only when that change request is successfully merged; closing the
+change request without merging is a distinct terminal result. Never conflate
+this lifecycle status with an individual Execution Outcome, the agent-run
 ``_compute_status`` heuristic, or EngineeringOutcomeStatus.
 _Avoid_: Reusing the Agent Run status heuristic, conflating with outcome status
 
@@ -1420,7 +1405,7 @@ manages.
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
 - An **Exact Resource↔Session Association** links one engineering resource (by **Stable Resource Identity**) to one OpenCode session and is keyed by `(provider, repository, resource_type, resource_number, external_session_id)`, written with `ON CONFLICT ... DO UPDATE SET last_seen_at = now()` so the same explicit reference never duplicates a link while `last_seen_at` tracks re-observation recency
 - An **Exact Resource↔Session Association** is derived only from a **Session Resource Reference**; the `afk_outcomes.repository` `AsyncpgOutcomeRepository.save_associations` is the only writer, and no association is ever created from temporal or heuristic inference
-- An **AWX Execution Binding** belongs to exactly one **AWX Execution** and one **afk_run_id**; its **Stable Resource Identity** (the `change_request`) and **External Session ID** are optional — `running` provisioning and `failed`/`cancelled` executions may persist without either, and readback returns `null` for absent identities. A resource may have many bindings, including failed and later successful executions
+- An **AFK Run** has exactly one **AWX Execution Binding**, and that binding contains many uniquely identified **AWX Executions**; each execution may carry optional **Stable Resource Identity** and **External Session ID** metadata
 - An **AWX Execution Binding** is idempotent by AWX job identity: repeating the same binding is a no-op, conflicting data for the same AWX job is rejected, and a new AWX job for the same resource creates a separate binding (applies to both `POST /api/v1/afk/executions` and `PATCH /api/v1/afk/executions/{awx_job_id}`; `PATCH` uses non-erasing fill-ins for late-discovered session/resource and never overwrites terminal history)
 - A GitHub pull request and GitLab merge request are both represented as a `change_request` **Stable Resource Identity** when a resource is present; provider identity is supplied at the API boundary rather than an internal Gateway database ID
 - An **AWX Execution Binding** may carry the originating EDA `source_event_id` (required when `trigger_type=eda`), `trigger_type`, branch metadata, title, `started_at`/`finished_at`, and a bounded redacted failure summary (only on non-completed outcomes); it never stores raw `extra_vars`, stdout, prompts, tokens, or arbitrary AWX payloads
