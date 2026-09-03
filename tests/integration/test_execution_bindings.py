@@ -9,6 +9,14 @@ database-enforced guarantees of ``/api/v1/afk/executions``:
 * Identical replay is a no-op, conflicting replay is rejected
 * DB UNIQUE constraints exercised at SQL level
 * No raw tokens, stdout, prompts, or arbitrary AWX payloads in stored/returned data
+* ADR 0028: binding writes never project ``afk_runs.status`` from child
+  AWX execution outcomes — the run stays ``pending`` after every binding
+  write, a completed run accepts new bindings (no completed-lifecycle
+  409), and finalization happens only via the provider-event seam
+  (``AsyncpgOutcomeRepository.save``)
+* Issue #626: every POST payload references a pre-provisioned ``afk_run_id``
+  (the legacy auto-provision path is closed) — each test seeds its run via
+  ``_seed_afk_run`` and passes it to ``_make_binding_payload``
 
 Prerequisites
 -------------
@@ -29,6 +37,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from fastapi import Request
 
 from app.core.identity import hash_token
@@ -69,7 +78,7 @@ async def _can_connect() -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def _integration_db_available() -> bool:
     if not await _can_connect():
         pytest.skip(
@@ -104,7 +113,7 @@ def _migration_script_dir() -> str:
     return str(dst)
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
@@ -221,6 +230,7 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 def _make_binding_payload(
     *,
     awx_job_id: int,
+    afk_run_id: str,
     external_session_id: str = "ses_integration_test",
     provider: str = "github",
     repository: str = "https://github.com/acme/proj",
@@ -234,10 +244,16 @@ def _make_binding_payload(
     started_at: str | None = "2026-08-01T12:00:00Z",
     finished_at: str | None = "2026-08-02T12:00:00Z",
 ) -> dict:
-    """Build a POST /api/v1/afk/executions payload."""
+    """Build a POST /api/v1/afk/executions payload.
+
+    ``afk_run_id`` is required for every new binding (issue #626): the
+    payload must reference a pre-provisioned AFK Run seeded via
+    ``_seed_afk_run``.
+    """
     payload: dict = {
         "awx_job": {"job_id": str(awx_job_id), "job_template_id": 7},
         "external_session_id": external_session_id,
+        "afk_run_id": afk_run_id,
         "resource": {
             "provider": provider,
             "repository": repository,
@@ -266,16 +282,17 @@ def _make_binding_payload(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
     """Authenticated POST persists a binding; GET by awx_job_id returns it."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)  # unique per run
 
-    payload = _make_binding_payload(awx_job_id=awx_job_id)
+    payload = _make_binding_payload(awx_job_id=awx_job_id, afk_run_id=run_id)
 
     async with client as c:
         # POST
@@ -309,11 +326,12 @@ async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> None:
     """Multiple AWX jobs targeting the same GitHub PR are both persisted."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -322,12 +340,14 @@ async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> 
 
     payload_1 = _make_binding_payload(
         awx_job_id=job_1,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         failure_reason="Timeout",
     )
     payload_2 = _make_binding_payload(
         awx_job_id=job_2,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
     )
@@ -357,17 +377,17 @@ async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> 
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> None:
-    """A second completed execution for a completed MR lifecycle is rejected.
+    """Multiple AWX jobs targeting the same GitLab MR are all persisted.
 
-    Issue #606 / ADR 0027: a completed AFK Run is closed to new AWX
-    Execution Bindings — the first completed binding makes the owning
-    lifecycle completed, and a second AWX job for the same canonical MR is
-    rejected with 409 without attaching a binding.
+    ADR 0028: a completed run does not close the lifecycle to new bindings —
+    the second completed execution for the same canonical MR is accepted
+    (201) and stored alongside the first.
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id(), provider="gitlab")
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -376,6 +396,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
 
     payload_1 = _make_binding_payload(
         awx_job_id=job_1,
+        afk_run_id=run_id,
         provider="gitlab",
         repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
@@ -384,6 +405,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     )
     payload_2 = _make_binding_payload(
         awx_job_id=job_2,
+        afk_run_id=run_id,
         provider="gitlab",
         repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
@@ -394,10 +416,10 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     async with client as c:
         resp1 = await c.post("/api/v1/afk/executions", json=payload_1)
         assert resp1.status_code == 201, resp1.text
-        # The lifecycle is now completed — the second execution is rejected.
+        # ADR 0028: the lifecycle status is untouched by binding writes, so
+        # the second execution is accepted, not rejected.
         resp2 = await c.post("/api/v1/afk/executions", json=payload_2)
-        assert resp2.status_code == 409, resp2.text
-        assert resp2.json()["error"]["code"] == "CONFLICT"
+        assert resp2.status_code == 201, resp2.text
 
         resp_hist = await c.get(
             "/api/v1/afk/executions",
@@ -410,18 +432,22 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
         )
         assert resp_hist.status_code == 200, resp_hist.text
         history = resp_hist.json()["data"]
-        # Only the first binding exists — the rejected job was never stored.
-        assert len(history["bindings"]) == 1
-        assert history["bindings"][0]["awx_job"]["job_id"] == str(job_1)
-        assert history["bindings"][0]["resource"]["resource_type"] == "change_request"
+        # Both bindings are stored — no completed-lifecycle rejection.
+        assert len(history["bindings"]) == 2
+        job_ids = {b["awx_job"]["job_id"] for b in history["bindings"]}
+        assert str(job_1) in job_ids
+        assert str(job_2) in job_ids
+        for binding in history["bindings"]:
+            assert binding["resource"]["resource_type"] == "change_request"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> None:
     """Failed execution followed by successful retry is ordered correctly."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -431,6 +457,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
     # First: failed
     payload_fail = _make_binding_payload(
         awx_job_id=job_failed,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         failure_reason="Timeout after 300s",
@@ -440,6 +467,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
     # Second: successful retry
     payload_ok = _make_binding_payload(
         awx_job_id=job_success,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
         started_at="2026-08-01T11:00:00Z",
@@ -473,17 +501,20 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
     """Identical callback replay returns existing binding without duplication."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -505,22 +536,25 @@ async def test_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
     """Conflicting data for same AWX job ID returns 409 without mutation."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload_original = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=f"cr-{uuid.uuid4().hex[:12]}",
         outcome="completed",
     )
     payload_conflict = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=payload_original["resource"]["resource_number"],
         outcome="failed",
         failure_reason="Conflict test",
@@ -549,7 +583,7 @@ async def test_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unique_constraint_enforced_at_sql_level(db_pool: asyncpg.Pool) -> None:
     """Direct duplicate INSERT of same awx_job_id is rejected by DB constraint."""
     awx_job_id = int(uuid.uuid4().int >> 96)
@@ -588,19 +622,22 @@ async def test_unique_constraint_enforced_at_sql_level(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_no_sensitive_data_in_stored_or_returned_data(
     db_pool: asyncpg.Pool,
 ) -> None:
     """No raw tokens, stdout, prompts, or arbitrary AWX payloads."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -641,7 +678,7 @@ async def test_no_sensitive_data_in_stored_or_returned_data(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_get_nonexistent_returns_404(db_pool: asyncpg.Pool) -> None:
     """GET for non-existent AWX job ID returns 404."""
     async with db_pool.acquire() as conn:
@@ -658,7 +695,7 @@ async def test_get_nonexistent_returns_404(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_read_requires_api_key(db_pool: asyncpg.Pool) -> None:
     """GET without API key returns 401/403."""
     from httpx import ASGITransport, AsyncClient
@@ -687,7 +724,7 @@ async def test_read_requires_api_key(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_get_nonexistent_binding_returns_404(db_pool: asyncpg.Pool) -> None:
     """GET for non-existent AWX job ID returns 404."""
     async with db_pool.acquire() as conn:
@@ -703,7 +740,7 @@ async def test_get_nonexistent_binding_returns_404(db_pool: asyncpg.Pool) -> Non
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_list_bindings_empty_resource(db_pool: asyncpg.Pool) -> None:
     """List bindings for resource with no history returns empty list."""
     async with db_pool.acquire() as conn:
@@ -730,7 +767,7 @@ async def test_list_bindings_empty_resource(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_identical_callbacks_one_201_one_200(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -743,11 +780,14 @@ async def test_concurrent_identical_callbacks_one_201_one_200(
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -788,7 +828,7 @@ async def test_concurrent_identical_callbacks_one_201_one_200(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_conflicting_callbacks_one_201_one_409(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -801,6 +841,7 @@ async def test_concurrent_conflicting_callbacks_one_201_one_409(
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
@@ -808,12 +849,14 @@ async def test_concurrent_conflicting_callbacks_one_201_one_409(
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload_original = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
         title="Original",
     )
     payload_conflict = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         title="Conflicting",
@@ -911,7 +954,7 @@ def _make_two_phase_payload(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> None:
     """Provision a running binding under an afk_run, then complete it in place."""
     async with db_pool.acquire() as conn:
@@ -977,7 +1020,7 @@ async def test_two_phase_running_then_terminal_update(db_pool: asyncpg.Pool) -> 
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_two_phase_terminal_resource_conflicts_with_lifecycle(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -1041,28 +1084,29 @@ async def test_two_phase_terminal_resource_conflicts_with_lifecycle(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_auto_created_run_persists_change_request_columns(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Issue #600 review (finding #5): a POST without afk_run_id persists the
-    change-request identity on the freshly-created afk_runs row in the same
-    transaction — the new lifecycle is authoritative for the PR immediately."""
+    """A POST attaching a binding to a pre-provisioned AFK Run persists the
+    change-request identity on the run in the same transaction — the
+    lifecycle is authoritative for the PR immediately (issue #600 review,
+    adapted for issue #626: the run is seeded and referenced explicitly)."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=resource_number
+        awx_job_id=awx_job_id, afk_run_id=run_id, resource_number=resource_number
     )
 
     async with client as c:
         resp = await c.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
-        run_id = resp.json()["data"]["afk_run_id"]
-        assert run_id is not None
+        assert resp.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1077,19 +1121,21 @@ async def test_auto_created_run_persists_change_request_columns(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker: a POST without afk_run_id for a canonical PR whose
-    lifecycle already exists reuses that lifecycle (201, same afk_run_id)
-    instead of returning 409 — no second afk_runs row.
+    """Two AWX jobs referencing the same pre-provisioned lifecycle with the
+    same canonical PR both attach to it (201, same afk_run_id) — no second
+    afk_runs row.
 
-    Issue #606 / ADR 0027: a *failed* lifecycle still accepts a retry
-    execution — the reuse path remains open until the lifecycle completes.
+    ADR 0028: a *failed* execution accepts a retry — binding writes never
+    close the lifecycle, and status is never projected from binding
+    outcomes.
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
@@ -1097,26 +1143,27 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
     job_2 = int(uuid.uuid4().int >> 96)
 
     async with client as c:
-        # First execution FAILS — the lifecycle is failed, not completed.
+        # First execution FAILS — the lifecycle stays open (ADR 0028).
         resp1 = await c.post(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_1,
+                afk_run_id=run_id,
                 resource_number=resource_number,
                 outcome="failed",
                 failure_reason="AWX job crashed",
             ),
         )
         assert resp1.status_code == 201, resp1.text
-        run_id = resp1.json()["data"]["afk_run_id"]
-        assert run_id is not None
+        assert resp1.json()["data"]["afk_run_id"] == run_id
 
-        # Second POST, different AWX job, same canonical PR, no afk_run_id —
-        # the failed lifecycle accepts the retry (reuse).
+        # Second POST, different AWX job, same canonical PR, same lifecycle —
+        # the failed lifecycle accepts the retry.
         resp2 = await c.post(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_2,
+                afk_run_id=run_id,
                 resource_number=resource_number,
                 outcome="completed",
             ),
@@ -1125,7 +1172,7 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
         assert resp2.json()["data"]["afk_run_id"] == run_id
 
     # Exactly one lifecycle owns the canonical PR; both bindings attach to
-    # it, and the parent converged to completed.
+    # it, and the parent status is untouched by binding writes (ADR 0028).
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT afk_run_id FROM afk_runs"
@@ -1144,20 +1191,22 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
         status = await conn.fetchval(
             "SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id
         )
-        assert status == "completed"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert status == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker (GitLab MR analogue): a second POST without afk_run_id
-    for the same canonical MR reuses the existing lifecycle — unless the
-    lifecycle is already completed (issue #606 / ADR 0027), in which case
-    the new execution is rejected with 409 and never stored."""
+    """Two AWX jobs referencing the same pre-provisioned lifecycle for the
+    same canonical MR both attach to it (201, same afk_run_id) — ADR 0028:
+    a completed run does not reject new bindings, and no second afk_runs
+    row is created."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id(), provider="gitlab")
 
     client = _build_app(db_pool)
     resource_number = f"mr-{uuid.uuid4().hex[:12]}"
@@ -1170,6 +1219,7 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_1,
+                afk_run_id=run_id,
                 provider="gitlab",
                 repository=repository,
                 resource_type="merge_request",
@@ -1177,22 +1227,23 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
             ),
         )
         assert resp1.status_code == 201, resp1.text
-        run_id = resp1.json()["data"]["afk_run_id"]
+        assert resp1.json()["data"]["afk_run_id"] == run_id
 
-        # The first execution completed the lifecycle — a second execution
-        # for the same canonical MR is rejected without storing a binding.
+        # ADR 0028: a completed run does not reject new bindings — the
+        # second execution is accepted and attached to the same lifecycle.
         resp2 = await c.post(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_2,
+                afk_run_id=run_id,
                 provider="gitlab",
                 repository=repository,
                 resource_type="merge_request",
                 resource_number=resource_number,
             ),
         )
-        assert resp2.status_code == 409, resp2.text
-        assert resp2.json()["error"]["code"] == "CONFLICT"
+        assert resp2.status_code == 201, resp2.text
+        assert resp2.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1204,27 +1255,26 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
         )
         assert len(rows) == 1
         assert rows[0]["afk_run_id"] == run_id
-        # The rejected execution was never stored.
+        # Both executions are stored against the single lifecycle.
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
-            job_2,
+            "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
+            run_id,
         )
-        assert count == 0
+        assert count == 2
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_concurrent_auto_provision_same_pr_one_winner(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_concurrent_auto_provision_same_pr_single_lifecycle(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker: two concurrent first discoveries for the same PR
-    produce one winner (201) and one completed-run rejection (409) with one
-    shared afk_run_id — the unique-constraint loser re-reads the winner's
-    lifecycle under the parent lock, finds it completed (issue #606 /
-    ADR 0027), and is rejected without storing a second binding.  Exactly
-    one afk_runs row and one binding."""
+    """Two concurrent POSTs referencing the same pre-provisioned lifecycle
+    with the same PR both attach to it (201, shared afk_run_id) — ADR 0028:
+    a completed run does not reject new bindings.  Exactly one afk_runs row
+    (the seeded one) and two stored bindings."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
@@ -1236,28 +1286,29 @@ async def test_concurrent_auto_provision_same_pr_one_winner(
             c.post(
                 "/api/v1/afk/executions",
                 json=_make_binding_payload(
-                    awx_job_id=job_a, resource_number=resource_number
+                    awx_job_id=job_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
                 ),
             ),
             c.post(
                 "/api/v1/afk/executions",
                 json=_make_binding_payload(
-                    awx_job_id=job_b, resource_number=resource_number
+                    awx_job_id=job_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
                 ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
-        assert status_codes == [201, 409], (
-            f"Expected [201, 409], got {status_codes}: "
+        # ADR 0028: no completed-lifecycle rejection — both executions are
+        # accepted (201) and attach to the seeded lifecycle.
+        assert status_codes == [201, 201], (
+            f"Expected [201, 201], got {status_codes}: "
             + "; ".join(r.text for r in results)
         )
-        winners = [
-            r.json()["data"]["afk_run_id"]
-            for r in results
-            if r.status_code == 201
-        ]
-        assert len(winners) == 1
-        run_id = winners[0]
+        for r in results:
+            assert r.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1273,15 +1324,16 @@ async def test_concurrent_auto_provision_same_pr_one_winner(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
             run_id,
         )
-        assert count == 1, f"expected one binding, got {count}"
+        assert count == 2, f"expected two bindings, got {count}"
         status = await conn.fetchval(
             "SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id
         )
-        assert status == "completed"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert status == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_post_accepts_resource_provider_differing_from_run_provider(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -1297,9 +1349,11 @@ async def test_post_accepts_resource_provider_differing_from_run_provider(
     awx_job_id = int(uuid.uuid4().int >> 96)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, provider="github", resource_number=resource_number
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        provider="github",
+        resource_number=resource_number,
     )
-    payload["afk_run_id"] = run_id
 
     async with client as c:
         resp = await c.post("/api/v1/afk/executions", json=payload)
@@ -1320,16 +1374,15 @@ async def test_post_accepts_resource_provider_differing_from_run_provider(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Issue #600 review (finding #6) + issue #606: two concurrent terminal
+    """Issue #600 review (finding #6) + ADR 0028: two concurrent terminal
     POSTs attaching different AWX jobs to the same lifecycle with the same
-    change request serialize on the parent lock — the winner succeeds (201),
-    and the loser re-reads the parent under the lock, finds it completed,
-    and is rejected (409).  Exactly one binding is stored and the parent is
-    completed."""
+    change request serialize on the parent lock — both succeed (201) since
+    a completed run does not reject new bindings.  Both bindings are stored
+    and the parent status is untouched by binding writes."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -1343,26 +1396,26 @@ async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
         results = await asyncio.gather(
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_a, resource_number=resource_number
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
+                ),
             ),
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_b, resource_number=resource_number
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
+                ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
-        assert status_codes == [201, 409], (
-            f"Expected [201, 409], got {status_codes}"
+        # ADR 0028: a completed run does not reject new bindings — both
+        # executions attach to the lifecycle.
+        assert status_codes == [201, 201], (
+            f"Expected [201, 201], got {status_codes}"
         )
 
     async with db_pool.acquire() as conn:
@@ -1379,15 +1432,16 @@ async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
             run_id,
         )
-        assert count == 1
+        assert count == 2
         status = await conn.fetchval(
             "SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id
         )
-        assert status == "completed"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert status == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_same_lifecycle_different_change_request_one_conflicts(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -1408,21 +1462,19 @@ async def test_concurrent_same_lifecycle_different_change_request_one_conflicts(
         results = await asyncio.gather(
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_a, resource_number=resource_number_a
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number_a,
+                ),
             ),
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_b, resource_number=resource_number_b
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number_b,
+                ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
@@ -1444,7 +1496,7 @@ async def test_concurrent_same_lifecycle_different_change_request_one_conflicts(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_failed_terminal_update_without_resource_or_session(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -1484,7 +1536,7 @@ async def test_failed_terminal_update_without_resource_or_session(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_terminal_callback_without_resource_or_session(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -1523,7 +1575,7 @@ async def test_terminal_callback_without_resource_or_session(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_terminal_update_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
     """Repeating an identical terminal update is idempotent (200, no mutation)."""
     async with db_pool.acquire() as conn:
@@ -1573,7 +1625,7 @@ async def test_terminal_update_identical_replay_is_noop(db_pool: asyncpg.Pool) -
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_terminal_update_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
     """A conflicting terminal update returns 409 and never overwrites history."""
     async with db_pool.acquire() as conn:
@@ -1625,7 +1677,7 @@ async def test_terminal_update_conflicting_replay_rejected(db_pool: asyncpg.Pool
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_failure_summary_redacted_before_persist(db_pool: asyncpg.Pool) -> None:
     """Secret-bearing failure summaries are redacted before persistence."""
     async with db_pool.acquire() as conn:
@@ -1654,7 +1706,7 @@ async def test_failure_summary_redacted_before_persist(db_pool: asyncpg.Pool) ->
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_identical_terminal_updates(db_pool: asyncpg.Pool) -> None:
     """Concurrent identical terminal updates serialize: both 200, one row."""
     async with db_pool.acquire() as conn:
@@ -1701,7 +1753,7 @@ async def test_concurrent_identical_terminal_updates(db_pool: asyncpg.Pool) -> N
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_concurrent_conflicting_terminal_updates(db_pool: asyncpg.Pool) -> None:
     """Concurrent conflicting terminal updates: one 200, one 409, no overwrite."""
     async with db_pool.acquire() as conn:
@@ -1756,7 +1808,7 @@ async def test_concurrent_conflicting_terminal_updates(db_pool: asyncpg.Pool) ->
             assert row["failure_reason"] == "competing failure"
 
 
-# ── Transactional AFK run status convergence tests (issue #606) ─────────────
+# ── AFK run status non-projection tests (ADR 0028, issue #639) ───────────────
 
 
 async def _run_row(conn: asyncpg.Connection, run_id: str) -> asyncpg.Record:
@@ -1773,12 +1825,12 @@ async def _run_row(conn: asyncpg.Connection, run_id: str) -> asyncpg.Record:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_running_creation_moves_parent_from_pending_to_running(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_running_creation_does_not_project_status_from_binding_outcome(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Creating the first running binding moves its run pending → running in
-    the same transaction."""
+    """ADR 0028: creating a running binding records the binding without
+    projecting status from the binding outcome — the run stays pending."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -1797,16 +1849,18 @@ async def test_running_creation_moves_parent_from_pending_to_running(
 
     async with db_pool.acquire() as conn:
         row = await _run_row(conn, run_id)
-        assert row["status"] == "running"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert row["status"] == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_direct_terminal_creation_converges_parent(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_direct_terminal_creation_records_binding_without_status_projection(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """A direct terminal binding converges the parent straight to its
-    aggregate terminal status — completed here (success-aware precedence)."""
+    """ADR 0028: a direct terminal binding is recorded without projecting
+    status onto the parent — the run stays pending, and enrichment columns
+    remain untouched."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -1834,20 +1888,21 @@ async def test_direct_terminal_creation_converges_parent(
 
     async with db_pool.acquire() as conn:
         row = await _run_row(conn, run_id)
-        assert row["status"] == "completed"
-        # Only status moved — the enrichment columns are untouched.
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert row["status"] == "pending"
+        # The enrichment columns are untouched.
         assert row["finished_at"] is None
         assert row["outcome_status"] is None
         assert row["outcome"] is None
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_direct_failed_and_cancelled_creation_converge_parent(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_direct_failed_and_cancelled_creation_leave_parent_pending(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Direct failed / cancelled bindings converge the parent to failed /
-    cancelled."""
+    """ADR 0028: direct failed / cancelled bindings are recorded without
+    projecting status — both runs stay pending."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_failed := _new_afk_run_id())
@@ -1879,18 +1934,19 @@ async def test_direct_failed_and_cancelled_creation_converge_parent(
         assert resp2.status_code == 201, resp2.text
 
     async with db_pool.acquire() as conn:
-        assert (await _run_row(conn, run_failed))["status"] == "failed"
-        assert (await _run_row(conn, run_cancelled))["status"] == "cancelled"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert (await _run_row(conn, run_failed))["status"] == "pending"
+        assert (await _run_row(conn, run_cancelled))["status"] == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_terminal_patch_converges_parent_with_success_aware_precedence(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_terminal_patch_records_binding_without_status_projection(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """The final running binding transitioning to terminal converges the run
-    with success-aware precedence — an earlier failed attempt does not mark
-    the lifecycle failed once a completed binding exists."""
+    """ADR 0028: transitioning the running binding to terminal records the
+    new outcome without projecting status onto the run — the run stays
+    pending regardless of the binding outcome mix."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -1909,7 +1965,7 @@ async def test_terminal_patch_converges_parent_with_success_aware_precedence(
                 ),
             )
         ).status_code == 201
-        # A second, direct terminal (failed) attempt — the run stays running.
+        # A second, direct terminal (failed) attempt is recorded alongside.
         assert (
             await c.post(
                 "/api/v1/afk/executions",
@@ -1922,10 +1978,10 @@ async def test_terminal_patch_converges_parent_with_success_aware_precedence(
             )
         ).status_code == 201
         async with db_pool.acquire() as conn:
-            assert (await _run_row(conn, run_id))["status"] == "running"
+            # ADR 0028: binding writes never project afk_runs.status.
+            assert (await _run_row(conn, run_id))["status"] == "pending"
 
-        # Phase two: the running binding completes — completed dominates the
-        # earlier failed attempt.
+        # Phase two: the running binding completes.
         resp = await c.patch(
             f"/api/v1/afk/executions/{job_running}",
             json={
@@ -1942,16 +1998,18 @@ async def test_terminal_patch_converges_parent_with_success_aware_precedence(
         assert resp.status_code == 200, resp.text
 
     async with db_pool.acquire() as conn:
-        assert (await _run_row(conn, run_id))["status"] == "completed"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_identical_replay_converges_touched_parent_without_duplication(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_identical_replay_stays_idempotent_without_status_projection(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """An identical replay stays idempotent, never duplicates the binding,
-    and re-converges its touched parent — a stale status is corrected."""
+    """ADR 0028: an identical replay stays idempotent and never duplicates
+    the binding; the replay is a binding write, so it never projects status
+    — the run keeps whatever status it had (pending here)."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -1974,8 +2032,9 @@ async def test_identical_replay_converges_touched_parent_without_duplication(
     async with client as c:
         assert (await c.post("/api/v1/afk/executions", json=payload)).status_code == 201
 
-        # Simulate a missed convergence (legacy/stale status) before the
-        # replay.
+        # Simulate any pre-existing status before the replay — ADR 0028
+        # forbids binding writes from projecting status, so the replay must
+        # leave it exactly as stored.
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE afk_runs SET status = 'pending' WHERE afk_run_id = $1",
@@ -1991,16 +2050,19 @@ async def test_identical_replay_converges_touched_parent_without_duplication(
             awx_job_id,
         )
         assert count == 1
-        assert (await _run_row(conn, run_id))["status"] == "completed"
+        # ADR 0028: binding writes never project afk_runs.status — the
+        # replayed binding does not touch the stored status.
+        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_failed_run_reopens_to_running_on_new_running_binding(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_failed_run_accepts_new_running_binding_without_status_change(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """A failed lifecycle accepts a new running binding with a new AWX job
-    identity and returns to running (retry reopening)."""
+    """ADR 0028: a failed lifecycle accepts a new running binding with a new
+    AWX job identity (retry) without projecting status — the run stays
+    pending."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -2022,7 +2084,8 @@ async def test_failed_run_reopens_to_running_on_new_running_binding(
             )
         ).status_code == 201
         async with db_pool.acquire() as conn:
-            assert (await _run_row(conn, run_id))["status"] == "failed"
+            # ADR 0028: binding writes never project afk_runs.status.
+            assert (await _run_row(conn, run_id))["status"] == "pending"
 
         resp = await c.post(
             "/api/v1/afk/executions",
@@ -2039,16 +2102,18 @@ async def test_failed_run_reopens_to_running_on_new_running_binding(
             run_id,
         )
         assert count == 2
-        assert (await _run_row(conn, run_id))["status"] == "running"
+        # ADR 0028: binding writes never project afk_runs.status.
+        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_completed_run_rejects_new_binding_without_modifying_history(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completed_run_accepts_new_binding(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """A completed AFK Run rejects new bindings with 409 without inserting a
-    binding, without changing status, and without modifying stored history."""
+    """ADR 0028: a completed run does not reject new bindings — a new
+    running execution is accepted (201) and stored without projecting
+    status or modifying the stored history."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -2078,45 +2143,52 @@ async def test_completed_run_rejects_new_binding_without_modifying_history(
             )
         ).status_code == 201
 
-        # A new running execution on the completed lifecycle is rejected.
+        # A new running execution on the completed lifecycle is accepted.
         resp = await c.post(
             "/api/v1/afk/executions",
             json=_make_two_phase_payload(
                 awx_job_id=job_new, afk_run_id=run_id, outcome="running"
             ),
         )
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["error"]["code"] == "CONFLICT"
+        assert resp.status_code == 201, resp.text
 
     async with db_pool.acquire() as conn:
         before_new = await _run_row(conn, run_id)
-        # The rejected binding was never stored.
+        # The new binding was stored.
         count_new = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
             job_new,
         )
-        assert count_new == 0
-        # History unchanged: exactly one (completed) binding, status still
-        # completed, enrichment columns untouched.
-        assert (await _run_row(conn, run_id))["status"] == "completed"
+        assert count_new == 1
+        # History preserved: both bindings exist, status untouched by
+        # binding writes (ADR 0028), enrichment columns untouched.
+        assert (await _run_row(conn, run_id))["status"] == "pending"
         assert (await _run_row(conn, run_id))["status"] == before_new["status"]
         count_total = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
             run_id,
         )
-        assert count_total == 1
+        assert count_total == 2
         outcome = await conn.fetchval(
             "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
             job_completed,
         )
         assert outcome == "completed"
+        new_outcome = await conn.fetchval(
+            "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
+            job_new,
+        )
+        assert new_outcome == "running"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_convergence_projects_only_status(db_pool: asyncpg.Pool) -> None:
-    """The convergence touches only afk_runs.status — finished_at,
-    outcome_status, outcome, and the change-request columns are preserved."""
+@pytest.mark.asyncio(loop_scope="module")
+async def test_binding_write_touches_no_run_columns(
+    db_pool: asyncpg.Pool,
+) -> None:
+    """ADR 0028: a binding write touches no afk_runs columns at all —
+    status, finished_at, outcome_status, outcome, and the change-request
+    columns are all preserved as stored."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -2150,7 +2222,9 @@ async def test_convergence_projects_only_status(db_pool: asyncpg.Pool) -> None:
 
     async with db_pool.acquire() as conn:
         after = await _run_row(conn, run_id)
-        assert after["status"] == "running"  # only this moved
+        # ADR 0028: binding writes never project afk_runs.status — the run
+        # row is untouched in every column.
+        assert after["status"] == "pending"
         assert after["finished_at"] == before["finished_at"]
         assert after["outcome_status"] == before["outcome_status"]
         assert after["outcome"] == before["outcome"]
@@ -2160,13 +2234,13 @@ async def test_convergence_projects_only_status(db_pool: asyncpg.Pool) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
-async def test_concurrent_binding_writes_keep_status_consistent(
+@pytest.mark.asyncio(loop_scope="module")
+async def test_concurrent_binding_writes_accept_both_without_status_projection(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Concurrent binding writes serialize on the parent lock: whatever the
-    interleaving, the stored status always equals the binding-derived
-    projection of the final binding set."""
+    """ADR 0028: concurrent binding writes both succeed — a completed run
+    never rejects a new binding — and the run status is never projected
+    from binding outcomes, so it stays pending whatever the interleaving."""
     from afk_outcomes.run_status import resolve_afk_run_status
 
     async with db_pool.acquire() as conn:
@@ -2196,9 +2270,8 @@ async def test_concurrent_binding_writes_keep_status_consistent(
             ),
         )
         codes = sorted(r.status_code for r in results)
-        # Either both succeeded (running first) or the running one was
-        # rejected once the terminal one completed the lifecycle.
-        assert codes in ([201, 201], [201, 409]), (
+        # ADR 0028: no completed-lifecycle rejection — both writes succeed.
+        assert codes == [201, 201], (
             f"unexpected status codes: {codes}"
         )
 
@@ -2211,5 +2284,8 @@ async def test_concurrent_binding_writes_keep_status_consistent(
                 run_id,
             )
         ]
-        expected = resolve_afk_run_status(outcomes)
-        assert (await _run_row(conn, run_id))["status"] == expected
+        # The pure-domain projection of the recorded outcomes is computed
+        # for reference only — under ADR 0028 it is never written to the
+        # run row.
+        _projected = resolve_afk_run_status(outcomes)
+        assert (await _run_row(conn, run_id))["status"] == "pending"

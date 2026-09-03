@@ -1880,6 +1880,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
     async def _project_afk_run_status(self, afk_run_id: str) -> str:
         """Project one run's status from its binding outcomes (issue #606).
 
+        .. deprecated::
+           Retained as a deprecated compatibility helper (issue #639).
+           ADR 0028 supersedes ADR 0027: ``afk_runs.status`` is no longer
+           projected from child AWX execution outcomes during binding
+           writes.  This helper is not invoked by any binding write path.
+
         Reads the outcome multiset for the run and applies the pure-domain
         policy :func:`afk_outcomes.run_status.resolve_afk_run_status`.  The
         caller must already hold the parent ``afk_runs`` lock so the
@@ -1899,6 +1905,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
 
     async def _converge_afk_run_status(self, afk_run_id: str) -> None:
         """Converge ``afk_runs.status`` to the binding-driven projection (issue #606).
+
+        .. deprecated::
+           Retained as a deprecated compatibility helper (issue #639).
+           ADR 0028 supersedes ADR 0027: ``afk_runs.status`` is no longer
+           projected from child AWX execution outcomes during binding
+           writes.  This helper is not invoked by any binding write path.
 
         Only ``status`` is projected — ``finished_at``, ``outcome_status``,
         ``outcome``, and the change-request columns are never touched.
@@ -2002,28 +2014,30 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
           or a different supplied ``afk_run_id``) — returns
           ``is_conflict=True`` without mutation.
 
-        **Transactional status convergence (issue #606 / ADR 0027)** — every
-        path that touches an existing lifecycle locks the owning ``afk_runs``
-        row (``SELECT ... FOR UPDATE``) before the binding is mutated, and
-        converges ``afk_runs.status`` to the binding-derived projection in
-        the same transaction:
+        **Parent lock (issue #606 / ADR 0027, superseded for status by
+        ADR 0028)** — every path that touches an existing lifecycle locks the
+        owning ``afk_runs`` row (``SELECT ... FOR UPDATE``) before the
+        binding is mutated.  ADR 0028 retires the binding-derived
+        ``afk_runs.status`` projection: AWX execution outcomes are historical
+        child facts and never close or reopen the AFK Run, so new AWX job IDs
+        under an existing ``afk_run_id`` are accepted regardless of prior
+        child execution outcomes.  The parent lock is retained for the
+        change-request binding rule (:meth:`_apply_change_request_binding`),
+        which must serialize concurrent writes to the same lifecycle.
 
-        * the first ``running`` binding moves its run ``pending`` → ``running``;
-        * a direct terminal creation converges the run straight to its
-          aggregate terminal status (``completed`` / ``failed`` /
-          ``cancelled``);
-        * a new ``running`` binding on a ``failed`` / ``cancelled`` run
-          reopens it to ``running`` (retry, new AWX job identity);
-        * a **completed** run rejects any new binding with
-          ``is_conflict=True`` without inserting, without touching the
-          stored binding history, and without changing ``status``;
-        * an identical replay stays idempotent and re-converges its touched
-          parent (correcting a stale status) without duplicating or
+        * the first ``running`` binding attaches normally (201);
+        * a direct terminal creation attaches normally (201);
+        * a new ``running`` binding on a run whose prior child bindings are
+          terminal (``completed`` / ``failed`` / ``cancelled``) is accepted —
+          the retry reuses the same ``afk_run_id`` (issue #638);
+        * a **completed** prior child binding never rejects a new AWX job ID
+          — the completed-run rejection of ADR 0027 is removed (issue #639);
+        * an identical replay stays idempotent without duplicating or
           changing terminal history.
 
-        Only ``afk_runs.status`` is projected — ``finished_at``,
-        ``outcome_status``, ``outcome``, and the change-request columns are
-        never touched by the convergence.
+        ``_project_afk_run_status()`` / ``_converge_afk_run_status()`` are
+        retained as deprecated compatibility helpers (issue #606) but are no
+        longer invoked during binding writes.
 
         The connection MUST already be in a transaction (the caller owns the
         transaction boundary).  Uses savepoints internally so that a failure
@@ -2127,14 +2141,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 if is_match and afk_run_id is not None:
                     is_match = existing["afk_run_id"] == afk_run_id
                 # An identical replay is never rejected (it creates no new
-                # binding), but it still converges its touched parent
-                # (issue #606 / ADR 0027): the parent lock was already taken
-                # by the SELECT above, so the projection is race-free.  The
-                # replay never duplicates or changes terminal binding
-                # history, while a stale parent status is corrected toward
-                # the binding-derived projection.
-                if is_match and existing["afk_run_id"] is not None:
-                    await self._converge_afk_run_status(existing["afk_run_id"])
+                # binding) and never duplicates or changes terminal binding
+                # history.  The binding-derived status convergence of
+                # issue #606 / ADR 0027 is retired by ADR 0028 — the parent
+                # lock is still taken by the SELECT above for the
+                # change-request binding rule, but ``afk_runs.status`` is no
+                # longer projected from child execution outcomes.
                 return CreateAFKExecutionBindingResult(
                     afk_run_id=existing["afk_run_id"],
                     binding_id=existing["id"],
@@ -2167,20 +2179,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         run_missing=True,
                     )
 
-                # Completed-run rejection (issue #606 / ADR 0027): a
-                # completed lifecycle is closed to new AWX Execution
-                # Bindings.  The projection is computed under the parent
-                # lock held above, so a racing terminal transition commits
-                # before this check runs or blocks until it finishes.
-                if (
-                    await self._project_afk_run_status(afk_run_id)
-                    == ExecutionOutcome.COMPLETED.value
-                ):
-                    return CreateAFKExecutionBindingResult(
-                        afk_run_id=afk_run_id,
-                        is_conflict=True,
-                    )
-
+                # ADR 0028 (issue #638/#639): prior child execution outcomes
+                # never close the AFK Run to new AWX job IDs.  The
+                # completed-run rejection of issue #606 / ADR 0027 is
+                # removed — a new binding is accepted under the same
+                # ``afk_run_id`` regardless of the projected child status.
                 # When a resource identity is supplied with the execution,
                 # make the referenced lifecycle authoritative for the change
                 # request (issue #600 review): an unbound lifecycle is bound,
@@ -2233,18 +2236,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                         resource_number,
                     )
                     if owner is not None:
-                        # Completed-run rejection (issue #606 / ADR 0027):
-                        # the canonical PR/MR's lifecycle is closed — a new
-                        # execution binding is rejected before adoption,
-                        # never attached to a completed lifecycle.
-                        if (
-                            await self._project_afk_run_status(owner["afk_run_id"])
-                            == ExecutionOutcome.COMPLETED.value
-                        ):
-                            return CreateAFKExecutionBindingResult(
-                                afk_run_id=owner["afk_run_id"],
-                                is_conflict=True,
-                            )
+                        # ADR 0028 (issue #638/#639): the canonical PR/MR's
+                        # lifecycle stays open to new AWX job IDs regardless
+                        # of prior child execution outcomes — the completed-
+                        # run rejection of issue #606 / ADR 0027 is removed.
                         # The canonical PR/MR already owns a lifecycle —
                         # reuse it and attach this execution instead of
                         # returning 409 (PR #600 blocker).  The shared 1:1
@@ -2322,20 +2317,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                                     afk_run_id=run_id,
                                     is_conflict=True,
                                 )
-                            # Completed-run rejection (issue #606 / ADR 0027):
-                            # the concurrent winner's lifecycle is closed — a
-                            # new execution binding is rejected before
-                            # adoption.
-                            if (
-                                await self._project_afk_run_status(
-                                    winner["afk_run_id"]
-                                )
-                                == ExecutionOutcome.COMPLETED.value
-                            ):
-                                return CreateAFKExecutionBindingResult(
-                                    afk_run_id=winner["afk_run_id"],
-                                    is_conflict=True,
-                                )
+                            # ADR 0028 (issue #638/#639): the concurrent
+                            # winner's lifecycle stays open to new AWX job
+                            # IDs regardless of prior child outcomes — the
+                            # completed-run rejection of issue #606 / ADR
+                            # 0027 is removed before winner adoption.
                             bind_result = await self._apply_change_request_binding(
                                 afk_run_id=winner["afk_run_id"],
                                 provider=provider,
@@ -2430,13 +2416,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                                 finished_at=finished_at,
                             )
                         )
-                # Converge the parent toward the binding-derived projection
-                # in the same transaction (issue #606 / ADR 0027): the
-                # freshly-inserted binding participates in the outcome
-                # multiset — first running binding → running, direct
-                # terminal creation → its terminal status, retry reopening
-                # → running.
-                await self._converge_afk_run_status(run_id)
+                # The freshly-inserted binding never re-projects the parent
+                # status (ADR 0028 / issue #639): ``afk_runs.status`` is not
+                # derived from child AWX execution outcomes, so no converge
+                # UPDATE is issued here.  The parent row lock taken earlier
+                # still serialized the change-request binding rule.
                 return CreateAFKExecutionBindingResult(
                     afk_run_id=run_id,
                     binding_id=binding_row[0]["id"],
@@ -2494,9 +2478,11 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         updater re-reads after the first commits and resolves to an
         idempotent replay or a conflict.  The owning ``afk_runs`` row (when
         one exists) is locked in the same statement *before* any binding
-        mutation, and ``afk_runs.status`` is converged to the
-        binding-derived projection in the same transaction (issue #606 /
-        ADR 0027).
+        mutation (issue #606 / ADR 0027).  ADR 0028 retires the
+        binding-derived ``afk_runs.status`` projection — the parent is no
+        longer converged from child execution outcomes during the terminal
+        update (issue #639); the parent lock still serializes the
+        change-request binding rule.
 
         **Non-erasing fill-ins** — ``external_session_id``, the resource
         identity, and ``failure_summary`` are optional: an omitted
@@ -2639,12 +2625,12 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                 )
                 if identical:
                     # An identical terminal replay is never rejected and
-                    # never mutates terminal history, but it still converges
-                    # its touched parent (issue #606 / ADR 0027) — the
-                    # parent lock held by the statement above makes the
-                    # projection race-free.
-                    if row.get("afk_run_id") is not None:
-                        await self._converge_afk_run_status(row["afk_run_id"])
+                    # never mutates terminal history.  The binding-derived
+                    # status convergence of issue #606 / ADR 0027 is retired
+                    # by ADR 0028 — the parent lock held by the statement
+                    # above still serializes the change-request binding rule,
+                    # but ``afk_runs.status`` is no longer projected from
+                    # child execution outcomes.
                     return UpdateExecutionBindingResult(binding_id=row["id"])
                 return UpdateExecutionBindingResult(
                     binding_id=row["id"], is_conflict=True
@@ -2826,13 +2812,10 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
                             finished_at=finished_at,
                         )
                     )
-            # Converge the parent toward the binding-derived projection in
-            # the same transaction (issue #606 / ADR 0027): the just-
-            # transitioned binding participates in the outcome multiset —
-            # the final running binding transitioning to terminal converges
-            # the run to its aggregate terminal status.
-            if row.get("afk_run_id") is not None:
-                await self._converge_afk_run_status(row["afk_run_id"])
+            # The transitioned binding never re-projects the parent status
+            # (ADR 0028 / issue #639): ``afk_runs.status`` is not derived
+            # from child AWX execution outcomes, so no converge UPDATE is
+            # issued here.
             return UpdateExecutionBindingResult(
                 binding_id=row["id"], is_updated=True
             )

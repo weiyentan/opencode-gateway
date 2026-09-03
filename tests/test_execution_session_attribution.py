@@ -505,16 +505,14 @@ class TestPostSessionAttributionPersistence:
                         "change_request_external_id": "99",
                     }
                 ),
-                saved_row,
+                saved_row,  # get_execution_binding_by_awx_job_id (API re-read)
             ]
         )
         conn.fetch = AsyncMock(
             side_effect=[
-                [],  # project completed-run status (no bindings yet)
                 [mock_row({"id": uuid.uuid4()})],  # binding RETURNING id
                 [mock_row({"id": internal_uuid})],  # resolve ses_a → 1 match
                 [],  # resolve ses_b → 0 matches
-                [mock_row({"outcome": "completed"})],  # converge projection
             ]
         )
         conn.execute = AsyncMock()
