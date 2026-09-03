@@ -2044,11 +2044,13 @@ async def test_failed_run_reopens_to_running_on_new_running_binding(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_completed_run_rejects_new_binding_without_modifying_history(
-    db_pool: asyncpg.Pool,
-) -> None:
-    """A completed AFK Run rejects new bindings with 409 without inserting a
-    binding, without changing status, and without modifying stored history."""
+async def test_completed_run_accepts_new_binding(db_pool: asyncpg.Pool) -> None:
+    """A completed AFK Run accepts a new binding with a new AWX job identity.
+
+    Issue #639 / ADR 0028: AWX execution outcomes are historical child facts
+    and never close the AFK Run to new AWX job IDs — the ADR 0027
+    completed-run rejection is removed.  A new binding is stored alongside
+    the completed history (two bindings total) instead of returning 409."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -2078,38 +2080,44 @@ async def test_completed_run_rejects_new_binding_without_modifying_history(
             )
         ).status_code == 201
 
-        # A new running execution on the completed lifecycle is rejected.
+        # A new running execution on the completed lifecycle is accepted.
         resp = await c.post(
             "/api/v1/afk/executions",
             json=_make_two_phase_payload(
                 awx_job_id=job_new, afk_run_id=run_id, outcome="running"
             ),
         )
-        assert resp.status_code == 409, resp.text
-        assert resp.json()["error"]["code"] == "CONFLICT"
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["outcome"] == "running"
+        assert resp.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
-        before_new = await _run_row(conn, run_id)
-        # The rejected binding was never stored.
+        # The new binding was stored under the same afk_run_id.
         count_new = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
             job_new,
         )
-        assert count_new == 0
-        # History unchanged: exactly one (completed) binding, status still
-        # completed, enrichment columns untouched.
-        assert (await _run_row(conn, run_id))["status"] == "completed"
-        assert (await _run_row(conn, run_id))["status"] == before_new["status"]
+        assert count_new == 1
+        # History is preserved: both the completed binding and the new
+        # running binding exist.  The status is no longer projected from
+        # child execution outcomes (issue #639 / ADR 0028), so the seeded
+        # pending status is untouched by the binding writes.
+        assert (await _run_row(conn, run_id))["status"] == "pending"
         count_total = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
             run_id,
         )
-        assert count_total == 1
+        assert count_total == 2
         outcome = await conn.fetchval(
             "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
             job_completed,
         )
         assert outcome == "completed"
+        new_outcome = await conn.fetchval(
+            "SELECT outcome FROM execution_bindings WHERE awx_job_id = $1",
+            job_new,
+        )
+        assert new_outcome == "running"
 
 
 @pytest.mark.integration
