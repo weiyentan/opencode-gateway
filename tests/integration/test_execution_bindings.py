@@ -14,6 +14,9 @@ database-enforced guarantees of ``/api/v1/afk/executions``:
   write, a completed run accepts new bindings (no completed-lifecycle
   409), and finalization happens only via the provider-event seam
   (``AsyncpgOutcomeRepository.save``)
+* Issue #626: every POST payload references a pre-provisioned ``afk_run_id``
+  (the legacy auto-provision path is closed) — each test seeds its run via
+  ``_seed_afk_run`` and passes it to ``_make_binding_payload``
 
 Prerequisites
 -------------
@@ -227,6 +230,7 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 def _make_binding_payload(
     *,
     awx_job_id: int,
+    afk_run_id: str,
     external_session_id: str = "ses_integration_test",
     provider: str = "github",
     repository: str = "https://github.com/acme/proj",
@@ -240,10 +244,16 @@ def _make_binding_payload(
     started_at: str | None = "2026-08-01T12:00:00Z",
     finished_at: str | None = "2026-08-02T12:00:00Z",
 ) -> dict:
-    """Build a POST /api/v1/afk/executions payload."""
+    """Build a POST /api/v1/afk/executions payload.
+
+    ``afk_run_id`` is required for every new binding (issue #626): the
+    payload must reference a pre-provisioned AFK Run seeded via
+    ``_seed_afk_run``.
+    """
     payload: dict = {
         "awx_job": {"job_id": str(awx_job_id), "job_template_id": 7},
         "external_session_id": external_session_id,
+        "afk_run_id": afk_run_id,
         "resource": {
             "provider": provider,
             "repository": repository,
@@ -277,11 +287,12 @@ async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
     """Authenticated POST persists a binding; GET by awx_job_id returns it."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)  # unique per run
 
-    payload = _make_binding_payload(awx_job_id=awx_job_id)
+    payload = _make_binding_payload(awx_job_id=awx_job_id, afk_run_id=run_id)
 
     async with client as c:
         # POST
@@ -320,6 +331,7 @@ async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> 
     """Multiple AWX jobs targeting the same GitHub PR are both persisted."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -328,12 +340,14 @@ async def test_multiple_executions_for_same_github_pr(db_pool: asyncpg.Pool) -> 
 
     payload_1 = _make_binding_payload(
         awx_job_id=job_1,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         failure_reason="Timeout",
     )
     payload_2 = _make_binding_payload(
         awx_job_id=job_2,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
     )
@@ -373,6 +387,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id(), provider="gitlab")
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -381,6 +396,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
 
     payload_1 = _make_binding_payload(
         awx_job_id=job_1,
+        afk_run_id=run_id,
         provider="gitlab",
         repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
@@ -389,6 +405,7 @@ async def test_multiple_executions_for_same_gitlab_mr(db_pool: asyncpg.Pool) -> 
     )
     payload_2 = _make_binding_payload(
         awx_job_id=job_2,
+        afk_run_id=run_id,
         provider="gitlab",
         repository="https://gitlab.com/cloudnative-pg/cloudnative-pg",
         resource_type="merge_request",
@@ -430,6 +447,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
     """Failed execution followed by successful retry is ordered correctly."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = str(int(uuid.uuid4().int >> 96))
@@ -439,6 +457,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
     # First: failed
     payload_fail = _make_binding_payload(
         awx_job_id=job_failed,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         failure_reason="Timeout after 300s",
@@ -448,6 +467,7 @@ async def test_failed_then_successful_retry_ordering(db_pool: asyncpg.Pool) -> N
     # Second: successful retry
     payload_ok = _make_binding_payload(
         awx_job_id=job_success,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
         started_at="2026-08-01T11:00:00Z",
@@ -486,12 +506,15 @@ async def test_identical_replay_is_noop(db_pool: asyncpg.Pool) -> None:
     """Identical callback replay returns existing binding without duplication."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -518,17 +541,20 @@ async def test_conflicting_replay_rejected(db_pool: asyncpg.Pool) -> None:
     """Conflicting data for same AWX job ID returns 409 without mutation."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload_original = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=f"cr-{uuid.uuid4().hex[:12]}",
         outcome="completed",
     )
     payload_conflict = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=payload_original["resource"]["resource_number"],
         outcome="failed",
         failure_reason="Conflict test",
@@ -603,12 +629,15 @@ async def test_no_sensitive_data_in_stored_or_returned_data(
     """No raw tokens, stdout, prompts, or arbitrary AWX payloads."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
 
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -751,11 +780,14 @@ async def test_concurrent_identical_callbacks_one_201_one_200(
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=f"cr-{uuid.uuid4().hex[:12]}"
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=f"cr-{uuid.uuid4().hex[:12]}",
     )
 
     async with client as c:
@@ -809,6 +841,7 @@ async def test_concurrent_conflicting_callbacks_one_201_one_409(
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
@@ -816,12 +849,14 @@ async def test_concurrent_conflicting_callbacks_one_201_one_409(
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload_original = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="completed",
         title="Original",
     )
     payload_conflict = _make_binding_payload(
         awx_job_id=awx_job_id,
+        afk_run_id=run_id,
         resource_number=resource_number,
         outcome="failed",
         title="Conflicting",
@@ -1053,24 +1088,25 @@ async def test_two_phase_terminal_resource_conflicts_with_lifecycle(
 async def test_auto_created_run_persists_change_request_columns(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Issue #600 review (finding #5): a POST without afk_run_id persists the
-    change-request identity on the freshly-created afk_runs row in the same
-    transaction — the new lifecycle is authoritative for the PR immediately."""
+    """A POST attaching a binding to a pre-provisioned AFK Run persists the
+    change-request identity on the run in the same transaction — the
+    lifecycle is authoritative for the PR immediately (issue #600 review,
+    adapted for issue #626: the run is seeded and referenced explicitly)."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, resource_number=resource_number
+        awx_job_id=awx_job_id, afk_run_id=run_id, resource_number=resource_number
     )
 
     async with client as c:
         resp = await c.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
-        run_id = resp.json()["data"]["afk_run_id"]
-        assert run_id is not None
+        assert resp.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1089,16 +1125,17 @@ async def test_auto_created_run_persists_change_request_columns(
 async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker: a POST without afk_run_id for a canonical PR whose
-    lifecycle already exists reuses that lifecycle (201, same afk_run_id)
-    instead of returning 409 — no second afk_runs row.
+    """Two AWX jobs referencing the same pre-provisioned lifecycle with the
+    same canonical PR both attach to it (201, same afk_run_id) — no second
+    afk_runs row.
 
-    ADR 0028: a *failed* lifecycle accepts a retry execution — binding
-    writes never close the lifecycle, and status is never projected from
-    binding outcomes.
+    ADR 0028: a *failed* execution accepts a retry — binding writes never
+    close the lifecycle, and status is never projected from binding
+    outcomes.
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
@@ -1106,26 +1143,27 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
     job_2 = int(uuid.uuid4().int >> 96)
 
     async with client as c:
-        # First execution FAILS — the lifecycle is failed, not completed.
+        # First execution FAILS — the lifecycle stays open (ADR 0028).
         resp1 = await c.post(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_1,
+                afk_run_id=run_id,
                 resource_number=resource_number,
                 outcome="failed",
                 failure_reason="AWX job crashed",
             ),
         )
         assert resp1.status_code == 201, resp1.text
-        run_id = resp1.json()["data"]["afk_run_id"]
-        assert run_id is not None
+        assert resp1.json()["data"]["afk_run_id"] == run_id
 
-        # Second POST, different AWX job, same canonical PR, no afk_run_id —
-        # the failed lifecycle accepts the retry (reuse).
+        # Second POST, different AWX job, same canonical PR, same lifecycle —
+        # the failed lifecycle accepts the retry.
         resp2 = await c.post(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_2,
+                afk_run_id=run_id,
                 resource_number=resource_number,
                 outcome="completed",
             ),
@@ -1162,12 +1200,13 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_pr(
 async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker (GitLab MR analogue): a second POST without afk_run_id
-    for the same canonical MR reuses the existing lifecycle (201, same
-    afk_run_id) — ADR 0028: a completed run does not reject new bindings,
-    and no second afk_runs row is created."""
+    """Two AWX jobs referencing the same pre-provisioned lifecycle for the
+    same canonical MR both attach to it (201, same afk_run_id) — ADR 0028:
+    a completed run does not reject new bindings, and no second afk_runs
+    row is created."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id(), provider="gitlab")
 
     client = _build_app(db_pool)
     resource_number = f"mr-{uuid.uuid4().hex[:12]}"
@@ -1180,6 +1219,7 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_1,
+                afk_run_id=run_id,
                 provider="gitlab",
                 repository=repository,
                 resource_type="merge_request",
@@ -1187,7 +1227,7 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
             ),
         )
         assert resp1.status_code == 201, resp1.text
-        run_id = resp1.json()["data"]["afk_run_id"]
+        assert resp1.json()["data"]["afk_run_id"] == run_id
 
         # ADR 0028: a completed run does not reject new bindings — the
         # second execution is accepted and attached to the same lifecycle.
@@ -1195,6 +1235,7 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
             "/api/v1/afk/executions",
             json=_make_binding_payload(
                 awx_job_id=job_2,
+                afk_run_id=run_id,
                 provider="gitlab",
                 repository=repository,
                 resource_type="merge_request",
@@ -1227,14 +1268,13 @@ async def test_auto_provision_reuses_existing_lifecycle_for_same_mr(
 async def test_concurrent_auto_provision_same_pr_single_lifecycle(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """PR #600 blocker: two concurrent first discoveries for the same PR
-    produce one winner (201) and one lifecycle-reuse (201) sharing a single
-    afk_run_id — the unique-constraint loser re-reads the winner's lifecycle
-    under the parent lock and attaches to it (ADR 0028: a completed run
-    does not reject new bindings).  Exactly one afk_runs row and two
-    stored bindings."""
+    """Two concurrent POSTs referencing the same pre-provisioned lifecycle
+    with the same PR both attach to it (201, shared afk_run_id) — ADR 0028:
+    a completed run does not reject new bindings.  Exactly one afk_runs row
+    (the seeded one) and two stored bindings."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
@@ -1246,31 +1286,29 @@ async def test_concurrent_auto_provision_same_pr_single_lifecycle(
             c.post(
                 "/api/v1/afk/executions",
                 json=_make_binding_payload(
-                    awx_job_id=job_a, resource_number=resource_number
+                    awx_job_id=job_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
                 ),
             ),
             c.post(
                 "/api/v1/afk/executions",
                 json=_make_binding_payload(
-                    awx_job_id=job_b, resource_number=resource_number
+                    awx_job_id=job_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
                 ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
         # ADR 0028: no completed-lifecycle rejection — both executions are
-        # accepted (one 201 for the fresh lifecycle, one 201 for the reuse).
+        # accepted (201) and attach to the seeded lifecycle.
         assert status_codes == [201, 201], (
             f"Expected [201, 201], got {status_codes}: "
             + "; ".join(r.text for r in results)
         )
-        winners = [
-            r.json()["data"]["afk_run_id"]
-            for r in results
-            if r.status_code == 201
-        ]
-        assert len(winners) == 2
-        assert winners[0] == winners[1]
-        run_id = winners[0]
+        for r in results:
+            assert r.json()["data"]["afk_run_id"] == run_id
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1311,9 +1349,11 @@ async def test_post_accepts_resource_provider_differing_from_run_provider(
     awx_job_id = int(uuid.uuid4().int >> 96)
     resource_number = f"cr-{uuid.uuid4().hex[:12]}"
     payload = _make_binding_payload(
-        awx_job_id=awx_job_id, provider="github", resource_number=resource_number
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        provider="github",
+        resource_number=resource_number,
     )
-    payload["afk_run_id"] = run_id
 
     async with client as c:
         resp = await c.post("/api/v1/afk/executions", json=payload)
@@ -1356,21 +1396,19 @@ async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
         results = await asyncio.gather(
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_a, resource_number=resource_number
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
+                ),
             ),
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_b, resource_number=resource_number
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number,
+                ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
@@ -1424,21 +1462,19 @@ async def test_concurrent_same_lifecycle_different_change_request_one_conflicts(
         results = await asyncio.gather(
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_a, resource_number=resource_number_a
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_a,
+                    afk_run_id=run_id,
+                    resource_number=resource_number_a,
+                ),
             ),
             c.post(
                 "/api/v1/afk/executions",
-                json={
-                    **_make_binding_payload(
-                        awx_job_id=awx_job_id_b, resource_number=resource_number_b
-                    ),
-                    "afk_run_id": run_id,
-                },
+                json=_make_binding_payload(
+                    awx_job_id=awx_job_id_b,
+                    afk_run_id=run_id,
+                    resource_number=resource_number_b,
+                ),
             ),
         )
         status_codes = sorted(r.status_code for r in results)
