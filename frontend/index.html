@@ -395,11 +395,13 @@
 
     <!-- Change Requests (issue #613): the PRIMARY AFK Outcomes view — one row
          per change request (provider + repository + PR/MR number) from
-         GET /api/v1/afk-outcomes/change-requests.  Provider state and AFK
-         automation state render as independent badges; cost shows USD or
-         "Cost unavailable"; rows open the identity-keyed detail overlay.
-         Filtering is served through the summary contract query params; the
-         shared dashboard date range scopes the activity window. -->
+         GET /api/v1/afk-outcomes/change-requests.  The provider lifecycle
+         status badge is labeled PR Status / MR Status / MR/PR Status by
+         provider (issue #652 — the redundant AFK Automation presentation was
+         removed); cost shows USD or "Cost unavailable"; rows open the
+         identity-keyed detail overlay.  Filtering is served through the
+         summary contract query params; the shared dashboard date range scopes
+         the activity window. -->
     <section class="glass-panel panel-afk-cr-list">
       <h2 class="panel-title">Change Requests<span class="panel-freshness" id="freshness-afk-cr-list"></span></h2>
       <div class="afk-cr-list-controls">
@@ -425,17 +427,6 @@
             <option value="open">open</option>
           </select>
         </label>
-        <label class="afk-cr-list-filter">
-          <span>AFK Automation</span>
-          <select id="afk-cr-filter-automation-state">
-            <option value="">All</option>
-            <option value="pending">pending</option>
-            <option value="running">running</option>
-            <option value="completed">completed</option>
-            <option value="failed">failed</option>
-            <option value="cancelled">cancelled</option>
-          </select>
-        </label>
         <button type="button" class="filter-clear" id="afk-cr-filter-apply">Apply</button>
         <button type="button" class="filter-clear" id="afk-cr-filter-clear">Clear</button>
       </div>
@@ -446,14 +437,13 @@
               <th>Provider</th>
               <th>Repository</th>
               <th>PR / MR</th>
-              <th>Provider State</th>
-              <th>AFK Automation</th>
+              <th>PR / MR Status</th>
               <th>Cost</th>
               <th>Latest Activity</th>
             </tr>
           </thead>
           <tbody id="afk-cr-list-tbody">
-            <tr><td colspan="7" class="empty-state">Loading&hellip;</td></tr>
+            <tr><td colspan="6" class="empty-state">Loading&hellip;</td></tr>
           </tbody>
         </table>
       </div>
@@ -675,10 +665,11 @@
 
   <!-- Change Request Detail (issue #613): the identity-keyed detail flow
        opened from a Change Requests list row.  Shows PR/MR identity, the
-       dual statuses (provider state + AFK automation state), total cost,
-       purpose-grouped AWX executions, linked sessions, and a collapsed
-       activity timeline.  Keyed by (provider, repository, external id) —
-       never an internal AFK Run ID. -->
+       provider lifecycle status (PR Status / MR Status / MR/PR Status by
+       provider — issue #652), the Gateway-owned AFK Run Cost, purpose-grouped
+       AWX executions, linked sessions, and a collapsed activity timeline.
+       Keyed by (provider, repository, external id) — never an internal AFK
+       Run ID. -->
   <div class="detail-overlay" id="cr-list-detail-overlay">
     <div class="detail-panel glass-panel" id="cr-list-detail-panel">
       <div class="detail-header">

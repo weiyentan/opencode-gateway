@@ -222,6 +222,8 @@ var historyStub = {
 (function loadRealAppJs() {
   var appJsPath = path.join(__dirname, '..', 'app.js');
   var source = fs.readFileSync(appJsPath, 'utf8');
+  var adaptersPath = path.join(__dirname, '..', 'adapters', 'change_request_adapters.js');
+  var adaptersSource = fs.readFileSync(adaptersPath, 'utf8');
 
   var documentStub = {
     readyState: 'loading',
@@ -265,6 +267,10 @@ var historyStub = {
   sandbox.window = sandboxWindow;
   appJsSandbox = sandbox;
   vm.createContext(sandbox);
+  // Load order mirrors index.html: the change-request adapter module first
+  // (exposes window.ChangeRequestAdapters), then app.js (captures it at IIFE
+  // load time for the change-request detail/execution renderers).
+  vm.runInContext(adaptersSource, sandbox, { filename: 'change_request_adapters.js' });
   vm.runInContext(source, sandbox, { filename: 'app.js' });
 
   window.resolveProjectLabel = sandboxWindow.resolveProjectLabel;
@@ -352,6 +358,13 @@ var historyStub = {
   window.renderChangeRequestList = sandboxWindow.renderChangeRequestList;
   window.selectRepository = sandboxWindow.selectRepository;
   window.clearSelectedRepo = sandboxWindow.clearSelectedRepo;
+  // Issue #651: change-request execution detail rendering — the grouped
+  // execution renderer and the per-execution entry renderer exercise the
+  // explicit purpose (Implementation/Review/Retry/Other) and outcome
+  // (Completed/Failed/Cancelled/Unknown) display paths through the window
+  // test seam with adapter-shaped view models.
+  window.renderChangeRequestExecutions = sandboxWindow.renderChangeRequestExecutions;
+  window.renderChangeRequestExecution = sandboxWindow.renderChangeRequestExecution;
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = sandboxWindow.fmtRelationshipState;
   window.renderRelationshipBadge = sandboxWindow.renderRelationshipBadge;
@@ -6769,4 +6782,243 @@ console.log('\u25B6 style.css \u2014 AFK Change Request List rules (issue #573)'
     'style.css: .afk-cr-badge rule exists');
   assert(live.indexOf('.repo-row') !== -1,
     'style.css: .repo-row rule exists (clickable repository rows)');
+})();
+
+// ── Issue #651 — change-request execution rendering ─────────────────────
+// The detail-view execution renderer groups executions under their known
+// purpose (Implementation / Review / Retry / Other) and renders each entry
+// with explicit display badges.  These tests drive the PRODUCTION app.js
+// renderers with adapter-shaped view models through the window test seam.
+
+console.log('\u25B6 issue #651 \u2014 execution rendering: purpose grouping');
+
+(function () {
+  if (typeof window.renderChangeRequestExecutions !== 'function') {
+    assert(false, 'app.js: renderChangeRequestExecutions exposed on the window test seam');
+    return;
+  }
+
+  function exec(jobId, purposeValue, purposeLabel, purposeBadge, statusValue, statusLabel, statusBadge, outcome) {
+    return {
+      awxJobId: jobId,
+      purpose: { value: purposeValue, label: purposeLabel, badgeClass: purposeBadge },
+      status: { value: statusValue, label: statusLabel, badgeClass: statusBadge },
+      outcome: outcome,
+      tokens: {}, duration: '--',
+      cost: { available: false, usd: null, label: 'Cost unavailable' }
+    };
+  }
+
+  var view = {
+    executionCounts: { total: 5 },
+    executions: [
+      exec('impl-1', 'implementation', 'Implementation', 'badge-completed', 'completed', 'Completed', 'badge-completed', 'completed'),
+      exec('review-1', 'review', 'Review', 'badge-open', 'completed', 'Completed', 'badge-completed', 'completed'),
+      exec('retry-1', 'retry', 'Retry', 'badge-cancelled', 'failed', 'Failed', 'badge-failed', 'failed'),
+      exec('other-1', 'unknown', 'Unknown', 'badge-unknown', null, 'Unknown', 'badge-unknown', null),
+      exec('other-2', 'some-future-vocab', 'Unknown', 'badge-unknown', 'cancelled', 'Cancelled', 'badge-cancelled', 'cancelled')
+    ]
+  };
+  var html = window.renderChangeRequestExecutions(view);
+
+  // Known purposes each appear as a distinct group title.
+  assert(html.indexOf('>Implementation<') !== -1, '#651 render: Implementation group rendered');
+  assert(html.indexOf('>Review<') !== -1, '#651 render: Review group rendered');
+  assert(html.indexOf('>Retry<') !== -1, '#651 render: Retry group rendered');
+  // Unknown / missing / non-vocabulary purposes all render under Other and
+  // are never hidden.
+  assert(html.indexOf('>Other<') !== -1, '#651 render: Other group rendered');
+  assert(html.indexOf('other-1') !== -1, '#651 render: missing-purpose execution preserved');
+  assert(html.indexOf('other-2') !== -1, '#651 render: non-vocabulary purpose preserved under Other');
+
+  // Explicit outcome display labels render on the execution badges.
+  assert(html.indexOf('>Completed<') !== -1, '#651 render: Completed outcome badge');
+  assert(html.indexOf('>Failed<') !== -1, '#651 render: Failed outcome badge');
+  assert(html.indexOf('>Cancelled<') !== -1, '#651 render: Cancelled outcome badge');
+  assert(html.indexOf('>Unknown<') !== -1, '#651 render: Unknown outcome badge for missing outcome');
+
+  // The section title carries the total execution count.
+  assert(html.indexOf('Executions (5)') !== -1, '#651 render: execution count in section title');
+})();
+
+console.log('\u25B6 issue #651 \u2014 execution rendering: explicit outcome entry');
+
+(function () {
+  if (typeof window.renderChangeRequestExecution !== 'function') {
+    assert(false, 'app.js: renderChangeRequestExecution exposed on the window test seam');
+    return;
+  }
+
+  // Reliable terminal outcomes display as Completed / Failed / Cancelled on
+  // the per-execution entry.
+  var completed = window.renderChangeRequestExecution({
+    awxJobId: 'e1',
+    purpose: { value: 'implementation', label: 'Implementation', badgeClass: 'badge-completed' },
+    status: { value: 'completed', label: 'Completed', badgeClass: 'badge-completed' },
+    outcome: 'completed', tokens: {}, duration: '--',
+    cost: { available: false, usd: null, label: 'Cost unavailable' }
+  });
+  assert(completed.indexOf('>Completed<') !== -1, '#651 entry: completed renders Completed');
+
+  var failed = window.renderChangeRequestExecution({
+    awxJobId: 'e2',
+    purpose: { value: 'retry', label: 'Retry', badgeClass: 'badge-cancelled' },
+    status: { value: 'failed', label: 'Failed', badgeClass: 'badge-failed' },
+    outcome: 'failed', tokens: {}, duration: '--',
+    cost: { available: false, usd: null, label: 'Cost unavailable' }
+  });
+  assert(failed.indexOf('>Failed<') !== -1, '#651 entry: failed renders Failed');
+
+  var cancelled = window.renderChangeRequestExecution({
+    awxJobId: 'e3',
+    purpose: { value: 'review', label: 'Review', badgeClass: 'badge-open' },
+    status: { value: 'cancelled', label: 'Cancelled', badgeClass: 'badge-cancelled' },
+    outcome: 'cancelled', tokens: {}, duration: '--',
+    cost: { available: false, usd: null, label: 'Cost unavailable' }
+  });
+  assert(cancelled.indexOf('>Cancelled<') !== -1, '#651 entry: cancelled renders Cancelled');
+
+  // Missing / unreliable outcome stays Unknown — never inferred from the
+  // job template or timestamps (the entry carries no raw '--' badge).
+  var unknown = window.renderChangeRequestExecution({
+    awxJobId: 'e4',
+    purpose: { value: 'implementation', label: 'Implementation', badgeClass: 'badge-completed' },
+    status: { value: null, label: 'Unknown', badgeClass: 'badge-unknown' },
+    outcome: null, tokens: {}, duration: '--',
+    cost: { available: false, usd: null, label: 'Cost unavailable' }
+  });
+  assert(unknown.indexOf('>Unknown<') !== -1, '#651 entry: missing outcome renders Unknown');
+  assert(unknown.indexOf('badge-unknown') !== -1, '#651 entry: missing outcome uses badge-unknown');
+})();
+
+console.log('\u25B6 issue #651 \u2014 execution rendering: distinct outcome badge');
+
+(function () {
+  if (typeof window.renderChangeRequestExecution !== 'function') {
+    assert(false, 'app.js: renderChangeRequestExecution exposed on the window test seam');
+    return;
+  }
+  // A provenance shape where the status ('stale') differs from the outcome
+  // ('failed') renders BOTH badges — the status and the explicit outcome.
+  var html = window.renderChangeRequestExecution({
+    awxJobId: 'e5',
+    purpose: { value: 'review', label: 'Review', badgeClass: 'badge-open' },
+    status: { value: 'stale', label: 'Stale', badgeClass: 'badge-stale' },
+    outcome: 'failed', tokens: {}, duration: '--',
+    cost: { available: false, usd: null, label: 'Cost unavailable' }
+  });
+  assert(html.indexOf('>Stale<') !== -1, '#651 distinct: status badge (Stale) rendered');
+  assert(html.indexOf('>Failed<') !== -1, '#651 distinct: distinct outcome badge (Failed) rendered');
+  assert(html.indexOf('badge-failed') !== -1, '#651 distinct: outcome badge uses badge-failed');
+})();
+
+// ── Issue #652: provider lifecycle status labels (PR/MR Status) ────────────
+// The primary change-request list and the detail header label the provider
+// lifecycle badge with provider-specific terminology: PR Status (GitHub),
+// MR Status (GitLab), MR/PR Status (unknown).  The redundant AFK Automation
+// presentation (list column + detail badge + filter) is removed, while the
+// automation_state API field and the AFK Run Cost remain.
+
+console.log('\u25B6 issue #652 \u2014 provider lifecycle status labels');
+
+(function () {
+  var W = appJsSandbox.window;
+  assert(W.crStatusHeaderLabel('github') === 'PR Status',
+    'issue #652: crStatusHeaderLabel github -> PR Status');
+  assert(W.crStatusHeaderLabel('gitlab') === 'MR Status',
+    'issue #652: crStatusHeaderLabel gitlab -> MR Status');
+  assert(W.crStatusHeaderLabel('bitbucket') === 'MR/PR Status',
+    'issue #652: crStatusHeaderLabel unknown -> MR/PR Status');
+  assert(W.crStatusHeaderLabel(null) === 'MR/PR Status',
+    'issue #652: crStatusHeaderLabel null -> MR/PR Status');
+})();
+
+console.log('\u25B6 issue #652 \u2014 summary row render (provider labels, no AFK Automation column)');
+
+(function () {
+  var W = appJsSandbox.window;
+  if (typeof W.renderChangeRequestSummaryRow !== 'function') {
+    assert(false, 'app.js: renderChangeRequestSummaryRow exposed on the window test seam');
+    return;
+  }
+  // GitHub row: PR Status data-label on the lifecycle status cell.
+  var gh = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'github', repository: 'acme/web-app', external_id: '142' },
+    providerTerm: 'PR',
+    statusHeaderLabel: 'PR Status',
+    displayId: 'acme/web-app#142',
+    title: 't',
+    providerState: { value: 'merged', label: 'merged', badgeClass: 'badge-merged' },
+    afkAutomationState: { value: 'completed', label: 'completed', badgeClass: 'badge-completed' },
+    cost: { available: true, usd: 1, label: '$1.00' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(gh.indexOf('data-label="PR Status"') !== -1,
+    'issue #652: GitHub row lifecycle status cell labeled PR Status');
+  assert(gh.indexOf('data-label="AFK Automation"') === -1,
+    'issue #652: GitHub row carries no AFK Automation cell');
+  assert(gh.indexOf('badge-completed') === -1,
+    'issue #652: GitHub row renders no automation completed badge');
+  assert(gh.indexOf('badge-merged') !== -1,
+    'issue #652: GitHub row renders the merged lifecycle badge');
+
+  // GitLab row: MR Status data-label.
+  var gl = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'gitlab', repository: 'group/cloudnative', external_id: '6' },
+    providerTerm: 'MR',
+    statusHeaderLabel: 'MR Status',
+    displayId: 'group/cloudnative#6',
+    title: 't',
+    providerState: { value: 'open', label: 'open', badgeClass: 'badge-open' },
+    afkAutomationState: { value: 'failed', label: 'failed', badgeClass: 'badge-failed' },
+    cost: { available: false, usd: null, label: 'Cost unavailable' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(gl.indexOf('data-label="MR Status"') !== -1,
+    'issue #652: GitLab row lifecycle status cell labeled MR Status');
+  assert(gl.indexOf('data-label="AFK Automation"') === -1 &&
+         gl.indexOf('badge-failed') === -1,
+    'issue #652: GitLab row renders no AFK Automation cell/badge');
+
+  // Unknown provider row: MR/PR Status data-label.
+  var unk = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'unknown', repository: 'r', external_id: '9' },
+    providerTerm: 'CR',
+    statusHeaderLabel: 'MR/PR Status',
+    displayId: 'r#9',
+    title: '',
+    providerState: { value: 'closed', label: 'closed', badgeClass: 'badge-closed' },
+    afkAutomationState: { value: '', label: '--', badgeClass: 'badge-unknown' },
+    cost: { available: false, usd: null, label: 'Cost unavailable' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(unk.indexOf('data-label="MR/PR Status"') !== -1,
+    'issue #652: unknown-provider row lifecycle status cell labeled MR/PR Status');
+  assert(unk.indexOf('Cost unavailable') !== -1,
+    'issue #652: cost cell remains for unknown-provider rows');
+})();
+
+console.log('\u25B6 index.html \u2014 issue #652 markup smoke check');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The primary change-request list: no AFK Automation filter, no AFK
+  // Automation column, and the lifecycle status column header is present.
+  assert(html.indexOf('id="afk-cr-filter-automation-state"') === -1,
+    'index.html: AFK Automation filter removed');
+  assert(html.indexOf('<th>AFK Automation</th>') === -1,
+    'index.html: AFK Automation column header removed');
+  assert(html.indexOf('<th>Provider State</th>') === -1,
+    'index.html: legacy Provider State column header removed');
+  assert(html.indexOf('<th>PR / MR Status</th>') !== -1,
+    'index.html: lifecycle status column header present');
+  // The secondary change-request panel (issue #573) is untouched.
+  assert(html.indexOf('id="afk-cr-filter-provider-state"') !== -1,
+    'index.html: Provider State filter remains for the provider lifecycle status');
 })();

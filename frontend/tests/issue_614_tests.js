@@ -9,9 +9,10 @@
  * code, not a copy.  No DOM, no network access, no provider credentials,
  * no AWX.
  *
- * Coverage (issue #614 acceptance criteria):
- *   - Detail header: provider identity, provider state, AFK automation
- *     state, and total estimated USD cost first.
+ * Coverage (issue #614 acceptance criteria, updated for issue #652):
+ *   - Detail header: provider identity, provider lifecycle status (PR Status
+ *     / MR Status / MR/PR Status by provider), and AFK Run Cost first; the
+ *     redundant AFK Automation badge is gone.
  *   - Execution records grouped by purpose (implementation / review /
  *     retry) as distinct sections under one change request.
  *   - Per-execution AWX job ID, status, outcome, timestamps, duration,
@@ -21,7 +22,7 @@
  *   - Session links navigate to the existing Agent Run detail experience
  *     (closing the change-request overlay first).
  *   - Provenance/activity timeline present but collapsed by default.
- *   - Provider state and AFK automation state remain visibly independent.
+ *   - The provider lifecycle state is the only header status badge.
  *   - Detail loading / not-found / partial-data / error states.
  */
 
@@ -242,29 +243,40 @@ function runTests() {
 // Header: identity + dual statuses + aggregate cost (GitHub)
 // ═════════════════════════════════════════════════════════════════════════
 
-test('header: identity, dual statuses, and AFK Run Cost render first (GitHub)', function () {
+test('header: identity, lifecycle status, and AFK Run Cost render first (GitHub, issue #652)', function () {
   W.renderChangeRequestDetail(githubFixture.buildDetail());
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'acme/web-app#142', 'header: display identity rendered');
   assertContains(html, 'feat: wire up web-app dashboard', 'header: title rendered');
-  assertContains(html, 'badge-merged', 'header: provider state badge');
-  assertContains(html, 'badge-completed', 'header: AFK automation state badge');
+  assertContains(html, 'badge-merged', 'header: provider lifecycle state badge');
   assertContains(html, 'AFK Run Cost', 'header: Gateway-owned AFK Run Cost label rendered');
   assertContains(html, '$6.35', 'header: AFK Run Cost value rendered');
   assertNotContains(html, '>Total Cost<', 'header: legacy Total Cost label retired');
-  // Independent badges: provider label and AFK automation label both present.
-  assertContains(html, '>Provider<', 'header: provider status label');
-  assertContains(html, '>AFK Automation<', 'header: AFK automation status label');
+  // Issue #652: the lifecycle badge is labeled PR Status for GitHub and the
+  // redundant AFK Automation badge is gone.
+  assertContains(html, '>PR Status<', 'header: GitHub lifecycle status label PR Status');
+  assertNotContains(html, '>Provider<', 'header: legacy generic Provider label retired');
+  assertNotContains(html, '>AFK Automation<', 'header: AFK Automation badge removed');
+  // The header block carries exactly one lifecycle badge (merged) — the
+  // automation completed badge must not appear within the header markup
+  // (execution rows below legitimately keep their own badge-completed).
+  var headerBlock = html.slice(html.indexOf('afk-cr-detail-header'), html.indexOf('afk-cr-section'));
+  assertNotContains(headerBlock, 'badge-completed',
+    'header: automation completed badge removed from the detail header');
 });
 
-test('header: GitLab parity — MR identity, same lifecycle semantics', function () {
+test('header: GitLab parity — MR Status label, no AFK Automation badge (issue #652)', function () {
   W.renderChangeRequestDetail(gitlabFixture.buildDetail());
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'group/cloudnative#6', 'header: GitLab MR identity');
-  assertContains(html, 'badge-merged', 'header: GitLab provider state badge');
-  assertContains(html, 'badge-completed', 'header: GitLab AFK automation badge');
+  assertContains(html, 'badge-merged', 'header: GitLab provider lifecycle state badge');
+  assertContains(html, '>MR Status<', 'header: GitLab lifecycle status label MR Status');
   assertContains(html, 'AFK Run Cost', 'header: GitLab AFK Run Cost label');
   assertContains(html, '$4.80', 'header: GitLab AFK Run Cost value');
+  assertNotContains(html, '>AFK Automation<', 'header: GitLab AFK Automation badge removed');
+  var headerBlock = html.slice(html.indexOf('afk-cr-detail-header'), html.indexOf('afk-cr-section'));
+  assertNotContains(headerBlock, 'badge-completed',
+    'header: GitLab automation completed badge removed from the detail header');
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -582,8 +594,10 @@ test('detail: partial data renders unavailable cost and empty sections', functio
   });
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'g/p#3', 'partial: identity rendered');
-  assertContains(html, 'badge-open', 'partial: provider state badge');
-  assertContains(html, 'badge-failed', 'partial: automation state badge');
+  assertContains(html, 'badge-open', 'partial: provider lifecycle badge');
+  assertContains(html, 'MR Status', 'partial: GitLab lifecycle status label');
+  assertNotContains(html, 'badge-failed', 'partial: automation failed badge not rendered (issue #652)');
+  assertNotContains(html, 'AFK Automation', 'partial: no AFK Automation badge (issue #652)');
   assertContains(html, 'Cost unavailable', 'partial: missing run cost renders Cost unavailable');
   assertContains(html, 'No linked executions', 'partial: empty executions section');
   assertContains(html, 'No sessions linked', 'partial: empty sessions section');
@@ -591,17 +605,19 @@ test('detail: partial data renders unavailable cost and empty sections', functio
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// Status combinations + provider/automation independence
+// Status combinations + lifecycle-only independence (issue #652)
 // ═════════════════════════════════════════════════════════════════════════
 
-test('status combinations: provider merged + automation completed', function () {
+test('status combinations: provider merged renders merged lifecycle badge only', function () {
   W.renderChangeRequestDetail(githubFixture.buildDetail());
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'badge-merged', 'status combo: provider merged');
-  assertContains(html, 'badge-completed', 'status combo: automation completed');
+  var headerBlock = html.slice(html.indexOf('afk-cr-detail-header'), html.indexOf('afk-cr-section'));
+  assertNotContains(headerBlock, 'badge-completed',
+    'status combo: automation completed badge not rendered in the header');
 });
 
-test('status combinations: provider open + automation running', function () {
+test('status combinations: provider open renders open lifecycle badge only', function () {
   W.renderChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r/x', external_id: '5', provider_state: 'open', automation_state: 'running' },
     executions: [],
@@ -609,10 +625,10 @@ test('status combinations: provider open + automation running', function () {
   });
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'badge-open', 'status combo: provider open');
-  assertContains(html, 'badge-running', 'status combo: automation running');
+  assertNotContains(html, 'badge-running', 'status combo: automation running badge not rendered');
 });
 
-test('status combinations: provider closed + automation failed', function () {
+test('status combinations: provider closed renders closed lifecycle badge only', function () {
   W.renderChangeRequestDetail({
     change_request: { provider: 'github', repository: 'r/x', external_id: '6', provider_state: 'closed', automation_state: 'failed' },
     executions: [],
@@ -620,7 +636,18 @@ test('status combinations: provider closed + automation failed', function () {
   });
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'badge-closed', 'status combo: provider closed');
-  assertContains(html, 'badge-failed', 'status combo: automation failed');
+  assertNotContains(html, 'badge-failed', 'status combo: automation failed badge not rendered');
+});
+
+test('status label: unknown provider falls back to MR/PR Status (issue #652)', function () {
+  W.renderChangeRequestDetail({
+    change_request: { repository: 'r/x', external_id: '11', provider_state: 'open' },
+    executions: [],
+    sessions: []
+  });
+  var html = crDetailBodyEl.innerHTML;
+  assertContains(html, '>MR/PR Status<', 'unknown provider: lifecycle status label MR/PR Status');
+  assertContains(html, 'badge-open', 'unknown provider: lifecycle badge still rendered');
 });
 
 test('overlay lifecycle: close button hides the overlay', function () {

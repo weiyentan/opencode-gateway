@@ -93,6 +93,19 @@ console.log('\u25B6 crDisplayId + crProviderTerm');
   assertEqual(A.crProviderTerm(''), 'CR', 'provider term: empty -> CR');
 })();
 
+console.log('\u25B6 crStatusHeaderLabel (issue #652)');
+
+(function () {
+  assertEqual(A.crStatusHeaderLabel('github'), 'PR Status', 'status header label: github -> PR Status');
+  assertEqual(A.crStatusHeaderLabel('GitHub'), 'PR Status', 'status header label: GitHub (case) -> PR Status');
+  assertEqual(A.crStatusHeaderLabel('gitlab'), 'MR Status', 'status header label: gitlab -> MR Status');
+  assertEqual(A.crStatusHeaderLabel('GitLab'), 'MR Status', 'status header label: GitLab (case) -> MR Status');
+  assertEqual(A.crStatusHeaderLabel('bitbucket'), 'MR/PR Status', 'status header label: unknown provider -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel('unknown'), 'MR/PR Status', 'status header label: unknown -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel(null), 'MR/PR Status', 'status header label: null -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel(''), 'MR/PR Status', 'status header label: empty -> MR/PR Status');
+})();
+
 // ── Provider state adapters ─────────────────────────────────────────────
 
 console.log('\u25B6 provider state');
@@ -229,15 +242,33 @@ console.log('\u25B6 execution purpose + status');
   assertEqual(A.executionPurposeBadgeClass('retry'), 'badge-cancelled', 'purpose badge: retry');
   assertEqual(A.executionPurposeBadgeClass(null), 'badge-unknown', 'purpose badge: unknown');
 
-  assertEqual(A.executionStatusLabel('pending'), 'pending', 'status label: pending');
-  assertEqual(A.executionStatusLabel('running'), 'running', 'status label: running');
-  assertEqual(A.executionStatusLabel(''), '--', 'status label: empty -> --');
+  // Issue #651: explicit AWX terminal outcomes display as Completed / Failed /
+  // Cancelled.  Reliable terminal-outcome aliases (successful, the single-l
+  // US "canceled") converge on the same display label; the provisional
+  // running state and the remaining observed states keep readable labels;
+  // missing/unreliable outcomes display Unknown — never inferred.
+  assertEqual(A.executionStatusLabel('completed'), 'Completed', 'status label: completed -> Completed');
+  assertEqual(A.executionStatusLabel('successful'), 'Completed', 'status label: successful -> Completed');
+  assertEqual(A.executionStatusLabel('failed'), 'Failed', 'status label: failed -> Failed');
+  assertEqual(A.executionStatusLabel('cancelled'), 'Cancelled', 'status label: cancelled -> Cancelled');
+  assertEqual(A.executionStatusLabel('canceled'), 'Cancelled', 'status label: canceled (single-l) -> Cancelled');
+  assertEqual(A.executionStatusLabel('running'), 'Running', 'status label: running -> Running');
+  assertEqual(A.executionStatusLabel('pending'), 'Pending', 'status label: pending -> Pending');
+  assertEqual(A.executionStatusLabel('blocked'), 'Blocked', 'status label: blocked -> Blocked');
+  assertEqual(A.executionStatusLabel('stale'), 'Stale', 'status label: stale -> Stale');
+  assertEqual(A.executionStatusLabel('timed_out'), 'Timed out', 'status label: timed_out -> Timed out');
+  assertEqual(A.executionStatusLabel(''), 'Unknown', 'status label: empty -> Unknown');
+  assertEqual(A.executionStatusLabel(null), 'Unknown', 'status label: null -> Unknown');
+  assertEqual(A.executionStatusLabel(undefined), 'Unknown', 'status label: undefined -> Unknown');
+  assertEqual(A.executionStatusLabel('bogus'), 'Unknown', 'status label: unreliable value -> Unknown');
 
   assertEqual(A.executionStatusBadgeClass('pending'), 'badge-blocked', 'status badge: pending');
   assertEqual(A.executionStatusBadgeClass('running'), 'badge-running', 'status badge: running');
   assertEqual(A.executionStatusBadgeClass('completed'), 'badge-completed', 'status badge: completed');
+  assertEqual(A.executionStatusBadgeClass('successful'), 'badge-completed', 'status badge: successful -> completed');
   assertEqual(A.executionStatusBadgeClass('failed'), 'badge-failed', 'status badge: failed');
   assertEqual(A.executionStatusBadgeClass('cancelled'), 'badge-cancelled', 'status badge: cancelled');
+  assertEqual(A.executionStatusBadgeClass('canceled'), 'badge-cancelled', 'status badge: canceled (single-l) -> cancelled');
   assertEqual(A.executionStatusBadgeClass('stale'), 'badge-stale', 'status badge: stale');
   assertEqual(A.executionStatusBadgeClass('bogus'), 'badge-unknown', 'status badge: unknown');
 })();
@@ -296,6 +327,7 @@ console.log('\u25B6 summary adapter');
     'summary: github identity preserved');
   assertEqual(gh.displayId, 'acme/web-app#142', 'summary: display id');
   assertEqual(gh.providerTerm, 'PR', 'summary: provider term PR');
+  assertEqual(gh.statusHeaderLabel, 'PR Status', 'summary: GitHub status header label PR Status');
   assertEqual(gh.title, 'Implement auth', 'summary: title');
   assertEqual(gh.providerState.value, 'merged', 'summary: provider state merged');
   assertEqual(gh.providerState.badgeClass, 'badge-merged', 'summary: provider state badge');
@@ -322,6 +354,7 @@ console.log('\u25B6 summary adapter');
   assertDeepEqual(gl.identity, { provider: 'gitlab', repository: 'group/project', external_id: '6' },
     'summary: gitlab identity preserved');
   assertEqual(gl.providerTerm, 'MR', 'summary: provider term MR');
+  assertEqual(gl.statusHeaderLabel, 'MR Status', 'summary: GitLab status header label MR Status');
   assertEqual(gl.providerState.value, 'open', 'summary: opened normalizes to open');
   assertEqual(gl.afkAutomationState.value, 'running', 'summary: afk running');
   assertEqual(gl.cost.available, false, 'summary: missing cost unavailable');
@@ -348,6 +381,8 @@ console.log('\u25B6 summary adapter');
 
   assertEqual(A.adaptChangeRequestSummary(null).identity.provider, 'unknown',
     'summary: null item -> unknown identity');
+  assertEqual(A.adaptChangeRequestSummary(null).statusHeaderLabel, 'MR/PR Status',
+    'summary: null item -> MR/PR Status fallback');
 
   // The canonical summary contract carries `executions` (outcome-state
   // counts, issue #610).  The legacy aliases (`execution_counts` / `counts`)
@@ -465,6 +500,35 @@ console.log('\u25B6 detail adapter — executions');
   assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'cancelled' }).status.value, 'cancelled', 'exec: cancelled');
   assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, status: 'stale' }).status.value, 'stale', 'exec: stale');
 
+  // Issue #651: the view-model status block exposes explicit display labels
+  // for reliable terminal outcomes (and Unknown when none is available).
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'completed' }).status.label,
+    'Completed', 'exec: completed outcome -> Completed display label');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'successful' }).status.label,
+    'Completed', 'exec: successful alias -> Completed display label');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'successful' }).status.badgeClass,
+    'badge-completed', 'exec: successful alias -> badge-completed');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'failed' }).status.label,
+    'Failed', 'exec: failed outcome -> Failed display label');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'cancelled' }).status.label,
+    'Cancelled', 'exec: cancelled outcome -> Cancelled display label');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'canceled' }).status.label,
+    'Cancelled', 'exec: canceled (single-l) -> Cancelled display label');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'canceled' }).status.badgeClass,
+    'badge-cancelled', 'exec: canceled (single-l) -> badge-cancelled');
+  // A provenance-shape status flows through the same outcome display mapping.
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, status: 'completed', outcome: 'changes_requested' }).status.label,
+    'Completed', 'exec: status field completed -> Completed display label');
+  // Missing outcome stays Unknown — never inferred from timestamps/template.
+  assertEqual(A.adaptExecution({ awx_job: { job_id: 'x' }, job_template_id: 'tpl-develop' }).status.label,
+    'Unknown', 'exec: missing outcome -> Unknown (no template inference)');
+  assertEqual(A.adaptExecution({
+    awx_job: { job_id: 'x' },
+    outcome: null,
+    started_at: '2026-08-01T09:00:00Z',
+    finished_at: '2026-08-01T09:40:00Z'
+  }).status.label, 'Unknown', 'exec: null outcome with timestamps -> Unknown (no timestamp inference)');
+
   // Missing cost on an execution
   var noCost = A.adaptExecution({ awx_job: { job_id: 'x' }, outcome: 'completed' });
   assertEqual(noCost.cost.available, false, 'exec: missing cost unavailable');
@@ -476,7 +540,7 @@ console.log('\u25B6 detail adapter — executions');
   var bad = A.adaptExecution(null);
   assertEqual(bad.awxJobId, null, 'exec: null execution -> null job id');
   assertEqual(bad.purpose.value, 'unknown', 'exec: null execution -> unknown purpose');
-  assertEqual(bad.status.label, '--', 'exec: null execution -> -- status');
+  assertEqual(bad.status.label, 'Unknown', 'exec: null execution -> Unknown status');
   assertEqual(bad.cost.available, false, 'exec: null execution -> cost unavailable');
   assertEqual(bad.duration, '--', 'exec: null execution -> no duration');
   assertEqual(bad.tokens.available, false, 'exec: null execution -> no token telemetry');
@@ -506,6 +570,7 @@ console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
   assertDeepEqual(detail.identity, { provider: 'gitlab', repository: 'group/project', external_id: '6' },
     'detail: identity preserved');
   assertEqual(detail.providerTerm, 'MR', 'detail: MR term');
+  assertEqual(detail.statusHeaderLabel, 'MR Status', 'detail: GitLab status header label MR Status');
   assertEqual(detail.providerState.value, 'merged', 'detail: provider state merged');
   assertEqual(detail.afkAutomationState.value, 'completed', 'detail: afk state completed');
   assertEqual(detail.runCost.available, true, 'detail: AFK Run Cost available');
@@ -591,6 +656,13 @@ console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
   assertEqual(nested.identity.external_id, '9', 'detail: summary-nested identity');
   assertEqual(nested.providerState.value, 'open', 'detail: summary-nested provider state');
 
+  // Unknown provider → MR/PR Status fallback in the detail view model.
+  var unknownDetail = A.adaptChangeRequestDetail({
+    change_request: { repository: 'r', external_id: '10', provider_state: 'open' }
+  });
+  assertEqual(unknownDetail.statusHeaderLabel, 'MR/PR Status',
+    'detail: unknown provider -> MR/PR Status fallback');
+
   // null/empty detail
   assertEqual(A.adaptChangeRequestDetail(null), null, 'detail: null -> null');
   var empty = A.adaptChangeRequestDetail({ change_request: null, executions: null });
@@ -652,6 +724,60 @@ console.log('\u25B6 detail adapter — timeline envelope flattening');
   });
   assert(Array.isArray(bare.timeline), 'detail: bare-array timeline accepted (legacy)');
   assertEqual(bare.timeline.length, 1, 'detail: bare-array timeline length preserved');
+})();
+
+// ── Issue #651 — purpose classification + explicit outcome grouping ──────
+// The change-request execution presentation classifies each execution into
+// exactly one purpose bucket (implementation / review / retry / unknown →
+// Other) and surfaces reliable terminal AWX outcomes with explicit display
+// labels (Completed / Failed / Cancelled), retaining Unknown when no
+// reliable outcome is available — never inferred from timestamps or
+// template type.
+
+console.log('\u25B6 issue #651 — purpose classification + explicit outcomes');
+
+(function () {
+  // Purpose preference: execution.purpose wins; execution.phase is the
+  // same-payload defensive fallback (no browser-side join).
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '1' }, purpose: 'implementation' }).purpose.value,
+    'implementation', '#651 purpose: execution.purpose implementation');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '2' }, purpose: 'review' }).purpose.value,
+    'review', '#651 purpose: execution.purpose review');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '3' }, purpose: 'retry' }).purpose.value,
+    'retry', '#651 purpose: execution.purpose retry');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '4' }, phase: 'develop' }).purpose.value,
+    'implementation', '#651 purpose: phase develop -> implementation (fallback)');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '5' }, phase: 'review' }).purpose.value,
+    'review', '#651 purpose: phase review -> review (fallback)');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '6' } }).purpose.value,
+    'unknown', '#651 purpose: missing purpose/phase -> unknown (Other)');
+  assertEqual(A.adaptExecution({ awx_job: { job_id: '7' }, purpose: 'future-vocab' }).purpose.value,
+    'future-vocab', '#651 purpose: unrecognized vocabulary preserved (Other)');
+
+  // A detail contract groups executions into purpose buckets: every known
+  // purpose counts toward its own bucket; unknown/missing purposes stay out
+  // of all three (they render under Other) but are preserved as executions.
+  var grouped = A.adaptChangeRequestDetail({
+    change_request: { provider: 'github', repository: 'r/x', external_id: '1' },
+    executions: [
+      { awx_job: { job_id: 'g1' }, purpose: 'implementation', outcome: 'completed' },
+      { awx_job: { job_id: 'g2' }, purpose: 'implementation', outcome: 'failed' },
+      { awx_job: { job_id: 'g3' }, purpose: 'review', outcome: 'cancelled' },
+      { awx_job: { job_id: 'g4' }, purpose: 'retry', outcome: 'completed' },
+      { awx_job: { job_id: 'g5' }, purpose: null, outcome: 'failed' }
+    ]
+  });
+  assertEqual(grouped.executions.length, 5, '#651 grouping: all executions preserved');
+  assertDeepEqual(grouped.executionCounts,
+    { total: 5, running: 0, completed: 0, failed: 0, cancelled: 0,
+      implementation: 2, review: 1, retry: 1 },
+    '#651 grouping: known-purpose buckets counted; unknown purpose not counted');
+  var unknownExecs = grouped.executions.filter(function (e) {
+    return e.purpose.value === 'unknown';
+  });
+  assertEqual(unknownExecs.length, 1, '#651 grouping: unknown-purpose execution preserved for Other');
+  assertEqual(unknownExecs[0].status.label, 'Failed',
+    '#651 grouping: unknown-purpose execution still shows its explicit outcome');
 })();
 
 // ── No browser-side join / purity guarantees ────────────────────────────
