@@ -35,6 +35,19 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 KNOWN_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0", "1.1", "1.2", "1.3"})
 
+# ── Cost-only divergence marker (issue #646) ──────────────────────────────
+#
+# Reason carried by an IngestRecordResult when the legacy first-write-wins
+# layer detects a replay whose ONLY changed observable field is a non-NULL
+# ``estimated_cost_usd``.  The ingest handler recognises this marker and
+# routes the record through canonical accounting so the authoritative cost
+# correction reaches ``usage_events`` / the session aggregate / the client
+# project rollup.  A NULL incoming cost is never a correction (it can only
+# erase), so it never produces this marker — it stays a plain conflict.
+COST_ONLY_DIVERGENCE_REASON: str = (
+    "Cost-only divergence — canonical reconciliation required"
+)
+
 
 # ── Operator-only access (issue #483, PRD #478 decision #16) ──────────────
 #
@@ -309,13 +322,22 @@ def _utcnow() -> datetime:
 
 
 def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
-    """Compare two optional decimals for approximate equality."""
+    """Compare two optional decimals for exact monetary equality.
+
+    Equality is exact on the **normalized** value (``Decimal.normalize()``),
+    so representation-only differences such as ``1.0`` vs ``1.00`` compare
+    equal while any real monetary difference — including a delta smaller
+    than ``$0.0001`` — compares as different.  NULL/NULL is equal and
+    NULL/non-NULL is different.
+    """
     if a is None and b is None:
         return True
     if a is None or b is None:
         return False
     try:
-        return abs(a - b) < Decimal('0.0001')
+        a_dec = a if isinstance(a, Decimal) else Decimal(str(a))
+        b_dec = b if isinstance(b, Decimal) else Decimal(str(b))
+        return a_dec.normalize() == b_dec.normalize()
     except (ValueError, TypeError, InvalidOperation):
         return False
 
@@ -712,7 +734,10 @@ async def _process_one_record(
     transaction so a crash between statements cannot permanently
     under-count.  A losing identical duplicate returns ``accepted``
     (with optional Replay Merge); a losing divergent duplicate returns
-    ``conflict``.
+    ``conflict``.  A losing replay whose ONLY changed observable field
+    is a non-NULL ``estimated_cost_usd`` returns ``conflict`` carrying
+    :data:`COST_ONLY_DIVERGENCE_REASON` — the ingest handler routes
+    that marker through canonical accounting (issue #646).
 
     Returns an :class:`IngestRecordResult` regardless of outcome so the
     caller can implement partial-success semantics.
@@ -832,6 +857,28 @@ async def _process_one_record(
                 index=index,
                 status="accepted",
                 reason=reason,
+            )
+
+        # Tokens match but the cost differs (exact monetary comparison) and the
+        # incoming carries a non-NULL authoritative cost → a **cost-only
+        # divergence**.  The legacy first-write-wins row keeps the first-delivery
+        # values (unchanged below), but the caller must route the replay through
+        # canonical accounting so the authoritative cost correction reaches
+        # ``usage_events`` / the session aggregate / the client project rollup
+        # (issue #646).  Distinct from a token/identity conflict — a token or
+        # source-identity change stays a ``conflict``.  A NULL incoming cost is
+        # never a correction (a NULL can only erase, never authoritatively
+        # update), so it stays a legacy conflict — no canonical routing.
+        if (
+            record.estimated_cost_usd is not None
+            and existing["input_tokens"] == input_tokens
+            and existing["output_tokens"] == output_tokens
+            and existing["cached_tokens"] == effective_cached_tokens
+        ):
+            return IngestRecordResult(
+                index=index,
+                status="conflict",
+                reason=COST_ONLY_DIVERGENCE_REASON,
             )
         # Different values → conflict
         return IngestRecordResult(
@@ -1734,6 +1781,9 @@ async def _process_part(
 
 def _canonical_fields_identical(
     stored: asyncpg.Record, record: IngestRecord, effective_cached_tokens: int,
+    *,
+    include_cost: bool = True,
+    include_text: bool = True,
 ) -> bool:
     """Compare all observable collector fields against the stored canonical event.
 
@@ -1747,6 +1797,12 @@ def _canonical_fields_identical(
       ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
       ``cache_write_tokens``, ``estimated_cost_usd``.
     - Text enrichment: ``provider``, ``mode``, ``finish_reason``.
+
+    ``include_cost=False`` excludes the ``estimated_cost_usd`` comparison —
+    used by the cost-only routing gate (issue #646).  ``include_text=False``
+    excludes the text-enrichment comparison — text enrichment is never a
+    conflict boundary: differences there are handled by the non-erasing
+    COALESCE fill, exactly as in the normal replay-merge path.
 
     ``reported_at`` is deliberately excluded — replays may carry slightly
     different timestamps for the same logical record, so timestamp drift
@@ -1776,10 +1832,13 @@ def _canonical_fields_identical(
     ) != record.cache_write_tokens:
         return False
     # estimated_cost_usd: only compare when incoming is non-None
-    if record.estimated_cost_usd is not None and not _decimal_equal(
+    if include_cost and record.estimated_cost_usd is not None and not _decimal_equal(
         stored["estimated_cost_usd"], record.estimated_cost_usd,
     ):
         return False
+
+    if not include_text:
+        return True
 
     # Text enrichment — normalised comparison (whitespace-only → None).
     # **Non-erasing semantics (ADR 0011)**: a None/omitted incoming value
@@ -1872,6 +1931,7 @@ async def _record_canonical_event(
     now: datetime,
     *,
     canonical_identity_id: uuid.UUID,
+    cost_only: bool = False,
 ) -> dict[str, uuid.UUID | None]:
     """Record a canonical event for an accepted first-delivery record.
 
@@ -1906,6 +1966,27 @@ async def _record_canonical_event(
       enrichment fields (provider, mode, finish_reason) without erasing;
       ``last_ingested_at`` is bumped; outcome is ``"updated"``.
 
+    **Cost-only routing (issue #646):** When ``cost_only=True`` the caller
+    (the ingest handler) has already determined — against the legacy
+    ``opencode_usage_records`` row — that the only changed observable field
+    is a non-NULL ``estimated_cost_usd``.  Under the canonical lock the
+    narrow scope is verified against the **stored canonical event** before
+    any accounting is touched:
+
+    * No canonical event exists → a canonical event is backfilled from the
+      incoming record (self-healing path), outcome ``"accepted"``.
+    * The stored event differs ONLY in ``estimated_cost_usd`` (every other
+      observable field plus the session/model attribution matches) → the
+      cost Replay Merge applies ``incoming − stored`` to the event, the
+      owning session aggregate, and the client project rollup, outcome
+      ``"updated"``.
+    * The stored event also differs in a token field, session attribution,
+      or model attribution → outcome ``"conflict"``: the narrow cost-only
+      authority must never silently broaden into a token/model/session
+      correction.  Text enrichment is never a conflict boundary — it is
+      COALESCE-filled non-erasingly exactly as in the normal replay-merge
+      path.
+
     **Compared field set**: ``input_tokens``, ``output_tokens``,
     ``cached_tokens``, ``reasoning_tokens``, ``cache_read_tokens``,
     ``cache_write_tokens``, ``estimated_cost_usd``, ``provider``,
@@ -1916,8 +1997,8 @@ async def _record_canonical_event(
     timestamps for the same logical record.
 
     Returns a dict with ``event_id``, ``attempt_id``, and ``status``
-    (``"accepted"``, ``"duplicate"``, or ``"updated"``) for the caller
-    to attach to the :class:`IngestRecordResult`.
+    (``"accepted"``, ``"duplicate"``, ``"updated"``, or ``"conflict"``)
+    for the caller to attach to the :class:`IngestRecordResult`.
     """
     from app.core.reconciliation import (
         IngestOutcome,
@@ -2053,12 +2134,73 @@ async def _record_canonical_event(
             stored = await conn.fetchrow(
                 """SELECT input_tokens, output_tokens, cached_tokens,
                           reasoning_tokens, cache_read_tokens, cache_write_tokens,
-                          estimated_cost_usd, provider, mode, finish_reason
+                          estimated_cost_usd, provider, mode, finish_reason,
+                          session_id, model_id
                    FROM usage_events WHERE id = $1""",
                 event_id,
             )
 
-            if _canonical_fields_identical(stored, record, effective_cached_tokens):
+            # Cost-only routing (issue #646): the caller classified the replay
+            # as cost-only against the LEGACY row.  Under the canonical lock the
+            # narrow scope must hold against the STORED CANONICAL EVENT too —
+            # otherwise a legacy/canonical skew could let a token or
+            # model/session change slip through as a cost correction.  Re-verify
+            # with ``include_cost=False`` and ``include_text=False``: cost is
+            # the one allowed numeric difference, and text enrichment is never
+            # a conflict boundary (the non-erasing COALESCE fill handles it,
+            # exactly as in the normal replay-merge path).  Session and model
+            # attribution are compared explicitly so a replayed record that
+            # points at a different session or model stays a ``conflict``.
+            if cost_only:
+                canonical_same_except_cost = _canonical_fields_identical(
+                    stored, record, effective_cached_tokens,
+                    include_cost=False,
+                    include_text=False,
+                )
+                session_matches = stored["session_id"] == internal_session_id
+                model_matches = stored["model_id"] == model_id
+                if not (canonical_same_except_cost and session_matches and model_matches):
+                    # A broader canonical difference must not be silently
+                    # corrected as a cost-only replay — it stays a conflict.
+                    # No event/aggregate write happens; only the audit attempt
+                    # is recorded (below) with the ``conflict`` outcome.
+                    outcome_str = "conflict"
+                    reason = (
+                        "Cost-only divergence but canonical event differs in "
+                        "token, session, or model fields"
+                    )
+                elif not _decimal_equal(
+                    stored["estimated_cost_usd"], record.estimated_cost_usd,
+                ):
+                    # Cost genuinely differs → apply ONLY the cost delta, plus
+                    # the non-erasing text-enrichment COALESCE fill (same as the
+                    # normal replay-merge path).  A NULL incoming cost was
+                    # already excluded upstream (marker never fires for NULL),
+                    # so the incoming cost is authoritative.
+                    new_values = {"estimated_cost_usd": record.estimated_cost_usd}
+                    merge_outcome = await apply_replay_merge(
+                        conn, event_id, new_values,
+                        client_id=client_id,
+                    )
+                    enrichment_filled = await _fill_canonical_text_enrichment(
+                        conn, event_id, record,
+                    )
+                    await conn.execute(
+                        "UPDATE usage_events SET last_ingested_at = $1 WHERE id = $2",
+                        now,
+                        event_id,
+                    )
+                    outcome_str = (
+                        "updated"
+                        if merge_outcome == IngestOutcome.UPDATED or enrichment_filled
+                        else "duplicate"
+                    )
+                else:
+                    # Cost equal under exact Decimal equality → idempotent
+                    # duplicate, no accounting change.
+                    outcome_str = "duplicate"
+
+            elif _canonical_fields_identical(stored, record, effective_cached_tokens):
                 # All compared fields identical → duplicate
                 outcome_str = "duplicate"
             else:
@@ -2387,6 +2529,59 @@ async def ingest_usage(
                         logger.error(
                             "Record %s canonical event recording failed: %s", idx, exc,
                         )
+            elif (
+                result.status == "conflict"
+                and result.reason == COST_ONLY_DIVERGENCE_REASON
+            ):
+                # ── Cost-only routing (issue #646) ──────────────────
+                # The legacy first-write-wins layer saw a divergent duplicate,
+                # but the ONLY changed observable field is a non-NULL
+                # ``estimated_cost_usd``.  Route the replay through canonical
+                # accounting: ``_record_canonical_event`` re-reads the canonical
+                # event under the advisory lock and either backfills a missing
+                # event or applies the cost Replay Merge (incoming − stored)
+                # to the event, the owning session aggregate, and the client
+                # project rollup.  Legacy ``opencode_usage_records`` storage is
+                # untouched — this is an additional canonical correction, never
+                # a legacy overwrite.
+                try:
+                    canonical = await _record_canonical_event(
+                        conn, record, client_id, source_db_id,
+                        batch_id, body.replay_id, now,
+                        canonical_identity_id=canonical_identity_id,
+                        cost_only=True,
+                    )
+                    result.event_id = canonical["event_id"]
+                    result.attempt_id = canonical["attempt_id"]
+                    canonical_status = canonical.get("status")
+                    if canonical_status:
+                        result.status = canonical_status
+                        if canonical.get("reason"):
+                            result.reason = canonical["reason"]
+                        elif canonical_status == "accepted":
+                            result.reason = (
+                                "Cost-only divergence — canonical event backfilled"
+                            )
+                        elif canonical_status == "duplicate":
+                            result.reason = (
+                                "Cost-only divergence already reconciled — no change"
+                            )
+                        elif canonical_status == "conflict":
+                            result.reason = (
+                                "Cost-only divergence not applied — canonical scope exceeded"
+                            )
+                        elif canonical_status == "updated":
+                            result.reason = (
+                                "Cost-only divergence — canonical cost corrected"
+                            )
+                except Exception as exc:
+                    logger.error(
+                        "Record %s canonical cost reconciliation failed: %s", idx, exc,
+                    )
+                    result.status = "conflict"
+                    result.reason = "Cost-only reconciliation failed — record skipped"
+                    result.event_id = None
+                    result.attempt_id = None
 
             if result.status in ("accepted", "duplicate", "updated"):
                 accepted += 1

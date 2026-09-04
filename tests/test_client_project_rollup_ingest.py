@@ -1146,3 +1146,208 @@ class TestNullProjectSkipsRollup:
         assert len(rollup_calls) == 0, (
             "NULL project_id replay should not write rollup"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Issue #646: cost-only replays route through canonical accounting and apply
+#  the cost delta to the rollup atomically with the event / session / attempt
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCostOnlyReplayRollupDelta:
+    """A legacy-conflict replay whose ONLY changed observable field is a
+    non-NULL ``estimated_cost_usd`` routes through canonical accounting
+    (issue #646).  The canonical Replay Merge applies the cost delta
+    ``incoming − stored`` to ``usage_events``, the owning session aggregate,
+    and the ``client_project_rollup`` row — atomically, in the same
+    transaction as the ingest-attempt audit record."""
+
+    @pytest.mark.asyncio
+    async def test_cost_only_replay_applies_rollup_cost_delta(self, monkeypatch):
+        """A cost-only replay (tokens identical, cost 0.0035 → 0.0100) applies
+        only the +0.0065 rollup delta and returns ``updated`` — the rollup is
+        never re-incremented by the full incoming value."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        model_id = uuid.uuid4()
+
+        # ── Handler + legacy loser path ────────────────────────────────
+        items: list = [_auth_row(), None]  # auth + sd_check
+        items.extend(_handler_routing_side_effect_items())
+
+        # _process_one_record (loser): model upsert, atomic INSERT → None,
+        # dedup SELECT → legacy row with SAME tokens but cost 0.0035.
+        model_upsert_row = MagicMock()
+        model_upsert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        legacy_row = MagicMock()
+        legacy_row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 20,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        items.extend([model_upsert_row, None, legacy_row])
+
+        # _record_canonical_event(cost_only=True): model lookup, session lookup
+        model_row = MagicMock()
+        model_row.__getitem__.side_effect = {"id": model_id}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": session_id}.__getitem__
+        items.extend([model_row, session_lookup_row])
+
+        # event lookup → existing
+        existing_row = MagicMock()
+        existing_row.__getitem__.side_effect = {"id": event_id}.__getitem__
+        items.append(existing_row)
+
+        # Stored canonical event read (cost_only re-verification reads
+        # session_id/model_id too).  Tokens identical; cost 0.0035.
+        stored = MagicMock()
+        stored.__getitem__.side_effect = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 20,  # effective: cache_read(10)+cache_write(10)
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 10,
+            "cache_write_tokens": 10,
+            "estimated_cost_usd": Decimal("0.0035"),
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+            "session_id": session_id,
+            "model_id": model_id,
+        }.__getitem__
+        items.append(stored)
+
+        # ── apply_replay_merge (REAL implementation, not mocked) ──────
+        #   1. pg_advisory_xact_lock (fetchval)
+        #   2. FOR UPDATE read of usage_events → merge event row
+        #   3. FOR UPDATE read of sessions → session aggregate row
+        merge_event_row = mock_row({
+            "input_tokens": 100, "output_tokens": 50,
+            "cached_tokens": 20, "reasoning_tokens": 0,
+            "cache_read_tokens": 10, "cache_write_tokens": 10,
+            "estimated_cost_usd": Decimal("0.0035"),
+            "session_id": session_id,
+            "client_id": _CLIENT_ID,
+            "project_id": "proj-test-abc",
+            "reported_at": _mk_ts(),
+        })
+        items.append(merge_event_row)
+
+        session_agg = mock_row({
+            "total_input_tokens": 1000, "total_output_tokens": 500,
+            "total_cached_tokens": 200, "total_cache_read_tokens": 100,
+            "total_cache_write_tokens": 100,
+            "total_estimated_cost_usd": Decimal("12.50"),
+        })
+        items.append(session_agg)
+
+        # _fill_canonical_text_enrichment: FOR UPDATE read (all NULL)
+        enrichment_row = MagicMock()
+        enrichment_row.__getitem__.side_effect = {
+            "provider": None, "mode": None, "finish_reason": None,
+        }.__getitem__
+        items.append(enrichment_row)
+
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)  # advisory locks
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[_project_record(
+                source_record_id="rec-cost-only-rollup-001",
+                input_tokens=100,
+                output_tokens=50,
+                cache_read_tokens=10,
+                cache_write_tokens=10,
+                estimated_cost_usd="0.0100",  # stored: 0.0035
+            )],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "updated", (
+            f"Expected 'updated' for cost-only replay, got "
+            f"'{data['results'][0]['status']}'"
+        )
+
+        # ── Rollup: exactly one UPSERT carrying ONLY the +cost delta ──
+        rollup_calls = _rollup_execute_calls(mock_conn)
+        assert len(rollup_calls) == 1, (
+            f"Expected 1 rollup update, got {len(rollup_calls)}"
+        )
+        rollup_args = rollup_calls[0].args
+        assert rollup_args[1] == _CLIENT_ID
+        assert rollup_args[2] == "proj-test-abc"
+        assert rollup_args[3] == _mk_ts().date()
+        # Token deltas are zero; only the cost delta moves.
+        assert rollup_args[4] == 0
+        assert rollup_args[5] == 0
+        assert rollup_args[6] == 0
+        assert rollup_args[7] == 0
+        assert rollup_args[8] == Decimal("0.0065"), (
+            f"Expected +0.0065 rollup cost delta, got {rollup_args[8]}"
+        )
+
+        # ── Session aggregate: cost adjusted by the same +0.0065 delta ─
+        session_updates = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE sessions" in str(c)
+        ]
+        assert len(session_updates) == 1
+        session_params = session_updates[0].args
+        assert "total_estimated_cost_usd" in str(session_updates[0].args[0])
+        assert session_params[1] == Decimal("12.5065")
+
+        # ── Ingest attempt recorded atomically with outcome "updated" ──
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "updated" in str(attempt_inserts[0].args)
+
+        # ── Legacy row untouched: no UPDATE to opencode_usage_records ─
+        legacy_updates = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE opencode_usage_records" in str(c)
+        ]
+        assert len(legacy_updates) == 0, (
+            "Cost-only canonical correction must not modify legacy storage"
+        )
+
+        # ── Rollup UPSERT sits between the event UPDATE and attempt INSERT,
+        #    inside the single canonical transaction (atomicity). ────────
+        execute_sequence = [
+            (i, str(c.args[0])[:80]) for i, c in enumerate(mock_conn.execute.call_args_list)
+        ]
+        rollup_positions = [i for i, sql in execute_sequence if "client_project_rollup" in sql]
+        event_positions = [
+            i for i, sql in execute_sequence
+            if "UPDATE usage_events" in sql
+            and "last_ingested_at" not in sql
+            and "usage_ingest_attempts" not in sql
+        ]
+        attempt_positions = [
+            i for i, sql in execute_sequence
+            if "INSERT INTO usage_ingest_attempts" in sql
+        ]
+        assert len(rollup_positions) == 1
+        assert len(event_positions) == 1
+        assert len(attempt_positions) == 1
+        assert event_positions[0] < rollup_positions[0] < attempt_positions[0], (
+            f"Rollup ({rollup_positions[0]}) must sit between the event write "
+            f"({event_positions[0]}) and attempt INSERT ({attempt_positions[0]})"
+        )
