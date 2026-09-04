@@ -97,7 +97,6 @@
     afkCrFilterProvider: $('afk-cr-filter-provider'),
     afkCrFilterRepository: $('afk-cr-filter-repository'),
     afkCrFilterProviderState: $('afk-cr-filter-provider-state'),
-    afkCrFilterAutomationState: $('afk-cr-filter-automation-state'),
     afkCrFilterApply: $('afk-cr-filter-apply'),
     afkCrFilterClear: $('afk-cr-filter-clear'),
     crListDetailOverlay: $('cr-list-detail-overlay'),
@@ -143,14 +142,14 @@
   let selectedRepo = null;
   let afkOnlyFilter = false;
   // Change-request summary list state (issue #613): the latest summary
-  // response, the per-cycle fetch error, the active filter set (served
-  // through the summary contract — never client-side re-filtering), and the
-  // change-request identity of the currently opened detail row.  Selection
-  // is keyed by (provider, repository, external_id) — never an internal
-  // AFK Run ID (PRD story 14).
+  // response, the per-cycle fetch error, and the active filter set (served
+  // through the summary contract — never client-side re-filtering).
+  // Issue #652: the AFK Automation filter was removed from the UI, so the
+  // automation_state query parameter is no longer emitted (the API field
+  // remains available for backward compatibility).
   let afkCrData = null;
   let afkCrFetchError = null;
-  let afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+  let afkCrFilters = { provider: '', repository: '', providerState: '' };
   let selectedChangeRequest = null;
   // Change-request list pagination state: the current page (1-indexed) and
   // the page size (AFK_CR_LIMIT).  The page is read from the URL
@@ -866,6 +865,19 @@
     if (p === 'github') return 'PR';
     if (p === 'gitlab') return 'MR';
     return 'CR';
+  }
+
+  /** Derive the provider-specific lifecycle STATUS label for a change
+   *  request (issue #652).  GitHub -> "PR Status", GitLab -> "MR Status",
+   *  anything else -> "MR/PR Status" (the fallback for unknown providers).
+   *  The label names the lifecycle state the badge represents — never the
+   *  AFK automation vocabulary.  Pure — no DOM or fetch access.
+   *  @param {string} provider
+   *  @returns {string} e.g. "PR Status", "MR Status", "MR/PR Status" */
+  function crStatusHeaderLabel(provider) {
+    var term = providerCrTerm(provider);
+    if (term === 'PR' || term === 'MR') return term + ' Status';
+    return 'MR/PR Status';
   }
 
   /** Build change-request rows for a selected repository from AFK runs.
@@ -3116,11 +3128,13 @@
   /** Build the change-request summary list URL from the active filters and
    *  the shared dashboard date range (activity window).  Filter names use
    *  the #610 query contract exactly (provider / repository /
-   *  provider_state / automation_state); the shared date range feeds
+   *  provider_state); issue #652 removed the AFK Automation filter from the
+   *  UI, so automation_state is no longer emitted (the API field remains
+   *  available for backward compatibility).  The shared date range feeds
    *  activity_from/activity_to — no second date picker (PRD).  Pure — no
    *  DOM or fetch access.
-   *  @param {Object|null} filters - {provider, repository, providerState,
-   *                                 automationState}; empty values omitted
+   *  @param {Object|null} filters - {provider, repository, providerState};
+   *                                 empty values omitted
    *  @param {Object|null} dateRangeState - the shared dashboard date range
    *  @param {number} [limit] - page size (default AFK_CR_LIMIT)
    *  @param {number} [offset] - page offset (default 0)
@@ -3131,7 +3145,6 @@
     if (f.provider) params.push('provider=' + encodeURIComponent(f.provider));
     if (f.repository) params.push('repository=' + encodeURIComponent(f.repository));
     if (f.providerState) params.push('provider_state=' + encodeURIComponent(f.providerState));
-    if (f.automationState) params.push('automation_state=' + encodeURIComponent(f.automationState));
     var range = resolveDateRange(dateRangeState || { preset: 'this-month' });
     if (range && range.startDate && !isNaN(range.startDate.getTime())) {
       params.push('activity_from=' + encodeURIComponent(range.startDate.toISOString()));
@@ -3290,8 +3303,9 @@
   }
 
   /** Render one change-request summary row: provider, repository, PR/MR
-   *  identity, provider state, AFK automation state (dual statuses rendered
-   *  independently), total cost (USD or 'Cost unavailable'), and latest
+   *  identity, the provider lifecycle status (labeled PR Status / MR Status /
+   *  MR/PR Status by provider — issue #652, replacing the redundant AFK
+   *  Automation column), total cost (USD or 'Cost unavailable'), and latest
    *  linked activity.  Pure — returns an HTML string; every interpolated
    *  value is escaped. */
   function renderChangeRequestSummaryRow(view) {
@@ -3306,10 +3320,8 @@
       '<td data-label="Provider">' + badge(id.provider || '--', 'badge-provider').outerHTML + '</td>' +
       '<td data-label="Repository">' + escHtml(id.repository || '--') + '</td>' +
       '<td data-label="' + escHtml(view.providerTerm) + '">' + escHtml(crLabel) + '</td>' +
-      '<td data-label="Provider State">' +
+      '<td data-label="' + escHtml(view.statusHeaderLabel) + '">' +
         badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</td>' +
-      '<td data-label="AFK Automation">' +
-        badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</td>' +
       '<td data-label="Cost" class="afk-cr-cost-cell">' + escHtml(view.cost.label) + '</td>' +
       '<td data-label="Latest Activity">' + fmtDT(view.latestActivityAt) + '</td>' +
       '</tr>';
@@ -3331,7 +3343,7 @@
         ? ' <span class="fetch-error" title="' + escHtml(afkCrFetchError) + '">\u26A0 Fetch error</span>'
         : '';
       els.afkCrListTbody.innerHTML =
-        '<tr><td colspan="7" class="empty-state">No change requests' + errSuffix + '</td></tr>';
+        '<tr><td colspan="6" class="empty-state">No change requests' + errSuffix + '</td></tr>';
       return;
     }
 
@@ -3359,7 +3371,8 @@
   }
 
   /** Read the change-request filter controls into the filter state shape.
-   *  Empty controls are omitted (the contract returns the unfiltered set). */
+   *  Empty controls are omitted (the contract returns the unfiltered set).
+   *  Issue #652: the AFK Automation filter was removed from the UI. */
   function readChangeRequestFiltersFromUI() {
     var filters = {};
     if (els.afkCrFilterProvider && els.afkCrFilterProvider.value) {
@@ -3371,9 +3384,6 @@
     if (els.afkCrFilterProviderState && els.afkCrFilterProviderState.value) {
       filters.providerState = els.afkCrFilterProviderState.value;
     }
-    if (els.afkCrFilterAutomationState && els.afkCrFilterAutomationState.value) {
-      filters.automationState = els.afkCrFilterAutomationState.value;
-    }
     return filters;
   }
 
@@ -3383,7 +3393,6 @@
     if (els.afkCrFilterProvider) els.afkCrFilterProvider.value = f.provider || '';
     if (els.afkCrFilterRepository) els.afkCrFilterRepository.value = f.repository || '';
     if (els.afkCrFilterProviderState) els.afkCrFilterProviderState.value = f.providerState || '';
-    if (els.afkCrFilterAutomationState) els.afkCrFilterAutomationState.value = f.automationState || '';
   }
 
   /** Apply the current filter controls and re-fetch the summary list through
@@ -3404,7 +3413,7 @@
    *  Resets pagination to page 1 and replaces the URL state, mirroring
    *  applyChangeRequestFilters. */
   function clearChangeRequestFilters() {
-    afkCrFilters = { provider: '', repository: '', providerState: '', automationState: '' };
+    afkCrFilters = { provider: '', repository: '', providerState: '' };
     syncChangeRequestFilterUI(afkCrFilters);
     afkCrPage = 1;
     var url = changeRequestsUrlWithPagination(afkCrPage, afkCrPageSize);
@@ -3574,12 +3583,13 @@
     wireCrDetailSessionDrilldown();
   }
 
-  /** Render the detail header: PR/MR identity, title, provider state and
-   *  AFK automation state as independent badges, and the Gateway-owned AFK
-   *  Run Cost (issue #629).  The AFK Run Cost is the lifecycle total over
-   *  every session in the linked runs — distinct from any individual AWX
-   *  Execution Cost subtotal, and never summed or derived in the browser.
-   *  Pure — returns an HTML string. */
+  /** Render the detail header: PR/MR identity, title, the provider lifecycle
+   *  status badge (labeled PR Status / MR Status / MR/PR Status by provider —
+   *  issue #652; the redundant AFK Automation badge was removed), and the
+   *  Gateway-owned AFK Run Cost (issue #629).  The AFK Run Cost is the
+   *  lifecycle total over every session in the linked runs — distinct from
+   *  any individual AWX Execution Cost subtotal, and never summed or derived
+   *  in the browser.  Pure — returns an HTML string. */
   function renderChangeRequestDetailHeader(view) {
     var runCost = view.runCost || view.aggregateCost;
     var html = '<div class="afk-cr-detail-header">' +
@@ -3589,10 +3599,9 @@
         (view.title ? ' <span class="afk-cr-detail-title">' + escHtml(view.title) + '</span>' : '') +
       '</div>' +
       '<div class="afk-cr-detail-statuses">' +
-        '<span class="afk-cr-status"><span class="afk-cr-status-label">Provider</span>' +
+        '<span class="afk-cr-status"><span class="afk-cr-status-label">' +
+          escHtml(view.statusHeaderLabel) + '</span>' +
           badge(view.providerState.label, view.providerState.badgeClass).outerHTML + '</span>' +
-        '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Automation</span>' +
-          badge(view.afkAutomationState.label, view.afkAutomationState.badgeClass).outerHTML + '</span>' +
         '<span class="afk-cr-status"><span class="afk-cr-status-label">AFK Run Cost</span>' +
           '<span class="afk-cr-cost">' + escHtml(runCost.label) + '</span></span>' +
       '</div>' +
@@ -4629,10 +4638,6 @@
     if (crFilterProviderState) {
       crFilterProviderState.addEventListener('change', function () { applyChangeRequestFilters(); });
     }
-    var crFilterAutomationState = $('afk-cr-filter-automation-state');
-    if (crFilterAutomationState) {
-      crFilterAutomationState.addEventListener('change', function () { applyChangeRequestFilters(); });
-    }
     var crFilterRepository = $('afk-cr-filter-repository');
     if (crFilterRepository) {
       crFilterRepository.addEventListener('keydown', function (e) {
@@ -5220,6 +5225,7 @@
   window.buildRepositorySummaries = buildRepositorySummaries;
   window.renderRepositorySummaryTable = renderRepositorySummaryTable;
   window.providerCrTerm = providerCrTerm;
+  window.crStatusHeaderLabel = crStatusHeaderLabel;
   window.buildChangeRequestList = buildChangeRequestList;
   window.filterChangeRequests = filterChangeRequests;
   window.renderChangeRequestList = renderChangeRequestList;

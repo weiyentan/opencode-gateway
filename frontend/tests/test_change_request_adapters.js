@@ -93,6 +93,19 @@ console.log('\u25B6 crDisplayId + crProviderTerm');
   assertEqual(A.crProviderTerm(''), 'CR', 'provider term: empty -> CR');
 })();
 
+console.log('\u25B6 crStatusHeaderLabel (issue #652)');
+
+(function () {
+  assertEqual(A.crStatusHeaderLabel('github'), 'PR Status', 'status header label: github -> PR Status');
+  assertEqual(A.crStatusHeaderLabel('GitHub'), 'PR Status', 'status header label: GitHub (case) -> PR Status');
+  assertEqual(A.crStatusHeaderLabel('gitlab'), 'MR Status', 'status header label: gitlab -> MR Status');
+  assertEqual(A.crStatusHeaderLabel('GitLab'), 'MR Status', 'status header label: GitLab (case) -> MR Status');
+  assertEqual(A.crStatusHeaderLabel('bitbucket'), 'MR/PR Status', 'status header label: unknown provider -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel('unknown'), 'MR/PR Status', 'status header label: unknown -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel(null), 'MR/PR Status', 'status header label: null -> MR/PR Status');
+  assertEqual(A.crStatusHeaderLabel(''), 'MR/PR Status', 'status header label: empty -> MR/PR Status');
+})();
+
 // ── Provider state adapters ─────────────────────────────────────────────
 
 console.log('\u25B6 provider state');
@@ -296,6 +309,7 @@ console.log('\u25B6 summary adapter');
     'summary: github identity preserved');
   assertEqual(gh.displayId, 'acme/web-app#142', 'summary: display id');
   assertEqual(gh.providerTerm, 'PR', 'summary: provider term PR');
+  assertEqual(gh.statusHeaderLabel, 'PR Status', 'summary: GitHub status header label PR Status');
   assertEqual(gh.title, 'Implement auth', 'summary: title');
   assertEqual(gh.providerState.value, 'merged', 'summary: provider state merged');
   assertEqual(gh.providerState.badgeClass, 'badge-merged', 'summary: provider state badge');
@@ -322,6 +336,7 @@ console.log('\u25B6 summary adapter');
   assertDeepEqual(gl.identity, { provider: 'gitlab', repository: 'group/project', external_id: '6' },
     'summary: gitlab identity preserved');
   assertEqual(gl.providerTerm, 'MR', 'summary: provider term MR');
+  assertEqual(gl.statusHeaderLabel, 'MR Status', 'summary: GitLab status header label MR Status');
   assertEqual(gl.providerState.value, 'open', 'summary: opened normalizes to open');
   assertEqual(gl.afkAutomationState.value, 'running', 'summary: afk running');
   assertEqual(gl.cost.available, false, 'summary: missing cost unavailable');
@@ -348,6 +363,8 @@ console.log('\u25B6 summary adapter');
 
   assertEqual(A.adaptChangeRequestSummary(null).identity.provider, 'unknown',
     'summary: null item -> unknown identity');
+  assertEqual(A.adaptChangeRequestSummary(null).statusHeaderLabel, 'MR/PR Status',
+    'summary: null item -> MR/PR Status fallback');
 
   // The canonical summary contract carries `executions` (outcome-state
   // counts, issue #610).  The legacy aliases (`execution_counts` / `counts`)
@@ -506,6 +523,7 @@ console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
   assertDeepEqual(detail.identity, { provider: 'gitlab', repository: 'group/project', external_id: '6' },
     'detail: identity preserved');
   assertEqual(detail.providerTerm, 'MR', 'detail: MR term');
+  assertEqual(detail.statusHeaderLabel, 'MR Status', 'detail: GitLab status header label MR Status');
   assertEqual(detail.providerState.value, 'merged', 'detail: provider state merged');
   assertEqual(detail.afkAutomationState.value, 'completed', 'detail: afk state completed');
   assertEqual(detail.runCost.available, true, 'detail: AFK Run Cost available');
@@ -590,6 +608,13 @@ console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
   });
   assertEqual(nested.identity.external_id, '9', 'detail: summary-nested identity');
   assertEqual(nested.providerState.value, 'open', 'detail: summary-nested provider state');
+
+  // Unknown provider → MR/PR Status fallback in the detail view model.
+  var unknownDetail = A.adaptChangeRequestDetail({
+    change_request: { repository: 'r', external_id: '10', provider_state: 'open' }
+  });
+  assertEqual(unknownDetail.statusHeaderLabel, 'MR/PR Status',
+    'detail: unknown provider -> MR/PR Status fallback');
 
   // null/empty detail
   assertEqual(A.adaptChangeRequestDetail(null), null, 'detail: null -> null');

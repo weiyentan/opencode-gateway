@@ -6770,3 +6770,114 @@ console.log('\u25B6 style.css \u2014 AFK Change Request List rules (issue #573)'
   assert(live.indexOf('.repo-row') !== -1,
     'style.css: .repo-row rule exists (clickable repository rows)');
 })();
+
+// ── Issue #652: provider lifecycle status labels (PR/MR Status) ────────────
+// The primary change-request list and the detail header label the provider
+// lifecycle badge with provider-specific terminology: PR Status (GitHub),
+// MR Status (GitLab), MR/PR Status (unknown).  The redundant AFK Automation
+// presentation (list column + detail badge + filter) is removed, while the
+// automation_state API field and the AFK Run Cost remain.
+
+console.log('\u25B6 issue #652 \u2014 provider lifecycle status labels');
+
+(function () {
+  var W = appJsSandbox.window;
+  assert(W.crStatusHeaderLabel('github') === 'PR Status',
+    'issue #652: crStatusHeaderLabel github -> PR Status');
+  assert(W.crStatusHeaderLabel('gitlab') === 'MR Status',
+    'issue #652: crStatusHeaderLabel gitlab -> MR Status');
+  assert(W.crStatusHeaderLabel('bitbucket') === 'MR/PR Status',
+    'issue #652: crStatusHeaderLabel unknown -> MR/PR Status');
+  assert(W.crStatusHeaderLabel(null) === 'MR/PR Status',
+    'issue #652: crStatusHeaderLabel null -> MR/PR Status');
+})();
+
+console.log('\u25B6 issue #652 \u2014 summary row render (provider labels, no AFK Automation column)');
+
+(function () {
+  var W = appJsSandbox.window;
+  if (typeof W.renderChangeRequestSummaryRow !== 'function') {
+    assert(false, 'app.js: renderChangeRequestSummaryRow exposed on the window test seam');
+    return;
+  }
+  // GitHub row: PR Status data-label on the lifecycle status cell.
+  var gh = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'github', repository: 'acme/web-app', external_id: '142' },
+    providerTerm: 'PR',
+    statusHeaderLabel: 'PR Status',
+    displayId: 'acme/web-app#142',
+    title: 't',
+    providerState: { value: 'merged', label: 'merged', badgeClass: 'badge-merged' },
+    afkAutomationState: { value: 'completed', label: 'completed', badgeClass: 'badge-completed' },
+    cost: { available: true, usd: 1, label: '$1.00' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(gh.indexOf('data-label="PR Status"') !== -1,
+    'issue #652: GitHub row lifecycle status cell labeled PR Status');
+  assert(gh.indexOf('data-label="AFK Automation"') === -1,
+    'issue #652: GitHub row carries no AFK Automation cell');
+  assert(gh.indexOf('badge-completed') === -1,
+    'issue #652: GitHub row renders no automation completed badge');
+  assert(gh.indexOf('badge-merged') !== -1,
+    'issue #652: GitHub row renders the merged lifecycle badge');
+
+  // GitLab row: MR Status data-label.
+  var gl = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'gitlab', repository: 'group/cloudnative', external_id: '6' },
+    providerTerm: 'MR',
+    statusHeaderLabel: 'MR Status',
+    displayId: 'group/cloudnative#6',
+    title: 't',
+    providerState: { value: 'open', label: 'open', badgeClass: 'badge-open' },
+    afkAutomationState: { value: 'failed', label: 'failed', badgeClass: 'badge-failed' },
+    cost: { available: false, usd: null, label: 'Cost unavailable' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(gl.indexOf('data-label="MR Status"') !== -1,
+    'issue #652: GitLab row lifecycle status cell labeled MR Status');
+  assert(gl.indexOf('data-label="AFK Automation"') === -1 &&
+         gl.indexOf('badge-failed') === -1,
+    'issue #652: GitLab row renders no AFK Automation cell/badge');
+
+  // Unknown provider row: MR/PR Status data-label.
+  var unk = W.renderChangeRequestSummaryRow({
+    identity: { provider: 'unknown', repository: 'r', external_id: '9' },
+    providerTerm: 'CR',
+    statusHeaderLabel: 'MR/PR Status',
+    displayId: 'r#9',
+    title: '',
+    providerState: { value: 'closed', label: 'closed', badgeClass: 'badge-closed' },
+    afkAutomationState: { value: '', label: '--', badgeClass: 'badge-unknown' },
+    cost: { available: false, usd: null, label: 'Cost unavailable' },
+    latestActivityAt: null,
+    executionCounts: { total: 0 },
+    runCount: 0
+  });
+  assert(unk.indexOf('data-label="MR/PR Status"') !== -1,
+    'issue #652: unknown-provider row lifecycle status cell labeled MR/PR Status');
+  assert(unk.indexOf('Cost unavailable') !== -1,
+    'issue #652: cost cell remains for unknown-provider rows');
+})();
+
+console.log('\u25B6 index.html \u2014 issue #652 markup smoke check');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The primary change-request list: no AFK Automation filter, no AFK
+  // Automation column, and the lifecycle status column header is present.
+  assert(html.indexOf('id="afk-cr-filter-automation-state"') === -1,
+    'index.html: AFK Automation filter removed');
+  assert(html.indexOf('<th>AFK Automation</th>') === -1,
+    'index.html: AFK Automation column header removed');
+  assert(html.indexOf('<th>Provider State</th>') === -1,
+    'index.html: legacy Provider State column header removed');
+  assert(html.indexOf('<th>PR / MR Status</th>') !== -1,
+    'index.html: lifecycle status column header present');
+  // The secondary change-request panel (issue #573) is untouched.
+  assert(html.indexOf('id="afk-cr-filter-provider-state"') !== -1,
+    'index.html: Provider State filter remains for the provider lifecycle status');
+})();
