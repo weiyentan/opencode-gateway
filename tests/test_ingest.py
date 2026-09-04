@@ -647,6 +647,122 @@ class TestDivergentDuplicate:
         assert data["results"][0]["status"] == "conflict"
 
 
+class TestCostDedupExactEquality:
+    """Issue #645 — exact Decimal equality for monetary deduplication.
+
+    The ingest dedup gates compare ``estimated_cost_usd`` with exact
+    normalized Decimal equality: representation-only differences such as
+    ``0.0035`` vs ``0.00350`` remain equal, while any real monetary
+    difference — including a delta smaller than ``$0.0001`` — compares as
+    different.
+    """
+
+    @staticmethod
+    def _cost_equal(a: object, b: object) -> bool:
+        from app.api.ingest import _decimal_equal
+
+        return _decimal_equal(a, b)
+
+    # ── Unit level: the comparison predicate ────────────────────────────
+
+    def test_equal_values_with_different_scale_compare_equal(self):
+        """Representation-only scale differences (1.0 vs 1.00) are equal."""
+        assert self._cost_equal(Decimal("1.0"), Decimal("1.00"))
+        assert self._cost_equal(Decimal("0.0035"), Decimal("0.00350"))
+        assert self._cost_equal(Decimal("100"), Decimal("1E+2"))
+
+    def test_equal_zero_values_compare_equal(self):
+        """Zero compares equal regardless of scale or sign."""
+        assert self._cost_equal(Decimal("0"), Decimal("0.00"))
+        assert self._cost_equal(Decimal("0"), Decimal("-0"))
+
+    def test_cost_delta_below_threshold_compares_different(self):
+        """A real cost delta smaller than ``$0.0001`` is still different."""
+        assert not self._cost_equal(Decimal("0.0035"), Decimal("0.00355"))
+        assert not self._cost_equal(Decimal("1.00000"), Decimal("1.00005"))
+
+    def test_any_non_zero_cost_delta_compares_different(self):
+        """Any non-zero monetary difference compares as different."""
+        assert not self._cost_equal(Decimal("1.00"), Decimal("1.01"))
+        assert not self._cost_equal(Decimal("0.0035"), Decimal("0.0070"))
+
+    def test_null_semantics_unchanged(self):
+        """NULL/NULL stays equal; NULL/non-NULL stays different."""
+        assert self._cost_equal(None, None)
+        assert not self._cost_equal(None, Decimal("0.0035"))
+        assert not self._cost_equal(Decimal("0.0035"), None)
+
+    def test_uncomparable_values_return_false(self):
+        """Non-numeric or NaN payloads never compare equal."""
+        assert not self._cost_equal(Decimal("NaN"), Decimal("NaN"))
+        assert not self._cost_equal("not-a-number", Decimal("1"))
+
+    # ── Endpoint level: observable dedup outcome ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_sub_threshold_cost_delta_is_divergent_duplicate(self, monkeypatch):
+        """Same dedup key, cost delta below ``$0.0001`` → conflict.
+
+        The approximate comparator previously treated a ``0.0035`` vs
+        ``0.00355`` replay as identical (idempotent accept); exact Decimal
+        equality must classify it as a divergent duplicate.
+        """
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        # Existing record whose cost differs only below the $0.0001 threshold
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            # handler: cross-identity conflict check
+            *_handler_routing_side_effect_items(),
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → divergent match
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                # stored: 0.0035; delta = 0.00005 < $0.0001 — still different
+                "estimated_cost_usd": "0.00355",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 0
+        assert data["rejected_count"] == 1
+        assert data["results"][0]["status"] == "conflict"
+
+
 class TestMalformedRecord:
     """Non-numeric or invalid field values → rejection."""
 
@@ -7930,6 +8046,121 @@ class TestCanonicalDuplicateDetection:
         new_values = apply_call[0][2]
         assert new_values["cache_read_tokens"] == 30
         assert new_values["cache_write_tokens"] == 15
+
+    @pytest.mark.asyncio
+    async def test_cost_delta_below_threshold_returns_updated(self, monkeypatch):
+        """Issue #645 — a replay whose cost differs by less than ``$0.0001``
+        is NOT an identical duplicate: it triggers replay merge and returns
+        ``"updated"``.  The stored cost (``0.0035``) is corrected toward the
+        collector's latest observation (``0.00355``)."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        stored_event = self._full_event_mock(estimated_cost_usd=Decimal("0.0035"))
+        enrichment_read = self._enrichment_read_mock()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+                extra_fetchrow=[enrichment_read],
+            )
+        )
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-sub-threshold-cost",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                # stored: 0.0035; delta = 0.00005 < $0.0001 — still different
+                "estimated_cost_usd": "0.00355",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for sub-$0.0001 cost delta, got '{result['status']}'"
+        )
+
+        # apply_replay_merge must be invoked with the corrected cost value
+        apply_call = _recon.apply_replay_merge.call_args
+        assert apply_call is not None, "apply_replay_merge should have been called"
+        new_values = apply_call[0][2]
+        assert new_values["estimated_cost_usd"] == Decimal("0.00355")
+
+    @pytest.mark.asyncio
+    async def test_cost_scale_difference_only_returns_duplicate(self, monkeypatch):
+        """Issue #645 — representation-only scale differences (``0.0035`` vs
+        ``0.00350``) are equal monetary values, so the replay is an
+        identical duplicate with no event modification."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        stored_event = self._full_event_mock(estimated_cost_usd=Decimal("0.0035"))
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = (
+            self._build_existing_canonical_side_effect(
+                event_id=event_id, stored_event=stored_event,
+            )
+        )
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-scale-only-cost",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                # Same monetary value, extra trailing zero scale
+                "estimated_cost_usd": "0.00350",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "duplicate", (
+            f"Expected 'duplicate' for scale-only cost difference, got '{result['status']}'"
+        )
+
+        # No change to the event — no UPDATE on usage_events
+        update_events = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE usage_events" in str(c)
+        ]
+        assert len(update_events) == 0, (
+            f"Expected 0 UPDATES for scale-only cost difference, got {len(update_events)}"
+        )
 
 
 class TestBatchOverlapQueryCount:

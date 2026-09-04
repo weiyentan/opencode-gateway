@@ -309,13 +309,22 @@ def _utcnow() -> datetime:
 
 
 def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
-    """Compare two optional decimals for approximate equality."""
+    """Compare two optional decimals for exact monetary equality.
+
+    Equality is exact on the **normalized** value (``Decimal.normalize()``),
+    so representation-only differences such as ``1.0`` vs ``1.00`` compare
+    equal while any real monetary difference — including a delta smaller
+    than ``$0.0001`` — compares as different.  NULL/NULL is equal and
+    NULL/non-NULL is different.
+    """
     if a is None and b is None:
         return True
     if a is None or b is None:
         return False
     try:
-        return abs(a - b) < Decimal('0.0001')
+        a_dec = a if isinstance(a, Decimal) else Decimal(str(a))
+        b_dec = b if isinstance(b, Decimal) else Decimal(str(b))
+        return a_dec.normalize() == b_dec.normalize()
     except (ValueError, TypeError, InvalidOperation):
         return False
 
