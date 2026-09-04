@@ -79,6 +79,20 @@
     return 'CR';
   }
 
+  /** Derive the provider-specific lifecycle STATUS header label for a change
+   *  request (issue #652).  GitHub -> "PR Status", GitLab -> "MR Status",
+   *  anything else -> "MR/PR Status" (the fallback label for unknown
+   *  providers).  The label describes the lifecycle state the badge next to
+   *  it represents — never the AFK automation vocabulary.  Pure string
+   *  builder — no HTML.
+   *  @param {string|null} provider
+   *  @returns {string} e.g. "PR Status", "MR Status", "MR/PR Status" */
+  function crStatusHeaderLabel(provider) {
+    var term = crProviderTerm(provider);
+    if (term === 'PR' || term === 'MR') return term + ' Status';
+    return 'MR/PR Status';
+  }
+
   // ── Provider state adapters ────────────────────────────────────────────
   // Provider state is read from stored normalized events (opened / updated /
   // reopened / closed / merged) and is NEVER conflated with AFK automation
@@ -431,6 +445,7 @@
       identity: identity,
       displayId: crDisplayId(item),
       providerTerm: crProviderTerm(identity.provider),
+      statusHeaderLabel: crStatusHeaderLabel(identity.provider),
       title: item.title || '',
       providerState: {
         value: providerState,
@@ -622,6 +637,7 @@
       identity: crIdentity(cr),
       displayId: crDisplayId(cr),
       providerTerm: crProviderTerm(crIdentity(cr).provider),
+      statusHeaderLabel: crStatusHeaderLabel(crIdentity(cr).provider),
       title: cr.title || '',
       providerState: {
         value: providerState,
@@ -665,6 +681,7 @@
     crIdentity: crIdentity,
     crDisplayId: crDisplayId,
     crProviderTerm: crProviderTerm,
+    crStatusHeaderLabel: crStatusHeaderLabel,
     // provider state
     providerStateValue: providerStateValue,
     providerStateLabel: providerStateLabel,

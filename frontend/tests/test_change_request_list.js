@@ -233,7 +233,6 @@ var crPaginationNavEl = makePaginationNav('afk-cr-pagination');
 var crFilterProviderEl = makeFakeElement('afk-cr-filter-provider');
 var crFilterRepositoryEl = makeFakeElement('afk-cr-filter-repository');
 var crFilterProviderStateEl = makeFakeElement('afk-cr-filter-provider-state');
-var crFilterAutomationStateEl = makeFakeElement('afk-cr-filter-automation-state');
 var crFilterApplyEl = makeFakeElement('afk-cr-filter-apply');
 var crFilterClearEl = makeFakeElement('afk-cr-filter-clear');
 var crFreshnessEl = makeFakeElement('freshness-afk-cr-list');
@@ -247,7 +246,6 @@ elementRegistry['afk-cr-pagination'] = crPaginationNavEl;
 elementRegistry['afk-cr-filter-provider'] = crFilterProviderEl;
 elementRegistry['afk-cr-filter-repository'] = crFilterRepositoryEl;
 elementRegistry['afk-cr-filter-provider-state'] = crFilterProviderStateEl;
-elementRegistry['afk-cr-filter-automation-state'] = crFilterAutomationStateEl;
 elementRegistry['afk-cr-filter-apply'] = crFilterApplyEl;
 elementRegistry['afk-cr-filter-clear'] = crFilterClearEl;
 elementRegistry['freshness-afk-cr-list'] = crFreshnessEl;
@@ -291,13 +289,13 @@ test('URL builder: empty filters emit only the activity window + limit', functio
   assertNotContains(url, 'provider=', 'URL: no provider param when empty');
   assertNotContains(url, 'repository=', 'URL: no repository param when empty');
   assertNotContains(url, 'provider_state=', 'URL: no provider_state param when empty');
-  assertNotContains(url, 'automation_state=', 'URL: no automation_state param when empty');
+  assertNotContains(url, 'automation_state=', 'URL: automation_state filter removed from the UI (issue #652)');
   assertContains(url, 'activity_from=2026-08-01T00%3A00%3A00.000Z', 'URL: activity_from from the shared date range');
   assertContains(url, 'activity_to=2026-08-15T23%3A59%3A59.000Z', 'URL: activity_to includes the full selected day');
   assertContains(url, 'limit=100', 'URL: default limit applied');
 });
 
-test('URL builder: filters map to the summary contract query params', function () {
+test('URL builder: filters map to the summary contract query params (automation_state retired, issue #652)', function () {
   var url = W.buildChangeRequestListUrl(
     { provider: 'gitlab', repository: 'group/cloudnative', providerState: 'open', automationState: 'failed' },
     { preset: 'custom', customStartDate: '2026-08-01', customEndDate: '2026-08-15' },
@@ -306,7 +304,7 @@ test('URL builder: filters map to the summary contract query params', function (
   assertContains(url, 'provider=gitlab', 'URL: provider filter');
   assertContains(url, 'repository=' + encodeURIComponent('group/cloudnative'), 'URL: repository filter (encoded)');
   assertContains(url, 'provider_state=open', 'URL: provider-state filter');
-  assertContains(url, 'automation_state=failed', 'URL: automation-state filter');
+  assertNotContains(url, 'automation_state=', 'URL: automation_state never emitted (issue #652)');
   assertContains(url, 'limit=50', 'URL: explicit limit');
   assertContains(url, 'offset=10', 'URL: explicit offset');
 });
@@ -335,17 +333,34 @@ test('summary table: one row per change request (GitHub)', function () {
   assertContains(html, 'badge-provider', 'summary table: provider badge');
 });
 
-test('summary table: dual statuses render independently (GitHub)', function () {
+test('summary table: provider lifecycle status badges render (GitHub)', function () {
   W.renderChangeRequestSummaryTable(githubFixture.buildSummaryList());
   var html = crListTbodyEl.innerHTML;
-  assertContains(html, 'badge-merged', 'dual statuses: merged provider state badge');
-  assertContains(html, 'badge-completed', 'dual statuses: completed AFK automation badge');
-  assertContains(html, 'badge-open', 'dual statuses: open provider state badge');
-  assertContains(html, 'badge-running', 'dual statuses: running AFK automation badge');
-  assertContains(html, 'badge-closed', 'dual statuses: closed provider state badge');
-  assertContains(html, 'badge-failed', 'dual statuses: failed AFK automation badge');
-  assert(html.indexOf('badge-merged') !== html.indexOf('badge-completed'),
-    'dual statuses: provider state and AFK automation state are distinct badges');
+  assertContains(html, 'badge-merged', 'lifecycle statuses: merged provider state badge');
+  assertContains(html, 'badge-open', 'lifecycle statuses: open provider state badge');
+  assertContains(html, 'badge-closed', 'lifecycle statuses: closed provider state badge');
+});
+
+test('summary table: provider-specific lifecycle labels; no AFK Automation column (issue #652)', function () {
+  W.renderChangeRequestSummaryTable(githubFixture.buildSummaryList());
+  var html = crListTbodyEl.innerHTML;
+  // GitHub rows use the provider-specific lifecycle label as the data-label.
+  assertContains(html, 'data-label="PR Status"', 'issue #652: GitHub lifecycle status label PR Status');
+  // The redundant AFK Automation column is gone.
+  assertNotContains(html, 'AFK Automation', 'issue #652: no AFK Automation label in rows');
+  assertNotContains(html, 'badge-running', 'issue #652: no running automation badge in GitHub fixture rows');
+  assertNotContains(html, 'badge-completed', 'issue #652: no completed automation badge in rows (merged provider state is the only lifecycle badge)');
+  assertNotContains(html, 'badge-failed', 'issue #652: no failed automation badge in rows');
+  assertContains(html, 'Cost unavailable', 'issue #652: cost column remains (unavailable rendered)');
+  assertContains(html, '$4.85', 'issue #652: cost column remains (known USD rendered)');
+});
+
+test('summary table: GitLab lifecycle status label MR Status (issue #652)', function () {
+  W.renderChangeRequestSummaryTable(gitlabFixture.buildSummaryList());
+  var html = crListTbodyEl.innerHTML;
+  assertContains(html, 'data-label="MR Status"', 'issue #652: GitLab lifecycle status label MR Status');
+  assertNotContains(html, 'data-label="PR Status"', 'issue #652: no PR Status label for GitLab rows');
+  assertNotContains(html, 'AFK Automation', 'issue #652: GitLab rows carry no AFK Automation label');
 });
 
 test('summary table: cost display — USD and Cost unavailable', function () {
@@ -388,14 +403,12 @@ test('summary table: GitLab parity — MR identity, same lifecycle semantics', f
   assertContains(html, 'group/cloudnative', 'GitLab parity: repository visible');
   assertNotContains(html, 'PR #', 'GitLab parity: no PR terminology for GitLab rows');
   assertContains(html, 'badge-merged', 'GitLab parity: merged provider state');
-  assertContains(html, 'badge-completed', 'GitLab parity: completed AFK automation state');
   assertContains(html, '$3.40', 'GitLab parity: known USD cost');
   assertContains(html, 'Cost unavailable', 'GitLab parity: missing cost renders Cost unavailable');
   assertContains(html, 'badge-open', 'GitLab parity: open provider state');
-  assertContains(html, 'badge-failed', 'GitLab parity: failed AFK automation state');
 });
 
-test('summary table: independent dual-status combinations', function () {
+test('summary table: provider lifecycle statuses only — no automation badges (issue #652)', function () {
   W.renderChangeRequestSummaryTable({
     items: [
       { provider: 'github', repository: 'r/x', external_id: '1', provider_state: 'open', automation_state: 'completed', total_estimated_cost_usd: 1.0, latest_linked_activity: '2026-08-17T10:00:00Z', executions: { total: 1, running: 0, completed: 1, failed: 0, cancelled: 0 } },
@@ -405,11 +418,15 @@ test('summary table: independent dual-status combinations', function () {
     total: 3, limit: 100, offset: 0
   });
   var html = crListTbodyEl.innerHTML;
-  assertContains(html, 'badge-open', 'combinations: open provider state');
-  assertContains(html, 'badge-completed', 'combinations: completed automation with open provider state');
-  assertContains(html, 'badge-running', 'combinations: running automation with merged provider state');
-  assertContains(html, 'badge-closed', 'combinations: closed provider state');
-  assertContains(html, 'badge-failed', 'combinations: failed automation with closed provider state');
+  assertContains(html, 'badge-open', 'lifecycle only: open provider state');
+  assertContains(html, 'badge-merged', 'lifecycle only: merged provider state');
+  assertContains(html, 'badge-closed', 'lifecycle only: closed provider state');
+  // The automation_state API field stays available but is NOT rendered: no
+  // automation badge class may appear even when a row carries the field.
+  assertNotContains(html, 'badge-completed', 'lifecycle only: automation completed badge not rendered');
+  assertNotContains(html, 'badge-running', 'lifecycle only: automation running badge not rendered');
+  assertNotContains(html, 'badge-failed', 'lifecycle only: automation failed badge not rendered');
+  assertNotContains(html, 'AFK Automation', 'lifecycle only: no AFK Automation label anywhere');
 });
 
 test('summary table: XSS-safe escaping of identity values', function () {
@@ -432,7 +449,7 @@ test('summary table: XSS-safe escaping of identity values', function () {
 test('state handling: empty result renders the empty state', function () {
   W.renderChangeRequestSummaryTable({ items: [], total: 0, limit: 100, offset: 0 });
   assertContains(crListTbodyEl.innerHTML, 'No change requests', 'empty: no-change-requests message');
-  assertContains(crListTbodyEl.innerHTML, 'colspan="7"', 'empty: empty state spans all 7 columns');
+  assertContains(crListTbodyEl.innerHTML, 'colspan="6"', 'empty: empty state spans all 6 columns (AFK Automation column removed, issue #652)');
 });
 
 test('state handling: failed fetch without previous data shows the error state', function () {
@@ -491,7 +508,8 @@ test('selection: clicking a row opens the identity-keyed detail flow', function 
       var html = crDetailBodyEl.innerHTML;
       assertContains(html, 'acme/web-app#142', 'detail: display identity first');
       assertContains(html, 'badge-merged', 'detail: provider state badge');
-      assertContains(html, 'badge-completed', 'detail: AFK automation state badge');
+      assertContains(html, 'PR Status', 'detail: GitHub lifecycle status label rendered');
+      assertNotContains(html, 'AFK Automation', 'detail: no AFK Automation badge in the detail header');
       assertContains(html, '$4.85', 'detail: aggregate cost rendered');
       assertContains(html, 'Implementation', 'detail: implementation executions grouped');
       assertContains(html, 'Review', 'detail: review executions grouped');
@@ -523,7 +541,9 @@ test('detail: partial data renders unavailable cost and empty sections', functio
   var html = crDetailBodyEl.innerHTML;
   assertContains(html, 'g/p#3', 'partial: identity rendered');
   assertContains(html, 'badge-open', 'partial: provider state badge');
-  assertContains(html, 'badge-failed', 'partial: automation state badge');
+  assertContains(html, 'MR Status', 'partial: GitLab lifecycle status label rendered');
+  assertNotContains(html, 'AFK Automation', 'partial: no AFK Automation badge');
+  assertNotContains(html, 'badge-failed', 'partial: automation failed badge not rendered (lifecycle only)');
   assertContains(html, 'Cost unavailable', 'partial: missing aggregate cost renders Cost unavailable');
   assertContains(html, 'No linked executions', 'partial: empty executions section');
   assertContains(html, 'No sessions linked', 'partial: empty sessions section');
@@ -538,7 +558,6 @@ test('filtering: apply sends filter values through the contract and re-fetches',
   crFilterProviderEl.value = 'gitlab';
   crFilterRepositoryEl.value = 'group/cloudnative';
   crFilterProviderStateEl.value = 'open';
-  crFilterAutomationStateEl.value = 'failed';
   var lastUrl = null;
   fetchImpl = function (url) {
     lastUrl = url;
@@ -548,7 +567,7 @@ test('filtering: apply sends filter values through the contract and re-fetches',
     assertContains(lastUrl, 'provider=gitlab', 'filtering: provider filter through the contract');
     assertContains(lastUrl, 'repository=' + encodeURIComponent('group/cloudnative'), 'filtering: repository filter through the contract');
     assertContains(lastUrl, 'provider_state=open', 'filtering: provider-state filter through the contract');
-    assertContains(lastUrl, 'automation_state=failed', 'filtering: automation-state filter through the contract');
+    assertNotContains(lastUrl, 'automation_state=', 'filtering: automation_state never sent (removed from the UI, issue #652)');
     assertContains(crListTbodyEl.innerHTML, 'No change requests', 'filtering: filtered empty result rendered');
   });
 });
@@ -557,7 +576,6 @@ test('filtering: clear resets filters, syncs controls, and re-fetches', function
   crFilterProviderEl.value = 'gitlab';
   crFilterRepositoryEl.value = 'group/cloudnative';
   crFilterProviderStateEl.value = 'open';
-  crFilterAutomationStateEl.value = 'failed';
   var lastUrl = null;
   fetchImpl = function (url) {
     lastUrl = url;
@@ -566,11 +584,10 @@ test('filtering: clear resets filters, syncs controls, and re-fetches', function
   return W.clearChangeRequestFilters().then(function () {
     assertNotContains(lastUrl, 'provider=', 'filtering: cleared provider param omitted');
     assertNotContains(lastUrl, 'provider_state=', 'filtering: cleared provider-state param omitted');
-    assertNotContains(lastUrl, 'automation_state=', 'filtering: cleared automation-state param omitted');
+    assertNotContains(lastUrl, 'automation_state=', 'filtering: automation_state never sent (issue #652)');
     assertEqual(crFilterProviderEl.value, '', 'filtering: provider control reset');
     assertEqual(crFilterRepositoryEl.value, '', 'filtering: repository control reset');
     assertEqual(crFilterProviderStateEl.value, '', 'filtering: provider-state control reset');
-    assertEqual(crFilterAutomationStateEl.value, '', 'filtering: automation-state control reset');
   });
 });
 
