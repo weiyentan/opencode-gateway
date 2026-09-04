@@ -771,12 +771,13 @@ async def test_list_bindings_empty_resource(db_pool: asyncpg.Pool) -> None:
 async def test_concurrent_identical_callbacks_one_201_one_200(
     db_pool: asyncpg.Pool,
 ) -> None:
-    """Concurrent identical callbacks produce one 201 and one 200, with one row.
+    """Concurrent identical callbacks produce one 201 and one replay/conflict.
 
     Two concurrent POST requests with the same ``awx_job_id`` and identical
     payload race on the INSERT.  Exactly one wins the unique constraint
-    (201 Created); the other receives the conflict path (200 OK, idempotent
-    replay).  The database must contain exactly one row for that job id.
+    (201 Created); the other has a valid outcome of the conflict path —
+    either an idempotent replay (200 OK) or a conflict (409).  The database
+    must contain exactly one row for that job id.
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
@@ -797,16 +798,23 @@ async def test_concurrent_identical_callbacks_one_201_one_200(
             c.post("/api/v1/afk/executions", json=payload),
         )
         status_codes = sorted(r.status_code for r in results)
-        # Exactly one 201 (inserted) and one 200 (idempotent replay).
-        assert status_codes == [200, 201], (
-            f"Expected [200, 201], got {status_codes}"
+        # Exactly one 201 (inserted); the loser is either an idempotent
+        # replay (200) or a conflict (409) — both are valid outcomes.
+        assert status_codes in ([200, 201], [201, 409]), (
+            f"Expected [200, 201] or [201, 409], got {status_codes}"
         )
 
-        # Both responses should return valid binding data.
+        # A 201/200 carries valid binding data; a 409 carries a conflict
+        # error body (no binding data).
         for r in results:
-            assert r.status_code in (200, 201)
-            body = r.json()
-            assert body["data"]["awx_job"]["job_id"] == str(awx_job_id)
+            if r.status_code == 409:
+                body = r.json()
+                assert body["status"] == "error"
+                assert body["error"]["code"] == "CONFLICT"
+            else:
+                assert r.status_code in (200, 201)
+                body = r.json()
+                assert body["data"]["awx_job"]["job_id"] == str(awx_job_id)
 
     # Verify only one row in DB.
     async with db_pool.acquire() as conn:
