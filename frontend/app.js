@@ -3641,20 +3641,40 @@
    *  events attributable to this one execution, distinct from the header's
    *  AFK Run Cost; unavailable — never zero — when the execution's session
    *  attribution or cost data is unknown), and the bounded failure summary
-   *  when present.  Pure — returns an HTML string. */
+   *  when present.  The status/outcome badges use the #651 display
+   *  vocabulary (Completed / Failed / Cancelled / Unknown) derived by the
+   *  adapter; the adapter is captured at load time, so the renderer stays
+   *  pure.  Pure — returns an HTML string. */
   function renderChangeRequestExecution(execution) {
     var tokens = execution.tokens || {};
     var tokensAvailable = !!tokens && [tokens.inputTokens, tokens.outputTokens,
       tokens.cacheReadTokens, tokens.cacheWriteTokens].some(function (t) {
         return t != null && t !== '' && !isNaN(Number(t)) && Number(t) > 0;
       });
+    // The distinct-outcome badge (when the raw outcome differs from the
+    // primary status value) reuses the adapter's explicit display mapping so
+    // a reliable terminal outcome renders as Completed / Failed / Cancelled
+    // even in the defensive shapes.  Absent adapter → raw value + the
+    // existing afkRunStatusBadgeClass fallback.
+    var distinctOutcome = (execution.outcome && execution.outcome !== execution.status.value)
+      ? execution.outcome : null;
+    var outcomeLabel = distinctOutcome;
+    var outcomeClass = distinctOutcome ? afkRunStatusBadgeClass(distinctOutcome) : 'badge-unknown';
+    if (distinctOutcome && ChangeRequestAdapters &&
+        typeof ChangeRequestAdapters.executionStatusLabel === 'function') {
+      outcomeLabel = ChangeRequestAdapters.executionStatusLabel(distinctOutcome);
+    }
+    if (distinctOutcome && ChangeRequestAdapters &&
+        typeof ChangeRequestAdapters.executionStatusBadgeClass === 'function') {
+      outcomeClass = ChangeRequestAdapters.executionStatusBadgeClass(distinctOutcome);
+    }
     var html = '<div class="afk-cr-execution">' +
       '<div class="afk-cr-execution-head">' +
         '<span class="afk-entity-id">' + escHtml(execution.awxJobId || '--') + '</span>' +
         badge(execution.purpose.label, execution.purpose.badgeClass).outerHTML +
         badge(execution.status.label, execution.status.badgeClass).outerHTML +
-        (execution.outcome && execution.outcome !== execution.status.value
-          ? badge(execution.outcome, afkRunStatusBadgeClass(execution.outcome)).outerHTML : '') +
+        (distinctOutcome
+          ? badge(outcomeLabel, outcomeClass).outerHTML : '') +
       '</div>' +
       '<div class="afk-cr-execution-meta">' +
         (execution.externalSessionId ? 'session: ' + escHtml(execution.externalSessionId) : '') +
@@ -5254,6 +5274,7 @@
   window.openChangeRequestDetail = openChangeRequestDetail;
   window.renderChangeRequestDetail = renderChangeRequestDetail;
   window.renderChangeRequestExecution = renderChangeRequestExecution;
+  window.renderChangeRequestExecutions = renderChangeRequestExecutions;
   window.setChangeRequestFilters = function (filters) { afkCrFilters = filters || {}; };
   window.setSelectedChangeRequest = function (cr) { selectedChangeRequest = cr; };
   window.getSelectedChangeRequest = function () { return selectedChangeRequest; };

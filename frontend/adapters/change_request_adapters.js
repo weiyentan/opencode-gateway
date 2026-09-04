@@ -257,8 +257,11 @@
   // relationships.  As a defensive fallback only, an execution's `phase`
   // (the provenance-timeline vocabulary: develop/review) maps to the same
   // purpose it already describes within the SAME payload — no browser-side
-  // join.  Execution status follows the locked binding vocabulary:
-  // pending, running, completed, failed, cancelled, stale.
+  // join.  Execution status/outcome follows the locked binding vocabulary
+  // (pending, running, completed, failed, cancelled, stale) and displays
+  // with explicit #651 labels: reliable terminal outcomes surface as
+  // Completed / Failed / Cancelled and missing/unreliable outcomes stay
+  // Unknown — never inferred from timestamps or template type.
 
   /** Normalize an execution purpose value to the canonical vocabulary:
    *  implementation | review | retry.  Unknown/missing → 'unknown'.
@@ -295,25 +298,44 @@
     return 'badge-unknown';
   }
 
-  /** Human label for an execution status value.  The locked vocabulary
-   *  passes through verbatim; null/absent → '--'.
+  /** Human label for an execution status/outcome value (issue #651).
+   *  Reliable terminal AWX outcomes display as Completed / Failed /
+   *  Cancelled — the explicit-success alias ``successful`` and the single-l
+   *  US ``canceled`` spelling converge on the same display label.  The
+   *  remaining explicitly-observed non-terminal states keep readable labels
+   *  (Running / Pending / Blocked / Stale / Timed out).  Missing and
+   *  unreliable values display 'Unknown' — the adapter never infers an
+   *  outcome from timestamps or template type.
    *  @param {string|null} status
-   *  @returns {string} */
+   *  @returns {string} e.g. "Completed" | "Failed" | "Cancelled" | "Unknown" */
   function executionStatusLabel(status) {
-    if (status == null || status === '') return '--';
-    return String(status);
+    if (status == null || status === '') return 'Unknown';
+    var v = String(status).toLowerCase();
+    if (v === 'completed' || v === 'successful') return 'Completed';
+    if (v === 'failed') return 'Failed';
+    if (v === 'cancelled' || v === 'canceled') return 'Cancelled';
+    if (v === 'running') return 'Running';
+    if (v === 'pending') return 'Pending';
+    if (v === 'blocked') return 'Blocked';
+    if (v === 'stale') return 'Stale';
+    if (v === 'timed_out') return 'Timed out';
+    return 'Unknown';
   }
 
-  /** Map an execution status value to a badge CSS class.
+  /** Map an execution status/outcome value to a badge CSS class (issue
+   *  #651).  The terminal-outcome aliases ``successful`` and ``canceled``
+   *  converge on the canonical completed/cancelled classes.
    *  @param {string|null} status
    *  @returns {string} badge class */
   function executionStatusBadgeClass(status) {
-    if (status === 'running') return 'badge-running';
-    if (status === 'completed') return 'badge-completed';
-    if (status === 'failed') return 'badge-failed';
-    if (status === 'cancelled') return 'badge-cancelled';
-    if (status === 'stale' || status === 'timed_out') return 'badge-stale';
-    if (status === 'blocked' || status === 'pending') return 'badge-blocked';
+    if (status == null) return 'badge-unknown';
+    var v = String(status).toLowerCase();
+    if (v === 'running') return 'badge-running';
+    if (v === 'completed' || v === 'successful') return 'badge-completed';
+    if (v === 'failed') return 'badge-failed';
+    if (v === 'cancelled' || v === 'canceled') return 'badge-cancelled';
+    if (v === 'stale' || v === 'timed_out') return 'badge-stale';
+    if (v === 'blocked' || v === 'pending') return 'badge-blocked';
     return 'badge-unknown';
   }
 
