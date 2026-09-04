@@ -8871,6 +8871,76 @@ class TestCostOnlyCanonicalRouting:
         _recon.apply_replay_merge.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_session_change_stays_conflict_in_cost_only_route(self, monkeypatch):
+        """A replay whose session attribution differs never applies the cost
+        correction — the canonical cost-only route compares session
+        attribution and reports ``conflict`` (a cost correction cannot move
+        accounting between sessions)."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        canonical_session_id = uuid.uuid4()   # stored canonical session
+        incoming_session_id = uuid.uuid4()    # resolved for the incoming session
+        resolved_model_id = uuid.uuid4()
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0035"),
+            session_id=canonical_session_id,
+            model_id=resolved_model_id,
+        )
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            event_id=event_id,
+            stored_event=stored_event,
+            # Session lookup returns a DIFFERENT session id than stored
+            canonical_session_id=incoming_session_id,
+            canonical_model_id=resolved_model_id,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-session-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",       # same model as canonical stored
+                "input_tokens": 100,    # same tokens as canonical stored
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "conflict", (
+            f"Expected 'conflict' when the session changes alongside cost, "
+            f"got '{result['status']}'"
+        )
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "conflict" in str(attempt_inserts[0].args)
+        _recon.apply_replay_merge.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_repeated_cost_correction_applies_delta_only_once(self, monkeypatch):
         """A repeated corrected delivery (canonical cost already equal to the
         incoming authoritative cost) resolves to ``duplicate`` — the delta is
