@@ -8163,6 +8163,967 @@ class TestCanonicalDuplicateDetection:
         )
 
 
+class TestCostOnlyCanonicalRouting:
+    """Cost-only replays route through canonical accounting (issue #646).
+
+    A valid, non-quarantined replay whose ONLY changed observable field is a
+    non-NULL ``estimated_cost_usd`` is reported by the legacy first-write-wins
+    layer as a ``conflict`` (exact-Decimal cost equality, issue #645).  The
+    ingest handler must route that replay through ``_record_canonical_event``
+    (``cost_only=True``) so the authoritative cost correction reaches the
+    canonical event, the owning session aggregate, the client project rollup,
+    and the ingest-attempt audit record — while token/model/session changes
+    remain ``conflict`` and the legacy row is left untouched.
+    """
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _legacy_divergent_row(*, cost: Decimal | None, input_tokens: int = 100,
+                              output_tokens: int = 50,
+                              cached_tokens: int = 0) -> MagicMock:
+        """Return the legacy dedup row the loser path reads on a replay.
+
+        Tokens match the incoming default payload (100/50/0); only the
+        cost differs from the incoming payload's default (0.0035)."""
+        row = MagicMock()
+        row.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "estimated_cost_usd": cost,
+        }.__getitem__
+        return row
+
+    def _build_cost_only_legacy_conflict_side_effect(
+        self,
+        *,
+        stored_legacy_cost: Decimal | None = Decimal("0.0035"),
+        event_id: uuid.UUID | None = None,
+        stored_event: MagicMock | None = None,
+        include_canonical_existing: bool = True,
+        canonical_session_id: uuid.UUID | None = None,
+        canonical_model_id: uuid.UUID | None = None,
+        extra_fetchrow: list | None = None,
+        extra_fetchval: list | None = None,
+    ) -> tuple[list, dict[str, uuid.UUID]]:
+        """Build the fetchrow side-effect list for a cost-only legacy conflict.
+
+        The legacy ``_process_one_record`` layer is a LOSER (atomic INSERT
+        conflicts): model upsert, atomic INSERT → None, dedup SELECT → the
+        existing legacy row with identical tokens but a divergent cost.
+        ``_process_one_record`` therefore returns the cost-only divergence
+        marker (status ``conflict``), and the handler routes the record to
+        ``_record_canonical_event(..., cost_only=True)``.
+
+        When ``include_canonical_existing`` the canonical event already
+        exists: model/session lookup, event lookup, full stored-event read.
+        When ``include_canonical_existing=False`` the canonical event is
+        absent → the backfill path inserts a new event.
+        """
+        auth = _auth_row()
+        items: list = [auth, None]  # auth + sd_check
+
+        # handler: cross-identity conflict check
+        items.extend(_handler_routing_side_effect_items())
+
+        # _process_one_record (loser): model upsert, atomic INSERT (loser → None),
+        # dedup SELECT → legacy row with identical tokens, divergent cost.
+        model_upsert_row = MagicMock()
+        model_upsert_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        items.append(model_upsert_row)
+        items.append(None)  # atomic INSERT ON CONFLICT → loser
+        items.append(self._legacy_divergent_row(cost=stored_legacy_cost))
+
+        if not include_canonical_existing:
+            return items, {}
+
+        # _record_canonical_event: model lookup, session lookup
+        resolved_model_id = canonical_model_id or uuid.uuid4()
+        resolved_session_id = canonical_session_id or uuid.uuid4()
+        model_row = MagicMock()
+        model_row.__getitem__.side_effect = {"id": resolved_model_id}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": resolved_session_id}.__getitem__
+        items.extend([model_row, session_lookup_row])
+
+        # event lookup → returns existing event id
+        resolved_event_id = event_id or uuid.uuid4()
+        existing_row = MagicMock()
+        existing_row.__getitem__.side_effect = {"id": resolved_event_id}.__getitem__
+        items.append(existing_row)
+
+        # full stored event read (includes session_id/model_id for cost_only)
+        if stored_event is None:
+            stored_event = self._full_event_mock(
+                session_id=resolved_session_id,
+                model_id=resolved_model_id,
+            )
+        items.append(stored_event)
+
+        if extra_fetchrow:
+            items.extend(extra_fetchrow)
+
+        return items, {
+            "event_id": resolved_event_id,
+            "session_id": resolved_session_id,
+            "model_id": resolved_model_id,
+        }
+
+    @staticmethod
+    def _full_event_mock(
+        *,
+        input_tokens: int = 100,
+        output_tokens: int = 50,
+        cached_tokens: int = 0,
+        reasoning_tokens: int | None = 0,
+        cache_read_tokens: int | None = 0,
+        cache_write_tokens: int | None = 0,
+        estimated_cost_usd: Decimal | None = Decimal("0.0035"),
+        provider: str | None = None,
+        mode: str | None = None,
+        finish_reason: str | None = None,
+        session_id: uuid.UUID | None = None,
+        model_id: uuid.UUID | None = None,
+    ) -> MagicMock:
+        """Return a fetchrow row with full canonical event field values."""
+        values: dict = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "estimated_cost_usd": estimated_cost_usd,
+            "provider": provider,
+            "mode": mode,
+            "finish_reason": finish_reason,
+            "session_id": session_id,
+            "model_id": model_id,
+        }
+        row = MagicMock()
+        row.__getitem__.side_effect = values.__getitem__
+        return row
+
+    @staticmethod
+    def _enrichment_read_mock() -> MagicMock:
+        """Return a fetchrow row for the text enrichment FOR UPDATE read."""
+        row = MagicMock()
+        row.__getitem__.side_effect = {
+            "provider": None,
+            "mode": None,
+            "finish_reason": None,
+        }.__getitem__
+        return row
+
+    # ── Tests ───────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_cost_only_replay_returns_updated_and_merges(self, monkeypatch):
+        """A cost-only replay (legacy conflict marker) routes through canonical
+        accounting and returns ``updated``, with the incoming authoritative cost
+        passed to the Replay Merge."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        resolved_model_id = uuid.uuid4()
+        # Legacy row cost 0.0035; incoming cost 0.0100 → cost-only divergence.
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0035"),
+            session_id=resolved_session_id,
+            model_id=resolved_model_id,
+        )
+        enrichment_read = self._enrichment_read_mock()
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            event_id=event_id,
+            stored_event=stored_event,
+            canonical_session_id=resolved_session_id,
+            canonical_model_id=resolved_model_id,
+            extra_fetchrow=[enrichment_read],
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                # Stored legacy: 0.0035. Incoming authoritative: 0.0100.
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        result = data["results"][0]
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for cost-only replay, got '{result['status']}'"
+        )
+        assert result["event_id"] is not None
+        assert result["attempt_id"] is not None
+
+        # The canonical merge must be invoked with ONLY the cost delta.
+        apply_call = _recon.apply_replay_merge.call_args
+        assert apply_call is not None, "apply_replay_merge should have been called"
+        new_values = apply_call[0][2]
+        assert new_values == {"estimated_cost_usd": Decimal("0.0100")}, (
+            f"Cost-only replay must merge ONLY the cost, got {new_values!r}"
+        )
+
+        # The ingest attempt records the "updated" outcome.
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "updated" in str(attempt_inserts[0].args)
+
+    @pytest.mark.asyncio
+    async def test_cost_only_decrease_merges_negative_delta(self, monkeypatch):
+        """A cost-only decrease routes through canonical accounting and
+        applies only the calculated (negative) delta."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        resolved_model_id = uuid.uuid4()
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0100"),
+            session_id=resolved_session_id,
+            model_id=resolved_model_id,
+        )
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0100"),
+            event_id=event_id,
+            stored_event=stored_event,
+            canonical_session_id=resolved_session_id,
+            canonical_model_id=resolved_model_id,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-decrease-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                # Stored legacy: 0.0100. Incoming authoritative: 0.0040.
+                "estimated_cost_usd": "0.0040",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for cost decrease, got '{result['status']}'"
+        )
+
+        apply_call = _recon.apply_replay_merge.call_args
+        assert apply_call is not None
+        new_values = apply_call[0][2]
+        # Only the incoming authoritative cost reaches the merge; the merge
+        # computes the negative delta (0.0040 - 0.0100).
+        assert new_values == {"estimated_cost_usd": Decimal("0.0040")}
+
+    @pytest.mark.asyncio
+    async def test_stored_null_cost_corrected_by_non_null_incoming(self, monkeypatch):
+        """A stored NULL cost is corrected by a non-NULL incoming cost via
+        the canonical cost-only route."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        resolved_model_id = uuid.uuid4()
+        # Legacy + canonical stored cost is NULL; incoming cost is 0.0050.
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=None,
+            session_id=resolved_session_id,
+            model_id=resolved_model_id,
+        )
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=None,
+            event_id=event_id,
+            stored_event=stored_event,
+            canonical_session_id=resolved_session_id,
+            canonical_model_id=resolved_model_id,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-null-to-cost-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0050",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "updated", (
+            f"Expected 'updated' for NULL→non-NULL cost correction, got '{result['status']}'"
+        )
+
+        apply_call = _recon.apply_replay_merge.call_args
+        assert apply_call is not None
+        new_values = apply_call[0][2]
+        assert new_values == {"estimated_cost_usd": Decimal("0.0050")}
+
+    @pytest.mark.asyncio
+    async def test_incoming_null_cost_does_not_erase_known_stored_cost(self, monkeypatch):
+        """A replay with a NULL incoming cost and identical tokens is NOT a
+        cost-only divergence (a NULL can never authoritatively correct).  It
+        stays a legacy ``conflict`` with no canonical routing — the known
+        stored cost is never erased."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_dedup = self._legacy_divergent_row(
+            cost=Decimal("0.0035"),  # stored known cost
+        )
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            *_handler_routing_side_effect_items(),
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → NULL cost vs stored non-NULL
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        # NULL estimated_cost_usd (omitted) + identical tokens.
+        record = {
+            "source_record_id": "rec-null-incoming-001",
+            "session_id": str(_SESSION_ID),
+            "model": "gpt-4",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "reported_at": _mk_ts().isoformat(),
+            # estimated_cost_usd omitted → None
+        }
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=_valid_ingest_payload(records=[record]),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        result = data["results"][0]
+        assert result["status"] == "conflict", (
+            f"Expected legacy conflict for NULL incoming cost, got '{result['status']}'"
+        )
+        assert result["event_id"] is None
+
+        # No canonical accounting was triggered (no usage_ingest_attempts insert,
+        # no apply_replay_merge, no UPDATE to usage_events).
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 0, (
+            "NULL incoming cost must not reach canonical accounting"
+        )
+        update_events = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE usage_events" in str(c)
+        ]
+        assert len(update_events) == 0, "NULL incoming cost must not erase a known cost"
+
+    @pytest.mark.asyncio
+    async def test_token_change_stays_conflict(self, monkeypatch):
+        """A replay whose tokens differ (in addition to or instead of cost)
+        never routes through the cost-only canonical path — it remains a
+        legacy ``conflict``."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,   # stored legacy value (incoming is 200)
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 1. auth
+            None,             # 2. source_database check (new)
+            *_handler_routing_side_effect_items(),
+            existing_model,   # 3. model upsert → existing model
+            None,             # 4. atomic INSERT ON CONFLICT → conflict (loser)
+            existing_dedup,   # 5. dedup query → token divergence
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-token-conflict-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 200,   # stored legacy: 100
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0035",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "conflict", (
+            f"Expected 'conflict' for token change, got '{result['status']}'"
+        )
+        assert result["event_id"] is None
+
+        # No canonical accounting triggered.
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 0, (
+            "Token-change conflict must not reach canonical accounting"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cost_only_replay_backfills_missing_canonical_event(self, monkeypatch):
+        """When a cost-only legacy conflict has NO canonical event yet, the
+        routing backfills one from the incoming record (self-healing) and
+        returns ``accepted``."""
+        mock_conn = AsyncMock()
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            include_canonical_existing=False,
+        )
+        # _record_canonical_event (NEW path): model lookup, session lookup,
+        # event lookup (None → insert).
+        model_row = MagicMock()
+        model_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+        items.extend([model_row, session_lookup_row, None])
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-backfill-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "accepted", (
+            f"Expected 'accepted' for backfilled canonical event, got '{result['status']}'"
+        )
+        assert result["event_id"] is not None
+        assert result["attempt_id"] is not None
+
+        # One canonical event INSERT + one ingest attempt.
+        event_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(c)
+        ]
+        assert len(event_inserts) == 1, (
+            f"Expected 1 canonical event INSERT, got {len(event_inserts)}"
+        )
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1, (
+            f"Expected 1 ingest attempt, got {len(attempt_inserts)}"
+        )
+        assert "accepted" in str(attempt_inserts[0].args)
+
+    @pytest.mark.asyncio
+    async def test_cost_only_scope_broader_canonical_difference_is_conflict(self, monkeypatch):
+        """If the canonical event differs from the incoming record in a token,
+        session, or model field (a legacy/canonical skew), the cost-only route
+        refuses to apply the correction and reports ``conflict`` — never a
+        silent token/model/session change."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        # Canonical stored event has DIFFERENT input_tokens (300) than the
+        # incoming (100) — a broader difference than cost.
+        stored_event = self._full_event_mock(
+            input_tokens=300,
+            estimated_cost_usd=Decimal("0.0035"),
+            session_id=uuid.uuid4(),
+            model_id=uuid.uuid4(),
+        )
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            event_id=event_id,
+            stored_event=stored_event,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-broad-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,     # canonical stored: 300
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "conflict", (
+            f"Expected 'conflict' when canonical differs beyond cost, got '{result['status']}'"
+        )
+        # The audit attempt records the conflict outcome; no event UPDATE.
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "conflict" in str(attempt_inserts[0].args)
+        _recon.apply_replay_merge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_model_change_stays_conflict_in_cost_only_route(self, monkeypatch):
+        """A replay whose cost AND model both differ never applies the cost
+        correction — the canonical cost-only route compares model attribution
+        and reports ``conflict`` (a cost correction cannot move accounting
+        between models)."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        canonical_model_id = uuid.uuid4()   # stored canonical model
+        incoming_model_id = uuid.uuid4()    # resolved for the incoming model
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0035"),
+            session_id=resolved_session_id,
+            model_id=canonical_model_id,
+        )
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            event_id=event_id,
+            stored_event=stored_event,
+            canonical_session_id=resolved_session_id,
+            # Model lookup returns a DIFFERENT model id than stored
+            canonical_model_id=incoming_model_id,
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-model-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-5",       # canonical stored model is gpt-4
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        result = response.json()["data"]["results"][0]
+        assert result["status"] == "conflict", (
+            f"Expected 'conflict' when the model changes alongside cost, "
+            f"got '{result['status']}'"
+        )
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "conflict" in str(attempt_inserts[0].args)
+        _recon.apply_replay_merge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repeated_cost_correction_applies_delta_only_once(self, monkeypatch):
+        """A repeated corrected delivery (canonical cost already equal to the
+        incoming authoritative cost) resolves to ``duplicate`` — the delta is
+        applied once, never re-applied (issue #646 acceptance criterion)."""
+        from app.api.ingest import IngestRecord, _record_canonical_event
+
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        identity_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        resolved_model_id = uuid.uuid4()
+        client_id = uuid.uuid4()
+        source_db_id = uuid.uuid4()
+        batch_id = uuid.uuid4()
+        now = _utcnow()
+
+        # Canonical stored cost is ALREADY 0.0100 (a prior delivery applied it).
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0100"),
+            session_id=resolved_session_id,
+            model_id=resolved_model_id,
+        )
+
+        # _record_canonical_event: model lookup, session lookup, event lookup,
+        # full stored-event read. (cost_only=True)
+        model_row = MagicMock()
+        model_row.__getitem__.side_effect = {"id": resolved_model_id}.__getitem__
+        session_lookup_row = MagicMock()
+        session_lookup_row.__getitem__.side_effect = {"id": resolved_session_id}.__getitem__
+        existing_row = MagicMock()
+        existing_row.__getitem__.side_effect = {"id": event_id}.__getitem__
+        mock_conn.fetchrow = AsyncMock(side_effect=[
+            model_row, session_lookup_row, existing_row, stored_event,
+        ])
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.DUPLICATE),
+        )
+
+        record = IngestRecord(
+            source_record_id="rec-repeat-cost-001",
+            session_id="ses-repeat",
+            model="gpt-4",
+            input_tokens=100,
+            output_tokens=50,
+            cached_tokens=0,
+            estimated_cost_usd=Decimal("0.0100"),  # == stored
+            reported_at=_mk_ts(),
+        )
+
+        result = await _record_canonical_event(
+            mock_conn, record, client_id, source_db_id,
+            batch_id, None, now,
+            canonical_identity_id=identity_id,
+            cost_only=True,
+        )
+
+        assert result["status"] == "duplicate", (
+            f"Repeated cost correction must be 'duplicate', got '{result['status']}'"
+        )
+        # No cost delta was re-applied.
+        _recon.apply_replay_merge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_quarantined_records_never_reach_cost_only_routing(self, monkeypatch):
+        """A quarantined identity's records return ``quarantined`` before the
+        legacy layer runs — canonical accounting (including the cost-only
+        route) is never entered."""
+        mock_conn = AsyncMock()
+        auth = _auth_row()
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,             # 0. auth row
+            None,             # 1. source_database check (new)
+        ]
+        mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+        # Override after _build_ingest_app so quarantine check returns True
+        # (same pattern as TestQuarantinedIdentity).
+        mock_conn.fetchval = AsyncMock(return_value=True)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["results"][0]["status"] == "quarantined"
+        assert data["results"][0]["event_id"] is None
+
+        # No canonical event / no legacy insert / no session resolution.
+        event_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_events" in str(c)
+        ]
+        assert len(event_inserts) == 0
+        session_calls = [
+            c for c in mock_conn.fetchrow.call_args_list
+            if "INSERT INTO sessions" in str(c)
+        ]
+        assert len(session_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_identical_replay_is_idempotent_no_accounting_change(self, monkeypatch):
+        """An identical replay (all fields including cost equal) is already
+        idempotent at the legacy layer — it never becomes a cost-only
+        divergence and makes no canonical accounting change beyond the
+        existing duplicate handling."""
+        mock_conn = AsyncMock()
+        _add_transaction_support(mock_conn)
+        auth = _auth_row()
+        existing_dedup = MagicMock()
+        existing_dedup.__getitem__.side_effect = {
+            "id": uuid.uuid4(),
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "estimated_cost_usd": Decimal("0.0035"),
+        }.__getitem__
+        existing_model = MagicMock()
+        existing_model.__getitem__.side_effect = {"id": uuid.uuid4()}.__getitem__
+
+        lock_row = MagicMock()
+        lock_row.__getitem__.side_effect = {
+            "provider": None, "mode": None, "finish_reason": None,
+            "reasoning_tokens": None, "cache_read_tokens": None,
+            "cache_write_tokens": None, "session_id": _SESSION_ID,
+        }.__getitem__
+
+        mock_conn.fetchrow = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            auth,
+            None,
+            *_handler_routing_side_effect_items(),
+            existing_model,  # model upsert
+            None,            # atomic INSERT → conflict (loser)
+            existing_dedup,  # dedup query → identical
+            lock_row,        # _apply_replay_merge: SELECT FOR UPDATE
+            _canonical_exists_row(),  # existence check → canonical event exists
+        ]
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        async with client as c:
+            response = await c.post(
+                "/ingest",
+                json=_valid_ingest_payload(),
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["accepted_count"] == 1
+        assert "idempotent" in (data["results"][0]["reason"] or "").lower()
+
+        # No cost-only routing: no apply_replay_merge for cost, no usage_events
+        # UPDATE, no rollup write.
+        update_events = [
+            c for c in mock_conn.execute.call_args_list
+            if "UPDATE usage_events" in str(c)
+        ]
+        assert len(update_events) == 0
+        rollup_calls = [
+            c for c in mock_conn.execute.call_args_list
+            if "client_project_rollup" in str(c)
+        ]
+        assert len(rollup_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_cost_only_merge_runs_inside_single_transaction(self, monkeypatch):
+        """The canonical event, session aggregate, rollup, and ingest attempt
+        are updated atomically — apply_replay_merge, the enrichment read, the
+        last_ingested_at bump and the attempt INSERT all happen inside the
+        single canonical transaction (issue #646 acceptance criterion)."""
+        mock_conn = AsyncMock()
+        event_id = uuid.uuid4()
+        resolved_session_id = uuid.uuid4()
+        resolved_model_id = uuid.uuid4()
+        stored_event = self._full_event_mock(
+            estimated_cost_usd=Decimal("0.0035"),
+            session_id=resolved_session_id,
+            model_id=resolved_model_id,
+        )
+        enrichment_read = self._enrichment_read_mock()
+        items, _ = self._build_cost_only_legacy_conflict_side_effect(
+            stored_legacy_cost=Decimal("0.0035"),
+            event_id=event_id,
+            stored_event=stored_event,
+            canonical_session_id=resolved_session_id,
+            canonical_model_id=resolved_model_id,
+            extra_fetchrow=[enrichment_read],
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=items)
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+        _add_transaction_support(mock_conn)
+
+        import app.core.reconciliation as _recon
+        monkeypatch.setattr(
+            _recon, "apply_replay_merge",
+            AsyncMock(return_value=_recon.IngestOutcome.UPDATED),
+        )
+
+        client = _build_ingest_app(mock_conn, monkeypatch=monkeypatch)
+
+        payload = _valid_ingest_payload(
+            records=[{
+                "source_record_id": "rec-cost-only-atomic-001",
+                "session_id": str(_SESSION_ID),
+                "model": "gpt-4",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 0,
+                "estimated_cost_usd": "0.0100",
+                "reported_at": _mk_ts().isoformat(),
+            }],
+        )
+
+        async with client as c:
+            response = await c.post(
+                "/ingest", json=payload,
+                headers={"Authorization": "Bearer collector-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["results"][0]["status"] == "updated"
+
+        # Transaction framing: the legacy loser path opens one transaction for
+        # the atomic INSERT (commits nothing on a losing ON CONFLICT), and
+        # _record_canonical_event opens the canonical transaction that wraps
+        # lock + merge + enrichment + attempt.  The cost correction and its
+        # audit record therefore share the single canonical transaction.
+        assert mock_conn.transaction.call_count == 2
+
+        # Attempt outcome recorded atomically in the same transaction.
+        attempt_inserts = [
+            c for c in mock_conn.execute.call_args_list
+            if "INSERT INTO usage_ingest_attempts" in str(c)
+        ]
+        assert len(attempt_inserts) == 1
+        assert "updated" in str(attempt_inserts[0].args)
+
+
 class TestBatchOverlapQueryCount:
     """Issue #416 batch overlap routing regressions."""
 
