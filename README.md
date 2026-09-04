@@ -908,7 +908,6 @@ opencode-gateway/
 │   ├── afk-outcome-validation.md # AFK reconstruction validation findings
 │   ├── afk-outcome-contract-validation.md
 │   ├── afk-e2e-validation.md     # Opt-in GitHub/GitLab lifecycle E2E operator guide
-│   ├── issue-515-github-pr-validation.md
 │   ├── prd/                      # PRDs (AFK run creation, AWX execution bindings, replay-safe accounting, …)
 │   └── contracts/normalized-event-v1   # Producer-owned normalized-event contract artifacts
 ├── alembic/                      # Alembic migrations
