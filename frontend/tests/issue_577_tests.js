@@ -147,7 +147,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitHub fixture chain detail');
   assert(html.indexOf('review:501') !== -1, 'GitHub: review entity id');
   assert(html.indexOf('merge_event:501') !== -1, 'GitHub: merge event entity id');
   assert(html.indexOf('code-editor-senior') !== -1, 'GitHub: agent identity');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitHub: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitHub: usage step Token Usage');
   assert(html.indexOf('data-step="issues"') !== -1, 'GitHub: issues step');
   assert(html.indexOf('data-step="run"') !== -1, 'GitHub: run step');
   assert(html.indexOf('data-step="sessions"') !== -1, 'GitHub: sessions step');
@@ -171,7 +171,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitLab fixture chain detail');
   assert(html.indexOf('merge_event:601') !== -1, 'GitLab: merge event entity id');
   assert(html.indexOf('cloudnative-pg') !== -1, 'GitLab: repository name');
   assert(html.indexOf('resolves #501') !== -1, 'GitLab: evidence detail');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitLab: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitLab: usage step Token Usage');
 })();
 
 console.log('\u25B6 issue #577 \u2014 provenance: cost + cache data');
@@ -599,9 +599,9 @@ console.log('\u25B6 issue #577 \u2014 cross-provider parity: GitHub vs GitLab fi
   assert(ghHtml.indexOf('resolver v2') !== -1, 'parity: GitHub resolver version');
   assert(glHtml.indexOf('resolver v2') !== -1, 'parity: GitLab resolver version');
 
-  // Both carry Active Tokens in usage step
-  assert(ghHtml.indexOf('Active Tokens') !== -1, 'parity: GitHub usage step');
-  assert(glHtml.indexOf('Active Tokens') !== -1, 'parity: GitLab usage step');
+  // Both carry Token Usage in usage step
+  assert(ghHtml.indexOf('Token Usage') !== -1, 'parity: GitHub usage step');
+  assert(glHtml.indexOf('Token Usage') !== -1, 'parity: GitLab usage step');
 
   // Provider-specific content present in respective fixtures
   assert(ghHtml.indexOf('weiyentan/opencode-gateway') !== -1, 'parity: GitHub repo name');

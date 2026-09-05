@@ -471,6 +471,20 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Token Usage KPI category breakdown (issue #658): the two lines of
+   category values (input | output, then cache read + cache write) sit
+   between the headline value and the date-range subtitle.  The muted
+   .kpi-sub scale keeps the breakdown subordinate to the headline while the
+   tabular-nums alignment (inherited convention) keeps the digits steady.
+   Lines may wrap naturally inside the card on narrow viewports (the KPI
+   grid collapses to two columns at ≤760px), so no nowrap clipping. */
+.kpi-breakdown {
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
 .kpi-tokens .kpi-value    { color: var(--accent-cyan); }
 .kpi-cost .kpi-value      { color: var(--accent-gold); }
 .kpi-sessions .kpi-value  { color: var(--accent-indigo); }
