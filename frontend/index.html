@@ -123,6 +123,11 @@
         <span class="panel-freshness" id="freshness-kpi-tokens"></span>
         <span class="kpi-label">Token Usage</span>
         <span class="kpi-value" id="kpi-tokens">--</span>
+        <!-- Token category breakdown (issue #658): input/output on line 1,
+             cache read/cache write on line 2 beneath the Token Usage
+             headline.  Zero-valued cache components stay visible (render
+             as 0).  Populated by renderKPIs from the same aggTotal row. -->
+        <span class="kpi-breakdown" id="kpi-tokens-breakdown"></span>
         <span class="kpi-sub" id="kpi-tokens-detail">--</span>
       </div>
       <div class="kpi-card kpi-cost">
