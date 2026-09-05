@@ -258,12 +258,14 @@ should preserve these categories instead of collapsing them into a single
 ambiguous token total.
 _Avoid_: Tokens when the category matters
 
-**Active Tokens**:
-The primary token total shown in Gateway summaries (e.g. Sessions table
-and aggregate views), calculated as input tokens plus output tokens.
-Active Tokens intentionally exclude cache read and cache write tokens so
-cache activity does not obscure new model work.
-_Avoid_: Total Tokens when cache categories are also visible
+**Token Usage**:
+ The primary token summary shown in Gateway views. The headline value is
+ input tokens plus output tokens. Cache read and cache write tokens are shown
+ as separate sibling values so cache activity remains visible without being
+ folded into the headline.
+ _Avoid_: Active Tokens in user-facing labels; the API's deprecated
+ `active_tokens` field remains the legacy name for the input-plus-output
+ calculation.
 
 **Uncached/Output Tokens**:
 The fresh model input and output tokens shown for one Aurora Glass summary
