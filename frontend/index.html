@@ -89,7 +89,7 @@
   <main class="dashboard">
 
     <!-- Shared date-range bar + KPI row (issue #411): the aggregate totals
-         (Active Tokens, Est. Cost, Sessions — from the aggregates total row)
+         (Token Usage, Est. Cost, Sessions — from the aggregates total row)
          render on EVERY tab — including the Agent Runs tab — with the
          dashboard date range applied.  Previously scoped inside
          #tab-overview, the Agent Runs tab showed no aggregate data. -->
@@ -121,7 +121,7 @@
     <section class="kpi-row" id="kpi-row">
       <div class="kpi-card kpi-tokens">
         <span class="panel-freshness" id="freshness-kpi-tokens"></span>
-        <span class="kpi-label">Active Tokens</span>
+        <span class="kpi-label">Token Usage</span>
         <span class="kpi-value" id="kpi-tokens">--</span>
         <span class="kpi-sub" id="kpi-tokens-detail">--</span>
       </div>
@@ -370,7 +370,7 @@
           <thead>
             <tr>
               <th>Client / Project</th>
-              <th>Active Tokens</th>
+              <th>Token Usage</th>
               <th>Est. Cost</th>
               <th>Sessions</th>
               <th>Models</th>

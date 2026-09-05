@@ -1729,7 +1729,7 @@ console.log('\u25B6 header last-refreshed clock (issue #357)');
 })();
 
 // ── KPI subtitle split (issue #358) ─────────────────────────────────────
-// Historical KPIs (Active Tokens, Est. Cost, Sessions) keep the selected
+// Historical KPIs (Token Usage, Est. Cost, Sessions) keep the selected
 // date range as their subtitle — they are date-range aggregates.  Current-
 // health KPIs (Healthy Collectors, Source Databases) are live snapshots:
 // they show "As of HH:MM:SS" from the last completed refresh (issue #357's
@@ -2246,13 +2246,14 @@ console.log('\u25B6 index.html markup (smoke check)');
   assert(html.indexOf('id="event-badge"') !== -1, 'events panel: #event-badge element still present');
   assert(html.indexOf('Waiting for events&hellip;') !== -1, 'events panel: empty-state text unchanged');
 
-  // Token vocabulary (issue #354): the KPI card label and the Client / Project
-  // Usage Breakdown tokens column header read "Active Tokens"; the legacy
+  // Token vocabulary (issue #354, #657): the KPI card label and the Client /
+  // Project Usage Breakdown tokens column header read "Token Usage" (the
+  // former "Active Tokens" label, input + output); the legacy
   // "Total Tokens" label is gone from the markup entirely.
-  assert(html.indexOf('<span class="kpi-label">Active Tokens</span>') !== -1,
-    'KPI card: label reads "Active Tokens"');
-  assert(html.indexOf('<th>Active Tokens</th>') !== -1,
-    'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
+  assert(html.indexOf('<span class="kpi-label">Token Usage</span>') !== -1,
+    'KPI card: label reads "Token Usage"');
+  assert(html.indexOf('<th>Token Usage</th>') !== -1,
+    'Client / Project Usage Breakdown: tokens column header reads "Token Usage"');
   assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
 
   // KPI subtitle spans (issue #358): all five KPI cards carry a .kpi-sub
@@ -2413,7 +2414,7 @@ console.log('\u25B6 index.html + style.css — Clear control + active state (iss
 // (1) the active Agent Runs tab fills the viewport — the panel becomes a
 // flex column and its .table-scroll owns the vertical scroll region, so a
 // long run list scrolls inside the panel instead of the page; (2) the
-// shared date-range bar and KPI row (aggregate totals — Active Tokens,
+// shared date-range bar and KPI row (aggregate totals — Token Usage,
 // Est. Cost, Sessions from the aggregates total row) sit ABOVE the tab
 // panels, so the aggregate totals render on the Agent Runs tab with the
 // dashboard date range applied.  The viewport-derived tab height is
@@ -3836,7 +3837,7 @@ console.log('\u25B6 Agent Usage — group_by=agent aggregate fetch wiring (issue
 // 'unknown' fallback for rows without a recorded agent) and the full
 // Token Breakdown contract fields — the four independent counters
 // (input/output/cacheRead/cacheWrite), the full total (total = input +
-// output + cache read + cache write, NOT Active Tokens), the estimated
+// output + cache read + cache write, NOT Token Usage), the estimated
 // cost, and the request count.  Rows order by total token usage
 // descending, agent name ascending as the tie-breaker (the Agent Usage
 // contract from CONTEXT.md).  Exercised through the vm-sandbox window seam
@@ -3851,7 +3852,7 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#
 
   // One row per observed agent; tokens = the FULL total per the Token
   // Breakdown contract (input + output + cache read + cache write).  These
-  // fixtures carry no cache fields, so the totals equal Active Tokens.
+  // fixtures carry no cache fields, so the totals equal Token Usage.
   var rows = window.buildAgentUsageRows([
     { agent: 'bob',    total_input_tokens: 1000, total_output_tokens: 500 },
     { agent: 'alice',  total_input_tokens: 3000, total_output_tokens: 2000 },
@@ -3883,7 +3884,7 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#
   assert(enriched[0].cost === 1.25 && enriched[0].requests === 42,
     'row carries estimated cost (1.25) and request count (42, from record_count)');
 
-  // Issue #439: the sort key is the FULL total, not Active Tokens — cache
+  // Issue #439: the sort key is the FULL total, not Token Usage — cache
   // activity counts toward ordering, so an agent with large cache usage
   // outranks one with more active tokens but no cache.
   var cacheHeavy = window.buildAgentUsageRows([
@@ -4035,8 +4036,8 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issues #438/#439)'
          agentUsagePanelHtml.indexOf('<th>Est. Cost</th>') !== -1 &&
          agentUsagePanelHtml.indexOf('<th>Requests</th>') !== -1,
     'index.html: the Agent Usage header carries Agent / Token Breakdown / Est. Cost / Requests');
-  assert(agentUsagePanelHtml.indexOf('<th>Active Tokens</th>') === -1,
-    'index.html: the minimal #438 "Active Tokens" header is gone');
+  assert(agentUsagePanelHtml.indexOf('<th>Token Usage</th>') === -1,
+    'index.html: the minimal #438 "Token Usage" header is gone from the Agent Usage panel');
   assert(agentUsagePanelHtml.indexOf('<td colspan="4" class="empty-state">Loading') !== -1,
     'index.html: the Agent Usage loading row spans the 4 enriched columns');
   assert(html.indexOf('id="collectors-tbody"') < html.indexOf('panel-agent-usage'),
@@ -4383,7 +4384,7 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
   assert(html.indexOf('100%') !== -1, 'confidence is visible on reconstructed links');
   assert(html.indexOf('issue_reference') !== -1 && html.indexOf('change_request:442') !== -1,
     'evidence source identifiers are visible');
-  assert(html.indexOf('Active Tokens') !== -1, 'tokens/cost step shows the Active Tokens aggregate');
+  assert(html.indexOf('Token Usage') !== -1, 'tokens/cost step shows the Token Usage aggregate');
   assert(html.indexOf('data-step="commits"') !== -1 && html.indexOf('commit:abc1234') !== -1 &&
          html.indexOf('commit_issue_reference') !== -1,
     'commits step renders the commit links with correlation provenance');
@@ -4805,7 +4806,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitHub fixture chain detail');
   assert(html.indexOf('review:501') !== -1, 'GitHub: review entity id');
   assert(html.indexOf('merge_event:501') !== -1, 'GitHub: merge event entity id');
   assert(html.indexOf('code-editor-senior') !== -1, 'GitHub: agent identity');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitHub: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitHub: usage step Token Usage');
   assert(html.indexOf('data-step="issues"') !== -1, 'GitHub: issues step');
   assert(html.indexOf('data-step="run"') !== -1, 'GitHub: run step');
   assert(html.indexOf('data-step="sessions"') !== -1, 'GitHub: sessions step');
@@ -4828,7 +4829,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitLab fixture chain detail');
   assert(html.indexOf('review:gl601') !== -1, 'GitLab: review entity id');
   assert(html.indexOf('merge_event:601') !== -1, 'GitLab: merge event entity id');
   assert(html.indexOf('resolves #501') !== -1, 'GitLab: evidence detail');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitLab: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitLab: usage step Token Usage');
   // entity_id format confirms correct GitLab fixture loaded
   assert(html.indexOf('change_request:601') !== -1, 'GitLab: entity id confirms GitLab fixture');
 })();
@@ -5277,9 +5278,9 @@ console.log('\u25B6 issue #577 \u2014 cross-provider parity: GitHub vs GitLab fi
   assert(ghHtml.indexOf('resolver v2') !== -1, 'parity: GitHub resolver version');
   assert(glHtml.indexOf('resolver v2') !== -1, 'parity: GitLab resolver version');
 
-  // Both carry Active Tokens in usage step
-  assert(ghHtml.indexOf('Active Tokens') !== -1, 'parity: GitHub usage step');
-  assert(glHtml.indexOf('Active Tokens') !== -1, 'parity: GitLab usage step');
+  // Both carry Token Usage in usage step
+  assert(ghHtml.indexOf('Token Usage') !== -1, 'parity: GitHub usage step');
+  assert(glHtml.indexOf('Token Usage') !== -1, 'parity: GitLab usage step');
 
   // Provider-specific content present in respective fixtures
   assert(ghHtml.indexOf('weiyentan/opencode-gateway') !== -1, 'parity: GitHub repo name');

@@ -1337,7 +1337,7 @@
   // must not be presented as historical aggregates, so their subtitles
   // show "As of HH:MM:SS" instead of the date range.
   const KPI_TYPES = {
-    'kpi-tokens':     'historical', // Active Tokens — date-range aggregate
+    'kpi-tokens':     'historical', // Token Usage — date-range aggregate
     'kpi-cost':       'historical', // Est. Cost (USD) — date-range aggregate
     'kpi-sessions':   'historical', // Sessions — date-range aggregate
     'kpi-collectors': 'current',    // Healthy Collectors — live health snapshot
@@ -1797,7 +1797,7 @@
       rangeLabel = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
     }
 
-    // Set KPI subtitles: historical KPIs (Active Tokens, Est. Cost,
+    // Set KPI subtitles: historical KPIs (Token Usage, Est. Cost,
     // Sessions) show the selected date range; current-health KPIs
     // (Healthy Collectors, Source Databases) show "As of HH:MM:SS" from
     // the last completed refresh (or "Current" before any refresh) — a
@@ -3931,7 +3931,7 @@
       '</div>';
   }
 
-  /** Render the Tokens/Cost step from the run UsageAggregate.  Active Tokens
+  /** Render the Tokens/Cost step from the run UsageAggregate.  Token Usage
    *  = input + output (cache read/write are siblings, never folded in) and the
    *  cost renders via fmtCost — per the CONTEXT.md token vocabulary. */
   function renderAfkUsageStep(usage) {
@@ -3941,7 +3941,7 @@
         fmtTokenBreakdownCompact(usage.input_tokens, usage.output_tokens,
           usage.cache_read_tokens, usage.cache_write_tokens) +
       '</div>' +
-      '<div class="afk-usage-meta">Active Tokens: ' + fmtNum(usage.active_tokens) +
+      '<div class="afk-usage-meta">Token Usage: ' + fmtNum(usage.active_tokens) +
         ' &middot; Est. Cost: ' + fmtCost(usage.estimated_cost_usd) +
         ' &middot; ' + fmtNum(usage.session_count) + ' sessions &middot; ' +
         fmtNum(usage.message_count) + ' messages</div>' +
@@ -4139,7 +4139,7 @@
         fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
         fieldHtml('Cache Read Tokens', fmtNum(d.total_cache_read_tokens)) +
         fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
-        fieldHtml('Active Tokens', fmtNum(tokens)) +
+        fieldHtml('Token Usage', fmtNum(tokens)) +
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
         fieldHtml('Code Changes', fmtCodeChangesDiff(d.code_change_additions, d.code_change_deletions)) +
       '</div></div>';
