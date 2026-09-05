@@ -944,3 +944,35 @@ async def get_run_by_change_request(
             resource_number=external_id,
         ),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/{afk_run_id} — run-scoped binding read
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/runs/{afk_run_id}", response_model=list[ExecutionBindingReadResponse])
+async def get_execution_bindings_for_run(
+    request: Request,
+    afk_run_id: str,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> list[ExecutionBindingReadResponse]:
+    """Return every execution binding attached to one AFK run lifecycle.
+
+    Read-only: queries the durable execution bindings and issues no writes.
+    Many bindings can reference one ``afk_run_id`` (a failed attempt and a
+    later successful retry with a new ``awx_job_id`` — issue #595), returned
+    in deterministic order (earliest first).  A provisioned run that has no
+    execution yet reads back as an empty list (``200``), never a 404.
+    """
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.query.execution_bindings.by_afk_run_id", "db"):
+            async with _db_timeout(
+                "db.query.execution_bindings.by_afk_run_id",
+                settings.database_timeout_seconds,
+            ):
+                bindings = await repo.list_execution_bindings_by_afk_run_id(afk_run_id)
+
+    return [_binding_to_read_response(b) for b in bindings]

@@ -2535,3 +2535,53 @@ class TestRunDetailSessionLinks:
         data = resp.json()["data"]
         assert data["sessions"] == []
         assert data["usage"]["session_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/{afk_run_id} — run-scoped binding read
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGetExecutionBindingsForRun:
+    """GET /api/v1/afk/executions/runs/{afk_run_id} — run-scoped binding read."""
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_for_run(self) -> None:
+        """Return every execution binding attached to the AFK run, in order."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        rows = [
+            _mk_binding_row(awx_job_id=10, outcome="failed", afk_run_id=_RUN_ULID),
+            _mk_binding_row(
+                awx_job_id=20, outcome="completed", afk_run_id=_RUN_ULID
+            ),
+        ]
+        conn.fetch = AsyncMock(return_value=rows)
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        bindings = data["data"]
+        assert len(bindings) == 2
+        assert bindings[0]["awx_job"]["job_id"] == "10"
+        assert bindings[0]["outcome"] == "failed"
+        assert bindings[1]["awx_job"]["job_id"] == "20"
+        assert bindings[1]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_for_run_empty(self) -> None:
+        """A run with no execution bindings reads back as an empty list."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"] == []
