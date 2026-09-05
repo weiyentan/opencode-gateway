@@ -1198,6 +1198,17 @@ later fact or an explicit rebuild.
 _Avoid_: coupling fact durability to projector correctness, a durable
 outbox in v1
 
+**Reporting boundary**:
+The Gateway is a reporting and observability service. It consumes watcher and
+provider events, stores reporting facts, rebuilds reporting projections, and
+serves read APIs. Event flow is one-way into the Gateway: the Gateway must not
+dispatch reporting or watcher events back to the FastAPI EDA Gateway, trigger
+AFK orchestration, or become an event producer for workflow side effects. Any
+outbox that initiates AFK execution belongs in the producing/orchestration
+service, not in this reporting service.
+_Avoid_: a reverse Gateway-to-EDA workflow dependency, treating the Gateway as
+an AFK dispatcher, placing orchestration outbox semantics in reporting code
+
 **Status vocabulary**:
 A small explicit finite set, per episode: `pending` (declaration active,
 not yet merged), `awaiting_closure` (merged with active declaration, no
@@ -1427,6 +1438,7 @@ manages.
 - A **Closure Unresolved** record belongs to one closed closure episode and is keyed by `(issue identity, closed_at, reason)` — historical records are retained, never deleted
 - The **Closure Relationships Read API** (`/api/v1/closure-relationships`) is strictly read-only — reads only the DB projection/unresolved rows, makes **no provider API calls**, and never derives a provider-authoritative causation claim
 - The **Closure-Episode Projection Recompute** is triggered by the **AFK Outcome Consumer** on every relevant fact (`issue.opened`, `issue.reopened`, `issue.closed`, `change_request.opened`, `change_request.updated`, `change_request.merged`) — DB-local, no scheduler, no provider API call
+- The **Gateway reporting boundary** is one-way: the Gateway consumes watcher/provider events and serves reporting read APIs; it does not dispatch events back to the FastAPI EDA Gateway, trigger AFK orchestration, or own workflow-side-effect outboxes (ADR 0029)
 - An **Observation Key** is the deterministic, NOT NULL, UNIQUE natural key on every `engineering_events` fact (migration 0035), derived as a SHA-256 over the fact's six identity fields — content-stable, replay-safe, never dependent on volatile delivery identifiers
 - An `engineering_events` fact carries **Observed Via** (`webhook`/`backfill`) and **Snapshot At** (observation time) provenance (migration 0035), distinguishing occurrence time from observation time
 
