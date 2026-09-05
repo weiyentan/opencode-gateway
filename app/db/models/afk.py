@@ -754,3 +754,45 @@ class ClosureUnresolved(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
+
+class ExecutionOutcomeCorrection(Base):
+    """An auditable correction of one execution binding outcome (migration 0043,
+    issue #654).
+
+    One append-only row per correction, written in the same transaction as
+    the outcome flip by ``scripts/correct_execution_outcome.py``.  Records
+    the full before/after story: the corrected binding, its AWX job id, the
+    previous and new outcome, the previous bounded failure metadata (cleared
+    on correction — a completed execution carries no Failure Summary), the
+    operator reason, and the correction time.  Rows are never updated or
+    deleted.
+
+    The only correction class the script permits is ``cancelled`` →
+    ``completed`` (the prose-substring false-cancellation root cause); the
+    normal two-phase lifecycle owns every other transition.
+    """
+
+    __tablename__ = "execution_outcome_corrections"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    execution_binding_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("execution_bindings.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    previous_outcome: Mapped[str] = mapped_column(String, nullable=False)
+    new_outcome: Mapped[str] = mapped_column(String, nullable=False)
+    previous_failure_reason: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    previous_failure_summary: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    corrected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
