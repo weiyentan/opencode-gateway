@@ -398,8 +398,13 @@ async def test_watcher_dispatcher_read_gate(db_pool: asyncpg.Pool) -> None:
 
     client = _build_app(db_pool)
     awx_job_id = int(uuid.uuid4().int >> 96)
+    resource_number = str(int(uuid.uuid4().int >> 96))
 
-    payload = _make_binding_payload(awx_job_id=awx_job_id, afk_run_id=run_id)
+    payload = _make_binding_payload(
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=resource_number,
+    )
 
     async with client as c:
         resp = await c.post("/api/v1/afk/executions", json=payload)
