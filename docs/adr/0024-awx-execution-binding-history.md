@@ -53,9 +53,16 @@ key, or hash to source control or documentation.
 **Failure behavior.** Missing, malformed, empty, invalid, revoked, and
 inactive credentials are rejected with `401 UNAUTHORIZED`, using the
 same error codes and messages as the existing `/ingest`
-collector-token path. Read endpoints (`GET /api/v1/afk/executions`
-and `GET /api/v1/afk/executions/{awx_job_id}`) remain protected by the
-global `ApiKeyMiddleware` boundary alone and accept the Admin API Key.
+collector-token path. The resource-history read
+(`GET /api/v1/afk/executions`) remains protected by the global
+`ApiKeyMiddleware` boundary alone and accepts the Admin API Key. The
+single-binding read (`GET /api/v1/afk/executions/{awx_job_id}`)
+additionally requires a collector credential attributable to the
+dedicated `watcher-dispatcher` client (`WATCHER_DISPATCHER_CLIENT_NAME`,
+issue #661) — the AFK watcher dispatcher resolves an open run's AWX
+execution binding by job identity through this endpoint with its own
+dedicated credential. A valid credential owned by any other client is
+rejected with `403 FORBIDDEN`, so pipeline credentials are never shared.
 
 **Secrets handling.** Only the SHA-256 `token_hash` is ever persisted
 in `collector_credentials`. Raw bearer tokens are never persisted,
