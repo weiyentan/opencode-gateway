@@ -20,7 +20,10 @@ Execution-binding endpoints (``/api/v1/afk/executions``):
 - ``GET /executions/{awx_job_id}`` — return one binding by AWX job ID, or 404.
 - ``GET /executions``    — list bindings filtered by provider, repository URL,
   entity type, and entity number.  Full history including failed attempts and
-  later successful retries in deterministic order.
+   later successful retries in deterministic order.
+- ``GET /runs/{afk_run_id}`` — return the full execution-attempt history for a
+  known AFK lifecycle.  The response is a Gateway envelope whose ``data`` is
+  always a list ordered oldest-first; unknown lifecycle IDs return 404.
 
 Provisional AFK run lifecycle endpoints (mounted on this router as
 ``/runs`` — i.e. ``/api/v1/afk/executions/runs``, issue #589):
@@ -962,12 +965,21 @@ async def get_execution_bindings_for_run(
     Read-only: queries the durable execution bindings and issues no writes.
     Many bindings can reference one ``afk_run_id`` (a failed attempt and a
     later successful retry with a new ``awx_job_id`` — issue #595), returned
-    in deterministic order (earliest first).  A provisioned run that has no
-    execution yet reads back as an empty list (``200``), never a 404.
+    in deterministic order (earliest first).  The Gateway envelope always
+    contains a list in ``data``.  A known provisioned run that has no
+    execution yet reads back as an empty list (``200``); an unknown lifecycle
+    ID returns ``404``.  Watchers must resolve the current attempt from this
+    history rather than implicitly selecting the first item.
     """
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
         repo = AsyncpgOutcomeRepository(conn)
+        lifecycle = await repo.get_afk_run_lifecycle(afk_run_id)
+        if lifecycle is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"AFK run not found: {afk_run_id}",
+            )
         async with timed_operation("db.query.execution_bindings.by_afk_run_id", "db"):
             async with _db_timeout(
                 "db.query.execution_bindings.by_afk_run_id",
