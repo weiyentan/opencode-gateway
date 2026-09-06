@@ -163,6 +163,27 @@ def _auth_row() -> MagicMock:
     )
 
 
+def _watcher_auth_row() -> MagicMock:
+    """Return a mock row that passes require_collector_token (read gate).
+
+    The single-binding read (``GET /executions/{awx_job_id}``) requires a
+    collector credential of the dedicated watcher-dispatcher client
+    (issue #661).
+    """
+    from app.api.afk_executions import WATCHER_DISPATCHER_CLIENT_NAME
+
+    return mock_row(
+        {
+            "credential_id": _CREDENTIAL_ID,
+            "revoked_at": None,
+            "last_used_at": None,
+            "client_id": _CLIENT_ID,
+            "client_name": WATCHER_DISPATCHER_CLIENT_NAME,
+            "client_is_active": True,
+        }
+    )
+
+
 def _mk_conn() -> AsyncMock:
     """Build a mock asyncpg connection with transaction support."""
     conn = AsyncMock()
@@ -710,8 +731,12 @@ class TestExecutionBindingApiMultiplicity:
             "/api/v1/afk/executions", json=payload
         )
         assert resp.status_code == 422, resp.text
-        # The stored binding (with its afk_run_id) is still readable.
-        conn.fetchrow = AsyncMock(side_effect=[existing])
+        # The stored binding (with its afk_run_id) is still readable — the
+        # single-binding read requires the watcher-dispatcher credential
+        # (issue #661), distinct from the write path's AWX client.
+        conn.fetchrow = AsyncMock(
+            side_effect=[_watcher_auth_row(), existing]
+        )
         readback = await client.get("/api/v1/afk/executions/42")
         assert readback.status_code == 200, readback.text
         assert readback.json()["data"]["afk_run_id"] == _RUN_ID

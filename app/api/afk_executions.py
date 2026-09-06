@@ -47,6 +47,14 @@ attributable to the dedicated AWX execution-binding integration client
 (``AWX_EXECUTION_BINDING_CLIENT_NAME``), never the usage collector
 (``opencode-collector``) or any other client (issue #550).
 
+The single-binding read path (``GET /executions/{awx_job_id}``) additionally
+requires a collector credential attributable to the dedicated
+watcher-dispatcher client (``WATCHER_DISPATCHER_CLIENT_NAME``, issue #661):
+the AFK watcher dispatcher reads an open run's AWX execution binding by job
+identity through this endpoint with its own dedicated credential.  The
+resource-history read (``GET /executions``) and the change-request lookup
+(``GET /runs/by-change-request``) remain API-key-only.
+
 Write semantics (ADR 0024; issue #589):
 
 * **Idempotent by AWX job identity** — repeating an identical POST is a no-op
@@ -108,6 +116,14 @@ router = APIRouter(tags=["afk-executions"])
 # treat the Admin API Key alone as sufficient.
 AWX_EXECUTION_BINDING_CLIENT_NAME = "awx-execution-bindings"
 
+# The watcher dispatcher is a read-only consumer that resolves an AWX job to
+# its execution binding by ``awx_job_id`` while an AFK run is still open
+# (issue #661).  It reads through the existing exact binding read API with a
+# dedicated collector credential of this client — never the AWX
+# execution-binding write credential, the usage collector
+# (``opencode-collector``), or the Admin API Key alone.
+WATCHER_DISPATCHER_CLIENT_NAME = "watcher-dispatcher"
+
 # ── Valid enum filter values (locked domain vocabulary) ──────────────────────
 
 _VALID_PROVIDERS = frozenset(m.value for m in Provider)
@@ -139,6 +155,35 @@ async def require_awx_execution_binding_credential(
             detail=(
                 "Credential is not attributable to the dedicated AWX "
                 "execution-binding integration client"
+            ),
+        )
+    return auth
+
+
+async def require_watcher_dispatcher_credential(
+    auth: dict[str, str] = Depends(require_collector_token),
+) -> dict[str, str]:
+    """Collector-token gate for the watcher-dispatcher execution-binding read.
+
+    Composes the existing ``require_collector_token`` dependency — missing,
+    malformed, empty, invalid, revoked, and inactive credentials are
+    rejected with the same 401 behavior and error codes as ``/ingest`` —
+    with a client-attribution check: the credential must belong to the
+    dedicated watcher-dispatcher client (``WATCHER_DISPATCHER_CLIENT_NAME``).
+    A valid credential owned by any other client (e.g. the usage collector
+    ``opencode-collector`` or the AWX execution-binding write client) is
+    rejected with 403, so the watcher-dispatcher read never reuses another
+    pipeline's credential (issue #661).
+
+    Only the SHA-256 token hash is ever inspected; the raw bearer token is
+    never persisted, returned, or logged.
+    """
+    if auth["client_name"] != WATCHER_DISPATCHER_CLIENT_NAME:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Credential is not attributable to the dedicated "
+                "watcher-dispatcher client"
             ),
         )
     return auth
@@ -566,9 +611,17 @@ async def update_execution_binding(
 async def get_execution_binding(
     request: Request,
     awx_job_id: str,
+    auth: dict = Depends(require_watcher_dispatcher_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
     """Return one execution binding by AWX job ID, or 404 when not found.
+
+    Requires the Admin API Key (``ApiKeyMiddleware``) **and** a collector
+    credential attributable to the dedicated watcher-dispatcher client
+    (issue #661) — the AFK watcher dispatcher resolves an open run's AWX job
+    to its execution binding through this endpoint with its own dedicated
+    credential.  Other consumers (Aurora Glass, operator tooling) that only
+    need the resource-history read continue to use ``GET /executions``.
 
     A non-numeric ``awx_job_id`` is rejected with 400 before any database
     access (the path schema accepts arbitrary strings).
