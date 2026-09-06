@@ -13,8 +13,10 @@ identities, the failed-to-successful retry flow, and the redaction guarantee
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock  # noqa: F811
 
 import pytest
@@ -2535,3 +2537,125 @@ class TestRunDetailSessionLinks:
         data = resp.json()["data"]
         assert data["sessions"] == []
         assert data["usage"]["session_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/{afk_run_id} — run-scoped binding read
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGetExecutionBindingsForRun:
+    """GET /api/v1/afk/executions/runs/{afk_run_id} — run-scoped binding read."""
+
+    @staticmethod
+    def _lifecycle_row() -> MagicMock:
+        return mock_row(
+            {
+                "afk_run_id": _RUN_ULID,
+                "provider": "github",
+                "status": "pending",
+                "host": "gateway.example",
+                "source_event_id": "evt_001",
+                "repository": "github.com/acme/proj",
+                "trigger_type": "eda",
+                "title": "Example",
+                "change_request_provider": None,
+                "change_request_repository": None,
+                "change_request_external_id": None,
+                "recovered_from_afk_run_id": None,
+                "first_seen_at": _A_TS,
+                "last_seen_at": _A_TS,
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_for_run(self) -> None:
+        """Return every execution binding attached to the AFK run, in order."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        rows = [
+            _mk_binding_row(awx_job_id=10, outcome="failed", afk_run_id=_RUN_ULID),
+            _mk_binding_row(
+                awx_job_id=20, outcome="completed", afk_run_id=_RUN_ULID
+            ),
+        ]
+        conn.fetchrow = AsyncMock(return_value=self._lifecycle_row())
+        conn.fetch = AsyncMock(return_value=rows)
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        bindings = data["data"]
+        assert len(bindings) == 2
+        assert bindings[0]["awx_job"]["job_id"] == "10"
+        assert bindings[0]["outcome"] == "failed"
+        assert bindings[1]["awx_job"]["job_id"] == "20"
+        assert bindings[1]["outcome"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_response_matches_canonical_gateway_fixture_shape(self) -> None:
+        """The run endpoint keeps the cross-repository envelope contract."""
+        from tests.conftest import create_client
+
+        fixture = json.loads(
+            (
+                Path(__file__).parent
+                / "fixtures"
+                / "afk_execution_bindings_by_run.json"
+            ).read_text(encoding="utf-8")
+        )
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=self._lifecycle_row())
+        conn.fetch = AsyncMock(
+            return_value=[
+                _mk_binding_row(
+                    awx_job_id=int(fixture["data"][0]["awx_job"]["job_id"]),
+                    outcome=fixture["data"][0]["outcome"],
+                    afk_run_id=fixture["data"][0]["afk_run_id"],
+                )
+            ]
+        )
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        body = resp.json()
+        assert body["status"] == fixture["status"]
+        assert isinstance(body["data"], list)
+        assert body["data"][0]["awx_job"]["job_id"] == fixture["data"][0]["awx_job"]["job_id"]
+        assert body["data"][0]["outcome"] == fixture["data"][0]["outcome"]
+        assert body["data"][0]["afk_run_id"] == fixture["data"][0]["afk_run_id"]
+
+    @pytest.mark.asyncio
+    async def test_list_bindings_for_run_empty(self) -> None:
+        """A run with no execution bindings reads back as an empty list."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=self._lifecycle_row())
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_run_returns_404(self) -> None:
+        """An unknown lifecycle ID is not confused with eventual consistency."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=None)
+        client = create_client(conn)
+
+        resp = await client.get(f"/api/v1/afk/executions/runs/{_RUN_ULID}")
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["status"] == "error"
+        assert "AFK run not found" in data["error"]["message"]
+        conn.fetch.assert_not_called()

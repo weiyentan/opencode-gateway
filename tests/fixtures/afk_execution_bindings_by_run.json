@@ -1,0 +1,13 @@
+{
+  "status": "ok",
+  "data": [
+    {
+      "awx_job": {
+        "job_id": "98765"
+      },
+      "outcome": "running",
+      "afk_run_id": "01XXXXXXXXXXXX"
+    }
+  ],
+  "error": null
+}

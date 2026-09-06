@@ -2881,6 +2881,33 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
         )
         return [_row_to_execution_binding(row) for row in rows]
 
+    async def list_execution_bindings_by_afk_run_id(
+        self, afk_run_id: str
+    ) -> list[ExecutionBinding]:
+        """Return every execution binding attached to one AFK run lifecycle.
+
+        Many execution bindings can reference one ``afk_run_id`` (a failed
+        attempt and a later retry with a new ``awx_job_id`` — issue #595).
+        Ordered deterministically by ``created_at ASC, id ASC`` (earliest
+        first, with ``id`` as a tie-breaker for same-timestamp rows),
+        mirroring :meth:`list_execution_bindings_for_resource`.  A run with
+        no bindings reads back as an empty list.
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, failure_summary,
+                   started_at, finished_at, afk_run_id, trigger_type,
+                   external_session_ids AS external_session_ids_json
+            FROM execution_bindings
+            WHERE afk_run_id = $1
+            ORDER BY created_at ASC, id ASC
+            """,
+            afk_run_id,
+        )
+        return [_row_to_execution_binding(row) for row in rows]
+
     # ── provisional AFK run lifecycle (issue #589) ──────────────────────
 
     @staticmethod
