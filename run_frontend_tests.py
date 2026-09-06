@@ -7,8 +7,9 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 tests = [
     'frontend/tests/test_pure_functions.js',
-    'frontend/tests/issue_577_tests.js',
     'frontend/tests/test_change_request_list.js',
+    'frontend/tests/test_change_request_adapters.js',
+    'frontend/tests/issue_614_tests.js',
 ]
 
 all_pass = True
