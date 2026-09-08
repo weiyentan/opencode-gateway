@@ -17,6 +17,11 @@ database-enforced guarantees of ``/api/v1/afk/executions``:
 * Issue #626: every POST payload references a pre-provisioned ``afk_run_id``
   (the legacy auto-provision path is closed) — each test seeds its run via
   ``_seed_afk_run`` and passes it to ``_make_binding_payload``
+* Issue #661: the single-binding read (``GET /executions/{awx_job_id}``)
+  requires the Admin API Key AND a collector credential of the dedicated
+  ``watcher-dispatcher`` client — exercised by
+  ``test_watcher_dispatcher_read_gate`` (200 for the watcher credential,
+  403 for another pipeline's credential, 401 when absent)
 
 Prerequisites
 -------------
@@ -58,6 +63,19 @@ _API_KEY = "test-api-key"
 # The dedicated AWX execution-binding client name — matches the constant in
 # app.api.afk_executions (issue #550).
 _AWX_CLIENT_NAME = "awx-execution-bindings"
+
+# The dedicated watcher-dispatcher client name — matches the constant in
+# app.api.afk_executions (issue #661).  The single-binding read
+# (``GET /executions/{awx_job_id}``) requires a collector credential of this
+# client, distinct from the AWX execution-binding write credential.
+_WATCHER_CLIENT_NAME = "watcher-dispatcher"
+
+# The watcher dispatcher's dedicated bearer token.  Distinct from ``_API_KEY``
+# because the collector-credential lookup is keyed on the token hash and must
+# resolve to the watcher client (never the AWX write client) on read
+# requests.  Sent on the dedicated ``X-Collector-Token`` header while the
+# Admin API Key rides ``Authorization``.
+_WATCHER_BEARER = "watcher-dispatcher-bearer-token"
 
 
 def _dsn() -> str:
@@ -190,6 +208,34 @@ async def _seed_awx_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UU
     return client_id, credential_id
 
 
+async def _seed_watcher_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
+    """Seed the dedicated watcher-dispatcher client + collector credential.
+
+    Returns (client_id, credential_id).  The credential hash matches the
+    ``_WATCHER_BEARER`` token (never ``_API_KEY``), so a GET carrying the
+    Admin API Key on ``Authorization`` and the watcher token on
+    ``X-Collector-Token`` resolves to this client at the collector layer.
+    Idempotent like ``_seed_awx_client``.
+    """
+    client_id = await conn.fetchval(
+        "INSERT INTO opencode_clients (name) VALUES ($1)"
+        " ON CONFLICT (name) DO NOTHING RETURNING id",
+        _WATCHER_CLIENT_NAME,
+    )
+    if client_id is None:
+        client_id = await conn.fetchval(
+            "SELECT id FROM opencode_clients WHERE name = $1", _WATCHER_CLIENT_NAME
+        )
+    credential_id = await conn.fetchval(
+        "INSERT INTO collector_credentials (client_id, token_hash, token_prefix)"
+        " VALUES ($1, $2, $3) RETURNING id",
+        client_id,
+        hash_token(_WATCHER_BEARER),
+        "watch-t",
+    )
+    return client_id, credential_id
+
+
 def _build_app(db_pool: asyncpg.Pool) -> object:
     """Build a FastAPI app connected to the real integration DB pool.
 
@@ -287,6 +333,7 @@ async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
     """Authenticated POST persists a binding; GET by awx_job_id returns it."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_watcher_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
 
     client = _build_app(db_pool)
@@ -305,8 +352,14 @@ async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
         assert binding["outcome"] == "completed"
         assert binding["resource"]["resource_type"] == "change_request"
 
-        # GET by awx_job_id
-        resp2 = await c.get(f"/api/v1/afk/executions/{awx_job_id}")
+        # GET by awx_job_id — the single-binding read requires the dedicated
+        # watcher-dispatcher collector credential (issue #661), sent on the
+        # dedicated X-Collector-Token header while the Admin API Key rides
+        # Authorization.
+        resp2 = await c.get(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            headers={"X-Collector-Token": _WATCHER_BEARER},
+        )
         assert resp2.status_code == 200, resp2.text
         data2 = resp2.json()["data"]
         assert data2["awx_job"]["job_id"] == str(awx_job_id)
@@ -323,6 +376,62 @@ async def test_post_and_get_by_awx_job_id(db_pool: asyncpg.Pool) -> None:
         assert row["outcome"] == "completed"
         assert row["provider"] == "github"
         assert row["entity_type"] == "change_request"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio(loop_scope="module")
+async def test_watcher_dispatcher_read_gate(db_pool: asyncpg.Pool) -> None:
+    """The single-binding read enforces the dedicated watcher credential.
+
+    ``GET /executions/{awx_job_id}`` requires the Admin API Key AND a
+    collector credential of the ``watcher-dispatcher`` client (issue #661):
+
+    * the dedicated watcher credential (on ``X-Collector-Token``) succeeds;
+    * a valid credential of the AWX execution-binding write client is
+      rejected with 403 (pipelines never share credentials);
+    * no collector credential is rejected with 401.
+    """
+    async with db_pool.acquire() as conn:
+        await _seed_awx_client(conn)
+        await _seed_watcher_client(conn)
+        await _seed_afk_run(conn, run_id := _new_afk_run_id())
+
+    client = _build_app(db_pool)
+    awx_job_id = int(uuid.uuid4().int >> 96)
+    resource_number = str(int(uuid.uuid4().int >> 96))
+
+    payload = _make_binding_payload(
+        awx_job_id=awx_job_id,
+        afk_run_id=run_id,
+        resource_number=resource_number,
+    )
+
+    async with client as c:
+        resp = await c.post("/api/v1/afk/executions", json=payload)
+        assert resp.status_code == 201, resp.text
+
+        # Dedicated watcher-dispatcher credential → 200.
+        resp_ok = await c.get(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            headers={"X-Collector-Token": _WATCHER_BEARER},
+        )
+        assert resp_ok.status_code == 200, resp_ok.text
+        assert resp_ok.json()["data"]["awx_job"]["job_id"] == str(awx_job_id)
+
+        # The AWX execution-binding write credential (the API key hash) is a
+        # valid collector credential of the WRONG client → 403.
+        resp_wrong = await c.get(f"/api/v1/afk/executions/{awx_job_id}")
+        assert resp_wrong.status_code == 403, resp_wrong.text
+        data = resp_wrong.json()
+        assert data["status"] == "error"
+        assert data["error"]["code"] == "FORBIDDEN"
+
+        # No collector credential at all → 401 from the collector layer.
+        resp_none = await c.get(
+            f"/api/v1/afk/executions/{awx_job_id}",
+            headers={"X-Collector-Token": ""},
+        )
+        assert resp_none.status_code == 401, resp_none.text
 
 
 @pytest.mark.integration
@@ -682,12 +791,15 @@ async def test_no_sensitive_data_in_stored_or_returned_data(
 async def test_get_nonexistent_returns_404(db_pool: asyncpg.Pool) -> None:
     """GET for non-existent AWX job ID returns 404."""
     async with db_pool.acquire() as conn:
-        await _seed_awx_client(conn)
+        await _seed_watcher_client(conn)
 
     client = _build_app(db_pool)
 
     async with client as c:
-        resp = await c.get("/api/v1/afk/executions/999999999")
+        resp = await c.get(
+            "/api/v1/afk/executions/999999999",
+            headers={"X-Collector-Token": _WATCHER_BEARER},
+        )
         assert resp.status_code == 404, resp.text
         data = resp.json()
         assert data["status"] == "error"
@@ -728,12 +840,15 @@ async def test_read_requires_api_key(db_pool: asyncpg.Pool) -> None:
 async def test_get_nonexistent_binding_returns_404(db_pool: asyncpg.Pool) -> None:
     """GET for non-existent AWX job ID returns 404."""
     async with db_pool.acquire() as conn:
-        await _seed_awx_client(conn)
+        await _seed_watcher_client(conn)
 
     client = _build_app(db_pool)
 
     async with client as c:
-        resp = await c.get("/api/v1/afk/executions/999999999")
+        resp = await c.get(
+            "/api/v1/afk/executions/999999999",
+            headers={"X-Collector-Token": _WATCHER_BEARER},
+        )
         assert resp.status_code == 404
         data = resp.json()
         assert data["status"] == "error"

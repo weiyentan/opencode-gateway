@@ -90,6 +90,13 @@ _API_KEY = "test-api-key"
 # app.api.afk_executions (issue #550).
 _AWX_CLIENT_NAME = "awx-execution-bindings"
 
+# The dedicated watcher-dispatcher client name — matches the constant in
+# app.api.afk_executions (issue #661).  The single-binding read
+# (GET /executions/{awx_job_id}) requires a collector credential attributable
+# to this client.
+_WATCHER_CLIENT_NAME = "watcher-dispatcher"
+_WATCHER_BEARER = "watcher-dispatcher-bearer-token"
+
 _RUNS_PATH = "/api/v1/afk/executions/runs"
 _EXECUTIONS_PATH = "/api/v1/afk/executions"
 
@@ -220,6 +227,32 @@ async def _seed_awx_client(conn: asyncpg.Connection) -> None:
         client_id,
         hash_token(_API_KEY),
         "test-api",
+    )
+
+
+async def _seed_watcher_client(conn: asyncpg.Connection) -> None:
+    """Seed the dedicated watcher-dispatcher client + collector credential.
+
+    The single-binding read (``GET /executions/{awx_job_id}``) requires a
+    collector credential attributable to the watcher-dispatcher client
+    (issue #661).  Idempotent — ``opencode_clients.name`` carries a UNIQUE
+    constraint, so re-seeding the same module-scoped database reuses the row.
+    """
+    client_id = await conn.fetchval(
+        "INSERT INTO opencode_clients (name) VALUES ($1)"
+        " ON CONFLICT (name) DO NOTHING RETURNING id",
+        _WATCHER_CLIENT_NAME,
+    )
+    if client_id is None:
+        client_id = await conn.fetchval(
+            "SELECT id FROM opencode_clients WHERE name = $1", _WATCHER_CLIENT_NAME
+        )
+    await conn.execute(
+        "INSERT INTO collector_credentials (client_id, token_hash, token_prefix)"
+        " VALUES ($1, $2, $3) RETURNING id",
+        client_id,
+        hash_token(_WATCHER_BEARER),
+        "watch-t",
     )
 
 
@@ -510,6 +543,7 @@ async def test_develop_review_fix_share_one_afk_run_id_no_false_409(
     """
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
+        await _seed_watcher_client(conn)
 
     client = _build_app(db_pool)
     async with client as c:
@@ -569,9 +603,13 @@ async def test_develop_review_fix_share_one_afk_run_id_no_false_409(
         )
 
         # All three jobs are independently queryable by AWX job id under the
-        # same afk_run_id.
+        # same afk_run_id.  The single-binding read requires the dedicated
+        # watcher-dispatcher collector credential (issue #661).
         for job_id in (9260, 9261, 9262):
-            single = await c.get(f"{_EXECUTIONS_PATH}/{job_id}")
+            single = await c.get(
+                f"{_EXECUTIONS_PATH}/{job_id}",
+                headers={"X-Collector-Token": _WATCHER_BEARER},
+            )
             assert single.status_code == 200, single.text
             assert single.json()["data"]["afk_run_id"] == run_id
             assert single.json()["data"]["outcome"] == "completed"
