@@ -102,6 +102,36 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
 var agentUsageTbodyEl = makeFakeElement('agent-usage-tbody');
 elementRegistry['agent-usage-tbody'] = agentUsageTbodyEl;
 
+// Token Usage KPI card fakes (issue #658): the headline value, the category
+// breakdown span, and the date-range subtitle span of the .kpi-tokens card,
+// plus the sibling KPI cards renderKPIs paints (Est. Cost, Sessions, Healthy
+// Collectors, Source Databases).  Registered before loadRealAppJs so app.js
+// captures the refs in els; renderKPIs targets these elements on every
+// refresh cycle (the freshness spans stay unregistered — applyPanelFreshness
+// no-ops when #freshness-* is missing).
+var kpiTokensEl = makeFakeElement('kpi-tokens');
+var kpiTokensBreakdownEl = makeFakeElement('kpi-tokens-breakdown');
+var kpiTokensDetailEl = makeFakeElement('kpi-tokens-detail');
+var kpiCostEl = makeFakeElement('kpi-cost');
+var kpiCostDetailEl = makeFakeElement('kpi-cost-detail');
+var kpiSessionsEl = makeFakeElement('kpi-sessions');
+var kpiSessionsDetailEl = makeFakeElement('kpi-sessions-detail');
+var kpiCollectorsEl = makeFakeElement('kpi-collectors');
+var kpiCollectorsDetailEl = makeFakeElement('kpi-collectors-detail');
+var kpiSourceDbsEl = makeFakeElement('kpi-source-dbs');
+var kpiSourceDbsDetailEl = makeFakeElement('kpi-source-dbs-detail');
+elementRegistry['kpi-tokens'] = kpiTokensEl;
+elementRegistry['kpi-tokens-breakdown'] = kpiTokensBreakdownEl;
+elementRegistry['kpi-tokens-detail'] = kpiTokensDetailEl;
+elementRegistry['kpi-cost'] = kpiCostEl;
+elementRegistry['kpi-cost-detail'] = kpiCostDetailEl;
+elementRegistry['kpi-sessions'] = kpiSessionsEl;
+elementRegistry['kpi-sessions-detail'] = kpiSessionsDetailEl;
+elementRegistry['kpi-collectors'] = kpiCollectorsEl;
+elementRegistry['kpi-collectors-detail'] = kpiCollectorsDetailEl;
+elementRegistry['kpi-source-dbs'] = kpiSourceDbsEl;
+elementRegistry['kpi-source-dbs-detail'] = kpiSourceDbsDetailEl;
+
 // Agent Runs pagination container fake (issue #427): renderAgentRunPagination
 // writes the Previous/Next + numbered-page markup into this element and wires
 // the buttons through querySelectorAll('button') — so the fake parses the
@@ -286,6 +316,11 @@ var historyStub = {
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
   window.formatAgentRunTimestamp = sandboxWindow.formatAgentRunTimestamp;
+  // Issue #658: the Token Usage KPI breakdown builder (pure) and the KPI-row
+  // renderer join the window test seam so the breakdown rendering is
+  // exercised against the REAL production code.
+  window.fmtKpiTokenBreakdown = sandboxWindow.fmtKpiTokenBreakdown;
+  window.renderKPIs = sandboxWindow.renderKPIs;
   // Issue #557: provider badge/missing-label, cache hit ratio, and the
   // Token Breakdown detail-section builder join the window test seam.
   window.fmtProvider = sandboxWindow.fmtProvider;
@@ -1729,7 +1764,7 @@ console.log('\u25B6 header last-refreshed clock (issue #357)');
 })();
 
 // ── KPI subtitle split (issue #358) ─────────────────────────────────────
-// Historical KPIs (Active Tokens, Est. Cost, Sessions) keep the selected
+// Historical KPIs (Token Usage, Est. Cost, Sessions) keep the selected
 // date range as their subtitle — they are date-range aggregates.  Current-
 // health KPIs (Healthy Collectors, Source Databases) are live snapshots:
 // they show "As of HH:MM:SS" from the last completed refresh (issue #357's
@@ -2246,13 +2281,14 @@ console.log('\u25B6 index.html markup (smoke check)');
   assert(html.indexOf('id="event-badge"') !== -1, 'events panel: #event-badge element still present');
   assert(html.indexOf('Waiting for events&hellip;') !== -1, 'events panel: empty-state text unchanged');
 
-  // Token vocabulary (issue #354): the KPI card label and the Client / Project
-  // Usage Breakdown tokens column header read "Active Tokens"; the legacy
+  // Token vocabulary (issue #354, #657): the KPI card label and the Client /
+  // Project Usage Breakdown tokens column header read "Token Usage" (the
+  // former "Active Tokens" label, input + output); the legacy
   // "Total Tokens" label is gone from the markup entirely.
-  assert(html.indexOf('<span class="kpi-label">Active Tokens</span>') !== -1,
-    'KPI card: label reads "Active Tokens"');
-  assert(html.indexOf('<th>Active Tokens</th>') !== -1,
-    'Client / Project Usage Breakdown: tokens column header reads "Active Tokens"');
+  assert(html.indexOf('<span class="kpi-label">Token Usage</span>') !== -1,
+    'KPI card: label reads "Token Usage"');
+  assert(html.indexOf('<th>Token Usage</th>') !== -1,
+    'Client / Project Usage Breakdown: tokens column header reads "Token Usage"');
   assert(html.indexOf('Total Tokens') === -1, 'index.html: no "Total Tokens" label remains');
 
   // KPI subtitle spans (issue #358): all five KPI cards carry a .kpi-sub
@@ -2263,6 +2299,20 @@ console.log('\u25B6 index.html markup (smoke check)');
       assert(html.indexOf('id="' + kpiId + '-detail"') !== -1,
         'KPI card: subtitle span #' + kpiId + '-detail exists in the markup');
     });
+
+  // Token Usage KPI breakdown (issue #658): the .kpi-tokens card carries a
+  // dedicated breakdown span (#kpi-tokens-breakdown) between the headline
+  // value and the date-range subtitle, inside the same .kpi-tokens card.
+  var kpiTokensCardHtml = html.slice(html.indexOf('kpi-card kpi-tokens'),
+                                     html.indexOf('kpi-card kpi-cost'));
+  assert(kpiTokensCardHtml.indexOf('id="kpi-tokens-breakdown"') !== -1 &&
+         kpiTokensCardHtml.indexOf('class="kpi-breakdown"') !== -1,
+    'index.html: the Token Usage KPI card carries a .kpi-breakdown span (#kpi-tokens-breakdown)');
+  assert(kpiTokensCardHtml.indexOf('id="kpi-tokens"') <
+         kpiTokensCardHtml.indexOf('id="kpi-tokens-breakdown"') &&
+         kpiTokensCardHtml.indexOf('id="kpi-tokens-breakdown"') <
+         kpiTokensCardHtml.indexOf('id="kpi-tokens-detail"'),
+    'index.html: breakdown span sits between the #kpi-tokens headline and the #kpi-tokens-detail subtitle');
 
   // Freshness indicators (issue #357): the header carries a labeled
   // "Last refreshed" clock, and each instrumented panel carries a
@@ -2370,6 +2420,12 @@ console.log('\u25B6 style.css responsive + reduced-motion (static verification)'
   assert(live.indexOf('.freshness-refreshing') !== -1, 'style.css: .freshness-refreshing state rule exists');
   assert(live.indexOf('.freshness-stale') !== -1, 'style.css: .freshness-stale state rule exists');
   assert(live.indexOf('.last-refreshed') !== -1, 'style.css: .last-refreshed header clock rule exists');
+
+  // Token Usage KPI breakdown (issue #658): the breakdown span shares the
+  // muted .kpi-sub scale so the category lines sit under the headline
+  // without competing with it; a base .kpi-breakdown rule exists in live CSS.
+  assert(live.indexOf('.kpi-breakdown') !== -1,
+    'style.css: .kpi-breakdown base rule exists');
 })();
 
 // ── Agent Runs date-filter control: markup + styling (issue #7) ─────────
@@ -2413,7 +2469,7 @@ console.log('\u25B6 index.html + style.css — Clear control + active state (iss
 // (1) the active Agent Runs tab fills the viewport — the panel becomes a
 // flex column and its .table-scroll owns the vertical scroll region, so a
 // long run list scrolls inside the panel instead of the page; (2) the
-// shared date-range bar and KPI row (aggregate totals — Active Tokens,
+// shared date-range bar and KPI row (aggregate totals — Token Usage,
 // Est. Cost, Sessions from the aggregates total row) sit ABOVE the tab
 // panels, so the aggregate totals render on the Agent Runs tab with the
 // dashboard date range applied.  The viewport-derived tab height is
@@ -3836,7 +3892,7 @@ console.log('\u25B6 Agent Usage — group_by=agent aggregate fetch wiring (issue
 // 'unknown' fallback for rows without a recorded agent) and the full
 // Token Breakdown contract fields — the four independent counters
 // (input/output/cacheRead/cacheWrite), the full total (total = input +
-// output + cache read + cache write, NOT Active Tokens), the estimated
+// output + cache read + cache write, NOT Token Usage), the estimated
 // cost, and the request count.  Rows order by total token usage
 // descending, agent name ascending as the tie-breaker (the Agent Usage
 // contract from CONTEXT.md).  Exercised through the vm-sandbox window seam
@@ -3851,7 +3907,7 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#
 
   // One row per observed agent; tokens = the FULL total per the Token
   // Breakdown contract (input + output + cache read + cache write).  These
-  // fixtures carry no cache fields, so the totals equal Active Tokens.
+  // fixtures carry no cache fields, so the totals equal Token Usage.
   var rows = window.buildAgentUsageRows([
     { agent: 'bob',    total_input_tokens: 1000, total_output_tokens: 500 },
     { agent: 'alice',  total_input_tokens: 3000, total_output_tokens: 2000 },
@@ -3883,7 +3939,7 @@ console.log('\u25B6 Agent Usage — dynamic agent rows + ordering (issues #438/#
   assert(enriched[0].cost === 1.25 && enriched[0].requests === 42,
     'row carries estimated cost (1.25) and request count (42, from record_count)');
 
-  // Issue #439: the sort key is the FULL total, not Active Tokens — cache
+  // Issue #439: the sort key is the FULL total, not Token Usage — cache
   // activity counts toward ordering, so an agent with large cache usage
   // outranks one with more active tokens but no cache.
   var cacheHeavy = window.buildAgentUsageRows([
@@ -4035,8 +4091,8 @@ console.log('\u25B6 Agent Usage — panel rendering + markup (issues #438/#439)'
          agentUsagePanelHtml.indexOf('<th>Est. Cost</th>') !== -1 &&
          agentUsagePanelHtml.indexOf('<th>Requests</th>') !== -1,
     'index.html: the Agent Usage header carries Agent / Token Breakdown / Est. Cost / Requests');
-  assert(agentUsagePanelHtml.indexOf('<th>Active Tokens</th>') === -1,
-    'index.html: the minimal #438 "Active Tokens" header is gone');
+  assert(agentUsagePanelHtml.indexOf('<th>Token Usage</th>') === -1,
+    'index.html: the minimal #438 "Token Usage" header is gone from the Agent Usage panel');
   assert(agentUsagePanelHtml.indexOf('<td colspan="4" class="empty-state">Loading') !== -1,
     'index.html: the Agent Usage loading row spans the 4 enriched columns');
   assert(html.indexOf('id="collectors-tbody"') < html.indexOf('panel-agent-usage'),
@@ -4165,6 +4221,150 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
     'index.html: the Agent Usage panel is the last panel in the Overview left column (bottom-left)');
   assert(colLeft.indexOf('panel-collectors') < colLeft.indexOf('panel-agent-usage'),
     'index.html: the Agent Usage panel sits below the Collectors panel');
+})();
+
+// ── Token Usage KPI category breakdown (issue #658) ─────────────────────
+// The Token Usage KPI card expands from a bare input+output headline into a
+// headline plus a visible four-category breakdown.  The headline stays
+// Token Usage (input + output — never cache read/write); the first
+// breakdown line shows input and output, the second shows cache read and
+// cache write, and ZERO-valued cache components stay visible (they render
+// as 0 — the KPI card is NOT the compact row Token Breakdown, which hides
+// a both-zero cache line).  Everything renders from the existing
+// date-filtered aggTotal row — no new fetch — reusing fmtNum for the
+// compact number formatting and fmtTokenBreakdownCompact's "in | out" and
+// "cache read + cache write" vocabulary.  The date-range subtitle and the
+// panel freshness behavior are unchanged (renderKPIs still paints the
+// subtitle into #kpi-tokens-detail and gates on shouldRenderPanel).
+// Exercised through the vm-sandbox window seam against the REAL production
+// helpers (fmtKpiTokenBreakdown + renderKPIs) and the fake KPI elements
+// registered above.
+
+console.log('\u25B6 Token Usage KPI — fmtKpiTokenBreakdown (issue #658)');
+
+(function () {
+  if (typeof window.fmtKpiTokenBreakdown !== 'function') {
+    assert(false, 'app.js: fmtKpiTokenBreakdown exposed on the window test seam');
+    return;
+  }
+
+  // Full four-category case: headline stays input+output (cache components
+  // are NEVER folded into the Token Usage headline).
+  var full = window.fmtKpiTokenBreakdown({ total_input_tokens: 38800, total_output_tokens: 5200,
+    total_cache_read_tokens: 23400, total_cache_write_tokens: 4200 });
+  assert(full.headline === fmtNum(38800 + 5200) && full.headline !== fmtNum(38800 + 5200 + 23400 + 4200),
+    'fmt: headline = Token Usage (input + output = 44.0K), never the cache-inclusive total');
+  assert(full.lines.indexOf('38.8K in | 5.2K out') !== -1,
+    'fmt: first breakdown line shows input and output ("38.8K in | 5.2K out")');
+  assert(full.lines.indexOf('23.4K cache read + 4.2K cache write') !== -1,
+    'fmt: second breakdown line shows cache read + cache write');
+  assert(full.lines.indexOf('total') === -1,
+    'fmt: the KPI card never shows the cache-inclusive "{total} total" line (headline already shows Token Usage)');
+
+  // Zero cache read (cache write alone on the second line, still visible)
+  var zeroRead = window.fmtKpiTokenBreakdown({ total_input_tokens: 10000, total_output_tokens: 5000,
+    total_cache_read_tokens: 0, total_cache_write_tokens: 3000 });
+  assert(zeroRead.headline === fmtNum(15000),
+    'fmt: zero cache read: headline still input + output (15.0K)');
+  assert(zeroRead.lines.indexOf('10.0K in | 5.0K out') !== -1 &&
+         zeroRead.lines.indexOf('0 cache read + 3.0K cache write') !== -1,
+    'fmt: zero cache read renders as "0 cache read" — the component stays visible (issue #658 zero rule)');
+
+  // Zero cache write (cache read alone, zero write visible)
+  var zeroWrite = window.fmtKpiTokenBreakdown({ total_input_tokens: 38800, total_output_tokens: 5200,
+    total_cache_read_tokens: 23400, total_cache_write_tokens: 0 });
+  assert(zeroWrite.headline === fmtNum(44000),
+    'fmt: zero cache write: headline still input + output (44.0K)');
+  assert(zeroWrite.lines.indexOf('38.8K in | 5.2K out') !== -1 &&
+         zeroWrite.lines.indexOf('23.4K cache read + 0 cache write') !== -1,
+    'fmt: zero cache write renders as "0 cache write" — both cache categories stay on the second line');
+
+  // BOTH cache categories zero: headline keeps input+output and the cache
+  // line renders "0 cache read + 0 cache write" (the #658 KPI card rule —
+  // zero cache components are always visible, unlike the compact row
+  // breakdown which omits a both-zero cache line entirely).
+  var bothZero = window.fmtKpiTokenBreakdown({ total_input_tokens: 1000, total_output_tokens: 500,
+    total_cache_read_tokens: 0, total_cache_write_tokens: 0 });
+  assert(bothZero.headline === fmtNum(1500),
+    'fmt: both cache zero: headline = Token Usage (1.5K)');
+  assert(bothZero.lines.indexOf('1.0K in | 500 out') !== -1 &&
+         bothZero.lines.indexOf('0 cache read + 0 cache write') !== -1,
+    'fmt: both cache zero render as "0 cache read + 0 cache write" (visible, not hidden)');
+
+  // Missing/null token fields default to 0 (numeric consistency)
+  var missing = window.fmtKpiTokenBreakdown({});
+  assert(missing.headline === '0', 'fmt: missing row → headline 0 (0 input + 0 output)');
+  assert(missing.lines.indexOf('0 in | 0 out') !== -1 &&
+         missing.lines.indexOf('0 cache read + 0 cache write') !== -1,
+    'fmt: missing row → "0 in | 0 out" + "0 cache read + 0 cache write"');
+
+  // Existing number formatting is used throughout (fmtNum compact numbers)
+  var fmt = window.fmtKpiTokenBreakdown({ total_input_tokens: 1000000, total_output_tokens: 500000,
+    total_cache_read_tokens: 2000000, total_cache_write_tokens: 100000 });
+  assert(fmt.headline === '1.5M',
+    'fmt: headline uses fmtNum compact formatting (1.0M in + 500.0K out → 1.5M)');
+  assert(fmt.lines.indexOf('1.0M in | 500.0K out') !== -1 &&
+         fmt.lines.indexOf('2.0M cache read + 100.0K cache write') !== -1,
+    'fmt: breakdown values use fmtNum compact formatting');
+})();
+
+console.log('\u25B6 Token Usage KPI — renderKPIs writes headline + breakdown + subtitle (issue #658)');
+
+(function () {
+  if (typeof window.renderKPIs !== 'function') {
+    assert(false, 'app.js: renderKPIs exposed on the window test seam');
+    return;
+  }
+  var appJsSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert(appJsSource.indexOf('kpi-tokens-breakdown') !== -1,
+    'app.js: the KPI renderer targets the #kpi-tokens-breakdown element (markup seam)');
+
+  // Non-zero cache categories: renderKPIs paints the headline, the two
+  // breakdown lines, and the date-range subtitle from the aggTotal row.
+  window.renderKPIs({
+    aggTotal: [
+      { total_input_tokens: 38800, total_output_tokens: 5200,
+        total_cache_read_tokens: 23400, total_cache_write_tokens: 4200,
+        total_estimated_cost_usd: 1.25, session_count: 9 }
+    ]
+  });
+  assert(kpiTokensEl.textContent === fmtNum(38800 + 5200),
+    'render: #kpi-tokens headline = input + output (44.0K)');
+  assert(kpiTokensBreakdownEl.innerHTML.indexOf('38.8K in | 5.2K out') !== -1 &&
+         kpiTokensBreakdownEl.innerHTML.indexOf('23.4K cache read + 4.2K cache write') !== -1,
+    'render: #kpi-tokens-breakdown shows both category lines');
+  assert(kpiTokensDetailEl.textContent === window.kpiSubtitle('kpi-tokens', '--', null),
+    'render: #kpi-tokens-detail keeps the date-range subtitle behavior unchanged');
+  assert(kpiCostEl.textContent === '$1.25',
+    'render: Est. Cost card still renders from the same aggTotal row (untouched)');
+
+  // Zero-valued cache components render as visible 0 (not hidden).
+  window.renderKPIs({
+    aggTotal: [
+      { total_input_tokens: 1000, total_output_tokens: 500,
+        total_cache_read_tokens: 0, total_cache_write_tokens: 0,
+        total_estimated_cost_usd: 0.005, session_count: 2 }
+    ]
+  });
+  assert(kpiTokensEl.textContent === fmtNum(1500),
+    'render: zero-cache headline = Token Usage (1.5K)');
+  assert(kpiTokensBreakdownEl.innerHTML.indexOf('1.0K in | 500 out') !== -1 &&
+         kpiTokensBreakdownEl.innerHTML.indexOf('0 cache read + 0 cache write') !== -1,
+    'render: zero cache components render as "0 cache read + 0 cache write" (visible, not hidden)');
+
+  // Date-range subtitle + freshness gate are preserved unchanged:
+  // renderKPIs still writes the subtitle into #kpi-tokens-detail and the
+  // content render is still gated on shouldRenderPanel('kpi-tokens').
+  assert(kpiTokensDetailEl.textContent === window.kpiSubtitle('kpi-tokens', '--', null),
+    'render: subtitle unchanged for the zero-cache render too');
+  var renderSrc = appJsSource.slice(appJsSource.indexOf('function renderKPIs'),
+                                    appJsSource.indexOf('function renderModelMix'));
+  assert(renderSrc.indexOf("els.kpiTokensDetail.textContent = kpiSubtitle('kpi-tokens'") !== -1,
+    'app.js: renderKPIs writes the date-range subtitle into #kpi-tokens-detail');
+  assert(renderSrc.indexOf("shouldRenderPanel(panelStates, 'kpi-tokens')") !== -1,
+    'app.js: renderKPIs still gates the Token Usage card on shouldRenderPanel (freshness unchanged)');
+  assert(renderSrc.indexOf("els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd)") !== -1,
+    'app.js: Est. Cost card still renders via fmtCost from the same aggTotal row');
 })();
 
 // ── AFK Outcomes view (issue #453) ──────────────────────────────────────
@@ -4383,7 +4583,7 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
   assert(html.indexOf('100%') !== -1, 'confidence is visible on reconstructed links');
   assert(html.indexOf('issue_reference') !== -1 && html.indexOf('change_request:442') !== -1,
     'evidence source identifiers are visible');
-  assert(html.indexOf('Active Tokens') !== -1, 'tokens/cost step shows the Active Tokens aggregate');
+  assert(html.indexOf('Token Usage') !== -1, 'tokens/cost step shows the Token Usage aggregate');
   assert(html.indexOf('data-step="commits"') !== -1 && html.indexOf('commit:abc1234') !== -1 &&
          html.indexOf('commit_issue_reference') !== -1,
     'commits step renders the commit links with correlation provenance');
@@ -4805,7 +5005,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitHub fixture chain detail');
   assert(html.indexOf('review:501') !== -1, 'GitHub: review entity id');
   assert(html.indexOf('merge_event:501') !== -1, 'GitHub: merge event entity id');
   assert(html.indexOf('code-editor-senior') !== -1, 'GitHub: agent identity');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitHub: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitHub: usage step Token Usage');
   assert(html.indexOf('data-step="issues"') !== -1, 'GitHub: issues step');
   assert(html.indexOf('data-step="run"') !== -1, 'GitHub: run step');
   assert(html.indexOf('data-step="sessions"') !== -1, 'GitHub: sessions step');
@@ -4828,7 +5028,7 @@ console.log('\u25B6 issue #577 \u2014 provenance: GitLab fixture chain detail');
   assert(html.indexOf('review:gl601') !== -1, 'GitLab: review entity id');
   assert(html.indexOf('merge_event:601') !== -1, 'GitLab: merge event entity id');
   assert(html.indexOf('resolves #501') !== -1, 'GitLab: evidence detail');
-  assert(html.indexOf('Active Tokens') !== -1, 'GitLab: usage step Active Tokens');
+  assert(html.indexOf('Token Usage') !== -1, 'GitLab: usage step Token Usage');
   // entity_id format confirms correct GitLab fixture loaded
   assert(html.indexOf('change_request:601') !== -1, 'GitLab: entity id confirms GitLab fixture');
 })();
@@ -5277,9 +5477,9 @@ console.log('\u25B6 issue #577 \u2014 cross-provider parity: GitHub vs GitLab fi
   assert(ghHtml.indexOf('resolver v2') !== -1, 'parity: GitHub resolver version');
   assert(glHtml.indexOf('resolver v2') !== -1, 'parity: GitLab resolver version');
 
-  // Both carry Active Tokens in usage step
-  assert(ghHtml.indexOf('Active Tokens') !== -1, 'parity: GitHub usage step');
-  assert(glHtml.indexOf('Active Tokens') !== -1, 'parity: GitLab usage step');
+  // Both carry Token Usage in usage step
+  assert(ghHtml.indexOf('Token Usage') !== -1, 'parity: GitHub usage step');
+  assert(glHtml.indexOf('Token Usage') !== -1, 'parity: GitLab usage step');
 
   // Provider-specific content present in respective fixtures
   assert(ghHtml.indexOf('weiyentan/opencode-gateway') !== -1, 'parity: GitHub repo name');

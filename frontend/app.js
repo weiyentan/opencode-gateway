@@ -42,6 +42,7 @@
 
     // KPIs
     kpiTokens:      $('kpi-tokens'),
+    kpiTokensBreakdown: $('kpi-tokens-breakdown'), // issue #658 — Token Usage category lines
     kpiTokensDetail:$('kpi-tokens-detail'),
     kpiCost:        $('kpi-cost'),
     kpiCostDetail:  $('kpi-cost-detail'),
@@ -675,6 +676,32 @@
    */
   function fmtAgentRunTokens(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) {
     return fmtTokenBreakdownCompact(inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens);
+  }
+
+  /** Build the Token Usage KPI card breakdown (issue #658).
+   *  The KPI headline stays Token Usage = input + output (cache read/write
+   *  are NEVER folded in).  Beneath the headline the card shows the four
+   *  aggregate categories on two lines:
+   *    {input} in | {output} out
+   *    {cr} cache read + {cw} cache write
+   *  Unlike the compact row Token Breakdown (fmtTokenBreakdownCompact,
+   *  which omits a both-zero cache line), the KPI card keeps zero-valued
+   *  cache components VISIBLE — they render as 0, per the PRD #656 rule.
+   *  Values use the shared fmtNum compact number formatting.
+   *  Pure — no DOM access — so the Node test harness exercises it through
+   *  the vm-sandbox exports.
+   *  @param {Object} row  aggregates-total row (data.aggTotal[0])
+   *  @returns {{headline: string, lines: string}} headline text + <br>-joined lines */
+  function fmtKpiTokenBreakdown(row) {
+    var input = (row && row.total_input_tokens) || 0;
+    var output = (row && row.total_output_tokens) || 0;
+    var cr = (row && row.total_cache_read_tokens) || 0;
+    var cw = (row && row.total_cache_write_tokens) || 0;
+    return {
+      headline: fmtNum(input + output), // Token Usage — cache never folded in
+      lines: fmtNum(input) + ' in | ' + fmtNum(output) + ' out<br>' +
+             fmtNum(cr) + ' cache read + ' + fmtNum(cw) + ' cache write'
+    };
   }
 
   /** Format a provider value for display (issue #557).
@@ -1337,7 +1364,7 @@
   // must not be presented as historical aggregates, so their subtitles
   // show "As of HH:MM:SS" instead of the date range.
   const KPI_TYPES = {
-    'kpi-tokens':     'historical', // Active Tokens — date-range aggregate
+    'kpi-tokens':     'historical', // Token Usage — date-range aggregate
     'kpi-cost':       'historical', // Est. Cost (USD) — date-range aggregate
     'kpi-sessions':   'historical', // Sessions — date-range aggregate
     'kpi-collectors': 'current',    // Healthy Collectors — live health snapshot
@@ -1797,7 +1824,7 @@
       rangeLabel = formatRangeLabel(data._dateRange.startDate, data._dateRange.endDate);
     }
 
-    // Set KPI subtitles: historical KPIs (Active Tokens, Est. Cost,
+    // Set KPI subtitles: historical KPIs (Token Usage, Est. Cost,
     // Sessions) show the selected date range; current-health KPIs
     // (Healthy Collectors, Source Databases) show "As of HH:MM:SS" from
     // the last completed refresh (or "Current" before any refresh) — a
@@ -1813,8 +1840,13 @@
     if (shouldRenderPanel(panelStates, 'kpi-tokens')) {
       if (data.aggTotal && data.aggTotal.length > 0) {
         var t = data.aggTotal[0];
-        var totalTokens = (t.total_input_tokens || 0) + (t.total_output_tokens || 0);
-        els.kpiTokens.textContent = fmtNum(totalTokens);
+        // Headline stays Token Usage = input + output (issue #658); the
+        // category breakdown (input/output on line 1, cache read/cache write
+        // on line 2 — zero cache components always visible) renders beneath
+        // the headline from the same already-fetched aggTotal row.
+        var kpiBreakdown = fmtKpiTokenBreakdown(t);
+        els.kpiTokens.textContent = kpiBreakdown.headline;
+        els.kpiTokensBreakdown.innerHTML = kpiBreakdown.lines;
         els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
       }
     }
@@ -3931,7 +3963,7 @@
       '</div>';
   }
 
-  /** Render the Tokens/Cost step from the run UsageAggregate.  Active Tokens
+  /** Render the Tokens/Cost step from the run UsageAggregate.  Token Usage
    *  = input + output (cache read/write are siblings, never folded in) and the
    *  cost renders via fmtCost — per the CONTEXT.md token vocabulary. */
   function renderAfkUsageStep(usage) {
@@ -3941,7 +3973,7 @@
         fmtTokenBreakdownCompact(usage.input_tokens, usage.output_tokens,
           usage.cache_read_tokens, usage.cache_write_tokens) +
       '</div>' +
-      '<div class="afk-usage-meta">Active Tokens: ' + fmtNum(usage.active_tokens) +
+      '<div class="afk-usage-meta">Token Usage: ' + fmtNum(usage.active_tokens) +
         ' &middot; Est. Cost: ' + fmtCost(usage.estimated_cost_usd) +
         ' &middot; ' + fmtNum(usage.session_count) + ' sessions &middot; ' +
         fmtNum(usage.message_count) + ' messages</div>' +
@@ -4139,7 +4171,7 @@
         fieldHtml('Output Tokens', fmtNum(d.total_output_tokens)) +
         fieldHtml('Cache Read Tokens', fmtNum(d.total_cache_read_tokens)) +
         fieldHtml('Cache Write Tokens', fmtNum(d.total_cache_write_tokens)) +
-        fieldHtml('Active Tokens', fmtNum(tokens)) +
+        fieldHtml('Token Usage', fmtNum(tokens)) +
         fieldHtml('Est. Cost', fmtCost(d.total_estimated_cost_usd)) +
         fieldHtml('Code Changes', fmtCodeChangesDiff(d.code_change_additions, d.code_change_deletions)) +
       '</div></div>';
@@ -5164,6 +5196,10 @@
   window.formatClockTime = formatClockTime;
   window.kpiSubtitle = kpiSubtitle;
   window.formatAgentRunTimestamp = formatAgentRunTimestamp;
+  // Token Usage KPI card (issue #658): the pure breakdown builder and the
+  // KPI-row renderer — exercised by the Node harness through the same seam.
+  window.fmtKpiTokenBreakdown = fmtKpiTokenBreakdown;
+  window.renderKPIs = renderKPIs;
   // Agent Runs date-filter state + Clear control (issue #7) — pure state
   // helper, DOM sync, the Clear action, the filter reader (UTC-boundary
   // conversion regression), and the wiring entry point for the test harness.
