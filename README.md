@@ -269,8 +269,6 @@ Key configuration variables:
 | `GATEWAY_NORMALIZED_EVENTS_TOPIC` | `engineering.events.normalized` | Normalized provider-events topic the AFK Outcome Consumer subscribes to (external; not created here) |
 | `GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC` | `engineering.events.normalized.dlq` | Dead-letter queue topic for poison normalized provider-events messages |
 | `GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID` | `opencode-normalized-events` | Kafka consumer group ID for the AFK Outcome Consumer (never shared with the usage consumer's `opencode-gateway` group) |
-| `GATEWAY_AFK_OUTCOMES_TOPIC` | `afk.events` | Compatibility-only (ADR 0023): legacy `afk.events` command topic. Settings still accepts it, but the AFK Outcome Consumer no longer reads it (never consumed — retention of `afk.events` is a Kafka-side concern) |
-| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | `afk.events-dlq` | Compatibility-only: legacy AFK outcome DLQ topic (never consumed by the current consumer path) |
 | `GATEWAY_AFK_OUTCOMES_PROVIDER` | `github` | Source provider for bounded reconciliation windows (`github` or `gitlab`) |
 | `GATEWAY_AFK_OUTCOMES_REPOSITORY` | *(empty)* | Full owner/repo (or group/project) name the AFK consumer/backfill reconciles against. Required when the AFK Outcome Consumer is enabled (fails fast at startup) |
 | `GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED` | `false` | Whether this process runs the AFK Outcome Consumer / backfill path (the read-only Gateway API process does not need it) |
@@ -575,7 +573,7 @@ execution attempt, `external_session_id` = one OpenCode session,
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/v1/afk/executions/runs` | Provision one provisional AFK Run lifecycle at webhook ingress. Body carries the source provenance (`provider` + `host` + `source_event_id`), the provider-qualified repository identity (normalized at the boundary), `trigger_type` (`eda`/`manual`/`scheduled`/`backfill`/`recovery`), an optional title, an optional ordered `deliveries` batch (first delivery stored as `first_delivery_id`, every identity kept as batch provenance; non-erasing), and an optional `recovered_from_afk_run_id` (required when `trigger_type=recovery`; provisions a recovery lifecycle without mutating its predecessor — unknown predecessor → `404`). Idempotent on `provider + host + source_event_id` (partial unique index `uq_afk_runs_provisioning_key`, migration 0039): new key → `201` (status `pending`), identical replay → `200`, conflicting replay → `409`. |
-| `POST` | `/api/v1/afk/executions` | Persist one AWX execution binding. Two-phase lifecycle: `outcome="running"` provisions the execution at AWX start, attached to the pre-provisioned `afk_run_id` (change request and sessions optional, still unknown); terminal outcomes (`completed`/`failed`/`cancelled`) may be persisted directly — failed/cancelled persist without a change request or a session, while a direct-terminal `completed` must carry both the change request and the resolved session(s). Session attribution is the deduplicated, order-preserving `external_session_ids` collection (the legacy singular `external_session_id` normalizes into it; the first entry is the primary session). `source_event_id` is required when `trigger_type=eda`. Idempotent by `awx_job_id`: identical replay → `200` (no mutation), conflicting data → `409`. A new `awx_job_id` for the same resource/run is a valid retry. `afk_run_id` is required for every new binding (unknown run → `404`). Never stores raw tokens, stdout, prompts, or arbitrary AWX payloads (bounded, redacted failure metadata only). |
+| `POST` | `/api/v1/afk/executions` | Persist one AWX execution binding. Two-phase lifecycle: `outcome="running"` provisions the execution at AWX start, attached to the pre-provisioned `afk_run_id` (change request and sessions optional, still unknown); terminal outcomes (`completed`/`failed`/`cancelled`) may be persisted directly — failed/cancelled persist without a change request or a session, while a direct-terminal `completed` must carry both the change request and the resolved session(s). Session attribution is the deduplicated, order-preserving `external_session_ids` collection (the first entry is the primary session). `source_event_id` is required when `trigger_type=eda`. Idempotent by `awx_job_id`: identical replay → `200` (no mutation), conflicting data → `409`. A new `awx_job_id` for the same resource/run is a valid retry. `afk_run_id` is required for every new binding (unknown run → `404`). Never stores raw tokens, stdout, prompts, or arbitrary AWX payloads (bounded, redacted failure metadata only). |
 | `PATCH` | `/api/v1/afk/executions/{awx_job_id}` | Transition one binding from `running` to a terminal outcome (`completed`/`failed`/`cancelled`). Idempotent identical replay → `200`; conflicting payload → `409` (history is never overwritten); unknown AWX job → `404`. `resource` and the session fields (`external_session_id` / `external_session_ids`) are non-erasing fill-ins for identities that only became known at completion — an omitted field never erases a stored value; a `completed` outcome never carries failure metadata and must end with both a change-request identity and a resolved session (repository-enforced after merge). |
 | `POST` | `/api/v1/afk/executions/runs/{afk_run_id}/change-request` | Bind one change request to a lifecycle (the 1:1 lifecycle ↔ change_request invariant, available before review processing and independent of the correlation engine). Idempotent per lifecycle; a different change request on the same run, or a change request already owned by another run → `409`; unknown lifecycle → `404`. |
 | `GET` | `/api/v1/afk/executions/runs/by-change-request` | Resolve a provider-qualified change-request identity (`provider` + `repository` + `external_id`) to its owning `afk_run_id` via the explicit durable binding on `afk_runs`. Read-only (Admin API Key only). `400` invalid identity, `404` unknown/unbound, `409` impossible ownership conflict. Follow-up GitHub PR / GitLab MR webhooks use this to continue the same lifecycle. |
@@ -954,8 +952,6 @@ opencode-gateway/
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](docs/adr/0001-separate-observation-tables.md) | Separate Observation Tables Per Domain Entity | Accepted |
-| [0002](docs/adr/0002-executor-plugin-interface.md) | Executor Plugin Interface Design | Superseded (#207) |
-| [0003](docs/adr/0003-postgres-port-allocation.md) | Port Allocation in Postgres | Superseded (#207) |
 | [0004](docs/adr/0004-gateway-no-infra-secrets.md) | Gateway Holds No Infrastructure Secrets | Accepted |
 | [0005](docs/adr/0005-separate-aurora-glass-from-gateway-service.md) | Separate Aurora Glass from Gateway Service | Accepted |
 | [0006](docs/adr/0006-session-identity-resolution.md) | Session Identity Resolution | Accepted |
@@ -972,7 +968,6 @@ opencode-gateway/
 | [0017](docs/adr/0017-migration-0019-index-measurement.md) | Migration 0019 Index Keep/Drop Decisions (Measured) | Accepted |
 | [0018](docs/adr/0018-reporting-delivery-write-semantics.md) | Reporting-Delivery Write Semantics | Accepted |
 | [0019](docs/adr/0019-exact-resource-session-associations.md) | Exact Resource↔Session Associations | Accepted |
-| [0020](docs/adr/0020-normalized-provider-event-mapping-bridge.md) | Normalized Provider Event Mapping Bridge | Superseded (FastAPI EDA Gateway ADR 0005) |
 | [0021](docs/adr/0021-reporting-read-api.md) | Reporting Read API | Accepted |
 | [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
 | [0023](docs/adr/0023-kafka-topic-split-commands-vs-observations.md) | Kafka Topic Split: afk.events vs engineering.events.normalized | Accepted |
@@ -983,6 +978,20 @@ opencode-gateway/
 Detailed schema, correlation, and database semantics live in the ADRs and
 in `CONTEXT.md`; this README deliberately links them rather than duplicating
 them.
+
+## Deprecated / compatibility-only
+
+Legacy settings and fields that remain accepted or emitted for
+compatibility only, but are no longer part of the live configuration or
+API surface. Superseded ADRs are deleted from the working tree and remain
+recoverable from git history (see
+[ADR 0030](docs/adr/0030-superseded-adr-retention-policy.md)).
+
+| Legacy name | Status | Replacement |
+|-------------|--------|-------------|
+| `GATEWAY_AFK_OUTCOMES_TOPIC` | Compatibility-only (ADR 0023): legacy `afk.events` topic; the consumer no longer reads it | `GATEWAY_NORMALIZED_EVENTS_TOPIC` (`engineering.events.normalized`) |
+| `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` | Compatibility-only: legacy AFK outcome DLQ topic (never consumed by the current consumer path) | `GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC` (`engineering.events.normalized.dlq`) |
+| `external_session_id` (singular, on execution-binding writes) | Compatibility-only: the legacy singular field normalizes into the deduplicated, order-preserving `external_session_ids` collection (the first entry is the primary session) | `external_session_ids` |
 
 ---
 

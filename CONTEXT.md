@@ -796,7 +796,8 @@ _Avoid_: Legacy provider event (the flat ``ProviderEventMessage`` shape has been
 **Mapping Bridge**:
 The AFK Outcome Consumer's ``map_provider_event`` / ``map_normalized_event``
 that bridges a **Normalized Provider Event** into the outcome layer's
-canonical vocabulary (ADR 0020, superseded by FastAPI EDA Gateway ADR 0005):
+canonical vocabulary (the producer owns the normalized-event contract —
+fast-api-eda-gateway ADR 0005):
 ``issue`` → ``issue``; ``pull_request`` and ``merge_request`` →
 ``change_request``.  ``action`` maps to the canonical event-type suffix
 (``edited``/``updated`` → ``updated``), and the result is validated against
@@ -1410,7 +1411,7 @@ manages.
 - An **Unresolved Correlation** belongs to exactly one **AFK Run** — `afk_run_id` is NOT NULL and part of the row identity (migration 0027), so the same entity may carry a separate unresolved row per run and evidence is never merged across runs — and is either `ambiguous` or `unmatched`
 - An **AFK Outcome Consumer** reads from the external provider-events topic (`afk.events`) in its own consumer group (`opencode-normalized-events`, never the usage consumer's `opencode-gateway` group)
 - An **AFK Outcome Consumer** writes canonical **Engineering Events** to Postgres and reconciles terminal states via the **AFK Backfill CLI** engine
-- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged (ADR 0020)
+- A **Mapping Bridge** maps a **Normalized Provider Event** into the outcome layer's canonical vocabulary — `pull_request`/`merge_request` → `change_request`, `issue` → `issue` — while leaving the legacy ten-type mapping unchanged
 - An **AFK Backfill CLI** run persists resolved **AFK Runs** idempotently and is the only write path for backfill — the **AFK Outcomes REST API** is strictly read-only
 - The **AFK Outcomes REST API** reads from the AFK outcome tables (`afk_runs`, `afk_run_entities`, `afk_run_sessions`, `unresolved_correlations`) and is consumed by **Aurora Glass** (the **AFK Outcomes Tab**)
 - The **AFK Outcomes Tab** in **Aurora Glass** renders **AFK Runs**, their **EngineeringOutcome**, per-link correlation provenance, and usage aggregates following the **Token Breakdown** / **Active Tokens** vocabulary
