@@ -68,7 +68,8 @@ credentials while the global Gateway API key already provides the
 authentication boundary for execution-binding reads. Execution-binding
 mutations remain protected by the dedicated `awx-execution-bindings`
 credential. During rolling deployment, an obsolete `X-Collector-Token` on a
-read is ignored; the watcher sends that header only for the terminal PATCH.
+read is ignored. Callers should send `X-Collector-Token` only for
+execution-binding write operations.
 
 **Secrets handling.** Only the SHA-256 `token_hash` is ever persisted
 in `collector_credentials`. Raw bearer tokens are never persisted,

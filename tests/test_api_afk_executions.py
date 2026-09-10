@@ -1233,6 +1233,23 @@ class TestGetExecutionBinding:
         assert data["data"]["awx_job"]["job_id"] == "42"
 
     @pytest.mark.asyncio
+    async def test_get_exact_binding_ignores_obsolete_collector_token(self) -> None:
+        """A stale collector token must not affect an API-key-authenticated read."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_mk_binding_row(awx_job_id=42))
+        client = create_client(conn)
+
+        resp = await client.get(
+            "/api/v1/afk/executions/42",
+            headers={"X-Collector-Token": "obsolete-invalid-token"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
     async def test_get_nonexistent_returns_404(self) -> None:
         """Return 404 when AWX job ID does not exist."""
         from tests.conftest import create_client
