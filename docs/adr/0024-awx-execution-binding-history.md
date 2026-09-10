@@ -59,6 +59,17 @@ collector-token path. The read endpoints (`GET /api/v1/afk/executions/{awx_job_i
 `ApiKeyMiddleware` boundary and accept the Admin API Key — no collector
 credential is needed.
 
+The dedicated `watcher-dispatcher` collector credential requirement on exact
+execution-binding reads was removed because the OpenCode Execution Watcher
+also performs terminal execution-binding writes using the existing
+`awx-execution-bindings` integration identity. Requiring a separate collector
+identity for reads forced one watcher execution to carry two domain
+credentials while the global Gateway API key already provides the
+authentication boundary for execution-binding reads. Execution-binding
+mutations remain protected by the dedicated `awx-execution-bindings`
+credential. During rolling deployment, an obsolete `X-Collector-Token` on a
+read is ignored; the watcher sends that header only for the terminal PATCH.
+
 **Secrets handling.** Only the SHA-256 `token_hash` is ever persisted
 in `collector_credentials`. Raw bearer tokens are never persisted,
 returned by any endpoint, or written to logs.
