@@ -408,15 +408,15 @@ never shared across pipelines (ADR 0022, CONTEXT.md):
 | Credential | Env / store | Transport | Gates |
 |------------|-------------|-----------|-------|
 | **Admin API Key** | `GATEWAY_API_KEY` | `Authorization: Bearer <key>` | **Every** non-`/health` route, via `ApiKeyMiddleware` (layer 1 of Two-Layer Auth) |
-| **Collector Credential** | `collector_credentials` rows (SHA-256 `token_hash`), owned by an OpenCode Client | `Authorization: Bearer <token>` | The `/ingest` and `/cursor` collector paths, the reporting-ingest write path, and the AFK execution-binding write path — via `require_collector_token` (layer 2) |
+| **Collector / integration credential** | `collector_credentials` rows (SHA-256 `token_hash`), owned by an OpenCode Client | Preferred: `X-Collector-Token: <token>`; legacy fallback: `Authorization: Bearer <token>` when the dedicated header is absent | The `/ingest` and `/cursor` collector paths, the reporting-ingest write path, and write paths requiring a client identity — via `require_collector_token` (layer 2) |
 | **Operator Token** | `GATEWAY_OPERATOR_TOKEN` | `X-Operator-Token` header (never `Authorization`) | Operator-only read surfaces: `GET /api/v1/reporting/resources`, `/resources/detail`, `/session-links`, via `require_operator_token`. Fails closed when unset |
 
 **Two-Layer Auth** on `/ingest`: (1) the bearer token must match the Admin
-API Key at the middleware; (2) the SHA-256 hash of the same token must be a
-non-revoked `collector_credentials` row. A collector therefore uses either
-the Admin API Key itself (with its hash registered as a bootstrap
-credential) or a provisioned collector token that also satisfies
-`GATEWAY_API_KEY` (see [ADR 0007](docs/adr/0007-two-layer-collector-auth.md)).
+API Key at the middleware; (2) the SHA-256 hash of the collector token must
+be a non-revoked `collector_credentials` row. When `X-Collector-Token` is
+present, `require_collector_token` uses that value; otherwise it falls back to
+the `Authorization` bearer value for legacy callers. This fallback is not the
+preferred execution-binding integration pattern (see [ADR 0007](docs/adr/0007-two-layer-collector-auth.md)).
 
 **The dedicated `awx-execution-bindings` client** (ADR 0024): the AFK
 execution-binding and lifecycle write paths — `POST /api/v1/afk/executions`,
@@ -425,16 +425,21 @@ execution-binding and lifecycle write paths — `POST /api/v1/afk/executions`,
 `POST /api/v1/afk/executions/runs/{afk_run_id}/change-request` — accept
 **only** collector credentials attributable to the dedicated integration
 client named `awx-execution-bindings` (module constant
-`AWX_EXECUTION_BINDING_CLIENT_NAME`). The request must pass both existing
-layers — the bearer token must match the Admin API Key at the middleware
-*and* its SHA-256 hash must be a non-revoked `collector_credentials` row
-owned by that client (register the Admin API Key's hash as a credential of
-the client, the standard bootstrap pattern). A valid credential owned by
-any other client (including the usage collector's `opencode-collector`) is
-rejected with `403`. The read endpoints (`GET /api/v1/afk/executions/{awx_job_id}`,
+`AWX_EXECUTION_BINDING_CLIENT_NAME`). Write requests use
+`Authorization: Bearer <GATEWAY_API_KEY>` plus
+`X-Collector-Token: <AWX_EXECUTION_BINDINGS_TOKEN>`; the collector token
+must resolve to an active credential owned by that client. A valid credential
+owned by any other client (including the usage collector's
+`opencode-collector`) is rejected with `403`. The read endpoints (`GET /api/v1/afk/executions/{awx_job_id}`,
 `GET /api/v1/afk/executions`, `GET /api/v1/afk/executions/runs/{afk_run_id}`,
 `GET /api/v1/afk/executions/runs/by-change-request`) require only the
 global Admin API Key — no collector credential is needed.
+
+The OpenCode Execution Watcher uses the same split: its binding GETs send only
+`Authorization: Bearer <GATEWAY_API_KEY>`, while the terminal PATCH sends that
+header plus `X-Collector-Token: <AWX_EXECUTION_BINDINGS_TOKEN>`. The two values
+are separate credentials and need not be the same secret. An obsolete
+`X-Collector-Token` on an execution-binding GET is ignored.
 
 **The Operator Token** does not replace the Admin API Key: a request to an
 operator-only surface must pass both gates, with the Admin API Key on

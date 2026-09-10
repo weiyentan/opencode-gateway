@@ -30,25 +30,30 @@ FORBIDDEN`. This client is provisioned through the existing admin
 clients API (`POST /admin/clients`) and is never shared with other
 pipelines.
 
-**Request contract.** AWX sends its execution-binding callback as
-`POST /api/v1/afk/executions` with a single `Authorization: Bearer
-<token>` header. The request must pass both existing layers:
+**Request contract.** Execution-binding reads require only the global Gateway
+Admin API Key, supplied as `Authorization: Bearer <GATEWAY_API_KEY>`.
+Execution-binding write operations require two authentication layers. The
+request must pass both existing layers:
 
 1. `ApiKeyMiddleware` — the bearer token must match `GATEWAY_API_KEY`
    (layer 1; unchanged global boundary).
-2. `require_collector_token` — the SHA-256 hash of the same bearer
-   token must be a non-revoked `collector_credentials` row owned by
-   the active `awx-execution-bindings` client (layer 2).
+2. `require_collector_token` — the `X-Collector-Token` value must resolve to
+   a non-revoked `collector_credentials` row owned by the active
+   `awx-execution-bindings` client (layer 2).
 
-Operationally this means registering the SHA-256 hash of
-`GATEWAY_API_KEY` as a collector credential of the dedicated client
-(the existing Admin-API-Key bootstrap pattern) and having AWX present
-`GATEWAY_API_KEY` as its bearer token. The dedicated credential row —
-not a distinct header scheme — is what makes the write path
-attributable to the AWX integration and keeps it separate from
-`opencode-collector`. Provision the credential with a placeholder-free
-value from the operator's secret store; never commit a real token,
-key, or hash to source control or documentation.
+The write request therefore uses two independently meaningful credentials:
+`Authorization: Bearer <GATEWAY_API_KEY>` for Gateway-wide authentication and
+`X-Collector-Token: <AWX_EXECUTION_BINDINGS_TOKEN>` for the dedicated
+integration identity. The Gateway API Key and the integration credential are
+separate credential roles and should not be documented as requiring the same
+secret. Provision both values from the operator's secret store; never commit
+a real token, key, or hash to source control or documentation.
+
+`require_collector_token` prefers `X-Collector-Token` when that header is
+present. It falls back to `Authorization: Bearer <token>` only when the
+collector header is absent, preserving compatibility with older collector
+callers. New execution-binding integrations should use the explicit
+`X-Collector-Token` header.
 
 **Failure behavior.** Missing, malformed, empty, invalid, revoked, and
 inactive credentials are rejected with `401 UNAUTHORIZED`, using the
