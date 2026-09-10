@@ -48,27 +48,6 @@ def _auth_row() -> MagicMock:
     )
 
 
-def _watcher_auth_row() -> MagicMock:
-    """Return a mock row that passes require_collector_token (read gate).
-
-    The single-binding read (``GET /executions/{awx_job_id}``) requires a
-    collector credential of the dedicated watcher-dispatcher client
-    (issue #661).
-    """
-    from app.api.afk_executions import WATCHER_DISPATCHER_CLIENT_NAME
-
-    return mock_row(
-        {
-            "credential_id": _CREDENTIAL_ID,
-            "revoked_at": None,
-            "last_used_at": None,
-            "client_id": _CLIENT_ID,
-            "client_name": WATCHER_DISPATCHER_CLIENT_NAME,
-            "client_is_active": True,
-        }
-    )
-
-
 def _mk_binding_row(
     *,
     binding_id: str = "00000000-0000-0000-0000-000000000001",
@@ -638,8 +617,7 @@ class TestPatchSessionAttributionPersistence:
 class TestReadSessionAttribution:
     """GET responses expose the normalized external_session_ids.
 
-    The single-binding read requires the dedicated watcher-dispatcher
-    collector credential (issue #661).
+    The exact-binding read requires only the Admin API Key.
     """
 
     @pytest.mark.asyncio
@@ -650,7 +628,7 @@ class TestReadSessionAttribution:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -667,7 +645,7 @@ class TestReadSessionAttribution:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42, external_session_id=None)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")

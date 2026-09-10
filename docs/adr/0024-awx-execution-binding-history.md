@@ -30,39 +30,51 @@ FORBIDDEN`. This client is provisioned through the existing admin
 clients API (`POST /admin/clients`) and is never shared with other
 pipelines.
 
-**Request contract.** AWX sends its execution-binding callback as
-`POST /api/v1/afk/executions` with a single `Authorization: Bearer
-<token>` header. The request must pass both existing layers:
+**Request contract.** Execution-binding reads require only the global Gateway
+Admin API Key, supplied as `Authorization: Bearer <GATEWAY_API_KEY>`.
+Execution-binding write operations require two authentication layers. The
+request must pass both existing layers:
 
 1. `ApiKeyMiddleware` — the bearer token must match `GATEWAY_API_KEY`
    (layer 1; unchanged global boundary).
-2. `require_collector_token` — the SHA-256 hash of the same bearer
-   token must be a non-revoked `collector_credentials` row owned by
-   the active `awx-execution-bindings` client (layer 2).
+2. `require_collector_token` — the `X-Collector-Token` value must resolve to
+   a non-revoked `collector_credentials` row owned by the active
+   `awx-execution-bindings` client (layer 2).
 
-Operationally this means registering the SHA-256 hash of
-`GATEWAY_API_KEY` as a collector credential of the dedicated client
-(the existing Admin-API-Key bootstrap pattern) and having AWX present
-`GATEWAY_API_KEY` as its bearer token. The dedicated credential row —
-not a distinct header scheme — is what makes the write path
-attributable to the AWX integration and keeps it separate from
-`opencode-collector`. Provision the credential with a placeholder-free
-value from the operator's secret store; never commit a real token,
-key, or hash to source control or documentation.
+The write request therefore uses two independently meaningful credentials:
+`Authorization: Bearer <GATEWAY_API_KEY>` for Gateway-wide authentication and
+`X-Collector-Token: <AWX_EXECUTION_BINDINGS_TOKEN>` for the dedicated
+integration identity. The Gateway API Key and the integration credential are
+separate credential roles and should not be documented as requiring the same
+secret. Provision both values from the operator's secret store; never commit
+a real token, key, or hash to source control or documentation.
+
+`require_collector_token` prefers `X-Collector-Token` when that header is
+present. It falls back to `Authorization: Bearer <token>` only when the
+collector header is absent, preserving compatibility with older collector
+callers. New execution-binding integrations should use the explicit
+`X-Collector-Token` header.
 
 **Failure behavior.** Missing, malformed, empty, invalid, revoked, and
 inactive credentials are rejected with `401 UNAUTHORIZED`, using the
 same error codes and messages as the existing `/ingest`
-collector-token path. The resource-history read
-(`GET /api/v1/afk/executions`) remains protected by the global
-`ApiKeyMiddleware` boundary alone and accepts the Admin API Key. The
-single-binding read (`GET /api/v1/afk/executions/{awx_job_id}`)
-additionally requires a collector credential attributable to the
-dedicated `watcher-dispatcher` client (`WATCHER_DISPATCHER_CLIENT_NAME`,
-issue #661) — the AFK watcher dispatcher resolves an open run's AWX
-execution binding by job identity through this endpoint with its own
-dedicated credential. A valid credential owned by any other client is
-rejected with `403 FORBIDDEN`, so pipeline credentials are never shared.
+collector-token path. The read endpoints (`GET /api/v1/afk/executions/{awx_job_id}`,
+`GET /api/v1/afk/executions`, `GET /api/v1/afk/executions/runs/{afk_run_id}`,
+`GET /api/v1/afk/executions/runs/by-change-request`) require only the global
+`ApiKeyMiddleware` boundary and accept the Admin API Key — no collector
+credential is needed.
+
+The dedicated `watcher-dispatcher` collector credential requirement on exact
+execution-binding reads was removed because the OpenCode Execution Watcher
+also performs terminal execution-binding writes using the existing
+`awx-execution-bindings` integration identity. Requiring a separate collector
+identity for reads forced one watcher execution to carry two domain
+credentials while the global Gateway API key already provides the
+authentication boundary for execution-binding reads. Execution-binding
+mutations remain protected by the dedicated `awx-execution-bindings`
+credential. During rolling deployment, an obsolete `X-Collector-Token` on a
+read is ignored. Callers should send `X-Collector-Token` only for
+execution-binding write operations.
 
 **Secrets handling.** Only the SHA-256 `token_hash` is ever persisted
 in `collector_credentials`. Raw bearer tokens are never persisted,

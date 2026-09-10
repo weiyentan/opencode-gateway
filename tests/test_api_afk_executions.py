@@ -10,14 +10,13 @@ Tests exercise both GitHub pull request and GitLab merge request resource
 identities, the failed-to-successful retry flow, and the redaction guarantee
 (no sensitive data in responses).
 
-Auth layers (issues #550, #661):
+Auth layers (issue #550):
 
 - Write paths require a collector credential of the dedicated AWX
   execution-binding client.
-- The single-binding read (``GET /executions/{awx_job_id}``) requires a
-  collector credential of the dedicated watcher-dispatcher client.
-- The resource-history read (``GET /executions``) requires the Admin API
-  Key only.
+- Read paths (``GET /executions/{awx_job_id}``, ``GET /executions``,
+  ``GET /runs/{afk_run_id}``, ``GET /runs/by-change-request``) require
+  the Admin API Key only.
 """
 
 from __future__ import annotations
@@ -65,27 +64,6 @@ def _auth_row() -> MagicMock:
             "last_used_at": None,
             "client_id": _CLIENT_ID,
             "client_name": AWX_EXECUTION_BINDING_CLIENT_NAME,
-            "client_is_active": True,
-        }
-    )
-
-
-def _watcher_auth_row() -> MagicMock:
-    """Return a mock row that passes require_collector_token for the read gate.
-
-    The credential is attributable to the dedicated watcher-dispatcher
-    client (issue #661) — the only client accepted by the single-binding
-    read path (``GET /executions/{awx_job_id}``).
-    """
-    from app.api.afk_executions import WATCHER_DISPATCHER_CLIENT_NAME
-
-    return mock_row(
-        {
-            "credential_id": _CREDENTIAL_ID,
-            "revoked_at": None,
-            "last_used_at": None,
-            "client_id": _CLIENT_ID,
-            "client_name": WATCHER_DISPATCHER_CLIENT_NAME,
             "client_is_active": True,
         }
     )
@@ -1214,7 +1192,7 @@ class TestCreateExecutionBinding:
             afk_run_id=None,
             trigger_type=None,
         )
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), legacy_row])
+        conn.fetchrow = AsyncMock(return_value=legacy_row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1234,9 +1212,8 @@ class TestCreateExecutionBinding:
 class TestGetExecutionBinding:
     """GET /api/v1/afk/executions/{awx_job_id} — single-binding read.
 
-    Requires the Admin API Key (middleware) AND a collector credential of
-    the dedicated watcher-dispatcher client (issue #661) — the AFK watcher
-    dispatcher reads an open run's AWX job binding through this endpoint.
+    Requires the Admin API Key (middleware) only — no collector credential
+    is needed.
     """
 
     @pytest.mark.asyncio
@@ -1246,7 +1223,7 @@ class TestGetExecutionBinding:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1256,12 +1233,29 @@ class TestGetExecutionBinding:
         assert data["data"]["awx_job"]["job_id"] == "42"
 
     @pytest.mark.asyncio
+    async def test_get_exact_binding_ignores_obsolete_collector_token(self) -> None:
+        """A stale collector token must not affect an API-key-authenticated read."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_mk_binding_row(awx_job_id=42))
+        client = create_client(conn)
+
+        resp = await client.get(
+            "/api/v1/afk/executions/42",
+            headers={"X-Collector-Token": "obsolete-invalid-token"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
     async def test_get_nonexistent_returns_404(self) -> None:
         """Return 404 when AWX job ID does not exist."""
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), None])
+        conn.fetchrow = AsyncMock(return_value=None)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/99999")
@@ -1276,7 +1270,7 @@ class TestGetExecutionBinding:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        conn.fetchrow = AsyncMock(return_value=_watcher_auth_row())
+        conn.fetchrow = AsyncMock()
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/abc")
@@ -1291,7 +1285,7 @@ class TestGetExecutionBinding:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42, external_session_id=None)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1311,7 +1305,7 @@ class TestGetExecutionBinding:
             afk_run_id="01JZABCDEFGHJKLMNPQRSTVWXY",
             trigger_type="eda",
         )
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1328,7 +1322,7 @@ class TestGetExecutionBinding:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1349,7 +1343,7 @@ class TestGetExecutionBinding:
             outcome="failed",
             failure_summary="Process crashed",
         )
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1364,7 +1358,7 @@ class TestGetExecutionBinding:
 
         conn = _mk_conn()
         row = _mk_binding_row(awx_job_id=42, failure_summary=None)
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), row])
+        conn.fetchrow = AsyncMock(return_value=row)
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -1641,11 +1635,7 @@ class TestListExecutionBindings:
 
 
 class TestAuth:
-    """Write path requires the AWX client credential; read paths use API key.
-
-    The single-binding read additionally requires the dedicated
-    watcher-dispatcher collector credential (issue #661).
-    """
+    """Write path requires the AWX client credential; read paths use API key."""
 
     @pytest.mark.asyncio
     async def test_write_requires_collector_token(self) -> None:
