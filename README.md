@@ -431,19 +431,10 @@ layers — the bearer token must match the Admin API Key at the middleware
 owned by that client (register the Admin API Key's hash as a credential of
 the client, the standard bootstrap pattern). A valid credential owned by
 any other client (including the usage collector's `opencode-collector`) is
-rejected with `403`. The resource-history read (`GET /api/v1/afk/executions`)
-remains protected by the global API-key middleware alone.
-
-**The dedicated `watcher-dispatcher` client** (issue #661): the
-single-binding read (`GET /api/v1/afk/executions/{awx_job_id}`) requires
-**both** the Admin API Key at the middleware *and* a collector credential
-attributable to the dedicated client named `watcher-dispatcher` (module
-constant `WATCHER_DISPATCHER_CLIENT_NAME`) — the AFK watcher dispatcher
-resolves an open run's AWX execution binding by job identity through this
-endpoint with its own dedicated credential. A valid credential owned by any
-other client (the `awx-execution-bindings` write client, the usage
-collector's `opencode-collector`, ...) is rejected with `403`, so pipeline
-credentials are never shared.
+rejected with `403`. The read endpoints (`GET /api/v1/afk/executions/{awx_job_id}`,
+`GET /api/v1/afk/executions`, `GET /api/v1/afk/executions/runs/{afk_run_id}`,
+`GET /api/v1/afk/executions/runs/by-change-request`) require only the
+global Admin API Key — no collector credential is needed.
 
 **The Operator Token** does not replace the Admin API Key: a request to an
 operator-only surface must pass both gates, with the Admin API Key on
@@ -580,7 +571,7 @@ execution attempt, `external_session_id` = one OpenCode session,
 | `POST` | `/api/v1/afk/executions/runs/{afk_run_id}/change-request` | Bind one change request to a lifecycle (the 1:1 lifecycle ↔ change_request invariant, available before review processing and independent of the correlation engine). Idempotent per lifecycle; a different change request on the same run, or a change request already owned by another run → `409`; unknown lifecycle → `404`. |
 | `GET` | `/api/v1/afk/executions/runs/by-change-request` | Resolve a provider-qualified change-request identity (`provider` + `repository` + `external_id`) to its owning `afk_run_id` via the explicit durable binding on `afk_runs`. Read-only (Admin API Key only). `400` invalid identity, `404` unknown/unbound, `409` impossible ownership conflict. Follow-up GitHub PR / GitLab MR webhooks use this to continue the same lifecycle. |
 | `GET` | `/api/v1/afk/executions` | List all execution bindings for one provider resource (`provider`, `repository_url`, `entity_type=change_request`, `entity_number` required). Returns the full failed-to-successful execution history in deterministic order (earliest first). |
-| `GET` | `/api/v1/afk/executions/{awx_job_id}` | Return one execution binding by AWX job ID (or 404). Requires the Admin API Key **and** a collector credential of the dedicated `watcher-dispatcher` client (issue #661). Exposes the approved execution metadata: AWX job identity, gateway-assigned `binding_id`, canonical `change_request` resource (nullable), `external_session_id`/`external_session_ids` session attribution (empty for bindings with no resolved session), `afk_run_id` (null for legacy rows), `trigger_type`, `source_event_id`, branch, title, timestamps, outcome, and bounded failure metadata. |
+| `GET` | `/api/v1/afk/executions/{awx_job_id}` | Return one execution binding by AWX job ID (or 404). Requires the Admin API Key only. Exposes the approved execution metadata: AWX job identity, gateway-assigned `binding_id`, canonical `change_request` resource (nullable), `external_session_id`/`external_session_ids` session attribution (empty for bindings with no resolved session), `afk_run_id` (null for legacy rows), `trigger_type`, `source_event_id`, branch, title, timestamps, outcome, and bounded failure metadata. |
 
 ### AFK Outcomes (read path)
 

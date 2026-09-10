@@ -6,20 +6,18 @@ additionally requires the credential to be attributable to the dedicated
 AWX execution-binding integration client — never the usage collector
 (``opencode-collector``) or any other client.
 
-The single-binding read (``GET /executions/{awx_job_id}``) applies the same
-two-layer mechanism with the dedicated watcher-dispatcher client (issue
-#661): the AFK watcher dispatcher resolves an open run's AWX job binding
-through this endpoint with its own dedicated credential.
+The single-binding read (``GET /executions/{awx_job_id}``) requires only
+the global Admin API Key (``ApiKeyMiddleware``) — no collector credential
+is needed.
 
 Covered here:
 
-* dedicated-client happy path through both auth layers,
+* dedicated-client happy path through both auth layers (write path),
 * rejection of a valid credential owned by another client (403),
 * the ``/ingest``-compatible rejection matrix (missing, malformed, empty,
   invalid, revoked, inactive → 401 with the same error codes/messages),
 * read endpoints protected by the Admin API Key alone,
-* the watcher-dispatcher gate on the single-binding read (accepted / 403
-  for another client / 401 for the missing-credential matrix),
+* API-key-only access to the exact-binding read endpoint,
 * raw bearer tokens never persisted, returned, or logged.
 """
 
@@ -35,7 +33,6 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api.afk_executions import (
     AWX_EXECUTION_BINDING_CLIENT_NAME,
-    WATCHER_DISPATCHER_CLIENT_NAME,
 )
 from app.core.identity import hash_token
 from tests.conftest import create_client, mock_row
@@ -58,25 +55,6 @@ def _auth_row(
     active: bool = True,
 ) -> MagicMock:
     """Return a mock ``collector_credentials`` auth row for require_collector_token."""
-    return mock_row(
-        {
-            "credential_id": _CREDENTIAL_ID,
-            "revoked_at": "2026-01-01T00:00:00Z" if revoked else None,
-            "last_used_at": None,
-            "client_id": _CLIENT_ID,
-            "client_name": client_name,
-            "client_is_active": active,
-        }
-    )
-
-
-def _watcher_auth_row(
-    *,
-    client_name: str = WATCHER_DISPATCHER_CLIENT_NAME,
-    revoked: bool = False,
-    active: bool = True,
-) -> MagicMock:
-    """Return a mock ``collector_credentials`` auth row for the read gate."""
     return mock_row(
         {
             "credential_id": _CREDENTIAL_ID,
@@ -408,30 +386,10 @@ class TestTwoLayerAuthBoundary:
         assert conn.fetchrow.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_read_requires_api_key_and_watcher_collector_token(self) -> None:
-        """GET by AWX job ID needs the Admin API Key AND a watcher credential.
-
-        The single-binding read (issue #661) composes the collector-token
-        layer on top of the API-key middleware: a request carrying the Admin
-        API Key but no watcher-dispatcher collector credential is rejected.
-        """
+    async def test_read_requires_api_key_only(self) -> None:
+        """GET by AWX job ID needs only the Admin API Key — no collector credential."""
         conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value=None)  # no collector credential
-        client = create_client(conn)
-
-        resp = await client.get("/api/v1/afk/executions/42")
-        assert resp.status_code == 401
-        data = resp.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "UNAUTHORIZED"
-
-    @pytest.mark.asyncio
-    async def test_read_with_api_key_and_watcher_credential_200(self) -> None:
-        """A watcher-dispatcher collector credential satisfies the read gate."""
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(
-            side_effect=[_watcher_auth_row(), _saved_row()]
-        )
+        conn.fetchrow = AsyncMock(return_value=_saved_row())
         client = create_client(conn)
 
         resp = await client.get("/api/v1/afk/executions/42")
@@ -439,27 +397,8 @@ class TestTwoLayerAuthBoundary:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["data"]["awx_job"]["job_id"] == "42"
-
-    @pytest.mark.asyncio
-    async def test_read_with_other_client_credential_403(self) -> None:
-        """A valid credential of another client is rejected on the read gate."""
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(
-            return_value=_watcher_auth_row(client_name="opencode-collector")
-        )
-        conn.execute = AsyncMock()
-        client = create_client(conn)
-
-        resp = await client.get("/api/v1/afk/executions/42")
-        assert resp.status_code == 403
-        data = resp.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "FORBIDDEN"
-        # Rejected at the auth gate — only the credential lookup and its
-        # last_used_at touch ran; no binding query.
+        # Exactly one fetchrow call — the binding lookup only, no auth credential lookup.
         assert conn.fetchrow.call_count == 1
-        assert conn.execute.call_count == 1
-        assert "UPDATE collector_credentials" in str(conn.execute.call_args)
 
     @pytest.mark.asyncio
     async def test_read_without_api_key_401(self) -> None:
@@ -614,78 +553,3 @@ class TestTerminalUpdateAuth:
             },
         )
         assert resp.status_code == 200
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Watcher-dispatcher read gate (issue #661)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestWatcherDispatcherCredential:
-    """The single-binding read gate requires the dedicated watcher client.
-
-    ``GET /executions/{awx_job_id}`` composes ``require_collector_token``
-    with a client-attribution check against
-    ``WATCHER_DISPATCHER_CLIENT_NAME`` (issue #661).  These tests exercise
-    the collector layer in isolation (API-key middleware disabled) so the
-    matrix mirrors the write-path dedicated-credential tests.
-    """
-
-    @pytest.mark.asyncio
-    async def test_valid_watcher_credential_reads_binding(self, monkeypatch) -> None:
-        """A watcher-dispatcher credential passes the gate and reads the row."""
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(side_effect=[_watcher_auth_row(), _saved_row()])
-        client = _build_collector_only_client(conn, monkeypatch)
-
-        resp = await client.get(
-            "/api/v1/afk/executions/42",
-            headers={"Authorization": f"Bearer {_COLLECTOR_BEARER}"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["data"]["awx_job"]["job_id"] == "42"
-
-    @pytest.mark.asyncio
-    async def test_wrong_client_credential_rejected_403(self, monkeypatch) -> None:
-        """A valid credential owned by another client is rejected with 403.
-
-        The token is a valid collector credential, but it belongs to the
-        usage collector (``opencode-collector``) rather than the dedicated
-        watcher-dispatcher client — the read must never reuse another
-        pipeline's credential.
-        """
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(
-            return_value=_watcher_auth_row(client_name="opencode-collector")
-        )
-        conn.execute = AsyncMock()
-        client = _build_collector_only_client(conn, monkeypatch)
-
-        resp = await client.get(
-            "/api/v1/afk/executions/42",
-            headers={"Authorization": f"Bearer {_COLLECTOR_BEARER}"},
-        )
-        assert resp.status_code == 403
-        data = resp.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "FORBIDDEN"
-        # Rejected at the auth gate — only the credential lookup and its
-        # last_used_at touch ran; no binding query.
-        assert conn.fetchrow.call_count == 1
-        assert conn.execute.call_count == 1
-        assert "UPDATE collector_credentials" in str(conn.execute.call_args)
-
-    @pytest.mark.asyncio
-    async def test_missing_credential_401(self, monkeypatch) -> None:
-        """No collector credential at all → 401 from require_collector_token."""
-        conn = AsyncMock()
-        client = _build_collector_only_client(conn, monkeypatch)
-
-        resp = await client.get("/api/v1/afk/executions/42")
-        assert resp.status_code == 401
-        data = resp.json()
-        assert data["status"] == "error"
-        assert data["error"]["code"] == "UNAUTHORIZED"
-        assert "Missing or invalid Authorization header" in data["error"]["message"]
