@@ -972,6 +972,7 @@ opencode-gateway/
 | [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
 | [0023](docs/adr/0023-kafka-topic-split-commands-vs-observations.md) | Kafka Topic Split: afk.events vs engineering.events.normalized | Accepted |
 | [0024](docs/adr/0024-awx-execution-binding-history.md) | Preserve AWX Execution Binding History | Accepted |
+| — | *ADR 0025 was skipped (numbering gap)* | — |
 | [0026](docs/adr/0026-afk-run-id-database-relationships.md) | AFK Run ID Database Relationships | Accepted |
 | [0027](docs/adr/0027-transactional-afk-run-status-projection.md) | Project AFK Run Status Transactionally from AWX Executions | Accepted |
 | [0028](docs/adr/0028-change-request-owns-afk-run-lifecycle.md) | Change Request Owns AFK Run Lifecycle | Accepted |
