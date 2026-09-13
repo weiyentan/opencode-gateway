@@ -915,7 +915,7 @@ opencode-gateway/
 │   ├── afk-outcome-validation.md # AFK reconstruction validation findings
 │   ├── afk-outcome-contract-validation.md
 │   ├── afk-e2e-validation.md     # Opt-in GitHub/GitLab lifecycle E2E operator guide
-│   ├── prd/                      # PRDs (AFK run creation, AWX execution bindings, replay-safe accounting, …)
+│   ├── reviews/                  # Historical review artifacts (issue reviews, PR review notes)
 │   └── contracts/normalized-event-v1   # Producer-owned normalized-event contract artifacts
 ├── alembic/                      # Alembic migrations
 ├── k8s/                          # Kubernetes manifests (gateway + usage consumer + AFK consumer)
@@ -942,7 +942,6 @@ opencode-gateway/
 | [docs/afk-outcome-validation.md](docs/afk-outcome-validation.md) | AFK reconstruction validation findings |
 | [docs/afk-outcome-contract-validation.md](docs/afk-outcome-contract-validation.md) | AFK outcome contract validation |
 | [docs/afk-e2e-validation.md](docs/afk-e2e-validation.md) | Opt-in GitHub/GitLab lifecycle E2E operator guide |
-| [docs/prd/](docs/prd/) | PRDs behind the implemented slices (AFK run creation, AWX execution bindings, replay-safe usage accounting, …) |
 | [docs/contracts/normalized-event-v1](docs/contracts/normalized-event-v1) | Producer-owned normalized-event contract (pinned copy) |
 
 ## Architecture Decision Records
@@ -973,8 +972,11 @@ opencode-gateway/
 | [0022](docs/adr/0022-retention-defaults-and-access-controls.md) | Retention Defaults and Access Controls | Accepted |
 | [0023](docs/adr/0023-kafka-topic-split-commands-vs-observations.md) | Kafka Topic Split: afk.events vs engineering.events.normalized | Accepted |
 | [0024](docs/adr/0024-awx-execution-binding-history.md) | Preserve AWX Execution Binding History | Accepted |
+| — | *ADR 0025 was skipped (numbering gap)* | — |
 | [0026](docs/adr/0026-afk-run-id-database-relationships.md) | AFK Run ID Database Relationships | Accepted |
 | [0027](docs/adr/0027-transactional-afk-run-status-projection.md) | Project AFK Run Status Transactionally from AWX Executions | Accepted |
+| [0028](docs/adr/0028-change-request-owns-afk-run-lifecycle.md) | Change Request Owns AFK Run Lifecycle | Accepted |
+| [0029](docs/adr/0029-gateway-reporting-boundary.md) | Gateway Remains a Reporting Service | Accepted |
 
 Detailed schema, correlation, and database semantics live in the ADRs and
 in `CONTEXT.md`; this README deliberately links them rather than duplicating

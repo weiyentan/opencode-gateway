@@ -294,4 +294,4 @@ Preserve:
 ## Related ADRs
 
 - ADR 0024: Preserve AWX execution binding history
-- ADR 0025: Pre-provision AFK run identity at webhook ingress
+- ADR 0025: *Not yet written* — Pre-provision AFK run identity at webhook ingress (planned)

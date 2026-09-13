@@ -2,7 +2,7 @@
 
 **Generated:** 2026-08-06  
 **Source Session:** Grill-with-docs review session  
-**Related PRD:** [`docs/prd/aurora-glass-performance-optimization.md`](../prd/aurora-glass-performance-optimization.md)
+**Related PRD:** ~~`docs/prd/aurora-glass-performance-optimization.md`~~ (removed in #669; content captured in this handoff document)
 
 ---
 
@@ -216,7 +216,7 @@ The migration includes indexes on:
 
 | File | Purpose |
 |------|---------|
-| `docs/prd/aurora-glass-performance-optimization.md` | Full PRD with detailed requirements |
+| ~~`docs/prd/aurora-glass-performance-optimization.md`~~ (removed in #669) | Full PRD with detailed requirements (content captured above) |
 | `alembic/versions/0019_*.py` | Database migration with 8 indexes |
 | Backend models/controllers | Session resolution, status computation, event queries |
 | Frontend dashboard components | Token labels, event naming, caching logic |
