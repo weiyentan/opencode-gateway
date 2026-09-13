@@ -865,17 +865,6 @@ collector source in the usage-telemetry domain — so reusing it here would be
 ambiguous. Use the relationship-specific `change-request repository` and
 `issue repository` instead.
 
-**Relationship edge identity**:
-The stable identity of one endpoint of an MR↔issue relationship. Each endpoint
-is a **Stable Resource Identity**: `(provider, repository, resource_type,
-external_id)` — e.g. `(gitlab, cloudnative-pg, change_request, "6")` and
-`(gitlab, cloudnative-pg, issue, "1")` (same-repo), or
-`(gitlab, application/api, change_request, "10")` and
-`(gitlab, platform/tracking, issue, "25")` (cross-repo). An MR↔issue
-relationship edge therefore spans two independent repository keys, one for
-the change-request repository and one for the issue repository.
-_Avoid_: a single shared repository key covering both endpoints
-
 **Cross-repository references (planned)**:
 References of the form `group/project#N` (e.g. `platform/tracking#25`)
 that point at an issue in a different repository than the change request.
@@ -1116,13 +1105,20 @@ by Git branch and workload-collector terminology.
 _Avoid_: source repository / target repository
 
 **Relationship edge identity**:
-Each endpoint is a **Stable Resource Identity**
-`(provider, repository, resource_type, external_id)`. Projection tables
-store **both natural tuples directly** (the change-request tuple and the
-issue tuple) — there is **no `engineering_resources` registry**; this
-matches the existing `engineering_events` / `resource_session_associations`
-flattened-identity convention.
+The stable identity of one endpoint of an MR↔issue relationship. Each endpoint
+is a **Stable Resource Identity** `(provider, repository, resource_type,
+external_id)` — e.g. `(gitlab, cloudnative-pg, change_request, "6")` and
+`(gitlab, cloudnative-pg, issue, "1")` (same-repo), or
+`(gitlab, application/api, change_request, "10")` and
+`(gitlab, platform/tracking, issue, "25")` (cross-repo). An MR↔issue
+relationship edge therefore spans two independent repository keys — one for
+the change-request repository and one for the issue repository. Projection
+tables store **both natural tuples directly** — there is **no
+`engineering_resources` registry**; this matches the existing
+`engineering_events` / `resource_session_associations` flattened-identity
+convention.
 _Avoid_: an engineering_resources registry, a single shared repository key
+covering both endpoints
 
 **issue_links**:
 A structured full-snapshot field on the normalized contract (additive schema
