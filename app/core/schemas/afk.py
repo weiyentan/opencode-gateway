@@ -35,6 +35,46 @@ class RunSummary(BaseModel):
     last_seen_at: datetime | None = None
 
 
+class AFKRunChangeRequest(BaseModel):
+    """The change request bound to an AFK Run (canonical API, v1 contract §2).
+
+    ``null`` while unbound.  The three ``afk_runs.change_request_*`` columns
+    are all-set-or-all-None (1:1 lifecycle↔change-request invariant, partial
+    unique index ``uq_afk_runs_change_request_identity``).
+    """
+
+    provider: str = Field(description="Source provider: github | gitlab")
+    repository: str = Field(description="Normalized repository identity")
+    external_id: str = Field(description="Provider-scoped change-request number")
+
+
+class AFKRunSummary(RunSummary):
+    """Canonical AFK Run summary (canonical API, v1 contract §4.1).
+
+    The outcomes endpoints keep their exact current :class:`RunSummary`
+    shape; only the canonical namespace (``/api/v1/afk/runs``) carries this
+    additive lifecycle extension — repository identity, trigger metadata,
+    recovery predecessor, and the bound change request.
+    """
+
+    repository: str | None = Field(
+        default=None,
+        description="Normalized repository identity; null for legacy rows",
+    )
+    trigger_type: str | None = Field(
+        default=None,
+        description="eda | manual | scheduled | backfill | recovery",
+    )
+    recovered_from_afk_run_id: str | None = Field(
+        default=None,
+        description="Gateway ULID of the recovery predecessor run, if any",
+    )
+    change_request: AFKRunChangeRequest | None = Field(
+        default=None,
+        description="{provider, repository, external_id} when bound; null when unbound",
+    )
+
+
 class EntityLink(BaseModel):
     """One derived link between a run and an engineering entity.
 
@@ -181,6 +221,19 @@ class RunDetail(BaseModel):
     sessions: list[SessionLink] = Field(default_factory=list)
     agents: list[str] = Field(default_factory=list)
     usage: UsageAggregate = Field(default_factory=UsageAggregate)
+
+
+class AFKRunDetail(RunDetail):
+    """Canonical AFK Run detail (canonical API, v1 contract §4.2).
+
+    The outcomes :class:`RunDetail` composition — full chain with per-link
+    provenance — with the run block replaced by the extended
+    :class:`AFKRunSummary`.  Only the canonical namespace (``/api/v1/afk/runs``)
+    carries this shape; the outcomes endpoints keep their exact current
+    response shape.
+    """
+
+    run: AFKRunSummary  # type: ignore[assignment]
 
 
 class ChangeRequestExecutionCounts(BaseModel):
