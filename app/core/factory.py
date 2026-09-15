@@ -148,6 +148,7 @@ def create_app(
     )
     from app.api.afk_executions import router as afk_executions_router
     from app.api.afk_outcomes import router as afk_outcomes_router
+    from app.api.afk_runs import router as afk_runs_router
     from app.api.closure_relationships import router as closure_relationships_router
     from app.api.cursor import router as cursor_router
     from app.api.execution import router as execution_router
@@ -173,5 +174,9 @@ def create_app(
     app.include_router(reporting_ingest_router)
     app.include_router(reporting_router)
     app.include_router(afk_executions_router, prefix="/api/v1/afk/executions")
+    # Canonical AFK Run API (issue #672, docs/contracts/afk-run-api-v1.md):
+    # resource-oriented read surface at /api/v1/afk/runs — deliberately
+    # separate from the execution-scoped router above.
+    app.include_router(afk_runs_router, prefix="/api/v1/afk")
 
     return app
