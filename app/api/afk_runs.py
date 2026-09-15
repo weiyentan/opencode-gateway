@@ -1,14 +1,20 @@
 """Canonical AFK Run REST API (issue #672, contract ``docs/contracts/afk-run-api-v1.md``).
 
-Two GET endpoints under the canonical namespace ``/api/v1/afk/runs``:
+Endpoints under the canonical namespace ``/api/v1/afk/runs``:
 
 - ``GET /runs``        — paginated, filterable list of AFK Runs (§4.1).
 - ``GET /runs/{id}``   — canonical detail: the full chain for one run with
   the run block carrying the extended ``AFKRunSummary`` (§4.2).
+- ``PATCH /runs/{id}`` — guarded lifecycle update (issue #673): only the
+  contract-approved mutable fields (``title``, ``status``) may change,
+  terminal runs are frozen (409), ``pending`` runs are patchable
+  (provisional), identical values are an idempotent no-op, and the row is
+  serialized with ``SELECT ... FOR UPDATE``.
 
 This is the resource-oriented canonical surface of the AFK Run aggregate.
-The write endpoints (PATCH/DELETE, issues #673/#674) join later on this same
-router; creation remains exclusively ``POST /api/v1/afk/executions/runs``.
+The write endpoints (PATCH now via #673; DELETE joins later in #674) live on
+this same router; creation remains exclusively
+``POST /api/v1/afk/executions/runs``.
 
 **Placement (binding contract §1).** These routes deliberately live on a
 dedicated router mounted at prefix ``/api/v1/afk`` in
@@ -45,11 +51,13 @@ from afk_outcomes.models import (
     Provider,
     RunStatus,
 )
+from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.config import get_settings
 from app.core.schemas.afk import (
     AFKRunChangeRequest,
     AFKRunDetail,
     AFKRunSummary,
+    AFKRunUpdateRequest,
     EntityLink,
     SessionLink,
     UsageAggregate,
@@ -58,6 +66,7 @@ from app.core.schemas.usage import PaginatedResponse
 from app.core.telemetry import timed_operation
 from app.core.timeouts import db_timeout as _db_timeout
 from app.core.timeouts import request_timeout as _request_timeout
+from app.api.afk_executions import require_awx_execution_binding_credential
 from app.db.session import get_session
 
 router = APIRouter(tags=["afk-runs"])
@@ -578,3 +587,91 @@ async def get_run_detail(
             detail=f"AFK run not found: {afk_run_id}",
         )
     return detail
+
+
+@router.patch("/runs/{afk_run_id}", response_model=AFKRunSummary)
+async def update_run(
+    afk_run_id: str,
+    body: AFKRunUpdateRequest,
+    request: Request,
+    auth: dict = Depends(require_awx_execution_binding_credential),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AFKRunSummary:
+    """Apply a guarded update to one canonical AFK Run (issue #673).
+
+    Mutable fields are exactly ``{title, status}`` — unknown fields, explicit
+    nulls, and empty bodies are rejected with 422 (``extra="forbid"`` schema
+    plus non-erasing update rules).  Lifecycle rules, evaluated by the
+    repository under a ``SELECT ... FOR UPDATE`` row lock:
+
+    * ``pending`` runs are provisional and patchable — every RunStatus
+      transition (and title change) is applied.
+    * Terminal runs (``completed`` / ``failed`` / ``cancelled`` /
+      ``timed_out``) are frozen → 409 when the request would change them;
+      history is never rewritten.
+    * Identical values are an idempotent no-op → 200 with the unchanged
+      summary.
+
+    The response is the updated :class:`AFKRunSummary`.  Only the run's own
+    ``title``/``status`` columns are written — linked execution bindings,
+    change-request bindings, entity links, and session links are preserved
+    by construction.  Auth = Admin API Key (global middleware) AND the
+    dedicated ``awx-execution-bindings`` collector credential.
+    """
+    _validate_afk_run_id(afk_run_id)
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.update.afk_run.guarded", "db"):
+            async with _db_timeout(
+                "db.update.afk_run.guarded", settings.database_timeout_seconds
+            ):
+                result = await repo.update_afk_run(
+                    afk_run_id=afk_run_id,
+                    title=body.title,
+                    title_provided="title" in body.model_fields_set,
+                    status=body.status.value if body.status is not None else None,
+                    status_provided="status" in body.model_fields_set,
+                )
+
+        if result.not_found:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"AFK run not found: {afk_run_id}",
+            )
+        if result.is_conflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "AFK run has reached a terminal status and is frozen: "
+                    f"{afk_run_id}"
+                ),
+            )
+
+        # Re-read the row for the response (the repository returns flags;
+        # the caller re-reads — the established write-path pattern).
+        async with timed_operation("db.query.afk.canonical_run.updated", "db"):
+            async with _db_timeout(
+                "db.query.afk.canonical_run.updated",
+                settings.database_timeout_seconds,
+            ):
+                row = await conn.fetchrow(
+                    """
+                    SELECT afk_run_id, provider, status, title, repository,
+                           trigger_type, recovered_from_afk_run_id,
+                           change_request_provider, change_request_repository,
+                           change_request_external_id,
+                           started_at, finished_at, outcome_status,
+                           first_seen_at, last_seen_at
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    """,
+                    afk_run_id,
+                )
+    if row is None:
+        # Should not happen — the guarded update saw the row under lock.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve updated AFK run",
+        )
+    return _afk_run_summary(row)

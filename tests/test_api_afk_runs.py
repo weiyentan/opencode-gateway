@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import AsyncClient
@@ -590,6 +590,479 @@ class TestCanonicalRunDetail:
         assert payload["status"] == "error"
         assert payload["error"]["code"] == "BAD_REQUEST"
         mock_conn.fetchrow.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Guarded updates — PATCH /api/v1/afk/runs/{afk_run_id} (issue #673)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _credential_auth_row() -> MagicMock:
+    """Mock row that passes require_collector_token (dedicated AWX client)."""
+    from app.api.afk_executions import AWX_EXECUTION_BINDING_CLIENT_NAME
+
+    return mock_row(
+        {
+            "credential_id": uuid.uuid4(),
+            "revoked_at": None,
+            "last_used_at": None,
+            "client_id": uuid.uuid4(),
+            "client_name": AWX_EXECUTION_BINDING_CLIENT_NAME,
+            "client_is_active": True,
+        }
+    )
+
+
+class TestAFKRunUpdate:
+    """Tests for PATCH /api/v1/afk/runs/{afk_run_id} (issue #673).
+
+    Mutable fields are exactly ``{title, status}``.  Terminal stored
+    statuses (completed/failed/cancelled/timed_out) are frozen → 409;
+    ``pending`` runs are patchable (every transition applies → 200);
+    identical values → 200 idempotent no-op; empty bodies → 422.
+    Serialization uses ``SELECT ... FOR UPDATE``; the write path
+    requires the Admin API Key AND the ``awx-execution-bindings`` collector
+    credential; the response is the updated ``AFKRunSummary``.
+    """
+
+    def _patch_client(self, mock_conn: AsyncMock) -> AsyncClient:
+        from tests.conftest import create_client
+
+        return create_client(mock_conn)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_title_and_status_success(
+        self, mock_conn: AsyncMock
+    ):
+        """A non-terminal run accepts title and status changes → 200."""
+        stored = _mk_run_row(status="running", outcome=None, outcome_status=None)
+        updated = _mk_run_row(
+            status="completed",
+            title="Renamed run",
+            outcome=None,
+            outcome_status=None,
+        )
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, updated]
+        )
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"title": "Renamed run", "status": "completed"},
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        data = body["data"]
+        assert data["afk_run_id"] == _RUN_ID
+        assert data["title"] == "Renamed run"
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_same_status_is_idempotent_noop(
+        self, mock_conn: AsyncMock
+    ):
+        """Identical supplied values → 200 with no UPDATE issued."""
+        stored = _mk_run_row(status="running", title="Fix login bug", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, stored]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+            )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "running"
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_title_only(self, mock_conn: AsyncMock):
+        """A title-only change on a non-terminal run → 200."""
+        stored = _mk_run_row(status="running", title="Old title", outcome=None, outcome_status=None)
+        updated = _mk_run_row(status="running", title="New title", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, updated]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": "New title"}
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["title"] == "New title"
+        assert data["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_preserves_linked_relationships(
+        self, mock_conn: AsyncMock
+    ):
+        """Only the run's own title/status columns are written — execution
+        bindings, change-request bindings, entity and session links are
+        never touched by the guarded update."""
+        stored = _mk_run_row(
+            status="running",
+            title="Old",
+            outcome=None,
+            outcome_status=None,
+            change_request_provider="gitlab",
+            change_request_repository="acme/proj",
+            change_request_external_id="442",
+        )
+        updated = _mk_run_row(
+            status="completed",
+            title="New",
+            outcome=None,
+            outcome_status=None,
+            change_request_provider="gitlab",
+            change_request_repository="acme/proj",
+            change_request_external_id="442",
+        )
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, updated]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"title": "New", "status": "completed"},
+            )
+
+        assert response.status_code == 200
+        # Exactly one business write: the afk_runs title/status UPDATE
+        # (the other execute is the credential last_used_at touch).
+        updates = [
+            call[0][0]
+            for call in mock_conn.execute.call_args_list
+            if "UPDATE afk_runs" in call[0][0]
+        ]
+        assert len(updates) == 1
+        assert "SET title = $2" in updates[0]
+        assert "status = $3" in updates[0]
+        # No other table is written.
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        for table in (
+            "execution_bindings",
+            "afk_run_entities",
+            "afk_run_sessions",
+            "afk_run_change_requests",
+            "unresolved_correlations",
+        ):
+            assert not any(table in sql for sql in executed_sql)
+        # The change-request binding survives on the returned summary.
+        assert response.json()["data"]["change_request"] == {
+            "provider": "gitlab",
+            "repository": "acme/proj",
+            "external_id": "442",
+        }
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_title_is_trimmed(
+        self, mock_conn: AsyncMock
+    ):
+        """Supplied titles are whitespace-trimmed before being stored."""
+        stored = _mk_run_row(status="running", title="Old title", outcome=None, outcome_status=None)
+        updated = _mk_run_row(status="running", title="Padded title", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, updated]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": "  Padded title  "}
+            )
+
+        assert response.status_code == 200
+        updates = [
+            call for call in mock_conn.execute.call_args_list
+            if "UPDATE afk_runs" in call[0][0]
+        ]
+        assert len(updates) == 1
+        # execute(sql, afk_run_id, new_title, new_status)
+        assert updates[0].args[2] == "Padded title"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_title",
+        [
+            "x" * 1001,  # exceeds the 1000-character bound
+            "   ",  # whitespace-only — empty after trim
+        ],
+    )
+    async def test_afk_run_update_invalid_titles_return_422(
+        self, mock_conn: AsyncMock, bad_title: str
+    ):
+        """Whitespace-only titles (empty after trim) and titles over the
+        1000-character bound are invalid → 422, nothing mutated."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row()])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": bad_title}
+            )
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_unknown_field_returns_422(
+        self, mock_conn: AsyncMock
+    ):
+        """Unknown fields are rejected — mutable set is exactly {title, status}."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row()])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"status": "running", "repository": "acme/proj"},
+            )
+
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_invalid_status_returns_422(
+        self, mock_conn: AsyncMock
+    ):
+        """status is validated against the RunStatus vocabulary."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row()])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "bogus"}
+            )
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["title", "status"])
+    async def test_afk_run_update_explicit_null_returns_422(
+        self, mock_conn: AsyncMock, field: str
+    ):
+        """Explicit nulls never erase — the update path is non-erasing."""
+        stored = _mk_run_row(status="running", title="Fix login bug", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row(), stored])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={field: None}
+            )
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+        # Nothing was mutated.
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_empty_body_returns_422(
+        self, mock_conn: AsyncMock
+    ):
+        """An empty body (no mutable field supplied) is an invalid request —
+        422, nothing queried beyond the credential gate."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row()])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={}
+            )
+
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "VALIDATION_ERROR"
+        # Only the credential lookup ran — no run-row query.
+        assert mock_conn.fetchrow.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "target_status",
+        ["running", "completed", "blocked", "stale", "timed_out", "failed", "cancelled"],
+    )
+    async def test_afk_run_update_pending_run_applies_transition(
+        self, mock_conn: AsyncMock, target_status: str
+    ):
+        """``pending`` runs are provisional and patchable — every RunStatus
+        transition is applied (200), not rejected."""
+        pending_row = _mk_run_row(
+            status="pending", title=None, outcome=None, outcome_status=None
+        )
+        updated = _mk_run_row(
+            status=target_status, title="New title", outcome=None, outcome_status=None
+        )
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), pending_row, updated]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"title": "New title", "status": target_status},
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert payload["data"]["status"] == target_status
+        assert payload["data"]["title"] == "New title"
+        # The transition is applied — exactly one afk_runs UPDATE.
+        updates = [
+            call[0][0] for call in mock_conn.execute.call_args_list
+            if "UPDATE afk_runs" in call[0][0]
+        ]
+        assert len(updates) == 1
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_missing_run_returns_404(
+        self, mock_conn: AsyncMock
+    ):
+        """A well-formed but unknown afk_run_id → 404, nothing mutated."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row(), None])
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+            )
+
+        assert response.status_code == 404
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "NOT_FOUND"
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled", "timed_out"])
+    async def test_afk_run_update_terminal_run_is_frozen_409(
+        self, mock_conn: AsyncMock, terminal_status: str
+    ):
+        """Terminal runs are frozen — any change attempt → 409, no mutation."""
+        stored = _mk_run_row(
+            status=terminal_status, title="Done", outcome=None, outcome_status=None
+        )
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row(), stored])
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"title": "Rewrite history", "status": "running"},
+            )
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "CONFLICT"
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_terminal_same_values_idempotent_200(
+        self, mock_conn: AsyncMock
+    ):
+        """A terminal run receiving its own current values → 200 no-op."""
+        stored = _mk_run_row(status="completed", title="Done", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, stored]
+        )
+        mock_conn.execute = AsyncMock()
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}",
+                json={"title": "Done", "status": "completed"},
+            )
+
+        assert response.status_code == 200
+        executed_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_requires_auth(self, mock_conn: AsyncMock):
+        """PATCH requires the Admin API Key — 401 without it."""
+        client = create_client(mock_conn, api_key=None)
+
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+            )
+
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_malformed_id_returns_400(
+        self, mock_conn: AsyncMock
+    ):
+        """Non-ULID path ids are rejected with 400 before any business query
+        (the collector-credential gate precedes handler validation)."""
+        mock_conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row()])
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                "/api/v1/afk/runs/not-a-ulid", json={"status": "running"}
+            )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "BAD_REQUEST"
+        # Only the credential lookup ran — no run-row query.
+        assert mock_conn.fetchrow.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_afk_run_update_serializes_with_for_update(
+        self, mock_conn: AsyncMock
+    ):
+        """The lifecycle row is locked with SELECT ... FOR UPDATE."""
+        stored = _mk_run_row(status="running", outcome=None, outcome_status=None)
+        updated = _mk_run_row(status="blocked", outcome=None, outcome_status=None)
+        mock_conn.fetchrow = AsyncMock(
+            side_effect=[_credential_auth_row(), stored, updated]
+        )
+
+        client = self._patch_client(mock_conn)
+        async with client as c:
+            response = await c.patch(
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "blocked"}
+            )
+
+        assert response.status_code == 200
+        # fetchrow call #2 is the repository's guarded read.
+        guard_sql = mock_conn.fetchrow.call_args_list[1][0][0]
+        assert "FOR UPDATE" in guard_sql
 
 
 # ══════════════════════════════════════════════════════════════════════════

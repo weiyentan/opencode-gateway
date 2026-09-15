@@ -13,9 +13,14 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from afk_outcomes.models import AWXJobIdentity, CorrelationEvidence, EngineeringOutcome
+from afk_outcomes.models import (
+    AWXJobIdentity,
+    CorrelationEvidence,
+    EngineeringOutcome,
+    RunStatus,
+)
 
 
 class RunSummary(BaseModel):
@@ -73,6 +78,68 @@ class AFKRunSummary(RunSummary):
         default=None,
         description="{provider, repository, external_id} when bound; null when unbound",
     )
+
+
+class AFKRunUpdateRequest(BaseModel):
+    """Request body for ``PATCH /api/v1/afk/runs/{afk_run_id}`` (issue #673).
+
+    The mutable-field set is exactly ``{title, status}`` — nothing else is
+    accepted (``extra="forbid"`` rejects unknown fields with 422).  An empty
+    body (neither field supplied) is also rejected with 422.  A field
+    omitted from the body leaves the stored value untouched (non-erasing);
+    an explicitly-null field is rejected — the update path never erases.
+    ``title`` is whitespace-trimmed before validation and storage, with a
+    1000-character maximum.  ``status`` is validated against the
+    :class:`RunStatus` vocabulary (``pending`` is the provisional
+    pre-lifecycle value written only by provisioning and is never a valid
+    PATCH *target* — patching a stored-``pending`` run to any RunStatus
+    value applies the transition).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description=(
+            "New lifecycle title (whitespace-trimmed, at most 1000 characters); "
+            "omit to leave unchanged"
+        ),
+    )
+    status: RunStatus | None = Field(
+        default=None,
+        description="New lifecycle status (RunStatus value); omit to leave unchanged",
+    )
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _strip_title(cls, value: object) -> object:
+        """Trim surrounding whitespace before validation — the stored value
+        is the trimmed value, and the length bounds apply to it."""
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @model_validator(mode="after")
+    def _require_at_least_one_field(self) -> AFKRunUpdateRequest:
+        """An empty body (no mutable field supplied) is invalid — 422."""
+        if not ({"title", "status"} & self.model_fields_set):
+            raise ValueError(
+                "at least one of 'title' or 'status' must be provided"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_explicit_nulls(self) -> AFKRunUpdateRequest:
+        """Explicit nulls are invalid — omitted fields are the only way to
+        leave a stored value unchanged (non-erasing update contract)."""
+        provided = self.model_fields_set
+        if "title" in provided and self.title is None:
+            raise ValueError("title must not be null; omit the field to leave it unchanged")
+        if "status" in provided and self.status is None:
+            raise ValueError("status must not be null; omit the field to leave it unchanged")
+        return self
 
 
 class EntityLink(BaseModel):

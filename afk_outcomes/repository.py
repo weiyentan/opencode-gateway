@@ -458,6 +458,40 @@ class UpdateExecutionBindingResult:
     not_found: bool = False
 
 
+# RunStatus values that freeze a run (issue #673): once the lifecycle has
+# reached a terminal status it can no longer be mutated through the guarded
+# update path — history is never rewritten.
+_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+        RunStatus.TIMED_OUT.value,
+    }
+)
+
+
+@dataclass(frozen=True)
+class UpdateAFKRunResult:
+    """Result of a guarded AFK Run update attempt (issue #673).
+
+    Returned by :meth:`AsyncpgOutcomeRepository.update_afk_run`:
+
+    * ``is_updated=True`` — the supplied title and/or status genuinely
+      mutated the stored lifecycle row.
+    * ``is_conflict=True`` — the stored run is terminal (frozen) and the
+      request would change it; nothing was mutated.
+    * ``not_found=True`` — no run with ``afk_run_id`` exists.
+    * Idempotent replay (supplied values equal the stored values) sets none
+      of the three flags — nothing was mutated.
+    """
+
+    afk_run_id: str
+    is_updated: bool = False
+    is_conflict: bool = False
+    not_found: bool = False
+
+
 @dataclass(frozen=True)
 class ChangeRequestBindingResult:
     """Result of an explicit change-request binding attempt (issue #589).
@@ -2819,6 +2853,84 @@ class AsyncpgOutcomeRepository(OutcomeRepository):
             return UpdateExecutionBindingResult(
                 binding_id=row["id"], is_updated=True
             )
+
+    async def update_afk_run(
+        self,
+        *,
+        afk_run_id: str,
+        title: str | None = None,
+        title_provided: bool = False,
+        status: str | None = None,
+        status_provided: bool = False,
+    ) -> UpdateAFKRunResult:
+        """Apply a guarded update to one canonical AFK Run (issue #673).
+
+        The mutable-field set is exactly ``{title, status}``; presence-aware
+        flags distinguish an omitted field (stored value left untouched,
+        non-erasing) from a supplied one.
+
+        **Serialization** — the ``afk_runs`` row is locked with
+        ``SELECT ... FOR UPDATE`` inside a transaction so concurrent guarded
+        updates for the same run are serialized; a second updater re-reads
+        after the first commits.
+
+        **Lifecycle rules** (evaluated under the lock):
+
+        * ``pending`` runs are provisional and patchable — every RunStatus
+          transition (and title change) is applied.
+        * Terminal statuses (``completed`` / ``failed`` / ``cancelled`` /
+          ``timed_out``) freeze the run — a request that would change it is
+          a conflict (``is_conflict``) and nothing is mutated.
+        * Identical values are an idempotent no-op — no UPDATE is issued and
+          no flag is set.
+
+        Only the ``title`` and ``status`` columns are ever written; linked
+        execution bindings, change-request bindings, entity links, and
+        session links are untouched by construction.
+
+        Returns :class:`UpdateAFKRunResult`; the caller re-reads the row for
+        the response body.
+        """
+        async with self._conn.transaction():
+            row = await self._conn.fetchrow(
+                """
+                SELECT afk_run_id, status, title
+                FROM afk_runs
+                WHERE afk_run_id = $1
+                FOR UPDATE
+                """,
+                afk_run_id,
+            )
+            if row is None:
+                return UpdateAFKRunResult(afk_run_id=afk_run_id, not_found=True)
+
+            stored_status = row["status"]
+
+            new_title = title if title_provided else row["title"]
+            new_status = status if status_provided else stored_status
+            title_changed = title_provided and row["title"] != new_title
+            status_changed = status_provided and stored_status != new_status
+
+            if not title_changed and not status_changed:
+                # Idempotent replay — nothing to mutate, no UPDATE issued.
+                return UpdateAFKRunResult(afk_run_id=afk_run_id)
+
+            if stored_status in _TERMINAL_RUN_STATUSES:
+                # A terminal lifecycle is frozen — history is never rewritten.
+                return UpdateAFKRunResult(afk_run_id=afk_run_id, is_conflict=True)
+
+            await self._conn.execute(
+                """
+                UPDATE afk_runs
+                SET title = $2,
+                    status = $3
+                WHERE afk_run_id = $1
+                """,
+                afk_run_id,
+                new_title,
+                new_status,
+            )
+            return UpdateAFKRunResult(afk_run_id=afk_run_id, is_updated=True)
 
     async def get_execution_binding_by_awx_job_id(
         self, awx_job_id: str
