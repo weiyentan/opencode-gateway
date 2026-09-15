@@ -593,6 +593,209 @@ class TestCanonicalRunDetail:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Delete run — DELETE /api/v1/afk/runs/{afk_run_id} (issue #674)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestDeleteRun:
+    """Tests for orphan-only AFK Run deletion (DELETE /api/v1/afk/runs/{id})."""
+
+    @pytest.mark.asyncio
+    async def test_eligible_orphan_run_deletes_204(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """An orphan run (no bindings, no bound CR, no delivery log) is deleted."""
+        # Orphan run row: no bound change request.
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        # Eligibility probes: no execution bindings, no delivery_log rows.
+        mock_conn.fetchval = AsyncMock(side_effect=[False, False])
+        # Link deletes then the run delete.
+        mock_conn.execute = AsyncMock(
+            side_effect=["DELETE 0", "DELETE 0", "DELETE 0", "DELETE 1"]
+        )
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 204
+
+    @pytest.mark.asyncio
+    async def test_run_with_execution_bindings_returns_409(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A run with execution bindings is ineligible — 409, nothing deleted."""
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        # Probe 1: execution bindings exist → blocked.
+        mock_conn.fetchval = AsyncMock(return_value=True)
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "CONFLICT"
+        assert "execution bindings" in payload["error"]["message"]
+        # Only the lock + probes ran — no DELETE statements were issued.
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_with_bound_change_request_returns_409(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A run with a bound change request is ineligible — 409, nothing deleted."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_mk_run_row(
+                change_request_provider="gitlab",
+                change_request_repository="acme/proj",
+                change_request_external_id="442",
+            )
+        )
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"]["code"] == "CONFLICT"
+        assert "bound change request" in payload["error"]["message"]
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_with_delivery_log_rows_returns_409(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A run with delivery_log rows is ineligible — 409, nothing deleted."""
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        # Probe 1: no bindings; Probe 2: delivery_log rows exist → blocked.
+        mock_conn.fetchval = AsyncMock(side_effect=[False, True])
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["error"]["code"] == "CONFLICT"
+        assert "delivery log" in payload["error"]["message"]
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_run_returns_404(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A well-formed but unknown afk_run_id returns 404."""
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 404
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "NOT_FOUND"
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_id", ["short", "0" * 27, "0" * 25 + "I"])
+    async def test_delete_malformed_afk_run_id_returns_400(
+        self, client: AsyncClient, mock_conn: AsyncMock, bad_id: str
+    ):
+        """Non-ULID path ids are rejected with 400 before any DB access."""
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{bad_id}")
+
+        assert response.status_code == 400
+        payload = response.json()
+        assert payload["error"]["code"] == "BAD_REQUEST"
+        mock_conn.fetchrow.assert_not_called()
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_without_api_key_returns_401(
+        self, mock_conn: AsyncMock
+    ):
+        """The Admin API Key (ApiKeyMiddleware) is required for deletion."""
+        client = create_client(mock_conn, api_key=None)
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+
+    @pytest.mark.asyncio
+    async def test_delete_without_operator_token_returns_401(
+        self, mock_conn: AsyncMock
+    ):
+        """The dedicated operator token is required — API key alone is not enough."""
+        client = create_client(mock_conn, operator_token=None)
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 401
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "UNAUTHORIZED"
+        mock_conn.fetchrow.assert_not_called()
+        mock_conn.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_delete_preserves_linked_execution_records(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Deletion removes only the run's aggregate links — never execution data."""
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        mock_conn.fetchval = AsyncMock(side_effect=[False, False])
+        mock_conn.execute = AsyncMock(
+            side_effect=["DELETE 2", "DELETE 1", "DELETE 3", "DELETE 1"]
+        )
+
+        async with client as c:
+            response = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 204
+
+        # The whole check-then-delete sequence runs in a single transaction
+        # that locks the run row (SELECT … FOR UPDATE).
+        lock_sql = mock_conn.fetchrow.call_args[0][0]
+        assert "FOR UPDATE" in lock_sql
+        mock_conn.transaction.assert_called_once()
+
+        # Only the run's own aggregate tables are deleted; execution
+        # bindings, delivery log, sessions, and engineering events are
+        # never written by the deletion path.
+        deleted_sql = [call[0][0] for call in mock_conn.execute.call_args_list]
+        assert len(deleted_sql) == 4
+        for table in (
+            "afk_run_entities",
+            "afk_run_sessions",
+            "unresolved_correlations",
+            "afk_runs",
+        ):
+            assert (
+                f"DELETE FROM {table} WHERE afk_run_id = $1" in deleted_sql
+            ), f"expected DELETE for {table}, got {deleted_sql}"
+        for forbidden in (
+            "execution_bindings",
+            "delivery_log",
+            "sessions",
+            "engineering_events",
+        ):
+            assert not any(
+                f"DELETE FROM {forbidden}" in sql for sql in deleted_sql
+            ), f"deletion must not touch {forbidden}"
+
+        # The eligibility probes READ (never write) the guarded tables.
+        probe_sql = [call[0][0] for call in mock_conn.fetchval.call_args_list]
+        assert any("execution_bindings" in sql for sql in probe_sql)
+        assert any("delivery_log" in sql for sql in probe_sql)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Coexistence with the execution-scoped endpoints (contract §6)
 # ══════════════════════════════════════════════════════════════════════════
 

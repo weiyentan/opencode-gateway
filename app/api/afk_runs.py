@@ -1,14 +1,17 @@
-"""Canonical AFK Run REST API (issue #672, contract ``docs/contracts/afk-run-api-v1.md``).
+"""Canonical AFK Run REST API (issues #672/#674, contract ``docs/contracts/afk-run-api-v1.md``).
 
-Two GET endpoints under the canonical namespace ``/api/v1/afk/runs``:
+Three endpoints under the canonical namespace ``/api/v1/afk/runs``:
 
 - ``GET /runs``        — paginated, filterable list of AFK Runs (§4.1).
 - ``GET /runs/{id}``   — canonical detail: the full chain for one run with
   the run block carrying the extended ``AFKRunSummary`` (§4.2).
+- ``DELETE /runs/{id}`` — orphan-only deletion of one AFK Run (issue #674):
+  eligible only with zero execution bindings, no bound change request, and
+  zero delivery-log rows; operator-gated.
 
 This is the resource-oriented canonical surface of the AFK Run aggregate.
-The write endpoints (PATCH/DELETE, issues #673/#674) join later on this same
-router; creation remains exclusively ``POST /api/v1/afk/executions/runs``.
+The write endpoints (PATCH #673, DELETE #674) join on this same router;
+creation remains exclusively ``POST /api/v1/afk/executions/runs``.
 
 **Placement (binding contract §1).** These routes deliberately live on a
 dedicated router mounted at prefix ``/api/v1/afk`` in
@@ -36,7 +39,15 @@ from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 
 from afk_outcomes.models import (
     CorrelationEvidence,
@@ -45,6 +56,7 @@ from afk_outcomes.models import (
     Provider,
     RunStatus,
 )
+from app.core.auth import require_operator_token
 from app.core.config import get_settings
 from app.core.schemas.afk import (
     AFKRunChangeRequest,
@@ -498,6 +510,116 @@ async def _fetch_canonical_run_detail(
     return detail
 
 
+async def _delete_orphan_run(
+    conn: asyncpg.Connection,
+    afk_run_id: str,
+    *,
+    db_timeout_seconds: int,
+) -> None:
+    """Delete one AFK Run if — and only if — it is an orphan (issue #674).
+
+    Runs the whole check-then-delete sequence inside a single transaction so
+    eligibility is evaluated under the run row's ``SELECT … FOR UPDATE`` lock:
+    a concurrent execution-binding write blocks on the row lock until this
+    transaction commits, then fails its FK check rather than corrupting the
+    read-model.
+
+    Orphan eligibility (all must hold):
+
+    - zero ``execution_bindings`` rows referencing the run,
+    - no bound change request (``change_request_provider IS NULL``),
+    - zero ``delivery_log`` rows referencing the run.
+
+    Only the run's own aggregate links are removed — ``afk_run_entities``,
+    ``afk_run_sessions``, and ``unresolved_correlations`` — followed by the
+    ``afk_runs`` row itself.  ``execution_bindings``, ``delivery_log``,
+    ``sessions``, and ``engineering_events`` are never written by this path;
+    the first two are exactly the tables the eligibility probes read.
+
+    Raises:
+        HTTPException(404): no run with this ``afk_run_id`` exists.
+        HTTPException(409): the run fails one or more eligibility rules.
+    """
+    async with conn.transaction():
+        async with timed_operation("db.delete.afk_run.lock", "db"):
+            async with _db_timeout("db.delete.afk_run.lock", db_timeout_seconds):
+                run_row = await conn.fetchrow(
+                    """
+                    SELECT change_request_provider
+                    FROM afk_runs
+                    WHERE afk_run_id = $1
+                    FOR UPDATE
+                    """,
+                    afk_run_id,
+                )
+        if run_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"AFK run not found: {afk_run_id}",
+            )
+
+        blocked: list[str] = []
+        if run_row["change_request_provider"] is not None:
+            blocked.append("run has a bound change request")
+
+        async with timed_operation("db.delete.afk_run.eligibility", "db"):
+            async with _db_timeout(
+                "db.delete.afk_run.eligibility", db_timeout_seconds
+            ):
+                has_bindings = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM execution_bindings WHERE afk_run_id = $1
+                    )
+                    """,
+                    afk_run_id,
+                )
+                if has_bindings:
+                    blocked.append("run has execution bindings")
+
+                has_deliveries = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM delivery_log WHERE afk_run_id = $1
+                    )
+                    """,
+                    afk_run_id,
+                )
+                if has_deliveries:
+                    blocked.append("run has delivery log rows")
+
+        if blocked:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"AFK run {afk_run_id} is not an orphan and cannot be "
+                    f"deleted: {'; '.join(blocked)}"
+                ),
+            )
+
+        async with timed_operation("db.delete.afk_run.links", "db"):
+            async with _db_timeout("db.delete.afk_run.links", db_timeout_seconds):
+                await conn.execute(
+                    "DELETE FROM afk_run_entities WHERE afk_run_id = $1",
+                    afk_run_id,
+                )
+                await conn.execute(
+                    "DELETE FROM afk_run_sessions WHERE afk_run_id = $1",
+                    afk_run_id,
+                )
+                await conn.execute(
+                    "DELETE FROM unresolved_correlations WHERE afk_run_id = $1",
+                    afk_run_id,
+                )
+
+        async with timed_operation("db.delete.afk_run.run", "db"):
+            async with _db_timeout("db.delete.afk_run.run", db_timeout_seconds):
+                await conn.execute(
+                    "DELETE FROM afk_runs WHERE afk_run_id = $1",
+                    afk_run_id,
+                )
+
+
 # ═════════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═════════════════════════════════════════════════════════════════════════
@@ -578,3 +700,40 @@ async def get_run_detail(
             detail=f"AFK run not found: {afk_run_id}",
         )
     return detail
+
+
+@router.delete("/runs/{afk_run_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_run(
+    request: Request,
+    afk_run_id: str,
+    _operator_token: str = Depends(require_operator_token),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> Response:
+    """Delete an orphaned AFK Run (issue #674).
+
+    Orphan-only: a run is eligible for deletion only when it has zero
+    execution bindings, no bound change request, and zero delivery-log rows.
+    Ineligible (linked or active) runs return 409 Conflict; an unknown
+    ``afk_run_id`` returns 404 Not Found; a non-ULID path id is rejected
+    with 400 before any database access.
+
+    Authorization is two-layer: the global :class:`~app.core.auth.ApiKeyMiddleware`
+    (Admin API Key) plus the dedicated :func:`~app.core.auth.require_operator_token`
+    dependency — the Admin API Key alone does not satisfy the operator gate.
+
+    Linked execution data is preserved: only the run row and its
+    ``afk_run_entities`` / ``afk_run_sessions`` / ``unresolved_correlations``
+    links are removed; ``execution_bindings``, ``delivery_log``, ``sessions``,
+    and ``engineering_events`` are never touched.
+
+    Returns 204 No Content on success.
+    """
+    _validate_afk_run_id(afk_run_id)
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        await _delete_orphan_run(
+            conn,
+            afk_run_id,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
