@@ -1282,7 +1282,7 @@ class TestRouteCoexistence:
         from app.core.factory import create_app
 
         app = create_app(configure_logging=False)
-        paths = {route.path for route in app.routes}
+        paths = {getattr(route, "path", None) for route in app.routes}
 
         # Canonical routes (new, issue #672).
         assert "/api/v1/afk/runs" in paths
