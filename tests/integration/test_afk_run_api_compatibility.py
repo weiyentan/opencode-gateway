@@ -197,6 +197,7 @@ def _mk_conn() -> AsyncMock:
 class TestEndToEndLifecycle:
     """One AFK Run is driven through every canonical flow in sequence."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_list_detail_update_delete_flow(self) -> None:
         conn = _mk_conn()
@@ -254,6 +255,7 @@ class TestEndToEndLifecycle:
         lock_sql = conn.fetchrow.call_args_list[4][0][0]
         assert "FOR UPDATE" in lock_sql
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_detail_returns_full_chain(self) -> None:
         conn = _mk_conn()
@@ -291,6 +293,7 @@ class TestEndToEndLifecycle:
 class TestPagination:
     """``limit`` / ``offset`` are validated, echoed, and passed through."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_pagination_metadata_and_query_bounds(self) -> None:
         conn = _mk_conn()
@@ -308,6 +311,7 @@ class TestPagination:
         assert data["offset"] == 20
         assert conn.fetch.call_args[0][-2:] == (10, 20)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_default_pagination_is_50_0(self) -> None:
         conn = _mk_conn()
@@ -323,6 +327,7 @@ class TestPagination:
         assert data["offset"] == 0
         assert conn.fetch.call_args[0][-2:] == (50, 0)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw_limit", ["1", "1000"])
     async def test_limit_boundaries_accepted(self, raw_limit: str) -> None:
@@ -337,6 +342,7 @@ class TestPagination:
         assert response.status_code == 200
         assert response.json()["data"]["limit"] == int(raw_limit)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw", ["0", "1001", "-5", "ten"])
     async def test_invalid_limit_returns_400(self, raw: str) -> None:
@@ -349,6 +355,7 @@ class TestPagination:
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "BAD_REQUEST"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raw", ["-1", "later"])
     async def test_invalid_offset_returns_400(self, raw: str) -> None:
@@ -370,6 +377,7 @@ class TestPagination:
 class TestFilters:
     """Every documented filter narrows the query without leaking state."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_all_filters_parameterised_in_order(self) -> None:
         conn = _mk_conn()
@@ -401,6 +409,7 @@ class TestFilters:
         assert "OFFSET $6" in sql
         assert conn.fetch.call_args[0][4] == _CUT_TS
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_repository_filter_matches_run_or_entity(self) -> None:
         conn = _mk_conn()
@@ -416,6 +425,7 @@ class TestFilters:
         assert "r.repository = $1" in sql
         assert "re.repository = $1" in sql
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_has_change_request_false_is_unbound(self) -> None:
         conn = _mk_conn()
@@ -432,6 +442,7 @@ class TestFilters:
         sql = conn.fetch.call_args[0][0]
         assert "r.change_request_provider IS NULL" in sql
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_bad_filters_never_touch_the_database(self) -> None:
         conn = _mk_conn()
@@ -444,6 +455,7 @@ class TestFilters:
         conn.fetch.assert_not_called()
         conn.fetchval.assert_not_called()
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "params",
@@ -475,6 +487,7 @@ class TestFilters:
 class TestAuthorization:
     """Each endpoint enforces the correct credential layer."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("method", "path"),
@@ -495,6 +508,7 @@ class TestAuthorization:
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_patch_requires_collector_credential(self) -> None:
         """A failed collector-credential lookup yields 401 before any row read."""
@@ -510,6 +524,7 @@ class TestAuthorization:
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_patch_rejects_non_awx_credential(self) -> None:
         """A valid credential owned by another client is rejected with 403."""
@@ -534,6 +549,7 @@ class TestAuthorization:
 
         assert response.status_code == 403
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_delete_requires_operator_token(self) -> None:
         conn = _mk_conn()
@@ -547,6 +563,7 @@ class TestAuthorization:
         conn.fetchrow.assert_not_called()
         conn.execute.assert_not_called()
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_delete_fails_closed_when_operator_token_unconfigured(
         self, monkeypatch: pytest.MonkeyPatch
@@ -573,6 +590,7 @@ class TestAuthorization:
 class TestErrorSemantics:
     """The documented error catalogue is honoured on every path."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_detail_unknown_run_returns_404(self) -> None:
         conn = _mk_conn()
@@ -585,6 +603,7 @@ class TestErrorSemantics:
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "NOT_FOUND"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_update_unknown_run_returns_404(self) -> None:
         conn = _mk_conn()
@@ -599,6 +618,7 @@ class TestErrorSemantics:
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "NOT_FOUND"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_delete_unknown_run_returns_404(self) -> None:
         conn = _mk_conn()
@@ -611,6 +631,7 @@ class TestErrorSemantics:
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "NOT_FOUND"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "terminal_status", ["completed", "failed", "cancelled", "timed_out"]
@@ -630,6 +651,7 @@ class TestErrorSemantics:
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "CONFLICT"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "body",
@@ -657,6 +679,7 @@ class TestErrorSemantics:
         executed_sql = [call[0][0] for call in conn.execute.call_args_list]
         assert not any("UPDATE afk_runs" in sql for sql in executed_sql)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("method", "path"),
@@ -687,6 +710,7 @@ class TestErrorSemantics:
 class TestDeletionOrphanRules:
     """Deletion is orphan-only and preserves every linked execution record."""
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_eligible_orphan_deletes_and_removes_only_aggregate_links(self) -> None:
         conn = _mk_conn()
@@ -713,6 +737,7 @@ class TestDeletionOrphanRules:
         ):
             assert f"DELETE FROM {table} WHERE afk_run_id = $1" in deleted_sql
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_relationship_preservation_no_execution_table_is_written(self) -> None:
         """Only the run's aggregate links are removed — execution data is not."""
@@ -744,6 +769,7 @@ class TestDeletionOrphanRules:
         assert any("execution_bindings" in sql for sql in probe_sql)
         assert any("delivery_log" in sql for sql in probe_sql)
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_bindings_make_run_ineligible(self) -> None:
         conn = _mk_conn()
@@ -759,6 +785,7 @@ class TestDeletionOrphanRules:
         assert "execution bindings" in response.json()["error"]["message"]
         conn.execute.assert_not_called()
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_bound_change_request_makes_run_ineligible(self) -> None:
         conn = _mk_conn()
@@ -778,6 +805,7 @@ class TestDeletionOrphanRules:
         assert "bound change request" in response.json()["error"]["message"]
         conn.execute.assert_not_called()
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_delivery_log_rows_make_run_ineligible(self) -> None:
         conn = _mk_conn()
@@ -792,6 +820,7 @@ class TestDeletionOrphanRules:
         assert "delivery log" in response.json()["error"]["message"]
         conn.execute.assert_not_called()
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_ineligible_run_emits_no_delete_statements(self) -> None:
         conn = _mk_conn()
@@ -820,6 +849,7 @@ class TestDeletionOrphanRules:
 class TestExecutionApiCompatibility:
     """The canonical router must not change the execution-scoped surface."""
 
+    @pytest.mark.integration
     def test_canonical_and_execution_routes_coexist(self) -> None:
         from app.core.factory import create_app
 
@@ -835,6 +865,7 @@ class TestExecutionApiCompatibility:
         assert "/api/v1/afk/executions/runs/{afk_run_id}" in paths
         assert "/api/v1/afk/executions/runs/by-change-request" in paths
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_binding_detail_read_still_works(self) -> None:
         from tests.test_api_afk_executions import _mk_binding_row
@@ -851,6 +882,7 @@ class TestExecutionApiCompatibility:
         assert body["status"] == "ok"
         assert body["data"]["awx_job"]["job_id"] == "42"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_binding_detail_404_and_400_unchanged(self) -> None:
         conn = _mk_conn()
@@ -867,6 +899,7 @@ class TestExecutionApiCompatibility:
             malformed = await c.get("/api/v1/afk/executions/abc")
         assert malformed.status_code == 400
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_history_list_shape_unchanged(self) -> None:
         from tests.test_api_afk_executions import _mk_binding_row
@@ -896,6 +929,7 @@ class TestExecutionApiCompatibility:
         assert history["resource"]["provider"] == "github"
         assert [b["outcome"] for b in history["bindings"]] == ["failed", "completed"]
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_create_still_returns_201(self) -> None:
         from tests.test_api_afk_executions import (
@@ -943,6 +977,7 @@ class TestExecutionApiCompatibility:
         assert response.status_code == 201
         assert response.json()["data"]["afk_run_id"] == run_ulid
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_create_validation_unchanged_422(self) -> None:
         from tests.test_api_afk_executions import _auth_row
@@ -969,6 +1004,7 @@ class TestExecutionApiCompatibility:
 
         assert response.status_code == 422
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_run_scoped_read_unchanged(self) -> None:
         from tests.test_api_afk_executions import _mk_binding_row
@@ -1008,6 +1044,7 @@ class TestExecutionApiCompatibility:
         assert body["status"] == "ok"
         assert body["data"][0]["awx_job"]["job_id"] == "10"
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_run_scoped_read_unknown_run_404(self) -> None:
         conn = _mk_conn()
@@ -1021,6 +1058,7 @@ class TestExecutionApiCompatibility:
 
         assert response.status_code == 404
 
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_execution_legacy_row_readback_unchanged(self) -> None:
         """Legacy rows without ``afk_run_id`` still read back with null fields."""

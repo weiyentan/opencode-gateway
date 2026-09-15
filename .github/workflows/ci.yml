@@ -58,6 +58,7 @@ jobs:
             tests/integration/test_execution_cost_attribution.py \
             tests/integration/test_afk_lifecycle_multi_stage.py \
             tests/integration/test_execution_bindings.py \
+            tests/integration/test_afk_run_api_compatibility.py \
             -v -m integration
 
       - name: Lint Python
