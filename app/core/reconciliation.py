@@ -1,14 +1,19 @@
-"""Core reconciliation: canonical replay-merge delta computation and application.
+"""Canonical replay-merge transaction orchestration (ADR 0012).
 
-The deepest module of the Replay-Safe Usage Accounting epic (#383).  It
-implements the canonical-event counterpart of the legacy Replay Merge
-(ADR 0011) for the ``usage_events`` table (migration 0021): a losing
-replay delivery is reconciled against the stored canonical event by
-computing a per-field delta and applying that delta to both the event
-row and the owning session aggregate, all inside the caller's
-transaction.
+The DB half of the Replay-Safe Usage Accounting epic (#383).  The
+*policy* — the delta-computation rules themselves — lives in
+:mod:`app.core.merge_policy` (pure domain, issue #684); this module
+applies that policy inside the caller's transaction: it serialises
+concurrent deliveries with advisory locks, reads the stored canonical
+event, computes the delta via :func:`app.core.merge_policy.compute_delta`,
+and writes the event row, the owning session aggregate, and the Client
+Project Rollup.
 
-Semantics (canonical-event model, per issue #385):
+The pure-domain names are re-exported here unchanged so existing
+``from app.core.reconciliation import ...`` callers keep working —
+``app.core.merge_policy`` is the single source of truth for the policy.
+
+Semantics (canonical-event model, per issue #385, ADR 0012):
 
 - **Non-null collector values are authoritative.**  A replay carrying a
   non-null value different from the stored event value corrects the
@@ -44,69 +49,27 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from enum import Enum
 from typing import Any
 
 import asyncpg
 
+# ── Pure-domain policy (single source of truth: app.core.merge_policy) ──────
+# Re-exported unchanged for backward compatibility (issue #684): every name
+# below is *imported*, never redefined here.
+from app.core.merge_policy import (
+    COST_FIELD as COST_FIELD,
+    DELTA_FIELDS as DELTA_FIELDS,
+    ROLLUP_FIELDS as ROLLUP_FIELDS,
+    SESSION_FIELD_MAP as SESSION_FIELD_MAP,
+    SESSION_TOKEN_FIELDS as SESSION_TOKEN_FIELDS,
+    DeltaResult as DeltaResult,
+    IngestOutcome as IngestOutcome,
+    _to_decimal as _to_decimal,
+    compute_delta as compute_delta,
+    validate_no_negative_totals as validate_no_negative_totals,
+)
+
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Field sets — the seven delta-computable fields of a canonical usage event
-# ---------------------------------------------------------------------------
-
-DELTA_FIELDS: tuple[str, ...] = (
-    "input_tokens",
-    "output_tokens",
-    "cached_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "reasoning_tokens",
-    "estimated_cost_usd",
-)
-"""Every canonical-event field that participates in delta computation."""
-
-ROLLUP_FIELDS: tuple[str, ...] = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "estimated_cost_usd",
-)
-"""The subset of DELTA_FIELDS with corresponding client_project_rollup columns.
-
-``cached_tokens`` and ``reasoning_tokens`` are in DELTA_FIELDS but have
-no rollup column — they map to sessions only.  The rollup stores only
-additive token/cost totals (ADR 0015 decision 3).
-"""
-
-SESSION_TOKEN_FIELDS: tuple[str, ...] = (
-    "input_tokens",
-    "output_tokens",
-    "cached_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-)
-"""Token fields with a ``sessions`` aggregate column.
-
-``reasoning_tokens`` is deliberately absent: the ``sessions`` table has
-no reasoning-token aggregate, so reasoning deltas are written to the
-event but never adjusted onto the session.
-"""
-
-COST_FIELD: str = "estimated_cost_usd"
-"""The cost field — deltas are ``Decimal`` arithmetic."""
-
-# Canonical event field -> sessions aggregate column.  These are the real
-# column names of the ``sessions`` table (see app/db/models/ingest.py).
-SESSION_FIELD_MAP: dict[str, str] = {
-    "input_tokens": "total_input_tokens",
-    "output_tokens": "total_output_tokens",
-    "cached_tokens": "total_cached_tokens",
-    "cache_read_tokens": "total_cache_read_tokens",
-    "cache_write_tokens": "total_cache_write_tokens",
-    "estimated_cost_usd": "total_estimated_cost_usd",
-}
 
 # ---------------------------------------------------------------------------
 # Advisory lock key — per-event serialisation namespace
@@ -205,165 +168,6 @@ async def acquire_canonical_event_lock(
 
 
 # ---------------------------------------------------------------------------
-# Outcome enum
-# ---------------------------------------------------------------------------
-
-
-class IngestOutcome(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
-    """Outcome of a replay delivery, compatible with the ingest layer.
-
-    Values are the plain strings used by the ingest response layer
-    (``accepted``/``rejected``/``conflict``) plus the replay-specific
-    outcomes of this module (``duplicate``/``updated``/``quarantined``).
-    """
-
-    ACCEPTED = "accepted"
-    DUPLICATE = "duplicate"
-    UPDATED = "updated"
-    QUARANTINED = "quarantined"
-    CONFLICT = "conflict"
-    REJECTED = "rejected"
-
-
-# ---------------------------------------------------------------------------
-# DeltaResult
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DeltaResult:
-    """The difference between a stored canonical event and incoming values.
-
-    Attributes:
-        old_values: Per-field stored values of the canonical event.
-        new_values: Per-field *effective* values after the non-erasing
-            merge — the incoming value when the collector sent a non-null
-            value, the stored value otherwise (null/omitted incoming never
-            erases).
-        deltas: Per-field deltas (``effective new - old``); always zero
-            for null/omitted incoming values.
-        token_adjustment: Overall token adjustment for the session — the
-            sum of the per-field deltas of :data:`SESSION_TOKEN_FIELDS`
-            (the token fields with a session aggregate column).
-            ``reasoning_tokens`` is excluded because ``sessions`` carries
-            no reasoning aggregate.
-        cost_adjustment: The ``estimated_cost_usd`` delta.
-    """
-
-    old_values: dict[str, int | Decimal | None]
-    new_values: dict[str, int | Decimal | None]
-    deltas: dict[str, int | Decimal]
-    token_adjustment: int
-    cost_adjustment: Decimal
-
-
-# ---------------------------------------------------------------------------
-# Value coercion helpers
-# ---------------------------------------------------------------------------
-
-
-def _to_decimal(value: Any) -> Decimal | None:
-    """Coerce a numeric value to ``Decimal``, passing ``None`` through."""
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
-
-
-# ---------------------------------------------------------------------------
-# Delta computation
-# ---------------------------------------------------------------------------
-
-
-def compute_delta(
-    old_event: Mapping[str, Any],
-    new_values: Mapping[str, Any],
-) -> DeltaResult:
-    """Compute the per-field delta between a stored canonical event and incoming values.
-
-    ``old_event`` is the stored ``usage_events`` row (an ``asyncpg``
-    ``Record``, a ``dict``, or any mapping exposing ``.get``);
-    ``new_values`` maps the :data:`DELTA_FIELDS` names to the collector's
-    incoming values — a ``None`` (or absent) value means the collector
-    did not observe the field and produces a zero delta.
-
-    Non-null incoming values are authoritative: the effective new value
-    becomes the incoming value and the delta is ``new - old`` (``old``
-    treated as zero when the stored value is NULL).  Numeric zero is a
-    valid observed value and never treated as missing.
-    """
-    old_values: dict[str, int | Decimal | None] = {}
-    effective_new: dict[str, int | Decimal | None] = {}
-    deltas: dict[str, int | Decimal] = {}
-    token_adjustment = 0
-    cost_adjustment = Decimal("0")
-
-    for field_name in DELTA_FIELDS:
-        old = old_event.get(field_name)
-        incoming = new_values.get(field_name)
-        old_values[field_name] = old
-
-        if incoming is None:
-            # Null/omitted collector value → zero delta, no erasure.
-            deltas[field_name] = 0
-            effective_new[field_name] = old
-            continue
-
-        if field_name == COST_FIELD:
-            old_cost = _to_decimal(old) or Decimal("0")
-            new_cost = _to_decimal(incoming)
-            assert new_cost is not None  # incoming is non-None here
-            delta = new_cost - old_cost
-            deltas[field_name] = delta
-            effective_new[field_name] = new_cost
-            cost_adjustment = delta
-        else:
-            old_tokens = int(old) if old is not None else 0
-            delta = int(incoming) - old_tokens
-            deltas[field_name] = delta
-            effective_new[field_name] = int(incoming)
-            if field_name in SESSION_TOKEN_FIELDS:
-                token_adjustment += delta
-
-    return DeltaResult(
-        old_values=old_values,
-        new_values=effective_new,
-        deltas=deltas,
-        token_adjustment=token_adjustment,
-        cost_adjustment=cost_adjustment,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Session-total validation
-# ---------------------------------------------------------------------------
-
-
-def validate_no_negative_totals(
-    session_id: uuid.UUID | None,
-    adjusted_values: dict[str, int | Decimal],
-) -> bool:
-    """Check and clamp adjusted session totals so no negative total is written.
-
-    Inspects the proposed post-adjustment session totals in
-    ``adjusted_values`` (keyed by ``sessions`` aggregate column names).
-    Any total that would go negative is clamped to zero **in place**, so
-    the caller can write the dict contents safely.  Returns ``True`` when
-    the adjusted totals are safe to write after clamping.
-
-    Returns ``False`` when ``session_id`` is ``None`` — there is no
-    session to protect, and the caller should skip the aggregate write.
-    """
-    if session_id is None:
-        return False
-    for column, value in adjusted_values.items():
-        if value is not None and value < 0:
-            adjusted_values[column] = Decimal("0") if isinstance(value, Decimal) else 0
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Replay merge application
 # ---------------------------------------------------------------------------
 
@@ -437,9 +241,10 @@ async def apply_replay_merge(
     Serialises concurrent deliveries of the same canonical event with a
     transaction-scoped advisory lock derived from ``event_id``, reads the
     stored ``usage_events`` row, computes the delta against ``new_values``
-    via :func:`compute_delta`, writes the authoritative (non-erasing)
-    event values, and adjusts the owning ``sessions`` aggregate by the
-    delta — clamping any total that would go negative to zero.
+    via :func:`app.core.merge_policy.compute_delta`, writes the
+    authoritative (non-erasing) event values, and adjusts the owning
+    ``sessions`` aggregate by the delta — clamping any total that would
+    go negative to zero.
 
     The Client Project Rollup is also maintained inside the same
     transaction.  The rollup key (``client_id``, ``project_id``, ``day``)
