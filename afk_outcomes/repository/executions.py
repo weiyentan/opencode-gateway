@@ -23,7 +23,7 @@ from afk_outcomes.models import (
     Provider,
     RunSessionLink,
 )
-from afk_outcomes.run_status import resolve_afk_run_status
+from afk_outcomes.service.lifecycle import get_run_status
 from afk_outcomes.serialization import ULIDSource
 
 def _parse_awx_job_id(awx_job_id: str) -> int:
@@ -257,7 +257,7 @@ class _ExecutionBindingsRepositoryMixin:
            writes.  This helper is not invoked by any binding write path.
 
         Reads the outcome multiset for the run and applies the pure-domain
-        policy :func:`afk_outcomes.run_status.resolve_afk_run_status`.  The
+        policy :func:`afk_outcomes.service.lifecycle.get_run_status`.  The
         caller must already hold the parent ``afk_runs`` lock so the
         multiset is stable while the projection computes.  Legacy rows with
         a NULL outcome carry no trusted signal and are excluded — the
@@ -271,7 +271,7 @@ class _ExecutionBindingsRepositoryMixin:
             afk_run_id,
         )
         outcomes = [row.get("outcome") for row in rows if row.get("outcome") is not None]
-        return resolve_afk_run_status(outcomes)
+        return get_run_status(outcomes)
 
     async def _converge_afk_run_status(self, afk_run_id: str) -> None:
         """Converge ``afk_runs.status`` to the binding-driven projection (issue #606).

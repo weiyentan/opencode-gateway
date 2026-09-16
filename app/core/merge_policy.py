@@ -211,11 +211,11 @@ def compute_delta(
             cost_adjustment = delta
         else:
             old_tokens = int(old) if old is not None else 0
-            delta = int(incoming) - old_tokens
-            deltas[field_name] = delta
+            token_delta = int(incoming) - old_tokens
+            deltas[field_name] = token_delta
             effective_new[field_name] = int(incoming)
             if field_name in SESSION_TOKEN_FIELDS:
-                token_adjustment += delta
+                token_adjustment += token_delta
 
     return DeltaResult(
         old_values=old_values,
