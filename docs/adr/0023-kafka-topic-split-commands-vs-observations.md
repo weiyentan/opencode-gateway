@@ -4,10 +4,10 @@
 Accepted (2026-08-18)
 
 ## Context
-- ADR 0003 established `afk.events` as the cross-repository Kafka transport between fast-api-eda-gateway (producer) and this repo's AFK Outcome Consumer (consumer group `opencode-outcomes`).
+- fast-api-eda-gateway ADR 0003 established `afk.events` as the cross-repository Kafka transport between fast-api-eda-gateway (producer) and this repo's AFK Outcome Consumer (consumer group `opencode-outcomes`).
 - Before this decision, the deployed configuration sent both AFK command messages and normalized lifecycle observations through the single topic `afk.events`. The outcomes consumer received messages it did not own, had to inspect message type before processing, and routed legitimate AFK command records to the DLQ as invalid outcome records (DLQ noise).
 - A separate consumer group does NOT filter message types from one topic — every consumer group reading a topic receives every record. The topic split is the correct isolation boundary.
-- The normalized-event v1 contract is producer-owned (FastAPI EDA Gateway ADR 0005 supersedes this repo's ADR 0020) and pinned in `docs/contracts/normalized-event-v1/` (schema.json, fixtures, checksums.sha256, consumer-policy.yaml).
+- The normalized-event v1 contract is producer-owned (fast-api-eda-gateway ADR 0005 supersedes this repo's former normalized-provider-event-mapping-bridge ADR, removed under the superseded-ADR retention policy) and pinned in `docs/contracts/normalized-event-v1/` (schema.json, fixtures, checksums.sha256, consumer-policy.yaml).
 - Live cluster facts: Strimzi Kafka, `auto.create.topics.enable: "false"` (topics must be explicitly provisioned), all topics RF=3, cleanup=delete, min ISR=2, 7-day retention (30-day for DLQs). The k8s_app/kafka repo declares `engineering.events.normalized`, `engineering.events.normalized.dlq`, and `afk.events.dlq` as KafkaTopic resources.
 
 ## Decision
@@ -49,7 +49,7 @@ Accepted (2026-08-18)
 Plus: topic names configurable via their producer and consumer environment variables, schema validation passes, and `linked_issues` is populated for develop-loop PRs/MRs.
 
 ## References
-- ADR 0003 (kafka-events-cross-repository-transport)
-- ADR 0020 (normalized-provider-event-mapping-bridge, superseded by FastAPI EDA Gateway ADR 0005)
+- fast-api-eda-gateway ADR 0003 (kafka-events-cross-repository-transport)
+- fast-api-eda-gateway ADR 0005 (producer-owned normalized-event contract; supersedes this repo's former normalized-provider-event-mapping-bridge ADR, removed under the superseded-ADR retention policy)
 - `docs/contracts/normalized-event-v1/` (producer-owned contract artifacts)
 - Design doc: "Kafka Topic Split for AFK Commands and Engineering Observations"

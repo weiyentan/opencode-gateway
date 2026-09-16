@@ -81,7 +81,7 @@ consumer_policy:
       Consumer policy.  Bridges the producer-native vocabulary into the outcome
       layer's canonical vocabulary (pull_request / merge_request → change_request,
       issue → issue; edited / updated → updated).  The producer has no concept of
-      change_request — this translation is entirely consumer-owned (ADR 0020).
+      change_request — this translation is entirely consumer-owned.
   - name: canonical event type vocabulary (_CANONICAL_EVENT_TYPES)
     where: app/consumer/afk_consumer.py
     detail: >-
