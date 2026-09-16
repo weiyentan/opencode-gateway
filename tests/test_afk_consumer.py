@@ -2405,7 +2405,7 @@ async def test_send_to_dlq_stamps_operational_max() -> None:
     consumer._producer.send_and_wait = AsyncMock()
 
     with patch(
-        "app.consumer.afk_consumer.datetime", wraps=datetime
+        "app.consumer.dlq_sweep.datetime", wraps=datetime
     ) as mock_dt:
         mock_dt.now.return_value = DLQ_NOW
         await consumer._process_message(_mk_msg(_valid_payload(action="assigned")))
@@ -2560,8 +2560,8 @@ async def test_sweep_dlq_commits_offsets_in_write_mode() -> None:
     producer = _FakeSweepProducer()
 
     with (
-        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
-        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+        patch("app.consumer.dlq_sweep.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.dlq_sweep.AIOKafkaProducer", return_value=producer),
     ):
         report = await sweep_dlq(
             "broker:9092",
@@ -2601,8 +2601,8 @@ async def test_sweep_dlq_dry_run_does_not_commit_or_publish() -> None:
     producer = _FakeSweepProducer()
 
     with (
-        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
-        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
+        patch("app.consumer.dlq_sweep.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.dlq_sweep.AIOKafkaProducer", return_value=producer),
     ):
         report = await sweep_dlq(
             "broker:9092",
@@ -2636,9 +2636,9 @@ async def test_sweep_dlq_skips_corrupt_record_with_warning() -> None:
     producer = _FakeSweepProducer()
 
     with (
-        patch("app.consumer.afk_consumer.AIOKafkaConsumer", return_value=consumer),
-        patch("app.consumer.afk_consumer.AIOKafkaProducer", return_value=producer),
-        patch("app.consumer.afk_consumer.logger") as mock_logger,
+        patch("app.consumer.dlq_sweep.AIOKafkaConsumer", return_value=consumer),
+        patch("app.consumer.dlq_sweep.AIOKafkaProducer", return_value=producer),
+        patch("app.consumer.dlq_sweep.logger") as mock_logger,
     ):
         report = await sweep_dlq(
             "broker:9092", dlq_topic, "engineering.events.normalized.dlq-expired", MAX_AGE, now=DLQ_NOW
