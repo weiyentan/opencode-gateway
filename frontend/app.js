@@ -145,9 +145,6 @@
   // Change-request summary list state (issue #613): the latest summary
   // response, the per-cycle fetch error, and the active filter set (served
   // through the summary contract — never client-side re-filtering).
-  // Issue #652: the AFK Automation filter was removed from the UI, so the
-  // automation_state query parameter is no longer emitted (the API field
-  // remains available for backward compatibility).
   let afkCrData = null;
   let afkCrFetchError = null;
   let afkCrFilters = { provider: '', repository: '', providerState: '' };
@@ -3160,9 +3157,7 @@
   /** Build the change-request summary list URL from the active filters and
    *  the shared dashboard date range (activity window).  Filter names use
    *  the #610 query contract exactly (provider / repository /
-   *  provider_state); issue #652 removed the AFK Automation filter from the
-   *  UI, so automation_state is no longer emitted (the API field remains
-   *  available for backward compatibility).  The shared date range feeds
+   *  provider_state).  The shared date range feeds
    *  activity_from/activity_to — no second date picker (PRD).  Pure — no
    *  DOM or fetch access.
    *  @param {Object|null} filters - {provider, repository, providerState};

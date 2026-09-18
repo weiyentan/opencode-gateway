@@ -156,7 +156,7 @@ def _make_run(
     return AFKRun(
         afk_run_id=afk_run_id,
         provider=Provider.GITHUB,
-            title="Integration run",
+        title="Integration run",
         started_at=started,
         finished_at=finished,
         entities=[
@@ -908,8 +908,8 @@ async def _seed_gateway_session(
 async def _seed_execution_afk_run(conn: asyncpg.Connection, run_id: str) -> None:
     """Insert a provisional afk_runs row the execution can attach to."""
     await conn.execute(
-        "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
-        " VALUES ($1, $2, 'pending', now(), now())",
+        "INSERT INTO afk_runs (afk_run_id, provider, first_seen_at, last_seen_at)"
+        " VALUES ($1, $2, now(), now())",
         run_id,
         "github",
     )
