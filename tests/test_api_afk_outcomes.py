@@ -2,7 +2,7 @@
 
 Covers the four endpoints under ``/api/v1/afk-outcomes``:
 
-- ``GET /runs``          — list runs (filterable by repository, window, status,
+- ``GET /runs``          — list runs (filterable by repository, window,
   outcome, origin; paginated)
 - ``GET /runs/{id}``     — run detail (full chain with per-link provenance and
   provisional markers)
@@ -258,7 +258,6 @@ class TestListRuns:
         assert len(data["items"]) == 1
         item = data["items"][0]
         assert item["afk_run_id"] == _RUN_ID
-        assert item["status"] == "completed"
         assert item["outcome_status"] == "merged"
 
     @pytest.mark.asyncio
@@ -275,20 +274,6 @@ class TestListRuns:
         sql = mock_conn.fetch.call_args[0][0]
         assert "afk_run_entities" in sql
         assert "re.repository = $1" in sql
-
-    @pytest.mark.asyncio
-    async def test_filters_by_status(self, client: AsyncClient, mock_conn: AsyncMock):
-        mock_conn.fetchval = AsyncMock(return_value=0)
-        mock_conn.fetch = AsyncMock(return_value=[])
-
-        async with client as c:
-            response = await c.get(
-                "/api/v1/afk-outcomes/runs", params={"status": "completed"}
-            )
-
-        assert response.status_code == 200
-        sql = mock_conn.fetch.call_args[0][0]
-        assert "r.status = $1" in sql
 
     @pytest.mark.asyncio
     async def test_filters_by_outcome(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -336,18 +321,6 @@ class TestListRuns:
         sql = mock_conn.fetch.call_args[0][0]
         assert "r.started_at >= $1" in sql
         assert "r.started_at <= $2" in sql
-
-    @pytest.mark.asyncio
-    async def test_invalid_status_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
-        async with client as c:
-            response = await c.get(
-                "/api/v1/afk-outcomes/runs", params={"status": "bogus"}
-            )
-
-        assert response.status_code == 400
-        payload = response.json()
-        assert payload["status"] == "error"
-        assert payload["error"]["code"] == "BAD_REQUEST"
 
     @pytest.mark.asyncio
     async def test_invalid_outcome_returns_400(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -434,7 +407,6 @@ class TestRunDetail:
 
         # Run aggregate
         assert data["run"]["afk_run_id"] == _RUN_ID
-        assert data["run"]["status"] == "completed"
 
         # Outcome
         assert data["outcome"]["status"] == "merged"

@@ -36,7 +36,6 @@ from afk_outcomes import (
     Provider,
     RunEntityLink,
     RunSessionLink,
-    RunStatus,
     UnresolvedCorrelation,
     UnresolvedReason,
 )
@@ -56,7 +55,6 @@ def _build_run() -> AFKRun:
     return AFKRun(
         afk_run_id=RUN_ID,
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Consolidated run",
         started_at=STARTED,
         finished_at=FINISHED,
@@ -300,7 +298,7 @@ def test_save_delivery_log_uses_on_conflict_do_nothing(mock_conn: AsyncMock) -> 
     sql = calls[0][0]
     assert "ON CONFLICT (provider, delivery_id) DO NOTHING" in sql
     # delivery keyed on (provider, afk_run_id) — the run's own identity
-    assert calls[0][1] == ("github", RUN_ID, RUN_ID, "completed")
+    assert calls[0][1] == ("github", RUN_ID, RUN_ID, None)
 
 
 def test_save_upserts_run_before_logging_delivery(mock_conn: AsyncMock) -> None:
@@ -673,7 +671,6 @@ def test_get_reconstructs_run(mock_conn: AsyncMock) -> None:
     assert run is not None
     assert run.afk_run_id == RUN_ID
     assert run.provider == Provider.GITHUB
-    assert run.status == RunStatus.COMPLETED
     assert run.outcome is not None
     assert run.outcome.status == EngineeringOutcomeStatus.MERGED
     assert [link.entity_id for link in run.entity_links] == ["issue:437"]

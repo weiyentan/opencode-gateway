@@ -105,7 +105,6 @@ class AFKRun(Base):
 
     afk_run_id: Mapped[str] = mapped_column(String(26), primary_key=True)
     provider: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

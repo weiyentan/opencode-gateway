@@ -68,7 +68,6 @@ from afk_outcomes.models import (
     EntityType,
     Provider,
     RunEntityLink,
-    RunStatus,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.identity import hash_token
@@ -371,7 +370,6 @@ def _reconstructed_run(afk_run_id: str, cr_number: str, *, merged: bool) -> AFKR
     return AFKRun(
         afk_run_id=afk_run_id,
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title=f"Implement issue #{cr_number}",
         started_at=started,
         finished_at=finished,
@@ -441,7 +439,6 @@ async def _provision_and_bind(client: object) -> str:
     prov = await client.post(_RUNS_PATH, json=_provision_payload())
     assert prov.status_code == 201, prov.text
     run_id = prov.json()["data"]["afk_run_id"]
-    assert prov.json()["data"]["status"] == "pending"
 
     bind = await client.post(
         f"{_RUNS_PATH}/{run_id}/change-request", json=_cr_binding_payload()
@@ -656,14 +653,13 @@ async def test_awx_outcomes_never_close_run_while_change_request_open(
     # No 409 occurred for any job (each stage returned 200/201 above).
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT status, outcome_status, outcome, finished_at"
+            "SELECT outcome_status, outcome, finished_at"
             " FROM afk_runs WHERE afk_run_id = $1",
             run_id,
         )
         assert row is not None
-        # The run is still open — pending, with no provider outcome derived
-        # and no finished_at (AWX outcomes never finalize it).
-        assert row["status"] == "pending"
+        # The run is still open — no provider outcome derived and no
+        # finished_at (AWX outcomes never finalize it).
         assert row["outcome_status"] is None
         assert row["outcome"] is None
         assert row["finished_at"] is None
@@ -714,11 +710,10 @@ async def test_provider_merge_event_finalizes_run_to_completed(
         # The run is finalized: completed with a merged engineering outcome.
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT status, outcome_status, finished_at"
+                "SELECT outcome_status, finished_at"
                 " FROM afk_runs WHERE afk_run_id = $1",
                 run_id,
             )
-            assert row["status"] == "completed"
             assert row["outcome_status"] == "merged"
             assert row["finished_at"] is not None
 
@@ -780,11 +775,10 @@ async def test_provider_close_without_merge_is_distinct_terminal_status(
         # Distinct terminal status: completed + closed (never merged).
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT status, outcome_status, finished_at"
+                "SELECT outcome_status, finished_at"
                 " FROM afk_runs WHERE afk_run_id = $1",
                 run_id,
             )
-            assert row["status"] == "completed"
             assert row["outcome_status"] == "closed"
             assert row["finished_at"] is not None
 

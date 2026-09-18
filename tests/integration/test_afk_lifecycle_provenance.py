@@ -309,7 +309,6 @@ async def test_provision_with_batch_persists_provenance(db_pool: asyncpg.Pool) -
         resp = await c.post(_LIFECYCLE_PROVISION_PATH, json=payload)
         assert resp.status_code == 201, resp.text
         body = resp.json()["data"]
-        assert body["status"] == "pending"
         assert len(body["afk_run_id"]) == 26
         assert body["first_delivery_id"] == "d1"
         assert body["delivery_ids"] == ["d1", "d2", "d3"]
@@ -317,12 +316,11 @@ async def test_provision_with_batch_persists_provenance(db_pool: asyncpg.Pool) -
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT first_delivery_id, status FROM afk_runs WHERE afk_run_id = $1",
+            "SELECT first_delivery_id FROM afk_runs WHERE afk_run_id = $1",
             run_id,
         )
         assert row is not None
         assert row["first_delivery_id"] == "d1"
-        assert row["status"] == "pending"
 
         batch_rows = await conn.fetch(
             "SELECT delivery_id, position FROM afk_run_delivery_batches"

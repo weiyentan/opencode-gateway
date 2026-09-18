@@ -59,7 +59,6 @@ from afk_outcomes.models import (
     EngineeringOutcome,
     EngineeringOutcomeStatus,
     Provider,
-    RunStatus,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from app.core.auth import require_operator_token
@@ -84,11 +83,6 @@ router = APIRouter(tags=["afk-runs"])
 
 # ── Valid filter values (locked domain vocabulary) ───────────────────────────
 
-# Contract §3: the status-filter vocabulary covers all EIGHT lifecycle values —
-# the seven RunStatus members plus the provisional ``pending`` (which is
-# deliberately not a RunStatus member; it enters afk_runs.status only through
-# provisioning).
-_VALID_STATUS = frozenset(m.value for m in RunStatus) | {"pending"}
 _VALID_OUTCOME = frozenset(m.value for m in EngineeringOutcomeStatus)
 _VALID_PROVIDER = frozenset(m.value for m in Provider)
 
@@ -256,7 +250,6 @@ def _afk_run_summary(row: asyncpg.Record) -> AFKRunSummary:
     return AFKRunSummary(
         afk_run_id=row["afk_run_id"],
         provider=row["provider"],
-        status=row["status"],
         title=row["title"],
         repository=row["repository"],
         trigger_type=row["trigger_type"],
@@ -273,7 +266,6 @@ def _afk_run_summary(row: asyncpg.Record) -> AFKRunSummary:
 def _build_canonical_run_filters(
     provider: str | None,
     repository: str | None,
-    status_filter: str | None,
     outcome_filter: str | None,
     has_change_request: bool | None,
     created_before: datetime | None,
@@ -304,9 +296,6 @@ def _build_canonical_run_filters(
         )
         params.append(repository)
 
-    if status_filter is not None:
-        filters.append(f"r.status = ${len(params) + 1}")
-        params.append(status_filter)
     if outcome_filter is not None:
         filters.append(f"r.outcome_status = ${len(params) + 1}")
         params.append(outcome_filter)
@@ -330,7 +319,6 @@ async def _fetch_canonical_runs(
     conn: asyncpg.Connection,
     provider: str | None,
     repository: str | None,
-    status_filter: str | None,
     outcome_filter: str | None,
     has_change_request: bool | None,
     created_before: datetime | None,
@@ -343,7 +331,6 @@ async def _fetch_canonical_runs(
     where_clause, params = _build_canonical_run_filters(
         provider,
         repository,
-        status_filter,
         outcome_filter,
         has_change_request,
         created_before,
@@ -355,7 +342,7 @@ async def _fetch_canonical_runs(
             total = await conn.fetchval(count_sql, *params)
 
     data_sql = f"""
-        SELECT r.afk_run_id, r.provider, r.status, r.title, r.repository,
+        SELECT r.afk_run_id, r.provider, r.title, r.repository,
                r.trigger_type, r.recovered_from_afk_run_id,
                r.change_request_provider, r.change_request_repository,
                r.change_request_external_id,
@@ -392,7 +379,7 @@ async def _fetch_canonical_run_detail(
         ):
             run_row = await conn.fetchrow(
                 """
-                SELECT afk_run_id, provider, status, title, started_at, finished_at,
+                SELECT afk_run_id, provider, title, started_at, finished_at,
                        outcome_status, outcome, first_seen_at, last_seen_at,
                        repository, trigger_type, recovered_from_afk_run_id,
                        change_request_provider, change_request_repository,
@@ -638,7 +625,6 @@ async def list_runs(
     request: Request,
     provider: str | None = Query(default=None),
     repository: str | None = Query(default=None),
-    status_filter: str | None = Query(default=None, alias="status"),
     outcome: str | None = Query(default=None),
     has_change_request: str | None = Query(default=None),
     created_before: str | None = Query(default=None),
@@ -649,15 +635,14 @@ async def list_runs(
     """List AFK Runs, paginated and filterable (canonical contract §4.1).
 
     Filters: ``provider``, ``repository`` (run-bound or entity-linked),
-    ``status``, ``outcome``, ``has_change_request`` (boolean on the change-
-    request binding), ``created_before`` (``first_seen_at`` strictly before
-    the given timestamp).  Ordered by ``last_seen_at DESC NULLS LAST`` with a
+    ``outcome``, ``has_change_request`` (boolean on the change-request
+    binding), ``created_before`` (``first_seen_at`` strictly before the
+    given timestamp).  Ordered by ``last_seen_at DESC NULLS LAST`` with a
     deterministic ``afk_run_id ASC`` tie-breaker.  Invalid enum values,
     unparseable datetimes, non-boolean ``has_change_request``, and
     out-of-range pagination raise 400.
     """
     _require_enum_value(provider, _VALID_PROVIDER, "provider")
-    _require_enum_value(status_filter, _VALID_STATUS, "status")
     _require_enum_value(outcome, _VALID_OUTCOME, "outcome")
     has_change_request_bool = _parse_bool_param(has_change_request, "has_change_request")
     created_before_dt = _parse_datetime(created_before, "created_before")
@@ -670,7 +655,6 @@ async def list_runs(
             conn,
             provider,
             repository,
-            status_filter,
             outcome,
             has_change_request_bool,
             created_before_dt,
@@ -718,23 +702,18 @@ async def update_run(
     auth: dict = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AFKRunSummary:
-    """Apply a guarded update to one canonical AFK Run (issue #673).
+    """Apply a guarded update to one canonical AFK Run (issue #673/#649).
 
-    Mutable fields are exactly ``{title, status}`` — unknown fields, explicit
-    nulls, and empty bodies are rejected with 422 (``extra="forbid"`` schema
-    plus non-erasing update rules).  Lifecycle rules, evaluated by the
-    repository under a ``SELECT ... FOR UPDATE`` row lock:
+    The mutable field set is exactly ``{title}`` — unknown fields, explicit
+    nulls, and empty bodies are rejected with 422 (``extra="forbid"``
+    schema plus non-erasing update rules).  Issue #649 retired the
+    ``afk_runs.status`` lifecycle column (ADR 0028 makes the bound change
+    request the lifecycle authority), so status is no longer patchable and
+    the former terminal-freeze rule no longer applies.
 
-    * ``pending`` runs are provisional and patchable — every RunStatus
-      transition (and title change) is applied.
-    * Terminal runs (``completed`` / ``failed`` / ``cancelled`` /
-      ``timed_out``) are frozen → 409 when the request would change them;
-      history is never rewritten.
-    * Identical values are an idempotent no-op → 200 with the unchanged
-      summary.
-
-    The response is the updated :class:`AFKRunSummary`.  Only the run's own
-    ``title``/``status`` columns are written — linked execution bindings,
+    Identical values are an idempotent no-op → 200 with the unchanged
+    summary.  The response is the updated :class:`AFKRunSummary`.  Only the
+    run's own ``title`` column is written — linked execution bindings,
     change-request bindings, entity links, and session links are preserved
     by construction.  Auth = Admin API Key (global middleware) AND the
     dedicated ``awx-execution-bindings`` collector credential.
@@ -751,22 +730,12 @@ async def update_run(
                     afk_run_id=afk_run_id,
                     title=body.title,
                     title_provided="title" in body.model_fields_set,
-                    status=body.status.value if body.status is not None else None,
-                    status_provided="status" in body.model_fields_set,
                 )
 
         if result.not_found:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"AFK run not found: {afk_run_id}",
-            )
-        if result.is_conflict:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "AFK run has reached a terminal status and is frozen: "
-                    f"{afk_run_id}"
-                ),
             )
 
         # Re-read the row for the response (the repository returns flags;
@@ -778,7 +747,7 @@ async def update_run(
             ):
                 row = await conn.fetchrow(
                     """
-                    SELECT afk_run_id, provider, status, title, repository,
+                    SELECT afk_run_id, provider, title, repository,
                            trigger_type, recovered_from_afk_run_id,
                            change_request_provider, change_request_repository,
                            change_request_external_id,

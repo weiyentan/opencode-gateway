@@ -1255,11 +1255,6 @@ async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
             run_id,
         )
         assert count == 2
-        status = await conn.fetchval(
-            "SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id
-        )
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert status == "pending"
 
 
 @pytest.mark.integration

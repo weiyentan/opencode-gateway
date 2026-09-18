@@ -673,7 +673,6 @@ class CorrelationEngine:
         reconstructed = AFKRun(
             afk_run_id=afk_run_id,
             provider=seed.provider,
-            status=seed.status,
             title=seed.title,
             started_at=seed.started_at,
             finished_at=seed.finished_at,

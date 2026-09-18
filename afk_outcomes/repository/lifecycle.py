@@ -17,23 +17,10 @@ import asyncpg
 from afk_outcomes.models import (
     AFKRunLifecycle,
     Provider,
-    RunStatus,
     TriggerType,
 )
 from afk_outcomes.repository.executions import ProvisionAFKRunResult
 from afk_outcomes.serialization import ULIDSource
-
-# RunStatus values that freeze a run (issue #673): once the lifecycle has
-# reached a terminal status it can no longer be mutated through the guarded
-# update path — history is never rewritten.
-_TERMINAL_RUN_STATUSES = frozenset(
-    {
-        RunStatus.COMPLETED.value,
-        RunStatus.FAILED.value,
-        RunStatus.CANCELLED.value,
-        RunStatus.TIMED_OUT.value,
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -42,18 +29,15 @@ class UpdateAFKRunResult:
 
     Returned by :meth:`AsyncpgOutcomeRepository.update_afk_run`:
 
-    * ``is_updated=True`` — the supplied title and/or status genuinely
-      mutated the stored lifecycle row.
-    * ``is_conflict=True`` — the stored run is terminal (frozen) and the
-      request would change it; nothing was mutated.
+    * ``is_updated=True`` — the supplied title genuinely mutated the stored
+      lifecycle row.
     * ``not_found=True`` — no run with ``afk_run_id`` exists.
-    * Idempotent replay (supplied values equal the stored values) sets none
-      of the three flags — nothing was mutated.
+    * Idempotent replay (supplied title equals the stored title) sets none
+      of the two flags — nothing was mutated.
     """
 
     afk_run_id: str
     is_updated: bool = False
-    is_conflict: bool = False
     not_found: bool = False
 
 
@@ -106,13 +90,13 @@ class _LifecycleRepositoryMixin:
         afk_run_id: str,
         title: str | None = None,
         title_provided: bool = False,
-        status: str | None = None,
-        status_provided: bool = False,
     ) -> UpdateAFKRunResult:
-        """Apply a guarded update to one canonical AFK Run (issue #673).
+        """Apply a guarded update to one canonical AFK Run (issue #673/#649).
 
-        The mutable-field set is exactly ``{title, status}``; presence-aware
-        flags distinguish an omitted field (stored value left untouched,
+        The mutable-field set is exactly ``{title}`` (issue #649 retired the
+        ``afk_runs.status`` lifecycle column — ADR 0028 makes the bound
+        change request the lifecycle authority); the presence-aware flag
+        distinguishes an omitted title (stored value left untouched,
         non-erasing) from a supplied one.
 
         **Serialization** — the ``afk_runs`` row is locked with
@@ -120,17 +104,8 @@ class _LifecycleRepositoryMixin:
         updates for the same run are serialized; a second updater re-reads
         after the first commits.
 
-        **Lifecycle rules** (evaluated under the lock):
-
-        * ``pending`` runs are provisional and patchable — every RunStatus
-          transition (and title change) is applied.
-        * Terminal statuses (``completed`` / ``failed`` / ``cancelled`` /
-          ``timed_out``) freeze the run — a request that would change it is
-          a conflict (``is_conflict``) and nothing is mutated.
-        * Identical values are an idempotent no-op — no UPDATE is issued and
-          no flag is set.
-
-        Only the ``title`` and ``status`` columns are ever written; linked
+        Identical values are an idempotent no-op — no UPDATE is issued and
+        no flag is set.  Only the ``title`` column is ever written; linked
         execution bindings, change-request bindings, entity links, and
         session links are untouched by construction.
 
@@ -140,7 +115,7 @@ class _LifecycleRepositoryMixin:
         async with self._conn.transaction():
             row = await self._conn.fetchrow(
                 """
-                SELECT afk_run_id, status, title
+                SELECT afk_run_id, title
                 FROM afk_runs
                 WHERE afk_run_id = $1
                 FOR UPDATE
@@ -150,31 +125,21 @@ class _LifecycleRepositoryMixin:
             if row is None:
                 return UpdateAFKRunResult(afk_run_id=afk_run_id, not_found=True)
 
-            stored_status = row["status"]
-
             new_title = title if title_provided else row["title"]
-            new_status = status if status_provided else stored_status
             title_changed = title_provided and row["title"] != new_title
-            status_changed = status_provided and stored_status != new_status
 
-            if not title_changed and not status_changed:
+            if not title_changed:
                 # Idempotent replay — nothing to mutate, no UPDATE issued.
                 return UpdateAFKRunResult(afk_run_id=afk_run_id)
-
-            if stored_status in _TERMINAL_RUN_STATUSES:
-                # A terminal lifecycle is frozen — history is never rewritten.
-                return UpdateAFKRunResult(afk_run_id=afk_run_id, is_conflict=True)
 
             await self._conn.execute(
                 """
                 UPDATE afk_runs
-                SET title = $2,
-                    status = $3
+                SET title = $2
                 WHERE afk_run_id = $1
                 """,
                 afk_run_id,
                 new_title,
-                new_status,
             )
             return UpdateAFKRunResult(afk_run_id=afk_run_id, is_updated=True)
 
@@ -312,12 +277,12 @@ class _LifecycleRepositoryMixin:
             rows = await self._conn.fetch(
                 """
                 INSERT INTO afk_runs
-                    (afk_run_id, provider, status, title, started_at, finished_at,
+                    (afk_run_id, provider, title, started_at, finished_at,
                      outcome_status, outcome, host, source_event_id, repository,
                      trigger_type, change_request_provider, change_request_repository,
                      change_request_external_id, recovered_from_afk_run_id,
                      first_delivery_id, first_seen_at, last_seen_at)
-                VALUES ($1, $2, 'pending', $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
+                VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
                         NULL, NULL, NULL, $8, $9, now(), now())
                 ON CONFLICT (provider, host, source_event_id)
                     WHERE host IS NOT NULL AND source_event_id IS NOT NULL
@@ -678,7 +643,7 @@ class _LifecycleRepositoryMixin:
         """
         row = await self._conn.fetchrow(
             """
-            SELECT afk_run_id, provider, status, host, source_event_id, repository,
+            SELECT afk_run_id, provider, host, source_event_id, repository,
                    trigger_type, title, change_request_provider,
                    change_request_repository, change_request_external_id,
                    recovered_from_afk_run_id, first_seen_at, last_seen_at
@@ -692,7 +657,6 @@ class _LifecycleRepositoryMixin:
         return AFKRunLifecycle(
             afk_run_id=row["afk_run_id"],
             provider=Provider(row["provider"]),
-            status=row["status"],
             host=row.get("host"),
             source_event_id=row.get("source_event_id"),
             repository=row.get("repository"),

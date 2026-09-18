@@ -27,7 +27,6 @@ from afk_outcomes import (
     EntityType,
     Provider,
     ResolutionResult,
-    RunStatus,
     SequenceULID,
     SessionDescriptor,
     UnresolvedReason,
@@ -64,7 +63,6 @@ def _build_window(
     seed = AFKRun(
         afk_run_id="",
         provider=provider,
-        status=RunStatus(run_meta["status"]),
         title=run_meta["title"],
         started_at=_parse_dt(run_meta["started_at"]),
         finished_at=_parse_dt(run_meta["finished_at"]),
@@ -314,7 +312,6 @@ async def test_rule_ordering_lower_confidence_never_overrides() -> None:
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #100",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -368,7 +365,6 @@ async def test_ambiguous_surfaces_resolver_result_not_forced_link() -> None:
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #100",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -404,7 +400,6 @@ async def test_unmatched_surfaces_resolver_result() -> None:
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Something no change request matches",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -432,7 +427,6 @@ async def test_temporal_inference_binds_overlapping_entity() -> None:
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="No change request",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -462,7 +456,6 @@ async def test_explicit_run_id_binds_via_event_payload() -> None:
     run = AFKRun(
         afk_run_id="01KZX9M4G80000000000000000",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Explicit run",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -510,7 +503,6 @@ async def test_rules_satisfy_correlation_rule_protocol() -> None:
     run = AFKRun(
         afk_run_id="r1",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #100",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -537,7 +529,6 @@ async def _resolve_single_cr(
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #100",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -623,7 +614,6 @@ def _shared_commit_scenario() -> tuple[AFKRun, list[EngineeringEntity]]:
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #100",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),
@@ -689,7 +679,6 @@ async def test_correlation_engine_isolates_entities_across_repositories() -> Non
     run = AFKRun(
         afk_run_id="",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Implement issue #437",
         started_at=_parse_dt("2026-08-13T08:00:00Z"),
         finished_at=_parse_dt("2026-08-13T10:00:00Z"),

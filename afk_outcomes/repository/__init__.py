@@ -59,7 +59,6 @@ from __future__ import annotations
 import asyncpg
 
 from afk_outcomes.interfaces import OutcomeRepository
-from afk_outcomes.service.lifecycle import get_run_status
 from afk_outcomes.repository.closure_projection import (
     ClosureRebuildResult,
     _ClosureProjectionRepositoryMixin,
@@ -93,7 +92,6 @@ from afk_outcomes.repository.lifecycle import (
     ChangeRequestLookupResult,
     UpdateAFKRunResult,
     _LifecycleRepositoryMixin,
-    _TERMINAL_RUN_STATUSES,
 )
 
 __all__ = [
@@ -109,7 +107,6 @@ __all__ = [
     "_CLOSURE_RELEVANT_EVENT_TYPES",
     "_RUN_LEVEL_ENTITY_TYPE",
     "_RESOLVED_ROLE",
-    "_TERMINAL_RUN_STATUSES",
     "_closure_fact_issue_keys",
     "_decode_jsonb",
     "_decode_session_ids",
@@ -121,7 +118,6 @@ __all__ = [
     "_source_reference_json",
     "_split_entity_id",
     "_to_closure_fact",
-    "get_run_status",
 ]
 
 

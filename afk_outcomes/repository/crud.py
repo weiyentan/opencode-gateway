@@ -26,7 +26,6 @@ from afk_outcomes.models import (
     ReferenceSource,
     RunEntityLink,
     RunSessionLink,
-    RunStatus,
     UnresolvedCorrelation,
     build_observation_key,
 )
@@ -249,7 +248,7 @@ class _CrudRepositoryMixin:
             run.provider.value,
             run.afk_run_id,
             run.afk_run_id,
-            run.status.value,
+            None,
         )
 
     async def _upsert_run(self, run: AFKRun) -> None:
@@ -261,11 +260,10 @@ class _CrudRepositoryMixin:
         await self._conn.execute(
             """
             INSERT INTO afk_runs
-                (afk_run_id, provider, status, title, started_at, finished_at,
+                (afk_run_id, provider, title, started_at, finished_at,
                  outcome_status, outcome, first_seen_at, last_seen_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
             ON CONFLICT (afk_run_id) DO UPDATE SET
-                status = EXCLUDED.status,
                 title = COALESCE(EXCLUDED.title, afk_runs.title),
                 started_at = COALESCE(afk_runs.started_at, EXCLUDED.started_at),
                 finished_at = COALESCE(EXCLUDED.finished_at, afk_runs.finished_at),
@@ -275,7 +273,6 @@ class _CrudRepositoryMixin:
             """,
             run.afk_run_id,
             run.provider.value,
-            run.status.value,
             run.title,
             run.started_at,
             run.finished_at,
@@ -582,7 +579,7 @@ class _CrudRepositoryMixin:
         """
         run_row = await self._conn.fetchrow(
             """
-            SELECT afk_run_id, provider, status, title, started_at, finished_at,
+            SELECT afk_run_id, provider, title, started_at, finished_at,
                    outcome_status, outcome
             FROM afk_runs
             WHERE afk_run_id = $1
@@ -703,7 +700,6 @@ class _CrudRepositoryMixin:
         return AFKRun(
             afk_run_id=run_row["afk_run_id"],
             provider=Provider(run_row["provider"]),
-            status=RunStatus(run_row["status"]),
             title=run_row["title"],
             started_at=run_row["started_at"],
             finished_at=run_row["finished_at"],

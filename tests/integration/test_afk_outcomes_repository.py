@@ -50,7 +50,6 @@ from afk_outcomes import (
     ReferenceSource,
     ResourceSessionAssociation,
     RunEntityLink,
-    RunStatus,
     UnresolvedCorrelation,
     UnresolvedReason,
 )
@@ -150,7 +149,6 @@ def _make_run(
     role: str = "resolved",
     confidence: float = 1.0,
     method: str = "issue_resolved",
-    status: RunStatus = RunStatus.COMPLETED,
     with_outcome: bool = True,
 ) -> AFKRun:
     started = datetime(2026, 8, 13, 8, 0, 0, tzinfo=UTC)
@@ -158,8 +156,7 @@ def _make_run(
     return AFKRun(
         afk_run_id=afk_run_id,
         provider=Provider.GITHUB,
-        status=status,
-        title="Integration run",
+            title="Integration run",
         started_at=started,
         finished_at=finished,
         entities=[
@@ -544,12 +541,12 @@ async def test_unresolved_ambiguous_rows_across_runs_independent(
         run_b = "01J00000000000000000000201"
 
         await repo.save_unresolved(
-            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB,),
             [_build_unresolved_item(run_a, UnresolvedReason.AMBIGUOUS)],
             repository=REPO,
         )
         await repo.save_unresolved(
-            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB,),
             [_build_unresolved_item(run_b, UnresolvedReason.AMBIGUOUS)],
             repository=REPO,
         )
@@ -577,12 +574,12 @@ async def test_unresolved_unmatched_rows_across_runs_independent(
         run_b = "01J00000000000000000000301"
 
         await repo.save_unresolved(
-            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            AFKRun(afk_run_id=run_a, provider=Provider.GITHUB,),
             [_build_unresolved_item(run_a, UnresolvedReason.UNMATCHED)],
             repository=REPO,
         )
         await repo.save_unresolved(
-            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB, status=RunStatus.COMPLETED),
+            AFKRun(afk_run_id=run_b, provider=Provider.GITHUB,),
             [_build_unresolved_item(run_b, UnresolvedReason.UNMATCHED)],
             repository=REPO,
         )
@@ -723,7 +720,6 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         run_a = AFKRun(
             afk_run_id=repo_a_id,
             provider=Provider.GITHUB,
-            status=RunStatus.COMPLETED,
             title="Run A",
             started_at=started,
             finished_at=finished,
@@ -763,7 +759,6 @@ async def test_multi_repo_events_isolated_by_repository(db_pool: asyncpg.Pool) -
         run_b = AFKRun(
             afk_run_id=repo_b_id,
             provider=Provider.GITHUB,
-            status=RunStatus.COMPLETED,
             title="Run B",
             started_at=started,
             finished_at=finished,

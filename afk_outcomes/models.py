@@ -58,18 +58,6 @@ class EntityType(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable 
     MERGE_EVENT = "merge_event"
 
 
-class RunStatus(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
-    """Lifecycle status of an AFK run (mirrors the CONTEXT.md Run Status vocabulary)."""
-
-    RUNNING = "running"
-    COMPLETED = "completed"
-    BLOCKED = "blocked"
-    STALE = "stale"
-    TIMED_OUT = "timed_out"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
 class EngineeringOutcomeStatus(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep importable on 3.9
     """Terminal status of the change request(s) produced by a run."""
 
@@ -289,16 +277,17 @@ class RunSessionLink(BaseModel):
 class AFKRun(BaseModel):
     """The aggregate root: one AFK run and its engineering outcome.
 
-    Carries the run's :class:`RunStatus` and :class:`EngineeringOutcome`,
-    the observed entities/events, and the correlations and links that tie
-    the run back to the engineering artifacts it touched.
+    Carries the run's :class:`EngineeringOutcome`, the observed
+    entities/events, and the correlations and links that tie the run back
+    to the engineering artifacts it touched.  The lifecycle is owned by the
+    bound change request (ADR 0028) — there is no stored lifecycle status
+    (issue #649 retired the redundant ``afk_runs.status`` column).
     """
 
     model_config = ConfigDict(extra="ignore")
 
     afk_run_id: str = Field(description="ULID primary key of the run")
     provider: Provider
-    status: RunStatus
     title: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -849,11 +838,11 @@ class ExecutionBinding(BaseModel):
 # ---------------------------------------------------------------------------
 
 # The status a provisional lifecycle starts in.  It is deliberately a plain
-# string rather than a :class:`RunStatus` member: ``RunStatus`` is the
-# reconstruction-era lifecycle vocabulary (running/completed/…), while a
-# provisioned run has not yet launched and is simply "pending" — the same
-# literal the execution-binding path (#584) already writes for its
-# provisional ``afk_runs`` rows.
+# string: a provisioned run has not yet launched and is simply "pending" —
+# the same literal the execution-binding path (#584) already used for its
+# provisional ``afk_runs`` rows.  Retained as the no-bindings result of the
+# pure-domain execution-outcome policy (``afk_outcomes.run_status``); the
+# ``afk_runs.status`` column itself was retired (issue #649).
 PROVISIONAL_RUN_STATUS = "pending"
 
 
@@ -879,12 +868,6 @@ class AFKRunLifecycle(BaseModel):
 
     afk_run_id: str = Field(description="ULID primary key of the run")
     provider: Provider
-    status: str = Field(
-        default=PROVISIONAL_RUN_STATUS,
-        description=(
-            "RunStatus value; a provisioned lifecycle starts as 'pending'"
-        ),
-    )
     host: str | None = Field(
         default=None,
         description="Source host provenance (idempotency key part)",

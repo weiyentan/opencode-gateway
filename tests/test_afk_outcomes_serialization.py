@@ -22,7 +22,6 @@ from afk_outcomes import (
     Provider,
     RunEntityLink,
     RunSessionLink,
-    RunStatus,
     dumps_canonical,
     loads_canonical,
     make_ulid,
@@ -40,7 +39,6 @@ def build_run() -> AFKRun:
     return AFKRun(
         afk_run_id="01J0000000000000000000000001",
         provider=Provider.GITHUB,
-        status=RunStatus.COMPLETED,
         title="Develop-Loop: Consolidated run — Implemented issues #437, #438, #439, #440",
         started_at=started,
         finished_at=finished,
@@ -196,7 +194,6 @@ def test_round_trip_is_idempotent() -> None:
 def test_enums_serialize_as_strings() -> None:
     plain = json.loads(dumps_canonical(build_run()))
     assert plain["data"]["provider"] == "github"
-    assert plain["data"]["status"] == "completed"
     assert plain["data"]["outcome"]["status"] == "merged"
 
 

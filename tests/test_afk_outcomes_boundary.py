@@ -101,7 +101,6 @@ def test_public_api_exposes_expected_symbols() -> None:
         "ProviderAdapter",
         "RunEntityLink",
         "RunSessionLink",
-        "RunStatus",
         "ULIDSource",
         "dumps_canonical",
         "loads_canonical",

@@ -23,7 +23,6 @@ from afk_outcomes.models import (
     Provider,
     RunSessionLink,
 )
-from afk_outcomes.service.lifecycle import get_run_status
 from afk_outcomes.serialization import ULIDSource
 
 def _parse_awx_job_id(awx_job_id: str) -> int:
@@ -239,54 +238,6 @@ class _ExecutionBindingsRepositoryMixin:
             return rows[0]["id"]
         return None
 
-    async def _project_afk_run_status(self, afk_run_id: str) -> str:
-        """Project one run's status from its binding outcomes (issue #606).
-
-        .. deprecated::
-           Retained as a deprecated compatibility helper (issue #639).
-           ADR 0028 supersedes ADR 0027: ``afk_runs.status`` is no longer
-           projected from child AWX execution outcomes during binding
-           writes.  This helper is not invoked by any binding write path.
-
-        Reads the outcome multiset for the run and applies the pure-domain
-        policy :func:`afk_outcomes.service.lifecycle.get_run_status`.  The
-        caller must already hold the parent ``afk_runs`` lock so the
-        multiset is stable while the projection computes.  Legacy rows with
-        a NULL outcome carry no trusted signal and are excluded — the
-        policy rejects unknown values, so they are never passed to it.
-        """
-        rows = await self._conn.fetch(
-            """
-            SELECT outcome FROM execution_bindings
-            WHERE afk_run_id = $1 AND outcome IS NOT NULL
-            """,
-            afk_run_id,
-        )
-        outcomes = [row.get("outcome") for row in rows if row.get("outcome") is not None]
-        return get_run_status(outcomes)
-
-    async def _converge_afk_run_status(self, afk_run_id: str) -> None:
-        """Converge ``afk_runs.status`` to the binding-driven projection (issue #606).
-
-        .. deprecated::
-           Retained as a deprecated compatibility helper (issue #639).
-           ADR 0028 supersedes ADR 0027: ``afk_runs.status`` is no longer
-           projected from child AWX execution outcomes during binding
-           writes.  This helper is not invoked by any binding write path.
-
-        Only ``status`` is projected — ``finished_at``, ``outcome_status``,
-        ``outcome``, and the change-request columns are never touched.
-        Runs inside the caller's transaction with the parent row already
-        locked, so the projection and the write are atomic with the binding
-        mutation that triggered them.
-        """
-        projected = await self._project_afk_run_status(afk_run_id)
-        await self._conn.execute(
-            "UPDATE afk_runs SET status = $2 WHERE afk_run_id = $1",
-            afk_run_id,
-            projected,
-        )
-
     async def create_or_replay_afk_execution_binding(
         self,
         *,
@@ -371,9 +322,9 @@ class _ExecutionBindingsRepositoryMixin:
         * an identical replay stays idempotent without duplicating or
           changing terminal history.
 
-        ``_project_afk_run_status()`` / ``_converge_afk_run_status()`` are
-        retained as deprecated compatibility helpers (issue #606) but are no
-        longer invoked during binding writes.
+        Binding writes never project any parent run status — AWX execution
+        outcomes are historical child facts (ADR 0028 / issue #649 retired
+        the ``afk_runs.status`` column entirely).
 
         The connection MUST already be in a transaction (the caller owns the
         transaction boundary).  Uses savepoints internally so that a failure

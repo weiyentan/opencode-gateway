@@ -2,13 +2,16 @@
 
 Covers the :class:`~afk_outcomes.models.AFKRunLifecycle` read model:
 
-* default provisional status (``pending``),
 * the change-request all-or-none validator (a lifecycle owns at most one
   change request, and a half-written tuple is never a valid bound state),
 * ``change_request_identity()`` — the bound change request surfaces as the
   canonical ``change_request`` :class:`ProviderResourceIdentity`,
 * lenient legacy-row readback (lifecycle columns predate migration 0039
   rows and read back as ``None``).
+
+Issue #649 retired the lifecycle ``status`` field (ADR 0028 makes the bound
+change request the lifecycle authority), so the former provisional-status
+tests are removed with it.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ import pytest
 from afk_outcomes.models import (
     AFKRunLifecycle,
     EntityType,
-    PROVISIONAL_RUN_STATUS,
     Provider,
 )
 
@@ -35,24 +37,6 @@ def _lifecycle(**overrides) -> dict:
     }
     kwargs.update(overrides)
     return kwargs
-
-
-# ── Defaults and provisional status ─────────────────────────────────────────
-
-
-def test_default_status_is_pending() -> None:
-    """A provisioned lifecycle defaults to status 'pending'."""
-    lifecycle = AFKRunLifecycle(**_lifecycle())
-    assert lifecycle.status == PROVISIONAL_RUN_STATUS
-    assert lifecycle.status == "pending"
-
-
-def test_provisional_status_is_plain_string_not_run_status() -> None:
-    """The provisional status is a plain string constant, not a RunStatus member."""
-    from afk_outcomes.models import RunStatus
-
-    assert PROVISIONAL_RUN_STATUS not in {m.value for m in RunStatus}
-    assert isinstance(PROVISIONAL_RUN_STATUS, str)
 
 
 # ── Change-request all-or-none validator ────────────────────────────────────

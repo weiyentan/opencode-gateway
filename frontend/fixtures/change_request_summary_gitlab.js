@@ -25,8 +25,7 @@ function buildSummaryList() {
       {
         provider: 'gitlab', repository: 'group/cloudnative', external_id: '6',
         resource_type: 'change_request',
-        provider_state: 'merged', automation_state: 'completed',
-        total_estimated_cost_usd: 3.40,
+        provider_state: 'merged',        total_estimated_cost_usd: 3.40,
         latest_linked_activity: TS.MR_6_MERGE,
         provider_state_observed_at: TS.MR_6_MERGE,
         executions: { total: 2, running: 0, completed: 2, failed: 0, cancelled: 0 }
@@ -34,8 +33,7 @@ function buildSummaryList() {
       {
         provider: 'gitlab', repository: 'group/cloudnative', external_id: '4',
         resource_type: 'change_request',
-        provider_state: 'open', automation_state: 'failed',
-        total_estimated_cost_usd: null,
+        provider_state: 'open',        total_estimated_cost_usd: null,
         latest_linked_activity: TS.MR_4_OPEN,
         provider_state_observed_at: TS.MR_4_OPEN,
         executions: { total: 2, running: 0, completed: 0, failed: 2, cancelled: 0 }
@@ -55,7 +53,7 @@ function buildDetail() {
     change_request: {
       provider: 'gitlab', repository: 'group/cloudnative', external_id: '6',
       resource_type: 'change_request', title: 'feat: operator upgrade path',
-      provider_state: 'merged', automation_state: 'completed'
+      provider_state: 'merged',
     },
     merge_state: 'merged',
     total_estimated_cost_usd: 3.40,

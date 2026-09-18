@@ -28,7 +28,6 @@ from afk_outcomes import (
     Provider,
     RunEntityLink,
     RunSessionLink,
-    RunStatus,
     SequenceULID,
     dumps_canonical,
 )
@@ -509,7 +508,6 @@ def build_run(neutral: dict, ulid_ms: int) -> AFKRun:
     return AFKRun(
         afk_run_id=afk_run_id,
         provider=provider,
-        status=RunStatus(run_meta["status"]),
         title=run_meta["title"],
         started_at=_parse_dt(run_meta["started_at"]),
         finished_at=_parse_dt(run_meta["finished_at"]),

@@ -22,8 +22,7 @@ function buildDetail() {
     change_request: {
       provider: 'gitlab', repository: 'group/cloudnative', external_id: '6',
       resource_type: 'change_request', title: 'feat: operator upgrade path',
-      provider_state: 'merged', automation_state: 'completed',
-      merged_at: TS.MR_6_MERGE,
+      provider_state: 'merged',      merged_at: TS.MR_6_MERGE,
       provider_state_observed_at: TS.MR_6_MERGE
     },
     merge_state: { state: 'merged', merged_at: TS.MR_6_MERGE },

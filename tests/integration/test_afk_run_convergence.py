@@ -302,13 +302,9 @@ async def test_api_running_creation_converges_to_running(db_pool: asyncpg.Pool) 
         resp = await c.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
 
-    async with db_pool.acquire() as conn:
-        # ADR 0028: afk_runs.status stays 'pending' — not projected from child outcomes
-        status = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id)
-        assert status == "pending"
-        # Verify via pure domain policy as well (the function itself is unchanged)
-        outcomes = ["running"]
-        assert resolve_afk_run_status(outcomes) == "running"
+    # Verify via pure domain policy (column retired by migration 0045)
+    outcomes = ["running"]
+    assert resolve_afk_run_status(outcomes) == "running"
 
 
 @pytest.mark.integration
@@ -322,9 +318,6 @@ async def test_api_direct_terminal_post_converges(db_pool: asyncpg.Pool) -> None
     async with _build_app(db_pool) as c:  # type: ignore[attr-defined]
         resp = await c.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 201, resp.text
-    async with db_pool.acquire() as conn:
-        status = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id)
-        assert status == "pending"
 
     # Direct failed (no resource/session required)
     run_id2 = await _provision_run_via_api(db_pool)
@@ -337,9 +330,6 @@ async def test_api_direct_terminal_post_converges(db_pool: asyncpg.Pool) -> None
     async with _build_app(db_pool) as c:  # type: ignore[attr-defined]
         resp2 = await c.post("/api/v1/afk/executions", json=payload2)
         assert resp2.status_code == 201, resp2.text
-    async with db_pool.acquire() as conn:
-        status2 = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id2)
-        assert status2 == "pending"
 
     # Direct cancelled
     run_id3 = await _provision_run_via_api(db_pool)
@@ -350,9 +340,6 @@ async def test_api_direct_terminal_post_converges(db_pool: asyncpg.Pool) -> None
     async with _build_app(db_pool) as c:  # type: ignore[attr-defined]
         resp3 = await c.post("/api/v1/afk/executions", json=payload3)
         assert resp3.status_code == 201, resp3.text
-    async with db_pool.acquire() as conn:
-        status3 = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id3)
-        assert status3 == "pending"
 
 
 @pytest.mark.integration
@@ -370,10 +357,6 @@ async def test_api_patch_final_running_converges(db_pool: asyncpg.Pool) -> None:
             payload.pop("resource", None)
             resp = await c.post("/api/v1/afk/executions", json=payload)
             assert resp.status_code == 201, resp.text
-        async with db_pool.acquire() as conn2:
-            s = await conn2.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-            assert s == "pending"
-        # PATCH job_a to completed — binding outcome only; afk_runs.status stays pending
         resp_patch_a = await c.patch(
             f"/api/v1/afk/executions/{job_a}",
             json={
@@ -389,11 +372,6 @@ async def test_api_patch_final_running_converges(db_pool: asyncpg.Pool) -> None:
             },
         )
         assert resp_patch_a.status_code == 200, resp_patch_a.text
-        async with db_pool.acquire() as conn2:
-            s = await conn2.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-            assert s == "pending", "afk_runs.status is never projected from child outcomes"
-
-        # PATCH job_b to completed -> both bindings terminal; afk_runs.status stays pending
         resp_patch_b = await c.patch(
             f"/api/v1/afk/executions/{job_b}",
             json={
@@ -409,11 +387,6 @@ async def test_api_patch_final_running_converges(db_pool: asyncpg.Pool) -> None:
             },
         )
         assert resp_patch_b.status_code == 200, resp_patch_b.text
-        async with db_pool.acquire() as conn2:
-            s = await conn2.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-            assert s == "pending"
-
-
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_completed_run_accepts_new_binding(db_pool: asyncpg.Pool) -> None:
@@ -428,9 +401,6 @@ async def test_completed_run_accepts_new_binding(db_pool: asyncpg.Pool) -> None:
         count_before = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id=$1", run_id
         )
-        # ADR 0028: status stays pending — not projected from child outcomes
-        status_before = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-        assert status_before == "pending"
 
     # New binding on the same lifecycle — accepted (no 409)
     job_new = int(uuid.uuid4().int >> 80)
@@ -444,9 +414,7 @@ async def test_completed_run_accepts_new_binding(db_pool: asyncpg.Pool) -> None:
         count_after = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id=$1", run_id
         )
-        status_after = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
         assert count_after == count_before + 1, "new binding should be stored"
-        assert status_after == "pending"
 
 
 @pytest.mark.integration
@@ -495,8 +463,6 @@ async def test_concurrent_terminal_callbacks_converge_deterministically(
             assert r.status_code == 200, r.text
 
     async with db_pool.acquire() as conn:
-        status = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-        assert status == "pending"
         # Ensure both bindings exist
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id=$1", run_id
@@ -526,8 +492,6 @@ async def test_concurrent_terminal_callbacks_converge_deterministically(
         for r in results2:
             assert r.status_code == 200, r.text
     async with db_pool.acquire() as conn:
-        status2 = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id2)
-        assert status2 == "pending"
         # Reverse order must still converge to same
         assert resolve_afk_run_status(["failed", "cancelled"]) == "failed"
         assert resolve_afk_run_status(["cancelled", "failed"]) == "failed"
@@ -578,19 +542,11 @@ async def test_concurrent_new_binding_vs_final_callback_no_terminal_with_running
         assert post_result.status_code in (201, 409), post_result.text
 
     async with db_pool.acquire() as conn:
-        status = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
         bindings = await conn.fetch(
             "SELECT outcome FROM execution_bindings WHERE afk_run_id=$1", run_id
         )
         outcomes = [r["outcome"] for r in bindings]
-        # Invariant: terminal parent must not have running child
-        if status in ("completed", "failed", "cancelled"):
-            assert "running" not in outcomes, f"terminal parent {status} must not have running child {outcomes}"
-        if "running" in outcomes:
-            assert status == "pending", f"running child requires parent running, got {status}"
-        # ADR 0028: afk_runs.status stays pending — not projected from child outcomes
-        assert status == "pending"
-        # Verify deterministic via pure policy (independent of DB status)
+        # Verify deterministic via pure policy (column retired by migration 0045)
         expected = resolve_afk_run_status(outcomes)
         assert expected in ("running", "completed", "failed", "cancelled")
 
@@ -616,9 +572,6 @@ async def test_identical_terminal_replay_is_idempotent(db_pool: asyncpg.Pool) ->
         resp1 = await c.patch(f"/api/v1/afk/executions/{job}", json=patch_body)
         assert resp1.status_code == 200, resp1.text
         async with db_pool.acquire() as conn2:
-            status_first = await conn2.fetchval(
-                "SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id
-            )
             count_first = await conn2.fetchval(
                 "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id=$1", run_id
             )
@@ -626,14 +579,10 @@ async def test_identical_terminal_replay_is_idempotent(db_pool: asyncpg.Pool) ->
         resp2 = await c.patch(f"/api/v1/afk/executions/{job}", json=patch_body)
         assert resp2.status_code == 200, resp2.text
         async with db_pool.acquire() as conn2:
-            status_second = await conn2.fetchval(
-                "SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id
-            )
             count_second = await conn2.fetchval(
                 "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id=$1", run_id
             )
         assert count_second == count_first == 1
-        assert status_second == status_first == "pending"
         # Ensure no duplicate row for awx_job_id
         async with db_pool.acquire() as conn2:
             dup = await conn2.fetchval(
@@ -697,8 +646,6 @@ async def test_pr_mr_state_has_no_effect_on_execution_status(db_pool: asyncpg.Po
         assert resp_patch.status_code == 200, resp_patch.text
 
     async with db_pool.acquire() as conn:
-        status = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-        assert status == "pending"
         # Insert more PR events after the terminal patch — afk_runs.status must stay pending
         await conn.execute(
             """
@@ -710,7 +657,5 @@ async def test_pr_mr_state_has_no_effect_on_execution_status(db_pool: asyncpg.Po
             """,
             f"obs-{uuid.uuid4().hex}",
         )
-        status2 = await conn.fetchval("SELECT status FROM afk_runs WHERE afk_run_id=$1", run_id)
-        assert status2 == "pending"
         # Pure policy never consults those tables
         assert resolve_afk_run_status(["completed"]) == "completed"

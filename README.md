@@ -121,7 +121,7 @@ AFK LIFECYCLE OBSERVABILITY FLOW
         │
         ▼
   AFK Outcomes + Change-Request + Closure APIs  ──►  Aurora Glass
-  (RunStatus projection, engineering outcome, closure relationships, cost)
+  (engineering outcome, closure relationships, cost)
 ```
 
 The EDA gateway drives the recording calls at lifecycle start and at
@@ -583,14 +583,14 @@ Gateway-owned AFK Runs recorded through the lifecycle/execution-binding
 path above, plus runs reconstructed from provider engineering activity by
 the backfill/correlation engine, all with per-link provenance. The AFK
 outcome vocabulary is described in `CONTEXT.md` (AFK Run, `afk_run_id`,
-RunStatus, EngineeringOutcome, EngineeringOutcomeStatus, change_request,
+EngineeringOutcome, EngineeringOutcomeStatus, change_request,
 correlation_confidence, correlation_method, resolver_version,
 correlation_source, owning_change_request_id, Provisional Link). Backfill
 remains CLI-only (`scripts/afk_backfill.py`); these endpoints never write.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/afk-outcomes/runs` | Paginated list of AFK Runs. Filterable by `repository`, window (`started_from`/`started_to`, `finished_from`/`finished_to`, `seen_from`/`seen_to` ISO-8601 bounds), `status` (RunStatus value: `running`/`completed`/`blocked`/`stale`/`timed_out`/`failed`/`cancelled`), `outcome` (EngineeringOutcomeStatus value: `merged`/`closed`/`abandoned`/`open`), and `origin` (provider). 400 on invalid enum/date values or inverted windows. Ordered by `last_seen_at DESC`. |
+| `GET` | `/api/v1/afk-outcomes/runs` | Paginated list of AFK Runs. Filterable by `repository`, window (`started_from`/`started_to`, `finished_from`/`finished_to`, `seen_from`/`seen_to` ISO-8601 bounds), `outcome` (EngineeringOutcomeStatus value: `merged`/`closed`/`abandoned`/`open`), and `origin` (provider). 400 on invalid enum/date values or inverted windows. Ordered by `last_seen_at DESC`. (The former `status` filter was retired with the `afk_runs.status` column — issue #649.) |
 | `GET` | `/api/v1/afk-outcomes/runs/{afk_run_id}` | Full chain for one run: run aggregate, EngineeringOutcome, engineering entities grouped by type (issues, change_requests, reviews, commits, merge_events) each carrying correlation and lineage provenance (`correlation_method`, `correlation_confidence`, `evidence`, `resolver_version`, `correlation_source`, `owning_change_request_id`) and a `provisional` marker, linked sessions with usage/cost aggregates, `parent_session_id` for the nested session tree, distinct agents, and a run-level usage aggregate (Active Tokens = input + output; cache read/write as siblings). 404 for unknown `afk_run_id`. |
 | `GET` | `/api/v1/afk-outcomes/entities` | Paginated engineering entities with their run links, correlation and lineage provenance, `superseded_at` (superseded state surfaced, not hidden), and `provisional` marker. |
 | `GET` | `/api/v1/afk-outcomes/correlations` | Paginated unresolved correlations with `method`, `correlation_confidence`, `evidence`, `resolver_version`, and `provisional=true`. Every row is attributed to a run — `afk_run_id` is NOT NULL (migration 0027) — and rows are unique per `(provider, repository, entity_type, external_id, afk_run_id, method)`, so the same entity can appear in separate rows per AFK run and evidence is never merged across runs. |
