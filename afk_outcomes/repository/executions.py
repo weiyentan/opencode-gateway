@@ -1090,3 +1090,38 @@ class _ExecutionBindingsRepositoryMixin:
             afk_run_id,
         )
         return [_row_to_execution_binding(row) for row in rows]
+
+    async def list_running_execution_bindings(
+        self, *, limit: int = 100
+    ) -> list[ExecutionBinding]:
+        """Return execution bindings stuck in the provisional ``running``
+        outcome (issue #637).
+
+        The discovery seam of the AWX execution reconciliation path: these
+        are bindings whose AWX job terminated without ever delivering a
+        terminal callback (job failed/cancelled/died before reporting), so
+        they never transitioned off ``running``.  Terminal rows are never
+        returned — repeated reconciliation passes cannot re-examine or
+        overwrite terminal execution history.
+
+        Ordered deterministically by ``created_at ASC, id ASC`` (oldest
+        first, ``id`` tie-breaker) and bounded by ``limit`` (must be >= 1),
+        so a large backlog is drained across repeated bounded passes.
+        """
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = await self._conn.fetch(
+            """
+            SELECT id, awx_job_id, job_template_id, external_session_id, provider,
+                   repository_url, entity_type, entity_number, outcome,
+                   source_event_id, branch, title, failure_reason, failure_summary,
+                   started_at, finished_at, afk_run_id, trigger_type,
+                   external_session_ids AS external_session_ids_json
+            FROM execution_bindings
+            WHERE outcome = 'running'
+            ORDER BY created_at ASC, id ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [_row_to_execution_binding(row) for row in rows]

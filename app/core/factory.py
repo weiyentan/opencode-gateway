@@ -146,6 +146,7 @@ def create_app(
     from app.api.admin_resolve_source_identity import (
         router as admin_resolve_source_identity_router,
     )
+    from app.api.admin_afk_reconcile import router as admin_afk_reconcile_router
     from app.api.afk_executions import router as afk_executions_router
     from app.api.afk_outcomes import router as afk_outcomes_router
     from app.api.afk_runs import router as afk_runs_router
@@ -163,6 +164,8 @@ def create_app(
     app.include_router(admin_quarantines_router)
     app.include_router(admin_resolve_source_identity_router)
     app.include_router(admin_reconcile_router)
+    # AFK AWX execution reconciliation trigger (issue #637)
+    app.include_router(admin_afk_reconcile_router)
     app.include_router(cursor_router)
     app.include_router(ingest_router)
     app.include_router(usage_router, prefix="/api/v1/usage")
