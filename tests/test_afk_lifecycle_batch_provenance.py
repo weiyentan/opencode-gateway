@@ -409,28 +409,6 @@ class TestExecutionBindingMultiplicity:
         assert _calls_matching(mock_conn, r"INSERT INTO execution_bindings") == []
         assert _calls_matching(mock_conn, r"INSERT INTO afk_runs") == []
 
-    def test_legacy_callback_without_run_still_auto_provisions(
-        self, mock_conn: AsyncMock
-    ) -> None:
-        """Omitting afk_run_id preserves the legacy auto-provision behavior."""
-        mock_conn.fetchrow = AsyncMock(return_value=None)
-        mock_conn.fetch = AsyncMock(return_value=[mock_row({"id": uuid.uuid4()})])
-        mock_conn.execute = AsyncMock()
-
-        repo = AsyncpgOutcomeRepository(mock_conn)
-        # A fresh deterministic source — the module-level source is shared
-        # across tests, so its counter has already advanced.
-        source = SequenceULID(1_700_000_000_000, start=1)
-        result = _run(
-            repo.create_or_replay_afk_execution_binding(
-                **_binding_kwargs(ulid_source=source)
-            )
-        )
-
-        assert result.is_created is True
-        assert result.afk_run_id == _NEW_ULID
-        assert len(_calls_matching(mock_conn, r"INSERT INTO afk_runs")) == 1
-
     def test_replay_with_matching_run_is_idempotent(self, mock_conn: AsyncMock) -> None:
         """Replaying with the same afk_run_id is a no-op."""
         mock_conn.fetchrow = AsyncMock(return_value=_existing_binding_row())
@@ -459,21 +437,6 @@ class TestExecutionBindingMultiplicity:
 
         assert result.is_conflict is True
         assert result.is_created is False
-
-    def test_legacy_replay_omitting_run_never_conflicts(
-        self, mock_conn: AsyncMock
-    ) -> None:
-        """A legacy replay without afk_run_id is idempotent against a stored run."""
-        mock_conn.fetchrow = AsyncMock(return_value=_existing_binding_row())
-
-        repo = AsyncpgOutcomeRepository(mock_conn)
-        result = _run(
-            repo.create_or_replay_afk_execution_binding(**_binding_kwargs())
-        )
-
-        assert result.is_conflict is False
-        assert result.is_created is False
-        assert result.afk_run_id == _SUPPLIED_RUN_ID
 
 
 # ══════════════════════════════════════════════════════════════════════════

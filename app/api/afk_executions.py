@@ -344,15 +344,13 @@ async def create_execution_binding(
     **Multiple jobs per resource**: different AWX jobs targeting the same
     GitHub pull request or GitLab merge request are both persisted.
 
-    **Lifecycle multiplicity (issue #595)**: an optional ``afk_run_id``
-    attaches the binding to a pre-provisioned lifecycle — many execution
-    bindings (a failed attempt and a later retry with a new ``awx_job_id``)
-    can reference one ``afk_run_id``.  A supplied ``afk_run_id`` that
-    references no provisioned lifecycle is rejected with ``404``; omitting
-    it auto-provisions a run with the binding — and when the canonical PR/MR
-    already owns a lifecycle, that existing lifecycle is reused and the new
-    binding attaches to it with ``201`` (PR #600 blocker, no second
-    lifecycle).
+    **Lifecycle multiplicity (issue #595)**: ``afk_run_id`` attaches the
+    binding to a pre-provisioned lifecycle — many execution bindings (a
+    failed attempt and a later retry with a new ``awx_job_id``) can
+    reference one ``afk_run_id``.  The binding path never auto-provisions a
+    lifecycle (issue #689): ``afk_run_id`` is required (the schema rejects a
+    missing value with ``422``), and a supplied value that references no
+    provisioned lifecycle is rejected with ``404``.
     """
     resource = body.resource
     # Normalize repository URL at the API boundary before any persistence
@@ -376,11 +374,8 @@ async def create_execution_binding(
         trigger_type_value: str | None = body.trigger_type.value
 
         # Transactional creation — attaches to the pre-provisioned lifecycle
-        # when afk_run_id is supplied, else inserts afk_runs +
-        # execution_bindings atomically (reusing the existing canonical
-        # lifecycle when one already owns the PR/MR — PR #600 blocker).
-        # Returns is_created/is_reused (201), is_conflict (409),
-        # run_missing (404), or idempotent replay (200).
+        # named by afk_run_id (required).  Returns is_created (201),
+        # is_conflict (409), run_missing (404), or idempotent replay (200).
         async with timed_operation("db.insert.execution_binding", "db"):
             async with _db_timeout(
                 "db.insert.execution_binding", settings.database_timeout_seconds
@@ -415,11 +410,9 @@ async def create_execution_binding(
                 detail=f"AFK run not found: {body.afk_run_id}",
             )
 
-        if result.is_created or result.is_reused:
-            # New binding was inserted — either attached to a fresh
-            # auto-provisioned lifecycle (is_created) or to an existing
-            # lifecycle the canonical PR/MR already owned (is_reused,
-            # PR #600 blocker).  Both surface as 201.
+        if result.is_created:
+            # New binding was inserted attached to the pre-provisioned
+            # lifecycle.  Surfaces as 201.
             saved = await repo.get_execution_binding_by_awx_job_id(awx_job_id_str)
             if saved is None:
                 # Should not happen — save succeeded — but handle gracefully.
