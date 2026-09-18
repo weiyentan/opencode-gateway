@@ -238,8 +238,7 @@ class ExecutionBindingCreateRequest(BaseModel):
       carry both a change request and a session (the execution is only
       meaningful once it resolved both); failed or cancelled executions
       persist without a change request or a session — when ``resource`` is
-      omitted the caller must supply ``afk_run_id`` (the repository needs
-      the run's provider to auto-provision only when no run is supplied).
+      omitted the caller must supply ``afk_run_id``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -328,13 +327,11 @@ class ExecutionBindingCreateRequest(BaseModel):
     ) -> ExecutionBindingCreateRequest:
         """Every new execution binding must carry ``afk_run_id`` (issue #626).
 
-        The AWX job must join directly to its logical AFK Run — the legacy
-        auto-provisioning path (POST without ``afk_run_id``, issue #595)
-        is closed for new bindings.  The rule applies uniformly to
-        start-time provisioning (``running``) and to direct terminal
-        POSTs, covering all outcomes.  Legacy persisted rows are
-        unaffected: reads return their null ``afk_run_id`` as-is and the
-        ``PATCH`` terminal-update path never re-validates the create
+        The AWX job must join directly to its logical AFK Run.  The rule
+        applies uniformly to start-time provisioning (``running``) and to
+        direct terminal POSTs, covering all outcomes.  Legacy persisted rows
+        are unaffected: reads return their null ``afk_run_id`` as-is and
+        the ``PATCH`` terminal-update path never re-validates the create
         contract.
         """
         if self.afk_run_id is None:
@@ -349,9 +346,7 @@ class ExecutionBindingCreateRequest(BaseModel):
     def _validate_terminal_requires_resource_or_run(self) -> ExecutionBindingCreateRequest:
         """A terminal callback without a change request must carry afk_run_id.
 
-        The repository auto-provisions an ``afk_runs`` row (with the
-        resource's provider) only when no run is supplied; a resource-less
-        terminal callback therefore needs the explicit run reference.
+        A resource-less terminal callback needs the explicit run reference.
         """
         if (
             self.outcome.is_terminal
