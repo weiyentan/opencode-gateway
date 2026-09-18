@@ -124,11 +124,13 @@ timeline, not an accounting summary. Exposed read-only via the
 _Avoid_: replay blob, transcript (in the usage-aggregate sense)
 
 **AWX Execution Binding**:
-A durable Gateway association between one **AFK Run** (`afk_run_id`) and its
-AWX job history. One AFK Run currently has exactly one AWX Execution Binding;
-the binding contains many uniquely identified **AWX Executions**. The outcome
-of any individual execution has no authority over the AFK Run lifecycle.
-_Avoid_: AFK Run, inferred correlation
+A durable Gateway association between one **AFK Run** (`afk_run_id`) and one
+**AWX Execution**, identified by its `awx_job_id`. One AFK Run may have many
+AWX Execution Bindings, including retries. The outcome of any individual
+execution has no authority over the AFK Run lifecycle.
+Every AWX Execution Binding references an AFK Run that already exists. A
+binding never creates, discovers, or reuses an AFK Run implicitly, including
+when it is created by an internal caller rather than through the Gateway API.
 _Avoid_: AFK Run, inferred correlation
 
 **AWX Execution**:
@@ -595,9 +597,13 @@ merge on base totals
 **AFK Run**:
 The aggregate root of the AFK outcome read-model (``afk_runs`` table,
 ``afk_outcomes.models.AFKRun``). Represents one logical AFK engineering
-life cycle anchored by one canonical **change_request**. It has one AWX
-Execution Binding containing many AWX executions, including development,
-review, and fixes.
+life cycle. It begins provisionally without a **change_request**. After a
+successful development execution creates a pull request or merge request,
+that one canonical change request is explicitly bound to the run. Failed,
+cancelled, or no-change-request executions leave the run unbound and
+provisional; their execution outcomes do not terminate the parent lifecycle.
+An AFK Run has one AWX Execution Binding for each AWX execution, including
+development, review, and fixes, and may therefore have many bindings.
 The child outcomes are historical execution facts. Sessions, engineering
 entities, correlations, and the resulting EngineeringOutcome enrich that lifecycle
 without defining its execution identity. The AFK Run remains open while its
@@ -622,8 +628,10 @@ _Avoid_: AFK Run Cost when the individual AWX job subtotal is meant
 
 **afk_run_id**:
 The Gateway-owned ULID primary key of an AFK Run (``afk_runs.afk_run_id``),
-assigned at reconstruction time by the resolver. The run carries no
-pre-existing identifier from the provider.
+assigned by the Gateway when ``fast-api-eda-gateway`` provisions an AFK Run
+for a qualifying AFK event batch. The run carries no pre-existing identifier
+from the provider. Execution bindings only reference this identifier and
+never assign or discover it implicitly.
 _Avoid_: Run ID (ambiguous — collides with agent-run session IDs)
 
 **RunStatus**:
