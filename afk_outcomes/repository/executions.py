@@ -315,9 +315,7 @@ class _ExecutionBindingsRepositoryMixin:
         **Required lifecycle (issue #689)**: ``afk_run_id`` is mandatory —
         every binding references an already-provisioned AFK Run.  Bindings
         never auto-provision, discover, or reuse an ``afk_runs`` row.  The
-        API schema already rejects a missing ``afk_run_id`` with ``422``;
-        the entry guard only protects direct repository callers that pass
-        ``None``.
+        API schema already rejects a missing ``afk_run_id`` with ``422``.
 
         The resource identity is optional — ``provider``/``repository``/
         ``resource_number`` may all be ``None`` for ``running`` provisioning
@@ -473,9 +471,9 @@ class _ExecutionBindingsRepositoryMixin:
                     for field, (existing_value, new_value) in optional_values.items()
                 ):
                     is_match = False
-                # The supplied afk_run_id only participates when the caller
-                # supplied one — a legacy replay that omits it never
-                # conflicts on the stored auto-created run (issue #595).
+                # afk_run_id is mandatory — always compare against the stored
+                # value (issue #689).  The None guard is a defensive check
+                # for direct repository callers that bypass the API schema.
                 if is_match and afk_run_id is not None:
                     is_match = existing["afk_run_id"] == afk_run_id
                 # An identical replay is never rejected (it creates no new

@@ -203,10 +203,9 @@ def _binding_conflicts_with(
     a silent accept of stale data (issue #549 review).
 
     Optional identity fields participate only when the caller supplied them
-    (non-erasing, issue #590): an omitted resource, session, or
-    ``afk_run_id`` never conflicts on the stored value, so a legacy replay
-    that omits them never conflicts on the stored auto-created run
-    (issue #595).
+    (non-erasing, issue #590): an omitted resource or session never
+    conflicts on the stored value.  ``afk_run_id`` is always required
+    (issue #689) and always participates.
     """
     supplied = body.model_fields_set
     conflict = (
@@ -370,7 +369,6 @@ async def create_execution_binding(
         # Parse trigger_type from the request body for persistence.
         trigger_type_value: str | None = body.trigger_type.value
 
-        # Transactional creation — attaches to the pre-provisioned lifecycle
         # Transactional creation — attaches to the pre-provisioned lifecycle
         # named by afk_run_id.  Returns is_created (201),
         # is_conflict (409), run_missing (404), or idempotent replay (200).
