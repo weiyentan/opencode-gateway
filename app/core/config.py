@@ -297,6 +297,22 @@ class Settings(BaseSettings):
     # GATEWAY_OPERATOR_TOKEN.
     operator_token: str = ""
 
+    # AWX execution reconciliation (issue #637) — outbound AWX REST API
+    # access used to reconcile AFK AWX executions that never delivered a
+    # terminal callback (job failed/cancelled/died before reporting).
+    # Deliberately named ``awx_reconciliation_*`` — distinct from the
+    # removed execution-era ``awx_base_url``/``awx_token`` fields, whose
+    # absence from Settings is guarded by tests/test_config.py.
+    # ``awx_reconciliation_base_url`` empty (the default) disables the
+    # reconciliation trigger — it responds gracefully without touching
+    # the database.  The token is sent only in the AWX request
+    # ``Authorization`` header: it is never logged, persisted, returned
+    # in API responses, or embedded in error messages.  Maps to
+    # GATEWAY_AWX_RECONCILIATION_BASE_URL and
+    # GATEWAY_AWX_RECONCILIATION_API_TOKEN.
+    awx_reconciliation_base_url: str = ""
+    awx_reconciliation_api_token: str = ""
+
     # active_tokens deprecation (issue #557) — the legacy ``active_tokens``
     # field (input + output tokens) is deprecated in favour of the raw token
     # fields (``cache_read_tokens`` / ``cache_write_tokens`` /

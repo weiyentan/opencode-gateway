@@ -2511,3 +2511,86 @@ class TestUpdateTerminalSessionLink:
         assert result.is_conflict is False
         assert _session_link_calls(mock_conn) == []
         assert _session_resolution_calls(mock_conn) == []
+
+
+# ── Running-binding discovery (reconciliation, issue #637) ───────────────────
+
+
+def _running_row(awx_job_id: int) -> dict:
+    return {
+        "id": awx_job_id,
+        "awx_job_id": awx_job_id,
+        "job_template_id": 7,
+        "external_session_id": None,
+        "provider": None,
+        "repository_url": None,
+        "entity_type": None,
+        "entity_number": None,
+        "outcome": "running",
+        "source_event_id": None,
+        "branch": None,
+        "title": None,
+        "failure_reason": None,
+        "failure_summary": None,
+        "started_at": None,
+        "finished_at": None,
+        "afk_run_id": None,
+        "trigger_type": "awx",
+        "external_session_ids_json": None,
+    }
+
+
+async def test_list_running_execution_bindings_discovers_stuck_rows():
+    """Reconciliation discovery: only ``running`` rows, deterministic order."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(
+        return_value=[mock_row(_running_row(501)), mock_row(_running_row(502))]
+    )
+    repo = AsyncpgOutcomeRepository(conn)
+
+    bindings = await repo.list_running_execution_bindings(limit=25)
+
+    assert [b.awx_job.job_id for b in bindings] == ["501", "502"]
+    assert all(b.outcome is ExecutionOutcome.RUNNING for b in bindings)
+
+    sql = conn.fetch.call_args[0][0]
+    assert "outcome = 'running'" in sql
+    assert "ORDER BY created_at ASC, id ASC" in sql
+    assert conn.fetch.call_args[0][1] == 25
+
+
+async def test_list_running_execution_bindings_empty_is_noop():
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    bindings = await repo.list_running_execution_bindings(limit=10)
+
+    assert bindings == []
+    assert conn.fetch.call_args[0][1] == 10
+
+
+async def test_list_running_execution_bindings_no_age_filter_by_default():
+    """Without ``max_age_seconds`` discovery is not age-bounded."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo.list_running_execution_bindings(limit=10)
+
+    sql = conn.fetch.call_args[0][0]
+    assert "make_interval" not in sql
+    assert conn.fetch.call_args[0][1:] == (10,)
+
+
+async def test_list_running_execution_bindings_applies_age_filter():
+    """``max_age_seconds`` narrows discovery to older-than-cutoff rows."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo.list_running_execution_bindings(limit=10, max_age_seconds=300)
+
+    sql = conn.fetch.call_args[0][0]
+    assert "created_at < now() - make_interval(secs => $2)" in sql
+    assert conn.fetch.call_args[0][1:] == (10, 300)
