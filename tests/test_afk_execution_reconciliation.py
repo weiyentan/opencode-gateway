@@ -60,6 +60,7 @@ class FakeRepository:
         self.update_results = update_results or {}
         self.update_calls: list[dict[str, Any]] = []
         self.limit_used: int | None = None
+        self.max_age_seconds_used: int | None = None
         self.other_calls: list[str] = []
 
     def __getattr__(self, name: str) -> Any:
@@ -73,9 +74,10 @@ class FakeRepository:
         )
 
     async def list_running_execution_bindings(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, max_age_seconds: int | None = None
     ) -> list[ExecutionBinding]:
         self.limit_used = limit
+        self.max_age_seconds_used = max_age_seconds
         return list(self.running_bindings)[:limit]
 
     async def update_execution_binding_terminal(
@@ -150,6 +152,20 @@ async def test_reconciler_discovers_running_bindings_with_limit():
     assert repo.limit_used == 25
     assert summary.examined == 0
     assert summary.updated_count == 0
+
+
+async def test_reconciler_forwards_max_age_seconds_to_discovery():
+    repo = FakeRepository()
+    await ExecutionReconciler(repository=repo, awx_lookup=FakeLookup()).reconcile(
+        max_age_seconds=300
+    )
+    assert repo.max_age_seconds_used == 300
+
+
+async def test_reconciler_defaults_to_no_age_filter():
+    repo = FakeRepository()
+    await ExecutionReconciler(repository=repo, awx_lookup=FakeLookup()).reconcile()
+    assert repo.max_age_seconds_used is None
 
 
 async def test_reconciler_processes_each_running_binding():
@@ -283,6 +299,88 @@ async def test_lookup_failure_detail_never_carries_credentials():
     assert secret not in (result.detail or "")
 
 
+# ── Persistence failures ─────────────────────────────────────────────────────
+
+
+async def test_persist_failure_is_isolated_per_binding():
+    class Boom(Exception):
+        pass
+
+    repo = FakeRepository(running_bindings=[_running_binding(1), _running_binding(2)])
+    lookup = FakeLookup(
+        jobs={
+            1: AWXJobState(status="failed", finished_at=_FINISHED),
+            2: AWXJobState(status="failed", finished_at=_FINISHED),
+        }
+    )
+
+    async def update_execution_binding_terminal(**kwargs: Any):
+        if kwargs["awx_job_id"] == "1":
+            raise Boom("db write failed")
+        return UpdateExecutionBindingResult(is_updated=True)
+
+    repo.update_execution_binding_terminal = update_execution_binding_terminal  # type: ignore[method-assign]
+    summary = await ExecutionReconciler(repository=repo, awx_lookup=lookup).reconcile()
+    # The DB error on binding 1 does not abort the pass; binding 2 persists.
+    assert summary.examined == 2
+    assert summary.persist_error_count == 1
+    assert summary.updated_count == 1
+    persistence_failure = next(
+        r for r in summary.results if r.kind is BindingResultKind.PERSIST_ERROR
+    )
+    assert persistence_failure.awx_job_id == 1
+    assert persistence_failure.detail == "Boom"
+
+
+async def test_malformed_binding_without_awx_job_is_isolated():
+    class FakeBinding:
+        pass
+
+    repo = FakeRepository()
+    summary = await ExecutionReconciler(
+        repository=repo, awx_lookup=FakeLookup()
+    ).reconcile()
+    assert summary.examined == 0
+
+    repo.running_bindings = [FakeBinding()]  # type: ignore[list-item]
+    summary = await ExecutionReconciler(
+        repository=repo, awx_lookup=FakeLookup()
+    ).reconcile()
+    assert summary.examined == 1
+    assert summary.lookup_error_count == 1
+    assert summary.results[0].awx_job_id == -1
+    assert summary.results[0].detail == "AttributeError"
+
+
+# ── Bounded concurrency ─────────────────────────────────────────────────────
+
+
+async def test_reconcile_bounds_concurrent_awx_lookups():
+    import asyncio
+
+    repo = FakeRepository(
+        running_bindings=[_running_binding(i) for i in range(1, 26)]
+    )
+    in_flight = 0
+    peak = 0
+
+    class ConcurrencyTrackingLookup:
+        async def get_job(self, job_id: int) -> AWXJobState | None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return AWXJobState(status="running")
+
+    summary = await ExecutionReconciler(
+        repository=repo, awx_lookup=ConcurrencyTrackingLookup()  # type: ignore[arg-type]
+    ).reconcile()
+    assert summary.examined == 25
+    # The semaphore caps simultaneous in-flight AWX calls (min(10, N)).
+    assert 1 < peak <= 10
+
+
 # ── Idempotency / already-terminal records ───────────────────────────────────
 
 
@@ -361,3 +459,93 @@ async def test_reconciler_never_touches_run_lifecycle_surfaces():
     lookup = FakeLookup(jobs={1: AWXJobState(status="failed", finished_at=_FINISHED)})
     await ExecutionReconciler(repository=repo, awx_lookup=lookup).reconcile()
     assert repo.other_calls == []
+
+
+# ── Production AWXHttpApi client tests (F3) ──────────────────────────────────
+
+
+def _awx_api_with_transport(status_code: int, payload: dict[str, Any] | None = None):
+    """Build an AWXHttpApi whose httpx client runs on an httpx.MockTransport."""
+    import httpx
+
+    from afk_outcomes.service.execution_reconciliation import AWXHttpApi
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status_code=status_code, json=payload or {})
+    )
+    api = AWXHttpApi(base_url="https://awx.example.com", token="test-token")
+    api._client = httpx.AsyncClient(
+        transport=transport, base_url="https://awx.example.com"
+    )
+    return api
+
+
+@pytest.mark.asyncio
+async def test_awk_http_api_get_job_returns_awx_job_state():
+    api = _awx_api_with_transport(
+        200,
+        {
+            "status": "successful",
+            "finished": "2026-09-01T12:00:00Z",
+        },
+    )
+    try:
+        state = await api.get_job(42)
+        assert state is not None
+        assert state.status == "successful"
+        assert state.finished_at is not None
+        assert state.finished_at.year == 2026
+    finally:
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_awk_http_api_get_job_404_returns_none():
+    api = _awx_api_with_transport(404, {"detail": "Not found"})
+    try:
+        state = await api.get_job(999)
+        assert state is None
+    finally:
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_awk_http_api_get_job_500_raises():
+    import httpx
+
+    api = _awx_api_with_transport(500, {"detail": "Server error"})
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await api.get_job(1)
+    finally:
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_awk_http_api_get_job_malformed_timestamp_finished_at_is_none():
+    api = _awx_api_with_transport(
+        200,
+        {
+            "status": "failed",
+            "finished": "not-a-valid-timestamp",
+        },
+    )
+    try:
+        state = await api.get_job(55)
+        assert state is not None
+        assert state.status == "failed"
+        assert state.finished_at is None
+    finally:
+        await api.aclose()
+
+
+@pytest.mark.asyncio
+async def test_awk_http_api_get_job_no_finished_field():
+    api = _awx_api_with_transport(200, {"status": "running"})
+    try:
+        state = await api.get_job(77)
+        assert state is not None
+        assert state.status == "running"
+        assert state.finished_at is None
+    finally:
+        await api.aclose()

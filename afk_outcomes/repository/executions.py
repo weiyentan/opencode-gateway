@@ -1092,7 +1092,7 @@ class _ExecutionBindingsRepositoryMixin:
         return [_row_to_execution_binding(row) for row in rows]
 
     async def list_running_execution_bindings(
-        self, *, limit: int = 100
+        self, *, limit: int = 100, max_age_seconds: int | None = None
     ) -> list[ExecutionBinding]:
         """Return execution bindings stuck in the provisional ``running``
         outcome (issue #637).
@@ -1107,11 +1107,15 @@ class _ExecutionBindingsRepositoryMixin:
         Ordered deterministically by ``created_at ASC, id ASC`` (oldest
         first, ``id`` tie-breaker) and bounded by ``limit`` (must be >= 1),
         so a large backlog is drained across repeated bounded passes.
+
+        ``max_age_seconds`` optionally narrows discovery to bindings created
+        more than that many seconds ago, so a binding that started recently
+        (and may still be legitimately running) is not reconciled
+        prematurely.  When ``None``, no age filter is applied.
         """
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        rows = await self._conn.fetch(
-            """
+        query = """
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
                    repository_url, entity_type, entity_number, outcome,
                    source_event_id, branch, title, failure_reason, failure_summary,
@@ -1119,9 +1123,13 @@ class _ExecutionBindingsRepositoryMixin:
                    external_session_ids AS external_session_ids_json
             FROM execution_bindings
             WHERE outcome = 'running'
-            ORDER BY created_at ASC, id ASC
-            LIMIT $1
-            """,
-            limit,
-        )
+        """
+        params: list[object] = [limit]
+        if max_age_seconds is not None:
+            query += (
+                " AND created_at < now() - make_interval(secs => $2)"
+            )
+            params.append(max_age_seconds)
+        query += " ORDER BY created_at ASC, id ASC LIMIT $1"
+        rows = await self._conn.fetch(query, *params)
         return [_row_to_execution_binding(row) for row in rows]

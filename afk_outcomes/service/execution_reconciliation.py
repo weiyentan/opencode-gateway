@@ -44,6 +44,7 @@ package (``app``) — only stdlib + ``afk_outcomes`` + ``httpx``.
 from __future__ import annotations
 
 import logging
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -117,6 +118,7 @@ class BindingResultKind(str, Enum):  # noqa: UP042 - StrEnum is 3.11+; keep impo
     NOT_YET_TERMINAL = "not_yet_terminal"
     CONFLICT = "conflict"
     LOOKUP_ERROR = "lookup_error"
+    PERSIST_ERROR = "persist_error"
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,10 @@ class ReconciliationSummary:
     def lookup_error_count(self) -> int:
         return self._count(BindingResultKind.LOOKUP_ERROR)
 
+    @property
+    def persist_error_count(self) -> int:
+        return self._count(BindingResultKind.PERSIST_ERROR)
+
 
 # ── Reconciler ───────────────────────────────────────────────────────────────
 
@@ -198,7 +204,9 @@ class ExecutionReconciler:
         self._awx_lookup = awx_lookup
         self._limit = max(1, limit)
 
-    async def reconcile(self) -> ReconciliationSummary:
+    async def reconcile(
+        self, *, max_age_seconds: int | None = None
+    ) -> ReconciliationSummary:
         """Run one pass and return the per-binding results.
 
         Discovery is bounded by ``limit`` (oldest bindings first), so a
@@ -206,16 +214,32 @@ class ExecutionReconciler:
         in one unbounded sweep.  Each binding is reconciled independently:
         an AWX lookup failure is recorded for that binding and the pass
         continues.
+
+        ``max_age_seconds`` optionally filters discovery to bindings whose
+        ``created_at`` is older than the given number of seconds.  When
+        ``None`` (the default), all ``running`` bindings are considered.
         """
         bindings = await self._repository.list_running_execution_bindings(  # type: ignore[attr-defined]
-            limit=self._limit
+            limit=self._limit,
+            max_age_seconds=max_age_seconds,
         )
-        results = [await self._reconcile_one(binding) for binding in bindings]
-        summary = ReconciliationSummary(examined=len(bindings), results=results)
+        # Bound concurrency to avoid holding a worker for a long sequential
+        # sweep of AWX HTTP calls.  The semaphore limits simultaneous
+        # in-flight AWX lookups + persistence writes.
+        semaphore = asyncio.Semaphore(min(10, len(bindings) or 1))
+
+        async def _bounded_reconcile_one(b: object) -> BindingReconciliationResult:
+            async with semaphore:
+                return await self._reconcile_one(b)
+
+        results = await asyncio.gather(
+            *[_bounded_reconcile_one(b) for b in bindings]
+        )
+        summary = ReconciliationSummary(examined=len(bindings), results=list(results))
         logger.info(
             "AFK execution reconciliation pass: examined=%d updated=%d "
             "already_terminal=%d missing_job=%d binding_missing=%d "
-            "not_yet_terminal=%d conflict=%d lookup_error=%d",
+            "not_yet_terminal=%d conflict=%d lookup_error=%d persist_error=%d",
             summary.examined,
             summary.updated_count,
             summary.already_terminal_count,
@@ -224,15 +248,16 @@ class ExecutionReconciler:
             summary.not_yet_terminal_count,
             summary.conflict_count,
             summary.lookup_error_count,
+            summary.persist_error_count,
         )
         return summary
 
     async def _reconcile_one(self, binding: object) -> BindingReconciliationResult:
         """Reconcile one ``running`` binding against its AWX job status."""
-        awx_job = getattr(binding, "awx_job")
         try:
+            awx_job = getattr(binding, "awx_job")
             job_id = int(awx_job.job_id)
-        except (TypeError, ValueError) as exc:
+        except (AttributeError, TypeError, ValueError) as exc:
             return BindingReconciliationResult(
                 awx_job_id=-1,
                 kind=BindingResultKind.LOOKUP_ERROR,
@@ -270,11 +295,19 @@ class ExecutionReconciler:
         # Persist through the existing terminal-update path: serialized,
         # history-preserving, idempotent — terminal rows are never mutated
         # and conflicting re-observations are rejected as conflicts.
-        update = await self._repository.update_execution_binding_terminal(  # type: ignore[attr-defined]
-            awx_job_id=str(job_id),
-            outcome=outcome,
-            finished_at=state.finished_at,
-        )
+        try:
+            update = await self._repository.update_execution_binding_terminal(  # type: ignore[attr-defined]
+                awx_job_id=str(job_id),
+                outcome=outcome,
+                finished_at=state.finished_at,
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence isolation
+            return BindingReconciliationResult(
+                awx_job_id=job_id,
+                kind=BindingResultKind.PERSIST_ERROR,
+                detail=type(exc).__name__,
+            )
+
         if update.is_updated:
             kind = BindingResultKind.UPDATED
         elif update.is_conflict:

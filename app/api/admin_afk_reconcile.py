@@ -37,6 +37,8 @@ ingestion path, and each terminal update is its own short DB transaction.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import asyncpg
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -67,7 +69,7 @@ class AFKExecutionReconcileResultItem(BaseModel):
         description=(
             "Per-binding result kind: updated | already_terminal | "
             "missing_job | binding_missing | not_yet_terminal | conflict "
-            "| lookup_error"
+            "| lookup_error | persist_error"
         )
     )
     outcome: str | None = Field(
@@ -102,6 +104,7 @@ class AFKExecutionReconcileResponse(BaseModel):
     not_yet_terminal: int = Field(default=0, description="AWX jobs still active — binding stays running")
     conflicts: int = Field(default=0, description="Conflicting re-observations (history preserved)")
     lookup_errors: int = Field(default=0, description="Per-binding AWX lookup failures (pass continued)")
+    persist_errors: int = Field(default=0, description="Per-binding persistence failures (pass continued)")
     results: list[AFKExecutionReconcileResultItem] = Field(default_factory=list)
 
 
@@ -115,21 +118,30 @@ def _provide_repository(
     return AsyncpgOutcomeRepository(conn)
 
 
-def _provide_awx_lookup() -> AWXJobLookup | None:
+async def _provide_awx_lookup() -> AsyncIterator[AWXJobLookup | None]:
     """Provide the AWX job lookup, or ``None`` when unconfigured.
 
     The token is read from settings and passed only to the HTTP client —
     it is never logged or echoed.  An empty
-    ``GATEWAY_AWX_RECONCILIATION_BASE_URL`` disables reconciliation: the
+    ``GATEWAY_AWX_RECONCILIATION_BASE_URL`` or an empty
+    ``GATEWAY_AWX_RECONCILIATION_API_TOKEN`` disables reconciliation: the
     endpoint then reports ``configured=false`` and touches nothing.
+
+    This is an async generator so that FastAPI runs the ``finally`` block
+    (closing the underlying ``httpx.AsyncClient``) after the request.
     """
     settings = get_settings()
-    if not settings.awx_reconciliation_base_url:
-        return None
-    return AWXHttpApi(
+    if not settings.awx_reconciliation_base_url or not settings.awx_reconciliation_api_token:
+        yield None
+        return
+    api = AWXHttpApi(
         base_url=settings.awx_reconciliation_base_url,
         token=settings.awx_reconciliation_api_token,
     )
+    try:
+        yield api
+    finally:
+        await api.aclose()
 
 
 def _summary_to_response(
@@ -156,6 +168,7 @@ def _summary_to_response(
         not_yet_terminal=summary.not_yet_terminal_count,
         conflicts=summary.conflict_count,
         lookup_errors=summary.lookup_error_count,
+        persist_errors=summary.persist_error_count,
         results=[_item(r) for r in summary.results],
     )
 
@@ -176,6 +189,11 @@ async def reconcile_afk_executions(
         le=1000,
         description="Maximum number of running bindings examined in this pass",
     ),
+    max_age_seconds: int | None = Query(
+        default=None,
+        ge=1,
+        description="Optional maximum age in seconds — only examine bindings older than this",
+    ),
 ) -> AFKExecutionReconcileResponse:
     """Run one bounded AFK AWX execution reconciliation pass.
 
@@ -193,5 +211,5 @@ async def reconcile_afk_executions(
     reconciler = ExecutionReconciler(
         repository=repository, awx_lookup=awx_lookup, limit=limit
     )
-    summary = await reconciler.reconcile()
+    summary = await reconciler.reconcile(max_age_seconds=max_age_seconds)
     return _summary_to_response(summary)

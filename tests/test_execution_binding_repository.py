@@ -2568,3 +2568,29 @@ async def test_list_running_execution_bindings_empty_is_noop():
 
     assert bindings == []
     assert conn.fetch.call_args[0][1] == 10
+
+
+async def test_list_running_execution_bindings_no_age_filter_by_default():
+    """Without ``max_age_seconds`` discovery is not age-bounded."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo.list_running_execution_bindings(limit=10)
+
+    sql = conn.fetch.call_args[0][0]
+    assert "make_interval" not in sql
+    assert conn.fetch.call_args[0][1:] == (10,)
+
+
+async def test_list_running_execution_bindings_applies_age_filter():
+    """``max_age_seconds`` narrows discovery to older-than-cutoff rows."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    repo = AsyncpgOutcomeRepository(conn)
+
+    await repo.list_running_execution_bindings(limit=10, max_age_seconds=300)
+
+    sql = conn.fetch.call_args[0][0]
+    assert "created_at < now() - make_interval(secs => $2)" in sql
+    assert conn.fetch.call_args[0][1:] == (10, 300)

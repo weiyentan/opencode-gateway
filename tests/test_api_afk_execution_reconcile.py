@@ -178,4 +178,14 @@ async def test_reconcile_endpoint_requires_api_key():
 async def test_provide_awx_lookup_none_when_base_url_unset(monkeypatch):
     monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_BASE_URL", "")
     # get_settings() is uncached — each call reads current env.
-    assert admin_afk_reconcile._provide_awx_lookup() is None
+    gen = admin_afk_reconcile._provide_awx_lookup()
+    value = await gen.__anext__()
+    assert value is None
+
+
+async def test_provide_awx_lookup_none_when_token_empty(monkeypatch):
+    monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_BASE_URL", "https://awx.example.com")
+    monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_API_TOKEN", "")
+    gen = admin_afk_reconcile._provide_awx_lookup()
+    value = await gen.__anext__()
+    assert value is None
