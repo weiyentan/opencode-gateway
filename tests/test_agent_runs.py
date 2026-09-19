@@ -885,16 +885,21 @@ class TestAgentRunsList:
         assert item["code_changes_total"] == 7
         # Pin the SQL projection: the mock row factory supplies columns
         # independently of the SQL, so only an SQL assertion catches a
-        # regression that drops the code_change_* columns from the CTE
-        # wrapper's inner subquery select list.
+        # regression that drops the code_change_* columns from the page
+        # projection.  Issue #709 moved the status predicate inside the
+        # page selection (page-before-enrichment) — the wrapper subquery
+        # is gone, so pin the new shape instead.
         sql = mock_conn.fetch.call_args[0][0]
-        assert "WHERE sub._status" in sql  # CTE wrapper path is active
+        assert "WITH page_ids AS" in sql  # page-before-enrichment path active
+        flat = " ".join(sql.split())
+        assert "= $1" in flat  # status predicate narrows the page selection
+        assert flat.index("= $1") < flat.index("LIMIT $")  # before pagination
         for col in (
             "osc.code_change_count",
             "osc.code_change_additions",
             "osc.code_change_deletions",
         ):
-            assert col in sql, f"{col} missing from status-filter CTE projection"
+            assert col in sql, f"{col} missing from page projection"
 
     @pytest.mark.asyncio
     async def test_filters_by_date_range(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -1129,6 +1134,215 @@ def _mk_todo_row(
     row.__getitem__.side_effect = data.__getitem__
     row.get.side_effect = data.get
     return row
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Page-before-enrichment (issue #709)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _norm_sql(sql: str) -> str:
+    """Collapse whitespace so SQL shape assertions survive reformatting."""
+    return " ".join(sql.split())
+
+
+class TestPageBeforeEnrichment:
+    """Issue #709 — the Agent Runs list pages the filtered universe BEFORE
+    enrichment.
+
+    The ordered, paginated page of session rows is selected first
+    (``page_ids``); usage, provider, and Todo Snapshot aggregation then
+    join the page rather than the full filtered universe, so enrichment
+    work scales with the page size instead of the total match count.
+    Response contract, ordering, filters, and status semantics are
+    unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pagination_precedes_enrichment_in_data_sql(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """LIMIT/OFFSET apply inside the page selection, before any
+        enrichment CTE is computed."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            resp = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": "25", "offset": "75"},
+            )
+
+        assert resp.status_code == 200
+        sql = _norm_sql(mock_conn.fetch.call_args[0][0])
+        assert "WITH page_ids AS" in sql
+        # Pagination is bound before the enrichment CTEs are defined
+        # (no other filters here, so limit/offset take slots 1 and 2).
+        assert sql.index("LIMIT $") < sql.index("usage_agg AS")
+        assert sql.index("OFFSET $") < sql.index("usage_agg AS")
+        assert "LIMIT $1" in sql
+        assert "OFFSET $2" in sql
+
+    @pytest.mark.asyncio
+    async def test_enrichment_ctes_join_the_page_not_the_universe(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """usage/provider/todo aggregation is scoped to the selected page,
+        not to the full filtered universe."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            resp = await c.get("/api/v1/usage/agent-runs")
+
+        assert resp.status_code == 200
+        sql = _norm_sql(mock_conn.fetch.call_args[0][0])
+        # usage_agg and provider_agg each join the page.
+        assert sql.count("JOIN page p ON p.id = ue.session_id") == 2
+        assert "JOIN page s ON s.source_database_id" in sql  # todo_counts
+        # The full-universe scoping must be gone (pre-#709 shape).
+        assert "JOIN base" not in sql
+        assert "WITH base AS" not in sql
+
+    @pytest.mark.asyncio
+    async def test_child_counts_stay_global(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """child_run_count aggregates over ALL sessions, never truncated to
+        the selected page — a page parent shows every child."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            resp = await c.get(
+                "/api/v1/usage/agent-runs", params={"limit": "10"}
+            )
+
+        assert resp.status_code == 200
+        sql = _norm_sql(mock_conn.fetch.call_args[0][0])
+        assert (
+            "child_counts AS ( SELECT parent_session_id, COUNT(*) AS cnt "
+            "FROM sessions WHERE parent_session_id IS NOT NULL "
+            "GROUP BY parent_session_id )" in sql
+        )
+        assert "LEFT JOIN child_counts cc" in sql
+        assert "ON cc.parent_session_id = s.external_session_id" in sql
+
+    @pytest.mark.asyncio
+    async def test_page_rows_carry_parity_identical_enrichment(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Provider, usage, context, project, and Todo Snapshot values land
+        on the returned page rows unchanged."""
+        row = _mk_session_row(
+            session_id=_SESSION_ID,
+            external_session_id=_EXTERNAL_ID_A,
+            agent="code-editor",
+            project_id="proj-9",
+            project_label="proj-9",
+            session_title="Page run",
+            session_model="claude-sonnet-4-20250514",
+            code_change_count=7,
+            code_change_additions=15,
+            code_change_deletions=3,
+            child_run_count=4,
+            todo_total=9,
+            todo_completed=5,
+            todo_blocked=1,
+        )
+        # Usage/provider enrichment arrive as ordinary row keys.
+        _base = row.__getitem__.side_effect
+
+        def _enriched(k, _base=_base):
+            if k == "total_reasoning_tokens":
+                return 1234
+            if k == "primary_provider":
+                return "anthropic"
+            return _base(k)
+
+        row.__getitem__.side_effect = _enriched
+        mock_conn.fetch = AsyncMock(return_value=[row])
+        mock_conn.fetchval = AsyncMock(return_value=1)
+
+        async with client as c:
+            resp = await c.get("/api/v1/usage/agent-runs")
+
+        assert resp.status_code == 200
+        item = resp.json()["data"]["items"][0]
+        assert item["id"] == str(_SESSION_ID)
+        assert item["total_reasoning_tokens"] == 1234
+        assert item["primary_provider"] == "anthropic"
+        assert item["child_run_count"] == 4
+        assert item["todo_total"] == 9
+        assert item["todo_completed"] == 5
+        assert item["todo_blocked"] == 1
+        assert item["code_change_count"] == 7
+        assert item["code_change_additions"] == 15
+        assert item["code_change_deletions"] == 3
+        assert item["session_title"] == "Page run"
+        assert item["model"] == "claude-sonnet-4-20250514"
+        assert item["project_label"] == "proj-9"
+
+    @pytest.mark.asyncio
+    async def test_offset_beyond_total_keeps_response_contract(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """An offset past the total yields an empty item list with intact
+        pagination metadata (limit/offset echoed, total from the count)."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=12)
+
+        async with client as c:
+            resp = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"limit": "50", "offset": "500"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["items"] == []
+        assert data["total"] == 12
+        assert data["limit"] == 50
+        assert data["offset"] == 500
+
+    @pytest.mark.asyncio
+    async def test_status_filter_applies_inside_page_selection(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The status predicate narrows the page BEFORE pagination and binds
+        the shared reference timestamp; params stay filter → status → now →
+        limit → offset."""
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchval = AsyncMock(return_value=0)
+
+        async with client as c:
+            resp = await c.get(
+                "/api/v1/usage/agent-runs",
+                params={"status": "running", "limit": "5", "offset": "5"},
+            )
+
+        assert resp.status_code == 200
+        count_sql = mock_conn.fetchval.call_args[0][0]
+        count_params = mock_conn.fetchval.call_args[0][1:]
+        data_sql = mock_conn.fetch.call_args[0][0]
+        data_params = mock_conn.fetch.call_args[0][1:]
+
+        # Shared single reference timestamp between count and data.
+        assert count_params[0] == "running"
+        assert data_params[0] == "running"
+        assert count_params[1] == data_params[1]
+        assert data_params[2:] == (5, 5)
+
+        sql = _norm_sql(data_sql)
+        # The status predicate is applied inside the page selection, before
+        # pagination (the pre-#709 shape filtered an outer ``sub`` wrapper).
+        assert "WHERE sub._status" not in sql
+        assert "= $1" in sql
+        assert sql.index("= $1") < sql.index("LIMIT $")
+        assert "s.last_message_at > $2 - interval" in sql
+        # The count query keeps the same predicate and binding shape.
+        count_flat = _norm_sql(count_sql)
+        assert "s.last_message_at > $2 - interval" in count_flat
 
 
 # ══════════════════════════════════════════════════════════════════════════
