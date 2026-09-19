@@ -1,23 +1,30 @@
 ## Summary
 
-This automated develop-loop run implemented the following issue:
+This automated develop-loop run implemented the following issues:
 
 | Issue | Title |
 |-------|-------|
-| #664 | docs: reframe README to current observability direction — deprecation appendix + purge superseded ADRs |
+| #708  | Add read-path parity and performance regression coverage |
+| #709  | Rewrite Agent Runs to page before enrichment |
+| #710  | Add deterministic Records ordering tiebreaker |
+| #711  | Implement the grouped aggregate FILTER pivot |
 
 ## Changes
 
-- Added "Deprecated / compatibility-only" appendix to README
-- Moved `GATEWAY_AFK_OUTCOMES_TOPIC` / `GATEWAY_AFK_OUTCOMES_DLQ_TOPIC` and legacy `external_session_id` normalization to appendix
-- Kept `active_tokens` deprecation + sunset in live tables
-- Removed superseded ADRs 0002, 0003, 0020 from ADR index
-- Deleted ADR files 0002, 0003, 0020
-- Created new ADR 0030: superseded ADR retention policy
-- Fixed dangling references in CONTEXT.md and docs/
+- **#708**: Added 5 new test files covering read-path parity, SQL shape, agent runs parity, usage/aggregate parity, rollup parity, and live protocol harness (84 new tests)
+- **#709**: Rewrote Agent Run Summary query to select filtered page before enrichment — O(page) enrichment instead of O(universe)
+- **#710**: Added `usage_events.id ASC` deterministic tiebreaker to all Records sort modes
+- **#711**: Replaced duplicate grouped scan with single-pass `GROUPING SETS` + `FILTER` pivot — scan count halved, p95 improved 25-45%
 
 ## Review
 
-A consolidated diff review is available.
+Per-issue reviews completed:
+- #708: auto review (test-only, no production changes)
+- #709: mandatory review — approve-with-comments (non-blocking nits on benchmark docstring)
+- #710: mandatory review — approve-with-comments (tests provided by #708 dependency)
+- #711: mandatory review — approve-with-comments (non-blocking: test assertion brittleness)
 
-Closes #664
+Closes #708
+Closes #709
+Closes #710
+Closes #711
