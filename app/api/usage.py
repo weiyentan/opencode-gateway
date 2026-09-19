@@ -633,60 +633,92 @@ async def _fetch_aggregates(
         else ""
     )
 
-    group_by_clause = f"GROUP BY {group_expr}"
+    # Standalone GROUP BY terms beyond the group expression.  The project
+    # label and multi-part agent fragments are already embedded in
+    # ``group_expr``; the standalone terms exist so the corresponding
+    # select columns resolve (they never add grouping granularity).
+    extra_group_terms = ""
     if has_project:
-        group_by_clause += f",{_PROJECT_LABEL_SQL}"
+        extra_group_terms += f",{_PROJECT_LABEL_SQL}"
     if has_agent and len(group_parts) > 1:
-        group_by_clause += ",COALESCE(s.agent, 'unknown')"
+        extra_group_terms += ",COALESCE(s.agent, 'unknown')"
 
-    # The provider breakdown rides the SAME statement via a CTE keyed on the
-    # group expression (one query budget preserved — see test_query_counts).
-    # The CTE replicates the main query's joins so the group expression
-    # (including project-label and agent COALESCE fragments) resolves
-    # identically, then collapses per-provider counts into one JSON object
-    # per group.
+    # Outer pivot projection: the group columns are carried through from
+    # ``inner_agg`` (grouping by them preserves the one-row-per-group
+    # multiplicity the standalone GROUP BY terms produced before #711).
+    project_label_outer = ",\n            project_label" if has_project else ""
+    agent_outer = ",\n            agent" if has_agent else ""
+    outer_group_terms = "group_value"
+    if has_project:
+        outer_group_terms += ", project_label"
+    if has_agent:
+        outer_group_terms += ", agent"
+
+    # The grouped aggregate rides a SINGLE usage_events scan (issue #711):
+    # an inner GROUPING SETS aggregation produces both the per-group total
+    # rows and the per-(group, provider) rows, and the outer query pivots
+    # the provider rows into the provider_breakdown JSON via
+    # ``jsonb_object_agg ... FILTER``.  Token, cost, record, session, and
+    # model measures are taken from the total grouping rows (``is_total``);
+    # provider rows contribute only their record counts.  Null/empty
+    # providers keep mapping to 'unknown'.  The one-row-per-group response
+    # shape, the query budget (one statement — see test_query_counts), and
+    # the ``ORDER BY group_value`` ordering are unchanged.
     sql = f"""
-        WITH provider_counts AS (
+        WITH inner_agg AS (
             SELECT
-                {group_expr} AS group_value,
+                {group_expr} AS group_value{project_label_col}{agent_col},
                 COALESCE(NULLIF(our.provider, ''), 'unknown') AS provider_key,
-                COUNT(*) AS cnt
+                GROUPING(COALESCE(NULLIF(our.provider, ''), 'unknown')) = 1
+                    AS is_total,
+                COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
+                COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
+                COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
+                COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
+                SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
+                COUNT(*) AS record_count,
+                COUNT(DISTINCT our.session_id) AS session_count,
+                COUNT(DISTINCT om.model_name) AS model_count
             FROM usage_events our
             JOIN observed_models om ON om.id = our.model_id
             LEFT JOIN opencode_clients oc ON oc.id = our.client_id
             {sessions_join}
             {project_join}
             WHERE {where_clause}
-            GROUP BY {group_expr}, COALESCE(NULLIF(our.provider, ''), 'unknown')
-        ),
-        provider_breakdown AS (
-            SELECT
-                group_value,
-                jsonb_object_agg(provider_key, cnt) AS provider_breakdown
-            FROM provider_counts
-            GROUP BY group_value
+            GROUP BY {group_expr}{extra_group_terms},
+                GROUPING SETS (
+                    (),
+                    (COALESCE(NULLIF(our.provider, ''), 'unknown'))
+                )
         )
         SELECT
-            {group_expr} AS group_value{project_label_col}{agent_col},
-            COALESCE(SUM(our.input_tokens), 0) AS total_input_tokens,
-            COALESCE(SUM(our.output_tokens), 0) AS total_output_tokens,
-            COALESCE(SUM(our.cached_tokens), 0) AS total_cached_tokens,
-            COALESCE(SUM(our.reasoning_tokens), 0) AS total_reasoning_tokens,
-            COALESCE(SUM(our.cache_read_tokens), 0) AS total_cache_read_tokens,
-            COALESCE(SUM(our.cache_write_tokens), 0) AS total_cache_write_tokens,
-            SUM(our.estimated_cost_usd) AS total_estimated_cost_usd,
-            COUNT(*) AS record_count,
-            COUNT(DISTINCT our.session_id) AS session_count,
-            COUNT(DISTINCT om.model_name) AS model_count,
-            COALESCE(pb.provider_breakdown, '{{}}'::jsonb) AS provider_breakdown
-        FROM usage_events our
-        JOIN observed_models om ON om.id = our.model_id
-        LEFT JOIN opencode_clients oc ON oc.id = our.client_id
-        {sessions_join}
-        {project_join}
-        LEFT JOIN provider_breakdown pb ON pb.group_value = {group_expr}
-        WHERE {where_clause}
-        {group_by_clause}, COALESCE(pb.provider_breakdown, '{{}}'::jsonb)
+            group_value{project_label_outer}{agent_outer},
+            MAX(total_input_tokens) FILTER (WHERE is_total)
+                AS total_input_tokens,
+            MAX(total_output_tokens) FILTER (WHERE is_total)
+                AS total_output_tokens,
+            MAX(total_cached_tokens) FILTER (WHERE is_total)
+                AS total_cached_tokens,
+            MAX(total_reasoning_tokens) FILTER (WHERE is_total)
+                AS total_reasoning_tokens,
+            MAX(total_cache_read_tokens) FILTER (WHERE is_total)
+                AS total_cache_read_tokens,
+            MAX(total_cache_write_tokens) FILTER (WHERE is_total)
+                AS total_cache_write_tokens,
+            MAX(total_estimated_cost_usd) FILTER (WHERE is_total)
+                AS total_estimated_cost_usd,
+            MAX(record_count) FILTER (WHERE is_total) AS record_count,
+            MAX(session_count) FILTER (WHERE is_total) AS session_count,
+            MAX(model_count) FILTER (WHERE is_total) AS model_count,
+            COALESCE(
+                jsonb_object_agg(provider_key, record_count)
+                    FILTER (WHERE NOT is_total),
+                '{{}}'::jsonb
+            ) AS provider_breakdown
+        FROM inner_agg
+        GROUP BY {outer_group_terms}
         ORDER BY group_value
     """
     async with timed_operation("db.query.aggregates.grouped", "db"):
