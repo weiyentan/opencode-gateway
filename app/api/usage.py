@@ -811,6 +811,10 @@ async def _fetch_records(
     else:
         order_col = "our.reported_at"
 
+    # Determinism fix (issue #710), not a deep-offset performance fix: rows
+    # sharing a primary timestamp are ordered by their stable ``usage_events.id``
+    # so repeated requests and adjacent pages never reorder tied rows.  The id
+    # tiebreaker is ascending in both primary directions.
     data_sql = f"""
         SELECT
             our.id,
@@ -837,7 +841,7 @@ async def _fetch_records(
             ON osc.source_database_id = s.source_database_id
             AND osc.external_session_id = s.external_session_id
         WHERE {where_clause}
-        ORDER BY {order_col} {sort_dir}
+        ORDER BY {order_col} {sort_dir}, our.id ASC
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
@@ -2227,6 +2231,10 @@ async def _fetch_records_with_context(
             total = await conn.fetchval(count_sql, *query_params)
 
     # ── Data query ──────────────────────────────────────────────────
+    # Determinism fix (issue #710), not a deep-offset performance fix: the
+    # default Source-Created Ordering keeps its COALESCE expression and adds a
+    # stable, ascending ``usage_events.id`` tiebreaker so records sharing a
+    # source/created timestamp keep a fixed order across requests and pages.
     data_sql = f"""
         SELECT
             our.id,
@@ -2255,7 +2263,7 @@ async def _fetch_records_with_context(
         {_RWC_CONTEXT_JOIN}
         {_RWC_PROJECT_JOIN}
         WHERE {where_clause}
-        ORDER BY COALESCE(osc.source_created_at_tz, our.reported_at) DESC
+        ORDER BY COALESCE(osc.source_created_at_tz, our.reported_at) DESC, our.id ASC
         LIMIT ${len(query_params) + 1}
         OFFSET ${len(query_params) + 2}
     """
