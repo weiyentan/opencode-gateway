@@ -348,7 +348,7 @@ async def test_malformed_binding_without_awx_job_is_isolated():
     ).reconcile()
     assert summary.examined == 1
     assert summary.lookup_error_count == 1
-    assert summary.results[0].awx_job_id == -1
+    assert summary.results[0].awx_job_id is None
     assert summary.results[0].detail == "AttributeError"
 
 
@@ -377,8 +377,9 @@ async def test_reconcile_bounds_concurrent_awx_lookups():
         repository=repo, awx_lookup=ConcurrencyTrackingLookup()  # type: ignore[arg-type]
     ).reconcile()
     assert summary.examined == 25
-    # The semaphore caps simultaneous in-flight AWX calls (min(10, N)).
-    assert 1 < peak <= 10
+    # Phase 1 runs every AWX lookup concurrently (HTTP only, no DB), so all
+    # bindings are in flight at once — there is no concurrency bound.
+    assert peak == 25
 
 
 # ── Idempotency / already-terminal records ───────────────────────────────────

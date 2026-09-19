@@ -22,7 +22,7 @@ Invariants:
   re-discovered; conflicting re-observations are reported as conflicts).
 * **Graceful degradation** — a missing AWX job or a per-binding lookup
   failure is reported in the summary and never crashes the pass.  With
-  the AWX integration unconfigured (``GATEWAY_AWX_BASE_URL`` empty) the
+  the AWX integration unconfigured (``GATEWAY_AWX_RECONCILIATION_BASE_URL`` empty) the
   endpoint responds ``configured=false`` without touching the database.
 * **No credential exposure** — the AWX token lives only in the outbound
   request ``Authorization`` header; lookup-failure detail records the
@@ -64,7 +64,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 class AFKExecutionReconcileResultItem(BaseModel):
     """Per-binding reconciliation result (credential-free)."""
 
-    awx_job_id: int = Field(description="AWX job id of the examined binding")
+    awx_job_id: int | None = Field(default=None, description="AWX job id of the examined binding (None when malformed)")
     result: str = Field(
         description=(
             "Per-binding result kind: updated | already_terminal | "
@@ -93,7 +93,7 @@ class AFKExecutionReconcileResponse(BaseModel):
         default=True,
         description=(
             "False when the AWX integration is unconfigured "
-            "(GATEWAY_AWX_BASE_URL empty) — no discovery or writes occurred"
+            "(GATEWAY_AWX_RECONCILIATION_BASE_URL empty) — no discovery or writes occurred"
         ),
     )
     examined: int = Field(default=0, description="Running bindings examined")

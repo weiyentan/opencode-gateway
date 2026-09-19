@@ -20,6 +20,14 @@ The pass is deliberately narrow:
   (``update_execution_binding_terminal``), which is already serialized,
   history-preserving, and idempotent.
 
+The pass runs in **two phases** so it is safe on a single shared asyncpg
+connection:
+
+* **Phase 1 (parallel)** — AWX status lookups.  These are HTTP calls that
+  never touch the database, so they run fully concurrently.
+* **Phase 2 (serialized)** — terminal persistence.  Every task shares one
+  connection, so writes are issued one at a time.
+
 Invariants (issue #637 acceptance criteria):
 
 * Reconciliation **never** changes the AFK Run lifecycle status and never
@@ -130,7 +138,7 @@ class BindingReconciliationResult:
     carry AWX credentials.
     """
 
-    awx_job_id: int
+    awx_job_id: int | None
     kind: BindingResultKind
     outcome: ExecutionOutcome | None = None
     detail: str | None = None
@@ -209,33 +217,49 @@ class ExecutionReconciler:
     ) -> ReconciliationSummary:
         """Run one pass and return the per-binding results.
 
-        Discovery is bounded by ``limit`` (oldest bindings first), so a
-        large backlog is drained across repeated invocations rather than
-        in one unbounded sweep.  Each binding is reconciled independently:
-        an AWX lookup failure is recorded for that binding and the pass
-        continues.
-
-        ``max_age_seconds`` optionally filters discovery to bindings whose
-        ``created_at`` is older than the given number of seconds.  When
-        ``None`` (the default), all ``running`` bindings are considered.
+        Two-phase design for safe concurrent operation on a single asyncpg Connection:
+        Phase 1 runs all AWX lookups in parallel (HTTP only, no DB).
+        Phase 2 serializes DB writes over the shared connection.
         """
         bindings = await self._repository.list_running_execution_bindings(  # type: ignore[attr-defined]
             limit=self._limit,
             max_age_seconds=max_age_seconds,
         )
-        # Bound concurrency to avoid holding a worker for a long sequential
-        # sweep of AWX HTTP calls.  The semaphore limits simultaneous
-        # in-flight AWX lookups + persistence writes.
-        semaphore = asyncio.Semaphore(min(10, len(bindings) or 1))
 
-        async def _bounded_reconcile_one(b: object) -> BindingReconciliationResult:
-            async with semaphore:
-                return await self._reconcile_one(b)
-
-        results = await asyncio.gather(
-            *[_bounded_reconcile_one(b) for b in bindings]
+        # Phase 1: Parallel AWX lookups (no DB needed — fully concurrent).
+        lookup_results = await asyncio.gather(
+            *[self._lookup_job(b) for b in bindings]
         )
-        summary = ReconciliationSummary(examined=len(bindings), results=list(results))
+
+        # Phase 2: Serialized DB writes over the single shared connection.
+        results: list[BindingReconciliationResult] = []
+        for binding, (job_id, state, error_detail) in zip(bindings, lookup_results):
+            if error_detail is not None and job_id is None:
+                # Malformed binding — couldn't extract job_id at all.
+                results.append(BindingReconciliationResult(
+                    awx_job_id=None,
+                    kind=BindingResultKind.LOOKUP_ERROR,
+                    detail=error_detail,
+                ))
+            elif error_detail is not None:
+                # AWX lookup failed — job_id known, but state unknown.
+                results.append(BindingReconciliationResult(
+                    awx_job_id=job_id,
+                    kind=BindingResultKind.LOOKUP_ERROR,
+                    detail=error_detail,
+                ))
+            elif state is None:
+                # AWX knows no such job.
+                results.append(BindingReconciliationResult(
+                    awx_job_id=job_id,
+                    kind=BindingResultKind.MISSING_JOB,
+                ))
+            else:
+                # Got a valid state — persist (serialized on single connection).
+                result = await self._persist_result(binding, job_id, state)
+                results.append(result)
+
+        summary = ReconciliationSummary(examined=len(bindings), results=results)
         logger.info(
             "AFK execution reconciliation pass: examined=%d updated=%d "
             "already_terminal=%d missing_job=%d binding_missing=%d "
@@ -323,6 +347,58 @@ class ExecutionReconciler:
         return BindingReconciliationResult(
             awx_job_id=job_id, kind=kind, outcome=outcome
         )
+
+    async def _lookup_job(self, binding: object) -> tuple[int | None, AWXJobState | None, str | None]:
+        """Look up the AWX job status for one binding. Returns (job_id, state, error_detail).
+
+        Does NOT touch the database — pure HTTP lookup.
+        """
+        try:
+            awx_job = getattr(binding, "awx_job")
+            job_id = int(awx_job.job_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            return None, None, type(exc).__name__
+
+        try:
+            state = await self._awx_lookup.get_job(job_id)
+        except Exception as exc:  # noqa: BLE001
+            return job_id, None, type(exc).__name__
+
+        return job_id, state, None
+
+    async def _persist_result(
+        self, binding: object, job_id: int, state: AWXJobState
+    ) -> BindingReconciliationResult:
+        """Persist the AWX lookup result for one binding. DB write only."""
+        outcome = map_awx_status_to_outcome(state.status)
+        if outcome is None:
+            return BindingReconciliationResult(
+                awx_job_id=job_id,
+                kind=BindingResultKind.NOT_YET_TERMINAL,
+            )
+
+        try:
+            update = await self._repository.update_execution_binding_terminal(  # type: ignore[attr-defined]
+                awx_job_id=str(job_id),
+                outcome=outcome,
+                finished_at=state.finished_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return BindingReconciliationResult(
+                awx_job_id=job_id,
+                kind=BindingResultKind.PERSIST_ERROR,
+                detail=type(exc).__name__,
+            )
+
+        if update.is_updated:
+            kind = BindingResultKind.UPDATED
+        elif update.is_conflict:
+            kind = BindingResultKind.CONFLICT
+        elif update.not_found:
+            kind = BindingResultKind.BINDING_MISSING
+        else:
+            kind = BindingResultKind.ALREADY_TERMINAL
+        return BindingReconciliationResult(awx_job_id=job_id, kind=kind, outcome=outcome)
 
 
 # ── Production AWX HTTP client ───────────────────────────────────────────────
