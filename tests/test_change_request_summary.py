@@ -5,7 +5,6 @@ provider/repository/change-request identity, aggregating:
 
 * **provider state** — derived from observed ``engineering_events`` facts
   (``merged`` / ``closed`` / ``open``);
-* **AFK automation state** — the owning lifecycle's ``afk_runs.status``
   (``pending`` / ``running`` / ``completed`` / ``failed`` / ``cancelled``);
 * **total estimated USD cost** — summed linked-session cost, ``null`` when no
   cost telemetry is available (unavailable, never zero);
@@ -48,7 +47,6 @@ def _mk_summary_row(
     repository: str = "acme/proj",
     external_id: str = "42",
     provider_state: str | None = "merged",
-    automation_state: str | None = "completed",
     latest_activity_at: datetime | None = _B_TS,
     provider_state_observed_at: datetime | None = _B_TS,
     total_estimated_cost_usd: Decimal | None = Decimal("0.08"),
@@ -65,7 +63,6 @@ def _mk_summary_row(
             "repository": repository,
             "external_id": external_id,
             "provider_state": provider_state,
-            "automation_state": automation_state,
             "latest_activity_at": latest_activity_at,
             "provider_state_observed_at": provider_state_observed_at,
             "total_estimated_cost_usd": total_estimated_cost_usd,
@@ -124,7 +121,6 @@ class TestListChangeRequests:
                     repository="cloudnative-pg/cloudnative-pg",
                     external_id="6",
                     provider_state="open",
-                    automation_state="running",
                     latest_activity_at=_A_TS,
                     total_estimated_cost_usd=None,
                     execution_total=1,
@@ -152,7 +148,6 @@ class TestListChangeRequests:
         assert github_row["external_id"] == "42"
         assert github_row["resource_type"] == "change_request"
         assert github_row["provider_state"] == "merged"
-        assert github_row["automation_state"] == "completed"
         assert github_row["latest_linked_activity"] is not None
         assert github_row["provider_state_observed_at"] is not None
         assert github_row["executions"] == {
@@ -168,7 +163,6 @@ class TestListChangeRequests:
         gitlab_row = data["items"][1]
         assert gitlab_row["provider"] == "gitlab"
         assert gitlab_row["provider_state"] == "open"
-        assert gitlab_row["automation_state"] == "running"
         assert gitlab_row["total_estimated_cost_usd"] is None
 
     @pytest.mark.asyncio
@@ -192,14 +186,14 @@ class TestListChangeRequests:
         assert item["executions"]["failed"] == 1
 
     @pytest.mark.asyncio
-    async def test_missing_automation_and_provider_state_are_null(
+    async def test_missing_provider_state_is_null(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
-        """A change request known only from executions has no derived states."""
+        """A change request known only from executions has no derived state."""
         mock_conn.fetchval = AsyncMock(return_value=1)
         mock_conn.fetch = AsyncMock(
             return_value=[
-                _mk_summary_row(provider_state=None, automation_state=None)
+                _mk_summary_row(provider_state=None)
             ]
         )
 
@@ -209,7 +203,6 @@ class TestListChangeRequests:
         assert response.status_code == 200
         item = response.json()["data"]["items"][0]
         assert item["provider_state"] is None
-        assert item["automation_state"] is None
 
     @pytest.mark.asyncio
     async def test_empty_results(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -292,20 +285,6 @@ class TestChangeRequestSummaryFilters:
         assert "summary.provider_state = $1" in count_sql
 
     @pytest.mark.asyncio
-    async def test_filters_by_automation_state(
-        self, client: AsyncClient, mock_conn: AsyncMock
-    ):
-        mock_conn.fetchval = AsyncMock(return_value=0)
-        mock_conn.fetch = AsyncMock(return_value=[])
-
-        async with client as c:
-            response = await c.get(_ENDPOINT, params={"automation_state": "failed"})
-
-        assert response.status_code == 200
-        sql = mock_conn.fetch.call_args[0][0]
-        assert "summary.automation_state = $1" in sql
-
-    @pytest.mark.asyncio
     async def test_filters_by_activity_window(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
@@ -348,15 +327,6 @@ class TestChangeRequestSummaryFilters:
         assert response.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_invalid_automation_state_returns_400(
-        self, client: AsyncClient, mock_conn: AsyncMock
-    ):
-        async with client as c:
-            response = await c.get(_ENDPOINT, params={"automation_state": "stale"})
-
-        assert response.status_code == 400
-
-    @pytest.mark.asyncio
     async def test_inverted_activity_window_returns_400(
         self, client: AsyncClient, mock_conn: AsyncMock
     ):
@@ -387,7 +357,7 @@ class TestChangeRequestSummaryQueries:
 
     def test_universe_joins_three_identity_sources(self):
         build = self._builder()
-        count_sql, data_sql, params = build(None, None, None, None, None, None)
+        count_sql, data_sql, params = build(None, None, None, None, None)
         assert params == []
         assert "WITH identities AS" in data_sql
         assert "FROM engineering_events" in data_sql
@@ -399,7 +369,7 @@ class TestChangeRequestSummaryQueries:
 
     def test_excludes_executions_without_durable_change_request_identity(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # The execution-binding legs of the union and the count aggregation
         # both require every resource-identity column to be present.
         normalized = " ".join(data_sql.split())
@@ -411,7 +381,7 @@ class TestChangeRequestSummaryQueries:
 
     def test_provider_state_derived_from_latest_event_chronologically(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # Provider state is derived from the chronologically latest observed
         # lifecycle fact (a reopened PR/MR reports ``open`` again), with the
         # historical merged > closed > open precedence kept only as the
@@ -429,7 +399,7 @@ class TestChangeRequestSummaryQueries:
 
     def test_latest_activity_at_is_null_safe_greatest(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # Null-safe maximum across run, fact, and execution timestamps — a
         # COALESCE would stop at the first non-null source and hide newer ones.
         assert "GREATEST(" in data_sql
@@ -440,14 +410,14 @@ class TestChangeRequestSummaryQueries:
 
     def test_provider_state_observed_at_surfaces_fact_freshness(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # The summary exposes the freshness of the derived provider state:
         # the occurred_at of the most recent observed change_request fact.
         assert "MAX(es.latest_event_at) AS provider_state_observed_at" in data_sql
 
     def test_default_order_is_execution_activity_only(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # #613: rows are ordered by newest linked AWX activity by default.
         # The ORDER BY must use execution-only activity (the #610/#613
         # acceptance criterion), never the combined latest_activity_at which
@@ -466,7 +436,7 @@ class TestChangeRequestSummaryQueries:
     def test_activity_window_filter_still_uses_combined_activity(self):
         build = self._builder()
         _, data_sql, _ = build(
-            None, None, None, None,
+            None, None, None,
             datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
             datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
         )
@@ -475,19 +445,9 @@ class TestChangeRequestSummaryQueries:
         assert "summary.latest_activity_at >= $1" in data_sql
         assert "summary.latest_activity_at <= $2" in data_sql
 
-    def test_automation_state_precedence_mirrors_run_status_policy(self):
-        build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
-        # Success-aware precedence, mirroring resolve_afk_run_status.
-        assert "WHEN BOOL_OR(r.status = 'running') THEN 'running'" in data_sql
-        assert "WHEN BOOL_OR(r.status = 'completed') THEN 'completed'" in data_sql
-        assert "WHEN BOOL_OR(r.status = 'failed') THEN 'failed'" in data_sql
-        assert "WHEN BOOL_OR(r.status = 'cancelled') THEN 'cancelled'" in data_sql
-        assert "WHEN BOOL_OR(r.status = 'pending') THEN 'pending'" in data_sql
-
     def test_cost_sum_never_coalesces_null_to_zero(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # Missing cost telemetry must surface as SQL NULL (unavailable), so the
         # mapper yields None — the cost column derives from the deduplicated
         # ``session_cost`` aggregate, never wrapped in a COALESCE that would
@@ -498,7 +458,7 @@ class TestChangeRequestSummaryQueries:
 
     def test_cost_deduplicates_sessions_across_runs(self):
         build = self._builder()
-        _, data_sql, _ = build(None, None, None, None, None, None)
+        _, data_sql, _ = build(None, None, None, None, None)
         # A session linked to multiple AFK runs for one change request (a
         # retry reuses the same internal session UUID) must contribute its
         # cost exactly once — the raw run→session join would double-count.
@@ -518,7 +478,6 @@ class TestChangeRequestSummaryQueries:
         assert mapped.external_id == "42"
         assert mapped.resource_type == "change_request"
         assert mapped.provider_state == "merged"
-        assert mapped.automation_state == "completed"
         assert mapped.latest_linked_activity == _B_TS
         assert mapped.provider_state_observed_at == _B_TS
         assert mapped.total_estimated_cost_usd == Decimal("0.08")

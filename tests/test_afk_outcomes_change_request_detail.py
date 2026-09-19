@@ -4,7 +4,7 @@
 resolves one change request directly by its flattened stable resource
 identity and returns one composite read model:
 
-* **summary block** — provider state and AFK automation state as separate
+* **summary block** — provider state as separate
   values, aggregate cost, merge/freshness enrichment, execution counts;
 * **linked AFK runs** — with every durable link source;
 * **ordered AWX execution bindings** — AWX job identity, outcome,
@@ -46,7 +46,6 @@ def _mk_summary_row(
     repository: str = "acme/proj",
     external_id: str = "42",
     provider_state: str | None = "merged",
-    automation_state: str | None = "completed",
     latest_activity_at: datetime | None = _B_TS,
     total_estimated_cost_usd: Decimal | None = Decimal("0.12"),
     merged_at: datetime | None = _B_TS,
@@ -65,7 +64,6 @@ def _mk_summary_row(
             "repository": repository,
             "external_id": external_id,
             "provider_state": provider_state,
-            "automation_state": automation_state,
             "latest_activity_at": latest_activity_at,
             "total_estimated_cost_usd": total_estimated_cost_usd,
             "merged_at": merged_at,
@@ -307,7 +305,7 @@ class TestChangeRequestDetail:
         assert response.status_code == 200
         data = response.json()["data"]
 
-        # Summary block — provider state and AFK automation state as
+        # Summary block — provider state as
         # separate values, with merge/freshness enrichment.
         summary = data["change_request"]
         assert summary["provider"] == "github"
@@ -315,7 +313,6 @@ class TestChangeRequestDetail:
         assert summary["external_id"] == "42"
         assert summary["resource_type"] == "change_request"
         assert summary["provider_state"] == "merged"
-        assert summary["automation_state"] == "completed"
         assert summary["title"] == "Implement auth"
         assert summary["merged_at"] is not None
         assert summary["provider_state_observed_at"] is not None
@@ -332,7 +329,6 @@ class TestChangeRequestDetail:
         assert len(data["afk_runs"]) == 1
         run = data["afk_runs"][0]
         assert run["afk_run_id"] == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-        assert run["status"] == "completed"
         assert run["link_sources"] == ["change_request_binding", "execution"]
 
         # Executions in deterministic order with AWX job identity, outcome,
@@ -390,7 +386,6 @@ class TestChangeRequestDetail:
                 repository="cloudnative-pg/cloudnative-pg",
                 external_id="6",
                 provider_state="open",
-                automation_state="running",
                 merged_at=None,
                 provider_state_observed_at=_A_TS,
                 total_estimated_cost_usd=None,
@@ -423,7 +418,6 @@ class TestChangeRequestDetail:
         data = response.json()["data"]
         assert data["change_request"]["provider"] == "gitlab"
         assert data["change_request"]["provider_state"] == "open"
-        assert data["change_request"]["automation_state"] == "running"
         # Missing cost telemetry is null — never zero.
         assert data["change_request"]["total_estimated_cost_usd"] is None
         assert data["total_estimated_cost_usd"] is None
@@ -703,7 +697,6 @@ class TestChangeRequestDetail:
             mock_conn,
             summary=_mk_summary_row(
                 provider_state=None,
-                automation_state=None,
                 merged_at=None,
                 provider_state_observed_at=None,
                 title=None,
@@ -716,7 +709,6 @@ class TestChangeRequestDetail:
 
         data = response.json()["data"]
         assert data["change_request"]["provider_state"] is None
-        assert data["change_request"]["automation_state"] is None
         assert data["merge_state"] is None
         assert data["timeline"] is None
 
@@ -973,9 +965,6 @@ class TestChangeRequestDetailQueries:
         assert "WHEN BOOL_OR(es.closed) THEN 'closed'" not in sql
         assert "WHEN BOOL_OR(es.opened) THEN 'open'" not in sql
         # Success-aware automation precedence, mirroring #610's summary.
-        assert "WHEN BOOL_OR(r.status = 'running') THEN 'running'" in sql
-        assert "WHEN BOOL_OR(r.status = 'completed') THEN 'completed'" in sql
-        assert "WHEN BOOL_OR(r.status = 'pending') THEN 'pending'" in sql
 
     def test_latest_activity_at_is_null_safe_greatest(self):
         from app.api.afk_outcomes import _CHANGE_REQUEST_DETAIL_SUMMARY_SQL
@@ -1052,7 +1041,6 @@ class TestChangeRequestDetailQueries:
 
         summary = _change_request_detail_summary_row(_mk_summary_row())
         assert summary.provider_state == "merged"
-        assert summary.automation_state == "completed"
         assert summary.title == "Implement auth"
         assert summary.merged_at == _B_TS
         assert summary.provider_state_observed_at == _B_TS

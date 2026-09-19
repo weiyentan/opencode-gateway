@@ -634,14 +634,20 @@ from the provider. Execution bindings only reference this identifier and
 never assign or discover it implicitly.
 _Avoid_: Run ID (ambiguous — collides with agent-run session IDs)
 
-**RunStatus**:
-The lifecycle status of an AFK Run, independent of its AWX Execution Outcomes.
-The AFK Run remains open while its canonical change request is open and is
-completed only when that change request is successfully merged; closing the
-change request without merging is a distinct terminal result. Never conflate
-this lifecycle status with an individual Execution Outcome, the agent-run
-``_compute_status`` heuristic, or EngineeringOutcomeStatus.
-_Avoid_: Reusing the Agent Run status heuristic, conflating with outcome status
+**RunStatus** (retired):
+The former lifecycle-status vocabulary of an AFK Run. Issue #649 retired the
+``afk_runs.status`` column (migration 0045) and every API/schema/query
+surface over it: per ADR 0028 the owning **change request** is the lifecycle
+authority — the AFK Run remains open while its canonical change request is
+open and is completed only when that change request is successfully merged;
+closing the change request without merging is a distinct terminal result.
+Lifecycle semantics are covered by ``outcome_status`` (EngineeringOutcomeStatus),
+the derived provider state from observed ``change_request`` facts, and the
+per-execution Execution Outcome. The pure-domain policy
+(``afk_outcomes.run_status.resolve_afk_run_status``) survives as the
+deterministic projection of execution-outcome multisets. Never conflate any
+of these with the agent-run ``_compute_status`` heuristic.
+_Avoid_: Reusing the Agent Run status heuristic, conflating with outcome status, a stored AFK Run lifecycle status
 
 **Engineering Entity**:
 A provider-independent, stable reference to one engineering artifact
@@ -1406,7 +1412,7 @@ manages.
 - The **Replay Merge** non-erasing fill-absent principle also applies to **Session Context** and Project projections while preserving their snapshot semantics
 - A **Canonical Event Replay Merge** (ADR 0012) corrects a stored **Canonical Event** toward the collector's latest non-null observation and moves the owning session aggregate by the per-field delta, never re-incrementing it
 - A **Canonical Event Replay Merge** never erases a populated value: null/omitted collector values produce a zero delta, and text enrichment is COALESCE-filled
-- An **AFK Run** is keyed by an **afk_run_id** ULID assigned at reconstruction time and carries one **RunStatus** and one optional **EngineeringOutcome**
+- An **AFK Run** is keyed by an **afk_run_id** ULID assigned at reconstruction time and carries one optional **EngineeringOutcome** (the lifecycle ``status`` column was retired by issue #649 — ADR 0028 makes the bound change request the lifecycle authority)
 - An **AFK Run** is reconstructed by the **CorrelationEngine** from a session seed plus a window of **Engineering Entities/Events**
 - A **Correlation** links one **AFK Run** to one **Engineering Entity** and records **correlation_method**, **correlation_confidence**, evidence, and **resolver_version**
 - An **Engineering Entity** is referenced by zero or more **Engineering Events** and may carry an entity link on zero or more **AFK Runs**

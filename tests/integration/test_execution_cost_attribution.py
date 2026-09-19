@@ -235,9 +235,9 @@ async def _seed_execution(
     if afk_run_id is None:
         afk_run_id = f"01J628{'0' * 11}{awx_job_id:03d}"[:26]
         await conn.execute(
-            "INSERT INTO afk_runs (afk_run_id, provider, status,"
+            "INSERT INTO afk_runs (afk_run_id, provider,"
             " first_seen_at, last_seen_at)"
-            " VALUES ($1, 'github', 'completed', now(), now())"
+            " VALUES ($1, 'github', now(), now())"
             " ON CONFLICT (afk_run_id) DO NOTHING",
             afk_run_id,
         )
@@ -489,9 +489,9 @@ async def test_multiple_executions_independent_subtotals(db_pool) -> None:
         await _seed_awx_client(conn)
         run_id = "01J6280000000000000000TEST"  # 26-char ULID
         await conn.execute(
-            "INSERT INTO afk_runs (afk_run_id, provider, status,"
+            "INSERT INTO afk_runs (afk_run_id, provider,"
             " first_seen_at, last_seen_at)"
-            " VALUES ($1, 'github', 'completed', now(), now())",
+            " VALUES ($1, 'github', now(), now())",
             run_id,
         )
         ext_first = f"ses_628_first_{uuid.uuid4().hex[:8]}"

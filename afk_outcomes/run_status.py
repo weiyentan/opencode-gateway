@@ -101,10 +101,7 @@ def resolve_afk_run_status(
     -------
     str
         One of ``"pending"`` (no bindings), ``"running"``, ``"completed"``,
-        ``"failed"``, ``"cancelled"``.  Terminal values coincide with
-        :class:`RunStatus` members; ``"pending"`` is the provisional status
-        ``PROVISIONAL_RUN_STATUS`` and is intentionally not a :class:`RunStatus`
-        member.
+        ``"failed"``, ``"cancelled"``.
 
     Notes
     -----

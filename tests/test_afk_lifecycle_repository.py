@@ -145,8 +145,8 @@ def test_provision_first_call_creates_lifecycle(mock_conn: AsyncMock) -> None:
     assert len(result.afk_run_id) == 26  # ULID length
 
 
-def test_provision_inserts_pending_status_and_provenance(mock_conn: AsyncMock) -> None:
-    """The INSERT carries status='pending' plus the lifecycle provenance columns."""
+def test_provision_inserts_lifecycle_provenance(mock_conn: AsyncMock) -> None:
+    """The INSERT carries the lifecycle provenance columns."""
     mock_conn.fetchrow = AsyncMock(return_value=None)
     mock_conn.fetch = AsyncMock(
         return_value=[mock_row({"afk_run_id": _NEW_ULID})]
@@ -158,7 +158,6 @@ def test_provision_inserts_pending_status_and_provenance(mock_conn: AsyncMock) -
     calls = _insert_calls(mock_conn)
     assert len(calls) == 1
     sql, args = calls[0]
-    assert "'pending'" in sql
     for col in (
         "host",
         "source_event_id",
@@ -611,7 +610,6 @@ def test_get_lifecycle_maps_provisioned_row(mock_conn: AsyncMock) -> None:
     assert lifecycle is not None
     assert lifecycle.afk_run_id == _NEW_ULID
     assert lifecycle.provider == Provider.GITHUB
-    assert lifecycle.status == "pending"
     assert lifecycle.host == "awx-01.internal"
     assert lifecycle.source_event_id == "eda-1234"
     assert lifecycle.trigger_type == "eda"
@@ -630,7 +628,6 @@ def test_get_lifecycle_maps_legacy_row_leniently(mock_conn: AsyncMock) -> None:
             source_event_id=None,
             repository=None,
             trigger_type=None,
-            status="completed",
         )
     )
 
@@ -638,7 +635,6 @@ def test_get_lifecycle_maps_legacy_row_leniently(mock_conn: AsyncMock) -> None:
     lifecycle = _run(repo.get_afk_run_lifecycle(_NEW_ULID))
 
     assert lifecycle is not None
-    assert lifecycle.status == "completed"
     assert lifecycle.host is None
     assert lifecycle.source_event_id is None
     assert lifecycle.repository is None

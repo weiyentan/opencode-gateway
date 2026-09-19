@@ -61,7 +61,6 @@ def _mk_lifecycle_row(
     *,
     afk_run_id: str = _RUN_ID,
     provider: str = "github",
-    status: str = "pending",
     host: str | None = "awx-01.internal",
     source_event_id: str | None = "eda-1234",
     repository: str | None = "github.com/acme/proj",
@@ -77,7 +76,6 @@ def _mk_lifecycle_row(
         {
             "afk_run_id": afk_run_id,
             "provider": provider,
-            "status": status,
             "host": host,
             "source_event_id": source_event_id,
             "repository": repository,
@@ -162,7 +160,6 @@ class TestProvisionLifecycle:
         lifecycle = data["data"]
         assert lifecycle["afk_run_id"] == _RUN_ID
         assert lifecycle["provider"] == "github"
-        assert lifecycle["status"] == "pending"
         assert lifecycle["host"] == "awx-01.internal"
         assert lifecycle["source_event_id"] == "eda-1234"
         # Repository identity is normalized at the API boundary.

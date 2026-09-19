@@ -244,7 +244,6 @@ _SUMMARY_ROW_VOCABULARY = {
     "external_id": "string",
     "resource_type": "string",
     "provider_state": "string",
-    "automation_state": "string",
     "total_estimated_cost_usd": "number",
     "latest_linked_activity": "string",
     "provider_state_observed_at": "string",
@@ -297,7 +296,6 @@ _EXECUTION_ITEM_VOCABULARY = {
 _LINKED_RUN_VOCABULARY = {
     "afk_run_id": "string",
     "provider": "string",
-    "status": "string",
     "title": "string",
     "started_at": "string",
     "finished_at": "string",

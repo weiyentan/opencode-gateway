@@ -69,45 +69,24 @@ paths. A well-formed but unknown `afk_run_id` is **`404 NOT_FOUND`**.
 
 ---
 
-## 3. Lifecycle status vocabulary
+## 3. Lifecycle status — retired (issue #649)
 
-`afk_runs.status` carries the **lifecycle status** — distinct from
-`EngineeringOutcomeStatus` (merged/closed/abandoned/open, stored as
-`outcome_status`), from the per-execution `ExecutionOutcome`, and from the
+There is **no lifecycle status field** on an AFK Run. Per ADR 0028 the
+owning change request is the lifecycle authority: the run remains open
+while its change request is open and becomes terminal only through
+change-request state. Issue #649 retired the redundant `afk_runs.status`
+column (migration 0045) together with the API `status` field, the `status`
+filter, and PATCH `status`. The lifecycle semantics are fully covered by:
+
+* **`outcome_status`** — the derived `EngineeringOutcomeStatus`
+  (merged/closed/abandoned/open) from observed provider facts;
+* **Provider state** — `merged | closed | open` derived from observed
+  `change_request` lifecycle facts (change-request endpoints);
+* **Per-execution `ExecutionOutcome`** — `running | completed | failed |
+  cancelled` on each AWX execution binding.
+
+These three vocabularies are distinct from one another and from the
 agent-run `_compute_status` heuristic. Never conflate them.
-
-| Status | Meaning | Origin |
-|---|---|---|
-| `pending` | Provisioned, no execution bound yet (provisional start state) | `POST /api/v1/afk/executions/runs` |
-| `running` | Execution in progress | Projection / lifecycle facts |
-| `completed` | Terminal success | Projection / lifecycle facts |
-| `failed` | Terminal failure | Projection / lifecycle facts |
-| `cancelled` | Terminal cancellation | Projection / lifecycle facts |
-| `blocked` | Intentionally paused awaiting an external condition | Operator correction (PATCH) |
-| `stale` | Liveness no longer trusted; no terminal signal | Operator correction (PATCH) |
-| `timed_out` | Terminal — exceeded maximum duration | Operator correction (PATCH) |
-
-* `pending` is the provisional status (`PROVISIONAL_RUN_STATUS` in
-  `afk_outcomes/models.py`) — it is deliberately **not** a `RunStatus` member.
-* `blocked`, `stale`, and `timed_out` are `RunStatus` members
-  (`afk_outcomes/models.py`) that enter `afk_runs.status` only through the
-  canonical PATCH (§4.3). The status **filter** vocabulary therefore covers
-  all eight values.
-* Per ADR 0028 the owning change request anchors the lifecycle: a change-
-  request lifecycle fact (merge/close) may supersede a manually patched
-  status at the next reconciliation. **Facts outrank manual corrections** —
-  a PATCH is a correction until the next authoritative fact arrives.
-* **Writer scoping (resolves the PATCH-terminal vs ADR 0028 tension).** The
-  §4.3 terminal freeze and ADR 0028 reconciliation govern **different
-  writers** of `afk_runs.status`:
-  * The terminal freeze (§4.3) binds **the canonical PATCH endpoint** — an
-    operator correction can never rewrite terminal history through the API.
-  * The ADR 0028 reconciliation writer (the backfill/reconciliation upsert,
-    `AsyncpgOutcomeRepository.save` → `_upsert_run`) supersedes **any**
-    stored status — including a manually patched terminal one — with the
-    re-derived status whenever a change-request lifecycle fact is
-    reconciled. No database trigger or constraint may enforce the terminal
-    freeze, or this writer would break (see §4.3).
 
 ---
 
@@ -139,7 +118,6 @@ All responses use the shared `{status, data, error}` envelope
 |---|---|---|---|
 | `provider` | string, optional | `github`, `gitlab` | `afk_runs.provider` equality |
 | `repository` | string, optional | normalized repository identity | Matches the run's bound repository (`afk_runs.repository`) **or** any linked entity's repository (`afk_run_entities.repository`) — reconstruction-era rows carry `NULL` repository but have entity links |
-| `status` | string, optional | `pending`, `running`, `completed`, `blocked`, `stale`, `timed_out`, `failed`, `cancelled` | `afk_runs.status` equality |
 | `outcome` | string, optional | `merged`, `closed`, `abandoned`, `open` | `afk_runs.outcome_status` equality |
 | `has_change_request` | boolean, optional | `true`, `false` | `true` → bound (`change_request_provider IS NOT NULL`); `false` → unbound |
 | `created_before` | ISO-8601 datetime, optional | — | `afk_runs.first_seen_at < value` |
@@ -165,7 +143,6 @@ lifecycle fields. The outcomes endpoints keep their exact current
 |---|---|---|
 | `afk_run_id` | string (ULID) | |
 | `provider` | string | `github` \| `gitlab` |
-| `status` | string | §3 vocabulary |
 | `title` | string \| null | |
 | `repository` | string \| null | Normalized identity; `null` for legacy rows |
 | `trigger_type` | string \| null | `eda` \| `manual` \| `scheduled` \| `backfill` \| `recovery` |
@@ -197,46 +174,33 @@ lifecycle fields. The outcomes endpoints keep their exact current
 
 | Field | Type | Rules |
 |---|---|---|
-| `title` | string, optional | When supplied: non-empty, whitespace-trimmed, ≤ 1000 characters. Supplying `null` is **`422`** — omit the field to leave the value unchanged. |
-| `status` | string, optional | One of the seven `RunStatus` values: `running`, `completed`, `blocked`, `stale`, `timed_out`, `failed`, `cancelled`. `pending` is **not** patchable (`422`) — it is the provisioning-assigned provisional state. |
+| `title` | string, required | Non-empty, whitespace-trimmed, ≤ 1000 characters. Supplying `null` is **`422`**. |
 
-**Mutable fields are exactly `{title, status}`.** Nothing else is patchable,
-ever: `provider`, `afk_run_id`, `started_at`/`finished_at`,
-`first_seen_at`/`last_seen_at`, `outcome`/`outcome_status`, the change-request
-binding columns, `recovered_from_afk_run_id`, `trigger_type`, `repository`,
-and `host` are immutable through this endpoint. PATCH never touches execution
-bindings, entity/session links, unresolved correlations, or the change-request
+**Mutable fields are exactly `{title}`** (issue #649 retired the `status`
+field with the column). Nothing else is patchable, ever: `provider`,
+`afk_run_id`, `started_at`/`finished_at`, `first_seen_at`/`last_seen_at`,
+`outcome`/`outcome_status`, the change-request binding columns,
+`recovered_from_afk_run_id`, `trigger_type`, `repository`, and `host` are
+immutable through this endpoint. PATCH never touches execution bindings,
+entity/session links, unresolved correlations, or the change-request
 binding.
 
 **Body validation.** Unknown fields (`extra="forbid"`), wrong types, an
-explicit `null` for `title`, and an empty body (neither field supplied) are
-**`422 VALIDATION_ERROR`**.
+explicit `null` for `title`, and an empty body are
+**`422 VALIDATION_ERROR`**. The retired `status` field is an unknown field
+and is rejected with `422`.
 
-**Lifecycle transition rules.** Evaluated against the current stored status
-under a `SELECT … FOR UPDATE` row lock (serialized, replay-safe):
+**Update rules.** Evaluated under a `SELECT … FOR UPDATE` row lock
+(serialized, replay-safe):
 
-| Current status | Requested status | Result |
-|---|---|---|
-| any | same as current | `200` — idempotent no-op, no mutation (including terminal → same terminal) |
-| `completed`, `failed`, `cancelled`, `timed_out` (terminal) | any different value | **`409 CONFLICT`** — through this endpoint, terminal history is never overwritten; a retry is a new lifecycle via `recovered_from_afk_run_id` |
-| `pending`, `running`, `blocked`, `stale` (non-terminal) | any of the seven | `200` — applied (e.g. `pending → failed`, `blocked → running`, `running → stale`) |
+| Requested title | Result |
+|---|---|
+| same as current | `200` — idempotent no-op, no mutation |
+| different | `200` — applied (only the `title` column is written) |
 
-Mirrors the execution-binding terminal rule (`running` never reappears after
-a terminal outcome) and the domain language that `blocked`/`stale` may return
-to `running`. A status value outside the seven-member vocabulary is `422`
-(validation); a vocabulary member rejected only by the transition table is
-`409` (conflict with lifecycle state).
-
-**Scope of the terminal freeze.** The freeze is endpoint validation on the
-PATCH writer — not a database-wide constraint. It stops an operator
-correction from rewriting terminal history through the API, and nothing
-else: the ADR 0028 reconciliation writer (`AsyncpgOutcomeRepository.save` →
-`_upsert_run`, which upserts with `status = EXCLUDED.status`) supersedes any
-stored status, including a manually patched terminal one, when a re-derived
-change-request lifecycle fact is reconciled (§3 — facts outrank manual
-corrections). Implementations (#673) must therefore enforce the freeze **in
-the PATCH handler only** and must not add a trigger or database constraint
-that would block the reconciliation writer.
+There is no terminal-freeze rule: issue #649 retired the lifecycle status
+the freeze guarded. The bound change request (ADR 0028) is the lifecycle
+authority, and every other column is immutable through this endpoint.
 
 **Authorization.** Admin API Key (`ApiKeyMiddleware`) **plus** the dedicated
 AWX execution-binding collector credential — the same two-layer write gate as
@@ -325,7 +289,7 @@ DELETE is `404`, not a second `204`); `409` not orphan-eligible.
 | 403 | `FORBIDDEN` | Operator access not configured (DELETE — fail closed); collector credential not attributable to `awx-execution-bindings` (PATCH) |
 | 404 | `NOT_FOUND` | Well-formed ULID with no `afk_runs` row |
 | 409 | `CONFLICT` | PATCH: forbidden lifecycle transition; DELETE: not orphan-eligible (bindings present, change request bound, or delivery provenance present) |
-| 422 | `VALIDATION_ERROR` | Request-body shape failures on PATCH (unknown fields, wrong types, `null` title, empty body, non-member status, oversized title) |
+| 422 | `VALIDATION_ERROR` | Request-body shape failures on PATCH (unknown fields — including the retired `status` —, wrong types, `null` title, empty body, oversized title) |
 | 504 | `GATEWAY_TIMEOUT` | Request time budget exceeded (existing handler) |
 
 ---

@@ -4,7 +4,7 @@
  * Deterministic: fixed identity tuples and timestamps — no Date.now(),
  * no Math.random(), no network access, no provider credentials.  The
  * summary list follows the #610 summary contract exactly (one row per
- * provider/repository/external-id with provider_state, automation_state,
+ * provider/repository/external-id with provider_state,
  * total_estimated_cost_usd, latest_linked_activity, and execution counts,
  * ordered newest-linked-activity first as the query layer delivers it).
  * The detail payload follows the planned #611 composite shape consumed by
@@ -28,8 +28,7 @@ function buildSummaryList() {
       {
         provider: 'github', repository: 'acme/web-app', external_id: '142',
         resource_type: 'change_request',
-        provider_state: 'merged', automation_state: 'completed',
-        total_estimated_cost_usd: 4.85,
+        provider_state: 'merged',        total_estimated_cost_usd: 4.85,
         latest_linked_activity: TS.PR_142_MERGE,
         provider_state_observed_at: TS.PR_142_MERGE,
         executions: { total: 3, running: 0, completed: 2, failed: 1, cancelled: 0 }
@@ -37,8 +36,7 @@ function buildSummaryList() {
       {
         provider: 'github', repository: 'acme/web-app', external_id: '138',
         resource_type: 'change_request',
-        provider_state: 'open', automation_state: 'running',
-        total_estimated_cost_usd: 1.25,
+        provider_state: 'open',        total_estimated_cost_usd: 1.25,
         latest_linked_activity: TS.PR_138_OPEN,
         provider_state_observed_at: TS.PR_138_OPEN,
         executions: { total: 1, running: 1, completed: 0, failed: 0, cancelled: 0 }
@@ -46,8 +44,7 @@ function buildSummaryList() {
       {
         provider: 'github', repository: 'acme/tooling', external_id: '7',
         resource_type: 'change_request',
-        provider_state: 'closed', automation_state: 'failed',
-        total_estimated_cost_usd: null,
+        provider_state: 'closed',        total_estimated_cost_usd: null,
         latest_linked_activity: null,
         provider_state_observed_at: null,
         executions: { total: 2, running: 0, completed: 0, failed: 2, cancelled: 0 }
@@ -67,7 +64,7 @@ function buildDetail() {
     change_request: {
       provider: 'github', repository: 'acme/web-app', external_id: '142',
       resource_type: 'change_request', title: 'feat: wire up web-app dashboard',
-      provider_state: 'merged', automation_state: 'completed'
+      provider_state: 'merged',
     },
     merge_state: 'merged',
     total_estimated_cost_usd: 4.85,

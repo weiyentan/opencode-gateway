@@ -85,7 +85,6 @@ from afk_outcomes import (  # noqa: E402
     Provider,
     ProviderAdapter,
     ResolutionResult,
-    RunStatus,
     SessionDescriptor,
     UnresolvedReason,
     make_ulid,
@@ -426,7 +425,6 @@ async def run_backfill(
         run_seed = AFKRun(
             afk_run_id="",
             provider=adapter.provider,
-            status=RunStatus.COMPLETED,
             title=seed.title,
             started_at=seed.started_at,
             finished_at=seed.finished_at,

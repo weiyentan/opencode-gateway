@@ -32,8 +32,7 @@ function buildDetail() {
     change_request: {
       provider: 'github', repository: 'acme/web-app', external_id: '142',
       resource_type: 'change_request', title: 'feat: wire up web-app dashboard',
-      provider_state: 'merged', automation_state: 'completed',
-      merged_at: TS.PR_142_MERGE,
+      provider_state: 'merged',      merged_at: TS.PR_142_MERGE,
       provider_state_observed_at: TS.PR_142_MERGE
     },
     merge_state: { state: 'merged', merged_at: TS.PR_142_MERGE },

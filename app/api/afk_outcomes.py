@@ -4,7 +4,7 @@ Five GET endpoints under the versioned namespace expose the AFK outcome
 read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
 
 - ``GET /runs``        — list runs, filterable by repository, window
-  (started/finished/seen bounds), status, outcome, and origin; paginated.
+  (started/finished/seen bounds), outcome, and origin; paginated.
 - ``GET /runs/{id}``   — the full chain for one run (aggregate, outcome,
   engineering entities grouped by type, sessions, agents, usage/cost).
 - ``GET /entities``    — engineering entities with their run links, correlation
@@ -13,7 +13,7 @@ read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
   evidence/resolver_version and provisional markers.
 - ``GET /change-requests`` — one summary row per provider/repository/
   change-request identity (issue #610): provider state derived from observed
-  facts, AFK automation state, total estimated cost, latest linked activity,
+  facts, total estimated cost, latest linked activity,
   and aggregated execution counts; filterable by provider, repository,
   provider state, automation state, and activity window; paginated.
 - ``GET /change-requests/{provider}/{repository}/{external_number}`` — the
@@ -47,7 +47,6 @@ from afk_outcomes.models import (
     EngineeringOutcome,
     EngineeringOutcomeStatus,
     Provider,
-    RunStatus,
     UnresolvedReason,
 )
 from app.core.config import get_settings
@@ -79,7 +78,6 @@ router = APIRouter(tags=["afk-outcomes"])
 
 # ── Valid enum filter values (locked domain vocabulary) ──────────────────────
 
-_VALID_STATUS = frozenset(m.value for m in RunStatus)
 _VALID_OUTCOME = frozenset(m.value for m in EngineeringOutcomeStatus)
 _VALID_ORIGIN = frozenset(m.value for m in Provider)
 _VALID_REASON = frozenset(m.value for m in UnresolvedReason)
@@ -88,13 +86,6 @@ _VALID_REASON = frozenset(m.value for m in UnresolvedReason)
 # It is a fact-derived display vocabulary, NOT EngineeringOutcomeStatus:
 # only merged/closed/open are determinable from event types.
 _VALID_PROVIDER_STATE = frozenset({"merged", "closed", "open"})
-
-# AFK automation state is the owning lifecycle's ``afk_runs.status`` — the
-# aggregate lifecycle vocabulary from ``resolve_afk_run_status`` (including
-# the provisional ``pending``), not the agent-run ``RunStatus`` enum.
-_VALID_AUTOMATION_STATE = frozenset(
-    {"pending", "running", "completed", "failed", "cancelled"}
-)
 
 # Entity-type → detail response field name grouping.
 _ENTITY_TYPE_FIELDS = {
@@ -192,7 +183,6 @@ def _build_run_filters(
     finished_to: datetime | None,
     seen_from: datetime | None,
     seen_to: datetime | None,
-    status_filter: str | None,
     outcome_filter: str | None,
     origin_filter: str | None,
 ) -> tuple[str, list[object]]:
@@ -220,9 +210,6 @@ def _build_run_filters(
         filters.append(f"r.{column} {op} ${len(params) + 1}")
         params.append(value)
 
-    if status_filter is not None:
-        filters.append(f"r.status = ${len(params) + 1}")
-        params.append(status_filter)
     if outcome_filter is not None:
         filters.append(f"r.outcome_status = ${len(params) + 1}")
         params.append(outcome_filter)
@@ -265,7 +252,6 @@ async def _fetch_runs(
     finished_to: datetime | None,
     seen_from: datetime | None,
     seen_to: datetime | None,
-    status_filter: str | None,
     outcome_filter: str | None,
     origin_filter: str | None,
     limit: int,
@@ -282,7 +268,6 @@ async def _fetch_runs(
         finished_to,
         seen_from,
         seen_to,
-        status_filter,
         outcome_filter,
         origin_filter,
     )
@@ -293,7 +278,7 @@ async def _fetch_runs(
             total = await conn.fetchval(count_sql, *params)
 
     data_sql = f"""
-        SELECT r.afk_run_id, r.provider, r.status, r.title, r.started_at,
+        SELECT r.afk_run_id, r.provider, r.title, r.started_at,
                r.finished_at, r.outcome_status, r.first_seen_at, r.last_seen_at
         FROM afk_runs r
         WHERE {where_clause}
@@ -309,7 +294,6 @@ async def _fetch_runs(
         RunSummary(
             afk_run_id=r["afk_run_id"],
             provider=r["provider"],
-            status=r["status"],
             title=r["title"],
             started_at=r["started_at"],
             finished_at=r["finished_at"],
@@ -333,7 +317,7 @@ async def _fetch_run_detail(
         async with _db_timeout("db.query.afk.run.detail.run", db_timeout_seconds):
             run_row = await conn.fetchrow(
                 """
-                SELECT afk_run_id, provider, status, title, started_at, finished_at,
+                SELECT afk_run_id, provider, title, started_at, finished_at,
                        outcome_status, outcome, first_seen_at, last_seen_at
                 FROM afk_runs
                 WHERE afk_run_id = $1
@@ -379,7 +363,6 @@ async def _fetch_run_detail(
         run=RunSummary(
             afk_run_id=run_row["afk_run_id"],
             provider=run_row["provider"],
-            status=run_row["status"],
             title=run_row["title"],
             started_at=run_row["started_at"],
             finished_at=run_row["finished_at"],
@@ -582,8 +565,7 @@ async def _fetch_correlations(
 # ``change_request`` lifecycle fact (``merged`` / ``closed`` / ``open`` —
 # observed facts only, never a provider API claim), with the historical
 # ``merged > closed > open`` precedence retained only as the deterministic
-# tie-breaker for equal ``occurred_at`` timestamps; automation state mirrors
-# ``resolve_afk_run_status``'s success-aware precedence; cost is summed
+# tie-breaker for equal ``occurred_at`` timestamps; cost is summed
 # over **deduplicated** linked sessions (one internal session UUID per
 # change-request identity — a retry that reuses the same session across
 # runs must never double-count) and stays NULL when no linked session
@@ -621,14 +603,6 @@ _CHANGE_REQUEST_GROUPED_SQL = """
             i.repository AS repository,
             i.external_id AS external_id,
 {provider_state_sql}            AS provider_state,
-            CASE
-                WHEN BOOL_OR(r.status = 'running') THEN 'running'
-                WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
-                WHEN BOOL_OR(r.status = 'failed') THEN 'failed'
-                WHEN BOOL_OR(r.status = 'cancelled') THEN 'cancelled'
-                WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
-                ELSE NULL
-            END AS automation_state,
             GREATEST(
                 MAX(r.last_seen_at),
                 MAX(es.latest_event_at),
@@ -753,16 +727,15 @@ def _build_change_request_queries(
     provider: str | None,
     repository: str | None,
     provider_state: str | None,
-    automation_state: str | None,
     activity_from: datetime | None,
     activity_to: datetime | None,
 ) -> tuple[str, str, list[object]]:
     """Build the count and data SQL (plus params) for the change-request summary.
 
     Identity filters (provider, repository) apply pre-aggregation on the
-    ``identities`` CTE; derived-state filters (provider state, automation
-    state) and the activity window apply post-aggregation on the ``summary``
-    wrapper, so the paginated ``total`` reflects the full filter set.
+    ``identities`` CTE; the derived provider-state filter and the activity
+    window apply post-aggregation on the ``summary`` wrapper, so the
+    paginated ``total`` reflects the full filter set.
     """
     params: list[object] = []
     inner_filters: list[str] = []
@@ -778,9 +751,6 @@ def _build_change_request_queries(
     if provider_state is not None:
         post_filters.append(f"summary.provider_state = ${len(params) + 1}")
         params.append(provider_state)
-    if automation_state is not None:
-        post_filters.append(f"summary.automation_state = ${len(params) + 1}")
-        params.append(automation_state)
     if activity_from is not None:
         post_filters.append(f"summary.latest_activity_at >= ${len(params) + 1}")
         params.append(activity_from)
@@ -814,7 +784,6 @@ def _change_request_summary_row(row: asyncpg.Record) -> ChangeRequestSummaryRow:
         repository=row["repository"],
         external_id=row["external_id"],
         provider_state=row["provider_state"],
-        automation_state=row["automation_state"],
         total_estimated_cost_usd=row["total_estimated_cost_usd"],
         latest_linked_activity=row["latest_activity_at"],
         provider_state_observed_at=row["provider_state_observed_at"],
@@ -833,7 +802,6 @@ async def _fetch_change_request_summaries(
     provider: str | None,
     repository: str | None,
     provider_state: str | None,
-    automation_state: str | None,
     activity_from: datetime | None,
     activity_to: datetime | None,
     limit: int,
@@ -846,7 +814,6 @@ async def _fetch_change_request_summaries(
         provider,
         repository,
         provider_state,
-        automation_state,
         activity_from,
         activity_to,
     )
@@ -878,8 +845,7 @@ async def _fetch_change_request_summaries(
 #
 # Aggregation rules mirror the summary query: provider state prefers
 # ``merged`` over ``closed`` over ``open`` (observed facts only — never a
-# provider API claim); automation state mirrors ``resolve_afk_run_status``'s
-# success-aware precedence; cost is summed over deduplicated linked sessions
+# provider API claim); cost is summed over deduplicated linked sessions
 # (one internal session UUID — a retry that reuses the same session across
 # runs must never double-count) and stays NULL when no linked session
 # carries cost telemetry (unavailable, never zero).
@@ -1025,14 +991,6 @@ _CHANGE_REQUEST_DETAIL_SUMMARY_SQL = f"""
         $2::text AS repository,
         $3::text AS external_id,
 {_PROVIDER_STATE_SQL}        AS provider_state,
-        CASE
-            WHEN BOOL_OR(r.status = 'running') THEN 'running'
-            WHEN BOOL_OR(r.status = 'completed') THEN 'completed'
-            WHEN BOOL_OR(r.status = 'failed') THEN 'failed'
-            WHEN BOOL_OR(r.status = 'cancelled') THEN 'cancelled'
-            WHEN BOOL_OR(r.status = 'pending') THEN 'pending'
-            ELSE NULL
-        END AS automation_state,
         GREATEST(
             MAX(r.last_seen_at),
             MAX(es.latest_event_at),
@@ -1066,13 +1024,13 @@ _CHANGE_REQUEST_DETAIL_RUNS_SQL = f"""
     WITH run_sources AS (
 {_CHANGE_REQUEST_DETAIL_RUN_SOURCES_BODY}
     )
-    SELECT r.afk_run_id, r.provider, r.status, r.title, r.started_at,
+    SELECT r.afk_run_id, r.provider, r.title, r.started_at,
            r.finished_at, r.outcome_status, r.first_seen_at, r.last_seen_at,
            ARRAY_AGG(DISTINCT rs.link_source ORDER BY rs.link_source)
                AS link_sources
     FROM run_sources rs
     JOIN afk_runs r ON r.afk_run_id = rs.afk_run_id
-    GROUP BY r.afk_run_id, r.provider, r.status, r.title, r.started_at,
+    GROUP BY r.afk_run_id, r.provider, r.title, r.started_at,
              r.finished_at, r.outcome_status, r.first_seen_at, r.last_seen_at
     ORDER BY r.last_seen_at DESC NULLS LAST, r.afk_run_id ASC
 """
@@ -1259,7 +1217,6 @@ def _change_request_detail_summary_row(
         repository=row["repository"],
         external_id=row["external_id"],
         provider_state=row["provider_state"],
-        automation_state=row["automation_state"],
         total_estimated_cost_usd=row["total_estimated_cost_usd"],
         latest_linked_activity=row["latest_activity_at"],
         executions=ChangeRequestExecutionCounts(
@@ -1280,7 +1237,6 @@ def _change_request_linked_run_row(row: asyncpg.Record) -> ChangeRequestLinkedRu
     return ChangeRequestLinkedRun(
         afk_run_id=row["afk_run_id"],
         provider=row["provider"],
-        status=row["status"],
         title=row["title"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
@@ -1531,15 +1487,13 @@ async def list_runs(
     finished_to: str | None = Query(default=None),
     seen_from: str | None = Query(default=None),
     seen_to: str | None = Query(default=None),
-    status_filter: str | None = Query(default=None, alias="status"),
     outcome: str | None = Query(default=None),
     origin: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> PaginatedResponse[RunSummary]:
-    """List AFK runs, filterable by repository, window, status, outcome, origin."""
-    _require_enum_value(status_filter, _VALID_STATUS, "status")
+    """List AFK runs, filterable by repository, window, outcome, origin."""
     _require_enum_value(outcome, _VALID_OUTCOME, "outcome")
     _require_enum_value(origin, _VALID_ORIGIN, "origin")
 
@@ -1565,7 +1519,6 @@ async def list_runs(
             finished_to_dt,
             seen_from_dt,
             seen_to_dt,
-            status_filter,
             outcome,
             origin,
             limit,
@@ -1641,7 +1594,6 @@ async def list_change_requests(
     provider: str | None = Query(default=None),
     repository: str | None = Query(default=None),
     provider_state: str | None = Query(default=None),
-    automation_state: str | None = Query(default=None),
     activity_from: str | None = Query(default=None),
     activity_to: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
@@ -1651,14 +1603,13 @@ async def list_change_requests(
     """List change-request summaries — one row per provider/repository/identity.
 
     Each row aggregates provider state (derived from observed facts),
-    AFK automation state, total estimated USD cost (``null`` when no cost
-    telemetry is available — never zero), latest linked activity, and AWX
-    execution counts.  Executions without a durable change-request identity
-    are excluded from the row universe and never contribute counts.
+    total estimated USD cost (``null`` when no cost telemetry is available
+    — never zero), latest linked activity, and AWX execution counts.
+    Executions without a durable change-request identity are excluded from
+    the row universe and never contribute counts.
     """
     _require_enum_value(provider, _VALID_ORIGIN, "provider")
     _require_enum_value(provider_state, _VALID_PROVIDER_STATE, "provider_state")
-    _require_enum_value(automation_state, _VALID_AUTOMATION_STATE, "automation_state")
 
     activity_from_dt = _parse_datetime(activity_from, "activity_from")
     activity_to_dt = _parse_datetime(activity_to, "activity_to")
@@ -1671,7 +1622,6 @@ async def list_change_requests(
             provider,
             repository,
             provider_state,
-            automation_state,
             activity_from_dt,
             activity_to_dt,
             limit,
@@ -1693,7 +1643,7 @@ async def get_change_request_detail(
     Resolves the change request directly by ``(provider, repository,
     external number)`` — no internal AFK Run ID discovery required — and
     returns one composite read model: the summary block (provider state,
-    AFK automation state, merge/freshness enrichment, aggregate cost),
+    merge/freshness enrichment, aggregate cost),
     the linked AFK runs with link provenance, the ordered AWX execution
     bindings (purpose, per-execution session telemetry, cost, duration,
     failure metadata), the deduplicated linked sessions, the aggregate

@@ -134,52 +134,6 @@
     return 'badge-unknown';
   }
 
-  // ── AFK automation state adapters ──────────────────────────────────────
-  // AFK automation state is the observed execution aggregation lifecycle:
-  // pending (provisioned, not yet launched), running, completed, failed,
-  // cancelled, stale.  `completed` means the observed execution aggregation
-  // completed — it does NOT imply the PR/MR merged (PRD story 9).
-
-  /** Resolve the AFK automation state value from a change-request contract.
-   *  Accepts the documented vocabulary (`automation_state` / `afk_state` /
-   *  `afk_status` / `status`) plus the run-nested `run.status` shape used by
-   *  the AFK run detail.  Missing → ''.
-   *  @param {Object|null} cr
-   *  @returns {string} e.g. "pending" | "running" | "completed" | ... */
-  function afkStateValue(cr) {
-    cr = cr || {};
-    var v = cr.automation_state != null ? cr.automation_state
-      : (cr.afk_state != null ? cr.afk_state
-      : (cr.afk_status != null ? cr.afk_status
-      : (cr.status != null ? cr.status
-      : (cr.run && cr.run.status != null ? cr.run.status : ''))));
-    return v == null ? '' : String(v);
-  }
-
-  /** Human label for an AFK automation state value.  The locked RunStatus /
-   *  provisioning vocabulary passes through verbatim; null/absent → '--'.
-   *  @param {string|null} state
-   *  @returns {string} */
-  function afkStateLabel(state) {
-    if (state == null || state === '') return '--';
-    return String(state);
-  }
-
-  /** Map an AFK automation state value to a status-badge CSS class.  Extends
-   *  the app.js afkRunStatusBadgeClass mapping with the provisioning state
-   *  `pending` (rendered as an intentional wait).  Unknown → badge-unknown.
-   *  @param {string|null} state
-   *  @returns {string} badge class */
-  function afkStateBadgeClass(state) {
-    if (state === 'running') return 'badge-running';
-    if (state === 'completed') return 'badge-completed';
-    if (state === 'failed') return 'badge-failed';
-    if (state === 'cancelled') return 'badge-cancelled';
-    if (state === 'stale' || state === 'timed_out') return 'badge-stale';
-    if (state === 'blocked' || state === 'pending') return 'badge-blocked';
-    return 'badge-unknown';
-  }
-
   // ── Cost adapters ──────────────────────────────────────────────────────
   // Cost is the sum of available estimated USD usage associated with linked
   // execution sessions.  Missing cost telemetry is represented as
@@ -435,7 +389,6 @@
     item = item || {};
     var identity = crIdentity(item);
     var providerState = providerStateValue(item);
-    var afkState = afkStateValue(item);
     var costUsd = crCostUsd(item);
     var counts = normalizeExecutionCounts(
       item.executions != null ? item.executions
@@ -451,11 +404,6 @@
         value: providerState,
         label: providerStateLabel(providerState),
         badgeClass: providerStateBadgeClass(providerState)
-      },
-      afkAutomationState: {
-        value: afkState,
-        label: afkStateLabel(afkState),
-        badgeClass: afkStateBadgeClass(afkState)
       },
       cost: {
         available: costUsd !== null,
@@ -619,7 +567,6 @@
     var executionsRaw = detail.executions || detail.bindings || [];
     var executions = Array.isArray(executionsRaw) ? executionsRaw.map(adaptExecution) : [];
     var providerState = providerStateValue(cr);
-    var afkState = afkStateValue(cr);
     var runUsd = runCostUsd(detail, executions);
     var purposeCounts = { implementation: 0, review: 0, retry: 0 };
     executions.forEach(function (e) {
@@ -643,11 +590,6 @@
         value: providerState,
         label: providerStateLabel(providerState),
         badgeClass: providerStateBadgeClass(providerState)
-      },
-      afkAutomationState: {
-        value: afkState,
-        label: afkStateLabel(afkState),
-        badgeClass: afkStateBadgeClass(afkState)
       },
       runCost: {
         available: runUsd !== null,
@@ -686,10 +628,6 @@
     providerStateValue: providerStateValue,
     providerStateLabel: providerStateLabel,
     providerStateBadgeClass: providerStateBadgeClass,
-    // AFK automation state
-    afkStateValue: afkStateValue,
-    afkStateLabel: afkStateLabel,
-    afkStateBadgeClass: afkStateBadgeClass,
     // cost
     crCostUsd: crCostUsd,
     crCostAvailable: crCostAvailable,

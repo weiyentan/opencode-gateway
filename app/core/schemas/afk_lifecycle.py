@@ -152,16 +152,15 @@ class AFKRunLifecycleResponse(BaseModel):
 
     The read counterpart of the provisioning request: the same source
     provenance, repository identity, and trigger metadata, plus the
-    gateway-assigned ``afk_run_id``, the current ``status``, the bound
-    change request (``None`` until bound), the recovery reference, and the
-    batch provenance (``first_delivery_id`` + ``delivery_ids`` — issue
-    #595).  Legacy rows surface ``None`` for the lifecycle columns they
-    predate and an empty batch.
+    gateway-assigned ``afk_run_id``, the bound change request (``None``
+    until bound), the recovery reference, and the batch provenance
+    (``first_delivery_id`` + ``delivery_ids`` — issue #595).  Legacy rows
+    surface ``None`` for the lifecycle columns they predate and an empty
+    batch.
     """
 
     afk_run_id: str = Field(description="ULID primary key of the run")
     provider: Provider = Field(description="Source provider: github | gitlab")
-    status: str = Field(description="RunStatus value (provisional: 'pending')")
     host: str | None = Field(
         default=None, description="Source host provenance (None for legacy rows)"
     )
@@ -227,7 +226,6 @@ class AFKRunLifecycleResponse(BaseModel):
         return cls(
             afk_run_id=lifecycle.afk_run_id,
             provider=lifecycle.provider,
-            status=lifecycle.status,
             host=lifecycle.host,
             source_event_id=lifecycle.source_event_id,
             repository=lifecycle.repository,

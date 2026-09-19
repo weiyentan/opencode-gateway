@@ -131,34 +131,6 @@ console.log('\u25B6 provider state');
   assertEqual(A.providerStateBadgeClass(null), 'badge-unknown', 'badge: null');
 })();
 
-// ── AFK automation state adapters ───────────────────────────────────────
-
-console.log('\u25B6 AFK automation state');
-
-(function () {
-  assertEqual(A.afkStateValue({ automation_state: 'completed' }), 'completed', 'value: completed');
-  assertEqual(A.afkStateValue({ afk_state: 'running' }), 'running', 'value: afk_state alias');
-  assertEqual(A.afkStateValue({ afk_status: 'failed' }), 'failed', 'value: afk_status alias');
-  assertEqual(A.afkStateValue({ status: 'cancelled' }), 'cancelled', 'value: status fallback');
-  assertEqual(A.afkStateValue({ run: { status: 'pending' } }), 'pending', 'value: nested run.status');
-  assertEqual(A.afkStateValue({}), '', 'value: missing -> empty string');
-  assertEqual(A.afkStateValue(null), '', 'value: null -> empty string');
-
-  assertEqual(A.afkStateLabel('pending'), 'pending', 'label: pending');
-  assertEqual(A.afkStateLabel('running'), 'running', 'label: running');
-  assertEqual(A.afkStateLabel(''), '--', 'label: empty -> --');
-
-  assertEqual(A.afkStateBadgeClass('running'), 'badge-running', 'badge: running');
-  assertEqual(A.afkStateBadgeClass('completed'), 'badge-completed', 'badge: completed');
-  assertEqual(A.afkStateBadgeClass('failed'), 'badge-failed', 'badge: failed');
-  assertEqual(A.afkStateBadgeClass('cancelled'), 'badge-cancelled', 'badge: cancelled');
-  assertEqual(A.afkStateBadgeClass('stale'), 'badge-stale', 'badge: stale');
-  assertEqual(A.afkStateBadgeClass('timed_out'), 'badge-stale', 'badge: timed_out -> stale');
-  assertEqual(A.afkStateBadgeClass('blocked'), 'badge-blocked', 'badge: blocked');
-  assertEqual(A.afkStateBadgeClass('pending'), 'badge-blocked', 'badge: pending -> blocked (intentional wait)');
-  assertEqual(A.afkStateBadgeClass('bogus'), 'badge-unknown', 'badge: unknown');
-})();
-
 // ── Cost adapters ───────────────────────────────────────────────────────
 
 console.log('\u25B6 cost');
@@ -331,8 +303,6 @@ console.log('\u25B6 summary adapter');
   assertEqual(gh.title, 'Implement auth', 'summary: title');
   assertEqual(gh.providerState.value, 'merged', 'summary: provider state merged');
   assertEqual(gh.providerState.badgeClass, 'badge-merged', 'summary: provider state badge');
-  assertEqual(gh.afkAutomationState.value, 'completed', 'summary: afk state completed');
-  assertEqual(gh.afkAutomationState.badgeClass, 'badge-completed', 'summary: afk state badge');
   assertEqual(gh.cost.available, true, 'summary: cost available');
   assertEqual(gh.cost.usd, 4.5, 'summary: cost usd');
   assertEqual(gh.cost.label, '$4.50', 'summary: cost label');
@@ -356,7 +326,6 @@ console.log('\u25B6 summary adapter');
   assertEqual(gl.providerTerm, 'MR', 'summary: provider term MR');
   assertEqual(gl.statusHeaderLabel, 'MR Status', 'summary: GitLab status header label MR Status');
   assertEqual(gl.providerState.value, 'open', 'summary: opened normalizes to open');
-  assertEqual(gl.afkAutomationState.value, 'running', 'summary: afk running');
   assertEqual(gl.cost.available, false, 'summary: missing cost unavailable');
   assertEqual(gl.cost.label, 'Cost unavailable', 'summary: missing cost label');
   assertEqual(gl.cost.usd, null, 'summary: missing cost usd null');
@@ -373,7 +342,6 @@ console.log('\u25B6 summary adapter');
   var partial = A.adaptChangeRequestSummary({ provider: 'github', repository: 'r' });
   assertEqual(partial.displayId, 'r', 'summary: partial payload display id');
   assertEqual(partial.providerState.value, '', 'summary: partial provider state empty');
-  assertEqual(partial.afkAutomationState.value, '', 'summary: partial afk state empty');
   assertEqual(partial.cost.available, false, 'summary: partial cost unavailable');
   assertDeepEqual(partial.executionCounts, { total: 0, running: 0, completed: 0, failed: 0, cancelled: 0,
     implementation: 0, review: 0, retry: 0 },
@@ -572,7 +540,6 @@ console.log('\u25B6 detail adapter — AFK Run Cost + sessions + usage');
   assertEqual(detail.providerTerm, 'MR', 'detail: MR term');
   assertEqual(detail.statusHeaderLabel, 'MR Status', 'detail: GitLab status header label MR Status');
   assertEqual(detail.providerState.value, 'merged', 'detail: provider state merged');
-  assertEqual(detail.afkAutomationState.value, 'completed', 'detail: afk state completed');
   assertEqual(detail.runCost.available, true, 'detail: AFK Run Cost available');
   assertEqual(detail.runCost.usd, 0.12, 'detail: AFK Run Cost uses gateway value');
   assertEqual(detail.executions.length, 4, 'detail: 4 executions preserved (duplicates kept)');
@@ -790,7 +757,6 @@ console.log('\u25B6 purity + no browser-side joins');
   assert(typeof A.adaptExecution === 'function', 'adapter: execution function exported');
   assert(typeof A.fmtCrCost === 'function', 'adapter: cost formatter exported');
   assert(typeof A.providerStateBadgeClass === 'function', 'adapter: provider state badge exported');
-  assert(typeof A.afkStateBadgeClass === 'function', 'adapter: afk state badge exported');
 
   // The module source must not contain DOM/fetch/join patterns.
   var source = require('fs').readFileSync(

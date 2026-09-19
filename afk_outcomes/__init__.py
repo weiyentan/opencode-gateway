@@ -43,7 +43,6 @@ from afk_outcomes.models import (
     ResourceSessionAssociation,
     RunEntityLink,
     RunSessionLink,
-    RunStatus,
     SessionResourceReference,
     UnresolvedCorrelation,
     UnresolvedReason,
@@ -61,7 +60,6 @@ from afk_outcomes.serialization import (
     loads_canonical,
     make_ulid,
 )
-from afk_outcomes.service.lifecycle import get_run_status
 
 __all__ = [
     "AFKRun",
@@ -95,7 +93,6 @@ __all__ = [
     "ResourceSessionAssociation",
     "RunEntityLink",
     "RunSessionLink",
-    "RunStatus",
     "SequenceULID",
     "SessionDescriptor",
     "SessionResourceReference",
@@ -105,7 +102,6 @@ __all__ = [
     "UnresolvedReason",
     "derive_exact_associations",
     "dumps_canonical",
-    "get_run_status",
     "loads_canonical",
     "make_ulid",
     "resolve_afk_run_status",

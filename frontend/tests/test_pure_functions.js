@@ -7116,8 +7116,8 @@ console.log('\u25B6 issue #651 \u2014 execution rendering: distinct outcome badg
 // The primary change-request list and the detail header label the provider
 // lifecycle badge with provider-specific terminology: PR Status (GitHub),
 // MR Status (GitLab), MR/PR Status (unknown).  The redundant AFK Automation
-// presentation (list column + detail badge + filter) is removed, while the
-// automation_state API field and the AFK Run Cost remain.
+// presentation (list column + detail badge + filter) is removed, and the
+// automation_state API field is retired (issue #649); the AFK Run Cost remains.
 
 console.log('\u25B6 issue #652 \u2014 provider lifecycle status labels');
 
@@ -7149,7 +7149,6 @@ console.log('\u25B6 issue #652 \u2014 summary row render (provider labels, no AF
     displayId: 'acme/web-app#142',
     title: 't',
     providerState: { value: 'merged', label: 'merged', badgeClass: 'badge-merged' },
-    afkAutomationState: { value: 'completed', label: 'completed', badgeClass: 'badge-completed' },
     cost: { available: true, usd: 1, label: '$1.00' },
     latestActivityAt: null,
     executionCounts: { total: 0 },
@@ -7172,7 +7171,6 @@ console.log('\u25B6 issue #652 \u2014 summary row render (provider labels, no AF
     displayId: 'group/cloudnative#6',
     title: 't',
     providerState: { value: 'open', label: 'open', badgeClass: 'badge-open' },
-    afkAutomationState: { value: 'failed', label: 'failed', badgeClass: 'badge-failed' },
     cost: { available: false, usd: null, label: 'Cost unavailable' },
     latestActivityAt: null,
     executionCounts: { total: 0 },
@@ -7192,7 +7190,6 @@ console.log('\u25B6 issue #652 \u2014 summary row render (provider labels, no AF
     displayId: 'r#9',
     title: '',
     providerState: { value: 'closed', label: 'closed', badgeClass: 'badge-closed' },
-    afkAutomationState: { value: '', label: '--', badgeClass: 'badge-unknown' },
     cost: { available: false, usd: null, label: 'Cost unavailable' },
     latestActivityAt: null,
     executionCounts: { total: 0 },

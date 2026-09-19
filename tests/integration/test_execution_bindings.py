@@ -9,11 +9,10 @@ database-enforced guarantees of ``/api/v1/afk/executions``:
 * Identical replay is a no-op, conflicting replay is rejected
 * DB UNIQUE constraints exercised at SQL level
 * No raw tokens, stdout, prompts, or arbitrary AWX payloads in stored/returned data
-* ADR 0028: binding writes never project ``afk_runs.status`` from child
-  AWX execution outcomes — the run stays ``pending`` after every binding
-  write, a completed run accepts new bindings (no completed-lifecycle
-  409), and finalization happens only via the provider-event seam
-  (``AsyncpgOutcomeRepository.save``)
+* ADR 0028 (issue #649): binding writes never project lifecycle status
+  from child AWX execution outcomes — a completed run accepts new bindings
+  (no completed-lifecycle 409), and finalization happens only via the
+  provider-event seam (``AsyncpgOutcomeRepository.save``)
 * Issue #626: every POST payload references a pre-provisioned ``afk_run_id``
   (the legacy auto-provision path is closed) — each test seeds its run via
   ``_seed_afk_run`` and passes it to ``_make_binding_payload``
@@ -955,8 +954,8 @@ async def _seed_afk_run(
 ) -> None:
     """Insert a provisional afk_runs row the execution can attach to."""
     await conn.execute(
-        "INSERT INTO afk_runs (afk_run_id, provider, status, first_seen_at, last_seen_at)"
-        " VALUES ($1, $2, 'pending', now(), now())",
+        "INSERT INTO afk_runs (afk_run_id, provider, first_seen_at, last_seen_at)"
+        " VALUES ($1, $2, now(), now())",
         run_id,
         provider,
     )
@@ -1255,11 +1254,6 @@ async def test_concurrent_same_lifecycle_same_change_request_both_succeed(
             run_id,
         )
         assert count == 2
-        status = await conn.fetchval(
-            "SELECT status FROM afk_runs WHERE afk_run_id = $1", run_id
-        )
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert status == "pending"
 
 
 @pytest.mark.integration
@@ -1636,7 +1630,7 @@ async def test_concurrent_conflicting_terminal_updates(db_pool: asyncpg.Pool) ->
 async def _run_row(conn: asyncpg.Connection, run_id: str) -> asyncpg.Record:
     """Read the projection-relevant afk_runs columns for one lifecycle."""
     row = await conn.fetchrow(
-        "SELECT status, finished_at, outcome_status, outcome,"
+        "SELECT finished_at, outcome_status, outcome,"
         " change_request_provider, change_request_repository,"
         " change_request_external_id"
         " FROM afk_runs WHERE afk_run_id = $1",
@@ -1668,11 +1662,6 @@ async def test_running_creation_does_not_project_status_from_binding_outcome(
             ),
         )
         assert resp.status_code == 201, resp.text
-
-    async with db_pool.acquire() as conn:
-        row = await _run_row(conn, run_id)
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert row["status"] == "pending"
 
 
 @pytest.mark.integration
@@ -1710,8 +1699,6 @@ async def test_direct_terminal_creation_records_binding_without_status_projectio
 
     async with db_pool.acquire() as conn:
         row = await _run_row(conn, run_id)
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert row["status"] == "pending"
         # The enrichment columns are untouched.
         assert row["finished_at"] is None
         assert row["outcome_status"] is None
@@ -1755,11 +1742,6 @@ async def test_direct_failed_and_cancelled_creation_leave_parent_pending(
         )
         assert resp2.status_code == 201, resp2.text
 
-    async with db_pool.acquire() as conn:
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert (await _run_row(conn, run_failed))["status"] == "pending"
-        assert (await _run_row(conn, run_cancelled))["status"] == "pending"
-
 
 @pytest.mark.integration
 @pytest.mark.asyncio(loop_scope="module")
@@ -1799,9 +1781,6 @@ async def test_terminal_patch_records_binding_without_status_projection(
                 ),
             )
         ).status_code == 201
-        async with db_pool.acquire() as conn:
-            # ADR 0028: binding writes never project afk_runs.status.
-            assert (await _run_row(conn, run_id))["status"] == "pending"
 
         # Phase two: the running binding completes.
         resp = await c.patch(
@@ -1818,10 +1797,6 @@ async def test_terminal_patch_records_binding_without_status_projection(
             },
         )
         assert resp.status_code == 200, resp.text
-
-    async with db_pool.acquire() as conn:
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
@@ -1854,15 +1829,6 @@ async def test_identical_replay_stays_idempotent_without_status_projection(
     async with client as c:
         assert (await c.post("/api/v1/afk/executions", json=payload)).status_code == 201
 
-        # Simulate any pre-existing status before the replay — ADR 0028
-        # forbids binding writes from projecting status, so the replay must
-        # leave it exactly as stored.
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE afk_runs SET status = 'pending' WHERE afk_run_id = $1",
-                run_id,
-            )
-
         resp = await c.post("/api/v1/afk/executions", json=payload)
         assert resp.status_code == 200, resp.text
 
@@ -1872,9 +1838,6 @@ async def test_identical_replay_stays_idempotent_without_status_projection(
             awx_job_id,
         )
         assert count == 1
-        # ADR 0028: binding writes never project afk_runs.status — the
-        # replayed binding does not touch the stored status.
-        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
@@ -1905,9 +1868,6 @@ async def test_failed_run_accepts_new_running_binding_without_status_change(
                 ),
             )
         ).status_code == 201
-        async with db_pool.acquire() as conn:
-            # ADR 0028: binding writes never project afk_runs.status.
-            assert (await _run_row(conn, run_id))["status"] == "pending"
 
         resp = await c.post(
             "/api/v1/afk/executions",
@@ -1924,8 +1884,6 @@ async def test_failed_run_accepts_new_running_binding_without_status_change(
             run_id,
         )
         assert count == 2
-        # ADR 0028: binding writes never project afk_runs.status.
-        assert (await _run_row(conn, run_id))["status"] == "pending"
 
 
 @pytest.mark.integration
@@ -1975,17 +1933,13 @@ async def test_completed_run_accepts_new_binding(
         assert resp.status_code == 201, resp.text
 
     async with db_pool.acquire() as conn:
-        before_new = await _run_row(conn, run_id)
         # The new binding was stored.
         count_new = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE awx_job_id = $1",
             job_new,
         )
         assert count_new == 1
-        # History preserved: both bindings exist, status untouched by
-        # binding writes (ADR 0028), enrichment columns untouched.
-        assert (await _run_row(conn, run_id))["status"] == "pending"
-        assert (await _run_row(conn, run_id))["status"] == before_new["status"]
+        # History preserved: both bindings exist.
         count_total = await conn.fetchval(
             "SELECT COUNT(*) FROM execution_bindings WHERE afk_run_id = $1",
             run_id,
@@ -2009,8 +1963,8 @@ async def test_binding_write_touches_no_run_columns(
     db_pool: asyncpg.Pool,
 ) -> None:
     """ADR 0028: a binding write touches no afk_runs columns at all —
-    status, finished_at, outcome_status, outcome, and the change-request
-    columns are all preserved as stored."""
+    finished_at, outcome_status, outcome, and the change-request columns
+    are all preserved as stored."""
     async with db_pool.acquire() as conn:
         await _seed_awx_client(conn)
         await _seed_afk_run(conn, run_id := _new_afk_run_id())
@@ -2044,9 +1998,8 @@ async def test_binding_write_touches_no_run_columns(
 
     async with db_pool.acquire() as conn:
         after = await _run_row(conn, run_id)
-        # ADR 0028: binding writes never project afk_runs.status — the run
-        # row is untouched in every column.
-        assert after["status"] == "pending"
+        # ADR 0028: binding writes never project lifecycle columns — the
+        # run row is untouched in every column.
         assert after["finished_at"] == before["finished_at"]
         assert after["outcome_status"] == before["outcome_status"]
         assert after["outcome"] == before["outcome"]
@@ -2110,4 +2063,3 @@ async def test_concurrent_binding_writes_accept_both_without_status_projection(
         # for reference only — under ADR 0028 it is never written to the
         # run row.
         _projected = resolve_afk_run_status(outcomes)
-        assert (await _run_row(conn, run_id))["status"] == "pending"

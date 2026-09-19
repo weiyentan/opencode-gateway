@@ -233,7 +233,6 @@ class TestEndToEndLifecycle:
             body = listed.json()
             assert body["status"] == "ok"
             assert body["data"]["total"] == 1
-            assert body["data"]["items"][0]["status"] == "running"
 
             detail = await c.get(f"/api/v1/afk/runs/{_RUN_ID}")
             assert detail.status_code == 200
@@ -241,10 +240,9 @@ class TestEndToEndLifecycle:
 
             patched = await c.patch(
                 f"/api/v1/afk/runs/{_RUN_ID}",
-                json={"title": "Fix login bug", "status": "completed"},
+                json={"title": "Fix login bug"},
             )
             assert patched.status_code == 200
-            assert patched.json()["data"]["status"] == "completed"
 
             deleted = await c.delete(f"/api/v1/afk/runs/{_RUN_ID}")
             assert deleted.status_code == 204
@@ -390,7 +388,6 @@ class TestFilters:
                 "/api/v1/afk/runs",
                 params={
                     "provider": "github",
-                    "status": "running",
                     "outcome": "open",
                     "has_change_request": "true",
                     "created_before": "2026-08-01T00:00:00Z",
@@ -400,14 +397,13 @@ class TestFilters:
         assert response.status_code == 200
         sql = conn.fetch.call_args[0][0]
         assert "r.provider = $1" in sql
-        assert "r.status = $2" in sql
-        assert "r.outcome_status = $3" in sql
+        assert "r.outcome_status = $2" in sql
         assert "r.change_request_provider IS NOT NULL" in sql
-        assert "r.first_seen_at < $4" in sql
-        # limit/offset take the next placeholders after the four filters.
-        assert "LIMIT $5" in sql
-        assert "OFFSET $6" in sql
-        assert conn.fetch.call_args[0][4] == _CUT_TS
+        assert "r.first_seen_at < $3" in sql
+        # limit/offset take the next placeholders after the three filters.
+        assert "LIMIT $4" in sql
+        assert "OFFSET $5" in sql
+        assert conn.fetch.call_args[0][3] == _CUT_TS
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -461,7 +457,6 @@ class TestFilters:
         "params",
         [
             {"provider": "bogus"},
-            {"status": "bogus"},
             {"outcome": "bogus"},
             {"created_before": "yesterday"},
             {"has_change_request": "yes"},
@@ -518,7 +513,7 @@ class TestAuthorization:
 
         async with client as c:
             response = await c.patch(
-                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": "New title"}
             )
 
         assert response.status_code == 401
@@ -544,7 +539,7 @@ class TestAuthorization:
 
         async with client as c:
             response = await c.patch(
-                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": "New title"}
             )
 
         assert response.status_code == 403
@@ -612,7 +607,7 @@ class TestErrorSemantics:
 
         async with client as c:
             response = await c.patch(
-                f"/api/v1/afk/runs/{_RUN_ID}", json={"status": "running"}
+                f"/api/v1/afk/runs/{_RUN_ID}", json={"title": "New title"}
             )
 
         assert response.status_code == 404
@@ -634,30 +629,9 @@ class TestErrorSemantics:
     @pytest.mark.integration
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "terminal_status", ["completed", "failed", "cancelled", "timed_out"]
-    )
-    async def test_update_terminal_run_is_409(self, terminal_status: str) -> None:
-        conn = _mk_conn()
-        stored = _mk_run_row(status=terminal_status, title="Done")
-        conn.fetchrow = AsyncMock(side_effect=[_credential_auth_row(), stored])
-        client = create_client(conn)
-
-        async with client as c:
-            response = await c.patch(
-                f"/api/v1/afk/runs/{_RUN_ID}",
-                json={"title": "Rewrite", "status": "running"},
-            )
-
-        assert response.status_code == 409
-        assert response.json()["error"]["code"] == "CONFLICT"
-
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
         "body",
         [
             {},
-            {"status": "bogus"},
             {"repository": "acme/proj"},
             {"title": "   "},
             {"title": "x" * 1001},
@@ -696,7 +670,7 @@ class TestErrorSemantics:
         client = create_client(conn)
 
         async with client as c:
-            response = await c.request(method, path, json={"status": "running"})
+            response = await c.request(method, path, json={"title": "New title"})
 
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "BAD_REQUEST"
