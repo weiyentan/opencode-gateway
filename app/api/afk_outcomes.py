@@ -13,7 +13,7 @@ read-model stored by ``afk_outcomes.repository.AsyncpgOutcomeRepository``:
   evidence/resolver_version and provisional markers.
 - ``GET /change-requests`` — one summary row per provider/repository/
   change-request identity (issue #610): provider state derived from observed
-  facts, AFK automation state, total estimated cost, latest linked activity,
+  facts, total estimated cost, latest linked activity,
   and aggregated execution counts; filterable by provider, repository,
   provider state, automation state, and activity window; paginated.
 - ``GET /change-requests/{provider}/{repository}/{external_number}`` — the
@@ -1643,7 +1643,7 @@ async def get_change_request_detail(
     Resolves the change request directly by ``(provider, repository,
     external number)`` — no internal AFK Run ID discovery required — and
     returns one composite read model: the summary block (provider state,
-    AFK automation state, merge/freshness enrichment, aggregate cost),
+    merge/freshness enrichment, aggregate cost),
     the linked AFK runs with link provenance, the ordered AWX execution
     bindings (purpose, per-execution session telemetry, cost, duration,
     failure metadata), the deduplicated linked sessions, the aggregate

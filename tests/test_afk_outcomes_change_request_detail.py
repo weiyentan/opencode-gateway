@@ -4,7 +4,7 @@
 resolves one change request directly by its flattened stable resource
 identity and returns one composite read model:
 
-* **summary block** — provider state and AFK automation state as separate
+* **summary block** — provider state as separate
   values, aggregate cost, merge/freshness enrichment, execution counts;
 * **linked AFK runs** — with every durable link source;
 * **ordered AWX execution bindings** — AWX job identity, outcome,
@@ -305,7 +305,7 @@ class TestChangeRequestDetail:
         assert response.status_code == 200
         data = response.json()["data"]
 
-        # Summary block — provider state and AFK automation state as
+        # Summary block — provider state as
         # separate values, with merge/freshness enrichment.
         summary = data["change_request"]
         assert summary["provider"] == "github"
