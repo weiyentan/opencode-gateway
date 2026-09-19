@@ -1445,6 +1445,21 @@ async def _fetch_agent_runs(
     level.  For N result rows the old plan does O(N) index scans; the new
     plan does O(1) hash-aggregate + hash-join.  ``parent_session_id`` is
     indexed, so the CTE can use an index-only scan.
+
+    Page-before-enrichment (issue #709): the data query first selects the
+    filtered, source-created ordered page of sessions (``page_ids`` —
+    filters, status predicate, ``ORDER BY … DESC NULLS LAST``, and
+    LIMIT/OFFSET all apply there) and only then computes the enrichment
+    (usage reasoning total, primary provider, Todo Snapshot aggregates)
+    for those page rows.  ``usage_agg``, ``provider_agg``, and
+    ``todo_counts`` join the page rather than the full filtered universe,
+    so their cost scales with the page size instead of the total match
+    count.  ``child_counts`` deliberately stays global: a page parent's
+    child count must reflect all of its children, not only the children
+    that happen to land on the same page.  The enrichment values are
+    parity-identical to the pre-#709 query because every aggregate is
+    per-session (GROUP BY the session key) and the LEFT JOINs only match
+    rows for page sessions.
     """
     from app.core.schemas.usage import AgentRunSummary
 
@@ -1452,7 +1467,7 @@ async def _fetch_agent_runs(
         client_id, from_date, to_date, agent, external_project_id
     )
 
-    # ── Build the status filter as a CTE wrapper ────────────────────
+    # ── Build the status filter as a page-selection predicate ───────
     if status_filter is not None:
         # Resolve a single reference timestamp for status derivation.  The
         # count and data queries each embed the status CASE expression;
@@ -1474,42 +1489,12 @@ async def _fetch_agent_runs(
             unknown_threshold_hours=unknown_threshold_hours,
             now_param=now_placeholder,
         )
-        # Wrap in a subquery that computes status, then filter
-        base_query = f"""
-            SELECT * FROM (
-                SELECT
-                    s.id,
-                    s.client_id,
-                    s.source_database_id,
-                    s.external_session_id,
-                    s.project_id,
-                    s.workspace_id,
-                    s.agent,
-                    s.parent_session_id,
-                    s.message_count,
-                    s.total_input_tokens,
-                    s.total_output_tokens,
-                    s.total_cached_tokens,
-                    s.total_cache_read_tokens,
-                    s.total_cache_write_tokens,
-                    s.total_estimated_cost_usd,
-                    s.last_message_at,
-                    ({status_expr}) AS _status,
-                    osc.title AS session_title,
-                    osc.session_model AS session_model,
-                    osc.code_change_count,
-                    osc.code_change_additions,
-                    osc.code_change_deletions,
-                    {_PROJECT_LABEL_SQL} AS project_label
-                FROM sessions s
-                LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
-                LEFT JOIN opencode_source_projects osp
-                    ON osp.source_database_id = s.source_database_id
-                    AND osp.external_project_id = s.project_id
-                WHERE {where_clause}
-            ) sub
-            WHERE sub._status = {status_filter_placeholder}
-        """
+        # The status predicate narrows the page selection before
+        # pagination; the page CTE projects ``_status`` from the same
+        # expression and the same bound reference timestamp.
+        page_where = (
+            f"{where_clause} AND ({status_expr}) = {status_filter_placeholder}"
+        )
         count_from = f"""
             FROM sessions s
             WHERE {where_clause} AND ({status_expr}) = {status_filter_placeholder}
@@ -1520,7 +1505,30 @@ async def _fetch_agent_runs(
             stale_threshold_hours=stale_threshold_hours,
             unknown_threshold_hours=unknown_threshold_hours,
         )
-        base_query = f"""
+        page_where = where_clause
+        count_from = f"FROM sessions s WHERE {where_clause}"
+
+    # ── Count query ─────────────────────────────────────────────────
+    count_sql = f"SELECT COUNT(*) {count_from}"
+    async with timed_operation("db.query.agent_runs.count", "db"):
+        async with _db_timeout(
+            "db.query.agent_runs.count", db_timeout_seconds
+        ):
+            total = await conn.fetchval(count_sql, *params)
+
+    # ── Data query: page first, then enrich (issue #709) ────────────
+    # ``page_ids`` selects the filtered, source-created ordered page of
+    # sessions — the WHERE clause (including the status predicate when
+    # present), the DESC NULLS LAST ordering, and LIMIT/OFFSET all apply
+    # there.  ``page`` then attaches the Session Context and project
+    # columns for just those rows.  ``usage_agg``, ``provider_agg``, and
+    # ``todo_counts`` join ``page`` (not the filtered universe), so the
+    # aggregation cost tracks the page rather than the total match count —
+    # the sessions table carries no reasoning/provider columns (ADR 0012),
+    # so these derive from ``usage_events``.  ``child_counts`` stays
+    # global (see the docstring) so page parents report all children.
+    data_sql = f"""
+        WITH page_ids AS (
             SELECT
                 s.id,
                 s.client_id,
@@ -1538,45 +1546,27 @@ async def _fetch_agent_runs(
                 s.total_cache_write_tokens,
                 s.total_estimated_cost_usd,
                 s.last_message_at,
-                ({status_expr}) AS _status,
+                ({status_expr}) AS _status
+            FROM sessions s
+            WHERE {page_where}
+            ORDER BY s.last_message_at DESC NULLS LAST
+            LIMIT ${len(params) + 1}
+            OFFSET ${len(params) + 2}
+        ),
+        page AS (
+            SELECT
+                s.*,
                 osc.title AS session_title,
                 osc.session_model AS session_model,
                 osc.code_change_count,
                 osc.code_change_additions,
                 osc.code_change_deletions,
                 {_PROJECT_LABEL_SQL} AS project_label
-            FROM sessions s
+            FROM page_ids s
             LEFT JOIN opencode_session_contexts osc ON s.id = osc.session_id
             LEFT JOIN opencode_source_projects osp
                 ON osp.source_database_id = s.source_database_id
                 AND osp.external_project_id = s.project_id
-            WHERE {where_clause}
-        """
-        count_from = f"FROM sessions s WHERE {where_clause}"
-
-    # ── Count query ─────────────────────────────────────────────────
-    # ── Count query ─────────────────────────────────────────────────
-    count_sql = f"SELECT COUNT(*) {count_from}"
-    async with timed_operation("db.query.agent_runs.count", "db"):
-        async with _db_timeout(
-            "db.query.agent_runs.count", db_timeout_seconds
-        ):
-            total = await conn.fetchval(count_sql, *params)
-
-    # ── Data query with CTE for child counts (no N+1) ──────────────
-    # ``base`` is hoisted into a CTE so both the main result and the
-    # ``todo_counts`` aggregation share a single evaluation of the filtered
-    # session universe.  ``todo_counts`` is scoped to that universe via an
-    # INNER JOIN, so the todo aggregation cost tracks the filtered result
-    # set (and any client_id/date/agent/project/status predicate) rather
-    # than the full ``opencode_session_todos`` table.  ``usage_agg`` and
-    # ``provider_agg`` (issue #557) follow the same scoping pattern for the
-    # read-time reasoning total and primary provider — the sessions table
-    # carries no reasoning/provider columns (ADR 0012), so these derive
-    # from ``usage_events`` for the filtered universe only.
-    data_sql = f"""
-        WITH base AS (
-            {base_query}
         ),
         usage_agg AS (
             SELECT
@@ -1584,7 +1574,7 @@ async def _fetch_agent_runs(
                 COALESCE(SUM(ue.reasoning_tokens), 0)::bigint
                     AS total_reasoning_tokens
             FROM usage_events ue
-            JOIN base b ON b.id = ue.session_id
+            JOIN page p ON p.id = ue.session_id
             GROUP BY ue.session_id
         ),
         provider_agg AS (
@@ -1598,7 +1588,7 @@ async def _fetch_agent_runs(
                         ORDER BY COUNT(*) DESC, ue.provider ASC
                     ) AS rn
                 FROM usage_events ue
-                JOIN base b ON b.id = ue.session_id
+                JOIN page p ON p.id = ue.session_id
                 WHERE ue.provider IS NOT NULL AND ue.provider <> ''
                 GROUP BY ue.session_id, ue.provider
             ) ranked
@@ -1616,7 +1606,7 @@ async def _fetch_agent_runs(
                    COUNT(*) FILTER (WHERE t.status = 'completed') AS todo_completed,
                    COUNT(*) FILTER (WHERE t.status = 'blocked') AS todo_blocked
             FROM opencode_session_todos t
-            JOIN base s
+            JOIN page s
               ON s.source_database_id = t.source_database_id
              AND s.external_session_id = t.external_session_id
             GROUP BY t.source_database_id, t.external_session_id
@@ -1628,7 +1618,7 @@ async def _fetch_agent_runs(
                COALESCE(tc.todo_total, 0) AS todo_total,
                COALESCE(tc.todo_completed, 0) AS todo_completed,
                COALESCE(tc.todo_blocked, 0) AS todo_blocked
-        FROM base s
+        FROM page s
         LEFT JOIN usage_agg ua ON ua.session_id = s.id
         LEFT JOIN provider_agg pa ON pa.session_id = s.id
         LEFT JOIN child_counts cc
@@ -1637,8 +1627,6 @@ async def _fetch_agent_runs(
             ON tc.source_database_id = s.source_database_id
             AND tc.external_session_id = s.external_session_id
         ORDER BY s.last_message_at DESC NULLS LAST
-        LIMIT ${len(params) + 1}
-        OFFSET ${len(params) + 2}
     """
     async with timed_operation("db.query.agent_runs.data", "db"):
         async with _db_timeout(
