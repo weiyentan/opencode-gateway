@@ -492,7 +492,7 @@ def _setup_synthetic_mocks(mock_conn: AsyncMock) -> None:
         # dispatched on their outer-CTE markers BEFORE the generic
         # "usage_events" branch below — otherwise they receive
         # record-shaped rows.
-        if "FROM base s" in sql:
+        if "FROM page s" in sql:
             return [
                 _mk_session_row(
                     session_id=uuid.uuid4(),

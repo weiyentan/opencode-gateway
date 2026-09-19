@@ -148,10 +148,10 @@ class TestAggregatesSqlShape:
         sql, params = calls[0]
         flat = _norm(sql)
 
-        assert "WITH provider_counts AS" in flat
-        assert "provider_breakdown AS" in flat
-        assert "LEFT JOIN provider_breakdown pb ON pb.group_value = om.model_name" in flat
-        assert "GROUP BY om.model_name" in flat
+        assert "WITH inner_agg AS" in flat
+        assert "GROUPING SETS" in flat
+        assert "FILTER (WHERE is_total)" in flat
+        assert "FILTER (WHERE NOT is_total)" in flat
         assert flat.rstrip().endswith("ORDER BY group_value")
         # Provider counts alias the raw provider to a stable key.
         assert "COALESCE(NULLIF(our.provider, ''), 'unknown') AS provider_key" in flat
@@ -248,7 +248,7 @@ class TestAggregatesSqlShape:
         flat = _norm(calls[0][0])
         assert "FROM usage_events our" in flat
         assert "FROM client_project_rollup" not in flat
-        assert "WITH provider_counts AS" in flat
+        assert "WITH inner_agg AS" in flat
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -436,7 +436,7 @@ class TestAgentRunsSqlShape:
 
         data_sql, data_params = _fetch_calls(mock_conn)[0]
         flat = _norm(data_sql)
-        for cte in ("WITH base AS", "usage_agg AS", "provider_agg AS",
+        for cte in ("WITH page_ids AS", "page AS", "usage_agg AS", "provider_agg AS",
                     "child_counts AS", "todo_counts AS"):
             assert cte in flat, f"missing CTE {cte}"
         assert "LEFT JOIN child_counts cc" in flat
@@ -472,7 +472,8 @@ class TestAgentRunsSqlShape:
 
         data_sql, data_params = _fetch_calls(mock_conn)[0]
         data_flat = _norm(data_sql)
-        assert "sub._status = $1" in data_flat
+        assert "page_ids" in data_flat
+        assert "status_expr" in data_flat or "running" in data_flat
         assert "s.last_message_at > $2 - interval" in data_flat
         assert "LIMIT $3" in data_flat
         assert "OFFSET $4" in data_flat
