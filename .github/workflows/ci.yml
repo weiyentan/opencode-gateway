@@ -60,6 +60,7 @@ jobs:
             tests/integration/test_afk_lifecycle_provenance.py \
             tests/integration/test_execution_bindings.py \
             tests/integration/test_afk_run_api_compatibility.py \
+            tests/integration/test_execution_reconciliation_integration.py \
             -v -m integration
 
       - name: Lint Python

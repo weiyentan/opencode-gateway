@@ -256,8 +256,17 @@ class ExecutionReconciler:
                 ))
             else:
                 # Got a valid state — persist (serialized on single connection).
-                result = await self._persist_result(binding, job_id, state)
-                results.append(result)
+                if job_id is None:
+                    # Unreachable: a None job_id is only produced with
+                    # error_detail set. Defensive for the type-checker.
+                    results.append(BindingReconciliationResult(
+                        awx_job_id=None,
+                        kind=BindingResultKind.LOOKUP_ERROR,
+                        detail="missing_job_id",
+                    ))
+                else:
+                    result = await self._persist_result(binding, job_id, state)
+                    results.append(result)
 
         summary = ReconciliationSummary(examined=len(bindings), results=results)
         logger.info(
@@ -275,78 +284,6 @@ class ExecutionReconciler:
             summary.persist_error_count,
         )
         return summary
-
-    async def _reconcile_one(self, binding: object) -> BindingReconciliationResult:
-        """Reconcile one ``running`` binding against its AWX job status."""
-        try:
-            awx_job = getattr(binding, "awx_job")
-            job_id = int(awx_job.job_id)
-        except (AttributeError, TypeError, ValueError) as exc:
-            return BindingReconciliationResult(
-                awx_job_id=-1,
-                kind=BindingResultKind.LOOKUP_ERROR,
-                detail=type(exc).__name__,
-            )
-
-        try:
-            state = await self._awx_lookup.get_job(job_id)
-        except Exception as exc:  # noqa: BLE001 - isolation is the point
-            # Credential redaction: only the exception class name is
-            # recorded — never str(exc), which could carry auth material
-            # from the HTTP layer.
-            return BindingReconciliationResult(
-                awx_job_id=job_id,
-                kind=BindingResultKind.LOOKUP_ERROR,
-                detail=type(exc).__name__,
-            )
-
-        if state is None:
-            # AWX knows no such job — graceful skip, no crash, no mutation.
-            return BindingReconciliationResult(
-                awx_job_id=job_id,
-                kind=BindingResultKind.MISSING_JOB,
-            )
-
-        outcome = map_awx_status_to_outcome(state.status)
-        if outcome is None:
-            # The job is still active (or an unknown future status) — the
-            # binding legitimately stays running.
-            return BindingReconciliationResult(
-                awx_job_id=job_id,
-                kind=BindingResultKind.NOT_YET_TERMINAL,
-            )
-
-        # Persist through the existing terminal-update path: serialized,
-        # history-preserving, idempotent — terminal rows are never mutated
-        # and conflicting re-observations are rejected as conflicts.
-        try:
-            update = await self._repository.update_execution_binding_terminal(  # type: ignore[attr-defined]
-                awx_job_id=str(job_id),
-                outcome=outcome,
-                finished_at=state.finished_at,
-            )
-        except Exception as exc:  # noqa: BLE001 - persistence isolation
-            return BindingReconciliationResult(
-                awx_job_id=job_id,
-                kind=BindingResultKind.PERSIST_ERROR,
-                detail=type(exc).__name__,
-            )
-
-        if update.is_updated:
-            kind = BindingResultKind.UPDATED
-        elif update.is_conflict:
-            kind = BindingResultKind.CONFLICT
-        elif update.not_found:
-            # The binding disappeared between discovery and update —
-            # nothing to persist.
-            kind = BindingResultKind.BINDING_MISSING
-        else:
-            # Idempotent replay of an identical terminal record (no flags
-            # set) — a no-op, not an error.
-            kind = BindingResultKind.ALREADY_TERMINAL
-        return BindingReconciliationResult(
-            awx_job_id=job_id, kind=kind, outcome=outcome
-        )
 
     async def _lookup_job(self, binding: object) -> tuple[int | None, AWXJobState | None, str | None]:
         """Look up the AWX job status for one binding. Returns (job_id, state, error_detail).
