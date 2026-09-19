@@ -7116,8 +7116,8 @@ console.log('\u25B6 issue #651 \u2014 execution rendering: distinct outcome badg
 // The primary change-request list and the detail header label the provider
 // lifecycle badge with provider-specific terminology: PR Status (GitHub),
 // MR Status (GitLab), MR/PR Status (unknown).  The redundant AFK Automation
-// presentation (list column + detail badge + filter) is removed, while the
-// automation_state API field and the AFK Run Cost remain.
+// presentation (list column + detail badge + filter) is removed, and the
+// automation_state API field is retired (issue #649); the AFK Run Cost remains.
 
 console.log('\u25B6 issue #652 \u2014 provider lifecycle status labels');
 
