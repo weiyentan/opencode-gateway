@@ -682,6 +682,294 @@ class TestAgentAggregates:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Grouped aggregate pivot tests (issue #711)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestGroupedAggregatePivotSQL:
+    """Issue #711 — raw grouped aggregates ride a SINGLE usage_events scan.
+
+    The grouped SQL replaces the duplicate usage_events scan (a separate
+    provider_counts CTE scanning the same filtered rows) with an inner
+    GROUPING SETS aggregation plus an outer FILTER pivot.  The
+    one-row-per-group response shape and the provider_breakdown JSON
+    mapping (null/empty provider → 'unknown') are preserved.
+    """
+
+    @pytest.mark.asyncio
+    async def test_grouped_uses_single_scan_grouping_sets_pivot(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """group_by=model scans usage_events once and pivots provider counts
+        via GROUPING SETS + FILTER in the same statement."""
+        rows = [_mk_aggregate_row(group_value="gpt-4", record_count=2)]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        # Single usage_events scan — the duplicate provider scan is gone.
+        assert sql.count("FROM usage_events") == 1, (
+            f"Expected exactly one usage_events scan, got "
+            f"{sql.count('FROM usage_events')}:\n{sql}"
+        )
+        # Inner GROUPING SETS aggregation + outer FILTER pivot.
+        assert "GROUPING SETS" in sql, f"Expected GROUPING SETS, got:\n{sql}"
+        assert "GROUPING(" in sql, f"Expected GROUPING() marker, got:\n{sql}"
+        assert "jsonb_object_agg(" in sql, (
+            f"Expected jsonb_object_agg pivot, got:\n{sql}"
+        )
+        assert "FILTER (WHERE" in sql, f"Expected FILTER pivot, got:\n{sql}"
+        # The old provider-CTE join-back is gone.
+        assert "LEFT JOIN provider_breakdown" not in sql
+        # Still a single statement / one query budget (test_query_counts).
+        assert "FROM client_project_rollup" not in sql
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "group_by",
+        [
+            "client",
+            "model",
+            "session",
+            "day",
+            "week",
+            "month",
+            "project",
+            "agent",
+            "client,model",
+            "agent,client",
+            "day,model",
+        ],
+    )
+    async def test_all_dimensions_use_single_scan_pivot(
+        self, group_by: str, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Every supported raw grouped dimension rides the single-scan
+        GROUPING SETS pivot.  (Rollup-safe ``client,project`` requests take
+        the separate rollup path — see TestClientProjectAggregates.)"""
+        rows = [
+            _mk_aggregate_row(group_value="g", record_count=1),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": group_by,
+                },
+            )
+
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert sql.count("FROM usage_events") == 1, (
+            f"group_by={group_by}: expected one usage_events scan, "
+            f"got {sql.count('FROM usage_events')}:\n{sql}"
+        )
+        assert "GROUPING SETS" in sql, f"group_by={group_by}:\n{sql}"
+        assert "jsonb_object_agg(" in sql, f"group_by={group_by}:\n{sql}"
+        # Null/empty provider still maps to 'unknown'.
+        assert "COALESCE(NULLIF(our.provider, ''), 'unknown')" in sql, (
+            f"group_by={group_by}: provider unknown mapping missing:\n{sql}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_project_raw_fallback_uses_single_scan_pivot(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The raw ``client,project`` fallback (taken when a model or session
+        filter makes the rollup unsafe) also rides the single-scan pivot."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="Acme Corp|My Project",
+                project_label="My Project",
+                record_count=4,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "client,project",
+                    "model": "gpt-4",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert sql.count("FROM usage_events") == 1, f"SQL:\n{sql}"
+        assert "GROUPING SETS" in sql, f"SQL:\n{sql}"
+        assert "LEFT JOIN opencode_source_projects osp" in sql
+
+    @pytest.mark.asyncio
+    async def test_agent_multi_dimension_grouping_preserves_semantics(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Multi-part groupings including agent keep the sessions join and
+        never duplicate the agent COALESCE term in GROUP BY."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="researcher|gpt-4",
+                agent="researcher",
+                record_count=4,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "agent,model",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["agent"] == "researcher"
+        assert data[0]["group_value"] == "researcher|gpt-4"
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert "LEFT JOIN sessions s ON s.id = our.session_id" in sql
+        assert (
+            "GROUP BY COALESCE(s.agent, 'unknown'),COALESCE(s.agent, 'unknown')"
+            not in sql
+        )
+
+    @pytest.mark.asyncio
+    async def test_project_grouping_preserves_label_column(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Project groupings keep the resolved project_label column and the
+        source_projects join in the single-scan pivot."""
+        rows = [
+            _mk_aggregate_row(
+                group_value="My Project",
+                project_label="My Project",
+                record_count=7,
+            ),
+        ]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "project",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data[0]["project_label"] == "My Project"
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        assert "LEFT JOIN opencode_source_projects osp" in sql
+        assert "AS project_label" in sql
+
+    @pytest.mark.asyncio
+    async def test_provider_breakdown_response_shape_preserved(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The pivoted provider_breakdown stays a JSON object of
+        provider → record count on each grouped row, and an empty breakdown
+        serializes as {}."""
+        row_with = _mk_aggregate_row(group_value="gpt-4", record_count=3)
+        row_with.__getitem__.side_effect = lambda k: {
+            "provider_breakdown": '{"github": 2, "gitlab": 1}',
+        }.get(k) if k == "provider_breakdown" else {
+            "group_value": "gpt-4",
+            "total_input_tokens": 300,
+            "total_output_tokens": 150,
+            "total_cached_tokens": 10,
+            "total_reasoning_tokens": 5,
+            "total_cache_read_tokens": 3,
+            "total_cache_write_tokens": 2,
+            "total_estimated_cost_usd": Decimal("0.0105"),
+            "record_count": 3,
+            "session_count": 2,
+            "model_count": 1,
+            "project_label": None,
+            "agent": None,
+        }[k]
+        row_without = _mk_aggregate_row(group_value="claude-3", record_count=1)
+        mock_conn.fetch = AsyncMock(return_value=[row_with, row_without])
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data[0]["provider_breakdown"] == {"github": 2, "gitlab": 1}
+        assert data[1]["provider_breakdown"] == {}
+        # One-row-per-group response shape is unchanged.
+        assert [r["group_value"] for r in data] == ["gpt-4", "claude-3"]
+
+    @pytest.mark.asyncio
+    async def test_measures_taken_from_total_grouping_rows(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Token/cost/record/session/model measures are selected from the
+        total grouping rows via the is_total FILTER, not re-summed across
+        provider rows (which would double-count)."""
+        rows = [_mk_aggregate_row(group_value="gpt-4", record_count=9)]
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_conn.fetchrow = AsyncMock(return_value=None)
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                    "group_by": "model",
+                },
+            )
+
+        assert response.status_code == 200
+        sql = mock_conn.fetch.call_args_list[0][0][0]
+        # Every measure pivots from the total grouping rows...
+        assert sql.count("FILTER (WHERE is_total)") == 10, (
+            f"Expected 10 total-row measure pivots "
+            f"(6 token sums + cost + 3 counts), got:\n{sql}"
+        )
+        # ...while the provider breakdown aggregates the provider rows.
+        assert "FILTER (WHERE NOT is_total)" in sql
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Client / Project aggregate tests
 # ══════════════════════════════════════════════════════════════════════════
 
