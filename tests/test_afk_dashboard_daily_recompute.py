@@ -203,9 +203,9 @@ async def test_rollup_version_is_configurable():
                 "engineering_events",
                 "e.entity_type = 'change_request'",
                 "e.occurred_at",
-                "'opened'",
-                "'merged'",
-                "'closed'",
+                "'change_request.opened'",
+                "'change_request.merged'",
+                "'change_request.closed'",
             ],
         ),
         (
@@ -243,6 +243,37 @@ def test_each_metric_sourced_from_canonical_table(sql, expected_tokens):
 def test_event_time_bucketed_in_utc(sql):
     assert "AT TIME ZONE 'UTC'" in sql
     assert "::date = $1" in sql
+
+
+def test_change_request_sql_uses_prefixed_event_types_not_bare_suffixes():
+    """FILTER clauses match the stored engineering_events vocabulary.
+
+    ``engineering_events.event_type`` stores the fully-qualified canonical
+    type (``change_request.opened`` / ``change_request.merged`` /
+    ``change_request.closed``), so a bare ``'opened'`` filter can never
+    match a row.
+    """
+    assert "'change_request.opened'" in CHANGE_REQUEST_SQL
+    assert "'change_request.merged'" in CHANGE_REQUEST_SQL
+    assert "'change_request.closed'" in CHANGE_REQUEST_SQL
+    # The bare suffixes must never be matched on their own.
+    assert "'opened'" not in CHANGE_REQUEST_SQL
+    assert "'merged'" not in CHANGE_REQUEST_SQL
+    assert "'closed'" not in CHANGE_REQUEST_SQL
+
+
+def test_session_count_excludes_ambiguous_session_attribution():
+    """A session mapped to more than one run is excluded, never split.
+
+    Mirrors the USAGE_SQL rule: the count routes through the
+    ``unambiguous_sessions`` CTE so a session attributed to more than one
+    AFK run contributes to no bucket.
+    """
+    assert "unambiguous_sessions" in SESSION_SQL
+    assert "COUNT(DISTINCT ars.afk_run_id) = 1" in SESSION_SQL
+    assert "HAVING" in SESSION_SQL
+    # The main query must route through the CTE, not count raw rows.
+    assert "JOIN unambiguous_sessions" in SESSION_SQL
 
 
 def test_upsert_replaces_every_column():

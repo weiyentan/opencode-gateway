@@ -41,10 +41,10 @@ guessed:
   NULL``) cannot be keyed into a bucket and is skipped.  The bucket
   ``repository`` is the normalized repository identity the rest of the
   gateway uses.
-* Usage is attributed to a run through ``afk_run_sessions`` (the internal
-  ``session_id``).  When one session maps to more than one AFK run the
-  attribution is ambiguous, so the whole session's usage is excluded rather
-  than split or arbitrarily assigned.
+* Sessions and usage are attributed to a run through ``afk_run_sessions``
+  (the internal ``session_id``).  When one session maps to more than one
+  AFK run the attribution is ambiguous, so the session — and its usage —
+  is excluded rather than split or arbitrarily assigned.
 
 Change-request counts come from ``engineering_events`` — the immutable
 facts — not from ``afk_run_entities`` (derived links that may be provisional
@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 # Version + lock namespace
 # ---------------------------------------------------------------------------
 
-AFK_DASHBOARD_ROLLUP_VERSION = "1"
+AFK_DASHBOARD_ROLLUP_VERSION = "2"
 """Rule version stamped on every recomputed bucket (``rollup_version``).
 
 Bump this whenever any metric's source table, filter, or event-time
@@ -129,11 +129,11 @@ RUNS_SQL = """
 
 CHANGE_REQUEST_SQL = """
     SELECT
-        COUNT(*) FILTER (WHERE e.event_type = 'opened')::int
+        COUNT(*) FILTER (WHERE e.event_type = 'change_request.opened')::int
             AS change_requests_opened,
-        COUNT(*) FILTER (WHERE e.event_type = 'merged')::int
+        COUNT(*) FILTER (WHERE e.event_type = 'change_request.merged')::int
             AS change_requests_merged,
-        COUNT(*) FILTER (WHERE e.event_type = 'closed')::int
+        COUNT(*) FILTER (WHERE e.event_type = 'change_request.closed')::int
             AS change_requests_closed
     FROM engineering_events e
     WHERE e.provider = $2
@@ -158,9 +158,18 @@ EXECUTION_SQL = """
 """
 
 SESSION_SQL = """
+    WITH unambiguous_sessions AS (
+        SELECT ars.session_id AS gateway_session_id,
+               MIN(ars.afk_run_id) AS afk_run_id
+        FROM afk_run_sessions ars
+        WHERE ars.session_id IS NOT NULL
+        GROUP BY ars.session_id
+        HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+    )
     SELECT COUNT(*)::int AS session_count
     FROM afk_run_sessions ars
-    JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
+    JOIN unambiguous_sessions us ON us.gateway_session_id = ars.session_id
+    JOIN afk_runs r ON r.afk_run_id = us.afk_run_id
     WHERE r.provider = $2
       AND r.repository = $3
       AND (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date = $1
