@@ -20,6 +20,7 @@ Migration-only schema, so this module verifies the rendered SQL of
 4. The ``(provider, repository, day)`` index supports provider-scoped scans;
    the composite primary key serves the unfiltered date-range scan.
 5. The downgrade drops the index and the table.
+6. The SQLAlchemy ORM model (Alembic-autogenerate only) mirrors the DDL.
 """
 
 from __future__ import annotations
@@ -244,3 +245,38 @@ class TestMigration0046Downgrade:
         assert "DROP TABLE afk_dashboard_daily" in sql, (
             "Expected DROP TABLE afk_dashboard_daily in downgrade SQL"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ORM Model — Alembic autogenerate parity
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAFKDashboardDailyModel:
+    """The SQLAlchemy model mirrors the migration (autogenerate source)."""
+
+    def test_model_table_name_and_registration(self):
+        from app.db.models import Base
+        from app.db.models.afk import AFKDashboardDaily
+
+        assert AFKDashboardDaily.__tablename__ == "afk_dashboard_daily"
+        assert "afk_dashboard_daily" in Base.metadata.tables
+
+    def test_model_primary_key_matches_migration(self):
+        from app.db.models.afk import AFKDashboardDaily
+
+        pk = [c.name for c in AFKDashboardDaily.__table__.primary_key.columns]
+        assert pk == ["day", "provider", "repository"]
+
+    def test_model_has_additive_and_metadata_columns(self):
+        from app.db.models.afk import AFKDashboardDaily
+
+        columns = set(AFKDashboardDaily.__table__.columns.keys())
+        for col in _ADDITIVE_COLUMNS + _METADATA_COLUMNS:
+            assert col in columns, f"Model missing column '{col}'"
+
+    def test_model_registers_scoped_index(self):
+        from app.db.models.afk import AFKDashboardDaily
+
+        index_names = {idx.name for idx in AFKDashboardDaily.__table__.indexes}
+        assert "ix_afk_dashboard_daily_provider_repository_day" in index_names

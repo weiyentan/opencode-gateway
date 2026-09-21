@@ -97,9 +97,23 @@ per-resource keys are derived from a resource hash and are essentially never
 # ``afk_runs.repository``, ``engineering_events.repository`` and
 # ``execution_bindings.repository_url`` (aliased to ``repository``).  Rows
 # without a repository identity cannot be keyed and are skipped.
+#
+# The sessions and usage-events branches are filtered through the
+# ``unambiguous`` CTE (the same pattern the recompute engine and the verify
+# tool use): a session mapped to multiple ``afk_run_ids`` is ambiguous and the
+# engine excludes it, so discovery must not surface buckets whose only
+# activity is ambiguous — otherwise the engine recomputes them to all-zero
+# and the verify tool flags a stale mismatch.
 # ---------------------------------------------------------------------------
 
 DISCOVERY_SQL = """
+    WITH unambiguous AS (
+        SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
+        FROM afk_run_sessions ars
+        WHERE ars.session_id IS NOT NULL
+        GROUP BY ars.session_id
+        HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+    )
     SELECT DISTINCT ON (day, provider, repository)
            day, provider, repository
     FROM (
@@ -128,12 +142,13 @@ DISCOVERY_SQL = """
         WHERE b.repository_url IS NOT NULL
           AND (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
         UNION ALL
-        -- Sessions
+        -- Sessions (unambiguous only)
         SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date AS day,
                r.provider,
                r.repository
         FROM afk_run_sessions ars
-        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
+        JOIN unambiguous u ON u.session_id = ars.session_id
+        JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
         WHERE r.repository IS NOT NULL
           AND (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
         UNION ALL
@@ -142,8 +157,9 @@ DISCOVERY_SQL = """
                r.provider,
                r.repository
         FROM usage_events ue
-        JOIN afk_run_sessions ars ON ars.session_id = ue.session_id
-        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
+        JOIN unambiguous u ON u.session_id = ue.session_id
+        JOIN afk_run_sessions ars ON ars.session_id = u.session_id
+        JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
         WHERE r.repository IS NOT NULL
           AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
     ) all_buckets
