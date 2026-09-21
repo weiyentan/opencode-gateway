@@ -22,16 +22,18 @@ Retention tiers (issue #483, ADR 0022 — configurable via ``GATEWAY_RETENTION_*
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Date,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     UniqueConstraint,
     text,
@@ -793,5 +795,100 @@ class ExecutionOutcomeCorrection(Base):
     reason: Mapped[str] = mapped_column(String(1000), nullable=False)
     corrected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class AFKDashboardDaily(Base):
+    """The AFK dashboard daily rollup — one row per UTC day / provider /
+    repository bucket (migration 0046, issue #714).
+
+    A pre-aggregated operational read-model following the
+    ``client_project_rollup`` precedent (migration 0023): the composite
+    primary key is the bucket identity ``(day, provider, repository)`` and
+    every metric column is additive, ``NOT NULL DEFAULT 0``.  Non-additive
+    values (distinct counts, ratios, percentiles) are deliberately absent —
+    they cannot be summed across buckets.
+
+    ``derived_at``/``updated_at`` are freshness markers and
+    ``rollup_version`` records the recomputation rule version, so consumers
+    can detect stale or version-skewed buckets.  Runtime access is raw
+    asyncpg (the recomputation engine is the only writer); this model exists
+    for Alembic autogenerate only.
+    """
+
+    __tablename__ = "afk_dashboard_daily"
+
+    __table_args__ = (
+        # Provider/repository-scoped day-range scans; the composite primary
+        # key already covers unfiltered date-range scans.
+        Index(
+            "ix_afk_dashboard_daily_provider_repository_day",
+            "provider",
+            "repository",
+            "day",
+        ),
+    )
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, primary_key=True)
+    repository: Mapped[str] = mapped_column(String, primary_key=True)
+
+    # ── Additive AFK metrics ──
+    runs_started: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    change_requests_opened: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    change_requests_merged: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    change_requests_closed: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    execution_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    successful_execution_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    failed_execution_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    cancelled_execution_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    session_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    input_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    output_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    cache_read_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    cache_write_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    estimated_cost_usd: Mapped[float] = mapped_column(
+        Numeric, nullable=False, server_default=text("0")
+    )
+
+    # ── Freshness / versioning metadata ──
+    derived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("now()"),
+        nullable=False,
+    )
+    rollup_version: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=text("now()"),
+        nullable=False,
     )
 
