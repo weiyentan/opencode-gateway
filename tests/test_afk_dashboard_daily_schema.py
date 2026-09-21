@@ -1,34 +1,32 @@
-"""Tests for the ``afk_dashboard_daily`` migration 0047 and ORM model
-(issue #714/#720).
+"""Tests for the afk_dashboard_daily table migrations 0046–0047.
 
-The AFK dashboard daily rollup is the pre-aggregated operational read-model the
-AFK Dashboard summary endpoint (issue #719) reads and the recompute engine
-(``app.core.afk_dashboard_daily``, issue #715) writes.  It follows the
-``client_project_rollup`` precedent (migration 0023, ADR 0014/0015): a composite
-primary key on the bucket identity, additive-only metric columns, and a
-reversible downgrade.
+The AFK dashboard daily rollup is a pre-aggregated operational read-model
+keyed by ``(day, provider, repository)`` (client_project_rollup precedent,
+migration 0023 / ADR 0014/0015).  This module verifies:
 
-This module covers the parts unique to this change set: the migration 0047
-addition of the day index used by unfiltered date-range scans, and the
-SQLAlchemy ORM model that mirrors the DDL for Alembic autogenerate.  Migration
-0046 (table creation) is covered by its own test module.
-
-Migration-only schema, so the migration tests verify the rendered SQL of
-``alembic upgrade 0046:0047 --sql`` and ``alembic downgrade 0047:0046 --sql``
-(Alembic offline mode):
-
-1. Upgrade adds the ``(day)`` index used by unfiltered date-range scans.
-2. Upgrade creates no table — ``afk_dashboard_daily`` was created by 0046.
-3. The downgrade drops the day index.
-4. The SQLAlchemy ORM model (Alembic-autogenerate only) mirrors the DDL,
-   including both indexes.
+1. Upgrade creates ``afk_dashboard_daily`` with the agreed composite primary
+   key ``(day, provider, repository)``.
+2. Every additive metric column is present — run counts, change-request
+   counts, execution counts, session count, token totals, and estimated
+   cost.  No non-additive (distinct-count / ratio) columns are stored.
+3. The metadata columns ``derived_at`` (timestamptz), ``rollup_version``
+   (text), and ``updated_at`` (timestamptz) are present.
+4. Indexes support the summary read path: the composite primary key serves
+   date-range scans, the ``(provider, repository, day)`` index serves
+   provider/repository-scoped scans, and the ``day`` index serves
+   date-range-only scans (migration 0047).
+5. Downgrade drops the index and the table.
+6. The SQLAlchemy ORM model (Alembic-autogenerate only) mirrors the DDL.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import re
 from pathlib import Path
+
+from alembic.config import Config
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +51,178 @@ _ADDITIVE_COLUMNS = [
 ]
 
 _METADATA_COLUMNS = ["derived_at", "rollup_version", "updated_at"]
+
+
+def _alembic_cfg() -> Config:
+    """Build a minimal Alembic Config pointing at the project's migrations."""
+    cfg = Config()
+    cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
+    cfg.set_main_option("sqlalchemy.url", "postgresql://none:none@localhost/none")
+    return cfg
+
+
+def _run_alembic_upgrade_sql(start: str = "0045", revision: str = "0046") -> str:
+    """Run ``alembic upgrade <start>:<revision> --sql`` and return the SQL string."""
+    from alembic.command import upgrade
+
+    cfg = _alembic_cfg()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        upgrade(cfg, f"{start}:{revision}", sql=True)
+    return buf.getvalue()
+
+
+def _run_alembic_downgrade_sql(revision: str = "0045") -> str:
+    """Run ``alembic downgrade 0046:<revision> --sql`` and return the SQL string."""
+    from alembic.command import downgrade
+
+    cfg = _alembic_cfg()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        downgrade(cfg, f"0046:{revision}", sql=True)
+    return buf.getvalue()
+
+
+def _extract_table_ddl(sql: str, table_name: str) -> str:
+    """Extract the DDL block for a given CREATE TABLE statement."""
+    start = sql.find(f"CREATE TABLE {table_name}")
+    if start == -1:
+        return ""
+    # Guard against unbalanced parens (e.g. DEFAULT gen_random_uuid()) by
+    # extending to the next ");" until the paren depth is balanced.
+    open_paren = sql.find("(", start)
+    if open_paren == -1:
+        return sql[start:]
+    pos = open_paren + 1
+    depth = 0
+    while True:
+        closer = sql.find(")", pos)
+        if closer == -1:
+            return sql[start:]
+        depth = sql.count("(", pos, closer + 1) - 1 + depth
+        if depth <= 0 and closer + 1 < len(sql) and sql[closer + 1] == ";":
+            return sql[start : closer + 1]
+        pos = closer + 1
+
+
+def _has_column(table_ddl: str, column: str) -> bool:
+    """Word-boundary column match — prevents ``execution_count`` matching
+    inside ``successful_execution_count``."""
+    return re.search(rf"\b{re.escape(column)}\b", table_ddl) is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Migration 0046 — Offline SQL Verification
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMigration0046Upgrade:
+    """Verify Alembic migration 0046 upgrade creates the dashboard rollup."""
+
+    def _get_upgrade_sql(self) -> str:
+        return _run_alembic_upgrade_sql()
+
+    def test_upgrade_creates_afk_dashboard_daily_table(self):
+        """Upgrade should emit CREATE TABLE for afk_dashboard_daily."""
+        sql = self._get_upgrade_sql()
+
+        assert "CREATE TABLE afk_dashboard_daily" in sql, (
+            "Expected CREATE TABLE afk_dashboard_daily in upgrade SQL"
+        )
+
+    def test_upgrade_table_has_composite_primary_key(self):
+        """The rollup is keyed by (day, provider, repository)."""
+        sql = self._get_upgrade_sql()
+        table_ddl = _extract_table_ddl(sql, "afk_dashboard_daily")
+
+        assert "PRIMARY KEY (day, provider, repository)" in table_ddl, (
+            "Missing composite PRIMARY KEY (day, provider, repository)"
+        )
+
+    def test_upgrade_table_has_all_additive_metric_columns(self):
+        """Every additive metric column is present exactly once."""
+        sql = self._get_upgrade_sql()
+        table_ddl = _extract_table_ddl(sql, "afk_dashboard_daily")
+
+        for col in _ADDITIVE_COLUMNS:
+            assert _has_column(table_ddl, col), (
+                f"Missing additive column '{col}' in afk_dashboard_daily"
+            )
+
+    def test_upgrade_table_has_metadata_columns(self):
+        """derived_at/rollup_version/updated_at metadata columns are present."""
+        sql = self._get_upgrade_sql()
+        table_ddl = _extract_table_ddl(sql, "afk_dashboard_daily")
+
+        for col in _METADATA_COLUMNS:
+            assert _has_column(table_ddl, col), (
+                f"Missing metadata column '{col}' in afk_dashboard_daily"
+            )
+
+        assert "derived_at TIMESTAMP WITH TIME ZONE" in table_ddl
+        assert "updated_at TIMESTAMP WITH TIME ZONE" in table_ddl
+        assert re.search(r"\brollup_version VARCHAR", table_ddl), (
+            "rollup_version should be a text column"
+        )
+
+    def test_upgrade_does_not_store_non_additive_metrics(self):
+        """No distinct-count/ratio columns — only additive totals belong here."""
+        sql = self._get_upgrade_sql()
+        table_ddl = _extract_table_ddl(sql, "afk_dashboard_daily")
+
+        forbidden = [
+            "avg_",
+            "median_",
+            "p95_",
+            "distinct_",
+            "unique_",
+            "success_rate",
+            "repository_url",
+        ]
+        lowered = table_ddl.lower()
+        for token in forbidden:
+            assert token not in lowered, (
+                f"Rollup must not store non-additive column '{token}'"
+            )
+
+    def test_upgrade_creates_provider_repository_day_index(self):
+        """The (provider, repository, day) index supports scoped scans."""
+        sql = self._get_upgrade_sql()
+
+        assert (
+            "CREATE INDEX ix_afk_dashboard_daily_provider_repository_day" in sql
+        ), "Missing index ix_afk_dashboard_daily_provider_repository_day"
+
+    def test_upgrade_does_not_touch_existing_tables(self):
+        """0046 should create exactly one table and no other DDL."""
+        sql = self._get_upgrade_sql()
+
+        assert sql.count("CREATE TABLE") == 1, (
+            "Expected exactly one CREATE TABLE from migration 0046"
+        )
+        assert "ALTER TABLE" not in sql, "Migration 0046 should not ALTER tables"
+        assert "DROP TABLE" not in sql, "Migration 0046 should not DROP tables"
+
+
+class TestMigration0046Downgrade:
+    """Verify Alembic migration 0046 downgrade is fully reversible."""
+
+    def _get_downgrade_sql(self) -> str:
+        return _run_alembic_downgrade_sql("0045")
+
+    def test_downgrade_drops_provider_repository_day_index(self):
+        """Downgrade should drop the rollup's scoped index."""
+        sql = self._get_downgrade_sql()
+
+        assert "DROP INDEX ix_afk_dashboard_daily_provider_repository_day" in sql
+
+    def test_downgrade_drops_table(self):
+        """Downgrade should emit DROP TABLE for afk_dashboard_daily."""
+        sql = self._get_downgrade_sql()
+
+        assert "DROP TABLE afk_dashboard_daily" in sql, (
+            "Expected DROP TABLE afk_dashboard_daily in downgrade SQL"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
