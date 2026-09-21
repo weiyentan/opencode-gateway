@@ -168,6 +168,15 @@ class TestDiscoverySql:
         assert "($3::text IS NULL OR b.provider = $3)" in sql
         assert "($4::text IS NULL OR b.repository = $4)" in sql
 
+    def test_discovery_excludes_ambiguous_sessions(self):
+        """A session mapped to more than one AFK run must not contribute its
+        own usage rows or afk_run_sessions rows to bucket discovery."""
+        sql = backfill.DISCOVERY_SQL
+        assert "unambiguous AS" in sql
+        assert "HAVING COUNT(DISTINCT ars.afk_run_id) = 1" in sql
+        assert "JOIN unambiguous u ON u.session_id = ars.session_id" in sql
+        assert "JOIN unambiguous u ON u.session_id = ue.session_id" in sql
+
     @pytest.mark.asyncio
     async def test_discover_buckets_passes_window_and_filters(self):
         conn = AsyncMock()
