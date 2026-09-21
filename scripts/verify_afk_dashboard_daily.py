@@ -30,14 +30,14 @@ job status.  There is no ``--fix`` mode: verification reports only; correcting
 a rollup remains the job of the backfill/recompute tooling.
 
 Usage:
-    python scripts/verify_rollup_parity.py [--days N]
-    python scripts/verify_rollup_parity.py --from-date 2026-09-01 --to-date 2026-09-15
-    python scripts/verify_rollup_parity.py --days 3 --json
+    python scripts/verify_afk_dashboard_daily.py [--window-days N]
+    python scripts/verify_afk_dashboard_daily.py --from-date 2026-09-01 --to-date 2026-09-15
+    python scripts/verify_afk_dashboard_daily.py --window-days 3 --json
 
 Flags:
-    --days N          Verify the last N days including today (default: 7).
+    --window-days N   Verify the last N days including today (default: 7).
     --from-date DATE  Explicit inclusive window start (YYYY-MM-DD); requires
-                      --to-date.  Overrides --days.
+                      --to-date.  Overrides --window-days.
     --to-date DATE    Explicit inclusive window end (YYYY-MM-DD).
     --json            Emit the report as JSON on stdout (for CronJob alerting).
     --dry-run         Accepted for CronJob symmetry; always read-only and logs
@@ -67,7 +67,7 @@ from app.core.reporting_aggregates import (  # noqa: E402
     resource_identity_from_payload,
 )
 
-logger = logging.getLogger("verify_rollup_parity")
+logger = logging.getLogger("verify_afk_dashboard_daily")
 
 SOURCE_USAGE_ROLLUP = "client_project_rollup"
 SOURCE_REPORTING_AGGREGATES = "reporting_resource_aggregates"
@@ -200,7 +200,7 @@ def parse_window(
         return VerificationWindow(from_date=from_date, to_date=to_date)
 
     if days < 1:
-        raise ValueError(f"--days must be a positive integer, got {days}")
+        raise ValueError(f"--window-days must be a positive integer, got {days}")
     end = today if today is not None else _today_utc()
     start = end - timedelta(days=days - 1)
     return VerificationWindow(from_date=start, to_date=end)
@@ -685,7 +685,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "usage_events / reporting_deliveries data.",
     )
     parser.add_argument(
-        "--days",
+        "--window-days",
+        dest="days",
         type=int,
         default=7,
         help="Verify the last N days including today (default: 7).",

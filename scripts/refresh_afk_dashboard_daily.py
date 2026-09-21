@@ -21,10 +21,10 @@ holds the lock, this process logs and exits **0** immediately — a CronJob
 overlap is a normal, non-error condition.
 
 Usage:
-    python scripts/afk_daily_refresh.py [--days N] [--as-of YYYY-MM-DD]
+    python scripts/refresh_afk_dashboard_daily.py [--days-back N] [--as-of YYYY-MM-DD]
 
 Flags:
-    --days N          Number of days to recompute, ending at --as-of
+    --days-back N     Number of days to recompute, ending at --as-of
                       (default: 2 = today and yesterday).
     --as-of DATE      UTC date anchoring the end of the window
                       (default: today, UTC).  Useful for replaying a
@@ -49,12 +49,11 @@ from app.core.reporting_aggregates import (  # noqa: E402
     AGGREGATE_LOCK_CLASS,
 )
 from scripts.backfill_client_project_rollup import (  # noqa: E402
-    EVENT_AGGREGATE_SQL,
     _get_pool,
     _parse_row_count,
 )
 
-logger = logging.getLogger("afk_daily_refresh")
+logger = logging.getLogger("refresh_afk_dashboard_daily")
 
 DEFAULT_WINDOW_DAYS = 2
 """Default window size: today plus yesterday (a single-day-safe default)."""
@@ -73,16 +72,36 @@ per-resource keys are derived from a resource hash and are essentially never
 # SQL
 #
 # The recompute source is the engine's grouped additive SUM over canonical
-# usage_events (``EVENT_AGGREGATE_SQL`` in the backfill script) — reused
-# verbatim so ingest-time and refresh-time math can never drift.  The window
-# predicate filters the *grouped* rows by their UTC day bucket, so only
-# buckets inside the configured window are ever written.  The LEFT JOIN +
-# mismatch predicates restrict the upsert to genuinely disagreeing groups,
+# usage_events — the same SELECT shape as ``EVENT_AGGREGATE_SQL`` in the
+# backfill script — restated locally as ``WINDOWED_EVENT_AGGREGATE_SQL`` with
+# the day-window predicate pushed INTO the CTE's WHERE clause.  The shared
+# backfill constant intentionally scans all history, so it cannot be reused
+# verbatim here: the outer-SELECT-only filter left the grouped CTE doing an
+# O(all-history) aggregate on every run.  Filtering ``usage_events`` inside
+# the CTE bounds the recomputation cost to the configured window; the window
+# parameters ($1, $2) are consumed by the CTE's WHERE clause.  The LEFT JOIN
+# + mismatch predicates restrict the upsert to genuinely disagreeing groups,
 # exactly as the engine does.
 # ---------------------------------------------------------------------------
 
+WINDOWED_EVENT_AGGREGATE_SQL = """
+    SELECT ue.client_id,
+           ue.project_id,
+           (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
+           COALESCE(SUM(ue.input_tokens), 0)::int AS input_tokens,
+           COALESCE(SUM(ue.output_tokens), 0)::int AS output_tokens,
+           COALESCE(SUM(ue.cache_read_tokens), 0)::int AS cache_read_tokens,
+           COALESCE(SUM(ue.cache_write_tokens), 0)::int AS cache_write_tokens,
+           COALESCE(SUM(ue.estimated_cost_usd), 0) AS estimated_cost_usd
+    FROM usage_events ue
+    WHERE ue.project_id IS NOT NULL
+      AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+    GROUP BY ue.client_id, ue.project_id,
+             (ue.reported_at AT TIME ZONE 'UTC')::date
+"""
+
 DAILY_BACKFILL_SQL = f"""WITH grouped AS (
-{EVENT_AGGREGATE_SQL}
+{WINDOWED_EVENT_AGGREGATE_SQL}
 )
 INSERT INTO client_project_rollup
     (client_id, project_id, day,
@@ -96,16 +115,14 @@ LEFT JOIN client_project_rollup r
   ON r.client_id = g.client_id
  AND r.project_id = g.project_id
  AND r.day = g.day
-WHERE g.day >= $1
-  AND g.day <= $2
-  AND (
+WHERE (
         r.client_id IS NULL
      OR r.input_tokens != g.input_tokens
      OR r.output_tokens != g.output_tokens
      OR r.cache_read_tokens != g.cache_read_tokens
      OR r.cache_write_tokens != g.cache_write_tokens
      OR r.estimated_cost_usd != g.estimated_cost_usd
-  )
+   )
 ON CONFLICT (client_id, project_id, day)
 DO UPDATE SET
     input_tokens = EXCLUDED.input_tokens,
@@ -137,7 +154,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "usage_events (default: today and yesterday, UTC).",
     )
     parser.add_argument(
-        "--days",
+        "--days-back",
+        dest="days",
         type=int,
         default=DEFAULT_WINDOW_DAYS,
         help="Number of days to recompute, ending at --as-of "
@@ -151,7 +169,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.days < 1:
-        parser.error("--days must be >= 1")
+        parser.error("--days-back must be >= 1")
     return args
 
 

@@ -2,8 +2,8 @@
 
 Covers the task contract acceptance criteria:
 
-1. A CLI entry point (``scripts/afk_daily_refresh.py``) invocable by a
-   Kubernetes CronJob.
+1. A CLI entry point (``scripts/refresh_afk_dashboard_daily.py``) invocable
+   by a Kubernetes CronJob.
 2. It recomputes client_project_rollup buckets for a configurable window
    (default: today and yesterday) reusing the recomputation logic in
    ``scripts/backfill_client_project_rollup.py``.
@@ -25,7 +25,7 @@ import pytest
 from app.core.reconciliation import ROLLUP_FIELDS
 from scripts.backfill_client_project_rollup import EVENT_AGGREGATE_SQL
 
-import scripts.afk_daily_refresh as refresh
+import scripts.refresh_afk_dashboard_daily as refresh
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AC 2: Window resolution — default today + yesterday, configurable
@@ -67,7 +67,8 @@ class TestWindow:
 
 
 class TestArgParsing:
-    """``--days`` and ``--as-of`` drive the window; invalid input fails fast."""
+    """``--days-back`` and ``--as-of`` drive the window; invalid input fails
+    fast."""
 
     def test_days_defaults_to_two(self):
         assert refresh._parse_args([]).days == 2
@@ -76,7 +77,7 @@ class TestArgParsing:
         assert refresh._parse_args([]).as_of is None
 
     def test_days_override(self):
-        assert refresh._parse_args(["--days", "5"]).days == 5
+        assert refresh._parse_args(["--days-back", "5"]).days == 5
 
     def test_as_of_parses_iso_date(self):
         args = refresh._parse_args(["--as-of", "2026-03-15"])
@@ -84,7 +85,7 @@ class TestArgParsing:
 
     def test_invalid_days_rejected(self):
         with pytest.raises(SystemExit):
-            refresh._parse_args(["--days", "0"])
+            refresh._parse_args(["--days-back", "0"])
 
     def test_invalid_as_of_rejected(self):
         with pytest.raises(SystemExit):
@@ -104,13 +105,29 @@ class TestRecomputeSql:
         assert refresh.AGGREGATE_LOCK_CLASS == 47_006
 
     def test_sql_reuses_engine_additive_sum(self):
-        """The recomputation engine's grouped SUM is embedded verbatim."""
-        assert EVENT_AGGREGATE_SQL in refresh.DAILY_BACKFILL_SQL
+        """The windowed CTE keeps the engine's additive SUM lines verbatim."""
+        engine_sum_lines = [
+            line.strip()
+            for line in EVENT_AGGREGATE_SQL.splitlines()
+            if "SUM(ue." in line
+        ]
+        assert len(engine_sum_lines) == len(ROLLUP_FIELDS)
+        for line in engine_sum_lines:
+            assert line in refresh.DAILY_BACKFILL_SQL
 
-    def test_sql_windows_by_day(self):
+    def test_sql_windows_by_day_inside_cte(self):
+        """The day-window predicate is pushed INTO the grouped CTE so the
+        aggregate scans only the configured window, not all history."""
         sql = refresh.DAILY_BACKFILL_SQL
-        assert "g.day >= $1" in sql
-        assert "g.day <= $2" in sql
+        cte = sql.split(")\nINSERT INTO")[0]
+        assert "WITH grouped AS (" in cte
+        assert (
+            "(ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2"
+            in cte
+        )
+        # The outer SELECT no longer carries the day filter.
+        assert "g.day >= $1" not in sql
+        assert "g.day <= $2" not in sql
 
     def test_sql_upserts_and_corrects_toward_events(self):
         sql = refresh.DAILY_BACKFILL_SQL
@@ -137,7 +154,7 @@ class TestRecomputeSql:
         )
         assert result == 4
         sql, start, end = conn.execute.call_args[0]
-        assert "g.day >= $1" in sql
+        assert "BETWEEN $1 AND $2" in sql
         assert start == date(2026, 3, 14)
         assert end == date(2026, 3, 15)
 
@@ -226,7 +243,7 @@ class TestMain:
 
         monkeypatch.setattr(refresh, "_get_pool", fake_get_pool)
 
-        with caplog.at_level(logging.WARNING, logger="afk_daily_refresh"):
+        with caplog.at_level(logging.WARNING, logger="refresh_afk_dashboard_daily"):
             rc = await refresh.main([])
 
         assert rc == 0
@@ -247,7 +264,7 @@ class TestMain:
 
         monkeypatch.setattr(refresh, "_get_pool", fake_get_pool)
 
-        rc = await refresh.main(["--days", "2", "--as-of", "2026-03-15"])
+        rc = await refresh.main(["--days-back", "2", "--as-of", "2026-03-15"])
 
         assert rc == 0
         # Advisory lock attempted via AGGREGATE_LOCK_CLASS with the fixed key.

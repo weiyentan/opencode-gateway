@@ -3,7 +3,7 @@
 
 Covers the acceptance criteria from the task contract:
 
-1. The script accepts a configurable recent window (``--days N`` or an
+1. The script accepts a configurable recent window (``--window-days N`` or an
    explicit ``--from-date``/``--to-date`` range).
 2. It compares ``client_project_rollup`` rows against ``SUM(usage_events)``
    per ``(client_id, project_id, day)`` (token totals + cost).
@@ -40,7 +40,7 @@ class TestParseWindow:
     explicit --from-date/--to-date range (both bounds inclusive)."""
 
     def _parse(self, **kwargs):
-        from scripts.verify_rollup_parity import parse_window
+        from scripts.verify_afk_dashboard_daily import parse_window
         return parse_window(**kwargs)
 
     def test_default_seven_day_inclusive_window(self):
@@ -86,7 +86,7 @@ class TestParseArgs:
     """CLI argument parsing for the verification entry point."""
 
     def _parse(self, argv):
-        from scripts.verify_rollup_parity import _parse_args
+        from scripts.verify_afk_dashboard_daily import _parse_args
         return _parse_args(argv)
 
     def test_defaults(self):
@@ -97,7 +97,7 @@ class TestParseArgs:
         assert args.json is False
 
     def test_days_flag(self):
-        args = self._parse(["--days", "3"])
+        args = self._parse(["--window-days", "3"])
         assert args.days == 3
 
     def test_from_to_flags_parsed_as_dates(self):
@@ -128,7 +128,7 @@ class TestUsageRollupSql:
     ``SUM(usage_events)`` per ``(client_id, project_id, day)``."""
 
     def _sql(self) -> str:
-        from scripts.verify_rollup_parity import USAGE_ROLLUP_MISMATCH_SQL
+        from scripts.verify_afk_dashboard_daily import USAGE_ROLLUP_MISMATCH_SQL
         return USAGE_ROLLUP_MISMATCH_SQL
 
     def test_joins_both_tables_full_outer(self):
@@ -209,7 +209,7 @@ class TestCompareUsageRows:
         return row
 
     def test_maps_differing_fields_and_delta(self):
-        from scripts.verify_rollup_parity import compare_usage_rollup_rows
+        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
 
         mismatches = compare_usage_rollup_rows([self._row()])
         assert len(mismatches) == 1
@@ -228,7 +228,7 @@ class TestCompareUsageRows:
         assert mismatch.fields["output_tokens"].delta == 0
 
     def test_missing_rollup_row_has_none_rollup_side(self):
-        from scripts.verify_rollup_parity import compare_usage_rollup_rows
+        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
 
         row = self._row(
             rollup_input_tokens=None,
@@ -243,7 +243,7 @@ class TestCompareUsageRows:
         assert mismatch.fields["input_tokens"].delta is None
 
     def test_stale_rollup_row_has_none_canonical_side(self):
-        from scripts.verify_rollup_parity import compare_usage_rollup_rows
+        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
 
         row = self._row(
             canonical_input_tokens=None,
@@ -258,7 +258,7 @@ class TestCompareUsageRows:
         assert mismatch.fields["input_tokens"].canonical is None
 
     def test_event_count_is_reported_as_context(self):
-        from scripts.verify_rollup_parity import compare_usage_rollup_rows
+        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
 
         mismatch = compare_usage_rollup_rows([self._row()])[0]
         assert mismatch.context["event_count"] == 2
@@ -274,7 +274,7 @@ class TestReportingSql:
     aggregate table and the canonical delivery table."""
 
     def test_aggregate_select_reads_current_table(self):
-        from scripts.verify_rollup_parity import REPORTING_AGGREGATES_SQL
+        from scripts.verify_afk_dashboard_daily import REPORTING_AGGREGATES_SQL
 
         assert "reporting_resource_aggregates" in REPORTING_AGGREGATES_SQL
         assert "provider" in REPORTING_AGGREGATES_SQL
@@ -282,7 +282,7 @@ class TestReportingSql:
         assert "last_delivery_id" in REPORTING_AGGREGATES_SQL
 
     def test_deliveries_select_is_windowed_by_utc_day(self):
-        from scripts.verify_rollup_parity import REPORTING_DELIVERIES_SQL
+        from scripts.verify_afk_dashboard_daily import REPORTING_DELIVERIES_SQL
 
         assert "reporting_deliveries" in REPORTING_DELIVERIES_SQL
         assert "AT TIME ZONE 'UTC'" in REPORTING_DELIVERIES_SQL
@@ -308,7 +308,7 @@ class TestCanonicalLatestByResource:
         }
 
     def test_picks_max_occurred_at(self):
-        from scripts.verify_rollup_parity import canonical_latest_by_resource
+        from scripts.verify_afk_dashboard_daily import canonical_latest_by_resource
 
         latest, counts = canonical_latest_by_resource([
             self._delivery(
@@ -323,7 +323,7 @@ class TestCanonicalLatestByResource:
         assert counts[key] == 2
 
     def test_tie_break_lowest_delivery_id(self):
-        from scripts.verify_rollup_parity import canonical_latest_by_resource
+        from scripts.verify_afk_dashboard_daily import canonical_latest_by_resource
 
         same_time = datetime(2026, 9, 20, 2, tzinfo=timezone.utc)
         latest, _ = canonical_latest_by_resource([
@@ -336,7 +336,7 @@ class TestCanonicalLatestByResource:
     def test_maps_provider_resource_type_to_canonical(self):
         """A GitHub pull_request and a GitLab merge_request both canonicalise
         to the reporting layer's ``change_request`` type."""
-        from scripts.verify_rollup_parity import canonical_latest_by_resource
+        from scripts.verify_afk_dashboard_daily import canonical_latest_by_resource
 
         row = self._delivery(
             delivery_id="d1", occurred_at=datetime(2026, 9, 20, tzinfo=timezone.utc),
@@ -346,7 +346,7 @@ class TestCanonicalLatestByResource:
         assert ("gitlab", "gitlab.example.com/group/proj", "change_request", "1") in latest
 
     def test_skips_malformed_payload(self):
-        from scripts.verify_rollup_parity import canonical_latest_by_resource
+        from scripts.verify_afk_dashboard_daily import canonical_latest_by_resource
 
         latest, counts = canonical_latest_by_resource([
             {"provider": "gitlab", "delivery_id": "d1",
@@ -365,7 +365,7 @@ class TestCompareReportingAggregates:
     derived from reporting_deliveries."""
 
     def _window(self):
-        from scripts.verify_rollup_parity import parse_window
+        from scripts.verify_afk_dashboard_daily import parse_window
         return parse_window(from_date=date(2026, 9, 20), to_date=date(2026, 9, 21))
 
     def _delivery(self, *, delivery_id, occurred_at, provider="gitlab", number="6"):
@@ -393,7 +393,7 @@ class TestCompareReportingAggregates:
         }
 
     def test_clean_when_pointer_matches(self):
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         t = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
         mismatches = compare_reporting_aggregates(
@@ -404,7 +404,7 @@ class TestCompareReportingAggregates:
         assert mismatches == []
 
     def test_flags_last_delivery_id_mismatch(self):
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         t1 = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
         t2 = datetime(2026, 9, 20, 13, tzinfo=timezone.utc)
@@ -425,7 +425,7 @@ class TestCompareReportingAggregates:
         assert "last_occurred_at" in mismatch.fields
 
     def test_flags_missing_aggregate_for_observed_identity(self):
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         t = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
         mismatches = compare_reporting_aggregates(
@@ -439,7 +439,7 @@ class TestCompareReportingAggregates:
         assert mismatches[0].context["reason"] == "aggregate_missing"
 
     def test_flags_aggregate_without_backing_delivery_in_window(self):
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         t = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
         mismatches = compare_reporting_aggregates(
@@ -455,7 +455,7 @@ class TestCompareReportingAggregates:
     def test_ignores_aggregates_newer_than_window(self):
         """A resource whose aggregate advanced past the window end is not a
         window mismatch — the historical window simply does not cover it."""
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         later = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
         mismatches = compare_reporting_aggregates(
@@ -466,7 +466,7 @@ class TestCompareReportingAggregates:
         assert mismatches == []
 
     def test_ignores_aggregate_outside_window_when_no_deliveries(self):
-        from scripts.verify_rollup_parity import compare_reporting_aggregates
+        from scripts.verify_afk_dashboard_daily import compare_reporting_aggregates
 
         old = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
         mismatches = compare_reporting_aggregates(
@@ -492,7 +492,7 @@ class TestReadOnlySql:
     )
 
     def _sql_constants(self) -> dict[str, str]:
-        from scripts import verify_rollup_parity as mod
+        from scripts import verify_afk_dashboard_daily as mod
 
         return {
             "USAGE_ROLLUP_MISMATCH_SQL": mod.USAGE_ROLLUP_MISMATCH_SQL,
@@ -520,7 +520,7 @@ class TestGroupMismatches:
     ``(day, provider, repository)`` in a stable order."""
 
     def _mismatch(self, day, provider, repository):
-        from scripts.verify_rollup_parity import Mismatch
+        from scripts.verify_afk_dashboard_daily import Mismatch
         return Mismatch(
             source="client_project_rollup",
             day=day,
@@ -533,7 +533,7 @@ class TestGroupMismatches:
         )
 
     def test_groups_by_day_provider_repository(self):
-        from scripts.verify_rollup_parity import group_mismatches
+        from scripts.verify_afk_dashboard_daily import group_mismatches
 
         a = self._mismatch(date(2026, 9, 20), "p1", "r1")
         b = self._mismatch(date(2026, 9, 20), "p1", "r1")
@@ -546,7 +546,7 @@ class TestGroupMismatches:
         assert len(groups[(date(2026, 9, 20), "p1", "r1")]) == 2
 
     def test_empty_returns_empty(self):
-        from scripts.verify_rollup_parity import group_mismatches
+        from scripts.verify_afk_dashboard_daily import group_mismatches
         assert group_mismatches([]) == {}
 
 
@@ -554,11 +554,11 @@ class TestExitCode:
     """Acceptance criterion 5: non-zero when mismatches exist, zero otherwise."""
 
     def test_zero_when_no_mismatches(self):
-        from scripts.verify_rollup_parity import _exit_code
+        from scripts.verify_afk_dashboard_daily import _exit_code
         assert _exit_code([]) == 0
 
     def test_one_when_mismatches(self):
-        from scripts.verify_rollup_parity import Mismatch, _exit_code
+        from scripts.verify_afk_dashboard_daily import Mismatch, _exit_code
         mismatch = Mismatch(
             source="client_project_rollup",
             day=date(2026, 9, 20),
@@ -596,7 +596,7 @@ class TestMain:
             return None
 
     async def _run_main(self, monkeypatch, mismatches):
-        from scripts import verify_rollup_parity as mod
+        from scripts import verify_afk_dashboard_daily as mod
 
         async def _fake_get_pool():
             return TestMain._FakePool(AsyncMock())
@@ -607,13 +607,13 @@ class TestMain:
         monkeypatch.setattr(mod, "_get_pool", _fake_get_pool)
         monkeypatch.setattr(mod, "_run_verification", _fake_run)
         monkeypatch.setattr(mod, "_emit_report", lambda *a, **k: None)
-        return await mod.main(["--days", "1"])
+        return await mod.main(["--window-days", "1"])
 
     async def test_main_returns_zero_when_clean(self, monkeypatch):
         assert await self._run_main(monkeypatch, []) == 0
 
     async def test_main_returns_one_when_mismatches(self, monkeypatch):
-        from scripts.verify_rollup_parity import Mismatch
+        from scripts.verify_afk_dashboard_daily import Mismatch
 
         mismatch = Mismatch(
             source="client_project_rollup",
@@ -633,7 +633,7 @@ class TestFetchReportingMismatches:
     delegates to the pure comparison."""
 
     async def test_uses_both_queries(self):
-        from scripts import verify_rollup_parity as mod
+        from scripts import verify_afk_dashboard_daily as mod
 
         t = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
         conn = AsyncMock()
@@ -681,7 +681,7 @@ class TestFetchUsageMismatches:
     """The usage fetch path binds the window bounds to the mismatch query."""
 
     async def test_binds_window_bounds(self):
-        from scripts import verify_rollup_parity as mod
+        from scripts import verify_afk_dashboard_daily as mod
 
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
@@ -697,7 +697,7 @@ class TestWindowDayCount:
     """Sanity: the inclusive day count is used for the report summary."""
 
     def test_day_count(self):
-        from scripts.verify_rollup_parity import parse_window
+        from scripts.verify_afk_dashboard_daily import parse_window
         window = parse_window(from_date=date(2026, 9, 20), to_date=date(2026, 9, 21))
         assert window.day_count == 2
         assert window.contains(date(2026, 9, 20))
@@ -708,7 +708,7 @@ class TestWindowDayCount:
 def test_today_utc_default_uses_utc_calendar_day():
     """The default 'today' uses UTC so a nightly run near midnight buckets
     consistently with the UTC rollup day."""
-    from scripts.verify_rollup_parity import _today_utc
+    from scripts.verify_afk_dashboard_daily import _today_utc
 
     before = datetime.now(timezone.utc).date()
     today = _today_utc()
