@@ -1,18 +1,20 @@
 # ruff: noqa: UP017 — timezone.utc for consistent tz handling in tests
-"""Tests for the nightly rollup-parity verification script (issue #718).
+"""Tests for the nightly ``afk_dashboard_daily`` parity verifier (issue #718).
 
 Covers the acceptance criteria from the task contract:
 
 1. The script accepts a configurable recent window (``--window-days N`` or an
    explicit ``--from-date``/``--to-date`` range).
-2. It compares ``client_project_rollup`` rows against ``SUM(usage_events)``
-   per ``(client_id, project_id, day)`` (token totals + cost).
+2. It compares ``afk_dashboard_daily`` rows against the canonical source tables
+   the recompute engine projects from, per ``(day, provider, repository)``.
+   Every one of the fourteen additive metrics is compared — run / change-request
+   / execution / session counts, the four token categories, and estimated cost.
 3. It compares ``reporting_resource_aggregates`` against
    ``reporting_deliveries`` source data per stable resource identity.
 4. Mismatches are grouped by ``(day, provider, repository)`` with a detailed
-   breakdown of the differing fields.
-5. The process exits non-zero when mismatches are found, zero when the
-   rollups match canonical data.
+   breakdown of the differing metrics.
+5. The process exits non-zero when mismatches are found, zero when the rollups
+   match canonical data.
 6. It never modifies, deletes, or updates any rollup or canonical row —
    read-only reporting (the SQL is SELECT-only).
 
@@ -23,7 +25,6 @@ Tests follow the mock pattern of ``tests/test_client_project_rollup_backfill.py`
 from __future__ import annotations
 
 import re
-import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -119,55 +120,79 @@ class TestParseArgs:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AC 2: client_project_rollup vs SUM(usage_events)
+#  AC 2: afk_dashboard_daily vs canonical source aggregation
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestUsageRollupSql:
-    """Acceptance criterion 2: the usage-side query joins the rollup against
-    ``SUM(usage_events)`` per ``(client_id, project_id, day)``."""
+class TestAfkDashboardDailySql:
+    """Acceptance criterion 2: the rollup-side query joins ``afk_dashboard_daily``
+    against the canonical per-``(day, provider, repository)`` aggregation the
+    recompute engine projects from its source tables."""
 
     def _sql(self) -> str:
-        from scripts.verify_afk_dashboard_daily import USAGE_ROLLUP_MISMATCH_SQL
-        return USAGE_ROLLUP_MISMATCH_SQL
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_DAILY_MISMATCH_SQL,
+        )
+        return AFK_DASHBOARD_DAILY_MISMATCH_SQL
 
-    def test_joins_both_tables_full_outer(self):
+    def test_joins_rollup_against_canonical_full_outer(self):
         sql = self._sql()
-        assert "client_project_rollup" in sql
-        assert "usage_events" in sql
-        assert "FULL OUTER JOIN" in sql.upper()
+        assert "FROM afk_dashboard_daily d" in sql
+        assert "FULL OUTER JOIN (" in sql
+        assert "SELECT * FROM canonical" in sql
+        assert "ON d.day = c.day" in sql
 
-    def test_keys_on_client_project_day(self):
+    def test_compares_all_fourteen_metric_columns(self):
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_METRIC_COLUMNS,
+        )
+
+        assert len(AFK_DASHBOARD_METRIC_COLUMNS) == 14
         sql = self._sql()
-        assert "ON r.client_id = g.client_id" in sql
-        assert "AND r.project_id = g.project_id" in sql
-        assert "AND r.day = g.day" in sql
+        for name in AFK_DASHBOARD_METRIC_COLUMNS:
+            assert f"rollup_{name}" in sql, f"missing rollup side of {name}"
+            assert f"canonical_{name}" in sql, f"missing canonical side of {name}"
 
-    def test_compares_all_rollup_fields(self):
-        from app.core.reconciliation import ROLLUP_FIELDS
-
+    def test_canonical_side_reads_every_source_table(self):
         sql = self._sql()
-        for field in ROLLUP_FIELDS:
-            assert f"rollup_{field}" in sql, f"missing rollup side of {field}"
-            assert f"canonical_{field}" in sql, f"missing canonical side of {field}"
+        for table in (
+            "afk_runs",
+            "engineering_events",
+            "execution_bindings",
+            "afk_run_sessions",
+            "usage_events",
+        ):
+            assert f"FROM {table}" in sql, f"canonical side missing {table}"
 
-    def test_sums_only_additive_fields(self):
-        from app.core.reconciliation import ROLLUP_FIELDS
-
+    def test_canonical_side_recomputes_the_pivot_metrics(self):
+        """The canonical CTEs compute the count/SUM metrics, not just project
+        the rollup columns."""
         sql = self._sql()
-        summed = set(re.findall(r"SUM\(ue\.(\w+)\)", sql))
-        assert sorted(summed) == sorted(ROLLUP_FIELDS)
-        assert "cached_tokens" not in summed
-        assert "reasoning_tokens" not in summed
+        assert "COUNT(*)::int AS runs_started" in sql
+        assert "FILTER (WHERE e.event_type = 'change_request.opened')" in sql
+        assert "FILTER (WHERE e.event_type = 'change_request.merged')" in sql
+        assert "FILTER (WHERE e.event_type = 'change_request.closed')" in sql
+        assert "FILTER (WHERE b.outcome = 'completed')" in sql
+        assert "FILTER (WHERE b.outcome = 'failed')" in sql
+        assert "FILTER (WHERE b.outcome = 'cancelled')" in sql
+        assert "COALESCE(SUM(ue.input_tokens), 0)" in sql
+        assert "COALESCE(SUM(ue.estimated_cost_usd), 0)" in sql
+
+    def test_excludes_ambiguous_session_attribution(self):
+        sql = self._sql()
+        assert "HAVING COUNT(DISTINCT ars.afk_run_id) = 1" in sql
 
     def test_flags_missing_rows_on_either_side(self):
         sql = self._sql()
-        assert "r.client_id IS NULL" in sql
-        assert "g.client_id IS NULL" in sql
+        assert "d.day IS NULL" in sql
+        assert "c.day IS NULL" in sql
 
-    def test_excludes_null_project_events(self):
+    def test_excludes_rows_without_repository_identity(self):
         sql = self._sql()
-        assert "project_id IS NOT NULL" in sql
+        assert "r.repository IS NOT NULL" in sql
+        assert "e.repository IS NOT NULL" in sql
+        assert "b.repository_url IS NOT NULL" in sql
+        assert "b.repository_url AS repository" in sql
 
     def test_uses_utc_day_bucketing(self):
         sql = self._sql()
@@ -182,86 +207,132 @@ class TestUsageRollupSql:
 
     def test_orders_by_day_provider_repository(self):
         sql = self._sql()
-        assert re.search(r"ORDER BY\s+day,\s+client_id,\s+project_id", sql)
+        assert re.search(r"ORDER BY\s+day,\s+provider,\s+repository", sql)
+
+    def test_backward_compatible_alias_points_at_new_sql(self):
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_DAILY_MISMATCH_SQL,
+            USAGE_ROLLUP_MISMATCH_SQL,
+        )
+
+        assert USAGE_ROLLUP_MISMATCH_SQL == AFK_DASHBOARD_DAILY_MISMATCH_SQL
 
 
-class TestCompareUsageRows:
+class TestCompareAfkDashboardDailyRows:
     """Pure mapping of SQL mismatch rows into grouped mismatch records."""
+
+    _ROLLUP = {
+        "runs_started": 5,
+        "change_requests_opened": 3,
+        "change_requests_merged": 2,
+        "change_requests_closed": 1,
+        "execution_count": 4,
+        "successful_execution_count": 3,
+        "failed_execution_count": 1,
+        "cancelled_execution_count": 0,
+        "session_count": 6,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_tokens": 10,
+        "cache_write_tokens": 5,
+        "estimated_cost_usd": Decimal("0.0035"),
+    }
+    _CANONICAL = {
+        **_ROLLUP,
+        "runs_started": 7,
+        "input_tokens": 120,
+        "estimated_cost_usd": Decimal("0.0040"),
+    }
 
     def _row(self, **overrides):
         row = {
-            "client_id": uuid.UUID("11111111-1111-1111-1111-111111111111"),
-            "project_id": "proj-a",
             "day": date(2026, 9, 20),
-            "rollup_input_tokens": 100,
-            "rollup_output_tokens": 50,
-            "rollup_cache_read_tokens": 10,
-            "rollup_cache_write_tokens": 5,
-            "rollup_estimated_cost_usd": Decimal("0.0035"),
-            "canonical_input_tokens": 120,
-            "canonical_output_tokens": 50,
-            "canonical_cache_read_tokens": 10,
-            "canonical_cache_write_tokens": 5,
-            "canonical_estimated_cost_usd": Decimal("0.0040"),
-            "canonical_event_count": 2,
+            "provider": "gitlab",
+            "repository": "cloudnative-pg",
         }
+        for name, value in self._ROLLUP.items():
+            row[f"rollup_{name}"] = value
+        for name, value in self._CANONICAL.items():
+            row[f"canonical_{name}"] = value
         row.update(overrides)
         return row
 
-    def test_maps_differing_fields_and_delta(self):
-        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
+    def test_maps_all_fourteen_metrics(self):
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_METRIC_COLUMNS,
+            compare_afk_dashboard_daily_rows,
+        )
 
-        mismatches = compare_usage_rollup_rows([self._row()])
-        assert len(mismatches) == 1
-        mismatch = mismatches[0]
-        assert mismatch.source == "client_project_rollup"
+        mismatch = compare_afk_dashboard_daily_rows([self._row()])[0]
+        assert set(mismatch.fields) == set(AFK_DASHBOARD_METRIC_COLUMNS)
+        assert len(mismatch.fields) == 14
+
+    def test_maps_identity_and_source(self):
+        from scripts.verify_afk_dashboard_daily import (
+            compare_afk_dashboard_daily_rows,
+        )
+
+        mismatch = compare_afk_dashboard_daily_rows([self._row()])[0]
+        assert mismatch.source == "afk_dashboard_daily"
         assert mismatch.day == date(2026, 9, 20)
-        assert mismatch.provider == "11111111-1111-1111-1111-111111111111"
-        assert mismatch.repository == "proj-a"
-        assert mismatch.group_key == (date(2026, 9, 20), mismatch.provider, "proj-a")
+        assert mismatch.provider == "gitlab"
+        assert mismatch.repository == "cloudnative-pg"
+        assert mismatch.group_key == (
+            date(2026, 9, 20), "gitlab", "cloudnative-pg",
+        )
 
-        assert mismatch.fields["input_tokens"].rollup == 100
-        assert mismatch.fields["input_tokens"].canonical == 120
-        assert mismatch.fields["input_tokens"].delta == 20
-        assert mismatch.fields["estimated_cost_usd"].delta == Decimal("0.0005")
-        # A matching field still appears in the breakdown with a zero delta.
-        assert mismatch.fields["output_tokens"].delta == 0
+    def test_computes_delta_for_differing_metrics(self):
+        from scripts.verify_afk_dashboard_daily import (
+            compare_afk_dashboard_daily_rows,
+        )
+
+        fields = compare_afk_dashboard_daily_rows([self._row()])[0].fields
+        assert fields["runs_started"].rollup == 5
+        assert fields["runs_started"].canonical == 7
+        assert fields["runs_started"].delta == 2
+        assert fields["input_tokens"].delta == 20
+        assert fields["estimated_cost_usd"].delta == Decimal("0.0005")
+        # A matching metric still appears with a zero delta.
+        assert fields["output_tokens"].delta == 0
+
+    def test_reports_the_mismatched_metric_names(self):
+        from scripts.verify_afk_dashboard_daily import (
+            compare_afk_dashboard_daily_rows,
+        )
+
+        mismatch = compare_afk_dashboard_daily_rows([self._row()])[0]
+        assert set(mismatch.context["mismatched_metrics"]) == {
+            "runs_started",
+            "input_tokens",
+            "estimated_cost_usd",
+        }
 
     def test_missing_rollup_row_has_none_rollup_side(self):
-        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
-
-        row = self._row(
-            rollup_input_tokens=None,
-            rollup_output_tokens=None,
-            rollup_cache_read_tokens=None,
-            rollup_cache_write_tokens=None,
-            rollup_estimated_cost_usd=None,
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_METRIC_COLUMNS,
+            compare_afk_dashboard_daily_rows,
         )
-        mismatch = compare_usage_rollup_rows([row])[0]
+
+        row = self._row()
+        for name in AFK_DASHBOARD_METRIC_COLUMNS:
+            row[f"rollup_{name}"] = None
+        mismatch = compare_afk_dashboard_daily_rows([row])[0]
         assert mismatch.fields["input_tokens"].rollup is None
         assert mismatch.fields["input_tokens"].canonical == 120
         assert mismatch.fields["input_tokens"].delta is None
 
     def test_stale_rollup_row_has_none_canonical_side(self):
-        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
-
-        row = self._row(
-            canonical_input_tokens=None,
-            canonical_output_tokens=None,
-            canonical_cache_read_tokens=None,
-            canonical_cache_write_tokens=None,
-            canonical_estimated_cost_usd=None,
-            canonical_event_count=0,
+        from scripts.verify_afk_dashboard_daily import (
+            AFK_DASHBOARD_METRIC_COLUMNS,
+            compare_afk_dashboard_daily_rows,
         )
-        mismatch = compare_usage_rollup_rows([row])[0]
+
+        row = self._row()
+        for name in AFK_DASHBOARD_METRIC_COLUMNS:
+            row[f"canonical_{name}"] = None
+        mismatch = compare_afk_dashboard_daily_rows([row])[0]
         assert mismatch.fields["input_tokens"].rollup == 100
         assert mismatch.fields["input_tokens"].canonical is None
-
-    def test_event_count_is_reported_as_context(self):
-        from scripts.verify_afk_dashboard_daily import compare_usage_rollup_rows
-
-        mismatch = compare_usage_rollup_rows([self._row()])[0]
-        assert mismatch.context["event_count"] == 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -495,7 +566,7 @@ class TestReadOnlySql:
         from scripts import verify_afk_dashboard_daily as mod
 
         return {
-            "USAGE_ROLLUP_MISMATCH_SQL": mod.USAGE_ROLLUP_MISMATCH_SQL,
+            "AFK_DASHBOARD_DAILY_MISMATCH_SQL": mod.AFK_DASHBOARD_DAILY_MISMATCH_SQL,
             "REPORTING_AGGREGATES_SQL": mod.REPORTING_AGGREGATES_SQL,
             "REPORTING_DELIVERIES_SQL": mod.REPORTING_DELIVERIES_SQL,
         }
@@ -507,7 +578,7 @@ class TestReadOnlySql:
 
     def test_all_sql_starts_with_select(self):
         for name, sql in self._sql_constants().items():
-            assert sql.lstrip().upper().startswith("SELECT"), name
+            assert sql.lstrip().upper().startswith(("SELECT", "WITH")), name
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -522,7 +593,7 @@ class TestGroupMismatches:
     def _mismatch(self, day, provider, repository):
         from scripts.verify_afk_dashboard_daily import Mismatch
         return Mismatch(
-            source="client_project_rollup",
+            source="afk_dashboard_daily",
             day=day,
             provider=provider,
             repository=repository,
@@ -560,7 +631,7 @@ class TestExitCode:
     def test_one_when_mismatches(self):
         from scripts.verify_afk_dashboard_daily import Mismatch, _exit_code
         mismatch = Mismatch(
-            source="client_project_rollup",
+            source="afk_dashboard_daily",
             day=date(2026, 9, 20),
             provider="p",
             repository="r",
@@ -616,7 +687,7 @@ class TestMain:
         from scripts.verify_afk_dashboard_daily import Mismatch
 
         mismatch = Mismatch(
-            source="client_project_rollup",
+            source="afk_dashboard_daily",
             day=date(2026, 9, 20),
             provider="p",
             repository="r",
@@ -677,8 +748,8 @@ class TestFetchReportingMismatches:
         assert second_args[1:] == (date(2026, 9, 20), date(2026, 9, 21))
 
 
-class TestFetchUsageMismatches:
-    """The usage fetch path binds the window bounds to the mismatch query."""
+class TestFetchAfkDashboardMismatches:
+    """The dashboard fetch path binds the window bounds to the mismatch query."""
 
     async def test_binds_window_bounds(self):
         from scripts import verify_afk_dashboard_daily as mod
@@ -686,10 +757,10 @@ class TestFetchUsageMismatches:
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
         window = mod.parse_window(from_date=date(2026, 9, 20), to_date=date(2026, 9, 21))
-        result = await mod._fetch_usage_mismatches(conn, window)
+        result = await mod._fetch_afk_dashboard_mismatches(conn, window)
         assert result == []
         args = conn.fetch.call_args[0]
-        assert args[0] == mod.USAGE_ROLLUP_MISMATCH_SQL
+        assert args[0] == mod.AFK_DASHBOARD_DAILY_MISMATCH_SQL
         assert args[1:] == (date(2026, 9, 20), date(2026, 9, 21))
 
 

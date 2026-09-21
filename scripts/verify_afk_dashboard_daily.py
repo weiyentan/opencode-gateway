@@ -1,22 +1,47 @@
 #!/usr/bin/env python3
-"""Nightly rollup-parity verification (issue #718).
+"""Nightly ``afk_dashboard_daily`` parity verification (issue #718).
 
-Compares the Gateway's derived rollup read-models against their canonical
-sources over a configurable recent window and reports every disagreement by
-``(day, provider, repository)`` with a per-field breakdown.  It is strictly
-**read-only** — it never inserts, updates, deletes, or otherwise mutates a
-rollup row or a canonical row.  Its SQL is SELECT-only by construction.
+Compares the Gateway's derived ``afk_dashboard_daily`` rollup against the
+canonical source tables the recomputation engine
+(``app.core.afk_dashboard_daily``) projects from, over a configurable recent
+window, and reports every disagreement by ``(day, provider, repository)`` with
+a per-metric breakdown.  It is strictly **read-only** — it never inserts,
+updates, deletes, or otherwise mutates a rollup or a canonical row.  Its SQL is
+SELECT-only by construction.
 
 Two comparisons run:
 
-* **Usage rollup** — ``client_project_rollup`` vs ``SUM(usage_events)`` per
-  ``(client_id, project_id, day)`` (ADR 0015).  The five additive fields are
-  the token totals (input, output, cache read, cache write) and the estimated
-  cost total.  A rollup row with no backing event group (stale) and an event
-  group with no rollup row (missing) both count as mismatches.  The canonical
-  event count for the bucket is reported as context.
-* **Reporting aggregate** — ``reporting_resource_aggregates`` vs the
-  canonical ``reporting_deliveries`` rows per **stable resource identity**
+* **AFK dashboard daily rollup** — ``afk_dashboard_daily`` vs the canonical
+  sources the recompute engine uses, per ``(day, provider, repository)`` (issue
+  #714/#715).  Every one of the fourteen additive metrics is recomputed from
+  its source:
+
+  ====================================  ==========================  =====================================
+  Metric                                Canonical table             Event-time column
+  ====================================  ==========================  =====================================
+  ``runs_started``                      ``afk_runs``                ``COALESCE(started_at, first_seen_at)``
+  ``change_requests_opened``            ``engineering_events``      ``occurred_at``
+  ``change_requests_merged``            ``engineering_events``      ``occurred_at``
+  ``change_requests_closed``            ``engineering_events``      ``occurred_at``
+  ``execution_count``                   ``execution_bindings``      ``COALESCE(started_at, created_at)``
+  ``successful_execution_count``        ``execution_bindings``      ``COALESCE(started_at, created_at)``
+  ``failed_execution_count``            ``execution_bindings``      ``COALESCE(started_at, created_at)``
+  ``cancelled_execution_count``         ``execution_bindings``      ``COALESCE(started_at, created_at)``
+  ``session_count``                     ``afk_run_sessions``        ``COALESCE(started_at, first_seen_at)``
+  ``input_tokens``                      ``usage_events``            ``reported_at``
+  ``output_tokens``                     ``usage_events``            ``reported_at``
+  ``cache_read_tokens``                 ``usage_events``            ``reported_at``
+  ``cache_write_tokens``                ``usage_events``            ``reported_at``
+  ``estimated_cost_usd``                ``usage_events``            ``reported_at``
+  ====================================  ==========================  =====================================
+
+  Sessions whose internal ``session_id`` maps to more than one AFK run are
+  ambiguous and are excluded (``HAVING COUNT(DISTINCT afk_run_id) = 1``), never
+  split or arbitrarily attributed.  A rollup row with no backing canonical
+  group (stale) and a canonical group with no rollup row (missing) both count
+  as mismatches.
+* **Reporting aggregate** — ``reporting_resource_aggregates`` vs the canonical
+  ``reporting_deliveries`` rows per **stable resource identity**
   ``(provider, repository_url, resource_type, resource_number)`` (ADR 0018).
   The current aggregate's forward-advanced ``last_delivery_id`` /
   ``last_occurred_at`` pointer must resolve to the resource's newest delivery;
@@ -24,10 +49,10 @@ Two comparisons run:
   backing delivery in the window) is a mismatch.  The canonical delivery count
   for the identity is reported as context.
 
-Exit code is ``0`` when every rollup matches its canonical source and
-non-zero when any mismatch is found, so a Kubernetes CronJob can alert on the
-job status.  There is no ``--fix`` mode: verification reports only; correcting
-a rollup remains the job of the backfill/recompute tooling.
+Exit code is ``0`` when every rollup matches its canonical source and non-zero
+when any mismatch is found, so a Kubernetes CronJob can alert on the job status.
+There is no ``--fix`` mode: verification reports only; correcting a rollup
+remains the job of the recompute tooling.
 
 Usage:
     python scripts/verify_afk_dashboard_daily.py [--window-days N]
@@ -62,70 +87,221 @@ import asyncpg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.config import get_settings  # noqa: E402
-from app.core.reconciliation import ROLLUP_FIELDS  # noqa: E402
 from app.core.reporting_aggregates import (  # noqa: E402
     resource_identity_from_payload,
 )
 
+# Mirror of ``app.core.afk_dashboard_daily.METRIC_COLUMNS`` used until the
+# #715 recompute engine is merged onto this branch.  When the engine module is
+# importable its canonical vocabulary wins, so the verifier and the writer can
+# never drift.
+_FALLBACK_AFK_DASHBOARD_METRIC_COLUMNS: tuple[str, ...] = (
+    "runs_started",
+    "change_requests_opened",
+    "change_requests_merged",
+    "change_requests_closed",
+    "execution_count",
+    "successful_execution_count",
+    "failed_execution_count",
+    "cancelled_execution_count",
+    "session_count",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "estimated_cost_usd",
+)
+try:  # pragma: no cover - the #715 engine may not be merged on this branch yet.
+    from app.core.afk_dashboard_daily import (  # noqa: E402
+        METRIC_COLUMNS as AFK_DASHBOARD_METRIC_COLUMNS,
+    )
+except ImportError:  # pragma: no cover - engine absent, use the mirror above.
+    AFK_DASHBOARD_METRIC_COLUMNS = _FALLBACK_AFK_DASHBOARD_METRIC_COLUMNS
+
 logger = logging.getLogger("verify_afk_dashboard_daily")
 
-SOURCE_USAGE_ROLLUP = "client_project_rollup"
+SOURCE_AFK_DASHBOARD_DAILY = "afk_dashboard_daily"
 SOURCE_REPORTING_AGGREGATES = "reporting_resource_aggregates"
+# Backward-compatible alias for the historical source label.
+SOURCE_USAGE_ROLLUP = SOURCE_AFK_DASHBOARD_DAILY
 
 # ---------------------------------------------------------------------------
 # SQL (SELECT-only)
 #
-# Usage side: a FULL OUTER JOIN flags three disagreement shapes — a rollup row
-# whose totals differ from SUM(usage_events), a rollup row with no matching
-# event group (stale), and an event group with no rollup row (missing).  Both
-# sides are restricted to the verification window by the UTC calendar day.
+# The canonical side recomputes every metric of the ``afk_dashboard_daily``
+# rollup from the same source tables the recompute engine
+# (``app.core.afk_dashboard_daily``) reads, grouped by
+# ``(day, provider, repository)`` for the whole window in one round trip.
+# A FULL OUTER JOIN against ``afk_dashboard_daily`` then flags three
+# disagreement shapes — a rollup row whose metrics differ, a rollup row with no
+# matching canonical group (stale), and a canonical group with no rollup row
+# (missing).  Both sides are restricted to the verification window by the UTC
+# calendar day.
 # ---------------------------------------------------------------------------
 
-USAGE_ROLLUP_MISMATCH_SQL = """
-    SELECT COALESCE(r.client_id, g.client_id) AS client_id,
-           COALESCE(r.project_id, g.project_id) AS project_id,
-           COALESCE(r.day, g.day) AS day,
-           r.input_tokens AS rollup_input_tokens,
-           r.output_tokens AS rollup_output_tokens,
-           r.cache_read_tokens AS rollup_cache_read_tokens,
-           r.cache_write_tokens AS rollup_cache_write_tokens,
-           r.estimated_cost_usd AS rollup_estimated_cost_usd,
-           g.input_tokens AS canonical_input_tokens,
-           g.output_tokens AS canonical_output_tokens,
-           g.cache_read_tokens AS canonical_cache_read_tokens,
-           g.cache_write_tokens AS canonical_cache_write_tokens,
-           g.estimated_cost_usd AS canonical_estimated_cost_usd,
-           COALESCE(g.event_count, 0)::bigint AS canonical_event_count
-    FROM client_project_rollup r
+_AFK_ROLLUP_COLUMNS_SQL = ",\n           ".join(
+    f"d.{column} AS rollup_{column}" for column in AFK_DASHBOARD_METRIC_COLUMNS
+)
+_AFK_CANONICAL_COLUMNS_SQL = ",\n           ".join(
+    f"c.{column} AS canonical_{column}" for column in AFK_DASHBOARD_METRIC_COLUMNS
+)
+_AFK_MISMATCH_PREDICATE = "\n         OR ".join(
+    f"d.{column} != c.{column}" for column in AFK_DASHBOARD_METRIC_COLUMNS
+)
+
+AFK_DASHBOARD_DAILY_MISMATCH_SQL = f"""
+    SELECT COALESCE(d.day, c.day) AS day,
+           COALESCE(d.provider, c.provider) AS provider,
+           COALESCE(d.repository, c.repository) AS repository,
+           {_AFK_ROLLUP_COLUMNS_SQL},
+           {_AFK_CANONICAL_COLUMNS_SQL}
+    FROM afk_dashboard_daily d
     FULL OUTER JOIN (
-        SELECT ue.client_id,
-               ue.project_id,
-               (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
-               COALESCE(SUM(ue.input_tokens), 0)::int AS input_tokens,
-               COALESCE(SUM(ue.output_tokens), 0)::int AS output_tokens,
-               COALESCE(SUM(ue.cache_read_tokens), 0)::int AS cache_read_tokens,
-               COALESCE(SUM(ue.cache_write_tokens), 0)::int AS cache_write_tokens,
-               COALESCE(SUM(ue.estimated_cost_usd), 0) AS estimated_cost_usd,
-               COUNT(*)::bigint AS event_count
-        FROM usage_events ue
-        WHERE ue.project_id IS NOT NULL
-          AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
-        GROUP BY ue.client_id, ue.project_id,
-                 (ue.reported_at AT TIME ZONE 'UTC')::date
-    ) g
-      ON r.client_id = g.client_id
-     AND r.project_id = g.project_id
-     AND r.day = g.day
-    WHERE COALESCE(r.day, g.day) BETWEEN $1 AND $2
-      AND ( r.client_id IS NULL
-         OR g.client_id IS NULL
-         OR r.input_tokens != g.input_tokens
-         OR r.output_tokens != g.output_tokens
-         OR r.cache_read_tokens != g.cache_read_tokens
-         OR r.cache_write_tokens != g.cache_write_tokens
-         OR r.estimated_cost_usd != g.estimated_cost_usd )
-    ORDER BY day, client_id, project_id
+        WITH runs_agg AS (
+            SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
+                       AS day,
+                   r.provider,
+                   r.repository,
+                   COUNT(*)::int AS runs_started
+            FROM afk_runs r
+            WHERE r.repository IS NOT NULL
+              AND (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
+                  BETWEEN $1 AND $2
+            GROUP BY day, r.provider, r.repository
+        ),
+        cr_agg AS (
+            SELECT (e.occurred_at AT TIME ZONE 'UTC')::date AS day,
+                   e.provider,
+                   e.repository,
+                   COUNT(*) FILTER (WHERE e.event_type = 'change_request.opened')::int
+                       AS change_requests_opened,
+                   COUNT(*) FILTER (WHERE e.event_type = 'change_request.merged')::int
+                       AS change_requests_merged,
+                   COUNT(*) FILTER (WHERE e.event_type = 'change_request.closed')::int
+                       AS change_requests_closed
+            FROM engineering_events e
+            WHERE e.entity_type = 'change_request'
+              AND e.repository IS NOT NULL
+              AND (e.occurred_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+            GROUP BY day, e.provider, e.repository
+        ),
+        exec_agg AS (
+            SELECT (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date
+                       AS day,
+                   b.provider,
+                   b.repository_url AS repository,
+                   COUNT(*)::int AS execution_count,
+                   COUNT(*) FILTER (WHERE b.outcome = 'completed')::int
+                       AS successful_execution_count,
+                   COUNT(*) FILTER (WHERE b.outcome = 'failed')::int
+                       AS failed_execution_count,
+                   COUNT(*) FILTER (WHERE b.outcome = 'cancelled')::int
+                       AS cancelled_execution_count
+            FROM execution_bindings b
+            WHERE b.repository_url IS NOT NULL
+              AND (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date
+                  BETWEEN $1 AND $2
+            GROUP BY day, b.provider, b.repository_url
+        ),
+        unambiguous AS (
+            SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
+            FROM afk_run_sessions ars
+            WHERE ars.session_id IS NOT NULL
+            GROUP BY ars.session_id
+            HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+        ),
+        sess_agg AS (
+            SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
+                       AS day,
+                   r.provider,
+                   r.repository,
+                   COUNT(*)::int AS session_count
+            FROM afk_run_sessions ars
+            JOIN unambiguous u ON u.session_id = ars.session_id
+            JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
+            WHERE r.repository IS NOT NULL
+              AND (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
+                  BETWEEN $1 AND $2
+            GROUP BY day, r.provider, r.repository
+        ),
+        usage_agg AS (
+            SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
+                   r.provider,
+                   r.repository,
+                   COALESCE(SUM(ue.input_tokens), 0)::int AS input_tokens,
+                   COALESCE(SUM(ue.output_tokens), 0)::int AS output_tokens,
+                   COALESCE(SUM(ue.cache_read_tokens), 0)::int AS cache_read_tokens,
+                   COALESCE(SUM(ue.cache_write_tokens), 0)::int AS cache_write_tokens,
+                   COALESCE(SUM(ue.estimated_cost_usd), 0) AS estimated_cost_usd
+            FROM usage_events ue
+            JOIN unambiguous u ON u.session_id = ue.session_id
+            JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
+            WHERE r.repository IS NOT NULL
+              AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+            GROUP BY day, r.provider, r.repository
+        ),
+        canonical AS (
+            SELECT COALESCE(r.day, cr.day, ex.day, se.day, ug.day) AS day,
+                   COALESCE(r.provider, cr.provider, ex.provider, se.provider,
+                            ug.provider) AS provider,
+                   COALESCE(r.repository, cr.repository, ex.repository,
+                            se.repository, ug.repository) AS repository,
+                   COALESCE(r.runs_started, 0)::int AS runs_started,
+                   COALESCE(cr.change_requests_opened, 0)::int
+                       AS change_requests_opened,
+                   COALESCE(cr.change_requests_merged, 0)::int
+                       AS change_requests_merged,
+                   COALESCE(cr.change_requests_closed, 0)::int
+                       AS change_requests_closed,
+                   COALESCE(ex.execution_count, 0)::int AS execution_count,
+                   COALESCE(ex.successful_execution_count, 0)::int
+                       AS successful_execution_count,
+                   COALESCE(ex.failed_execution_count, 0)::int
+                       AS failed_execution_count,
+                   COALESCE(ex.cancelled_execution_count, 0)::int
+                       AS cancelled_execution_count,
+                   COALESCE(se.session_count, 0)::int AS session_count,
+                   COALESCE(ug.input_tokens, 0)::int AS input_tokens,
+                   COALESCE(ug.output_tokens, 0)::int AS output_tokens,
+                   COALESCE(ug.cache_read_tokens, 0)::int AS cache_read_tokens,
+                   COALESCE(ug.cache_write_tokens, 0)::int AS cache_write_tokens,
+                   COALESCE(ug.estimated_cost_usd, 0) AS estimated_cost_usd
+            FROM runs_agg r
+            FULL OUTER JOIN cr_agg cr
+              ON cr.day = r.day
+             AND cr.provider = r.provider
+             AND cr.repository = r.repository
+            FULL OUTER JOIN exec_agg ex
+              ON ex.day = COALESCE(r.day, cr.day)
+             AND ex.provider = COALESCE(r.provider, cr.provider)
+             AND ex.repository = COALESCE(r.repository, cr.repository)
+            FULL OUTER JOIN sess_agg se
+              ON se.day = COALESCE(r.day, cr.day, ex.day)
+             AND se.provider = COALESCE(r.provider, cr.provider, ex.provider)
+             AND se.repository = COALESCE(r.repository, cr.repository,
+                                          ex.repository)
+            FULL OUTER JOIN usage_agg ug
+              ON ug.day = COALESCE(r.day, cr.day, ex.day, se.day)
+             AND ug.provider = COALESCE(r.provider, cr.provider, ex.provider,
+                                        se.provider)
+             AND ug.repository = COALESCE(r.repository, cr.repository,
+                                          ex.repository, se.repository)
+        )
+        SELECT * FROM canonical
+    ) c
+      ON d.day = c.day
+     AND d.provider = c.provider
+     AND d.repository = c.repository
+    WHERE COALESCE(d.day, c.day) BETWEEN $1 AND $2
+      AND ( d.day IS NULL
+         OR c.day IS NULL
+         OR {_AFK_MISMATCH_PREDICATE} )
+    ORDER BY day, provider, repository
 """
+
+# Backward-compatible alias: the comparison now targets ``afk_dashboard_daily``
+# but the module's historical constant name is retained for callers/tests.
+USAGE_ROLLUP_MISMATCH_SQL = AFK_DASHBOARD_DAILY_MISMATCH_SQL
 
 # Reporting side: the aggregate table is the *current* state (one row per
 # stable resource identity), so it is read in full and window-guarded in
@@ -213,7 +389,7 @@ def parse_window(
 
 @dataclass(frozen=True)
 class FieldDiff:
-    """One differing field: the rollup value, the canonical value, and delta."""
+    """One differing metric: the rollup value, the canonical value, and delta."""
 
     rollup: Any
     canonical: Any
@@ -289,15 +465,16 @@ def _as_utc_day(value: datetime) -> date:
     return value.astimezone(timezone.utc).date()
 
 
-def compare_usage_rollup_rows(
+def compare_afk_dashboard_daily_rows(
     rows: Sequence[Mapping[str, Any]],
 ) -> list[Mismatch]:
     """Map SQL mismatch rows (already filtered) into grouped mismatch records.
 
-    Every row returned by :data:`USAGE_ROLLUP_MISMATCH_SQL` is a genuine
-    disagreement, keyed per ``(client_id, project_id, day)``.  The
-    ``client_id`` becomes the report's ``provider`` and ``project_id`` the
-    ``repository`` so both comparison sources share one grouping vocabulary.
+    Every row returned by :data:`AFK_DASHBOARD_DAILY_MISMATCH_SQL` is a genuine
+    disagreement, keyed per ``(day, provider, repository)``.  Each of the
+    fourteen additive :data:`AFK_DASHBOARD_METRIC_COLUMNS` is compared, so the
+    breakdown names every metric — the differing ones carry a non-zero delta,
+    the matching ones a zero delta.
     """
     mismatches: list[Mismatch] = []
     for row in rows:
@@ -307,26 +484,30 @@ def compare_usage_rollup_rows(
                 canonical=_get(row, f"canonical_{name}"),
                 delta=_delta(_get(row, f"canonical_{name}"), _get(row, f"rollup_{name}")),
             )
-            for name in ROLLUP_FIELDS
+            for name in AFK_DASHBOARD_METRIC_COLUMNS
         }
-        client_id = _get(row, "client_id")
+        mismatched_metrics = [
+            name
+            for name, diff in fields.items()
+            if diff.rollup != diff.canonical
+        ]
         mismatches.append(
             Mismatch(
-                source=SOURCE_USAGE_ROLLUP,
+                source=SOURCE_AFK_DASHBOARD_DAILY,
                 day=_get(row, "day"),
-                provider=str(client_id) if client_id is not None else None,
-                repository=_get(row, "project_id"),
+                provider=_get(row, "provider"),
+                repository=_get(row, "repository"),
                 resource_type=None,
                 resource_number=None,
                 fields=fields,
-                context={
-                    "client_id": str(client_id) if client_id is not None else None,
-                    "project_id": _get(row, "project_id"),
-                    "event_count": _get(row, "canonical_event_count"),
-                },
+                context={"mismatched_metrics": mismatched_metrics},
             )
         )
     return mismatches
+
+
+# Backward-compatible alias for the historical helper name.
+compare_usage_rollup_rows = compare_afk_dashboard_daily_rows
 
 
 def canonical_latest_by_resource(
@@ -540,15 +721,19 @@ async def _get_pool() -> asyncpg.Pool:
     )
 
 
-async def _fetch_usage_mismatches(
+async def _fetch_afk_dashboard_mismatches(
     conn: asyncpg.Connection,
     window: VerificationWindow,
 ) -> list[Mismatch]:
-    """Run the usage-rollup mismatch query for the window."""
+    """Run the ``afk_dashboard_daily`` mismatch query for the window."""
     rows = await conn.fetch(
-        USAGE_ROLLUP_MISMATCH_SQL, window.from_date, window.to_date,
+        AFK_DASHBOARD_DAILY_MISMATCH_SQL, window.from_date, window.to_date,
     )
-    return compare_usage_rollup_rows(rows)
+    return compare_afk_dashboard_daily_rows(rows)
+
+
+# Backward-compatible alias for the historical fetch helper name.
+_fetch_usage_mismatches = _fetch_afk_dashboard_mismatches
 
 
 async def _fetch_reporting_mismatches(
@@ -568,7 +753,7 @@ async def _run_verification(
     window: VerificationWindow,
 ) -> list[Mismatch]:
     """Run every rollup-parity comparison and return grouped mismatches."""
-    mismatches = await _fetch_usage_mismatches(conn, window)
+    mismatches = await _fetch_afk_dashboard_mismatches(conn, window)
     mismatches.extend(await _fetch_reporting_mismatches(conn, window))
     return mismatches
 
@@ -584,8 +769,7 @@ def group_mismatches(
     """Group mismatches by ``(day, provider, repository)`` in stable order.
 
     Both comparison sources share the ``(day, provider, repository)`` grouping
-    vocabulary (usage rows map ``client_id`` → provider and ``project_id`` →
-    repository), so one report groups every disagreement the same way.  Groups
+    vocabulary, so one report groups every disagreement the same way.  Groups
     are ordered by the tuple with deterministic tie-breakers, preserving
     insertion order for equal keys.
     """
@@ -612,7 +796,11 @@ def _exit_code(mismatches: Sequence[Mismatch]) -> int:
 
 
 def _format_mismatch(mismatch: Mismatch) -> str:
-    """Render one mismatch as a single operator-readable line."""
+    """Render one mismatch as a single operator-readable line.
+
+    The metric breakdown names every ``afk_dashboard_daily`` metric; differing
+    metrics are listed first so the affected metric names are front and centre.
+    """
     parts = [f"{mismatch.source} day={mismatch.day} provider={mismatch.provider}"]
     if mismatch.repository is not None:
         parts.append(f"repository={mismatch.repository}")
@@ -622,9 +810,13 @@ def _format_mismatch(mismatch: Mismatch) -> str:
         parts.append(f"number={mismatch.resource_number}")
     head = " ".join(parts)
 
+    def _order(item: tuple[str, FieldDiff]) -> int:
+        name, diff = item
+        return 0 if diff.rollup != diff.canonical else 1
+
     detail = ", ".join(
         f"{name}: rollup={diff.rollup!r} canonical={diff.canonical!r}"
-        for name, diff in mismatch.fields.items()
+        for name, diff in sorted(mismatch.fields.items(), key=_order)
     )
     reason = mismatch.context.get("reason")
     reason_note = f" [{reason}]" if reason else ""
@@ -656,7 +848,8 @@ def _emit_report(
         return
 
     logger.info(
-        "Rollup parity verification window %s..%s (%d day(s)): %d mismatch(es).",
+        "AFK dashboard daily parity verification window %s..%s (%d day(s)): "
+        "%d mismatch(es).",
         window.from_date,
         window.to_date,
         window.day_count,
@@ -681,8 +874,8 @@ def _emit_report(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read-only rollup-parity verification against canonical "
-        "usage_events / reporting_deliveries data.",
+        description="Read-only afk_dashboard_daily parity verification against "
+        "the canonical AFK/usage/engineering source tables.",
     )
     parser.add_argument(
         "--window-days",

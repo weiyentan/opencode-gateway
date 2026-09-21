@@ -4,26 +4,26 @@ Covers the task contract acceptance criteria:
 
 1. A CLI entry point (``scripts/refresh_afk_dashboard_daily.py``) invocable
    by a Kubernetes CronJob.
-2. It recomputes client_project_rollup buckets for a configurable window
-   (default: today and yesterday) reusing the recomputation logic in
-   ``scripts/backfill_client_project_rollup.py``.
-3. It acquires the ``AGGREGATE_LOCK_CLASS`` (47_006) advisory lock before
-   recomputing and exits cleanly (0) on lock contention.
-4. It connects via application settings (the same ``_get_pool`` pattern).
-5. It logs progress and results.
+2. It recomputes ``afk_dashboard_daily`` buckets for a configurable window
+   (default: today and yesterday) by delegating to the shared recomputation
+   engine in ``app.core.afk_dashboard_daily`` (issue #715).
+3. It acquires the ``AGGREGATE_LOCK_CLASS`` (47_006) session-level advisory
+   lock before recomputing and exits cleanly (0) on lock contention.
+4. It discovers active buckets, takes the engine's per-bucket advisory lock,
+   and recomputes each bucket in its own transaction.
+5. It connects via application settings (the same ``_get_pool`` pattern) and
+   logs progress and results.
 
-Tests use SQL-content assertions plus an in-memory recording connection so
+Tests use SQL-content assertions plus in-memory recording connections so
 they exercise the real entry point without a database.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
-
-from app.core.reconciliation import ROLLUP_FIELDS
-from scripts.backfill_client_project_rollup import EVENT_AGGREGATE_SQL
 
 import scripts.refresh_afk_dashboard_daily as refresh
 
@@ -93,70 +93,50 @@ class TestArgParsing:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AC 2 + 3: Recompute SQL — windowed, reuses the engine, corrects rollup
+#  AC 2 + 4: Bucket discovery SQL + engine delegation
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestRecomputeSql:
-    """The daily recompute is the engine's additive grouped SUM, restricted
-    to the configured day window, upserting only disagreeing groups."""
+class TestDiscoverySql:
+    """Discovery spans every canonical source table and bounds the scan to
+    the configured day window."""
 
     def test_uses_aggregate_lock_class(self):
         assert refresh.AGGREGATE_LOCK_CLASS == 47_006
 
-    def test_sql_reuses_engine_additive_sum(self):
-        """The windowed CTE keeps the engine's additive SUM lines verbatim."""
-        engine_sum_lines = [
-            line.strip()
-            for line in EVENT_AGGREGATE_SQL.splitlines()
-            if "SUM(ue." in line
-        ]
-        assert len(engine_sum_lines) == len(ROLLUP_FIELDS)
-        for line in engine_sum_lines:
-            assert line in refresh.DAILY_BACKFILL_SQL
+    def test_uses_fixed_daily_refresh_lock_key(self):
+        assert refresh.DAILY_REFRESH_LOCK_KEY == 0
 
-    def test_sql_windows_by_day_inside_cte(self):
-        """The day-window predicate is pushed INTO the grouped CTE so the
-        aggregate scans only the configured window, not all history."""
-        sql = refresh.DAILY_BACKFILL_SQL
-        cte = sql.split(")\nINSERT INTO")[0]
-        assert "WITH grouped AS (" in cte
-        assert (
-            "(ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2"
-            in cte
-        )
-        # The outer SELECT no longer carries the day filter.
-        assert "g.day >= $1" not in sql
-        assert "g.day <= $2" not in sql
+    def test_engine_lock_class_is_exposed(self):
+        assert refresh.AFK_DASHBOARD_LOCK_CLASS == 47_007
 
-    def test_sql_upserts_and_corrects_toward_events(self):
-        sql = refresh.DAILY_BACKFILL_SQL
-        assert "INSERT INTO client_project_rollup" in sql
-        assert "ON CONFLICT (client_id, project_id, day)" in sql
-        for field in ROLLUP_FIELDS:
-            assert f"{field} = EXCLUDED.{field}" in sql
+    def test_discovers_distinct_buckets(self):
+        sql = refresh.DISCOVERY_SQL
+        assert "SELECT DISTINCT ON (day, provider, repository)" in sql
+        assert "ORDER BY day, provider, repository" in sql
 
-    def test_sql_only_touches_disagreeing_groups(self):
-        sql = refresh.DAILY_BACKFILL_SQL
-        assert "LEFT JOIN client_project_rollup r" in sql
-        assert "r.client_id IS NULL" in sql
-        for field in ROLLUP_FIELDS:
-            assert f"r.{field} != g.{field}" in sql
+    def test_windows_every_canonical_source(self):
+        sql = refresh.DISCOVERY_SQL
+        for table in (
+            "afk_runs",
+            "engineering_events",
+            "execution_bindings",
+            "afk_run_sessions",
+            "usage_events",
+        ):
+            assert table in sql
+        # Each union branch constrains to the $1..$2 day window.
+        assert sql.count("BETWEEN $1 AND $2") == 5
 
-    @pytest.mark.asyncio
-    async def test_run_windowed_recompute_binds_window_and_parses_count(self):
-        from unittest.mock import AsyncMock
+    def test_skips_rows_without_repository_identity(self):
+        sql = refresh.DISCOVERY_SQL
+        assert "r.repository IS NOT NULL" in sql
+        assert "e.repository IS NOT NULL" in sql
+        assert "b.repository_url IS NOT NULL" in sql
+        assert "b.repository_url AS repository" in sql
 
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="INSERT 0 4")
-        result = await refresh._run_windowed_recompute(
-            conn, date(2026, 3, 14), date(2026, 3, 15)
-        )
-        assert result == 4
-        sql, start, end = conn.execute.call_args[0]
-        assert "BETWEEN $1 AND $2" in sql
-        assert start == date(2026, 3, 14)
-        assert end == date(2026, 3, 15)
+    def test_change_requests_scoped_to_change_request_events(self):
+        assert "e.entity_type = 'change_request'" in refresh.DISCOVERY_SQL
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,8 +147,6 @@ class TestRecomputeSql:
 class TestRefreshLock:
     @pytest.mark.asyncio
     async def test_try_acquire_uses_aggregate_class_and_fixed_key(self):
-        from unittest.mock import AsyncMock
-
         conn = AsyncMock()
         conn.fetchval = AsyncMock(return_value=True)
         assert await refresh._try_acquire_refresh_lock(conn) is True
@@ -179,36 +157,53 @@ class TestRefreshLock:
 
     @pytest.mark.asyncio
     async def test_try_acquire_returns_false_when_contended(self):
-        from unittest.mock import AsyncMock
-
         conn = AsyncMock()
         conn.fetchval = AsyncMock(return_value=False)
         assert await refresh._try_acquire_refresh_lock(conn) is False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AC 3 + 4 + 5: main() — lock, recompute, release, exit codes
+#  Recording connection + pool doubles
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class _RecordingConn:
-    """Records fetchval/execute calls; returns scripted results."""
+    """Records fetch/fetchval/execute calls; returns scripted results."""
 
-    def __init__(self, *, lock_available: bool, execute_result: str = "INSERT 0 3"):
+    def __init__(self, *, lock_available: bool, buckets: list[dict] | None = None):
         self.lock_available = lock_available
-        self.execute_result = execute_result
+        self.buckets = list(buckets or [])
         self.fetchvals: list[tuple[str, tuple]] = []
+        self.fetches: list[tuple[str, tuple]] = []
         self.executes: list[tuple[str, tuple]] = []
+        self.transactions = 0
 
     async def fetchval(self, sql, *args):
         self.fetchvals.append((sql, args))
         return self.lock_available
 
+    async def fetch(self, sql, *args):
+        self.fetches.append((sql, args))
+        return self.buckets
+
     async def execute(self, sql, *args):
         self.executes.append((sql, args))
-        if "pg_advisory_unlock" in sql:
-            return "SELECT 1"
-        return self.execute_result
+        return "SELECT 1"
+
+    def transaction(self):
+        return _Transaction(self)
+
+
+class _Transaction:
+    def __init__(self, conn: _RecordingConn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        self._conn.transactions += 1
+        return self._conn
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 def _fake_pool(conn: _RecordingConn):
@@ -229,6 +224,76 @@ def _fake_pool(conn: _RecordingConn):
     return _Pool()
 
 
+def _patch_engine(monkeypatch, calls: list[tuple]):
+    """Replace the engine calls with recorders so orchestration is observable."""
+
+    async def fake_acquire(conn, day, provider, repository):
+        calls.append(("lock", day, provider, repository))
+
+    async def fake_recompute(conn, day, provider, repository):
+        calls.append(("recompute", day, provider, repository))
+        return {}
+
+    monkeypatch.setattr(refresh, "acquire_bucket_lock", fake_acquire)
+    monkeypatch.setattr(refresh, "recompute_bucket", fake_recompute)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AC 2 + 4: _run_windowed_recompute discovers and recomputes each bucket
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRunWindowedRecompute:
+    @pytest.mark.asyncio
+    async def test_discovers_window_and_recomputes_each_bucket_in_own_txn(
+        self, monkeypatch
+    ):
+        buckets = [
+            {"day": date(2026, 3, 14), "provider": "gitlab", "repository": "a"},
+            {"day": date(2026, 3, 15), "provider": "gitlab", "repository": "b"},
+        ]
+        conn = _RecordingConn(lock_available=True, buckets=buckets)
+        calls: list[tuple] = []
+        _patch_engine(monkeypatch, calls)
+
+        result = await refresh._run_windowed_recompute(
+            conn, date(2026, 3, 14), date(2026, 3, 15)
+        )
+
+        assert result == 2
+        # Discovery bound to the window.
+        assert conn.fetches == [
+            (refresh.DISCOVERY_SQL, (date(2026, 3, 14), date(2026, 3, 15)))
+        ]
+        # One transaction, lock, and recompute per discovered bucket.
+        assert conn.transactions == 2
+        assert calls == [
+            ("lock", date(2026, 3, 14), "gitlab", "a"),
+            ("recompute", date(2026, 3, 14), "gitlab", "a"),
+            ("lock", date(2026, 3, 15), "gitlab", "b"),
+            ("recompute", date(2026, 3, 15), "gitlab", "b"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_window_recomputes_nothing(self, monkeypatch):
+        conn = _RecordingConn(lock_available=True, buckets=[])
+        calls: list[tuple] = []
+        _patch_engine(monkeypatch, calls)
+
+        result = await refresh._run_windowed_recompute(
+            conn, date(2026, 3, 14), date(2026, 3, 15)
+        )
+
+        assert result == 0
+        assert conn.transactions == 0
+        assert calls == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AC 3 + 5: main() — lock, recompute, release, exit codes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 class TestMain:
     @pytest.mark.asyncio
     async def test_lock_contention_exits_zero_without_recomputing(
@@ -237,6 +302,8 @@ class TestMain:
         import logging
 
         conn = _RecordingConn(lock_available=False)
+        calls: list[tuple] = []
+        _patch_engine(monkeypatch, calls)
 
         async def fake_get_pool():
             return _fake_pool(conn)
@@ -247,9 +314,9 @@ class TestMain:
             rc = await refresh.main([])
 
         assert rc == 0
-        assert not any(
-            "INSERT INTO client_project_rollup" in sql for sql, _ in conn.executes
-        )
+        # No discovery, no recompute, lock never released.
+        assert conn.fetches == []
+        assert calls == []
         assert not any("pg_advisory_unlock" in sql for sql, _ in conn.executes)
         assert "lock" in caplog.text.lower()
 
@@ -257,7 +324,13 @@ class TestMain:
     async def test_successful_run_recomputes_window_and_releases_lock(
         self, monkeypatch
     ):
-        conn = _RecordingConn(lock_available=True, execute_result="INSERT 0 7")
+        buckets = [
+            {"day": date(2026, 3, 14), "provider": "gitlab", "repository": "a"},
+            {"day": date(2026, 3, 15), "provider": "gitlab", "repository": "b"},
+        ]
+        conn = _RecordingConn(lock_available=True, buckets=buckets)
+        calls: list[tuple] = []
+        _patch_engine(monkeypatch, calls)
 
         async def fake_get_pool():
             return _fake_pool(conn)
@@ -267,38 +340,35 @@ class TestMain:
         rc = await refresh.main(["--days-back", "2", "--as-of", "2026-03-15"])
 
         assert rc == 0
-        # Advisory lock attempted via AGGREGATE_LOCK_CLASS with the fixed key.
+        # Session advisory lock attempted via AGGREGATE_LOCK_CLASS + fixed key.
         assert len(conn.fetchvals) == 1
-        assert conn.fetchvals[0][1] == (refresh.AGGREGATE_LOCK_CLASS, refresh.DAILY_REFRESH_LOCK_KEY)
+        assert conn.fetchvals[0][1] == (
+            refresh.AGGREGATE_LOCK_CLASS,
+            refresh.DAILY_REFRESH_LOCK_KEY,
+        )
 
-        # Exactly one recompute, bound to the resolved window.
-        recompute = [
-            (sql, params)
-            for sql, params in conn.executes
-            if "INSERT INTO client_project_rollup" in sql
-        ]
-        assert len(recompute) == 1
-        assert recompute[0][1] == (date(2026, 3, 14), date(2026, 3, 15))
+        # Discovery bound to the resolved window; both buckets recomputed.
+        assert conn.fetches[0][1] == (date(2026, 3, 14), date(2026, 3, 15))
+        assert [c[0] for c in calls] == ["lock", "recompute", "lock", "recompute"]
 
-        # Lock released on the way out.
+        # Session lock released on the way out.
         assert any("pg_advisory_unlock" in sql for sql, _ in conn.executes)
 
     @pytest.mark.asyncio
     async def test_lock_released_even_when_recompute_fails(self, monkeypatch):
-        conn = _RecordingConn(lock_available=True)
-
-        async def boom(sql, *args):
-            conn.executes.append((sql, args))
-            if "pg_advisory_unlock" in sql:
-                return "SELECT 1"
-            raise RuntimeError("db exploded")
-
-        conn.execute = boom  # type: ignore[assignment]
+        conn = _RecordingConn(lock_available=True, buckets=[])
 
         async def fake_get_pool():
             return _fake_pool(conn)
 
         monkeypatch.setattr(refresh, "_get_pool", fake_get_pool)
+
+        async def boom(conn_arg, day, provider, repository):
+            raise RuntimeError("db exploded")
+
+        # Fails on discovery (before any recompute) to exercise the finally.
+        conn.fetch = AsyncMock(side_effect=RuntimeError("db exploded"))  # type: ignore[assignment]
+        monkeypatch.setattr(refresh, "recompute_bucket", boom)
 
         with pytest.raises(RuntimeError):
             await refresh.main([])

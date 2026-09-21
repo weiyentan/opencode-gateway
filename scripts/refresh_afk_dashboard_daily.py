@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""Daily refresh of recent ``client_project_rollup`` buckets (issue #717).
+"""Daily refresh of recent ``afk_dashboard_daily`` buckets (issue #717).
 
 Kubernetes CronJob entry point for the AFK dashboard daily refresh.  It
-recomputes the Client Project Rollup (migration 0023, ADR 0015) for a small,
-configurable window of recent UTC days — by default **today and yesterday** —
-by delegating to the recomputation engine in
-``scripts/backfill_client_project_rollup.py``: the same grouped additive
-``SUM(usage_events)`` over the five :data:`~app.core.reconciliation.ROLLUP_FIELDS`
-(input, output, cache read, cache write tokens plus estimated cost) and the
-same ``INSERT ... ON CONFLICT DO UPDATE`` correction toward the event sums.
+recomputes the pre-aggregated AFK dashboard rollup (``afk_dashboard_daily``,
+migration 0046) for a small, configurable window of recent UTC days — by
+default **today and yesterday** — by delegating the per-bucket metric
+computation to the shared recomputation engine in
+``app.core.afk_dashboard_daily`` (issue #715): it discovers every
+``(day, provider, repository)`` bucket that carries activity in the window,
+then calls :func:`~app.core.afk_dashboard_daily.recompute_bucket` for each.
 
-Unlike the one-shot backfill, this refresh is bounded to the configured day
-window and never touches rows outside it.  Only ``(client_id, project_id,
-day)`` groups that genuinely disagree with ``SUM(usage_events)`` are written.
+The engine derives every additive metric from the canonical source tables,
+so the rollup stays a rebuildable projection of source facts.  Unlike the
+one-shot backfill, this refresh is bounded to the configured day window and
+never touches buckets outside it.
 
-Concurrency is prevented with a database advisory lock in the
-:data:`~app.core.reporting_aggregates.AGGREGATE_LOCK_CLASS` (``47_006``)
-namespace, acquired with ``pg_try_advisory_lock``.  If another refresh already
-holds the lock, this process logs and exits **0** immediately — a CronJob
-overlap is a normal, non-error condition.
+Each bucket is recomputed in its own transaction: the script takes the
+engine's per-bucket advisory lock
+(:func:`~app.core.afk_dashboard_daily.acquire_bucket_lock`, a
+transaction-scoped ``pg_advisory_xact_lock`` in the
+:data:`~app.core.afk_dashboard_daily.AFK_DASHBOARD_LOCK_CLASS` namespace)
+before calling :func:`~app.core.afk_dashboard_daily.recompute_bucket`, so
+concurrent recomputations of the *same* bucket serialise while different
+buckets never contend.
+
+Concurrency between refresh runs is prevented with a **session-level**
+database advisory lock in the :data:`~app.core.reporting_aggregates.AGGREGATE_LOCK_CLASS`
+(``47_006``) namespace, acquired with ``pg_try_advisory_lock``.  If another
+refresh already holds the lock, this process logs and exits **0** immediately
+— a CronJob overlap is a normal, non-error condition.
 
 Usage:
     python scripts/refresh_afk_dashboard_daily.py [--days-back N] [--as-of YYYY-MM-DD]
@@ -45,12 +55,16 @@ import asyncpg
 # Allow running from any location by resolving the repo root relative to this script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.core.afk_dashboard_daily import (  # noqa: E402
+    AFK_DASHBOARD_LOCK_CLASS,
+    acquire_bucket_lock,
+    recompute_bucket,
+)
 from app.core.reporting_aggregates import (  # noqa: E402
     AGGREGATE_LOCK_CLASS,
 )
 from scripts.backfill_client_project_rollup import (  # noqa: E402
     _get_pool,
-    _parse_row_count,
 )
 
 logger = logging.getLogger("refresh_afk_dashboard_daily")
@@ -71,65 +85,69 @@ per-resource keys are derived from a resource hash and are essentially never
 # ---------------------------------------------------------------------------
 # SQL
 #
-# The recompute source is the engine's grouped additive SUM over canonical
-# usage_events — the same SELECT shape as ``EVENT_AGGREGATE_SQL`` in the
-# backfill script — restated locally as ``WINDOWED_EVENT_AGGREGATE_SQL`` with
-# the day-window predicate pushed INTO the CTE's WHERE clause.  The shared
-# backfill constant intentionally scans all history, so it cannot be reused
-# verbatim here: the outer-SELECT-only filter left the grouped CTE doing an
-# O(all-history) aggregate on every run.  Filtering ``usage_events`` inside
-# the CTE bounds the recomputation cost to the configured window; the window
-# parameters ($1, $2) are consumed by the CTE's WHERE clause.  The LEFT JOIN
-# + mismatch predicates restrict the upsert to genuinely disagreeing groups,
-# exactly as the engine does.
+# Bucket discovery.  The canonical source tables each bucket their own
+# event-time column by UTC calendar day; the five ``UNION ALL`` branches
+# collect every ``(day, provider, repository)`` triple that has activity in
+# the configured window ($1 start, $2 end).  ``DISTINCT ON`` collapses the
+# per-source rows to the distinct triples the engine recomputes.  The actual
+# metric computation is the engine's responsibility — this query only decides
+# *which* buckets are worth recomputing.
+#
+# Buckets are keyed by the same repository identity the engine uses:
+# ``afk_runs.repository``, ``engineering_events.repository`` and
+# ``execution_bindings.repository_url`` (aliased to ``repository``).  Rows
+# without a repository identity cannot be keyed and are skipped.
 # ---------------------------------------------------------------------------
 
-WINDOWED_EVENT_AGGREGATE_SQL = """
-    SELECT ue.client_id,
-           ue.project_id,
-           (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
-           COALESCE(SUM(ue.input_tokens), 0)::int AS input_tokens,
-           COALESCE(SUM(ue.output_tokens), 0)::int AS output_tokens,
-           COALESCE(SUM(ue.cache_read_tokens), 0)::int AS cache_read_tokens,
-           COALESCE(SUM(ue.cache_write_tokens), 0)::int AS cache_write_tokens,
-           COALESCE(SUM(ue.estimated_cost_usd), 0) AS estimated_cost_usd
-    FROM usage_events ue
-    WHERE ue.project_id IS NOT NULL
-      AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
-    GROUP BY ue.client_id, ue.project_id,
-             (ue.reported_at AT TIME ZONE 'UTC')::date
-"""
-
-DAILY_BACKFILL_SQL = f"""WITH grouped AS (
-{WINDOWED_EVENT_AGGREGATE_SQL}
-)
-INSERT INTO client_project_rollup
-    (client_id, project_id, day,
-     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-     estimated_cost_usd)
-SELECT g.client_id, g.project_id, g.day,
-       g.input_tokens, g.output_tokens, g.cache_read_tokens,
-       g.cache_write_tokens, g.estimated_cost_usd
-FROM grouped g
-LEFT JOIN client_project_rollup r
-  ON r.client_id = g.client_id
- AND r.project_id = g.project_id
- AND r.day = g.day
-WHERE (
-        r.client_id IS NULL
-     OR r.input_tokens != g.input_tokens
-     OR r.output_tokens != g.output_tokens
-     OR r.cache_read_tokens != g.cache_read_tokens
-     OR r.cache_write_tokens != g.cache_write_tokens
-     OR r.estimated_cost_usd != g.estimated_cost_usd
-   )
-ON CONFLICT (client_id, project_id, day)
-DO UPDATE SET
-    input_tokens = EXCLUDED.input_tokens,
-    output_tokens = EXCLUDED.output_tokens,
-    cache_read_tokens = EXCLUDED.cache_read_tokens,
-    cache_write_tokens = EXCLUDED.cache_write_tokens,
-    estimated_cost_usd = EXCLUDED.estimated_cost_usd
+DISCOVERY_SQL = """
+    SELECT DISTINCT ON (day, provider, repository)
+           day, provider, repository
+    FROM (
+        -- Runs
+        SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date AS day,
+               r.provider,
+               r.repository
+        FROM afk_runs r
+        WHERE r.repository IS NOT NULL
+          AND (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+        UNION ALL
+        -- Engineering events (change requests)
+        SELECT (e.occurred_at AT TIME ZONE 'UTC')::date AS day,
+               e.provider,
+               e.repository
+        FROM engineering_events e
+        WHERE e.entity_type = 'change_request'
+          AND e.repository IS NOT NULL
+          AND (e.occurred_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+        UNION ALL
+        -- Execution bindings
+        SELECT (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date AS day,
+               b.provider,
+               b.repository_url AS repository
+        FROM execution_bindings b
+        WHERE b.repository_url IS NOT NULL
+          AND (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+        UNION ALL
+        -- Sessions
+        SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date AS day,
+               r.provider,
+               r.repository
+        FROM afk_run_sessions ars
+        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
+        WHERE r.repository IS NOT NULL
+          AND (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+        UNION ALL
+        -- Usage events (via unambiguous sessions)
+        SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
+               r.provider,
+               r.repository
+        FROM usage_events ue
+        JOIN afk_run_sessions ars ON ars.session_id = ue.session_id
+        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
+        WHERE r.repository IS NOT NULL
+          AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+    ) all_buckets
+    ORDER BY day, provider, repository
 """
 
 
@@ -150,8 +168,8 @@ def _parse_iso_date(value: str) -> date:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Recompute recent client_project_rollup buckets from "
-        "usage_events (default: today and yesterday, UTC).",
+        description="Recompute recent afk_dashboard_daily buckets from the "
+        "canonical source tables (default: today and yesterday, UTC).",
     )
     parser.add_argument(
         "--days-back",
@@ -229,12 +247,36 @@ async def _run_windowed_recompute(
     start_day: date,
     end_day: date,
 ) -> int:
-    """Recompute disagreeing rollup buckets inside the window.
+    """Recompute every active ``afk_dashboard_daily`` bucket in the window.
 
-    Returns the number of rollup rows upserted.
+    Discovers the distinct ``(day, provider, repository)`` triples with
+    activity in ``[start_day, end_day]`` and recomputes each one through the
+    shared engine.  Every bucket is recomputed in its own transaction, under
+    the engine's transaction-scoped per-bucket advisory lock, so concurrent
+    refreshes of the same bucket serialise.
+
+    Returns the number of buckets recomputed.
     """
-    result = await conn.execute(DAILY_BACKFILL_SQL, start_day, end_day)
-    return _parse_row_count(result)
+    buckets = await conn.fetch(DISCOVERY_SQL, start_day, end_day)
+    logger.debug(
+        "Discovered %d bucket(s) in %s .. %s (per-bucket lock class %s).",
+        len(buckets),
+        start_day,
+        end_day,
+        AFK_DASHBOARD_LOCK_CLASS,
+    )
+
+    recomputed = 0
+    for bucket in buckets:
+        day = bucket["day"]
+        provider = bucket["provider"]
+        repository = bucket["repository"]
+        async with conn.transaction():
+            await acquire_bucket_lock(conn, day, provider, repository)
+            await recompute_bucket(conn, day, provider, repository)
+        recomputed += 1
+
+    return recomputed
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +295,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     start_day, end_day = _resolve_window(args.days, args.as_of)
     logger.info(
-        "Daily rollup refresh window: %s .. %s (%d day(s)).",
+        "AFK dashboard daily refresh window: %s .. %s (%d day(s)).",
         start_day,
         end_day,
         args.days,
@@ -265,18 +307,21 @@ async def main(argv: list[str] | None = None) -> int:
         async with pool.acquire() as conn:
             if not await _try_acquire_refresh_lock(conn):
                 logger.warning(
-                    "Another rollup refresh holds the aggregate lock "
-                    "(class=%s key=%s); exiting cleanly.",
+                    "Another AFK dashboard daily refresh holds the aggregate "
+                    "lock (class=%s key=%s); exiting cleanly.",
                     AGGREGATE_LOCK_CLASS,
                     DAILY_REFRESH_LOCK_KEY,
                 )
                 return 0
 
             try:
-                updated = await _run_windowed_recompute(conn, start_day, end_day)
+                recomputed = await _run_windowed_recompute(
+                    conn, start_day, end_day
+                )
                 logger.info(
-                    "Recomputed %d rollup row(s) for window %s .. %s.",
-                    updated,
+                    "Recomputed %d afk_dashboard_daily bucket(s) for window "
+                    "%s .. %s.",
+                    recomputed,
                     start_day,
                     end_day,
                 )

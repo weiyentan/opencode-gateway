@@ -1,30 +1,30 @@
-"""Add the afk_dashboard_daily table (issue #720).
+"""Add the afk_dashboard_daily rollup table (issue #714).
 
 Creates: afk_dashboard_daily.
 
-The pre-aggregated daily AFK-dashboard rollup (issue #714) read by the
-AFK Dashboard summary endpoint (issue #719,
-``app/api/afk_dashboard_summary.py``), keyed by
-``(provider, repository, day)`` — the same triple the summary query
-groups by.  Each row stores additive per-day totals: run / change-request
-/ execution / session counts, the four token categories (input, output,
-cache read, cache write), and the estimated cost.  ``derived_at`` is the
-nullable freshness marker of the rollup recompute that produced the row
-(``MAX(derived_at)`` across returned buckets becomes the summary's
-``derived_at``).
+A pre-aggregated operational read-model for the AFK dashboard, keyed by
+``(day, provider, repository)``.  Follows the ``client_project_rollup``
+precedent (migration 0023, ADR 0014/0015): a composite primary key on the
+bucket identity, additive-only metric columns, and a reversible downgrade.
 
-Metric columns are NOT NULL with a zero server default so the rollup
-writer can omit zero counters, mirroring the additive-counter convention
-of the ``client_project_rollup`` table (migration 0023).  The summary
-endpoint still ``COALESCE``s every ``SUM`` defensively.
+Each row stores only additive AFK metrics for one UTC day and one
+provider/repository bucket — run counts, change-request counts, execution
+counts, session count, token totals, and estimated cost.  No non-additive
+(distinct-count, ratio, or percentile) values are stored: those cannot be
+summed across buckets and remain queries over the canonical source tables.
 
-The composite primary key serves the per-(provider, repository, day)
-point lookups and UPSERTs of rollup maintenance; the ``day`` index serves
-the summary's date-range filter (``day >= $1 AND day <= $2``), which
-cannot use the primary key because ``day`` is its last column.
+The composite primary key on ``(day, provider, repository)`` serves the
+date-range scans of the unfiltered summary, and the
+``(provider, repository, day)`` index serves provider/repository-scoped
+scans.  Every additive column is ``NOT NULL DEFAULT 0`` so a freshly
+recomputed bucket never needs to distinguish "missing" from zero.
+
+Runtime access is raw asyncpg (the recomputation engine is the only
+writer); the SQLAlchemy model exists for Alembic autogenerate only.
 
 Revision ID: 0046
 Revises:     0045
+Create Date: 2026-09-21
 """
 
 from typing import Sequence, Union
@@ -40,87 +40,89 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Create the additive per-(provider, repository, day) dashboard rollup."""
+    """Create the additive AFK dashboard daily rollup table."""
     op.create_table(
         "afk_dashboard_daily",
-        sa.Column("provider", sa.Text(), primary_key=True, nullable=False),
-        sa.Column("repository", sa.Text(), primary_key=True, nullable=False),
+        # ── Bucket identity — composite primary key ──
         sa.Column("day", sa.Date(), primary_key=True, nullable=False),
+        sa.Column("provider", sa.String(), primary_key=True, nullable=False),
+        sa.Column("repository", sa.String(), primary_key=True, nullable=False),
+        # ── Additive AFK metrics ──
         sa.Column(
             "runs_started",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "change_requests_opened",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "change_requests_merged",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "change_requests_closed",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "execution_count",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "successful_execution_count",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "failed_execution_count",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "cancelled_execution_count",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "session_count",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "input_tokens",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "output_tokens",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "cache_read_tokens",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
         sa.Column(
             "cache_write_tokens",
-            sa.BigInteger(),
+            sa.Integer(),
             nullable=False,
             server_default=sa.text("0"),
         ),
@@ -130,21 +132,34 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("0"),
         ),
-        sa.Column("derived_at", sa.DateTime(timezone=True), nullable=True),
+        # ── Freshness / versioning metadata ──
+        sa.Column(
+            "derived_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
+        sa.Column("rollup_version", sa.String(), nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
     )
-    # The summary endpoint's date-range filter (``day >= $1 AND day <= $2``)
-    # cannot use the composite primary key — ``day`` is its last column.
+    # Provider/repository-scoped day-range scans of the summary read path;
+    # the composite primary key already covers unfiltered date-range scans.
     op.create_index(
-        "ix_afk_dashboard_daily_day",
+        "ix_afk_dashboard_daily_provider_repository_day",
         "afk_dashboard_daily",
-        ["day"],
+        ["provider", "repository", "day"],
     )
 
 
 def downgrade() -> None:
-    """Drop the afk_dashboard_daily table."""
+    """Drop the afk_dashboard_daily rollup table."""
     op.drop_index(
-        "ix_afk_dashboard_daily_day",
+        "ix_afk_dashboard_daily_provider_repository_day",
         table_name="afk_dashboard_daily",
     )
     op.drop_table("afk_dashboard_daily")
