@@ -128,48 +128,60 @@ except ImportError:  # pragma: no cover - engine #715 not merged on this branch.
 # ``(day, provider, repository)`` triple that carries canonical activity in
 # any of the five source tables, bucketed by that source's own event-time
 # column (never by ingest time) into UTC calendar days.  Rows without a
-# repository identity cannot be keyed into a bucket and are skipped.  It is
-# the SQL counterpart of the engine's per-category queries
+# repository identity cannot be keyed into a bucket and are skipped.  Like
+# the verification aggregate (``CANONICAL_AGGREGATE_SQL``), the two
+# session-derived branches (``afk_run_sessions`` and ``usage_events``) route
+# through an ``unambiguous`` CTE that excludes sessions mapped to more than
+# one AFK run, so an ambiguous session can never keep a stale bucket alive.
+# It is the SQL counterpart of the engine's per-category queries
 # (``app.core.afk_dashboard_daily``).
 # ---------------------------------------------------------------------------
 
 CANONICAL_BUCKETS_SQL = """
-        SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
-                   AS day,
-               r.provider AS provider,
-               r.repository AS repository
-        FROM afk_runs r
-        WHERE r.repository IS NOT NULL
-        UNION
-        SELECT (e.occurred_at AT TIME ZONE 'UTC')::date AS day,
-               e.provider AS provider,
-               e.repository AS repository
-        FROM engineering_events e
-        WHERE e.entity_type = 'change_request'
-          AND e.repository IS NOT NULL
-        UNION
-        SELECT (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date
-                   AS day,
-               b.provider AS provider,
-               b.repository_url AS repository
-        FROM execution_bindings b
-        WHERE b.repository_url IS NOT NULL
-        UNION
-        SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
-                   AS day,
-               r.provider AS provider,
-               r.repository AS repository
+    WITH unambiguous AS (
+        SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
         FROM afk_run_sessions ars
-        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
-        WHERE r.repository IS NOT NULL
-        UNION
-        SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
-               r.provider AS provider,
-               r.repository AS repository
-        FROM usage_events ue
-        JOIN afk_run_sessions ars ON ars.session_id = ue.session_id
-        JOIN afk_runs r ON r.afk_run_id = ars.afk_run_id
-        WHERE r.repository IS NOT NULL
+        WHERE ars.session_id IS NOT NULL
+        GROUP BY ars.session_id
+        HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+    )
+    SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
+               AS day,
+           r.provider AS provider,
+           r.repository AS repository
+    FROM afk_runs r
+    WHERE r.repository IS NOT NULL
+    UNION
+    SELECT (e.occurred_at AT TIME ZONE 'UTC')::date AS day,
+           e.provider AS provider,
+           e.repository AS repository
+    FROM engineering_events e
+    WHERE e.entity_type = 'change_request'
+      AND e.repository IS NOT NULL
+    UNION
+    SELECT (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date
+               AS day,
+           b.provider AS provider,
+           b.repository_url AS repository
+    FROM execution_bindings b
+    WHERE b.repository_url IS NOT NULL
+    UNION
+    SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
+               AS day,
+           r.provider AS provider,
+           r.repository AS repository
+    FROM afk_run_sessions ars
+    JOIN unambiguous u ON u.session_id = ars.session_id
+    JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
+    WHERE r.repository IS NOT NULL
+    UNION
+    SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
+           r.provider AS provider,
+           r.repository AS repository
+    FROM usage_events ue
+    JOIN unambiguous u ON u.session_id = ue.session_id
+    JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
+    WHERE r.repository IS NOT NULL
 """
 
 # The buckets the backfill recomputes: those with canonical activity in the
