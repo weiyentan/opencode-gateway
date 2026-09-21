@@ -147,6 +147,9 @@ def create_app(
         router as admin_resolve_source_identity_router,
     )
     from app.api.admin_afk_reconcile import router as admin_afk_reconcile_router
+    from app.api.afk_dashboard_summary import (
+        router as afk_dashboard_summary_router,
+    )
     from app.api.afk_executions import router as afk_executions_router
     from app.api.afk_outcomes import router as afk_outcomes_router
     from app.api.afk_runs import router as afk_runs_router
@@ -181,5 +184,11 @@ def create_app(
     # resource-oriented read surface at /api/v1/afk/runs — deliberately
     # separate from the execution-scoped router above.
     app.include_router(afk_runs_router, prefix="/api/v1/afk")
+    # AFK Dashboard summary API (issue #719): the daily/monthly rollup
+    # summary at /api/v1/afk/dashboard/summary — separate from the
+    # resource-oriented run surface above.
+    app.include_router(
+        afk_dashboard_summary_router, prefix="/api/v1/afk/dashboard"
+    )
 
     return app
