@@ -827,6 +827,12 @@ class AFKDashboardDaily(Base):
             "repository",
             "day",
         ),
+        # Date-range-only scans (migration 0047): the summary endpoint filters
+        # on ``day`` with no provider/repository predicate.
+        Index(
+            "ix_afk_dashboard_daily_day",
+            "day",
+        ),
     )
 
     day: Mapped[date] = mapped_column(Date, primary_key=True)

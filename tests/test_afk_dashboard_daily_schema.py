@@ -247,6 +247,52 @@ class TestMigration0046Downgrade:
         )
 
 
+class TestMigration0047DayIndex:
+    """Verify migration 0047 adds the day index for unfiltered date-range scans."""
+
+    def test_upgrade_creates_day_index(self):
+        """Migration 0047 upgrade should emit CREATE INDEX ix_afk_dashboard_daily_day."""
+        from alembic.command import upgrade
+        from alembic.config import Config
+
+        cfg = Config()
+        cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
+        cfg.set_main_option("sqlalchemy.url", "postgresql://none:none@localhost/none")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upgrade(cfg, "0046:0047", sql=True)
+        sql = buf.getvalue()
+        assert "CREATE INDEX ix_afk_dashboard_daily_day" in sql
+
+    def test_upgrade_does_not_create_table(self):
+        """Migration 0047 only adds an index — the table was created by 0046."""
+        from alembic.command import upgrade
+        from alembic.config import Config
+
+        cfg = Config()
+        cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
+        cfg.set_main_option("sqlalchemy.url", "postgresql://none:none@localhost/none")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upgrade(cfg, "0046:0047", sql=True)
+        sql = buf.getvalue()
+        assert "CREATE TABLE" not in sql
+
+    def test_downgrade_drops_day_index(self):
+        """Migration 0047 downgrade should drop the day index."""
+        from alembic.command import downgrade
+        from alembic.config import Config
+
+        cfg = Config()
+        cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
+        cfg.set_main_option("sqlalchemy.url", "postgresql://none:none@localhost/none")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            downgrade(cfg, "0047:0046", sql=True)
+        sql = buf.getvalue()
+        assert "DROP INDEX ix_afk_dashboard_daily_day" in sql
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ORM Model — Alembic autogenerate parity
 # ══════════════════════════════════════════════════════════════════════════════
@@ -280,3 +326,9 @@ class TestAFKDashboardDailyModel:
 
         index_names = {idx.name for idx in AFKDashboardDaily.__table__.indexes}
         assert "ix_afk_dashboard_daily_provider_repository_day" in index_names
+
+    def test_model_registers_day_index(self):
+        from app.db.models.afk import AFKDashboardDaily
+
+        index_names = {idx.name for idx in AFKDashboardDaily.__table__.indexes}
+        assert "ix_afk_dashboard_daily_day" in index_names
