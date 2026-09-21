@@ -1,6 +1,7 @@
 """SQLAlchemy ORM models — observability models added in later slices."""
 
 from app.db.models.afk import (
+    AFKDashboardDaily,
     AFKRun,
     AFKRunEntityLink,
     AFKRunSessionLink,
@@ -37,6 +38,7 @@ from app.db.models.reporting import (
 )
 
 __all__ = [
+    "AFKDashboardDaily",
     "AFKRun",
     "AFKRunEntityLink",
     "AFKRunSessionLink",
