@@ -57,6 +57,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.afk_dashboard_daily import (  # noqa: E402
     AFK_DASHBOARD_LOCK_CLASS,
+    CR_EVENT_FILTER,
+    UNAMBIGUOUS_CTE,
     acquire_bucket_lock,
     recompute_bucket,
 )
@@ -106,13 +108,9 @@ per-resource keys are derived from a resource hash and are essentially never
 # and the verify tool flags a stale mismatch.
 # ---------------------------------------------------------------------------
 
-DISCOVERY_SQL = """
+DISCOVERY_SQL = f"""
     WITH unambiguous AS (
-        SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
-        FROM afk_run_sessions ars
-        WHERE ars.session_id IS NOT NULL
-        GROUP BY ars.session_id
-        HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+{UNAMBIGUOUS_CTE}
     )
     SELECT DISTINCT ON (day, provider, repository)
            day, provider, repository
@@ -130,7 +128,7 @@ DISCOVERY_SQL = """
                e.provider,
                e.repository
         FROM engineering_events e
-        WHERE e.entity_type = 'change_request'
+        WHERE {CR_EVENT_FILTER}
           AND e.repository IS NOT NULL
           AND (e.occurred_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
         UNION ALL

@@ -111,6 +111,29 @@ METRIC_COLUMNS: tuple[str, ...] = (
 )
 """The additive metric columns, in the exact order the upsert binds them."""
 
+
+UNAMBIGUOUS_CTE: str = """\
+    SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
+    FROM afk_run_sessions ars
+    WHERE ars.session_id IS NOT NULL
+    GROUP BY ars.session_id
+    HAVING COUNT(DISTINCT ars.afk_run_id) = 1"""
+"""CTE body selecting sessions mapped to exactly one AFK run.
+
+Use as ``WITH unambiguous AS (<UNAMBIGUOUS_CTE>)``.  Sessions mapped to
+multiple runs are ambiguous and excluded from attribution — the engine,
+backfill, verify, and refresh scripts all share this definition.
+"""
+
+CR_EVENT_FILTER: str = "e.entity_type = 'change_request'"
+"""Filter selecting change-request engineering events.
+
+Used to restrict ``engineering_events`` queries to change-request rows
+when computing change-request counts or discovering change-request
+buckets.  The engine, backfill, verify, and refresh scripts all share
+this definition.
+"""
+
 # ---------------------------------------------------------------------------
 # Per-category recomputation SQL
 #

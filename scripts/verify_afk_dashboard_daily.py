@@ -91,32 +91,11 @@ from app.core.reporting_aggregates import (  # noqa: E402
     resource_identity_from_payload,
 )
 
-# Mirror of ``app.core.afk_dashboard_daily.METRIC_COLUMNS`` used until the
-# #715 recompute engine is merged onto this branch.  When the engine module is
-# importable its canonical vocabulary wins, so the verifier and the writer can
-# never drift.
-_FALLBACK_AFK_DASHBOARD_METRIC_COLUMNS: tuple[str, ...] = (
-    "runs_started",
-    "change_requests_opened",
-    "change_requests_merged",
-    "change_requests_closed",
-    "execution_count",
-    "successful_execution_count",
-    "failed_execution_count",
-    "cancelled_execution_count",
-    "session_count",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "estimated_cost_usd",
+from app.core.afk_dashboard_daily import (  # noqa: E402
+    CR_EVENT_FILTER,
+    METRIC_COLUMNS as AFK_DASHBOARD_METRIC_COLUMNS,
+    UNAMBIGUOUS_CTE,
 )
-try:  # pragma: no cover - the #715 engine may not be merged on this branch yet.
-    from app.core.afk_dashboard_daily import (  # noqa: E402
-        METRIC_COLUMNS as AFK_DASHBOARD_METRIC_COLUMNS,
-    )
-except ImportError:  # pragma: no cover - engine absent, use the mirror above.
-    AFK_DASHBOARD_METRIC_COLUMNS = _FALLBACK_AFK_DASHBOARD_METRIC_COLUMNS
 
 logger = logging.getLogger("verify_afk_dashboard_daily")
 
@@ -180,7 +159,7 @@ AFK_DASHBOARD_DAILY_MISMATCH_SQL = f"""
                    COUNT(*) FILTER (WHERE e.event_type = 'change_request.closed')::int
                        AS change_requests_closed
             FROM engineering_events e
-            WHERE e.entity_type = 'change_request'
+            WHERE {CR_EVENT_FILTER}
               AND e.repository IS NOT NULL
               AND (e.occurred_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
             GROUP BY day, e.provider, e.repository
@@ -204,11 +183,7 @@ AFK_DASHBOARD_DAILY_MISMATCH_SQL = f"""
             GROUP BY day, b.provider, b.repository_url
         ),
         unambiguous AS (
-            SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
-            FROM afk_run_sessions ars
-            WHERE ars.session_id IS NOT NULL
-            GROUP BY ars.session_id
-            HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+{UNAMBIGUOUS_CTE}
         ),
         sess_agg AS (
             SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
