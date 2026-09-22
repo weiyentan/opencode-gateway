@@ -1,4 +1,4 @@
-"""Tests for the afk_dashboard_daily table migration 0046 (issue #714).
+"""Tests for the afk_dashboard_daily table migrations 0046 and 0047.
 
 The AFK dashboard daily rollup is a pre-aggregated operational read-model
 keyed by ``(day, provider, repository)`` (client_project_rollup precedent,
@@ -12,8 +12,9 @@ migration 0023 / ADR 0014/0015).  This module verifies:
 3. The metadata columns ``derived_at`` (timestamptz), ``rollup_version``
    (text), and ``updated_at`` (timestamptz) are present.
 4. Indexes support the summary read path: the composite primary key serves
-   date-range scans and the ``(provider, repository, day)`` index serves
-   provider/repository-scoped scans.
+   date-range scans, the ``(provider, repository, day)`` index serves
+   provider/repository-scoped scans, and the ``day`` index serves
+   unfiltered date-range scans (migration 0047).
 5. Downgrade drops the index and the table.
 6. The SQLAlchemy ORM model (Alembic-autogenerate only) mirrors the DDL.
 """
@@ -26,7 +27,6 @@ import re
 from pathlib import Path
 
 from alembic.config import Config
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
@@ -225,6 +225,48 @@ class TestMigration0046Downgrade:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Migration 0047 — Offline SQL Verification
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMigration0047DayIndex:
+    """Verify migration 0047 adds the day index for unfiltered date-range scans."""
+
+    def test_upgrade_creates_day_index(self):
+        """Migration 0047 upgrade should emit CREATE INDEX ix_afk_dashboard_daily_day."""
+        from alembic.command import upgrade
+
+        cfg = _alembic_cfg()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upgrade(cfg, "0046:0047", sql=True)
+        sql = buf.getvalue()
+        assert "CREATE INDEX ix_afk_dashboard_daily_day" in sql
+
+    def test_upgrade_does_not_create_table(self):
+        """Migration 0047 only adds an index — the table was created by 0046."""
+        from alembic.command import upgrade
+
+        cfg = _alembic_cfg()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upgrade(cfg, "0046:0047", sql=True)
+        sql = buf.getvalue()
+        assert "CREATE TABLE" not in sql
+
+    def test_downgrade_drops_day_index(self):
+        """Migration 0047 downgrade should drop the day index."""
+        from alembic.command import downgrade
+
+        cfg = _alembic_cfg()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            downgrade(cfg, "0047:0046", sql=True)
+        sql = buf.getvalue()
+        assert "DROP INDEX ix_afk_dashboard_daily_day" in sql
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ORM Model — Alembic autogenerate parity
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -257,3 +299,9 @@ class TestAFKDashboardDailyModel:
 
         index_names = {idx.name for idx in AFKDashboardDaily.__table__.indexes}
         assert "ix_afk_dashboard_daily_provider_repository_day" in index_names
+
+    def test_model_registers_day_index(self):
+        from app.db.models.afk import AFKDashboardDaily
+
+        index_names = {idx.name for idx in AFKDashboardDaily.__table__.indexes}
+        assert "ix_afk_dashboard_daily_day" in index_names
