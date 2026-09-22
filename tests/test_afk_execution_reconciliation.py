@@ -373,13 +373,67 @@ async def test_reconcile_bounds_concurrent_awx_lookups():
             in_flight -= 1
             return AWXJobState(status="running")
 
+    # Default max_concurrency=10: the semaphore bounds concurrent lookups.
     summary = await ExecutionReconciler(
         repository=repo, awx_lookup=ConcurrencyTrackingLookup()  # type: ignore[arg-type]
     ).reconcile()
     assert summary.examined == 25
-    # Phase 1 runs every AWX lookup concurrently (HTTP only, no DB), so all
-    # bindings are in flight at once — there is no concurrency bound.
-    assert peak == 25
+    # The semaphore allows at most 10 concurrent lookups.
+    assert peak <= 10
+
+
+async def test_reconcile_respects_explicit_concurrency_bound():
+    import asyncio
+
+    repo = FakeRepository(
+        running_bindings=[_running_binding(i) for i in range(1, 21)]
+    )
+    in_flight = 0
+    peak = 0
+
+    class ConcurrencyTrackingLookup:
+        async def get_job(self, job_id: int) -> AWXJobState | None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return AWXJobState(status="running")
+
+    # Explicit max_concurrency=3: at most 3 concurrent lookups.
+    summary = await ExecutionReconciler(
+        repository=repo, awx_lookup=ConcurrencyTrackingLookup(),  # type: ignore[arg-type]
+        max_concurrency=3,
+    ).reconcile()
+    assert summary.examined == 20
+    assert peak <= 3
+
+
+async def test_concurrency_bound_of_one_serializes_lookups():
+    import asyncio
+
+    repo = FakeRepository(
+        running_bindings=[_running_binding(i) for i in range(1, 6)]
+    )
+    in_flight = 0
+    peak = 0
+
+    class ConcurrencyTrackingLookup:
+        async def get_job(self, job_id: int) -> AWXJobState | None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return AWXJobState(status="running")
+
+    # max_concurrency=1: lookups run one at a time.
+    summary = await ExecutionReconciler(
+        repository=repo, awx_lookup=ConcurrencyTrackingLookup(),  # type: ignore[arg-type]
+        max_concurrency=1,
+    ).reconcile()
+    assert summary.examined == 5
+    assert peak == 1
 
 
 # ── Idempotency / already-terminal records ───────────────────────────────────

@@ -312,6 +312,11 @@ class Settings(BaseSettings):
     # GATEWAY_AWX_RECONCILIATION_API_TOKEN.
     awx_reconciliation_base_url: str = ""
     awx_reconciliation_api_token: str = ""
+    # Concurrency bound for Phase 1 (parallel AWX HTTP lookups) in
+    # execution reconciliation.  Phase 2 (DB persistence) remains
+    # serialized on the shared asyncpg connection.  Maps to
+    # GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY.
+    awx_reconciliation_max_concurrency: int = Field(default=10, ge=1)
 
     # active_tokens deprecation (issue #557) — the legacy ``active_tokens``
     # field (input + output tokens) is deprecated in favour of the raw token
