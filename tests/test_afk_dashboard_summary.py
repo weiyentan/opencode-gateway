@@ -49,6 +49,7 @@ def _mk_bucket_row(
     cache_write_tokens: int = 100,
     estimated_cost_usd: Decimal = Decimal("0.25"),
     derived_at: datetime | None = _TS_A,
+    oldest_derived_at: datetime | None = _TS_A,
 ):
     return mock_row(
         {
@@ -70,6 +71,7 @@ def _mk_bucket_row(
             "cache_write_tokens": cache_write_tokens,
             "estimated_cost_usd": estimated_cost_usd,
             "derived_at": derived_at,
+            "oldest_derived_at": oldest_derived_at,
         }
     )
 
@@ -139,6 +141,12 @@ class TestDailySummary:
         assert first["estimated_cost_usd"] == "0.25"
         # Freshness is the latest derived_at across the returned buckets.
         assert data["derived_at"].startswith("2026-08-02T03:00:00")
+        # Daily bucket: oldest_derived_at equals that bucket's derived_at.
+        assert first["oldest_derived_at"] is not None
+        assert first["oldest_derived_at"].startswith("2026-08-01T03:00:00")
+        # Response-level oldest_derived_at is MIN across all buckets.
+        assert data["oldest_derived_at"] is not None
+        assert data["oldest_derived_at"].startswith("2026-08-01T03:00:00")
 
     @pytest.mark.asyncio
     async def test_daily_uses_day_column_without_month_truncation(
@@ -198,6 +206,43 @@ class TestMonthlySummary:
         sql = mock_conn.fetch.call_args[0][0]
         assert "date_trunc('month', day)::date AS period_start" in sql
         assert "GROUP BY date_trunc('month', day)::date, provider, repository" in sql
+
+    @pytest.mark.asyncio
+    async def test_monthly_oldest_derived_at_is_min_across_daily_rows(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Monthly bucket: oldest_derived_at = MIN(derived_at) across daily rows."""
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_bucket_row(
+                    period_start=date(2026, 8, 1),
+                    runs_started=7,
+                    derived_at=_TS_A,
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get(
+                _PATH,
+                params={
+                    "from_date": "2026-08-01",
+                    "to_date": "2026-08-31",
+                    "interval": "monthly",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["interval"] == "monthly"
+        bucket = data["buckets"][0]
+        assert bucket["period_start"] == "2026-08-01"
+        # Monthly bucket: oldest_derived_at equals the bucket's derived_at (MIN across constituent daily rows).
+        assert bucket["oldest_derived_at"] is not None
+        assert bucket["oldest_derived_at"].startswith("2026-08-01T03:00:00")
+        # Response-level oldest_derived_at equals the single bucket's oldest_derived_at.
+        assert data["oldest_derived_at"] is not None
+        assert data["oldest_derived_at"].startswith("2026-08-01T03:00:00")
 
     @pytest.mark.asyncio
     async def test_invalid_interval_returns_400(
@@ -337,3 +382,4 @@ class TestDefaultsAndEmpty:
         data = body["data"]
         assert data["buckets"] == []
         assert data["derived_at"] is None
+        assert data["oldest_derived_at"] is None

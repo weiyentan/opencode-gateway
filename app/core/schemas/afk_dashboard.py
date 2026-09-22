@@ -63,6 +63,10 @@ class AFKDashboardSummaryBucket(BaseModel):
         default=None,
         description="Latest rollup recompute observed for this bucket",
     )
+    oldest_derived_at: datetime | None = Field(
+        default=None,
+        description="Oldest rollup recompute observed for this bucket (freshness floor)",
+    )
 
 
 class AFKDashboardSummary(BaseModel):
@@ -84,4 +88,8 @@ class AFKDashboardSummary(BaseModel):
     derived_at: datetime | None = Field(
         default=None,
         description="Latest rollup recompute across the returned buckets",
+    )
+    oldest_derived_at: datetime | None = Field(
+        default=None,
+        description="Oldest rollup recompute across the returned buckets (freshness floor)",
     )
