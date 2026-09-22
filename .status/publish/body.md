@@ -4,27 +4,32 @@ This automated develop-loop run implemented the following issues:
 
 | Issue | Title |
 |-------|-------|
-| #708  | Add read-path parity and performance regression coverage |
-| #709  | Rewrite Agent Runs to page before enrichment |
-| #710  | Add deterministic Records ordering tiebreaker |
-| #711  | Implement the grouped aggregate FILTER pivot |
+| #724 | Extract shared dashboard vocabulary as importable constants |
+| #725 | Add freshness floor to dashboard summary API |
+| #726 | Bound AWX reconciliation concurrency with configurable semaphore |
+| #727 | Measure day-index benefit on production-like data |
+| #728 | Remove redundant session join from refresh usage discovery |
+| #729 | Split verifier into independent AFK and reporting failure domains |
+| #730 | Add PostgreSQL golden-dataset integration test for AFK dashboard |
 
 ## Changes
 
-- **#708**: Added 5 new test files covering read-path parity, SQL shape, agent runs parity, usage/aggregate parity, rollup parity, and live protocol harness (84 new tests)
-- **#709**: Rewrote Agent Run Summary query to select filtered page before enrichment — O(page) enrichment instead of O(universe)
-- **#710**: Added `usage_events.id ASC` deterministic tiebreaker to all Records sort modes
-- **#711**: Replaced duplicate grouped scan with single-pass `GROUPING SETS` + `FILTER` pivot — scan count halved, p95 improved 25-45%
+- **#724**: Extracted METRIC_COLUMNS, UNAMBIGUOUS_CTE, and CR_EVENT_FILTER from the dashboard engine as importable constants. Backfill, verify, and refresh scripts now import from the engine.
+- **#725**: Added oldest_derived_at freshness floor field to AFKDashboardSummaryBucket and AFKDashboardSummary schemas. Additive and backward-compatible.
+- **#726**: Added GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY env var (default 10, min 1) to bound concurrent AWX HTTP lookups during execution reconciliation.
+- **#727**: Measurement-only task — documented index measurement methodology following ADR 0017 precedent.
+- **#728**: Removed redundant JOIN afk_run_sessions from refresh usage-event discovery branch.
+- **#729**: Split verify_afk_dashboard_daily.py into independent AFK and reporting verifiers with independent exit statuses. Shared helpers moved to verify_helpers.py.
+- **#730**: Added PostgreSQL golden-dataset integration test (12 tests) exercising the full AFK Dashboard lifecycle.
 
 ## Review
 
-Per-issue reviews completed:
-- #708: auto review (test-only, no production changes)
-- #709: mandatory review — approve-with-comments (non-blocking nits on benchmark docstring)
-- #710: mandatory review — approve-with-comments (tests provided by #708 dependency)
-- #711: mandatory review — approve-with-comments (non-blocking: test assertion brittleness)
+A consolidated diff review is available.
 
-Closes #708
-Closes #709
-Closes #710
-Closes #711
+Closes #724
+Closes #725
+Closes #726
+Closes #727
+Closes #728
+Closes #729
+Closes #730
