@@ -75,9 +75,6 @@ SOURCE_AFK_DASHBOARD_DAILY = "afk_dashboard_daily"
 # Backward-compatible alias for the historical source label.
 SOURCE_USAGE_ROLLUP = SOURCE_AFK_DASHBOARD_DAILY
 
-# Re-export shared helpers for backward compatibility with existing callers/tests.
-from scripts.verify_helpers import _today_utc, parse_window as _parse_window
-
 # ---------------------------------------------------------------------------
 # SQL (SELECT-only)
 #
