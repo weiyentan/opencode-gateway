@@ -158,7 +158,6 @@ DISCOVERY_SQL = """
                r.repository
         FROM usage_events ue
         JOIN unambiguous u ON u.session_id = ue.session_id
-        JOIN afk_run_sessions ars ON ars.session_id = u.session_id
         JOIN afk_runs r ON r.afk_run_id = u.afk_run_id
         WHERE r.repository IS NOT NULL
           AND (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
