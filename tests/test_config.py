@@ -495,3 +495,52 @@ def test_reporting_topic_override_from_env(monkeypatch):
 
     settings = Settings()
     assert settings.reporting_topic == "custom.reporting.topic"
+
+
+# ── Issue #726: AWX reconciliation concurrency bound ────────────────────────
+
+
+def test_awx_reconciliation_max_concurrency_default(monkeypatch):
+    """awx_reconciliation_max_concurrency defaults to 10."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.awx_reconciliation_max_concurrency == 10
+
+
+def test_awx_reconciliation_max_concurrency_override_from_env(monkeypatch):
+    """GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY overrides the default."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY", "5")
+
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.awx_reconciliation_max_concurrency == 5
+
+
+def test_awx_reconciliation_max_concurrency_must_be_positive(monkeypatch):
+    """GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY must be >= 1 (ge=1)."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY", "0")
+
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_awx_reconciliation_max_concurrency_negative_rejected(monkeypatch):
+    """Negative concurrency values are rejected."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_AWX_RECONCILIATION_MAX_CONCURRENCY", "-3")
+
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
