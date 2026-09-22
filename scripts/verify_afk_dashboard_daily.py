@@ -76,9 +76,7 @@ SOURCE_AFK_DASHBOARD_DAILY = "afk_dashboard_daily"
 SOURCE_USAGE_ROLLUP = SOURCE_AFK_DASHBOARD_DAILY
 
 # Re-export shared helpers for backward compatibility with existing callers/tests.
-_parse_window = parse_window
-_today_utc = __import__("scripts.verify_helpers", fromlist=["_today_utc"])._today_utc
-parse_window = parse_window  # noqa: F811 — re-export
+from scripts.verify_helpers import _today_utc, parse_window as _parse_window
 
 # ---------------------------------------------------------------------------
 # SQL (SELECT-only)

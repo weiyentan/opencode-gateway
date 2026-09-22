@@ -38,7 +38,7 @@ from app.core.identity import hash_token
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 
 _DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
+_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5432"))
 _DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
 _DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
 _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
@@ -334,7 +334,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
                (afk_run_id, awx_job_id, provider, repository_url, outcome,
                 created_at, started_at, finished_at)
                VALUES ($1, $2, $3, $4, $5, $6, $6, $6)""",
-            _RUN_A, str(100000 + i), _PROVIDER, _REPO, outcome, day1_started,
+            _RUN_A, 100000 + i, _PROVIDER, _REPO, outcome, day1_started,
         )
 
     # Day 2: 1 cancelled
@@ -344,7 +344,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
            (afk_run_id, awx_job_id, provider, repository_url, outcome,
             created_at, started_at, finished_at)
            VALUES ($1, $2, $3, $4, $5, $6, $6, $6)""",
-        _RUN_C, "100003", _PROVIDER, _REPO, "cancelled", day2_started,
+        _RUN_C, 100003, _PROVIDER, _REPO, "cancelled", day2_started,
     )
 
     # ── 4. Gateway sessions ─────────────────────────────────────
@@ -919,19 +919,16 @@ async def test_reporting_verifier_independent_of_afk_verifier(
             f"mismatches: {[m.as_dict() for m in afk_mismatches]}"
         )
 
-        # Run the full verifier (which includes reporting side).
-        from scripts.verify_afk_dashboard_daily import (
+        # Run the reporting verifier independently.
+        from scripts.verify_reporting_resource_aggregates import (
             VerificationWindow,
             _run_verification,
         )
 
         window = VerificationWindow(from_date=_DAY_1, to_date=_DAY_2)
-        all_mismatches = await _run_verification(conn, window)
+        reporting_mismatches = await _run_verification(conn, window)
 
         # Reporting mismatches should be empty (no seeded reporting data).
-        reporting_mismatches = [
-            m for m in all_mismatches if m.source == "reporting_resource_aggregates"
-        ]
         assert len(reporting_mismatches) == 0, (
             f"reporting verifier should find 0 mismatches with no seeded data,"
             f" got {len(reporting_mismatches)}"
@@ -939,7 +936,7 @@ async def test_reporting_verifier_independent_of_afk_verifier(
 
         # AFK mismatches should still be 0 — the two verifiers are independent.
         afk_mismatches_after = [
-            m for m in all_mismatches if m.source == "afk_dashboard_daily"
+            m for m in reporting_mismatches if m.source == "afk_dashboard_daily"
         ]
         assert len(afk_mismatches_after) == 0, (
             f"AFK verifier should remain clean after reporting verifier run,"
