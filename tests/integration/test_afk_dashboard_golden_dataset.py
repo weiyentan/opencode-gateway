@@ -186,9 +186,15 @@ async def _seed_session(
 
 
 async def _seed_observed_model(conn: asyncpg.Connection) -> uuid.UUID:
-    """Insert an observed_models row; return model_id."""
+    """Insert an observed_models row; return model_id.
+
+    Uses an upsert so repeated calls within the same database (across tests)
+    never hit a unique-constraint violation on ``model_name``.
+    """
     return await conn.fetchval(
-        "INSERT INTO observed_models (model_name) VALUES ($1) RETURNING id",
+        "INSERT INTO observed_models (model_name) VALUES ($1)"
+        " ON CONFLICT (model_name) DO UPDATE SET model_name = EXCLUDED.model_name"
+        " RETURNING id",
         "claude-sonnet-4-20250514",
     )
 
