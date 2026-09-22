@@ -331,20 +331,20 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
     for i, outcome in enumerate(["completed", "completed", "failed"]):
         await conn.execute(
             """INSERT INTO execution_bindings
-               (afk_run_id, awx_job_id, provider, repository_url, outcome,
+               (afk_run_id, awx_job_id, job_template_id, provider, repository_url, outcome,
                 created_at, started_at, finished_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $6, $6)""",
-            _RUN_A, 100000 + i, _PROVIDER, _REPO, outcome, day1_started,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7)""",
+            _RUN_A, 100000 + i, 50000, _PROVIDER, _REPO, outcome, day1_started,
         )
 
     # Day 2: 1 cancelled
     day2_started = datetime(2026, 1, 16, 9, 0, 0, tzinfo=timezone.utc)
     await conn.execute(
         """INSERT INTO execution_bindings
-           (afk_run_id, awx_job_id, provider, repository_url, outcome,
+           (afk_run_id, awx_job_id, job_template_id, provider, repository_url, outcome,
             created_at, started_at, finished_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $6, $6)""",
-        _RUN_C, 100003, _PROVIDER, _REPO, "cancelled", day2_started,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7)""",
+        _RUN_C, 100003, 50000, _PROVIDER, _REPO, "cancelled", day2_started,
     )
 
     # ── 4. Gateway sessions ─────────────────────────────────────
