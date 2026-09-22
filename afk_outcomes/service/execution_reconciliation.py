@@ -24,7 +24,9 @@ The pass runs in **two phases** so it is safe on a single shared asyncpg
 connection:
 
 * **Phase 1 (parallel)** — AWX status lookups.  These are HTTP calls that
-  never touch the database, so they run fully concurrently.
+  never touch the database, so they run concurrently but are bounded by
+  an ``asyncio.Semaphore`` to avoid overwhelming the AWX API during
+  partial outages or latency spikes.
 * **Phase 2 (serialized)** — terminal persistence.  Every task shares one
   connection, so writes are issued one at a time.
 
@@ -207,10 +209,12 @@ class ExecutionReconciler:
         repository: object,
         awx_lookup: AWXJobLookup,
         limit: int = 100,
+        max_concurrency: int = 10,
     ) -> None:
         self._repository = repository
         self._awx_lookup = awx_lookup
         self._limit = max(1, limit)
+        self._max_concurrency = max(1, max_concurrency)
 
     async def reconcile(
         self, *, max_age_seconds: int | None = None
@@ -218,7 +222,7 @@ class ExecutionReconciler:
         """Run one pass and return the per-binding results.
 
         Two-phase design for safe concurrent operation on a single asyncpg Connection:
-        Phase 1 runs all AWX lookups in parallel (HTTP only, no DB).
+        Phase 1 runs AWX lookups concurrently but bounded by a semaphore (HTTP only, no DB).
         Phase 2 serializes DB writes over the shared connection.
         """
         bindings = await self._repository.list_running_execution_bindings(  # type: ignore[attr-defined]
@@ -226,9 +230,16 @@ class ExecutionReconciler:
             max_age_seconds=max_age_seconds,
         )
 
-        # Phase 1: Parallel AWX lookups (no DB needed — fully concurrent).
+        # Phase 1: Parallel AWX lookups (no DB needed — concurrent, but
+        # bounded by the semaphore to avoid overwhelming the AWX API).
+        semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        async def _semaphored_lookup(binding: object) -> tuple[int | None, AWXJobState | None, str | None]:
+            async with semaphore:
+                return await self._lookup_job(binding)
+
         lookup_results = await asyncio.gather(
-            *[self._lookup_job(b) for b in bindings]
+            *[_semaphored_lookup(b) for b in bindings]
         )
 
         # Phase 2: Serialized DB writes over the single shared connection.

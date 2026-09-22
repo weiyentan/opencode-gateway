@@ -208,8 +208,12 @@ async def reconcile_afk_executions(
         # reconciled — no discovery, no writes.
         return AFKExecutionReconcileResponse(configured=False)
 
+    settings = get_settings()
     reconciler = ExecutionReconciler(
-        repository=repository, awx_lookup=awx_lookup, limit=limit
+        repository=repository,
+        awx_lookup=awx_lookup,
+        limit=limit,
+        max_concurrency=settings.awx_reconciliation_max_concurrency,
     )
     summary = await reconciler.reconcile(max_age_seconds=max_age_seconds)
     return _summary_to_response(summary)

@@ -72,7 +72,8 @@ _METRIC_COLUMNS = """
     COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
     COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
     COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
-    MAX(derived_at) AS derived_at
+    MAX(derived_at) AS derived_at,
+    MIN(derived_at) AS oldest_derived_at
 """
 
 
@@ -173,6 +174,7 @@ def _bucket(row: asyncpg.Record) -> AFKDashboardSummaryBucket:
         cache_write_tokens=row["cache_write_tokens"],
         estimated_cost_usd=row["estimated_cost_usd"],
         derived_at=row["derived_at"],
+        oldest_derived_at=row["oldest_derived_at"],
     )
 
 
@@ -210,6 +212,7 @@ async def _fetch_summary(
 
     buckets = [_bucket(row) for row in rows]
     derived_values = [b.derived_at for b in buckets if b.derived_at is not None]
+    oldest_values = [b.oldest_derived_at for b in buckets if b.oldest_derived_at is not None]
     return AFKDashboardSummary(
         interval=interval,
         from_date=from_date,
@@ -218,6 +221,7 @@ async def _fetch_summary(
         repository=repository,
         buckets=buckets,
         derived_at=max(derived_values) if derived_values else None,
+        oldest_derived_at=min(oldest_values) if oldest_values else None,
     )
 
 

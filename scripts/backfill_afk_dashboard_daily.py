@@ -84,41 +84,17 @@ logger = logging.getLogger("backfill_afk_dashboard_daily")
 #
 # The engine is the single writer of ``afk_dashboard_daily``.  It is imported
 # at module scope so tests (and callers) can patch the engine calls on this
-# module.  The ``ImportError`` fallback mirrors the defensive pattern already
-# used by ``scripts/verify_afk_dashboard_daily.py``: on a branch where the
-# dependency (#714/#715) has not yet merged, the metric vocabulary still
-# resolves so the SQL and CLI remain testable, and the write path fails closed
-# with a clear error instead of silently writing.
+# module.  The shared vocabulary (METRIC_COLUMNS, UNAMBIGUOUS_CTE,
+# CR_EVENT_FILTER) is defined in the engine and imported here.
 # ---------------------------------------------------------------------------
 
-_FALLBACK_METRIC_COLUMNS: tuple[str, ...] = (
-    "runs_started",
-    "change_requests_opened",
-    "change_requests_merged",
-    "change_requests_closed",
-    "execution_count",
-    "successful_execution_count",
-    "failed_execution_count",
-    "cancelled_execution_count",
-    "session_count",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "estimated_cost_usd",
+from app.core.afk_dashboard_daily import (  # noqa: E402
+    CR_EVENT_FILTER,
+    METRIC_COLUMNS,
+    UNAMBIGUOUS_CTE,
+    acquire_bucket_lock,
+    recompute_bucket,
 )
-"""The engine's additive metric columns, mirrored for the dependency-absent case."""
-
-try:  # pragma: no cover - exercised by whichever branch is present.
-    from app.core.afk_dashboard_daily import (  # noqa: E402
-        METRIC_COLUMNS,
-        acquire_bucket_lock,
-        recompute_bucket,
-    )
-except ImportError:  # pragma: no cover - engine #715 not merged on this branch.
-    METRIC_COLUMNS = _FALLBACK_METRIC_COLUMNS
-    acquire_bucket_lock = None  # type: ignore[assignment]
-    recompute_bucket = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -137,13 +113,9 @@ except ImportError:  # pragma: no cover - engine #715 not merged on this branch.
 # (``app.core.afk_dashboard_daily``).
 # ---------------------------------------------------------------------------
 
-CANONICAL_BUCKETS_SQL = """
+CANONICAL_BUCKETS_SQL = f"""
     WITH unambiguous AS (
-        SELECT ars.session_id, MIN(ars.afk_run_id) AS afk_run_id
-        FROM afk_run_sessions ars
-        WHERE ars.session_id IS NOT NULL
-        GROUP BY ars.session_id
-        HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+{UNAMBIGUOUS_CTE}
     )
     SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
                AS day,
@@ -156,7 +128,7 @@ CANONICAL_BUCKETS_SQL = """
            e.provider AS provider,
            e.repository AS repository
     FROM engineering_events e
-    WHERE e.entity_type = 'change_request'
+    WHERE {CR_EVENT_FILTER}
       AND e.repository IS NOT NULL
     UNION
     SELECT (COALESCE(b.started_at, b.created_at) AT TIME ZONE 'UTC')::date
@@ -217,7 +189,7 @@ _MISMATCH_PREDICATE = "\n         OR ".join(
     f"d.{column} != c.{column}" for column in METRIC_COLUMNS
 )
 
-CANONICAL_AGGREGATE_SQL = """
+CANONICAL_AGGREGATE_SQL = f"""
         WITH runs_agg AS (
             SELECT (COALESCE(r.started_at, r.first_seen_at) AT TIME ZONE 'UTC')::date
                        AS day,
@@ -243,7 +215,7 @@ CANONICAL_AGGREGATE_SQL = """
                    COUNT(*) FILTER (WHERE e.event_type = 'change_request.closed')::int
                        AS change_requests_closed
             FROM engineering_events e
-            WHERE e.entity_type = 'change_request'
+            WHERE {CR_EVENT_FILTER}
               AND e.repository IS NOT NULL
               AND (e.occurred_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
               AND ($3::text IS NULL OR e.provider = $3)
@@ -271,12 +243,7 @@ CANONICAL_AGGREGATE_SQL = """
             GROUP BY day, b.provider, b.repository_url
         ),
         unambiguous AS (
-            SELECT ars.session_id,
-                   MIN(ars.afk_run_id) AS afk_run_id
-            FROM afk_run_sessions ars
-            WHERE ars.session_id IS NOT NULL
-            GROUP BY ars.session_id
-            HAVING COUNT(DISTINCT ars.afk_run_id) = 1
+{UNAMBIGUOUS_CTE}
         ),
         sess_agg AS (
             SELECT (COALESCE(ars.started_at, ars.first_seen_at) AT TIME ZONE 'UTC')::date
