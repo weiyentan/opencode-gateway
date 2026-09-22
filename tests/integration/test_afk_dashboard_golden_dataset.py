@@ -268,9 +268,11 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
     - Usage events only for the unambiguous session (ambiguous excluded)
     """
     now = datetime(2026, 1, 15, 8, 0, 0, tzinfo=timezone.utc)
+    day2_now = datetime(2026, 1, 16, 8, 0, 0, tzinfo=timezone.utc)
 
     # ── 1. AFK runs ──────────────────────────────────────────────
-    for run_id, repo in [(_RUN_A, _REPO), (_RUN_B, _REPO), (_RUN_C, _REPO)]:
+    # Day 1: runs A and B; Day 2: run C
+    for run_id, repo in [(_RUN_A, _REPO), (_RUN_B, _REPO)]:
         await conn.execute(
             """INSERT INTO afk_runs
                (afk_run_id, provider, repository, started_at, first_seen_at,
@@ -279,6 +281,14 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
                ON CONFLICT (afk_run_id) DO NOTHING""",
             run_id, _PROVIDER, repo, now,
         )
+    await conn.execute(
+        """INSERT INTO afk_runs
+           (afk_run_id, provider, repository, started_at, first_seen_at,
+            last_seen_at)
+           VALUES ($1, $2, $3, $4, $4, $4)
+           ON CONFLICT (afk_run_id) DO NOTHING""",
+        _RUN_C, _PROVIDER, _REPO, day2_now,
+    )
 
     # ── 2. Engineering events (change requests) ─────────────────
     # Run A: CR opened + merged on day 1
@@ -439,7 +449,7 @@ async def db_pool(_migrated_schema: None) -> asyncpg.Pool:  # type: ignore[overr
             " CASCADE"
         )
         await conn.execute(
-            "DELETE FROM collector_credentials WHERE client_id IN"
+            "DELETE FROM sessions WHERE client_id IN"
             " (SELECT id FROM opencode_clients WHERE name LIKE 'golden-%')"
         )
         await conn.execute(
@@ -447,11 +457,11 @@ async def db_pool(_migrated_schema: None) -> asyncpg.Pool:  # type: ignore[overr
             " (SELECT id FROM opencode_clients WHERE name LIKE 'golden-%')"
         )
         await conn.execute(
-            "DELETE FROM source_identities WHERE client_id IN"
+            "DELETE FROM collector_credentials WHERE client_id IN"
             " (SELECT id FROM opencode_clients WHERE name LIKE 'golden-%')"
         )
         await conn.execute(
-            "DELETE FROM sessions WHERE client_id IN"
+            "DELETE FROM source_identities WHERE client_id IN"
             " (SELECT id FROM opencode_clients WHERE name LIKE 'golden-%')"
         )
         await conn.execute(
