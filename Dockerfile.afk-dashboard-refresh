@@ -1,0 +1,23 @@
+# Minimal runtime for the hourly AFK dashboard rollup refresh.
+FROM python:3.12-slim
+
+RUN groupadd --system gateway && \
+    useradd --system --no-log-init --gid gateway --create-home gateway
+
+RUN pip install --no-cache-dir \
+    "asyncpg>=0.29.0,<1.0.0" \
+    "pydantic>=2.0.0,<3.0.0" \
+    "pydantic-settings>=2.0.0,<3.0.0"
+
+WORKDIR /app
+
+# The refresh entrypoint is mounted by Kubernetes.  Only the shared settings
+# and AFK rollup engine are copied into this image; the gateway runtime is not.
+COPY app/__init__.py /app/app/__init__.py
+COPY app/core/__init__.py /app/app/core/__init__.py
+COPY app/core/config.py /app/app/core/config.py
+COPY app/core/afk_dashboard_daily.py /app/app/core/afk_dashboard_daily.py
+
+USER gateway
+
+RUN python -c "from app.core.afk_dashboard_daily import recompute_bucket; from app.core.config import get_settings; print('AFK dashboard refresh runtime ready')"

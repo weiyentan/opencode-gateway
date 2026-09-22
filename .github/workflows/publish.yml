@@ -6,6 +6,7 @@
 #   Aurora Glass (frontend/Dockerfile)          — browser-based telemetry dashboard
 #   Consumer     (Dockerfile.consumer)          — Kafka consumer for usage events
 #   AFK Consumer (Dockerfile.afk-consumer)      — Kafka consumer for AFK outcomes
+#   AFK Dashboard Refresh (Dockerfile.afk-dashboard-refresh) — hourly rollup job
 #
 # All images are built from the same repository revision and receive
 # identical version tags (semver, SHA) so they are always deployed together.
@@ -42,7 +43,7 @@ jobs:
       - name: Define image matrix
         id: define
         run: |
-          echo 'matrix=[{"name":"gateway","context":".","dockerfile":"Dockerfile"},{"name":"aurora-glass","context":".","dockerfile":"frontend/Dockerfile"},{"name":"consumer","context":".","dockerfile":"Dockerfile.consumer"},{"name":"afk-consumer","context":".","dockerfile":"Dockerfile.afk-consumer"}]' >> "$GITHUB_OUTPUT"
+          echo 'matrix=[{"name":"gateway","context":".","dockerfile":"Dockerfile"},{"name":"aurora-glass","context":".","dockerfile":"frontend/Dockerfile"},{"name":"consumer","context":".","dockerfile":"Dockerfile.consumer"},{"name":"afk-consumer","context":".","dockerfile":"Dockerfile.afk-consumer"},{"name":"afk-dashboard-refresh","context":".","dockerfile":"Dockerfile.afk-dashboard-refresh"}]' >> "$GITHUB_OUTPUT"
 
   build:
     needs: images
