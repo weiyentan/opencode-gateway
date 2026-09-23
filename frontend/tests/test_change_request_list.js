@@ -836,6 +836,10 @@ test('dashboard refresh: non-default page size preserved on refresh (issue #617)
     assert(false, 'app.js: fetchAll exposed on the window test seam');
     return;
   }
+  // Simulate that first paint is done so detail endpoints (including
+  // change-requests) are fetched in the fetchAll() parallel block
+  // (issue #739).
+  W._setFirstPaintDone(true);
   // URL state: page 2 of 50 rows (?limit=50&offset=50).
   main.sandbox.location.search = '?limit=50&offset=50';
   W.readChangeRequestPaginationFromUrl();
@@ -860,6 +864,10 @@ test('dashboard refresh: deep page with non-default page size preserved on refre
     assert(false, 'app.js: fetchAll exposed on the window test seam');
     return;
   }
+  // Simulate that first paint is done so detail endpoints (including
+  // change-requests) are fetched in the fetchAll() parallel block
+  // (issue #739).
+  W._setFirstPaintDone(true);
   // URL state: page 3 of 25 rows (?limit=25&offset=50 → floor(50/25)+1 = 3).
   main.sandbox.location.search = '?limit=25&offset=50';
   W.readChangeRequestPaginationFromUrl();

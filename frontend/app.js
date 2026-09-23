@@ -193,6 +193,19 @@
   // "Last refreshed HH:MM:SS" clock consumes it via updateLastRefreshed().
   let panelStates = {};
   let lastRefreshedAt = null;
+  // Issue #739: first-paint gate — when false (initial load), fetchAll() only
+  // fires summary endpoints; detail endpoints are deferred to
+  // fetchDetailEndpoints() which runs after the first render.  Set to true
+  // after the first refreshDashboard() completes so subsequent auto-refresh
+  // cycles fetch all endpoints in the normal parallel block.
+  let _firstPaintDone = false;
+  // Issue #739: lazy-load tracking — each flag is true once the deferred
+  // detail fetch for that panel has completed, preventing redundant fetches
+  // on subsequent tab opens or panel expands.
+  let afkDetailFetched = false;
+  let clientProjectFetched = false;
+  let modelDetailFetched = false;
+  let agentUsageFetched = false;
 
   // Which fetch endpoint keys feed each panel — used to resolve a panel to
   // 'stale' when any of its endpoints failed in the current refresh cycle.
@@ -200,9 +213,14 @@
   // The merged Sessions + Agent Runs view (issue #402) reads the Sessions KPI
   // from the aggregates total row and the events feed from the agent-runs
   // channel; the /api/v1/usage/sessions endpoint is no longer fetched.
+  // Issue #739: panels that render summary KPIs or AFK aggregate cards now
+  // track freshness through the summary endpoints (summaryUsage / summaryAfk)
+  // instead of the detail endpoints.  Detail panels (kpi-sessions, model-mix,
+  // agents, agent-usage, client-project, afk-cr-list) keep their detail-key
+  // mappings — they are lazy-loaded after first paint.
   const PANEL_ENDPOINTS = {
-    'kpi-tokens':     ['aggTotal'],
-    'kpi-cost':       ['aggTotal'],
+    'kpi-tokens':     ['summaryUsage'],        // issue #739: summary endpoint
+    'kpi-cost':       ['summaryUsage'],        // issue #739: summary endpoint
     'kpi-sessions':   ['aggTotal'],
     'kpi-collectors': ['health'],
     'kpi-source-dbs': ['health'],
@@ -214,9 +232,9 @@
     'agent-usage':   ['aggByAgent'],
     'agent-runs':    ['agentRuns'],
     'client-project': ['aggClientProject'],
-    'afk-outcomes':  ['afkRuns'],
-    'afk-repos':     ['afkRuns'],
-    'afk-change-requests': ['afkRuns'],
+    'afk-outcomes':  ['summaryAfk'],           // issue #739: summary endpoint
+    'afk-repos':     ['summaryAfk'],           // issue #739: summary endpoint
+    'afk-change-requests': ['summaryAfk'],     // issue #739: summary endpoint
     'unresolved-relationships': ['afkRuns'],
     'afk-cr-list':   ['afkChangeRequests'], // primary change-request view (issue #613)
   };
@@ -1672,67 +1690,42 @@
         ? refreshClientCache()
         : Promise.resolve(null);
 
-      // Parallel fetches
-      // The /api/v1/usage/sessions fetch was dropped in the merged
-      // Sessions + Agent Runs view (issue #402): the merged table is driven
-      // by the agent-runs endpoint (a superset), and the Sessions KPI reads
-      // the aggregates total row's session_count.
-      const [health, aggTotal, aggByModel, records, clients, agentRuns, aggClientProjectResult, aggByAgent, afkRuns, afkChangeRequests] =
+      // Issue #739: summary endpoints for initial load provide the KPI
+      // cards and AFK aggregate metrics.  Detail endpoints (aggregates,
+      // model breakdown, records, AFK runs, change requests) are deferred
+      // on the first paint — loaded by fetchDetailEndpoints() after the
+      // first render, or in the full parallel block on subsequent
+      // auto-refresh cycles.
+      const [health, summaryUsage, summaryAfk, clients, agentRuns] =
         await Promise.allSettled([
           apiFetch('/health'),
-          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
-          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
-          apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=source_created_at&sort_dir=desc'),
+          apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd),
+          apiFetch('/api/v1/afk/dashboard/summary'),
           clientsPromise,
           apiFetch(arUrl),
-          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
-          // Agent Usage panel (issue #438): per-agent aggregate rows from the
-          // group_by=agent query, sharing the dashboard date range and the
-          // parallel-cycle fetchErrors/panelStates handling of the panels above.
-          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=agent'),
-          // AFK Outcomes view (issue #453): the runs list driving the AFK
-          // Outcomes tab.  List-only; the full chain is fetched on demand by
-          // openAfkRunDetail (GET /api/v1/afk-outcomes/runs/{afk_run_id}).
-          apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
-          // Change-request summary list (issue #613): the primary AFK
-          // Outcomes view — one row per provider/repository/change-request
-          // identity from GET /api/v1/afk-outcomes/change-requests, scoped
-          // by the active filters and the shared dashboard date range.
-          // The current page offset is carried through so auto-refresh never
-          // silently resets the list to page 1 (issue #617 review finding).
-          // The limit (page size) comes from the same pagination state as the
-          // offset — afkCrPageSize, not the hardcoded AFK_CR_LIMIT — so a
-          // deep link such as ?limit=50&offset=50 keeps limit=50 on refresh
-          // instead of reverting to limit=100 while offset stays at 50
-          // (issue #617 pagination page-size consistency bug).
-          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize,
-            (afkCrPage - 1) * afkCrPageSize)),
         ]);
 
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
-      results.aggTotal  = aggTotal.status  === 'fulfilled' ? aggTotal.value  : null;
-      results.aggByModel= aggByModel.status=== 'fulfilled' ? aggByModel.value: null;
-      results.records   = records.status   === 'fulfilled' ? records.value   : null;
+      results.summaryUsage = summaryUsage.status === 'fulfilled' ? summaryUsage.value : null;
+      results.summaryAfk = summaryAfk.status === 'fulfilled' ? summaryAfk.value : null;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
-      results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
-      results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
-      results.afkRuns   = afkRuns.status   === 'fulfilled' ? afkRuns.value   : null;
-      results.afkChangeRequests = afkChangeRequests.status === 'fulfilled' ? afkChangeRequests.value : null;
-      afkCrData = results.afkChangeRequests; // latest change-request summary response (issue #613)
 
-      // Track per-endpoint errors
+      // Track per-endpoint errors for summary phase
       fetchErrors = {};
       if (health.status    !== 'fulfilled') fetchErrors.health    = health.reason?.message    || 'Health check failed';
-      if (aggTotal.status  !== 'fulfilled') fetchErrors.aggTotal  = aggTotal.reason?.message  || 'Aggregates (total) failed';
-      if (aggByModel.status!== 'fulfilled') fetchErrors.aggByModel= aggByModel.reason?.message|| 'Aggregates (by model) failed';
-      if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
+      if (summaryUsage.status !== 'fulfilled') fetchErrors.summaryUsage = summaryUsage.reason?.message || 'Usage summary failed';
+      if (summaryAfk.status !== 'fulfilled') fetchErrors.summaryAfk = summaryAfk.reason?.message || 'AFK summary failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
-      fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
-      if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
-      afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
-      afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
+
+      // On subsequent refresh cycles (after first paint), also fetch detail
+      // endpoints in the same parallel block so panels stay fresh.  On the
+      // initial load, detail endpoints are deferred to fetchDetailEndpoints()
+      // which runs after the first render for fast first paint.
+      if (_firstPaintDone) {
+        await fetchDetailEndpoints(aggStart, aggEnd, results);
+      }
 
       // Attach date range for downstream render functions
       results._dateRange = _dateRange;
@@ -1747,6 +1740,155 @@
     }
 
     return results;
+  }
+
+  // ── Issue #739: Deferred detail endpoints ─────────────────────────────
+  // Detail endpoints (aggregates, model/agent/client breakdowns, records,
+  // AFK runs, change requests) are fetched after the first paint for fast
+  // initial load.  On subsequent auto-refresh cycles they are fetched
+  // inline in fetchAll().  Panel open/expand triggers call the individual
+  // fetch functions below for lazy loading.
+
+  /** Fetch all deferred detail endpoints and merge into the results object.
+   *  Called once after the first paint (from refreshDashboard) and on every
+   *  subsequent auto-refresh cycle (from fetchAll when _firstPaintDone).
+   *  Updates fetchErrors and re-resolves panel states when complete. */
+  async function fetchDetailEndpoints(aggStart, aggEnd, results) {
+    try {
+      const [aggTotal, aggByModel, records, aggClientProjectResult, aggByAgent, afkRuns, afkChangeRequests] =
+        await Promise.allSettled([
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd),
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model'),
+          apiFetch('/api/v1/usage/records?start_date=' + aggStart + '&end_date=' + aggEnd + '&limit=' + RECORD_LIMIT + '&sort_by=source_created_at&sort_dir=desc'),
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project'),
+          apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=agent'),
+          apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
+          apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize,
+            (afkCrPage - 1) * afkCrPageSize)),
+        ]);
+
+      results.aggTotal  = aggTotal.status  === 'fulfilled' ? aggTotal.value  : null;
+      results.aggByModel= aggByModel.status=== 'fulfilled' ? aggByModel.value: null;
+      results.records   = records.status   === 'fulfilled' ? records.value   : null;
+      results.aggClientProject = aggClientProjectResult.status === 'fulfilled' ? aggClientProjectResult.value : null;
+      results.aggByAgent = aggByAgent.status === 'fulfilled' ? aggByAgent.value : null;
+      results.afkRuns   = afkRuns.status   === 'fulfilled' ? afkRuns.value   : null;
+      results.afkChangeRequests = afkChangeRequests.status === 'fulfilled' ? afkChangeRequests.value : null;
+      afkCrData = results.afkChangeRequests;
+
+      // Track detail endpoint errors (merged into fetchErrors)
+      if (aggTotal.status  !== 'fulfilled') fetchErrors.aggTotal  = aggTotal.reason?.message  || 'Aggregates (total) failed';
+      if (aggByModel.status!== 'fulfilled') fetchErrors.aggByModel= aggByModel.reason?.message|| 'Aggregates (by model) failed';
+      if (records.status   !== 'fulfilled') fetchErrors.records   = records.reason?.message   || 'Usage records failed';
+      fetchErrors.aggClientProject = aggClientProjectResult.status !== 'fulfilled' ? (aggClientProjectResult.reason?.message || 'Client/project query failed') : null;
+      if (aggByAgent.status!== 'fulfilled') fetchErrors.aggByAgent= aggByAgent.reason?.message || 'Aggregates (by agent) failed';
+      afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
+      afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
+
+      // Re-resolve panel states with detail endpoint errors
+      resolvePanelStatesAfterFetch();
+
+      // Re-render panels that depend on detail data
+      renderKPIs(results);
+      renderModelMix(results);
+      renderAgentsTable(results);
+      renderAgentUsageTable(results);
+      renderClientProjectBreakdown(results);
+      renderAfkOutcomesTable(results.afkRuns);
+      renderRepositorySummaryTable(results.afkRuns);
+      renderChangeRequestList(results.afkRuns);
+      renderUnresolvedRelationshipsPanel(results.afkRuns);
+      renderChangeRequestSummaryTable(results.afkChangeRequests);
+      renderChangeRequestPagination(results.afkChangeRequests);
+    } catch (e) {
+      console.error('Detail endpoints fetch error:', e);
+    }
+  }
+
+  // ── Issue #739: Panel lazy-load functions ─────────────────────────────
+  // These fetch deferred detail data for individual panels on user
+  // interaction (tab open, panel expand).  Each function is idempotent —
+  // the first call fetches and caches; subsequent calls are no-ops.
+
+  /** Fetch AFK run records and change-request list when the AFK Outcomes
+   *  tab is first opened.  Feeds the runs table, repository summary,
+   *  change-request list, and unresolved relationships panel. */
+  async function fetchAfkDetailData() {
+    if (afkDetailFetched) return;
+    afkDetailFetched = true;
+    try {
+      const [afkRuns, afkChangeRequests] = await Promise.allSettled([
+        apiFetch('/api/v1/afk-outcomes/runs?limit=' + AFK_RUN_LIMIT),
+        apiFetch(buildChangeRequestListUrl(afkCrFilters, dateRangeState, afkCrPageSize,
+          (afkCrPage - 1) * afkCrPageSize)),
+      ]);
+      var data = {};
+      data.afkRuns = afkRuns.status === 'fulfilled' ? afkRuns.value : null;
+      data.afkChangeRequests = afkChangeRequests.status === 'fulfilled' ? afkChangeRequests.value : null;
+      afkCrData = data.afkChangeRequests;
+      afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
+      afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
+      renderAfkOutcomesTable(data.afkRuns);
+      renderRepositorySummaryTable(data.afkRuns);
+      renderChangeRequestList(data.afkRuns);
+      renderUnresolvedRelationshipsPanel(data.afkRuns);
+      renderChangeRequestSummaryTable(data.afkChangeRequests);
+      renderChangeRequestPagination(data.afkChangeRequests);
+    } catch (e) {
+      console.error('AFK detail fetch error:', e);
+    }
+  }
+
+  /** Fetch client/project breakdown when the client/project panel is
+   *  first expanded or scrolled into view. */
+  async function fetchClientProjectData() {
+    if (clientProjectFetched) return;
+    clientProjectFetched = true;
+    var _dateRange = resolveDateRange(dateRangeState);
+    var aggStart = _dateRange.startDate.toISOString();
+    var aggEnd = _dateRange.endDate.toISOString();
+    try {
+      var result = await apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=client,project');
+      fetchErrors.aggClientProject = null;
+      renderClientProjectBreakdown({ aggClientProject: result, _dateRange: _dateRange });
+    } catch (e) {
+      fetchErrors.aggClientProject = e.message || 'Client/project query failed';
+      console.error('Client/project detail fetch error:', e);
+    }
+  }
+
+  /** Fetch model breakdown when the model mix panel is first viewed. */
+  async function fetchModelData() {
+    if (modelDetailFetched) return;
+    modelDetailFetched = true;
+    var _dateRange = resolveDateRange(dateRangeState);
+    var aggStart = _dateRange.startDate.toISOString();
+    var aggEnd = _dateRange.endDate.toISOString();
+    try {
+      var result = await apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=model');
+      fetchErrors.aggByModel = null;
+      renderModelMix({ aggByModel: result, _dateRange: _dateRange });
+    } catch (e) {
+      fetchErrors.aggByModel = e.message || 'Aggregates (by model) failed';
+      console.error('Model detail fetch error:', e);
+    }
+  }
+
+  /** Fetch agent breakdown when the agent usage panel is first viewed. */
+  async function fetchAgentUsageData() {
+    if (agentUsageFetched) return;
+    agentUsageFetched = true;
+    var _dateRange = resolveDateRange(dateRangeState);
+    var aggStart = _dateRange.startDate.toISOString();
+    var aggEnd = _dateRange.endDate.toISOString();
+    try {
+      var result = await apiFetch('/api/v1/usage/aggregates?start_date=' + aggStart + '&end_date=' + aggEnd + '&group_by=agent');
+      fetchErrors.aggByAgent = null;
+      renderAgentUsageTable({ aggByAgent: result, _dateRange: _dateRange });
+    } catch (e) {
+      fetchErrors.aggByAgent = e.message || 'Aggregates (by agent) failed';
+      console.error('Agent usage detail fetch error:', e);
+    }
   }
 
   // ── Error handling ────────────────────────────────────────────────────
@@ -1832,19 +1974,19 @@
     els.kpiCollectorsDetail.textContent = kpiSubtitle('kpi-collectors', rangeLabel, lastRefreshedAt);
     els.kpiSourceDbsDetail.textContent = kpiSubtitle('kpi-source-dbs', rangeLabel, lastRefreshedAt);
 
-    // Total tokens from aggregates total row — gated on kpi-tokens (and
-    // kpi-cost, which shares the aggTotal endpoint).
+    // Token Usage and Est. Cost KPIs — prefer summaryUsage (summary
+    // endpoint, available on first paint), fall back to aggTotal (detail
+    // endpoint, available after first paint or on subsequent cycles).
+    // The summary endpoint and aggTotal share the same field names
+    // (total_input_tokens, total_output_tokens, etc.) so
+    // fmtKpiTokenBreakdown works for both.
     if (shouldRenderPanel(panelStates, 'kpi-tokens')) {
-      if (data.aggTotal && data.aggTotal.length > 0) {
-        var t = data.aggTotal[0];
-        // Headline stays Token Usage = input + output (issue #658); the
-        // category breakdown (input/output on line 1, cache read/cache write
-        // on line 2 — zero cache components always visible) renders beneath
-        // the headline from the same already-fetched aggTotal row.
-        var kpiBreakdown = fmtKpiTokenBreakdown(t);
+      var tokenSource = (data.summaryUsage || (data.aggTotal && data.aggTotal[0])) || null;
+      if (tokenSource) {
+        var kpiBreakdown = fmtKpiTokenBreakdown(tokenSource);
         els.kpiTokens.textContent = kpiBreakdown.headline;
         els.kpiTokensBreakdown.innerHTML = kpiBreakdown.lines;
-        els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd);
+        els.kpiCost.textContent = fmtCost(tokenSource.total_estimated_cost_usd);
       }
     }
 
@@ -4325,6 +4467,19 @@
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
+
+      // Issue #739: on the initial load, trigger detail endpoints after the
+      // first paint so KPI cards render immediately from summary data.  On
+      // subsequent cycles fetchAll() already fetched detail endpoints inline.
+      if (!_firstPaintDone) {
+        _firstPaintDone = true;
+        var _dr = data._dateRange || resolveDateRange(dateRangeState);
+        fetchDetailEndpoints(
+          _dr.startDate.toISOString(),
+          _dr.endDate.toISOString(),
+          data
+        );
+      }
     } catch (e) {
       console.error('Dashboard refresh failed:', e);
       showError('Dashboard refresh error: ' + e.message);
@@ -5062,6 +5217,13 @@
       var targetTab = document.getElementById('tab-' + tabName);
       if (targetItem) targetItem.classList.add('active');
       if (targetTab) targetTab.classList.add('active');
+
+      // Issue #739: when the AFK Outcomes tab is activated, trigger the
+      // deferred detail fetch so the runs list and change-request table
+      // populate (they were not fetched during the initial summary phase).
+      if (tabName === 'afk-outcomes' && !afkDetailFetched) {
+        fetchAfkDetailData();
+      }
     }
 
     navItems.forEach(function (item) {
@@ -5320,6 +5482,23 @@
   // change-request summary URL.  Exposed so the Node harness can drive the
   // exact refresh URL-building path and pin the pagination consistency.
   window.fetchAll = fetchAll;
+  // Issue #739: deferred detail endpoints and lazy-load functions — exposed
+  // so the Node test harness can verify that summary endpoints are called
+  // during initial fetchAll() and that detail endpoints are NOT called.
+  window.fetchDetailEndpoints = fetchDetailEndpoints;
+  window.fetchAfkDetailData = fetchAfkDetailData;
+  window.fetchClientProjectData = fetchClientProjectData;
+  window.fetchModelData = fetchModelData;
+  window.fetchAgentUsageData = fetchAgentUsageData;
+  // Setter for the first-paint gate — tests that exercise fetchAll() in a
+  // "subsequent refresh" context set _firstPaintDone = true before calling
+  // fetchAll() so detail endpoints are included in the parallel block.
+  window._setFirstPaintDone = function (v) { _firstPaintDone = !!v; };
+  window._getFirstPaintDone = function () { return _firstPaintDone; };
+  window._setAfkDetailFetched = function (v) { afkDetailFetched = !!v; };
+  window._setClientProjectFetched = function (v) { clientProjectFetched = !!v; };
+  window._setModelDetailFetched = function (v) { modelDetailFetched = !!v; };
+  window._setAgentUsageFetched = function (v) { agentUsageFetched = !!v; };
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;
