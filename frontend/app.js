@@ -1935,7 +1935,12 @@
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
-          apiFetch('/api/v1/afk/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
+          apiFetch(buildAfkDashboardSummaryUrl({
+            from_date: aggStart,
+            to_date: aggEnd,
+            provider: afkDashSummaryFilters.provider || '',
+            repository: afkDashSummaryFilters.repository || ''
+          }, summaryInterval)),
           clientsPromise,
           apiFetch(arUrl),
         ]);
@@ -5891,6 +5896,9 @@
   window._setClientProjectFetched = function (v) { clientProjectFetched = !!v; };
   window._setModelDetailFetched = function (v) { modelDetailFetched = !!v; };
   window._setAgentUsageFetched = function (v) { agentUsageFetched = !!v; };
+  // Issue #732: test setter for AFK Dashboard Summary filter state so the
+  // integration test can verify fetchAll() passes filters into the URL.
+  window._setAfkDashSummaryFilters = function (v) { afkDashSummaryFilters = v || { provider: '', repository: '' }; };
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;

@@ -364,6 +364,59 @@ console.log('\u25B6 Issue #739 — PANEL_ENDPOINTS mapping');
   assert(allOk['afk-change-requests'] === 'ok', 'no errors: afk-change-requests resolves to ok');
 })();
 
+// ── AFK Dashboard Summary: filter wiring (issue #732) ──────────────────────
+
+console.log('\u25B6 Issue #732 — fetchAll() wires AFK Dashboard Summary filters into URL');
+
+(async function () {
+  // Verify that fetchAll() passes the provider/repository filter state
+  // into the AFK summary URL via buildAfkDashboardSummaryUrl(), instead
+  // of using a hardcoded inline URL (the bug fixed in #732).
+  //
+  // Runs as an async IIFE BEFORE the other fetchAll() tests to avoid
+  // race conditions with shared sandbox state.
+
+  // Set non-empty filter state — the key fix for #732
+  W._setAfkDashSummaryFilters({ provider: 'github', repository: 'acme/web-app' });
+  W._setFirstPaintDone(false);
+
+  var fetchedUrls = [];
+  var _prevFetch = main.sandbox.fetch;
+  main.sandbox.fetch = function (url) {
+    fetchedUrls.push(String(url));
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({
+          status: 'ok',
+          data: { items: [], total: 0, total_input_tokens: 0, total_output_tokens: 0, total_estimated_cost_usd: 0, session_count: 0 }
+        });
+      }
+    });
+  };
+
+  await W.fetchAll();
+
+  var afkUrl = fetchedUrls.find(function (u) { return u.indexOf('/api/v1/afk/dashboard/summary') !== -1; });
+  assert(afkUrl !== undefined, 'fetchAll() calls /api/v1/afk/dashboard/summary');
+  assert(afkUrl.indexOf('provider=github') !== -1,
+    'AFK summary URL includes provider filter from afkDashSummaryFilters');
+  assert(afkUrl.indexOf('repository=acme%2Fweb-app') !== -1,
+    'AFK summary URL includes repository filter from afkDashSummaryFilters (URL-encoded)');
+  assert(afkUrl.indexOf('interval=') !== -1,
+    'AFK summary URL includes interval parameter');
+
+  // Verify the URL uses from_date (not the old hardcoded start_date)
+  assert(afkUrl.indexOf('from_date=') !== -1,
+    'AFK summary URL uses from_date parameter');
+  assert(afkUrl.indexOf('start_date=') === -1,
+    'AFK summary URL does not use the old hardcoded start_date');
+
+  // Restore state for subsequent tests
+  main.sandbox.fetch = _prevFetch;
+  W._setFirstPaintDone(false);
+})();
+
 // ── fetchAll() initial load behavior ──────────────────────────────────────
 
 console.log('\u25B6 Issue #739 — fetchAll() initial load: summary only');
