@@ -415,6 +415,26 @@ console.log('\u25B6 Issue #732 — fetchAll() wires AFK Dashboard Summary filter
   // Restore state for subsequent tests
   main.sandbox.fetch = _prevFetch;
   W._setFirstPaintDone(false);
+
+  // Issue #732: verify buildAfkDashboardSummaryUrl passes the interval
+  // value through to the URL (monthly and daily).
+  var monthlyUrl = W.buildAfkDashboardSummaryUrl({
+    from_date: '2026-09-01',
+    to_date: '2026-09-24',
+    provider: 'github',
+    repository: 'acme/web-app'
+  }, 'monthly');
+  assert(monthlyUrl.indexOf('interval=monthly') !== -1,
+    'buildAfkDashboardSummaryUrl includes interval=monthly when interval is monthly');
+
+  var dailyUrl = W.buildAfkDashboardSummaryUrl({
+    from_date: '2026-09-01',
+    to_date: '2026-09-24',
+    provider: 'github',
+    repository: 'acme/web-app'
+  }, 'daily');
+  assert(dailyUrl.indexOf('interval=daily') !== -1,
+    'buildAfkDashboardSummaryUrl includes interval=daily when interval is daily');
 })();
 
 // ── fetchAll() initial load behavior ──────────────────────────────────────

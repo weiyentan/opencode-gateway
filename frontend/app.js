@@ -1913,17 +1913,9 @@
         ? refreshClientCache()
         : Promise.resolve(null);
 
-      // Issue #739: compute summary interval based on date range length.
-      // Daily for ranges up to 90 days, monthly for longer windows.
-      var summaryInterval = 'daily';
-      if (aggStart && aggEnd) {
-        var startDate = new Date(aggStart);
-        var endDate = new Date(aggEnd);
-        var rangeDays = Math.round((endDate - startDate) / (1000 * 60 * 60 * 24));
-        if (rangeDays > 90) {
-          summaryInterval = 'monthly';
-        }
-      }
+      // Issue #732: Use the user's explicit interval selection from the UI.
+      // The dropdown handler updates afkDashInterval; defaults to 'daily'.
+      var summaryInterval = afkDashInterval || 'daily';
 
       // Issue #739: summary endpoints for initial load provide the KPI
       // cards and AFK aggregate metrics.  Detail endpoints (aggregates,
