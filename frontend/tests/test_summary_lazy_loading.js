@@ -108,6 +108,12 @@ elementRegistry['agent-runs-tbody'] = arTbodyEl;
 var agentUsageTbodyEl = makeFakeElement('agent-usage-tbody');
 elementRegistry['agent-usage-tbody'] = agentUsageTbodyEl;
 
+var modelMixChartEl = makeFakeElement('model-mix-chart');
+elementRegistry['model-mix-chart'] = modelMixChartEl;
+
+var agentsTbodyEl = makeFakeElement('agents-tbody');
+elementRegistry['agents-tbody'] = agentsTbodyEl;
+
 var afkRunsTbodyEl = makeFakeElement('afk-runs-tbody');
 var afkDetailOverlayEl = makeFakeElement('afk-detail-overlay');
 var afkDetailTitleEl = makeFakeElement('afk-detail-title');
@@ -438,21 +444,23 @@ console.log('\u25B6 Issue #739 — fetchAll() subsequent refresh: all endpoints'
   var fetchedUrls = [];
   main.sandbox.fetch = function (url) {
     fetchedUrls.push(String(url));
+    var responseData = {};
+    if (url.indexOf('group_by=model') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('group_by=agent') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('group_by=client,project') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('/api/v1/afk-outcomes/runs') !== -1) {
+      responseData = { status: 'ok', data: { items: [], total: 0 } };
+    } else if (url.indexOf('/api/v1/afk-outcomes/change-requests') !== -1) {
+      responseData = { status: 'ok', data: { items: [], total: 0 } };
+    } else {
+      responseData = { status: 'ok', data: { items: [], total: 0, total_input_tokens: 0, total_output_tokens: 0, total_estimated_cost_usd: 0, session_count: 0 } };
+    }
     return Promise.resolve({
       ok: true,
-      json: function () {
-        return Promise.resolve({
-          status: 'ok',
-          data: {
-            items: [],
-            total: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_estimated_cost_usd: 0,
-            session_count: 0
-          }
-        });
-      }
+      json: function () { return Promise.resolve(responseData); }
     });
   };
 
@@ -519,6 +527,97 @@ console.log('\u25B6 Issue #739 — lazy-load functions');
   assert(typeof W.fetchDetailEndpoints === 'function', 'fetchDetailEndpoints is exposed');
   assert(typeof W._setFirstPaintDone === 'function', '_setFirstPaintDone setter is exposed');
   assert(typeof W._getFirstPaintDone === 'function', '_getFirstPaintDone getter is exposed');
+})();
+
+// ── Panel open triggers deferred fetch ────────────────────────────────────
+
+console.log('\u25B6 Issue #739 — panel open triggers deferred fetch');
+
+(function () {
+  // Simulate tab activation: when a tab is activated, the corresponding
+  // deferred fetch function should be called.  We verify this by checking
+  // that the fetch functions are invoked when their respective tab handlers
+  // are triggered.
+
+  // Reset all fetched flags
+  W._setAfkDetailFetched(false);
+  W._setClientProjectFetched(false);
+  W._setModelDetailFetched(false);
+  W._setAgentUsageFetched(false);
+
+  // Save the previous mock so we can restore it after the panel tests.
+  // This is critical: fetchAll() from earlier IIFEs is still pending async
+  // and fetchDetailEndpoints() will use whatever mock is active when it runs.
+  var _prevFetch = main.sandbox.fetch;
+  var panelFetchUrls = [];
+  main.sandbox.fetch = function (url) {
+    panelFetchUrls.push(String(url));
+    var responseData = {};
+    if (url.indexOf('group_by=model') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('group_by=agent') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('group_by=client,project') !== -1) {
+      responseData = { status: 'ok', data: [] };
+    } else if (url.indexOf('/api/v1/afk-outcomes/runs') !== -1) {
+      responseData = { status: 'ok', data: { items: [], total: 0 } };
+    } else if (url.indexOf('/api/v1/afk-outcomes/change-requests') !== -1) {
+      responseData = { status: 'ok', data: { items: [], total: 0 } };
+    } else {
+      responseData = { status: 'ok', data: { items: [], total: 0 } };
+    }
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve(responseData); }
+    });
+  };
+
+  // Test 1: Calling fetchModelData triggers the model aggregate endpoint
+  panelFetchUrls = [];
+  var _urls1 = panelFetchUrls;
+  W.fetchModelData().then(function () {
+    assert(_urls1.some(function (u) { return u.indexOf('group_by=model') !== -1; }),
+      'fetchModelData triggers /api/v1/usage/aggregates?group_by=model');
+  });
+
+  // Test 2: Calling fetchAgentUsageData triggers the agent aggregate endpoint
+  panelFetchUrls = [];
+  var _urls2 = panelFetchUrls;
+  W.fetchAgentUsageData().then(function () {
+    assert(_urls2.some(function (u) { return u.indexOf('group_by=agent') !== -1; }),
+      'fetchAgentUsageData triggers /api/v1/usage/aggregates?group_by=agent');
+  });
+
+  // Test 3: Calling fetchClientProjectData triggers the client,project aggregate endpoint
+  panelFetchUrls = [];
+  var _urls3 = panelFetchUrls;
+  W.fetchClientProjectData().then(function () {
+    assert(_urls3.some(function (u) { return u.indexOf('group_by=client,project') !== -1; }),
+      'fetchClientProjectData triggers /api/v1/usage/aggregates?group_by=client,project');
+  });
+
+  // Test 4: Calling fetchAfkDetailData triggers the AFK outcomes runs endpoint
+  panelFetchUrls = [];
+  var _urls4 = panelFetchUrls;
+  W.fetchAfkDetailData().then(function () {
+    assert(_urls4.some(function (u) { return u.indexOf('/api/v1/afk-outcomes/runs') !== -1; }),
+      'fetchAfkDetailData triggers /api/v1/afk-outcomes/runs');
+  });
+
+  // Test 5: Idempotent guard — calling a lazy-load function a second time
+  // should NOT trigger another fetch (the fetched flag prevents re-fetch).
+  W._setModelDetailFetched(true);
+  panelFetchUrls = [];
+  var _urls5 = panelFetchUrls;
+  W.fetchModelData().then(function () {
+    assert(_urls5.length === 0,
+      'fetchModelData is idempotent: second call does not re-fetch when already fetched');
+  });
+  W._setModelDetailFetched(false);
+
+  // Restore the previous mock so that pending fetchAll() calls from earlier
+  // IIFEs use the correct mock when fetchDetailEndpoints() runs.
+  main.sandbox.fetch = _prevFetch;
 })();
 
 // ── Summary data renders KPI cards ────────────────────────────────────────

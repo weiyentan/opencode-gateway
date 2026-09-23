@@ -1693,6 +1693,18 @@
         ? refreshClientCache()
         : Promise.resolve(null);
 
+      // Issue #739: compute summary interval based on date range length.
+      // Daily for ranges up to 90 days, monthly for longer windows.
+      var summaryInterval = 'daily';
+      if (aggStart && aggEnd) {
+        var startDate = new Date(aggStart);
+        var endDate = new Date(aggEnd);
+        var rangeDays = Math.round((endDate - startDate) / (1000 * 60 * 60 * 24));
+        if (rangeDays > 90) {
+          summaryInterval = 'monthly';
+        }
+      }
+
       // Issue #739: summary endpoints for initial load provide the KPI
       // cards and AFK aggregate metrics.  Detail endpoints (aggregates,
       // model breakdown, records, AFK runs, change requests) are deferred
@@ -1702,8 +1714,8 @@
       const [health, summaryUsage, summaryAfk, clients, agentRuns] =
         await Promise.allSettled([
           apiFetch('/health'),
-          apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd),
-          apiFetch('/api/v1/afk/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd),
+          apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
+          apiFetch('/api/v1/afk/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
           clientsPromise,
           apiFetch(arUrl),
         ]);
