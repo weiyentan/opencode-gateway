@@ -19,6 +19,10 @@ COPY app/core/config.py /app/app/core/config.py
 COPY app/core/afk_dashboard_daily.py /app/app/core/afk_dashboard_daily.py
 COPY app/core/usage_dashboard_daily.py /app/app/core/usage_dashboard_daily.py
 COPY app/core/reporting_aggregates.py /app/app/core/reporting_aggregates.py
+COPY app/core/repository.py /app/app/core/repository.py
+COPY app/core/schemas/__init__.py /app/app/core/schemas/__init__.py
+COPY app/core/schemas/reporting.py /app/app/core/schemas/reporting.py
+COPY app/core/secrets.py /app/app/core/secrets.py
 COPY scripts/__init__.py /app/scripts/__init__.py
 COPY scripts/backfill_client_project_rollup.py /app/scripts/backfill_client_project_rollup.py
 
@@ -29,4 +33,4 @@ ENV PYTHONPATH=/app
 
 USER gateway
 
-RUN python -c "from app.core.afk_dashboard_daily import recompute_bucket; from app.core.config import get_settings; from app.core.usage_dashboard_daily import acquire_bucket_lock, recompute_bucket as ub_recompute; from app.core.reporting_aggregates import AGGREGATE_LOCK_CLASS; from scripts.backfill_client_project_rollup import _get_pool; print('Usage dashboard daily refresh runtime ready')"
+RUN python -c "from app.core.afk_dashboard_daily import recompute_bucket; from app.core.config import get_settings; from app.core.usage_dashboard_daily import acquire_bucket_lock, recompute_bucket as ub_recompute; from app.core.reporting_aggregates import AGGREGATE_LOCK_CLASS; from app.core.repository import normalize_repository_url; from app.core.secrets import redact_dict; from scripts.backfill_client_project_rollup import _get_pool; print('Usage dashboard daily refresh runtime ready')"
