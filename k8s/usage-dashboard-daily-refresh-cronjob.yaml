@@ -1,0 +1,88 @@
+---
+# Kubernetes CronJob for the OpenCode Gateway usage dashboard daily refresh.
+#
+# Recomputes recent usage_dashboard_daily buckets (issue #738) on an
+# hourly schedule, mirroring the existing AFK dashboard daily refresh
+# pattern.  The CronJob uses the dedicated opencode-gateway-afk-dashboard-refresh
+# image which contains asyncpg, Pydantic, and the rollup engine code.
+#
+# The entrypoint script is mounted from a ConfigMap so the refresh
+# logic can be updated without rebuilding the container image.
+#
+#   kubectl apply -f k8s/usage-dashboard-daily-refresh-cronjob.yaml
+#
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: opencode-gateway-usage-dashboard-daily-refresh
+  labels:
+    app: opencode-gateway
+    component: usage-dashboard-daily-refresh
+spec:
+  schedule: "0 * * * *"  # Every hour at minute 0
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        app: opencode-gateway
+        component: usage-dashboard-daily-refresh
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300  # 5 minute timeout
+      template:
+        metadata:
+          labels:
+            app: opencode-gateway
+            component: usage-dashboard-daily-refresh
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: usage-dashboard-daily-refresh
+              image: ${REGISTRY}/opencode-gateway-afk-dashboard-refresh:${IMAGE_TAG}
+              command: ["/bin/sh", "/scripts/refresh.sh"]
+              env:
+                - name: DAYS_BACK
+                  value: "2"
+                - name: GATEWAY_DATABASE_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: opencode-gateway-secrets
+                      key: database-host
+                - name: GATEWAY_DATABASE_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: opencode-gateway-secrets
+                      key: database-port
+                - name: GATEWAY_DATABASE_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: opencode-gateway-secrets
+                      key: database-name
+                - name: GATEWAY_DATABASE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: opencode-gateway-secrets
+                      key: database-user
+                - name: GATEWAY_DATABASE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: opencode-gateway-secrets
+                      key: database-password
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              volumeMounts:
+                - name: refresh-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: refresh-script
+              configMap:
+                name: usage-dashboard-daily-refresh-script
+                defaultMode: 0755
