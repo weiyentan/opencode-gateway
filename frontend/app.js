@@ -150,9 +150,8 @@
   let unresolvedRelationshipsData = null; // latest unresolved relationships data
   let selectedRepo = null;
   let afkOnlyFilter = false;
-  // AFK Dashboard Summary state (issue #732): the latest summary response,
-  // the per-cycle fetch error, and the active filter/interval set.
-  let afkDashSummaryData = null;
+  // AFK Dashboard Summary state (issue #732): the per-cycle fetch error,
+  // and the active filter/interval set.
   let afkDashSummaryFetchError = null;
   let afkDashSummaryFilters = { provider: '', repository: '' };
   let afkDashInterval = 'daily'; // 'daily' | 'monthly'
@@ -1038,15 +1037,28 @@
     applyPanelFreshness('afk-dashboard-summary');
     if (!shouldRenderPanel(panelStates, 'afk-dashboard-summary')) return;
 
+    // Use the API's derived_at as the panel freshness timestamp when the
+    // response carries it (issue #732 review finding R5): the "Updated Xm
+    // ago" label then reflects when the rollup was actually derived, not
+    // when the browser happened to fetch it.  setPanelState repaints the
+    // freshness span through the existing computePanelFreshness path.
+    if (data && data.derived_at) {
+      setPanelState('afk-dashboard-summary', 'ok', new Date(data.derived_at).getTime());
+    }
+
     var tbody = $('afk-dashboard-summary-tbody');
     if (!tbody) return;
+
+    var interval = (data && data.interval) || afkDashInterval;
+    var trendLabel = renderAfkDashboardTrendLabel(interval);
 
     var rows = buildAfkDashboardSummaryRows(data);
     if (rows.length === 0) {
       var errSuffix = afkDashSummaryFetchError
         ? ' <span class="fetch-error" title="' + escHtml(afkDashSummaryFetchError) + '">\u26A0 Fetch error</span>'
         : '';
-      tbody.innerHTML = '<tr><td colspan="12" class="empty-state">No AFK dashboard data' + errSuffix + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="12" class="empty-state">No AFK dashboard data' + errSuffix + '</td></tr>' +
+        '<tr><td colspan="12" class="trend-label">Trend: ' + escHtml(trendLabel) + '</td></tr>';
       return;
     }
 
@@ -1071,6 +1083,33 @@
         '</td>' +
         '</tr>';
     });
+
+    // Totals row: aggregated values across all buckets (issue #732 review
+    // finding — wire aggregateAfkDashboardSummaryBuckets into the render
+    // path).  "All" in the Period column, "--" in Provider/Repository.
+    var agg = aggregateAfkDashboardSummaryBuckets(data && data.buckets);
+    html += '<tr class="totals-row">' +
+      '<td data-label="Period">All</td>' +
+      '<td data-label="Provider">--</td>' +
+      '<td data-label="Repository">--</td>' +
+      '<td data-label="Runs">' + fmtNum(agg.runs_started) + '</td>' +
+      '<td data-label="CR Opened">' + fmtNum(agg.change_requests_opened) + '</td>' +
+      '<td data-label="CR Merged">' + fmtNum(agg.change_requests_merged) + '</td>' +
+      '<td data-label="CR Closed">' + fmtNum(agg.change_requests_closed) + '</td>' +
+      '<td data-label="Executions">' + fmtNum(agg.execution_count) + '</td>' +
+      '<td data-label="Sessions">' + fmtNum(agg.session_count) + '</td>' +
+      '<td data-label="Tokens">' + fmtTokenBreakdownCompact(agg.input_tokens, agg.output_tokens, agg.cache_read_tokens, agg.cache_write_tokens) + '</td>' +
+      '<td data-label="Est. Cost">' + fmtCost(agg.estimated_cost_usd) + '</td>' +
+      '<td data-label="Success / Fail / Cancel">' +
+        '<span class="badge badge-completed">' + fmtNum(agg.successful_execution_count) + '</span> / ' +
+        '<span class="badge badge-failed">' + fmtNum(agg.failed_execution_count) + '</span> / ' +
+        '<span class="badge badge-cancelled">' + fmtNum(agg.cancelled_execution_count) + '</span>' +
+      '</td>' +
+      '</tr>';
+
+    // Trend label row above the data rows (issue #732 review finding —
+    // wire renderAfkDashboardTrendLabel into the render path).
+    html = '<tr><td colspan="12" class="trend-label">Trend: ' + escHtml(trendLabel) + '</td></tr>' + html;
 
     tbody.innerHTML = html;
   }
@@ -5698,6 +5737,10 @@
   window.computePanelFreshness = computePanelFreshness;
   window.shouldRenderPanel = shouldRenderPanel;
   window.resolvePanelStatuses = resolvePanelStatuses;
+  // setPanelState drives the closure's panelStates map (and repaints the
+  // freshness span) — exposed so the Node harness can exercise the
+  // stale-panel early-return path of renderAfkDashboardSummaryTable.
+  window.setPanelState = setPanelState;
   window.formatClockTime = formatClockTime;
   window.kpiSubtitle = kpiSubtitle;
   window.formatAgentRunTimestamp = formatAgentRunTimestamp;

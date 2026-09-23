@@ -142,6 +142,11 @@ var appJsSandbox = null;
   window.renderAfkDashboardSummaryTable = sandboxWindow.renderAfkDashboardSummaryTable;
   window.readAfkDashboardFiltersFromUI = sandboxWindow.readAfkDashboardFiltersFromUI;
   window.renderAfkDashboardTrendLabel = sandboxWindow.renderAfkDashboardTrendLabel;
+  // Panel freshness helpers: shouldRenderPanel (already on the app.js seam)
+  // and setPanelState (drives the closure's panelStates map) let the render
+  // tests exercise the stale-panel early-return path.
+  window.shouldRenderPanel = sandboxWindow.shouldRenderPanel;
+  window.setPanelState = sandboxWindow.setPanelState;
 })();
 
 // ── Simple test runner ──────────────────────────────────────────────────
@@ -283,6 +288,59 @@ console.log('\u25B6 No double-counting across providers');
   assert(agg.session_count === 3, 'cross-provider sum: 2+1=3 sessions');
   assert(agg.input_tokens === 50000, 'cross-provider sum: 30000+20000=50000 input_tokens');
   assert(Math.abs(agg.estimated_cost_usd - 0.43) < 0.01, 'cross-provider cost: 0.25+0.18=0.43');
+})();
+
+// ── Tests: renderAfkDashboardSummaryTable ──────────────────────────────
+
+console.log('\u25B6 renderAfkDashboardSummaryTable');
+
+// Add freshness element to registry: renderAfkDashboardSummaryTable calls
+// applyPanelFreshness, which looks up #freshness-afk-dashboard-summary.
+var freshnessEl = makeFakeElement('freshness-afk-dashboard-summary');
+elementRegistry['freshness-afk-dashboard-summary'] = freshnessEl;
+
+(function () {
+  // Test empty state rendering
+  var data = fixture.emptyResponse();
+  afkDashSummaryTbody.innerHTML = '';
+  window.renderAfkDashboardSummaryTable(data);
+  assert(afkDashSummaryTbody.innerHTML.indexOf('No AFK dashboard data') !== -1, 'empty state renders');
+})();
+
+(function () {
+  // Test with daily fixture data
+  var data = fixture.dailyResponse();
+  afkDashSummaryTbody.innerHTML = '';
+  window.renderAfkDashboardSummaryTable(data);
+  assert(afkDashSummaryTbody.innerHTML.indexOf('acme/web-app') !== -1, 'renders repository name');
+  assert(afkDashSummaryTbody.innerHTML.indexOf('2026-08-01') !== -1, 'renders period_start');
+  // Check totals row exists
+  assert(afkDashSummaryTbody.innerHTML.indexOf('All') !== -1, 'totals row rendered');
+  // Check the totals row carries the aggregated runs_started (3+2=5) and
+  // execution_count (5+4=9) sums
+  assert(afkDashSummaryTbody.innerHTML.indexOf('>5<') !== -1, 'totals row sums runs_started');
+  assert(afkDashSummaryTbody.innerHTML.indexOf('>9<') !== -1, 'totals row sums execution_count');
+  // Check the trend label is rendered from the response interval
+  assert(afkDashSummaryTbody.innerHTML.indexOf('Trend: Daily') !== -1, 'trend label rendered');
+})();
+
+(function () {
+  // Test stale panel behavior: set panel state to stale with prior data,
+  // call renderAfkDashboardSummaryTable, and verify shouldRenderPanel
+  // returns false (so the render function returns early and keeps the
+  // previous content on screen).
+  var data = fixture.dailyResponse();
+  afkDashSummaryTbody.innerHTML = 'prior-content';
+  window.setPanelState('afk-dashboard-summary', 'stale', 500000);
+  assert(window.shouldRenderPanel(
+    { 'afk-dashboard-summary': { status: 'stale', updatedAt: 500000 } },
+    'afk-dashboard-summary') === false,
+    'stale + prior data \u2192 shouldRenderPanel false');
+  window.renderAfkDashboardSummaryTable(data);
+  assert(afkDashSummaryTbody.innerHTML === 'prior-content',
+    'stale panel keeps previous data (render returns early)');
+  // Reset panel state so later renders behave normally
+  window.setPanelState('afk-dashboard-summary', 'ok', Date.now());
 })();
 
 // ── Summary ──────────────────────────────────────────────────────────────

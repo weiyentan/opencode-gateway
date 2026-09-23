@@ -78,3 +78,6 @@ jobs:
 
       - name: Test issue 614 change-request detail
         run: node frontend/tests/issue_614_tests.js
+
+      - name: Test AFK dashboard summary
+        run: node frontend/tests/test_afk_dashboard_summary.js
