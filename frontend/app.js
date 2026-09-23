@@ -88,6 +88,14 @@
     afkDetailBody:   $('afk-detail-body'),
     afkDetailClose:  $('afk-detail-close'),
 
+    // AFK Dashboard Summary (issue #732)
+    afkDashSummaryTbody: $('afk-dashboard-summary-tbody'),
+    afkDashInterval: $('afk-dash-interval'),
+    afkDashFilterProvider: $('afk-dash-filter-provider'),
+    afkDashFilterRepository: $('afk-dash-filter-repository'),
+    afkDashFilterApply: $('afk-dash-filter-apply'),
+    afkDashFilterClear: $('afk-dash-filter-clear'),
+
     // Unresolved Relationships (issue #576)
     unresolvedTbody: $('unresolved-relationships-tbody'),
 
@@ -142,6 +150,12 @@
   let unresolvedRelationshipsData = null; // latest unresolved relationships data
   let selectedRepo = null;
   let afkOnlyFilter = false;
+  // AFK Dashboard Summary state (issue #732): the per-cycle fetch error,
+  // and the active filter/interval set.
+  let afkDashSummaryFetchError = null;
+  let afkDashSummaryFilters = { provider: '', repository: '' };
+  let afkDashInterval = 'daily'; // 'daily' | 'monthly'
+
   // Change-request summary list state (issue #613): the latest summary
   // response, the per-cycle fetch error, and the active filter set (served
   // through the summary contract — never client-side re-filtering).
@@ -240,6 +254,7 @@
     'afk-change-requests': ['summaryAfk'],     // issue #739: summary endpoint
     'unresolved-relationships': ['afkRuns'],
     'afk-cr-list':   ['afkChangeRequests'], // primary change-request view (issue #613)
+    'afk-dashboard-summary': ['summaryAfk'], // AFK dashboard summary (issue #732) — issue #739 summary endpoint
   };
 
   // ── Client metadata cache ─────────────────────────────────────────────
@@ -892,6 +907,211 @@
         }
       });
     });
+  }
+
+  // ── AFK Dashboard Summary helpers (issue #732) ───────────────────────
+  // Consumes GET /api/v1/afk/dashboard/summary for AFK rollup data:
+  // repository-level metrics (runs started, change requests opened/merged/
+  // closed, execution outcomes, sessions, tokens, estimated cost) bucketed
+  // by daily or monthly interval.  Pure helpers — no DOM access — so the
+  // Node test harness exercises them through the window test seam.
+
+  /** Build the AFK Dashboard Summary URL from the active filters, date
+   *  range, and interval.  Pure — no DOM or fetch access.
+   *  @param {Object} filters - { from_date, to_date, provider?, repository? }
+   *  @param {string} interval - 'daily' | 'monthly'
+   *  @returns {string} the API path with query string */
+  function buildAfkDashboardSummaryUrl(filters, interval) {
+    var params = [];
+    if (filters.from_date) params.push('from_date=' + encodeURIComponent(filters.from_date));
+    if (filters.to_date) params.push('to_date=' + encodeURIComponent(filters.to_date));
+    if (filters.provider) params.push('provider=' + encodeURIComponent(filters.provider));
+    if (filters.repository) params.push('repository=' + encodeURIComponent(filters.repository));
+    if (interval) params.push('interval=' + encodeURIComponent(interval));
+    return '/api/v1/afk/dashboard/summary' + (params.length ? '?' + params.join('&') : '');
+  }
+
+  /** Aggregate all buckets into a single totals row.  Ensures metrics are
+   *  not double-counted when multiple provider/repository buckets are
+   *  returned — each bucket's values are additive.
+   *  Pure — no DOM or fetch access.
+   *  @param {Array} buckets - array of bucket objects from the API response
+   *  @returns {Object} aggregated totals */
+  function aggregateAfkDashboardSummaryBuckets(buckets) {
+    var agg = {
+      runs_started: 0,
+      change_requests_opened: 0,
+      change_requests_merged: 0,
+      change_requests_closed: 0,
+      execution_count: 0,
+      successful_execution_count: 0,
+      failed_execution_count: 0,
+      cancelled_execution_count: 0,
+      session_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      estimated_cost_usd: 0
+    };
+    if (!buckets || !Array.isArray(buckets)) return agg;
+    buckets.forEach(function (b) {
+      agg.runs_started += (b.runs_started || 0);
+      agg.change_requests_opened += (b.change_requests_opened || 0);
+      agg.change_requests_merged += (b.change_requests_merged || 0);
+      agg.change_requests_closed += (b.change_requests_closed || 0);
+      agg.execution_count += (b.execution_count || 0);
+      agg.successful_execution_count += (b.successful_execution_count || 0);
+      agg.failed_execution_count += (b.failed_execution_count || 0);
+      agg.cancelled_execution_count += (b.cancelled_execution_count || 0);
+      agg.session_count += (b.session_count || 0);
+      agg.input_tokens += (b.input_tokens || 0);
+      agg.output_tokens += (b.output_tokens || 0);
+      agg.cache_read_tokens += (b.cache_read_tokens || 0);
+      agg.cache_write_tokens += (b.cache_write_tokens || 0);
+      agg.estimated_cost_usd += (b.estimated_cost_usd || 0);
+    });
+    return agg;
+  }
+
+  /** Build display rows from the summary response.  Each bucket becomes
+   *  one row.  Pure — no DOM or fetch access.
+   *  @param {Object|null} data - the full API response
+   *  @returns {Array} rows for rendering */
+  function buildAfkDashboardSummaryRows(data) {
+    if (!data || !data.buckets || !data.buckets.length) return [];
+    return data.buckets.map(function (b) {
+      return {
+        period_start: b.period_start || '--',
+        provider: b.provider || '--',
+        repository: b.repository || '--',
+        runs_started: b.runs_started || 0,
+        change_requests_opened: b.change_requests_opened || 0,
+        change_requests_merged: b.change_requests_merged || 0,
+        change_requests_closed: b.change_requests_closed || 0,
+        execution_count: b.execution_count || 0,
+        successful_execution_count: b.successful_execution_count || 0,
+        failed_execution_count: b.failed_execution_count || 0,
+        cancelled_execution_count: b.cancelled_execution_count || 0,
+        session_count: b.session_count || 0,
+        input_tokens: b.input_tokens || 0,
+        output_tokens: b.output_tokens || 0,
+        cache_read_tokens: b.cache_read_tokens || 0,
+        cache_write_tokens: b.cache_write_tokens || 0,
+        estimated_cost_usd: b.estimated_cost_usd || 0
+      };
+    });
+  }
+
+  /** Derive a human-readable trend label from the interval.
+   *  Pure — no DOM or fetch access.
+   *  @param {string|null} interval
+   *  @returns {string} e.g. "Daily", "Monthly", "--" */
+  function renderAfkDashboardTrendLabel(interval) {
+    if (interval === 'daily') return 'Daily';
+    if (interval === 'monthly') return 'Monthly';
+    return '--';
+  }
+
+  /** Read the AFK Dashboard Summary filter controls from the DOM.
+   *  Pure — returns a plain object; does not mutate state.
+   *  @returns {{ provider: string, repository: string }} */
+  function readAfkDashboardFiltersFromUI() {
+    var filters = {};
+    if (els.afkDashFilterProvider && els.afkDashFilterProvider.value) {
+      filters.provider = els.afkDashFilterProvider.value;
+    }
+    if (els.afkDashFilterRepository && els.afkDashFilterRepository.value) {
+      filters.repository = els.afkDashFilterRepository.value.trim();
+    }
+    return filters;
+  }
+
+  /** Render the AFK Dashboard Summary table: one row per bucket with
+   *  provider, repository, period, runs started, change requests
+   *  (opened/merged/closed), execution outcomes, sessions, token
+   *  breakdown, and estimated cost.  Follows the panel freshness
+   *  conventions: stale panels keep previous data.
+   *  @param {Object|null} data - the full API response */
+  function renderAfkDashboardSummaryTable(data) {
+    applyPanelFreshness('afk-dashboard-summary');
+    if (!shouldRenderPanel(panelStates, 'afk-dashboard-summary')) return;
+
+    // Use the API's derived_at as the panel freshness timestamp when the
+    // response carries it (issue #732 review finding R5): the "Updated Xm
+    // ago" label then reflects when the rollup was actually derived, not
+    // when the browser happened to fetch it.  setPanelState repaints the
+    // freshness span through the existing computePanelFreshness path.
+    if (data && data.derived_at) {
+      setPanelState('afk-dashboard-summary', 'ok', new Date(data.derived_at).getTime());
+    }
+
+    var tbody = $('afk-dashboard-summary-tbody');
+    if (!tbody) return;
+
+    var interval = (data && data.interval) || afkDashInterval;
+    var trendLabel = renderAfkDashboardTrendLabel(interval);
+
+    var rows = buildAfkDashboardSummaryRows(data);
+    if (rows.length === 0) {
+      var errSuffix = afkDashSummaryFetchError
+        ? ' <span class="fetch-error" title="' + escHtml(afkDashSummaryFetchError) + '">\u26A0 Fetch error</span>'
+        : '';
+      tbody.innerHTML = '<tr><td colspan="12" class="empty-state">No AFK dashboard data' + errSuffix + '</td></tr>' +
+        '<tr><td colspan="12" class="trend-label">Trend: ' + escHtml(trendLabel) + '</td></tr>';
+      return;
+    }
+
+    var html = '';
+    rows.forEach(function (r) {
+      html += '<tr>' +
+        '<td data-label="Period">' + escHtml(r.period_start) + '</td>' +
+        '<td data-label="Provider">' + badge(r.provider, 'badge-provider').outerHTML + '</td>' +
+        '<td data-label="Repository">' + escHtml(r.repository) + '</td>' +
+        '<td data-label="Runs">' + fmtNum(r.runs_started) + '</td>' +
+        '<td data-label="CR Opened">' + fmtNum(r.change_requests_opened) + '</td>' +
+        '<td data-label="CR Merged">' + fmtNum(r.change_requests_merged) + '</td>' +
+        '<td data-label="CR Closed">' + fmtNum(r.change_requests_closed) + '</td>' +
+        '<td data-label="Executions">' + fmtNum(r.execution_count) + '</td>' +
+        '<td data-label="Sessions">' + fmtNum(r.session_count) + '</td>' +
+        '<td data-label="Tokens">' + fmtTokenBreakdownCompact(r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_write_tokens) + '</td>' +
+        '<td data-label="Est. Cost">' + fmtCost(r.estimated_cost_usd) + '</td>' +
+        '<td data-label="Success / Fail / Cancel">' +
+          '<span class="badge badge-completed">' + fmtNum(r.successful_execution_count) + '</span> / ' +
+          '<span class="badge badge-failed">' + fmtNum(r.failed_execution_count) + '</span> / ' +
+          '<span class="badge badge-cancelled">' + fmtNum(r.cancelled_execution_count) + '</span>' +
+        '</td>' +
+        '</tr>';
+    });
+
+    // Totals row: aggregated values across all buckets (issue #732 review
+    // finding — wire aggregateAfkDashboardSummaryBuckets into the render
+    // path).  "All" in the Period column, "--" in Provider/Repository.
+    var agg = aggregateAfkDashboardSummaryBuckets(data && data.buckets);
+    html += '<tr class="totals-row">' +
+      '<td data-label="Period">All</td>' +
+      '<td data-label="Provider">--</td>' +
+      '<td data-label="Repository">--</td>' +
+      '<td data-label="Runs">' + fmtNum(agg.runs_started) + '</td>' +
+      '<td data-label="CR Opened">' + fmtNum(agg.change_requests_opened) + '</td>' +
+      '<td data-label="CR Merged">' + fmtNum(agg.change_requests_merged) + '</td>' +
+      '<td data-label="CR Closed">' + fmtNum(agg.change_requests_closed) + '</td>' +
+      '<td data-label="Executions">' + fmtNum(agg.execution_count) + '</td>' +
+      '<td data-label="Sessions">' + fmtNum(agg.session_count) + '</td>' +
+      '<td data-label="Tokens">' + fmtTokenBreakdownCompact(agg.input_tokens, agg.output_tokens, agg.cache_read_tokens, agg.cache_write_tokens) + '</td>' +
+      '<td data-label="Est. Cost">' + fmtCost(agg.estimated_cost_usd) + '</td>' +
+      '<td data-label="Success / Fail / Cancel">' +
+        '<span class="badge badge-completed">' + fmtNum(agg.successful_execution_count) + '</span> / ' +
+        '<span class="badge badge-failed">' + fmtNum(agg.failed_execution_count) + '</span> / ' +
+        '<span class="badge badge-cancelled">' + fmtNum(agg.cancelled_execution_count) + '</span>' +
+      '</td>' +
+      '</tr>';
+
+    // Trend label row above the data rows (issue #732 review finding —
+    // wire renderAfkDashboardTrendLabel into the render path).
+    html = '<tr><td colspan="12" class="trend-label">Trend: ' + escHtml(trendLabel) + '</td></tr>' + html;
+
+    tbody.innerHTML = html;
   }
 
   // ── AFK Change Request List helpers (issue #573) ──────────────────────
@@ -1693,17 +1913,9 @@
         ? refreshClientCache()
         : Promise.resolve(null);
 
-      // Issue #739: compute summary interval based on date range length.
-      // Daily for ranges up to 90 days, monthly for longer windows.
-      var summaryInterval = 'daily';
-      if (aggStart && aggEnd) {
-        var startDate = new Date(aggStart);
-        var endDate = new Date(aggEnd);
-        var rangeDays = Math.round((endDate - startDate) / (1000 * 60 * 60 * 24));
-        if (rangeDays > 90) {
-          summaryInterval = 'monthly';
-        }
-      }
+      // Issue #732: Use the user's explicit interval selection from the UI.
+      // The dropdown handler updates afkDashInterval; defaults to 'daily'.
+      var summaryInterval = afkDashInterval || 'daily';
 
       // Issue #739: summary endpoints for initial load provide the KPI
       // cards and AFK aggregate metrics.  Detail endpoints (aggregates,
@@ -1715,7 +1927,12 @@
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
-          apiFetch('/api/v1/afk/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd + '&interval=' + summaryInterval),
+          apiFetch(buildAfkDashboardSummaryUrl({
+            from_date: aggStart,
+            to_date: aggEnd,
+            provider: afkDashSummaryFilters.provider || '',
+            repository: afkDashSummaryFilters.repository || ''
+          }, summaryInterval)),
           clientsPromise,
           apiFetch(arUrl),
         ]);
@@ -1734,6 +1951,13 @@
       if (summaryAfk.status !== 'fulfilled') fetchErrors.summaryAfk = summaryAfk.reason?.message || 'AFK summary failed';
       if (clients.status   !== 'fulfilled') fetchErrors.clients   = clients.reason?.message   || 'Clients query failed';
       agentRunsFetchError = agentRuns.status !== 'fulfilled' ? (agentRuns.reason?.message || 'Agent runs query failed') : null;
+
+      // AFK Dashboard Summary (issue #732): the eager summaryAfk fetch is
+      // the panel's data channel — mirror its per-cycle error into the
+      // panel's state variable so the empty-state render can surface the
+      // fetch-error suffix (the panel freshness itself resolves through
+      // PANEL_ENDPOINTS['afk-dashboard-summary'] → summaryAfk).
+      afkDashSummaryFetchError = summaryAfk.status !== 'fulfilled' ? (summaryAfk.reason?.message || 'AFK dashboard summary query failed') : null;
 
       // On subsequent refresh cycles (after first paint), also fetch detail
       // endpoints in the same parallel block so panels stay fresh.  On the
@@ -4499,7 +4723,7 @@
    *  A failed panel keeps its previous updatedAt (data on screen is the
    *  previous successful render); a successful one records the cycle time. */
   function resolvePanelStatesAfterFetch() {
-    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError, afkChangeRequests: afkCrFetchError });
+    var errors = Object.assign({}, fetchErrors, { agentRuns: agentRunsFetchError, afkRuns: afkRunsFetchError, afkChangeRequests: afkCrFetchError, afkDashboardSummary: afkDashSummaryFetchError });
     var statuses = resolvePanelStatuses(errors);
     var nowMs = Date.now();
     Object.keys(PANEL_ENDPOINTS).forEach(function (panelId) {
@@ -4554,6 +4778,7 @@
       renderChangeRequestSummaryTable(data.afkChangeRequests); // Change Request list (issue #613) — primary view
       renderChangeRequestPagination(data.afkChangeRequests); // pagination control below the panel
       renderAfkOutcomesTable(data.afkRuns, data.summaryAfk); // AFK Outcomes view (issue #453) — secondary run-centric view
+      renderAfkDashboardSummaryTable(data.summaryAfk); // AFK Dashboard Summary (issue #732)
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
@@ -4845,6 +5070,58 @@
     if (els.arFilterAgent) {
       els.arFilterAgent.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') applyFilters();
+      });
+    }
+  }
+
+  // ── AFK Dashboard Summary filter handlers (issue #732) ────────────────
+  // Apply/Clear buttons and the interval selector drive the summary fetch
+  // through the shared path (buildAfkDashboardSummaryUrl → fetchAll).  The
+  // interval selector updates afkDashInterval and triggers a full refresh;
+  // the provider/repository filters are read from the UI on each fetch cycle.
+
+  /** Apply AFK Dashboard Summary filters from the UI and trigger a refresh.
+   *  Reads the provider, repository, and interval controls into the closure
+   *  state, then re-fetches the dashboard so the summary panel reflects the
+   *  new query scope. */
+  function applyAfkDashboardFilters() {
+    afkDashSummaryFilters = readAfkDashboardFiltersFromUI();
+    if (els.afkDashInterval) {
+      afkDashInterval = els.afkDashInterval.value || 'daily';
+    }
+    refreshDashboard();
+  }
+
+  /** Clear AFK Dashboard Summary filters and trigger a refresh. */
+  function clearAfkDashboardFilters() {
+    afkDashSummaryFilters = { provider: '', repository: '' };
+    if (els.afkDashFilterProvider) els.afkDashFilterProvider.value = '';
+    if (els.afkDashFilterRepository) els.afkDashFilterRepository.value = '';
+    if (els.afkDashInterval) {
+      afkDashInterval = 'daily';
+      els.afkDashInterval.value = 'daily';
+    }
+    refreshDashboard();
+  }
+
+  /** Wire AFK Dashboard Summary filter DOM events: interval change,
+   *  Apply/Clear buttons.  Called from startAutoRefresh. */
+  function setupAfkDashboardSummaryEventHandlers() {
+    if (els.afkDashInterval) {
+      els.afkDashInterval.addEventListener('change', function () {
+        afkDashInterval = els.afkDashInterval.value || 'daily';
+        refreshDashboard();
+      });
+    }
+    if (els.afkDashFilterApply) {
+      els.afkDashFilterApply.addEventListener('click', applyAfkDashboardFilters);
+    }
+    if (els.afkDashFilterClear) {
+      els.afkDashFilterClear.addEventListener('click', clearAfkDashboardFilters);
+    }
+    if (els.afkDashFilterRepository) {
+      els.afkDashFilterRepository.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') applyAfkDashboardFilters();
       });
     }
   }
@@ -5412,6 +5689,7 @@
     setupTranscriptEventHandlers();
     setupTabNavigation();
     setupDateRangeHandlers();
+    setupAfkDashboardSummaryEventHandlers(); // AFK Dashboard Summary (issue #732)
     // Issue #426: read ?page / ?page_size from the URL before the initial
     // fetch so a deep link such as ?page=2&page_size=100 loads the
     // corresponding Agent Runs page on dashboard load.
@@ -5456,6 +5734,10 @@
   window.computePanelFreshness = computePanelFreshness;
   window.shouldRenderPanel = shouldRenderPanel;
   window.resolvePanelStatuses = resolvePanelStatuses;
+  // setPanelState drives the closure's panelStates map (and repaints the
+  // freshness span) — exposed so the Node harness can exercise the
+  // stale-panel early-return path of renderAfkDashboardSummaryTable.
+  window.setPanelState = setPanelState;
   window.formatClockTime = formatClockTime;
   window.kpiSubtitle = kpiSubtitle;
   window.formatAgentRunTimestamp = formatAgentRunTimestamp;
@@ -5606,6 +5888,9 @@
   window._setClientProjectFetched = function (v) { clientProjectFetched = !!v; };
   window._setModelDetailFetched = function (v) { modelDetailFetched = !!v; };
   window._setAgentUsageFetched = function (v) { agentUsageFetched = !!v; };
+  // Issue #732: test setter for AFK Dashboard Summary filter state so the
+  // integration test can verify fetchAll() passes filters into the URL.
+  window._setAfkDashSummaryFilters = function (v) { afkDashSummaryFilters = v || { provider: '', repository: '' }; };
   // Issue #576: relationship state presentation + unresolved-relationships view
   window.fmtRelationshipState = fmtRelationshipState;
   window.renderRelationshipBadge = renderRelationshipBadge;
@@ -5633,5 +5918,14 @@
   window.fmtProvider = fmtProvider;
   window.fmtCacheHitRatio = fmtCacheHitRatio;
   window.fmtTokenBreakdownSection = fmtTokenBreakdownSection;
+  // AFK Dashboard Summary (issue #732): URL builder, bucket aggregator,
+  // row builder, render function, filter reader, and trend label — pure
+  // helpers exercised by the Node harness through the vm-sandbox seam.
+  window.buildAfkDashboardSummaryUrl = buildAfkDashboardSummaryUrl;
+  window.aggregateAfkDashboardSummaryBuckets = aggregateAfkDashboardSummaryBuckets;
+  window.buildAfkDashboardSummaryRows = buildAfkDashboardSummaryRows;
+  window.renderAfkDashboardSummaryTable = renderAfkDashboardSummaryTable;
+  window.readAfkDashboardFiltersFromUI = readAfkDashboardFiltersFromUI;
+  window.renderAfkDashboardTrendLabel = renderAfkDashboardTrendLabel;
 
 })();

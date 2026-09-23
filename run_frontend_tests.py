@@ -10,6 +10,7 @@ tests = [
     'frontend/tests/test_change_request_list.js',
     'frontend/tests/test_change_request_adapters.js',
     'frontend/tests/issue_614_tests.js',
+    'frontend/tests/test_afk_dashboard_summary.js',
 ]
 
 all_pass = True
