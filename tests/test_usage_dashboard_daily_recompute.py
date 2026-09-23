@@ -15,8 +15,6 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
-import pytest
-
 from app.core.usage_dashboard_daily import (
     COMPUTE_QUERIES,
     METRIC_COLUMNS,

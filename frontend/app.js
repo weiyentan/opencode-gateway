@@ -206,6 +206,9 @@
   let clientProjectFetched = false;
   let modelDetailFetched = false;
   let agentUsageFetched = false;
+  // Cached AFK dashboard summary — refreshed each fetchAll() cycle and
+  // passed to renderAfkOutcomesTable for the summary KPI row.
+  let _lastSummaryAfk = null;
 
   // Which fetch endpoint keys feed each panel — used to resolve a panel to
   // 'stale' when any of its endpoints failed in the current refresh cycle.
@@ -1700,7 +1703,7 @@
         await Promise.allSettled([
           apiFetch('/health'),
           apiFetch('/api/v1/usage/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd),
-          apiFetch('/api/v1/afk/dashboard/summary'),
+          apiFetch('/api/v1/afk/dashboard/summary?start_date=' + aggStart + '&end_date=' + aggEnd),
           clientsPromise,
           apiFetch(arUrl),
         ]);
@@ -1708,6 +1711,7 @@
       results.health    = health.status    === 'fulfilled' ? health.value    : null;
       results.summaryUsage = summaryUsage.status === 'fulfilled' ? summaryUsage.value : null;
       results.summaryAfk = summaryAfk.status === 'fulfilled' ? summaryAfk.value : null;
+      _lastSummaryAfk = results.summaryAfk;
       results.clients   = clients.status   === 'fulfilled' ? clients.value   : null;
       results.agentRuns = agentRuns.status === 'fulfilled' ? agentRuns.value : null;
 
@@ -1794,7 +1798,7 @@
       renderAgentsTable(results);
       renderAgentUsageTable(results);
       renderClientProjectBreakdown(results);
-      renderAfkOutcomesTable(results.afkRuns);
+      renderAfkOutcomesTable(results.afkRuns, results.summaryAfk);
       renderRepositorySummaryTable(results.afkRuns);
       renderChangeRequestList(results.afkRuns);
       renderUnresolvedRelationshipsPanel(results.afkRuns);
@@ -1828,7 +1832,7 @@
       afkCrData = data.afkChangeRequests;
       afkRunsFetchError = afkRuns.status !== 'fulfilled' ? (afkRuns.reason?.message || 'AFK runs query failed') : null;
       afkCrFetchError = afkChangeRequests.status !== 'fulfilled' ? (afkChangeRequests.reason?.message || 'Change-request query failed') : null;
-      renderAfkOutcomesTable(data.afkRuns);
+      renderAfkOutcomesTable(data.afkRuns, _lastSummaryAfk);
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns);
@@ -3149,20 +3153,57 @@
    *  Rows open the /runs/{afk_run_id} detail overlay.  Follows the agent-runs
    *  panel conventions: freshness guard, empty/error states, escHtml on every
    *  interpolated value. */
-  function renderAfkOutcomesTable(data) {
+  function renderAfkOutcomesTable(data, summaryAfk) {
     applyPanelFreshness('afk-outcomes');
     if (!shouldRenderPanel(panelStates, 'afk-outcomes')) return; // failed fetch → keep previous rows
+
+    // If summaryAfk data is available, aggregate bucket totals for the
+    // summary KPI row rendered above the runs table.
+    var summaryTotals = null;
+    if (summaryAfk && summaryAfk.buckets && summaryAfk.buckets.length) {
+      summaryTotals = { runsStarted: 0, crOpened: 0, crMerged: 0, executions: 0, sessions: 0 };
+      summaryAfk.buckets.forEach(function (b) {
+        summaryTotals.runsStarted += b.runs_started || 0;
+        summaryTotals.crOpened += b.change_requests_opened || 0;
+        summaryTotals.crMerged += b.change_requests_merged || 0;
+        summaryTotals.executions += b.execution_count || 0;
+        summaryTotals.sessions += b.session_count || 0;
+      });
+    }
 
     var runs = data && data.items;
     if (!runs || runs.length === 0) {
       var errSuffix = afkRunsFetchError
         ? ' <span class="fetch-error" title="' + escHtml(afkRunsFetchError) + '">\u26A0 Fetch error</span>'
         : '';
-      els.afkRunsTbody.innerHTML = '<tr><td colspan="6" class="empty-state">No AFK runs' + errSuffix + '</td></tr>';
+      // Render summary KPI row even when there are no individual runs
+      var summaryHtml = summaryTotals
+        ? '<tr class="afk-summary-row"><td colspan="6" class="afk-summary-kpis">' +
+          '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.runsStarted) + '</strong> runs</span>' +
+          '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.crOpened) + '</strong> CRs opened</span>' +
+          '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.crMerged) + '</strong> CRs merged</span>' +
+          '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.executions) + '</strong> executions</span>' +
+          '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.sessions) + '</strong> sessions</span>' +
+          '</td></tr>'
+        : '';
+      els.afkRunsTbody.innerHTML = summaryHtml +
+        '<tr><td colspan="6" class="empty-state">No AFK runs' + errSuffix + '</td></tr>';
       return;
     }
 
     var html = '';
+
+    // Summary KPI row (when summaryAfk data is available)
+    if (summaryTotals) {
+      html += '<tr class="afk-summary-row"><td colspan="6" class="afk-summary-kpis">' +
+        '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.runsStarted) + '</strong> runs</span>' +
+        '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.crOpened) + '</strong> CRs opened</span>' +
+        '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.crMerged) + '</strong> CRs merged</span>' +
+        '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.executions) + '</strong> executions</span>' +
+        '<span class="afk-kpi"><strong>' + fmtNum(summaryTotals.sessions) + '</strong> sessions</span>' +
+        '</td></tr>';
+    }
+
     runs.forEach(function (r) {
       var runStatusCls = afkRunStatusBadgeClass(r.status);
       var outcomeCls = outcomeStatusBadgeClass(r.outcome_status);
@@ -4500,7 +4541,7 @@
       renderClientProjectBreakdown(data);
       renderChangeRequestSummaryTable(data.afkChangeRequests); // Change Request list (issue #613) — primary view
       renderChangeRequestPagination(data.afkChangeRequests); // pagination control below the panel
-      renderAfkOutcomesTable(data.afkRuns); // AFK Outcomes view (issue #453) — secondary run-centric view
+      renderAfkOutcomesTable(data.afkRuns, data.summaryAfk); // AFK Outcomes view (issue #453) — secondary run-centric view
       renderRepositorySummaryTable(data.afkRuns);
       renderChangeRequestList(data.afkRuns);
       renderUnresolvedRelationshipsPanel(data.afkRuns); // Unresolved relationships (issue #576)
@@ -5255,6 +5296,17 @@
       if (targetItem) targetItem.classList.add('active');
       if (targetTab) targetTab.classList.add('active');
 
+      // Issue #739: when the Overview tab is activated, trigger the
+      // deferred model-mix and agent-usage detail fetch so those panels
+      // populate (they were not fetched during the initial summary phase).
+      if (tabName === 'overview') {
+        if (!modelDetailFetched) {
+          fetchModelData();
+        }
+        if (!agentUsageFetched) {
+          fetchAgentUsageData();
+        }
+      }
       // Issue #739: when the AFK Outcomes tab is activated, trigger the
       // deferred detail fetch so the runs list and change-request table
       // populate (they were not fetched during the initial summary phase).

@@ -123,7 +123,7 @@ _MISMATCH_PREDICATE = "\n         OR ".join(
     f"d.{column} != c.{column}" for column in METRIC_COLUMNS
 )
 
-CANONICAL_AGGREGATE_SQL = f"""
+CANONICAL_AGGREGATE_SQL = """
     SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
            ue.provider AS provider,
            COALESCE(SUM(ue.input_tokens), 0)::int AS input_tokens,

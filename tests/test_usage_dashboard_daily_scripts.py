@@ -16,9 +16,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.core.usage_dashboard_daily import METRIC_COLUMNS
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
