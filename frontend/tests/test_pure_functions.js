@@ -321,6 +321,7 @@ var historyStub = {
   // exercised against the REAL production code.
   window.fmtKpiTokenBreakdown = sandboxWindow.fmtKpiTokenBreakdown;
   window.renderKPIs = sandboxWindow.renderKPIs;
+  window.aggregateSummaryBuckets = sandboxWindow.aggregateSummaryBuckets;
   // Issue #557: provider badge/missing-label, cache hit ratio, and the
   // Token Breakdown detail-section builder join the window test seam.
   window.fmtProvider = sandboxWindow.fmtProvider;
@@ -4249,6 +4250,64 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
 // helpers (fmtKpiTokenBreakdown + renderKPIs) and the fake KPI elements
 // registered above.
 
+console.log('\u25B6 aggregateSummaryBuckets — sums buckets[] into totals');
+
+(function () {
+  if (typeof window.aggregateSummaryBuckets !== 'function') {
+    assert(false, 'app.js: aggregateSummaryBuckets exposed on the window test seam');
+    return;
+  }
+
+  // Multiple buckets: sums input_tokens, output_tokens, cache_read_tokens,
+  // cache_write_tokens, and estimated_cost_usd across all buckets.
+  var multi = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 6000, output_tokens: 3000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 7.00 },
+      { input_tokens: 4000, output_tokens: 2000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 5.34 }
+    ]
+  });
+  assert(multi.total_input_tokens === 10000, 'multi-bucket input_tokens summed');
+  assert(multi.total_output_tokens === 5000, 'multi-bucket output_tokens summed');
+  assert(multi.total_cache_read_tokens === 2000, 'multi-bucket cache_read_tokens summed');
+  assert(multi.total_cache_write_tokens === 1000, 'multi-bucket cache_write_tokens summed');
+  assert(Math.abs(multi.total_estimated_cost_usd - 12.34) < 0.001, 'multi-bucket estimated_cost_usd summed');
+
+  // Single bucket: passes through.
+  var single = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 100, output_tokens: 50, cache_read_tokens: 10, cache_write_tokens: 5, estimated_cost_usd: 0.25 }
+    ]
+  });
+  assert(single.total_input_tokens === 100, 'single-bucket input_tokens');
+  assert(single.total_estimated_cost_usd === 0.25, 'single-bucket estimated_cost_usd');
+
+  // Empty buckets: returns all zeros.
+  var empty = window.aggregateSummaryBuckets({ buckets: [] });
+  assert(empty.total_input_tokens === 0, 'empty buckets: input_tokens is 0');
+  assert(empty.total_estimated_cost_usd === 0, 'empty buckets: cost is 0');
+
+  // Missing/undefined buckets: returns all zeros.
+  var noBuckets = window.aggregateSummaryBuckets({});
+  assert(noBuckets.total_input_tokens === 0, 'missing buckets: input_tokens is 0');
+  assert(noBuckets.total_output_tokens === 0, 'missing buckets: output_tokens is 0');
+
+  // Null input: returns all zeros.
+  var nullInput = window.aggregateSummaryBuckets(null);
+  assert(nullInput.total_input_tokens === 0, 'null summary: input_tokens is 0');
+  assert(nullInput.total_estimated_cost_usd === 0, 'null summary: cost is 0');
+
+  // Buckets with missing fields: treated as 0.
+  var sparse = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 100 },
+      { estimated_cost_usd: 0.50 }
+    ]
+  });
+  assert(sparse.total_input_tokens === 100, 'sparse bucket: input_tokens from first');
+  assert(sparse.total_output_tokens === 0, 'sparse bucket: missing output_tokens treated as 0');
+  assert(sparse.total_estimated_cost_usd === 0.50, 'sparse bucket: cost from second');
+})();
+
 console.log('\u25B6 Token Usage KPI — fmtKpiTokenBreakdown (issue #658)');
 
 (function () {
@@ -4374,6 +4433,24 @@ console.log('\u25B6 Token Usage KPI — renderKPIs writes headline + breakdown +
     'app.js: renderKPIs still gates the Token Usage card on shouldRenderPanel (freshness unchanged)');
   assert(renderSrc.indexOf("els.kpiCost.textContent = fmtCost(tokenSource.total_estimated_cost_usd)") !== -1,
     'app.js: Est. Cost card renders via fmtCost from the summaryUsage or aggTotal source (issue #739)');
+
+  // summaryUsage with buckets[]: renderKPIs aggregates buckets and renders
+  // the same Token Usage headline + Est. Cost as the aggTotal path.
+  window.renderKPIs({
+    summaryUsage: {
+      buckets: [
+        { input_tokens: 30000, output_tokens: 4000, cache_read_tokens: 18000, cache_write_tokens: 3000, estimated_cost_usd: 0.95 },
+        { input_tokens: 8800, output_tokens: 1200, cache_read_tokens: 5400, cache_write_tokens: 1200, estimated_cost_usd: 0.30 }
+      ]
+    }
+  });
+  assert(kpiTokensEl.textContent === fmtNum(38800 + 5200),
+    'render: summaryUsage.buckets[] headline = summed input + output (44.0K)');
+  assert(kpiTokensBreakdownEl.innerHTML.indexOf('38.8K in | 5.2K out') !== -1 &&
+         kpiTokensBreakdownEl.innerHTML.indexOf('23.4K cache read + 4.2K cache write') !== -1,
+    'render: summaryUsage.buckets[] breakdown shows summed category lines');
+  assert(kpiCostEl.textContent === '$1.25',
+    'render: summaryUsage.buckets[] Est. Cost card sums bucket costs ($1.25)');
 })();
 
 // ── AFK Outcomes view (issue #453) ──────────────────────────────────────

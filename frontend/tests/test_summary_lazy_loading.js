@@ -318,8 +318,9 @@ console.log('\u25B6 Issue #739 — source code verification');
   // 5. Summary data used in renderKPIs
   assert(appJsSource.indexOf('summaryUsage') !== -1,
     'app.js: renderKPIs uses summaryUsage data');
-  assert(appJsSource.indexOf("data.summaryUsage || (data.aggTotal && data.aggTotal[0])") !== -1,
-    'app.js: renderKPIs prefers summaryUsage, falls back to aggTotal');
+  assert(appJsSource.indexOf("if (data.summaryUsage)") !== -1 &&
+         appJsSource.indexOf("aggregateSummaryBuckets(data.summaryUsage)") !== -1,
+    'app.js: renderKPIs aggregates summaryUsage.buckets[] and falls back to aggTotal');
 })();
 
 // ── PANEL_ENDPOINTS mapping verification ──────────────────────────────────
@@ -525,23 +526,24 @@ console.log('\u25B6 Issue #739 — lazy-load functions');
 console.log('\u25B6 Issue #739 — renderKPIs with summaryUsage data');
 
 (function () {
-  // renderKPIs should use summaryUsage when available
+  // renderKPIs should use summaryUsage when available.
+  // The backend /dashboard/summary endpoint returns buckets[] with per-bucket
+  // fields (input_tokens, estimated_cost_usd); renderKPIs sums them.
   W.setDateRangeState({ preset: 'this-month' });
   W.renderKPIs({
     summaryUsage: {
-      total_input_tokens: 10000,
-      total_output_tokens: 5000,
-      total_cache_read_tokens: 2000,
-      total_cache_write_tokens: 1000,
-      total_estimated_cost_usd: 12.34
+      buckets: [
+        { input_tokens: 6000, output_tokens: 3000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 7.00 },
+        { input_tokens: 4000, output_tokens: 2000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 5.34 }
+      ]
     },
     _dateRange: { startDate: new Date('2026-09-01'), endDate: new Date('2026-09-24') }
   });
-  // The headline should show Token Usage = input + output = 15K
+  // The headline should show Token Usage = sum(input) + sum(output) = 10K + 5K = 15K
   assert(kpiTokensEl.textContent === '15.0K',
-    'renderKPIs: kpi-tokens headline shows Token Usage from summaryUsage (15.0K)');
+    'renderKPIs: kpi-tokens headline shows Token Usage from summaryUsage buckets (15.0K)');
   assert(kpiCostEl.textContent === '$12.34',
-    'renderKPIs: kpi-cost shows cost from summaryUsage ($12.34)');
+    'renderKPIs: kpi-cost shows cost from summaryUsage buckets ($12.34)');
 })();
 
 // ── Run all tests ─────────────────────────────────────────────────────────

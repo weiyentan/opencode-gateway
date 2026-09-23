@@ -1947,6 +1947,37 @@
     }
   }
 
+  /** Aggregate summaryUsage buckets[] into a totals row compatible with
+   *  fmtKpiTokenBreakdown and cost rendering.  The backend /dashboard/summary
+   *  endpoint returns buckets[] with per-bucket fields (input_tokens,
+   *  estimated_cost_usd, etc.); this sums them into the total_* shape that
+   *  fmtKpiTokenBreakdown and the Est. Cost KPI card expect.
+   *  Pure — no DOM access.
+   *  @param {Object} summary - the summaryUsage response with buckets[]
+   *  @returns {{total_input_tokens, total_output_tokens, total_cache_read_tokens,
+   *             total_cache_write_tokens, total_estimated_cost_usd}}
+   */
+  function aggregateSummaryBuckets(summary) {
+    var buckets = (summary && summary.buckets) || [];
+    var totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    var totalCost = 0;
+    for (var i = 0; i < buckets.length; i++) {
+      var b = buckets[i];
+      totalInput += (b.input_tokens || 0);
+      totalOutput += (b.output_tokens || 0);
+      totalCacheRead += (b.cache_read_tokens || 0);
+      totalCacheWrite += (b.cache_write_tokens || 0);
+      totalCost += (b.estimated_cost_usd || 0);
+    }
+    return {
+      total_input_tokens: totalInput,
+      total_output_tokens: totalOutput,
+      total_cache_read_tokens: totalCacheRead,
+      total_cache_write_tokens: totalCacheWrite,
+      total_estimated_cost_usd: totalCost
+    };
+  }
+
   /** KPI Row — per-card freshness so a single failing endpoint (e.g. aggTotal)
    *  never freezes the entire row (issue N2). */
   function renderKPIs(data) {
@@ -1977,11 +2008,17 @@
     // Token Usage and Est. Cost KPIs — prefer summaryUsage (summary
     // endpoint, available on first paint), fall back to aggTotal (detail
     // endpoint, available after first paint or on subsequent cycles).
-    // The summary endpoint and aggTotal share the same field names
-    // (total_input_tokens, total_output_tokens, etc.) so
-    // fmtKpiTokenBreakdown works for both.
+    // summaryUsage carries a buckets[] array (per-provider, per-period
+    // rows with per-bucket fields like input_tokens, estimated_cost_usd)
+    // that must be summed into totals before rendering.  aggTotal carries
+    // pre-aggregated total_* fields in its first row.
     if (shouldRenderPanel(panelStates, 'kpi-tokens')) {
-      var tokenSource = (data.summaryUsage || (data.aggTotal && data.aggTotal[0])) || null;
+      var tokenSource = null;
+      if (data.summaryUsage) {
+        tokenSource = aggregateSummaryBuckets(data.summaryUsage);
+      } else if (data.aggTotal && data.aggTotal[0]) {
+        tokenSource = data.aggTotal[0];
+      }
       if (tokenSource) {
         var kpiBreakdown = fmtKpiTokenBreakdown(tokenSource);
         els.kpiTokens.textContent = kpiBreakdown.headline;
@@ -5224,6 +5261,11 @@
       if (tabName === 'afk-outcomes' && !afkDetailFetched) {
         fetchAfkDetailData();
       }
+      // Issue #739: when the Clients/Projects tab is activated, trigger
+      // the deferred client/project breakdown fetch.
+      if (tabName === 'clients-projects' && !clientProjectFetched) {
+        fetchClientProjectData();
+      }
     }
 
     navItems.forEach(function (item) {
@@ -5357,6 +5399,7 @@
   // KPI-row renderer — exercised by the Node harness through the same seam.
   window.fmtKpiTokenBreakdown = fmtKpiTokenBreakdown;
   window.renderKPIs = renderKPIs;
+  window.aggregateSummaryBuckets = aggregateSummaryBuckets;
   // Agent Runs date-filter state + Clear control (issue #7) — pure state
   // helper, DOM sync, the Clear action, the filter reader (UTC-boundary
   // conversion regression), and the wiring entry point for the test harness.
