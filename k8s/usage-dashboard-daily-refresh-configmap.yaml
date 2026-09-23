@@ -1,0 +1,205 @@
+---
+# ConfigMap for the usage dashboard daily refresh CronJob.
+#
+# Provides the entrypoint scripts that the CronJob pod executes.
+# The Python script imports the shared rollup engine from the
+# opencode-gateway-afk-dashboard-refresh image and recomputes
+# recent usage_dashboard_daily buckets.
+#
+#   kubectl apply -f k8s/usage-dashboard-daily-refresh-configmap.yaml
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: usage-dashboard-daily-refresh-script
+  labels:
+    app: opencode-gateway
+    component: usage-dashboard-daily-refresh
+data:
+  refresh.sh: |
+    #!/bin/sh
+    set -eu
+    echo "Starting usage_dashboard_daily refresh..."
+    exec python /scripts/refresh_usage_dashboard_daily.py --days-back "${DAYS_BACK:-2}"
+  refresh_usage_dashboard_daily.py: |
+    #!/usr/bin/env python3
+    """Kubernetes CronJob entry point: refresh recent usage_dashboard_daily buckets (issue #738).
+
+    Recomputes the pre-aggregated usage dashboard rollup
+    (usage_dashboard_daily) for a small, configurable window of recent
+    UTC days — by default today and yesterday — by delegating the
+    per-bucket metric computation to the shared recomputation engine
+    in app.core.usage_dashboard_daily.
+
+    Concurrency between refresh runs is prevented with a session-level
+    database advisory lock in the AGGREGATE_LOCK_CLASS (47_006)
+    namespace, acquired with pg_try_advisory_lock.  If another refresh
+    already holds the lock, this process logs and exits 0 immediately
+    — a CronJob overlap is a normal, non-error condition.
+
+    Usage:
+        python /scripts/refresh_usage_dashboard_daily.py [--days-back N] [--as-of YYYY-MM-DD]
+    """
+    from __future__ import annotations
+
+    import argparse
+    import asyncio
+    import logging
+    import sys
+    from datetime import date, datetime, timedelta, timezone
+
+    import asyncpg
+
+    from app.core.usage_dashboard_daily import (  # noqa: E402
+        USAGE_DASHBOARD_LOCK_CLASS,
+        acquire_bucket_lock,
+        recompute_bucket,
+    )
+    from app.core.reporting_aggregates import (  # noqa: E402
+        AGGREGATE_LOCK_CLASS,
+    )
+    from scripts.backfill_client_project_rollup import (  # noqa: E402
+        _get_pool,
+    )
+
+    logger = logging.getLogger("refresh_usage_dashboard_daily")
+
+    DEFAULT_WINDOW_DAYS = 2
+
+    DAILY_REFRESH_LOCK_KEY = 0
+
+    DISCOVERY_SQL = """
+        SELECT DISTINCT ON (day, provider)
+               day, provider
+        FROM (
+            SELECT (ue.reported_at AT TIME ZONE 'UTC')::date AS day,
+                   ue.provider
+            FROM usage_events ue
+            WHERE (ue.reported_at AT TIME ZONE 'UTC')::date BETWEEN $1 AND $2
+        ) all_buckets
+        ORDER BY day, provider
+    """
+
+    def _parse_iso_date(value: str) -> date:
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid date {value!r}; expected YYYY-MM-DD"
+            ) from exc
+
+    def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+        parser = argparse.ArgumentParser(
+            description="Recompute recent usage_dashboard_daily buckets from the "
+            "canonical usage_events table (default: today and yesterday, UTC).",
+        )
+        parser.add_argument(
+            "--days-back",
+            dest="days",
+            type=int,
+            default=DEFAULT_WINDOW_DAYS,
+            help="Number of days to recompute, ending at --as-of "
+            "(default: 2 = today and yesterday).",
+        )
+        parser.add_argument(
+            "--as-of",
+            type=_parse_iso_date,
+            default=None,
+            help="UTC date anchoring the end of the window (default: today, UTC).",
+        )
+        args = parser.parse_args(argv)
+        if args.days < 1:
+            parser.error("--days-back must be >= 1")
+        return args
+
+    def _resolve_window(
+        days: int,
+        as_of: date | None = None,
+    ) -> tuple[date, date]:
+        if days < 1:
+            raise ValueError(f"days must be >= 1, got {days}")
+        end_day = as_of if as_of is not None else datetime.now(timezone.utc).date()
+        start_day = end_day - timedelta(days=days - 1)
+        return start_day, end_day
+
+    async def _try_acquire_refresh_lock(conn: asyncpg.Connection) -> bool:
+        locked: bool = await conn.fetchval(
+            "SELECT pg_try_advisory_lock($1, $2)",
+            AGGREGATE_LOCK_CLASS,
+            DAILY_REFRESH_LOCK_KEY,
+        )
+        return bool(locked)
+
+    async def _release_refresh_lock(conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            "SELECT pg_advisory_unlock($1, $2)",
+            AGGREGATE_LOCK_CLASS,
+            DAILY_REFRESH_LOCK_KEY,
+        )
+
+    async def _run_windowed_recompute(
+        conn: asyncpg.Connection,
+        start_day: date,
+        end_day: date,
+    ) -> int:
+        buckets = await conn.fetch(DISCOVERY_SQL, start_day, end_day)
+        logger.debug(
+            "Discovered %d bucket(s) in %s .. %s (per-bucket lock class %s).",
+            len(buckets),
+            start_day,
+            end_day,
+            USAGE_DASHBOARD_LOCK_CLASS,
+        )
+        recomputed = 0
+        for bucket in buckets:
+            day = bucket["day"]
+            provider = bucket["provider"]
+            async with conn.transaction():
+                await acquire_bucket_lock(conn, day, provider)
+                await recompute_bucket(conn, day, provider)
+            recomputed += 1
+        return recomputed
+
+    async def main(argv: list[str] | None = None) -> int:
+        args = _parse_args(argv)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s:%(name)s:%(message)s",
+        )
+        start_day, end_day = _resolve_window(args.days, args.as_of)
+        logger.info(
+            "Usage dashboard daily refresh window: %s .. %s (%d day(s)).",
+            start_day,
+            end_day,
+            args.days,
+        )
+        pool = await _get_pool()
+        try:
+            async with pool.acquire() as conn:
+                if not await _try_acquire_refresh_lock(conn):
+                    logger.warning(
+                        "Another usage dashboard daily refresh holds the aggregate "
+                        "lock (class=%s key=%s); exiting cleanly.",
+                        AGGREGATE_LOCK_CLASS,
+                        DAILY_REFRESH_LOCK_KEY,
+                    )
+                    return 0
+                try:
+                    recomputed = await _run_windowed_recompute(
+                        conn, start_day, end_day
+                    )
+                    logger.info(
+                        "Recomputed %d usage_dashboard_daily bucket(s) for window "
+                        "%s .. %s.",
+                        recomputed,
+                        start_day,
+                        end_day,
+                    )
+                finally:
+                    await _release_refresh_lock(conn)
+        finally:
+            await pool.close()
+        return 0
+
+    if __name__ == "__main__":
+        sys.exit(asyncio.run(main()))
