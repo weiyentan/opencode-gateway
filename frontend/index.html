@@ -464,6 +464,63 @@
          a disabled state. -->
     <nav class="agent-runs-pagination" id="afk-cr-pagination" aria-label="Change Request pages"></nav>
 
+    <!-- AFK Dashboard Summary (issue #732): repository-level AFK rollup
+         metrics from GET /api/v1/afk/dashboard/summary.  Shows daily or
+         monthly trend buckets with provider, repository, runs started,
+         change requests opened/merged/closed, execution outcomes, sessions,
+         token breakdown, and estimated cost.  Filtered by provider,
+         repository, date range, and interval. -->
+    <section class="glass-panel panel-afk-dashboard-summary">
+      <h2 class="panel-title">AFK Dashboard Summary<span class="panel-freshness" id="freshness-afk-dashboard-summary"></span></h2>
+      <div class="afk-dashboard-summary-controls">
+        <label class="afk-dash-filter">
+          <span>Provider</span>
+          <select id="afk-dash-filter-provider">
+            <option value="">All</option>
+            <option value="github">github</option>
+            <option value="gitlab">gitlab</option>
+          </select>
+        </label>
+        <label class="afk-dash-filter">
+          <span>Repository</span>
+          <input type="text" id="afk-dash-filter-repository" class="afk-dash-filter-repository"
+                 placeholder="owner/repo" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="afk-dash-filter">
+          <span>Interval</span>
+          <select id="afk-dash-interval">
+            <option value="daily" selected>Daily</option>
+            <option value="monthly">Monthly</option>
+          </select>
+        </label>
+        <button type="button" class="filter-clear" id="afk-dash-filter-apply">Apply</button>
+        <button type="button" class="filter-clear" id="afk-dash-filter-clear">Clear</button>
+      </div>
+      <div class="table-scroll">
+        <table id="afk-dashboard-summary-table">
+          <thead>
+            <tr>
+              <th>Period</th>
+              <th>Provider</th>
+              <th>Repository</th>
+              <th>Runs</th>
+              <th>CR Opened</th>
+              <th>CR Merged</th>
+              <th>CR Closed</th>
+              <th>Executions</th>
+              <th>Sessions</th>
+              <th>Tokens</th>
+              <th>Est. Cost</th>
+              <th>Success / Fail / Cancel</th>
+            </tr>
+          </thead>
+          <tbody id="afk-dashboard-summary-tbody">
+            <tr><td colspan="12" class="empty-state">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Repository Summary (issue #572): repository-first entry view -->
     <section class="glass-panel panel-afk-repos">
       <h2 class="panel-title">Repository Summary<span class="panel-freshness" id="freshness-afk-repos"></span></h2>
