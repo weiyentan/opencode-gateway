@@ -87,10 +87,13 @@ def _parse_date(raw: str | None, param_name: str) -> date | None:
     try:
         return date.fromisoformat(raw)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid {param_name}: {raw!r} is not a valid ISO-8601 date",
-        ) from None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid {param_name}: {raw!r} is not a valid ISO-8601 date",
+            ) from None
 
 
 def _require_enum_value(raw: str | None, valid: frozenset[str], param_name: str) -> None:

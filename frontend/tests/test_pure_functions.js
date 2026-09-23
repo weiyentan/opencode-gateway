@@ -321,6 +321,7 @@ var historyStub = {
   // exercised against the REAL production code.
   window.fmtKpiTokenBreakdown = sandboxWindow.fmtKpiTokenBreakdown;
   window.renderKPIs = sandboxWindow.renderKPIs;
+  window.aggregateSummaryBuckets = sandboxWindow.aggregateSummaryBuckets;
   // Issue #557: provider badge/missing-label, cache hit ratio, and the
   // Token Breakdown detail-section builder join the window test seam.
   window.fmtProvider = sandboxWindow.fmtProvider;
@@ -1867,22 +1868,31 @@ console.log('\u25B6 formatAgentRunTimestamp (issue #4)');
 // single failing endpoint never freezes the other cards.  The merged
 // Sessions + Agent Runs view (issue #402) backs the Sessions KPI with the
 // aggregates total row (the /sessions endpoint is no longer fetched), so
-// only an aggTotal failure stales kpi-sessions.
+// only an aggTotal failure stales kpi-sessions.  Issue #739: kpi-tokens
+// and kpi-cost now track freshness through the summaryUsage endpoint.
 console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)');
 
 (function () {
-  // Only aggTotal fails → kpi-tokens, kpi-cost, and kpi-sessions go stale
+  // Only summaryUsage fails → kpi-tokens and kpi-cost go stale (issue #739)
+  var summaryFail = window.resolvePanelStatuses({ summaryUsage: 'boom' });
+  assert(summaryFail['kpi-tokens'] === 'stale', 'summaryUsage fail: kpi-tokens goes stale (issue #739)');
+  assert(summaryFail['kpi-cost'] === 'stale', 'summaryUsage fail: kpi-cost goes stale (issue #739)');
+  assert(summaryFail['kpi-sessions'] === 'ok', 'summaryUsage fail: kpi-sessions stays ok (aggTotal is fine)');
+  assert(summaryFail['kpi-collectors'] === 'ok', 'summaryUsage fail: kpi-collectors stays ok (health is fine)');
+  assert(summaryFail['kpi-source-dbs'] === 'ok', 'summaryUsage fail: kpi-source-dbs stays ok (health is fine)');
+
+  // Only aggTotal fails → kpi-sessions goes stale (kpi-tokens/cost use summaryUsage)
   var aggFail = window.resolvePanelStatuses({ aggTotal: 'boom' });
-  assert(aggFail['kpi-tokens'] === 'stale', 'aggTotal fail: kpi-tokens goes stale');
-  assert(aggFail['kpi-cost'] === 'stale', 'aggTotal fail: kpi-cost goes stale');
+  assert(aggFail['kpi-tokens'] === 'ok', 'aggTotal fail: kpi-tokens stays ok (summaryUsage is fine, issue #739)');
+  assert(aggFail['kpi-cost'] === 'ok', 'aggTotal fail: kpi-cost stays ok (summaryUsage is fine, issue #739)');
   assert(aggFail['kpi-sessions'] === 'stale', 'aggTotal fail: kpi-sessions goes stale (KPI reads the aggregates total row)');
   assert(aggFail['kpi-collectors'] === 'ok', 'aggTotal fail: kpi-collectors stays ok (health is fine)');
   assert(aggFail['kpi-source-dbs'] === 'ok', 'aggTotal fail: kpi-source-dbs stays ok (health is fine)');
 
   // Only health fails → only kpi-collectors and kpi-source-dbs go stale
   var healthFail = window.resolvePanelStatuses({ health: 'down' });
-  assert(healthFail['kpi-tokens'] === 'ok', 'health fail: kpi-tokens stays ok (aggTotal is fine)');
-  assert(healthFail['kpi-cost'] === 'ok', 'health fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(healthFail['kpi-tokens'] === 'ok', 'health fail: kpi-tokens stays ok (summaryUsage is fine)');
+  assert(healthFail['kpi-cost'] === 'ok', 'health fail: kpi-cost stays ok (summaryUsage is fine)');
   assert(healthFail['kpi-sessions'] === 'ok', 'health fail: kpi-sessions stays ok (aggTotal is fine)');
   assert(healthFail['kpi-collectors'] === 'stale', 'health fail: kpi-collectors goes stale');
   assert(healthFail['kpi-source-dbs'] === 'stale', 'health fail: kpi-source-dbs goes stale');
@@ -1891,8 +1901,8 @@ console.log('\u25B6 resolvePanelStatuses — KPI per-card staleness (issue N2)')
   // its previous rows and shows "Showing previous data"; kpi-sessions reads
   // the aggregates total row, not the agent-runs channel)
   var runFail = window.resolvePanelStatuses({ agentRuns: 'boom' });
-  assert(runFail['kpi-tokens'] === 'ok', 'agentRuns fail: kpi-tokens stays ok (aggTotal is fine)');
-  assert(runFail['kpi-cost'] === 'ok', 'agentRuns fail: kpi-cost stays ok (aggTotal is fine)');
+  assert(runFail['kpi-tokens'] === 'ok', 'agentRuns fail: kpi-tokens stays ok (summaryUsage is fine)');
+  assert(runFail['kpi-cost'] === 'ok', 'agentRuns fail: kpi-cost stays ok (summaryUsage is fine)');
   assert(runFail['kpi-sessions'] === 'ok', 'agentRuns fail: kpi-sessions stays ok (aggTotal is fine)');
   assert(runFail['kpi-collectors'] === 'ok', 'agentRuns fail: kpi-collectors stays ok (health is fine)');
   assert(runFail['kpi-source-dbs'] === 'ok', 'agentRuns fail: kpi-source-dbs stays ok (health is fine)');
@@ -4240,6 +4250,94 @@ console.log('\u25B6 Agent Usage — responsive placement CSS (issue #440)');
 // helpers (fmtKpiTokenBreakdown + renderKPIs) and the fake KPI elements
 // registered above.
 
+console.log('\u25B6 aggregateSummaryBuckets — sums buckets[] into totals');
+
+(function () {
+  if (typeof window.aggregateSummaryBuckets !== 'function') {
+    assert(false, 'app.js: aggregateSummaryBuckets exposed on the window test seam');
+    return;
+  }
+
+  // Multiple buckets: sums input_tokens, output_tokens, cache_read_tokens,
+  // cache_write_tokens, and estimated_cost_usd across all buckets.
+  var multi = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 6000, output_tokens: 3000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 7.00 },
+      { input_tokens: 4000, output_tokens: 2000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: 5.34 }
+    ]
+  });
+  assert(multi.total_input_tokens === 10000, 'multi-bucket input_tokens summed');
+  assert(multi.total_output_tokens === 5000, 'multi-bucket output_tokens summed');
+  assert(multi.total_cache_read_tokens === 2000, 'multi-bucket cache_read_tokens summed');
+  assert(multi.total_cache_write_tokens === 1000, 'multi-bucket cache_write_tokens summed');
+  assert(Math.abs(multi.total_estimated_cost_usd - 12.34) < 0.001, 'multi-bucket estimated_cost_usd summed');
+
+  // Single bucket: passes through.
+  var single = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 100, output_tokens: 50, cache_read_tokens: 10, cache_write_tokens: 5, estimated_cost_usd: 0.25 }
+    ]
+  });
+  assert(single.total_input_tokens === 100, 'single-bucket input_tokens');
+  assert(single.total_estimated_cost_usd === 0.25, 'single-bucket estimated_cost_usd');
+
+  // Empty buckets: returns all zeros.
+  var empty = window.aggregateSummaryBuckets({ buckets: [] });
+  assert(empty.total_input_tokens === 0, 'empty buckets: input_tokens is 0');
+  assert(empty.total_estimated_cost_usd === 0, 'empty buckets: cost is 0');
+
+  // Missing/undefined buckets: returns all zeros.
+  var noBuckets = window.aggregateSummaryBuckets({});
+  assert(noBuckets.total_input_tokens === 0, 'missing buckets: input_tokens is 0');
+  assert(noBuckets.total_output_tokens === 0, 'missing buckets: output_tokens is 0');
+
+  // Null input: returns all zeros.
+  var nullInput = window.aggregateSummaryBuckets(null);
+  assert(nullInput.total_input_tokens === 0, 'null summary: input_tokens is 0');
+  assert(nullInput.total_estimated_cost_usd === 0, 'null summary: cost is 0');
+
+  // Buckets with missing fields: treated as 0.
+  var sparse = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 100 },
+      { estimated_cost_usd: 0.50 }
+    ]
+  });
+  assert(sparse.total_input_tokens === 100, 'sparse bucket: input_tokens from first');
+  assert(sparse.total_output_tokens === 0, 'sparse bucket: missing output_tokens treated as 0');
+  assert(sparse.total_estimated_cost_usd === 0.50, 'sparse bucket: cost from second');
+
+  // Backend contract test: Pydantic v2 serializes Decimal as JSON string,
+  // so estimated_cost_usd arrives as "0.25" not 0.25.
+  // aggregateSummaryBuckets must coerce to Number before summing.
+  var stringCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 6000, output_tokens: 3000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: "0.25" },
+      { input_tokens: 4000, output_tokens: 2000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: "0.30" }
+    ]
+  });
+  assert(Math.abs(stringCost.total_estimated_cost_usd - 0.55) < 0.001, 'string-cost: two string values sum correctly');
+  assert(typeof stringCost.total_estimated_cost_usd === 'number', 'string-cost: result is a number, not a string');
+
+  // Mixed numeric and string values (defensive)
+  var mixedCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { estimated_cost_usd: "0.25" },
+      { estimated_cost_usd: 0.30 }
+    ]
+  });
+  assert(Math.abs(mixedCost.total_estimated_cost_usd - 0.55) < 0.001, 'mixed-cost: string and numeric sum correctly');
+
+  // Null/undefined cost in bucket
+  var nullCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { estimated_cost_usd: null },
+      { estimated_cost_usd: "0.50" }
+    ]
+  });
+  assert(Math.abs(nullCost.total_estimated_cost_usd - 0.50) < 0.001, 'null-cost: null treated as 0');
+})();
+
 console.log('\u25B6 Token Usage KPI — fmtKpiTokenBreakdown (issue #658)');
 
 (function () {
@@ -4363,8 +4461,26 @@ console.log('\u25B6 Token Usage KPI — renderKPIs writes headline + breakdown +
     'app.js: renderKPIs writes the date-range subtitle into #kpi-tokens-detail');
   assert(renderSrc.indexOf("shouldRenderPanel(panelStates, 'kpi-tokens')") !== -1,
     'app.js: renderKPIs still gates the Token Usage card on shouldRenderPanel (freshness unchanged)');
-  assert(renderSrc.indexOf("els.kpiCost.textContent = fmtCost(t.total_estimated_cost_usd)") !== -1,
-    'app.js: Est. Cost card still renders via fmtCost from the same aggTotal row');
+  assert(renderSrc.indexOf("els.kpiCost.textContent = fmtCost(tokenSource.total_estimated_cost_usd)") !== -1,
+    'app.js: Est. Cost card renders via fmtCost from the summaryUsage or aggTotal source (issue #739)');
+
+  // summaryUsage with buckets[]: renderKPIs aggregates buckets and renders
+  // the same Token Usage headline + Est. Cost as the aggTotal path.
+  window.renderKPIs({
+    summaryUsage: {
+      buckets: [
+        { input_tokens: 30000, output_tokens: 4000, cache_read_tokens: 18000, cache_write_tokens: 3000, estimated_cost_usd: 0.95 },
+        { input_tokens: 8800, output_tokens: 1200, cache_read_tokens: 5400, cache_write_tokens: 1200, estimated_cost_usd: 0.30 }
+      ]
+    }
+  });
+  assert(kpiTokensEl.textContent === fmtNum(38800 + 5200),
+    'render: summaryUsage.buckets[] headline = summed input + output (44.0K)');
+  assert(kpiTokensBreakdownEl.innerHTML.indexOf('38.8K in | 5.2K out') !== -1 &&
+         kpiTokensBreakdownEl.innerHTML.indexOf('23.4K cache read + 4.2K cache write') !== -1,
+    'render: summaryUsage.buckets[] breakdown shows summed category lines');
+  assert(kpiCostEl.textContent === '$1.25',
+    'render: summaryUsage.buckets[] Est. Cost card sums bucket costs ($1.25)');
 })();
 
 // ── AFK Outcomes view (issue #453) ──────────────────────────────────────
@@ -4620,25 +4736,30 @@ console.log('\u25B6 AFK Outcomes — chain detail + runs-list rendering (issue #
     'runs list renders the empty state');
 })();
 
-// A failed /afk-outcomes/runs fetch must mark ONLY the AFK Outcomes panel
-// stale (via the PANEL_ENDPOINTS mapping + the afkRunsFetchError channel),
-// so the panel retains its last successful rows with the stale/error
-// indicator — matching the established convention for every other panel
-// (acceptance criterion 4).  Mirrors the Agent Usage panel isolation test.
-console.log('\u25B6 AFK Outcomes — panel status isolation on afkRuns failure (issue #453)');
+// A failed /api/v1/afk/dashboard/summary fetch must mark ONLY the AFK
+// Outcomes panel stale (via the PANEL_ENDPOINTS mapping — issue #739 maps
+// afk-outcomes to summaryAfk), so the panel retains its last successful
+// rows with the stale/error indicator — matching the established convention
+// for every other panel (acceptance criterion 4).  Mirrors the Agent Usage
+// panel isolation test.
+console.log('\u25B6 AFK Outcomes — panel status isolation on summaryAfk failure (issue #739)');
 
 (function () {
-  var afkFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
-  assert(afkFail['afk-outcomes'] === 'stale',
-    'afkRuns failure: the AFK Outcomes panel resolves to stale (PANEL_ENDPOINTS entry)');
+  var summaryAfkFail = window.resolvePanelStatuses({ summaryAfk: 'boom' });
+  assert(summaryAfkFail['afk-outcomes'] === 'stale',
+    'summaryAfk failure: the AFK Outcomes panel resolves to stale (PANEL_ENDPOINTS entry, issue #739)');
+  assert(summaryAfkFail['afk-repos'] === 'stale',
+    'summaryAfk failure: the AFK Repos panel resolves to stale (PANEL_ENDPOINTS entry, issue #739)');
+  assert(summaryAfkFail['afk-change-requests'] === 'stale',
+    'summaryAfk failure: the AFK Change Requests panel resolves to stale (PANEL_ENDPOINTS entry, issue #739)');
   ['kpi-tokens', 'kpi-cost', 'kpi-sessions', 'kpi-collectors', 'kpi-source-dbs',
    'model-mix', 'events', 'collector-dist', 'collectors', 'agents', 'agent-usage', 'agent-runs', 'client-project']
     .forEach(function (panelId) {
-      assert(afkFail[panelId] === 'ok',
-        'afkRuns failure: unrelated panel "' + panelId + '" stays ok');
+      assert(summaryAfkFail[panelId] === 'ok',
+        'summaryAfk failure: unrelated panel "' + panelId + '" stays ok');
     });
 
-  // No afkRuns error \u2192 the panel is ok (freshness resolves normally)
+  // No summaryAfk error → the panel is ok (freshness resolves normally)
   var allOk = window.resolvePanelStatuses({});
   assert(allOk['afk-outcomes'] === 'ok', 'no errors: the AFK Outcomes panel resolves to ok');
 
@@ -4647,8 +4768,9 @@ console.log('\u25B6 AFK Outcomes — panel status isolation on afkRuns failure (
          window.resolvePanelStatuses({ health: 'down' })['afk-outcomes'] === 'ok' &&
          window.resolvePanelStatuses({ agentRuns: 'boom' })['afk-outcomes'] === 'ok' &&
          window.resolvePanelStatuses({ aggClientProject: 'boom' })['afk-outcomes'] === 'ok' &&
-         window.resolvePanelStatuses({ aggByAgent: 'boom' })['afk-outcomes'] === 'ok',
-    'model/health/agent-runs/client-project/agent failures leave the AFK Outcomes panel ok');
+         window.resolvePanelStatuses({ aggByAgent: 'boom' })['afk-outcomes'] === 'ok' &&
+         window.resolvePanelStatuses({ afkRuns: 'boom' })['afk-outcomes'] === 'ok',
+    'model/health/agent-runs/client-project/agent/afkRuns failures leave the AFK Outcomes panel ok (summaryAfk is the freshness key, issue #739)');
 })();
 
 console.log('\u25B6 AFK Outcomes — last-successful-rows retention + stale indicator (issue #453)');
@@ -4913,9 +5035,9 @@ console.log('\u25B6 issue #577 \u2014 repository summary: empty period');
 console.log('\u25B6 issue #577 \u2014 repository summary: API error isolation');
 
 (function () {
-  var afkFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
-  assert(afkFail['afk-outcomes'] === 'stale',
-    'API error: afkRuns failure stales AFK Outcomes panel');
+  var summaryAfkFail = window.resolvePanelStatuses({ summaryAfk: 'boom' });
+  assert(summaryAfkFail['afk-outcomes'] === 'stale',
+    'API error: summaryAfk failure stales AFK Outcomes panel (issue #739)');
   assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: 500000 } }, 'afk-outcomes') === false,
     'API error: stale panel with previous data skips re-render');
   assert(window.shouldRenderPanel({ 'afk-outcomes': { status: 'stale', updatedAt: null } }, 'afk-outcomes') === true,
@@ -5336,13 +5458,14 @@ console.log('\u25B6 issue #577 \u2014 stale-on-error: panel status map');
 
 (function () {
   // Stale-on-error: the panel status map correctly propagates stale state
-  // through shouldRenderPanel + computePanelFreshness
+  // through shouldRenderPanel + computePanelFreshness.  Issue #739:
+  // afk-outcomes now tracks summaryAfk, not afkRuns.
   var states = { 'afk-outcomes': { status: 'ok', updatedAt: 999000 } };
   states['afk-outcomes'] = {
-    status: window.resolvePanelStatuses({ afkRuns: 'boom' })['afk-outcomes'],
+    status: window.resolvePanelStatuses({ summaryAfk: 'boom' })['afk-outcomes'],
     updatedAt: states['afk-outcomes'].updatedAt
   };
-  assert(states['afk-outcomes'].status === 'stale', 'stale-on-error: panel status is stale');
+  assert(states['afk-outcomes'].status === 'stale', 'stale-on-error: panel status is stale (summaryAfk failure, issue #739)');
   assert(window.shouldRenderPanel(states, 'afk-outcomes') === false,
     'stale-on-error: shouldRenderPanel returns false');
   var fresh = window.computePanelFreshness(states, 'afk-outcomes', 1000000);
@@ -6549,10 +6672,19 @@ console.log('\u25B6 issue #576 \u2014 unresolved view panel freshness + stale/er
 
 (function () {
   // The unresolved-relationships panel follows the same PANEL_ENDPOINTS
-  // freshness convention as every other panel.
+  // freshness convention as every other panel.  Issue #739: afk-outcomes
+  // now tracks summaryAfk, not afkRuns.  afkRuns failure stales only
+  // unresolved-relationships (which still maps to afkRuns).
   var unresolvedFail = window.resolvePanelStatuses({ afkRuns: 'boom' });
-  assert(unresolvedFail['afk-outcomes'] === 'stale',
-    'afkRuns failure: the AFK Outcomes panel (including unresolved) goes stale');
+  assert(unresolvedFail['afk-outcomes'] === 'ok',
+    'afkRuns failure: the AFK Outcomes panel stays ok (tracks summaryAfk, issue #739)');
+  assert(unresolvedFail['unresolved-relationships'] === 'stale',
+    'afkRuns failure: the unresolved-relationships panel goes stale');
+
+  // summaryAfk failure stales afk-outcomes, afk-repos, afk-change-requests
+  var summaryAfkFail = window.resolvePanelStatuses({ summaryAfk: 'boom' });
+  assert(summaryAfkFail['afk-outcomes'] === 'stale',
+    'summaryAfk failure: the AFK Outcomes panel goes stale (issue #739)');
 
   // Stale panel with previous data: shouldRenderPanel returns false
   assert(window.shouldRenderPanel(

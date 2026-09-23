@@ -11,8 +11,9 @@ import contextlib
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Union
 
 import asyncpg
@@ -42,6 +43,7 @@ from app.core.telemetry import timed_operation, timeout_operation
 from app.core.timeouts import db_timeout as _db_timeout
 from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
+from pydantic import BaseModel as _BaseModel, Field as _Field
 
 logger = logging.getLogger(__name__)
 
@@ -2514,5 +2516,256 @@ async def get_records_with_context(
             limit,
             offset,
             settings.grafana_base_url,
+            db_timeout_seconds=settings.database_timeout_seconds,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Usage Dashboard summary (issue #736)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ── Schemas (inline — allowed_paths is app/api/usage.py only) ────────────
+
+
+class _UsageSummaryInterval(str, Enum):  # noqa: UP042
+    """The bucket granularity of a usage summary query."""
+
+    DAILY = "daily"
+    MONTHLY = "monthly"
+
+
+class _UsageDashboardSummaryBucket(_BaseModel):
+    """One aggregated summary bucket — a day (``daily``) or a month
+    (``monthly``) for one ``provider``.
+    """
+
+    period_start: date = _Field(
+        description="Bucket start: the day (daily) or first of the month (monthly)"
+    )
+    provider: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    estimated_cost_usd: Decimal = _Field(
+        default=Decimal("0"), description="Summed estimated cost in USD"
+    )
+    derived_at: datetime | None = _Field(
+        default=None,
+        description="Latest rollup recompute observed for this bucket",
+    )
+    oldest_derived_at: datetime | None = _Field(
+        default=None,
+        description="Oldest rollup recompute observed for this bucket (freshness floor)",
+    )
+
+
+class _UsageDashboardSummary(_BaseModel):
+    """The Usage Dashboard summary response.
+
+    Carries the effective query (``interval``, resolved ``from_date`` /
+    ``to_date``) and the ordered buckets.  ``derived_at`` is the latest
+    rollup recompute across the returned buckets — the freshness marker —
+    and is ``None`` when the window contains no data.
+    """
+
+    interval: str = _Field(description="daily | monthly")
+    from_date: date
+    to_date: date
+    buckets: list[_UsageDashboardSummaryBucket] = _Field(default_factory=list)
+    derived_at: datetime | None = _Field(
+        default=None,
+        description="Latest rollup recompute across the returned buckets",
+    )
+    oldest_derived_at: datetime | None = _Field(
+        default=None,
+        description="Oldest rollup recompute across the returned buckets (freshness floor)",
+    )
+
+
+# ── Usage Dashboard helpers ─────────────────────────────────────────────
+
+_USAGE_DASHBOARD_DEFAULT_WINDOW_DAYS = 30
+
+_USAGE_DASHBOARD_METRIC_COLUMNS = """
+    COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+    COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+    COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+    COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
+    COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+    MAX(derived_at) AS derived_at,
+    MIN(derived_at) AS oldest_derived_at
+"""
+
+
+def _usage_dashboard_parse_date(
+    raw: str | None, param_name: str
+) -> date | None:
+    """Parse an ISO-8601 date query param, raising 400 on malformed values."""
+    if raw is None:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid {param_name}: {raw!r} is not a valid ISO-8601 date",
+            ) from None
+
+
+def _usage_dashboard_resolve_date_range(
+    from_raw: date | None,
+    to_raw: date | None,
+    *,
+    today: date,
+) -> tuple[date, date]:
+    """Resolve the effective ``(from_date, to_date)`` window.
+
+    An omitted ``to_date`` defaults to today; an omitted ``from_date``
+    defaults to a 30-calendar-day inclusive window ending at the resolved
+    ``to_date``.  Both sides are validated in order (from <= to).
+    """
+    to_date = to_raw or today
+    from_date = from_raw or (to_date - timedelta(days=_USAGE_DASHBOARD_DEFAULT_WINDOW_DAYS - 1))
+    if from_date > to_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid date range: from_date must not be after to_date",
+        )
+    return from_date, to_date
+
+
+def _usage_dashboard_period_expression(interval: str) -> str:
+    """The SQL expression producing a bucket's start day for *interval*."""
+    if interval == _UsageSummaryInterval.MONTHLY.value:
+        return "date_trunc('month', day)::date"
+    return "day"
+
+
+def _usage_dashboard_build_filters(
+    from_date: date,
+    to_date: date,
+) -> tuple[str, list[object]]:
+    """Build the WHERE clause and parameter list for the summary query."""
+    params: list[object] = [from_date, to_date]
+    filters: list[str] = ["day >= $1", "day <= $2"]
+    return " AND ".join(filters), params
+
+
+def _usage_dashboard_bucket(row: asyncpg.Record) -> _UsageDashboardSummaryBucket:
+    """Build a bucket from an aggregated row."""
+    return _UsageDashboardSummaryBucket(
+        period_start=row["period_start"],
+        provider=row["provider"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        cache_read_tokens=row["cache_read_tokens"],
+        cache_write_tokens=row["cache_write_tokens"],
+        estimated_cost_usd=row["estimated_cost_usd"],
+        derived_at=row["derived_at"],
+        oldest_derived_at=row["oldest_derived_at"],
+    )
+
+
+async def _usage_dashboard_fetch_summary(
+    conn: asyncpg.Connection,
+    interval: str,
+    from_date: date,
+    to_date: date,
+    *,
+    db_timeout_seconds: int,
+) -> _UsageDashboardSummary:
+    """Run the grouped, parameterised summary query and shape the response."""
+    period = _usage_dashboard_period_expression(interval)
+    where_clause, params = _usage_dashboard_build_filters(from_date, to_date)
+    sql = f"""
+        SELECT
+            {period} AS period_start,
+            provider,
+            {_USAGE_DASHBOARD_METRIC_COLUMNS}
+        FROM usage_dashboard_daily
+        WHERE {where_clause}
+        GROUP BY {period}, provider
+        ORDER BY period_start ASC, provider ASC
+    """
+    async with timed_operation("db.query.usage_dashboard.summary", "db"):
+        async with _db_timeout(
+            "db.query.usage_dashboard.summary", db_timeout_seconds
+        ):
+            rows = await conn.fetch(sql, *params)
+
+    buckets = [_usage_dashboard_bucket(row) for row in rows]
+    derived_values = [b.derived_at for b in buckets if b.derived_at is not None]
+    oldest_values = [b.oldest_derived_at for b in buckets if b.oldest_derived_at is not None]
+    return _UsageDashboardSummary(
+        interval=interval,
+        from_date=from_date,
+        to_date=to_date,
+        buckets=buckets,
+        derived_at=max(derived_values) if derived_values else None,
+        oldest_derived_at=min(oldest_values) if oldest_values else None,
+    )
+
+
+# ── Usage Dashboard endpoint ────────────────────────────────────────────
+
+
+@router.get("/dashboard/summary")
+async def get_usage_dashboard_summary(
+    request: Request,
+    from_date: str | None = Query(default=None),
+    to_date: str | None = Query(default=None),
+    start_date: str | None = Query(default=None),
+    end_date: str | None = Query(default=None),
+    interval: str = Query(default=_UsageSummaryInterval.DAILY.value),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> _UsageDashboardSummary:
+    """Return the Usage Dashboard summary for the requested window and interval.
+
+    Reads from the ``usage_dashboard_daily`` rollup table, providing fast
+    additive usage metrics for the Overview tab.
+
+    Filters: the date range ``from_date`` / ``to_date``
+    (``start_date`` / ``end_date`` are accepted as aliases; an explicit
+    ``from_date`` / ``to_date`` wins).  The range defaults to the last 30
+    calendar days, and ``interval`` (``daily`` | ``monthly``) selects the
+    bucket granularity — ``monthly`` sums the daily rows at query time.
+
+    The response is a :class:`_UsageDashboardSummary` with the ordered
+    buckets and the ``derived_at`` freshness marker (latest rollup recompute
+    across the returned buckets, ``None`` when empty).
+    """
+    if interval not in (m.value for m in _UsageSummaryInterval):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid interval: {interval!r}. "
+                f"Valid values: {', '.join(sorted(m.value for m in _UsageSummaryInterval))}"
+            ),
+        )
+
+    from_date_dt = _usage_dashboard_parse_date(
+        from_date if from_date is not None else start_date, "from_date"
+    )
+    to_date_dt = _usage_dashboard_parse_date(
+        to_date if to_date is not None else end_date, "to_date"
+    )
+    resolved_from, resolved_to = _usage_dashboard_resolve_date_range(
+        from_date_dt,
+        to_date_dt,
+        today=_utcnow().date(),
+    )
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        return await _usage_dashboard_fetch_summary(
+            conn,
+            interval,
+            resolved_from,
+            resolved_to,
             db_timeout_seconds=settings.database_timeout_seconds,
         )
