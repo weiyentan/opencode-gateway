@@ -239,6 +239,50 @@ class TestMonthlySummary:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+class TestISODateTimeParams:
+    """Frontend sends full ISO datetime strings (e.g. from Date.toISOString())."""
+
+    @pytest.mark.asyncio
+    async def test_iso_datetime_strings_accepted(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                _PATH,
+                params={
+                    "start_date": "2026-09-01T00:00:00.000Z",
+                    "end_date": "2026-09-24T14:30:00.123Z",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["from_date"] == "2026-09-01"
+        assert data["to_date"] == "2026-09-24"
+
+    @pytest.mark.asyncio
+    async def test_mixed_date_and_datetime_params(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetch = AsyncMock(return_value=[])
+
+        async with client as c:
+            response = await c.get(
+                _PATH,
+                params={
+                    "from_date": "2026-08-01",
+                    "to_date": "2026-09-24T14:30:00.123Z",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["from_date"] == "2026-08-01"
+        assert data["to_date"] == "2026-09-24"
+
+
 class TestFilters:
     @pytest.mark.asyncio
     async def test_date_range_is_parameterised(

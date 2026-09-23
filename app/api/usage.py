@@ -2608,10 +2608,13 @@ def _usage_dashboard_parse_date(
     try:
         return date.fromisoformat(raw)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid {param_name}: {raw!r} is not a valid ISO-8601 date",
-        ) from None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid {param_name}: {raw!r} is not a valid ISO-8601 date",
+            ) from None
 
 
 def _usage_dashboard_resolve_date_range(
