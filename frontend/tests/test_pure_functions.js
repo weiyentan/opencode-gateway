@@ -4306,6 +4306,36 @@ console.log('\u25B6 aggregateSummaryBuckets — sums buckets[] into totals');
   assert(sparse.total_input_tokens === 100, 'sparse bucket: input_tokens from first');
   assert(sparse.total_output_tokens === 0, 'sparse bucket: missing output_tokens treated as 0');
   assert(sparse.total_estimated_cost_usd === 0.50, 'sparse bucket: cost from second');
+
+  // Backend contract test: Pydantic v2 serializes Decimal as JSON string,
+  // so estimated_cost_usd arrives as "0.25" not 0.25.
+  // aggregateSummaryBuckets must coerce to Number before summing.
+  var stringCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { input_tokens: 6000, output_tokens: 3000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: "0.25" },
+      { input_tokens: 4000, output_tokens: 2000, cache_read_tokens: 1000, cache_write_tokens: 500, estimated_cost_usd: "0.30" }
+    ]
+  });
+  assert(Math.abs(stringCost.total_estimated_cost_usd - 0.55) < 0.001, 'string-cost: two string values sum correctly');
+  assert(typeof stringCost.total_estimated_cost_usd === 'number', 'string-cost: result is a number, not a string');
+
+  // Mixed numeric and string values (defensive)
+  var mixedCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { estimated_cost_usd: "0.25" },
+      { estimated_cost_usd: 0.30 }
+    ]
+  });
+  assert(Math.abs(mixedCost.total_estimated_cost_usd - 0.55) < 0.001, 'mixed-cost: string and numeric sum correctly');
+
+  // Null/undefined cost in bucket
+  var nullCost = window.aggregateSummaryBuckets({
+    buckets: [
+      { estimated_cost_usd: null },
+      { estimated_cost_usd: "0.50" }
+    ]
+  });
+  assert(Math.abs(nullCost.total_estimated_cost_usd - 0.50) < 0.001, 'null-cost: null treated as 0');
 })();
 
 console.log('\u25B6 Token Usage KPI — fmtKpiTokenBreakdown (issue #658)');

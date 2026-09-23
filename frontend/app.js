@@ -1983,7 +1983,7 @@
       totalOutput += (b.output_tokens || 0);
       totalCacheRead += (b.cache_read_tokens || 0);
       totalCacheWrite += (b.cache_write_tokens || 0);
-      totalCost += (b.estimated_cost_usd || 0);
+      totalCost += Number(b.estimated_cost_usd || 0);
     }
     return {
       total_input_tokens: totalInput,
@@ -2521,7 +2521,7 @@
 
       clientMap[clientName].projectRows.push(projectRow);
       clientMap[clientName].totalTokens += tokens;
-      clientMap[clientName].totalCost += (r.total_estimated_cost_usd || 0);
+      clientMap[clientName].totalCost += Number(r.total_estimated_cost_usd || 0);
       clientMap[clientName].totalSessions += (r.session_count || 0);
       clientMap[clientName].totalModels += (r.model_count || 0);
     });
