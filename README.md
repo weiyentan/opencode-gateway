@@ -173,7 +173,7 @@ One logical AFK lifecycle, end to end:
    (1:1 lifecycle ↔ change_request invariant; idempotent, conflicts → 409.)
 
 6. The AFK Run's execution status is projected transactionally from its
-   bindings (ADR 0027); the engineering outcome and cost are read back
+   bindings (ADR 0028); the engineering outcome and cost are read back
    through the AFK Outcomes API together with sessions and provenance.
 ```
 
@@ -969,7 +969,6 @@ opencode-gateway/
 | [0024](docs/adr/0024-awx-execution-binding-history.md) | Preserve AWX Execution Binding History | Accepted |
 | — | *ADR 0025 was skipped (numbering gap)* | — |
 | [0026](docs/adr/0026-afk-run-id-database-relationships.md) | AFK Run ID Database Relationships | Accepted |
-| [0027](docs/adr/0027-transactional-afk-run-status-projection.md) | Project AFK Run Status Transactionally from AWX Executions | Accepted |
 | [0028](docs/adr/0028-change-request-owns-afk-run-lifecycle.md) | Change Request Owns AFK Run Lifecycle | Accepted |
 | [0029](docs/adr/0029-gateway-reporting-boundary.md) | Gateway Remains a Reporting Service | Accepted |
 

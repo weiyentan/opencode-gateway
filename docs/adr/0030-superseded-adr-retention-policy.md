@@ -36,6 +36,7 @@ without stale files in the tree. Recovery is always via git history
 | 0002 | Executor Plugin Interface Design | Observability service refactor (issue #207) — execution-era subsystems removed from the codebase | `git log --all -- docs/adr/0002-executor-plugin-interface.md` |
 | 0003 | Port Allocation in Postgres | Observability service refactor (issue #207) — workspace provisioning and port management removed from the codebase | `git log --all -- docs/adr/0003-postgres-port-allocation.md` |
 | 0020 | Normalized Provider Event Mapping Bridge (Stage 2) | fast-api-eda-gateway ADR 0005 — the producer owns the normalized-event contract; pinned artifacts live in `docs/contracts/normalized-event-v1/` | `git log --all -- docs/adr/0020-normalized-provider-event-mapping-bridge.md` |
+| 0027 | Project AFK Run Status Transactionally from AWX Executions | ADR 0028 — change request owns AFK run lifecycle | `git log --all -- docs/adr/0027-transactional-afk-run-status-projection.md` |
 
 ## Consequences
 
