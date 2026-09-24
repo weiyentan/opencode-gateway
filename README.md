@@ -172,9 +172,9 @@ One logical AFK lifecycle, end to end:
        POST /api/v1/afk/executions/runs/{afk_run_id}/change-request
    (1:1 lifecycle ↔ change_request invariant; idempotent, conflicts → 409.)
 
-6. The AFK Run's execution status is projected transactionally from its
-   bindings (ADR 0028); the engineering outcome and cost are read back
-   through the AFK Outcomes API together with sessions and provenance.
+6. The AFK Run's lifecycle is owned by its change request (ADR 0028); the
+   engineering outcome and cost are read back through the AFK Outcomes API
+   together with sessions and provenance.
 ```
 
 See [ADR 0026](docs/adr/0026-afk-run-id-database-relationships.md) for the
