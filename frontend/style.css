@@ -3025,3 +3025,282 @@ td.clickable:hover {
 .panel-transcript .panel-title {
   margin-bottom: 0.75rem;
 }
+
+/* ── Reference Fidelity production skin (2026-09-30) ───────────────────
+   Keeps the dashboard's production DOM/API contracts while applying the
+   approved Aurora Glass prototype composition. */
+@media (min-width: 901px) {
+  body {
+    padding-left: 188px;
+    background: #030d1f;
+  }
+
+  .top-nav {
+    position: fixed;
+    z-index: 20;
+    inset: 0 auto 0 0;
+    width: 188px;
+    display: flex;
+    flex-direction: column;
+    padding: 18px 12px 104px;
+    border: 0;
+    border-right: 1px solid rgba(77, 138, 218, 0.3);
+    background-image:
+      linear-gradient(180deg, rgba(1, 8, 25, 0.34) 0 12%, rgba(2, 12, 30, 0.82) 28% 51%, rgba(2, 13, 29, 0.25) 68%, rgba(2, 11, 25, 0.86) 100%),
+      url('/aurora-forest.png');
+    background-size: cover, auto 100%;
+    background-position: center, 56% center;
+    background-repeat: no-repeat;
+    backdrop-filter: none;
+  }
+
+  .sidebar-brand {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    min-height: 78px;
+  }
+
+  .sidebar-brand svg {
+    width: 29px;
+    height: 29px;
+    flex: 0 0 auto;
+    fill: none;
+    stroke: var(--accent-cyan);
+    stroke-width: 1.7;
+    stroke-linecap: round;
+  }
+
+  .sidebar-brand svg path:nth-of-type(2) { stroke: var(--accent-indigo); }
+  .sidebar-brand svg path:nth-of-type(3) { stroke: #b18cff; }
+
+  .sidebar-brand span { display: flex; flex-direction: column; }
+  .sidebar-brand strong { max-width: 120px; color: #fff; font-size: 18px; line-height: 1.05; }
+  .sidebar-brand small { margin-top: 6px; color: #b8c5e2; font-size: 10px; }
+
+  .top-nav-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .top-nav-item {
+    gap: 9px;
+    padding: 9px 10px;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    color: #c5cee4;
+    font-size: 0.78rem;
+  }
+
+  .top-nav-item:hover { border-color: rgba(82, 149, 255, 0.32); }
+  .top-nav-item.active {
+    color: #fff;
+    border-color: #3b8cff;
+    background: linear-gradient(90deg, rgba(21, 91, 210, 0.72), rgba(57, 60, 204, 0.38));
+    box-shadow: inset 0 0 18px rgba(45, 113, 255, 0.18), 0 0 14px rgba(33, 96, 255, 0.2);
+  }
+
+  .top-nav-icon,
+  .top-nav-icon svg { width: 16px; height: 16px; }
+
+  .sidebar-meta {
+    position: absolute;
+    inset: auto 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 15px 18px 20px;
+    color: #99a9c8;
+    font-size: 10px;
+    background: rgba(2, 14, 31, 0.72);
+    backdrop-filter: blur(5px);
+  }
+
+  .sidebar-meta strong { color: #eef4ff; font-size: 12px; }
+  .sidebar-meta i {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--status-healthy);
+    box-shadow: 0 0 8px var(--status-healthy);
+  }
+
+  .sidebar-gateway-status { display: flex; align-items: center; }
+  .sidebar-gateway-status.degraded i {
+    background: var(--status-stale);
+    box-shadow: 0 0 8px var(--status-stale);
+  }
+  .sidebar-gateway-status.disconnected i {
+    background: var(--status-error);
+    box-shadow: 0 0 8px var(--status-error);
+  }
+
+  .app-layout { min-height: calc(100vh - 75px); }
+  .footer { margin-left: 0; }
+}
+
+/* ── Reference Fidelity shared overrides ────────────────────────────────
+   Production skin shared by all viewports.  Placed AFTER the base
+   stylesheet so these declarations win via source-order cascade. */
+.header {
+  min-height: 96px;
+  padding: 18px 20px 15px 24px;
+  align-items: flex-start;
+  background-image:
+    linear-gradient(180deg, rgba(2, 15, 37, 0.2), rgba(3, 14, 31, 0.82) 82%, transparent),
+    url('/aurora-forest.png');
+  background-size: cover, cover;
+  background-position: center, center 20%;
+  border-bottom-color: rgba(77, 138, 218, 0.2);
+}
+
+.header-left { flex-direction: column; align-items: flex-start; gap: 3px; }
+.logo {
+  font-size: 2.5rem;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: -0.035em;
+}
+.subtitle { color: #bac6e6; font-size: 0.9rem; }
+.header-right { align-items: flex-start; padding-top: 2px; }
+.live-indicator,
+.db-status { border: 1px solid rgba(74, 222, 128, 0.28); }
+
+.dashboard {
+  max-width: none;
+  padding: 14px 14px 34px;
+}
+
+.date-range-bar {
+  justify-content: flex-end;
+  width: max-content;
+  margin-left: auto;
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(8, 28, 54, 0.62);
+}
+
+.dr-preset,
+.dr-date-input { padding-top: 6px; padding-bottom: 6px; }
+
+.kpi-row {
+  grid-template-columns: 1.52fr 1.3fr 1fr 0.98fr 1.02fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.kpi-card {
+  min-height: 158px;
+  gap: 4px;
+  padding: 15px 16px 12px;
+  overflow: hidden;
+  border-radius: 8px;
+  border-color: var(--kpi-accent);
+  box-shadow: inset 0 0 28px rgba(38, 116, 255, 0.08), 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.kpi-card::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  bottom: 20px;
+  width: 45%;
+  height: 44px;
+  opacity: 0.72;
+  background: linear-gradient(145deg, transparent 8%, var(--kpi-accent) 9% 11%, transparent 12% 23%, var(--kpi-accent) 24% 27%, transparent 28% 38%, var(--kpi-accent) 39% 42%, transparent 43% 55%, var(--kpi-accent) 56% 59%, transparent 60%);
+  clip-path: polygon(0 74%, 13% 55%, 25% 62%, 38% 25%, 52% 44%, 66% 12%, 80% 31%, 100% 0, 100% 100%, 0 100%);
+  filter: drop-shadow(0 0 5px var(--kpi-accent));
+}
+
+.kpi-card:nth-child(1) { --kpi-accent: #5ef2ff; background: radial-gradient(circle at 92% 18%, rgba(0, 212, 255, 0.32), transparent 43%), linear-gradient(135deg, rgba(21, 53, 129, 0.82), rgba(0, 107, 129, 0.42)); }
+.kpi-card:nth-child(2) { --kpi-accent: #ffd86f; background: radial-gradient(circle at 94% 14%, rgba(255, 195, 44, 0.25), transparent 44%), linear-gradient(135deg, rgba(22, 49, 75, 0.9), rgba(103, 78, 12, 0.42)); }
+.kpi-card:nth-child(3) { --kpi-accent: #8fa0ff; background: radial-gradient(circle at 90% 85%, rgba(172, 47, 255, 0.32), transparent 42%), linear-gradient(135deg, rgba(28, 42, 102, 0.88), rgba(28, 48, 129, 0.58)); }
+.kpi-card:nth-child(4) { --kpi-accent: #4ade80; background: radial-gradient(circle at 84% 85%, rgba(0, 197, 108, 0.27), transparent 44%), linear-gradient(135deg, rgba(12, 73, 84, 0.84), rgba(31, 67, 91, 0.68)); }
+.kpi-card:nth-child(5) { --kpi-accent: #ff75d7; background: radial-gradient(circle at 82% 72%, rgba(244, 55, 221, 0.28), transparent 46%), linear-gradient(135deg, rgba(65, 25, 91, 0.86), rgba(51, 35, 85, 0.7)); }
+.kpi-source-dbs::after { display: none; }
+
+.kpi-label {
+  color: #c7d2ed;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+}
+.kpi-label::before {
+  content: '';
+  display: inline-block;
+  width: 15px;
+  height: 15px;
+  margin-right: 8px;
+  border: 2px solid var(--kpi-accent);
+  border-radius: 50%;
+  vertical-align: -3px;
+  box-shadow: 0 0 10px var(--kpi-accent);
+}
+.kpi-value {
+  color: var(--kpi-accent) !important;
+  font-size: 2.2rem;
+  text-shadow: 0 0 18px color-mix(in srgb, var(--kpi-accent) 65%, transparent);
+}
+.kpi-sub { max-width: 65%; color: #d2daec; font-size: 0.72rem; }
+.kpi-breakdown { max-width: 68%; color: #aebbd2; font-size: 0.68rem; }
+
+.content-grid { gap: 12px; margin-bottom: 14px; }
+.col-left,
+.col-right { gap: 12px; }
+.glass-panel {
+  padding: 12px 16px;
+  border-color: rgba(55, 138, 207, 0.54);
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(11, 34, 60, 0.9), rgba(5, 21, 42, 0.82));
+  box-shadow: inset 0 0 28px rgba(14, 105, 170, 0.08), 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+.panel-title { margin-bottom: 10px; color: #f2f5ff; font-size: 1.15rem; }
+.panel-freshness { color: #8798be; font-size: 0.72rem; }
+
+.chart-bar-row { grid-template-columns: 185px minmax(80px, 1fr) 52px; gap: 10px; }
+.chart-bar-track { height: 17px; border-radius: 10px; background: rgba(20, 55, 96, 0.38); }
+.chart-bar-fill { border-radius: 10px; background: linear-gradient(90deg, #48e8eb, #7a70ff) !important; }
+.chart-bar-row:nth-child(2) .chart-bar-fill { background: linear-gradient(90deg, #54dff1, #f04fd1) !important; }
+.chart-bar-row:nth-child(3) .chart-bar-fill { background: linear-gradient(90deg, #ef68e3, #ffd06c) !important; }
+.chart-bar-row:nth-child(4) .chart-bar-fill { background: linear-gradient(90deg, #30dae5, #40f0b1) !important; }
+
+th { color: #aebbd6; }
+td { color: #cbd4e8; }
+.badge-merged {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+@media (max-width: 900px) {
+  .sidebar-brand,
+  .sidebar-meta { display: none; }
+  .header { min-height: auto; padding: 12px 12px 10px; }
+  .logo { font-size: 1.55rem; }
+  .subtitle { display: none; }
+  .header-right { gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+  .timestamp,
+  .last-refreshed { font-size: 0.68rem; }
+  .dashboard { padding: 10px 10px 90px; }
+  .date-range-bar { justify-content: flex-start; width: auto; margin-left: 0; }
+  .kpi-row { grid-template-columns: 1fr 1fr; gap: 9px; }
+  .kpi-card { min-height: 126px; padding: 11px 12px; }
+  .kpi-card:nth-child(5) { grid-column: 1 / -1; min-height: 76px; }
+  .kpi-value { font-size: 1.85rem; }
+  .kpi-sub,
+  .kpi-breakdown { font-size: 0.65rem; }
+  .content-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .db-status { display: none; }
+  .header-right { max-width: 58%; }
+  .date-range-bar { padding: 7px; }
+  .dr-preset { min-width: 132px; }
+  .kpi-label { font-size: 0.62rem; }
+  .kpi-label::before { width: 12px; height: 12px; margin-right: 5px; }
+}

@@ -38,6 +38,8 @@
     timestamp:      $('timestamp'),
     lastRefreshed:  $('last-refreshed'),
     dbStatus:       $('db-status'),
+    sidebarGatewayStatus: $('sidebar-gateway-status'),
+    sidebarGatewayStatusLabel: $('sidebar-gateway-status-label'),
     versionFooter:  $('footer-version'),
 
     // KPIs
@@ -2151,6 +2153,12 @@
 
   // ── Rendering ─────────────────────────────────────────────────────────
 
+  function gatewayConnectionState(health) {
+    if (!health) return { label: 'Unavailable', className: 'disconnected' };
+    if (health.database !== 'connected') return { label: 'Degraded', className: 'degraded' };
+    return { label: 'Connected', className: 'connected' };
+  }
+
   function renderHeader(data) {
     var now = new Date();
     els.timestamp.textContent = now.toLocaleString('en-US', {
@@ -2158,6 +2166,12 @@
       hour: '2-digit', minute: '2-digit', second: '2-digit',
       hour12: false
     });
+
+    var gatewayState = gatewayConnectionState(data.health);
+    if (els.sidebarGatewayStatus && els.sidebarGatewayStatusLabel) {
+      els.sidebarGatewayStatus.className = 'sidebar-gateway-status ' + gatewayState.className;
+      els.sidebarGatewayStatusLabel.textContent = gatewayState.label;
+    }
 
     if (data.health) {
       var h = data.health;
@@ -5911,6 +5925,8 @@
   window.renderTranscriptList = renderTranscriptList;
   // Read-only accessor for the last COMPLETED refresh cycle time — reusable
   // by follow-up work (issue #358) without reaching into module state.
+  window.gatewayConnectionState = gatewayConnectionState;
+  window.renderHeader = renderHeader;
   window.getLastRefreshedAt = function () { return lastRefreshedAt; };
   // Provider + token-breakdown helpers (issue #557): provider badge/missing
   // label, cache hit ratio, and the Token Breakdown detail-section builder —

@@ -96,6 +96,23 @@ elementRegistry['ar-filter-to'] = arFilterToEl;
 elementRegistry['ar-filter-clear'] = arFilterClearEl;
 elementRegistry['agent-runs-tbody'] = arTbodyEl;
 
+// Header and sidebar health indicators. renderHeader updates both surfaces
+// from the same health response so the sidebar never reports a static state.
+var liveIndicatorEl = makeFakeElement('live-indicator');
+var timestampEl = makeFakeElement('timestamp');
+var lastRefreshedEl = makeFakeElement('last-refreshed');
+var dbStatusEl = makeFakeElement('db-status');
+var footerVersionEl = makeFakeElement('footer-version');
+var sidebarGatewayStatusEl = makeFakeElement('sidebar-gateway-status');
+var sidebarGatewayStatusLabelEl = makeFakeElement('sidebar-gateway-status-label');
+elementRegistry['live-indicator'] = liveIndicatorEl;
+elementRegistry['timestamp'] = timestampEl;
+elementRegistry['last-refreshed'] = lastRefreshedEl;
+elementRegistry['db-status'] = dbStatusEl;
+elementRegistry['footer-version'] = footerVersionEl;
+elementRegistry['sidebar-gateway-status'] = sidebarGatewayStatusEl;
+elementRegistry['sidebar-gateway-status-label'] = sidebarGatewayStatusLabelEl;
+
 // Agent Usage panel tbody fake (issue #438): renderAgentUsageTable writes its
 // dynamic per-agent rows into this element.  Registered before loadRealAppJs
 // so app.js captures the ref in els like the other table fakes.
@@ -313,6 +330,8 @@ var historyStub = {
   window.shouldRenderPanel = sandboxWindow.shouldRenderPanel;
   window.resolvePanelStatuses = sandboxWindow.resolvePanelStatuses;
   window.formatClockTime = sandboxWindow.formatClockTime;
+  window.gatewayConnectionState = sandboxWindow.gatewayConnectionState;
+  window.renderHeader = sandboxWindow.renderHeader;
   window.getLastRefreshedAt = sandboxWindow.getLastRefreshedAt;
   window.kpiSubtitle = sandboxWindow.kpiSubtitle;
   window.formatAgentRunTimestamp = sandboxWindow.formatAgentRunTimestamp;
@@ -1762,6 +1781,30 @@ console.log('\u25B6 header last-refreshed clock (issue #357)');
   assert(window.formatClockTime(d) === '03:04:05', 'formatClockTime renders HH:MM:SS (03:04:05)');
   var e = new Date(2026, 6, 6, 23, 59, 59);
   assert(window.formatClockTime(e) === '23:59:59', 'formatClockTime renders HH:MM:SS (23:59:59)');
+})();
+
+console.log('\u25B6 sidebar Gateway connection state');
+
+(function () {
+  var connected = window.gatewayConnectionState({ database: 'connected' });
+  var degraded = window.gatewayConnectionState({ database: 'disconnected' });
+  var unavailable = window.gatewayConnectionState(null);
+  assert(connected.label === 'Connected' && connected.className === 'connected',
+    'sidebar status: healthy Gateway is connected');
+  assert(degraded.label === 'Degraded' && degraded.className === 'degraded',
+    'sidebar status: reachable Gateway with unavailable database is degraded');
+  assert(unavailable.label === 'Unavailable' && unavailable.className === 'disconnected',
+    'sidebar status: failed health request is unavailable');
+
+  window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [] } });
+  assert(sidebarGatewayStatusLabelEl.textContent === 'Connected' &&
+         sidebarGatewayStatusEl.className === 'sidebar-gateway-status connected',
+    'renderHeader: successful health response updates the sidebar status');
+
+  window.renderHeader({ health: null });
+  assert(sidebarGatewayStatusLabelEl.textContent === 'Unavailable' &&
+         sidebarGatewayStatusEl.className === 'sidebar-gateway-status disconnected',
+    'renderHeader: failed health response marks the sidebar unavailable');
 })();
 
 // ── KPI subtitle split (issue #358) ─────────────────────────────────────
