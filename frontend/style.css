@@ -3203,25 +3203,11 @@ td.clickable:hover {
   box-shadow: inset 0 0 28px rgba(38, 116, 255, 0.08), 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 
-.kpi-card::after {
-  content: '';
-  position: absolute;
-  right: 10px;
-  bottom: 20px;
-  width: 45%;
-  height: 44px;
-  opacity: 0.72;
-  background: linear-gradient(145deg, transparent 8%, var(--kpi-accent) 9% 11%, transparent 12% 23%, var(--kpi-accent) 24% 27%, transparent 28% 38%, var(--kpi-accent) 39% 42%, transparent 43% 55%, var(--kpi-accent) 56% 59%, transparent 60%);
-  clip-path: polygon(0 74%, 13% 55%, 25% 62%, 38% 25%, 52% 44%, 66% 12%, 80% 31%, 100% 0, 100% 100%, 0 100%);
-  filter: drop-shadow(0 0 5px var(--kpi-accent));
-}
-
 .kpi-card:nth-child(1) { --kpi-accent: #5ef2ff; background: radial-gradient(circle at 92% 18%, rgba(0, 212, 255, 0.32), transparent 43%), linear-gradient(135deg, rgba(21, 53, 129, 0.82), rgba(0, 107, 129, 0.42)); }
 .kpi-card:nth-child(2) { --kpi-accent: #ffd86f; background: radial-gradient(circle at 94% 14%, rgba(255, 195, 44, 0.25), transparent 44%), linear-gradient(135deg, rgba(22, 49, 75, 0.9), rgba(103, 78, 12, 0.42)); }
 .kpi-card:nth-child(3) { --kpi-accent: #8fa0ff; background: radial-gradient(circle at 90% 85%, rgba(172, 47, 255, 0.32), transparent 42%), linear-gradient(135deg, rgba(28, 42, 102, 0.88), rgba(28, 48, 129, 0.58)); }
 .kpi-card:nth-child(4) { --kpi-accent: #4ade80; background: radial-gradient(circle at 84% 85%, rgba(0, 197, 108, 0.27), transparent 44%), linear-gradient(135deg, rgba(12, 73, 84, 0.84), rgba(31, 67, 91, 0.68)); }
 .kpi-card:nth-child(5) { --kpi-accent: #ff75d7; background: radial-gradient(circle at 82% 72%, rgba(244, 55, 221, 0.28), transparent 46%), linear-gradient(135deg, rgba(65, 25, 91, 0.86), rgba(51, 35, 85, 0.7)); }
-.kpi-source-dbs::after { display: none; }
 
 .kpi-label {
   color: #c7d2ed;
