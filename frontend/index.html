@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="refresh-interval" content="30000">
   <title>Aurora Glass &mdash; OpenCode Gateway</title>
-  <link rel="stylesheet" href="/style.css?v=20260811-cache-control">
+  <link rel="stylesheet" href="/style.css?v=20260930-aurora-reference">
 </head>
 <body>
 
@@ -14,7 +14,7 @@
   <header class="header">
     <div class="header-left">
       <h1 class="logo">Aurora Glass</h1>
-      <span class="subtitle">OpenCode Gateway Observability</span>
+      <span class="subtitle">AI usage. Real activity. Real outcomes.</span>
     </div>
     <div class="header-right">
       <span class="live-indicator" id="live-indicator">LIVE</span>
@@ -27,6 +27,15 @@
   <div class="app-layout">
     <!-- Top Navigation -->
     <nav class="top-nav" id="top-nav">
+      <div class="sidebar-brand" aria-label="OpenCode Gateway">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="2" y="2" width="28" height="28" rx="8"></rect>
+          <path d="M8 20 C11 10 16 12 17 16"></path>
+          <path d="M13 23 C16 15 20 16 21 19"></path>
+          <path d="M18 26 C21 20 24 20 25 22"></path>
+        </svg>
+        <span><strong>OpenCode Gateway</strong><small>Aurora Glass</small></span>
+      </div>
       <ul class="top-nav-list">
         <li class="top-nav-item active" data-tab="overview" tabindex="0">
           <span class="top-nav-icon" aria-hidden="true">
@@ -84,6 +93,11 @@
           <span class="top-nav-label">Transcript</span>
         </li>
       </ul>
+      <div class="sidebar-meta" aria-hidden="true">
+        <strong>Gateway</strong>
+        <span><i></i> Connected</span>
+        <span>Auto-refresh every 30s</span>
+      </div>
     </nav>
 
   <main class="dashboard">
