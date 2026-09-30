@@ -3128,6 +3128,16 @@ td.clickable:hover {
     box-shadow: 0 0 8px var(--status-healthy);
   }
 
+  .sidebar-gateway-status { display: flex; align-items: center; }
+  .sidebar-gateway-status.degraded i {
+    background: var(--status-stale);
+    box-shadow: 0 0 8px var(--status-stale);
+  }
+  .sidebar-gateway-status.disconnected i {
+    background: var(--status-error);
+    box-shadow: 0 0 8px var(--status-error);
+  }
+
   .app-layout { min-height: calc(100vh - 75px); }
   .footer { margin-left: 0; }
 }

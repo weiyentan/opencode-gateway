@@ -44,9 +44,9 @@ class TestFrontendFilesExist:
         assert "Aurora Glass" in content
 
     def test_index_html_contains_correct_subtitle(self):
-        """The subtitle should read 'OpenCode Gateway Observability'."""
+        """The subtitle should use the approved Aurora reference copy."""
         content = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
-        assert "OpenCode Gateway Observability" in content
+        assert "AI usage. Real activity. Real outcomes." in content
 
 
 class TestMergedDashboardView:
