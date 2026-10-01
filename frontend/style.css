@@ -824,6 +824,21 @@ body {
 .dist-bar-stale   { background: var(--status-stale); }
 .dist-bar-unknown { background: var(--status-unknown); }
 
+/* Liveness-first: status + heartbeat recency are the primary signals; the
+   cumulative record count (.dist-tokens) is secondary context only. */
+.dist-status {
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.dist-heartbeat {
+  min-width: 90px;
+  font-size: 0.74rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .dist-tokens {
   min-width: 80px;
   font-size: 0.74rem;
