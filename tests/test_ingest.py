@@ -1108,13 +1108,18 @@ class TestHealthExtended:
         mock_conn3 = AsyncMock()  # for source-db summary
         mock_conn4 = AsyncMock()  # for last ingest timestamp
 
-        # Collector summary row
+        # Collector summary signal row (issue #750: client-level rows; the
+        # query returns one row per non-revoked credential). The client name
+        # carries the remote-collector prefix so the row survives the #749
+        # qualifying-client filter and is surfaced in the response.
         cs_row = MagicMock()
         cs_row.__getitem__.side_effect = {
             "credential_id": _CREDENTIAL_ID,
-            "client_name": "test-client",
-            "last_heartbeat": _mk_ts(),
-            "total_records_ingested": 10,
+            "client_id": _CREDENTIAL_ID,
+            "client_name": "remote-collector-test",
+            "credential_last_heartbeat": _mk_ts(),
+            "credential_records": 10,
+            "source_last_seen": None,
         }.__getitem__
 
         # Source-db summary row
