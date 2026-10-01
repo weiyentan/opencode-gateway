@@ -1,6 +1,7 @@
 """Tests for the GET /health endpoint."""
 
-from unittest.mock import AsyncMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -117,3 +118,118 @@ class TestHealthDatabaseDisconnected:
         assert response.status_code == 200
         payload = response.json()
         assert payload["data"]["database"] == "disconnected"
+
+
+def _collector_row(credential_id: str, client_name: str, last_heartbeat, total: int):
+    """Build an asyncpg-record-like mock row for the collector-health query."""
+    row = MagicMock()
+    row.__getitem__.side_effect = {
+        "credential_id": credential_id,
+        "client_name": client_name,
+        "last_heartbeat": last_heartbeat,
+        "total_records_ingested": total,
+    }.__getitem__
+    return row
+
+
+def _health_client_with_collector_rows(rows):
+    """Return an httpx client whose pool serves the given collector rows.
+
+    The first conn.fetch call (collector summary) returns `rows`; the
+    second (source-database summary) returns nothing; fetchrow (last
+    ingest timestamp) returns None.
+    """
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire = AsyncMock(return_value=mock_conn)
+    mock_pool.release = AsyncMock()
+    mock_conn.fetch = AsyncMock(side_effect=[rows, []])
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+
+    app = create_app()
+    app.state.pool = mock_pool
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    return AsyncClient(transport=transport, base_url="http://test")
+
+
+class TestCollectorHealthFiltering:
+    """The /health collector summary only surfaces remote-collector* clients."""
+
+    @pytest.mark.asyncio
+    async def test_excludes_non_remote_collector_clients(self):
+        """Integration identities (awx-execution-bindings, watcher-dispatcher)
+        and any other non-matching client name are excluded from
+        HealthResponse.collectors; only remote-collector* entries remain.
+        """
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        rows = [
+            _collector_row("cred-1", "remote-collector-ws-a", now, 10),
+            _collector_row("cred-2", "awx-execution-bindings", now, 20),
+            _collector_row("cred-3", "watcher-dispatcher", now, 30),
+            _collector_row("cred-4", "legacy-client", now, 40),
+        ]
+        client = _health_client_with_collector_rows(rows)
+
+        async with client as c:
+            response = await c.get("/health")
+
+        assert response.status_code == 200
+        collectors = response.json()["data"]["collectors"]
+        names = [entry["client_name"] for entry in collectors]
+        assert names == ["remote-collector-ws-a"]
+        assert "awx-execution-bindings" not in names
+        assert "watcher-dispatcher" not in names
+        assert "legacy-client" not in names
+
+    @pytest.mark.asyncio
+    async def test_includes_remote_collector_clients_with_unchanged_semantics(self):
+        """Every client whose name begins with 'remote-collector' is included,
+        and the existing per-credential fields and healthy/stale/unknown
+        heartbeat semantics are preserved verbatim.
+        """
+        now = datetime.now(timezone.utc)  # noqa: UP017
+        rows = [
+            # Recent heartbeat → healthy
+            _collector_row("cred-1", "remote-collector-ws-a", now, 10),
+            # Old heartbeat → stale
+            _collector_row(
+                "cred-2",
+                "remote-collector-ws-b",
+                now - timedelta(hours=6),  # noqa: UP017
+                20,
+            ),
+            # No heartbeat → unknown
+            _collector_row("cred-3", "remote-collector-ws-c", None, 0),
+            # Prefix match with suffix → included
+            _collector_row("cred-4", "remote-collector", now, 5),
+        ]
+        client = _health_client_with_collector_rows(rows)
+
+        async with client as c:
+            response = await c.get("/health")
+
+        assert response.status_code == 200
+        collectors = response.json()["data"]["collectors"]
+        assert [entry["client_name"] for entry in collectors] == [
+            "remote-collector-ws-a",
+            "remote-collector-ws-b",
+            "remote-collector-ws-c",
+            "remote-collector",
+        ]
+        health_by_name = {entry["client_name"]: entry for entry in collectors}
+        assert health_by_name["remote-collector-ws-a"]["health"] == "healthy"
+        assert health_by_name["remote-collector-ws-b"]["health"] == "stale"
+        assert health_by_name["remote-collector-ws-c"]["health"] == "unknown"
+        for entry in collectors:
+            for field in (
+                "credential_id",
+                "client_name",
+                "last_heartbeat",
+                "total_records_ingested",
+                "health",
+            ):
+                assert field in entry, f"Collector field {field!r} missing"
+        assert health_by_name["remote-collector-ws-a"]["total_records_ingested"] == 10
+        assert health_by_name["remote-collector-ws-a"]["credential_id"] == "cred-1"
+        assert health_by_name["remote-collector-ws-a"]["last_heartbeat"] is not None
+        assert health_by_name["remote-collector-ws-c"]["last_heartbeat"] is None

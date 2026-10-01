@@ -21,6 +21,13 @@ settings = get_settings()
 
 router = APIRouter(tags=["health"])
 
+# The collector-health summary is restricted to OpenCode Clients whose
+# registered name begins with this prefix. Integration identities (e.g.
+# "awx-execution-bindings", "watcher-dispatcher") are excluded by
+# construction — an include-prefix rule filters new integration clients
+# without maintaining a denylist.
+REMOTE_COLLECTOR_CLIENT_PREFIX = "remote-collector"
+
 
 
 def _get_version() -> str:
@@ -142,6 +149,7 @@ async def _collector_health_summary(
             health=_derive_health(r["last_heartbeat"], now, threshold),
         )
         for r in rows
+        if str(r["client_name"]).startswith(REMOTE_COLLECTOR_CLIENT_PREFIX)
     ]
 
 

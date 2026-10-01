@@ -776,7 +776,10 @@ class TestAuroraGlassApiContract:
         collector_row = MagicMock()
         collector_row.__getitem__.side_effect = {
             "credential_id": str(_CREDENTIAL_ID),
-            "client_name": "legacy-client",
+            # /health collectors are filtered to remote-collector* clients
+            # (issue #749); the source-databases summary below is NOT
+            # filtered, so it keeps a non-matching client name.
+            "client_name": "remote-collector-ws-a",
             "last_heartbeat": now,
             "total_records_ingested": 42,
         }.__getitem__
@@ -803,9 +806,10 @@ class TestAuroraGlassApiContract:
         data = response.json()["data"]
         assert "collectors" in data and "source_databases" in data
         assert data["collectors"][0]["health"] == "healthy"
-        assert data["collectors"][0]["client_name"] == "legacy-client"
+        assert data["collectors"][0]["client_name"] == "remote-collector-ws-a"
         assert data["source_databases"][0]["health"] == "healthy"
         assert data["source_databases"][0]["record_count"] == 42
+        assert data["source_databases"][0]["client_name"] == "legacy-client"
 
 
 # ══════════════════════════════════════════════════════════════════════════
