@@ -7425,29 +7425,29 @@ console.log('\u25B6 index.html \u2014 issue #652 markup smoke check');
 // alerts, and the LIVE/DEGRADED/OFFLINE indicator all present the same set.
 // Liveness (health + last_heartbeat) is primary; cumulative record count is
 // secondary and never determines health or suppresses an idle healthy
-// collector.  Excluded integration clients (names not beginning with
-// `remote-collector`) never appear.  The Source Databases view is untouched.
+// collector.  The backend narrows collectors[] to qualifying remote-collector
+// clients (issue #749), so the frontend trusts that server-filtered set and
+// only dedupes it — excluded integration clients are filtered server-side.
+// The Source Databases view is untouched.
 
-console.log('\u25B6 issue #751 \u2014 deriveRemoteCollectors (shared filtered set)');
+console.log('\u25B6 issue #751 \u2014 deriveRemoteCollectors (backend-filtered set, deduped)');
 
 (function () {
+  // Backend-filtered input: collectors[] already contains only qualifying
+  // remote-collector clients (issue #749).  The frontend trusts it as-is.
   var fixture = [
     { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy',
       last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 0 },
     { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale',
       last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 120 },
     { client_id: 'c3', client_name: 'remote-collector-c', health: 'unknown',
-      last_heartbeat: null, total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'awx-execution-bindings', health: 'healthy',
-      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 999 },
-    { client_id: 'x2', client_name: 'watcher-dispatcher', health: 'stale',
-      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 5 }
+      last_heartbeat: null, total_records_ingested: 0 }
   ];
 
   var rows = window.deriveRemoteCollectors(fixture);
-  assert(rows.length === 3, 'filters to the three client-level remote collectors');
+  assert(rows.length === 3, 'accepts the backend-filtered client-level set without re-filtering');
   assert(rows.every(function (r) { return r.client_name.indexOf('remote-collector') === 0; }),
-    'excluded integration clients never appear in the filtered set');
+    'every returned row is a client-level remote collector');
   assert(rows[0].health === 'healthy' && rows[1].health === 'stale' && rows[2].health === 'unknown',
     'healthy / stale / unknown statuses preserved from the health contract');
   assert(rows[1].last_heartbeat === '2026-07-01T00:00:00Z' && rows[2].last_heartbeat === null,
@@ -7497,17 +7497,14 @@ console.log('\u25B6 issue #751 \u2014 Collector Distribution (liveness-first)');
     { client_id: 'c1', client_name: 'remote-collector-idle', health: 'healthy',
       last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 0 },
     { client_id: 'c2', client_name: 'remote-collector-busy', health: 'stale',
-      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 5000 },
-    { client_id: 'x1', client_name: 'awx-execution-bindings', health: 'unknown',
-      last_heartbeat: null, total_records_ingested: 999999 }
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 5000 }
   ];
   window.renderCollectorDistribution({ health: { collectors: fixture } });
   var html = collectorDistEl.innerHTML;
   var rowCount = html.split('class="dist-row"').length - 1;
-  assert(rowCount === 2, 'exactly one row per client-level remote collector (excluded client dropped)');
+  assert(rowCount === 2, 'exactly one row per client-level remote collector');
   assert(html.indexOf('remote-collector-idle') !== -1, 'idle healthy collector renders');
   assert(html.indexOf('remote-collector-busy') !== -1, 'stale collector renders');
-  assert(html.indexOf('awx-execution-bindings') === -1, 'excluded client is not rendered');
 
   // Liveness, not record count, determines the bar: the idle healthy collector
   // keeps a full healthy bar even at zero records.
@@ -7527,46 +7524,40 @@ console.log('\u25B6 issue #751 \u2014 Collectors table (client-level rows)');
 (function () {
   var fixture = [
     { client_id: 'c1', client_name: 'remote-collector-a', health: 'unknown',
-      last_heartbeat: null, total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'watcher-dispatcher', health: 'healthy',
-      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 10 }
+      last_heartbeat: null, total_records_ingested: 0 }
   ];
   window.renderCollectorsTable({ health: { collectors: fixture } });
   var html = collectorsTbodyEl.innerHTML;
   assert(html.indexOf('remote-collector-a') !== -1, 'client-level remote collector row rendered');
-  assert(html.indexOf('watcher-dispatcher') === -1, 'excluded client not rendered in the table');
   assert(html.indexOf('badge-unknown') !== -1, 'status badge rendered');
   assert(html.indexOf('--') !== -1, 'missing heartbeat renders the -- recency fallback');
 })();
 
-console.log('\u25B6 issue #751 \u2014 Healthy Collectors KPI (filtered set)');
+console.log('\u25B6 issue #751 \u2014 Healthy Remote Collectors KPI (backend-filtered set)');
 
 (function () {
   window.renderKPIs({ health: { collectors: [
     { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 },
-    { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'awx-execution-bindings', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 }
+    { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
   ] } });
   assert(kpiCollectorsEl.textContent === '1 / 2',
-    'Healthy Collectors KPI counts only the filtered remote-collector set (1 healthy / 2 total)');
+    'Healthy Remote Collectors KPI counts healthy / total across the backend-filtered set');
 })();
 
 console.log('\u25B6 issue #751 \u2014 LIVE/DEGRADED/OFFLINE uses the filtered set');
 
 (function () {
-  // Excluded healthy clients must not lift the indicator to LIVE.
+  // The indicator consumes the backend-filtered set (issue #749) only.
   window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
-    { client_id: 'c1', client_name: 'remote-collector-a', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'awx-execution-bindings', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 }
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
   ] } });
-  assert(liveIndicatorEl.textContent === 'OFFLINE', 'excluded healthy client cannot make an all-stale remote set LIVE');
+  assert(liveIndicatorEl.textContent === 'OFFLINE', 'all-stale remote set \u2192 OFFLINE');
   assert(liveIndicatorEl.className === 'live-indicator error', 'OFFLINE uses the error class');
 
   window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
-    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'watcher-dispatcher', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 }
   ] } });
-  assert(liveIndicatorEl.textContent === 'LIVE', 'excluded stale client cannot degrade an all-healthy remote set');
+  assert(liveIndicatorEl.textContent === 'LIVE', 'all-healthy remote set \u2192 LIVE');
 
   window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
     { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 },
@@ -7582,10 +7573,6 @@ console.log('\u25B6 issue #751 \u2014 operational alerts only for remote collect
     { client_id: 'c1', client_name: 'remote-collector-stale', health: 'stale',
       last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 4 },
     { client_id: 'c2', client_name: 'remote-collector-new', health: 'unknown',
-      last_heartbeat: null, total_records_ingested: 0 },
-    { client_id: 'x1', client_name: 'awx-execution-bindings', health: 'stale',
-      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 4 },
-    { client_id: 'x2', client_name: 'watcher-dispatcher', health: 'unknown',
       last_heartbeat: null, total_records_ingested: 0 }
   ];
   window.renderLiveEvents({ health: {
@@ -7599,8 +7586,6 @@ console.log('\u25B6 issue #751 \u2014 operational alerts only for remote collect
   var html = eventsFeedEl.innerHTML;
   assert(html.indexOf('remote-collector-stale') !== -1, 'stale remote collector alert present');
   assert(html.indexOf('remote-collector-new') !== -1, 'unknown remote collector alert present');
-  assert(html.indexOf('awx-execution-bindings') === -1, 'excluded stale client produces no collector alert');
-  assert(html.indexOf('watcher-dispatcher') === -1, 'excluded unknown client produces no collector alert');
   // Source Databases view rendering is untouched.
   assert(html.indexOf('Source DB') !== -1 && html.indexOf('remote-collector-src') !== -1,
     'Source Databases alerts (source_databases[]) remain unchanged');
@@ -7614,6 +7599,8 @@ console.log('\u25B6 issue #751 \u2014 index.html / style.css markup');
     'index.html: Collectors table has the heartbeat-oriented header');
   assert(html.indexOf('<th>Records</th>') !== -1,
     'index.html: cumulative record count remains a secondary column');
+  assert(html.indexOf('<span class="kpi-label">Healthy Remote Collectors</span>') !== -1,
+    'index.html: KPI label reads "Healthy Remote Collectors" (liveness-first remote set)');
   var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
   assert(css.indexOf('.dist-heartbeat') !== -1, 'style.css: heartbeat recency styling present');
   assert(css.indexOf('.dist-status') !== -1, 'style.css: liveness status styling present');

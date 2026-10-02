@@ -2169,20 +2169,12 @@
   // is primary; total_records_ingested is secondary context only and never
   // determines health or suppresses an idle healthy collector.
 
-  /** Registered-name prefix that identifies a qualifying remote-collector
-   *  client (mirrors REMOTE_COLLECTOR_CLIENT_PREFIX in app/api/health.py). */
-  var REMOTE_COLLECTOR_CLIENT_PREFIX = 'remote-collector';
-
-  /** True when a registered client name is a remote collector (prefix rule). */
-  function isRemoteCollectorClient(name) {
-    return typeof name === 'string' &&
-      name.indexOf(REMOTE_COLLECTOR_CLIENT_PREFIX) === 0;
-  }
-
-  /** Derive the filtered client-level remote-collector rows from
-   *  health.collectors.  One row per client (deduped by client_id, falling
-   *  back to client_name) so credential-level duplicates never render twice;
-   *  non-remote / excluded integration clients are dropped.  Returns
+  /** Derive the client-level remote-collector rows from
+   *  health.collectors.  The backend already narrows collectors[] to
+   *  qualifying remote-collector clients (issue #749), so this helper trusts
+   *  that server-side filter and does NOT re-filter by client-name prefix.
+   *  One row per client (deduped by client_id, falling back to client_name)
+   *  so credential-level duplicates never render twice.  Returns
    *  liveness-first rows carrying health, last_heartbeat, and the secondary
    *  cumulative record total.  Pure — no DOM access. */
   function deriveRemoteCollectors(collectors) {
@@ -2190,7 +2182,7 @@
     var seen = {};
     var rows = [];
     collectors.forEach(function (c) {
-      if (!c || !isRemoteCollectorClient(c.client_name)) return;
+      if (!c) return;
       var key = c.client_id || c.client_name;
       if (seen[key]) return;
       seen[key] = true;
@@ -2607,7 +2599,7 @@
 
       // Try to associate with a client/collector health status
       if (data.health && data.health.collectors) {
-        var hasHealthy = data.health.collectors.some(function (c) { return c.health === 'healthy'; });
+        var hasHealthy = deriveRemoteCollectors(data.health.collectors).some(function (c) { return c.health === 'healthy'; });
         status = hasHealthy ? 'active' : status;
       }
 
