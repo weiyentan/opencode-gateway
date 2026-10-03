@@ -35,7 +35,6 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
-    Text,
     UniqueConstraint,
     text,
 )
@@ -617,7 +616,6 @@ class RecoveryCheckpoint(Base):
             "commit_sha",
             name="uq_recovery_checkpoints_execution_ref_sha",
         ),
-        Index("ix_recovery_checkpoints_awx_job_id", "awx_job_id"),
         Index("ix_recovery_checkpoints_afk_run_id", "afk_run_id"),
     )
 
@@ -634,8 +632,8 @@ class RecoveryCheckpoint(Base):
         ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
         nullable=True,
     )
-    ref: Mapped[str] = mapped_column(Text, nullable=False)
-    commit_sha: Mapped[str] = mapped_column(Text, nullable=False)
+    ref: Mapped[str] = mapped_column(String(1024), nullable=False)
+    commit_sha: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

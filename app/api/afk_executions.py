@@ -605,7 +605,7 @@ async def create_recovery_checkpoint(
     """Persist one execution-scoped AFK recovery checkpoint (issue #754).
 
     Records an emergency recovery branch/ref (and the commit SHA it points
-    at) that survived a failed AFX execution.  The checkpoint is linked to
+    at) that survived a failed AFK execution.  The checkpoint is linked to
     the existing ``execution_bindings`` row named by the path's
     ``awx_job_id`` and therefore to that execution's ``afk_run_id`` — it is
     **not** a new AFK Run and never rewrites the execution's failed outcome,

@@ -78,10 +78,10 @@ def upgrade() -> None:
             ),
             nullable=True,
         ),
-        # The emergency recovery branch/ref (unbounded text).
-        sa.Column("ref", sa.Text(), nullable=False),
-        # The commit SHA the ref points at (unbounded text — SHA-1/SHA-256).
-        sa.Column("commit_sha", sa.Text(), nullable=False),
+        # The emergency recovery branch/ref (bounded to 1024 chars).
+        sa.Column("ref", sa.String(1024), nullable=False),
+        # The commit SHA the ref points at (bounded to 128 chars — SHA-1/SHA-256).
+        sa.Column("commit_sha", sa.String(128), nullable=False),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -97,13 +97,6 @@ def upgrade() -> None:
             name="uq_recovery_checkpoints_execution_ref_sha",
         ),
     )
-    # Execution-scoped list scans (the unique constraint's leading column
-    # already serves these; the explicit index keeps the intent documented).
-    op.create_index(
-        "ix_recovery_checkpoints_awx_job_id",
-        "recovery_checkpoints",
-        ["awx_job_id"],
-    )
     # Run-scoped lookups across every execution of one AFK run.
     op.create_index(
         "ix_recovery_checkpoints_afk_run_id",
@@ -116,10 +109,6 @@ def downgrade() -> None:
     """Drop the recovery-checkpoint table."""
     op.drop_index(
         "ix_recovery_checkpoints_afk_run_id",
-        table_name="recovery_checkpoints",
-    )
-    op.drop_index(
-        "ix_recovery_checkpoints_awx_job_id",
         table_name="recovery_checkpoints",
     )
     op.drop_table("recovery_checkpoints")
