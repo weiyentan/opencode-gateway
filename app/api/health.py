@@ -21,6 +21,13 @@ settings = get_settings()
 
 router = APIRouter(tags=["health"])
 
+# The collector-health summary is restricted to OpenCode Clients whose
+# registered name begins with this prefix. Integration identities (e.g.
+# "awx-execution-bindings", "watcher-dispatcher") are excluded by
+# construction — an include-prefix rule filters new integration clients
+# without maintaining a denylist.
+REMOTE_COLLECTOR_CLIENT_PREFIX = "remote-collector"
+
 
 
 def _get_version() -> str:
@@ -35,15 +42,24 @@ def _get_version() -> str:
 
 
 class CollectorHealth(BaseModel):
-    """Health status for a single collector credential."""
+    """Health status for one remote-collector client (client-level row).
 
-    credential_id: str = Field(description="UUID of the collector_credentials row")
-    client_name: str = Field(description="Name of the associated OpenCode client")
+    The monitored identity is the OpenCode Client, not any individual
+    Collector Credential: liveness and record totals are aggregated across
+    the client's non-revoked credentials and watched source databases
+    (issue #750).
+    """
+
+    client_id: str = Field(description="UUID of the opencode_clients row")
+    client_name: str = Field(description="Name of the OpenCode client")
     last_heartbeat: Optional[datetime] = Field(
-        default=None, description="Most recent ingest timestamp"
+        default=None,
+        description="Most recent ingest activity across the client's "
+        "credentials and watched source databases",
     )
     total_records_ingested: int = Field(
-        default=0, description="Total records ingested via this credential"
+        default=0,
+        description="Total records ingested via the client's credentials",
     )
     health: str = Field(description="healthy | stale | unknown")
 
@@ -103,29 +119,51 @@ async def _collector_health_summary(
     threshold: int = settings.heartbeat_threshold,
 
 ) -> list[CollectorHealth]:
-    """Query collectors and their most recent ingest-batch activity."""
+    """Aggregate collector health at client level (issue #750).
+
+    One row per qualifying remote-collector client. The signal rows carry,
+    per non-revoked Collector Credential, that credential's most recent
+    heartbeat (Remote Collector Heartbeat = empty ingest batch, or
+    data-bearing ingest) and record total; UNION ALL one row per active
+    watched source database carrying its last_seen_at. Aggregation is
+    read-time: last_heartbeat is the MAX across all of the client's
+    signals, total_records_ingested is the SUM across the client's
+    credentials.
+    """
     try:
         conn = await db_pool.acquire()
         try:
             async with timed_operation("db.query.health.collectors", "db"):
                 rows = await conn.fetch("""
                     SELECT
-                        cc.id AS credential_id,
-                        c.name  AS client_name,
+                        cc.id            AS credential_id,
+                        cc.client_id     AS client_id,
+                        c.name           AS client_name,
                         (
                             SELECT MAX(ib.ingested_at)
                             FROM ingest_batches ib
                             WHERE ib.collector_credential_id = cc.id
-                        ) AS last_heartbeat,
+                        ) AS credential_last_heartbeat,
                         COALESCE((
                             SELECT SUM(ib.record_count)
                             FROM ingest_batches ib
                             WHERE ib.collector_credential_id = cc.id
-                        ), 0) AS total_records_ingested
+                        ), 0) AS credential_records,
+                        NULL::timestamptz AS source_last_seen
                     FROM collector_credentials cc
                     JOIN opencode_clients c ON c.id = cc.client_id
                     WHERE cc.revoked_at IS NULL
-                    ORDER BY cc.id
+                    UNION ALL
+                    SELECT
+                        NULL::uuid       AS credential_id,
+                        sd.client_id     AS client_id,
+                        c.name           AS client_name,
+                        NULL::timestamptz AS credential_last_heartbeat,
+                        0                AS credential_records,
+                        sd.last_seen_at  AS source_last_seen
+                    FROM source_databases sd
+                    JOIN opencode_clients c ON c.id = sd.client_id
+                    WHERE sd.is_active = true
                 """)
         finally:
             await db_pool.release(conn)
@@ -133,15 +171,38 @@ async def _collector_health_summary(
         logger.debug("Health: collector summary query failed", exc_info=True)
         return []
 
+    # Group signal rows by client, keeping only qualifying remote-collector
+    # clients (issue #749 prefix rule, unchanged).
+    by_client: dict[str, dict] = {}
+    for r in rows:
+        if not str(r["client_name"]).startswith(REMOTE_COLLECTOR_CLIENT_PREFIX):
+            continue
+        client_key = str(r["client_id"])
+        entry = by_client.setdefault(
+            client_key,
+            {
+                "client_id": client_key,
+                "client_name": r["client_name"],
+                "last_heartbeat": None,
+                "total_records_ingested": 0,
+            },
+        )
+        for signal in (r["credential_last_heartbeat"], r["source_last_seen"]):
+            if signal is not None and (
+                entry["last_heartbeat"] is None or signal > entry["last_heartbeat"]
+            ):
+                entry["last_heartbeat"] = signal
+        entry["total_records_ingested"] += r["credential_records"]
+
     return [
         CollectorHealth(
-            credential_id=str(r["credential_id"]),
-            client_name=r["client_name"],
-            last_heartbeat=r["last_heartbeat"],
-            total_records_ingested=r["total_records_ingested"],
-            health=_derive_health(r["last_heartbeat"], now, threshold),
+            client_id=e["client_id"],
+            client_name=e["client_name"],
+            last_heartbeat=e["last_heartbeat"],
+            total_records_ingested=e["total_records_ingested"],
+            health=_derive_health(e["last_heartbeat"], now, threshold),
         )
-        for r in rows
+        for e in sorted(by_client.values(), key=lambda e: e["client_name"])
     ]
 
 

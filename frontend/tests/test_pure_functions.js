@@ -149,6 +149,21 @@ elementRegistry['kpi-collectors-detail'] = kpiCollectorsDetailEl;
 elementRegistry['kpi-source-dbs'] = kpiSourceDbsEl;
 elementRegistry['kpi-source-dbs-detail'] = kpiSourceDbsDetailEl;
 
+// Collector panels + operational events feed fakes (issue #751): the
+// Collector Distribution chart, the Collectors table tbody, and the events
+// feed/badge are written by renderCollectorDistribution / renderCollectorsTable
+// / renderLiveEvents — registered before loadRealAppJs so app.js captures the
+// refs in els.  Source-database rendering writes into the same events feed and
+// is asserted unchanged through these fakes.
+var collectorDistEl = makeFakeElement('collector-dist-chart');
+var collectorsTbodyEl = makeFakeElement('collectors-tbody');
+var eventsFeedEl = makeFakeElement('events-feed');
+var eventBadgeEl = makeFakeElement('event-badge');
+elementRegistry['collector-dist-chart'] = collectorDistEl;
+elementRegistry['collectors-tbody'] = collectorsTbodyEl;
+elementRegistry['events-feed'] = eventsFeedEl;
+elementRegistry['event-badge'] = eventBadgeEl;
+
 // Agent Runs pagination container fake (issue #427): renderAgentRunPagination
 // writes the Previous/Next + numbered-page markup into this element and wires
 // the buttons through querySelectorAll('button') — so the fake parses the
@@ -341,6 +356,14 @@ var historyStub = {
   window.fmtKpiTokenBreakdown = sandboxWindow.fmtKpiTokenBreakdown;
   window.renderKPIs = sandboxWindow.renderKPIs;
   window.aggregateSummaryBuckets = sandboxWindow.aggregateSummaryBuckets;
+  // Issue #751: collector liveness-first view — the single shared helper that
+  // derives the filtered client-level remote-collector set, the liveness
+  // derivation, and the three collector renderers join the window seam.
+  window.deriveRemoteCollectors = sandboxWindow.deriveRemoteCollectors;
+  window.deriveCollectorLiveness = sandboxWindow.deriveCollectorLiveness;
+  window.renderCollectorDistribution = sandboxWindow.renderCollectorDistribution;
+  window.renderCollectorsTable = sandboxWindow.renderCollectorsTable;
+  window.renderLiveEvents = sandboxWindow.renderLiveEvents;
   // Issue #557: provider badge/missing-label, cache hit ratio, and the
   // Token Breakdown detail-section builder join the window test seam.
   window.fmtProvider = sandboxWindow.fmtProvider;
@@ -7393,4 +7416,192 @@ console.log('\u25B6 index.html \u2014 issue #652 markup smoke check');
   // The secondary change-request panel (issue #573) is untouched.
   assert(html.indexOf('id="afk-cr-filter-provider-state"') !== -1,
     'index.html: Provider State filter remains for the provider lifecycle status');
+})();
+
+// ── Collector views — liveness-first client-level set (issue #751) ──────
+// Aurora Glass derives its client-level remote-collector set from
+// health.collectors through ONE shared helper so the Collector Distribution,
+// Healthy Collectors KPI, Collectors table, operational stale/unknown
+// alerts, and the LIVE/DEGRADED/OFFLINE indicator all present the same set.
+// Liveness (health + last_heartbeat) is primary; cumulative record count is
+// secondary and never determines health or suppresses an idle healthy
+// collector.  The backend narrows collectors[] to qualifying remote-collector
+// clients (issue #749), so the frontend trusts that server-filtered set and
+// only dedupes it — excluded integration clients are filtered server-side.
+// The Source Databases view is untouched.
+
+console.log('\u25B6 issue #751 \u2014 deriveRemoteCollectors (backend-filtered set, deduped)');
+
+(function () {
+  // Backend-filtered input: collectors[] already contains only qualifying
+  // remote-collector clients (issue #749).  The frontend trusts it as-is.
+  var fixture = [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 0 },
+    { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 120 },
+    { client_id: 'c3', client_name: 'remote-collector-c', health: 'unknown',
+      last_heartbeat: null, total_records_ingested: 0 }
+  ];
+
+  var rows = window.deriveRemoteCollectors(fixture);
+  assert(rows.length === 3, 'accepts the backend-filtered client-level set without re-filtering');
+  assert(rows.every(function (r) { return r.client_name.indexOf('remote-collector') === 0; }),
+    'every returned row is a client-level remote collector');
+  assert(rows[0].health === 'healthy' && rows[1].health === 'stale' && rows[2].health === 'unknown',
+    'healthy / stale / unknown statuses preserved from the health contract');
+  assert(rows[1].last_heartbeat === '2026-07-01T00:00:00Z' && rows[2].last_heartbeat === null,
+    'last_heartbeat preserved as the primary recency signal');
+  assert(rows[0].total_records_ingested === 0 && rows[1].total_records_ingested === 120,
+    'cumulative record count preserved as secondary context');
+
+  // Zero-record heartbeat: a recent empty ingest stays healthy at zero records.
+  var zeroRecord = window.deriveRemoteCollectors([
+    { client_id: 'c1', client_name: 'remote-collector-idle', health: 'healthy',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 0 }
+  ]);
+  assert(zeroRecord.length === 1 && zeroRecord[0].health === 'healthy' &&
+         zeroRecord[0].total_records_ingested === 0,
+    'zero-record heartbeat: idle healthy collector survives with health healthy');
+
+  // One row per client-level collector even if credential-level duplicates leak.
+  var deduped = window.deriveRemoteCollectors([
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 1 },
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 2 }
+  ]);
+  assert(deduped.length === 1, 'one row per client-level remote collector (client_id dedupe)');
+
+  assert(window.deriveRemoteCollectors([]).length === 0, 'empty fixture \u2192 empty set');
+  assert(window.deriveRemoteCollectors(null).length === 0, 'null fixture \u2192 empty set');
+})();
+
+console.log('\u25B6 issue #751 \u2014 deriveCollectorLiveness (filtered set only)');
+
+(function () {
+  var healthy = [{ health: 'healthy' }, { health: 'healthy' }];
+  var mixed = [{ health: 'healthy' }, { health: 'stale' }];
+  var offline = [{ health: 'stale' }, { health: 'unknown' }];
+  assert(window.deriveCollectorLiveness(healthy).label === 'LIVE', 'all healthy \u2192 LIVE');
+  assert(window.deriveCollectorLiveness(mixed).label === 'DEGRADED', 'some healthy \u2192 DEGRADED');
+  assert(window.deriveCollectorLiveness(offline).label === 'OFFLINE', 'no healthy \u2192 OFFLINE');
+  assert(window.deriveCollectorLiveness([]).label === 'NO DATA', 'empty filtered set \u2192 NO DATA');
+  assert(window.deriveCollectorLiveness(healthy).className === 'live-indicator', 'LIVE uses the default live-indicator class');
+  assert(window.deriveCollectorLiveness(mixed).className === 'live-indicator stale', 'DEGRADED uses the stale class');
+  assert(window.deriveCollectorLiveness(offline).className === 'live-indicator error', 'OFFLINE uses the error class');
+})();
+
+console.log('\u25B6 issue #751 \u2014 Collector Distribution (liveness-first)');
+
+(function () {
+  var fixture = [
+    { client_id: 'c1', client_name: 'remote-collector-idle', health: 'healthy',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 0 },
+    { client_id: 'c2', client_name: 'remote-collector-busy', health: 'stale',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 5000 }
+  ];
+  window.renderCollectorDistribution({ health: { collectors: fixture } });
+  var html = collectorDistEl.innerHTML;
+  var rowCount = html.split('class="dist-row"').length - 1;
+  assert(rowCount === 2, 'exactly one row per client-level remote collector');
+  assert(html.indexOf('remote-collector-idle') !== -1, 'idle healthy collector renders');
+  assert(html.indexOf('remote-collector-busy') !== -1, 'stale collector renders');
+
+  // Liveness, not record count, determines the bar: the idle healthy collector
+  // keeps a full healthy bar even at zero records.
+  assert(html.indexOf('dist-bar-healthy') !== -1 && html.indexOf('width:100%') !== -1,
+    'zero-record healthy collector keeps the full liveness bar (record count cannot suppress it)');
+  assert(html.indexOf('dist-bar-stale') !== -1, 'stale row uses the stale liveness bar');
+  assert(html.indexOf('badge-healthy') !== -1 && html.indexOf('badge-stale') !== -1,
+    'liveness status badges are the primary signal');
+  assert(html.indexOf('last seen') !== -1, 'heartbeat recency is a primary signal');
+  // Record count remains available as secondary context.
+  assert(html.indexOf('0 recs') !== -1 && html.indexOf('5.0K recs') !== -1,
+    'cumulative record count remains available as secondary context');
+})();
+
+console.log('\u25B6 issue #751 \u2014 Collectors table (client-level rows)');
+
+(function () {
+  var fixture = [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'unknown',
+      last_heartbeat: null, total_records_ingested: 0 }
+  ];
+  window.renderCollectorsTable({ health: { collectors: fixture } });
+  var html = collectorsTbodyEl.innerHTML;
+  assert(html.indexOf('remote-collector-a') !== -1, 'client-level remote collector row rendered');
+  assert(html.indexOf('badge-unknown') !== -1, 'status badge rendered');
+  assert(html.indexOf('--') !== -1, 'missing heartbeat renders the -- recency fallback');
+})();
+
+console.log('\u25B6 issue #751 \u2014 Healthy Remote Collectors KPI (backend-filtered set)');
+
+(function () {
+  window.renderKPIs({ health: { collectors: [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 },
+    { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
+  ] } });
+  assert(kpiCollectorsEl.textContent === '1 / 2',
+    'Healthy Remote Collectors KPI counts healthy / total across the backend-filtered set');
+})();
+
+console.log('\u25B6 issue #751 \u2014 LIVE/DEGRADED/OFFLINE uses the filtered set');
+
+(function () {
+  // The indicator consumes the backend-filtered set (issue #749) only.
+  window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
+  ] } });
+  assert(liveIndicatorEl.textContent === 'OFFLINE', 'all-stale remote set \u2192 OFFLINE');
+  assert(liveIndicatorEl.className === 'live-indicator error', 'OFFLINE uses the error class');
+
+  window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 }
+  ] } });
+  assert(liveIndicatorEl.textContent === 'LIVE', 'all-healthy remote set \u2192 LIVE');
+
+  window.renderHeader({ health: { version: 'test', database: 'connected', collectors: [
+    { client_id: 'c1', client_name: 'remote-collector-a', health: 'healthy', last_heartbeat: 'x', total_records_ingested: 0 },
+    { client_id: 'c2', client_name: 'remote-collector-b', health: 'stale', last_heartbeat: 'x', total_records_ingested: 0 }
+  ] } });
+  assert(liveIndicatorEl.textContent === 'DEGRADED', 'mixed remote set \u2192 DEGRADED');
+})();
+
+console.log('\u25B6 issue #751 \u2014 operational alerts only for remote collectors');
+
+(function () {
+  var fixture = [
+    { client_id: 'c1', client_name: 'remote-collector-stale', health: 'stale',
+      last_heartbeat: '2026-07-01T00:00:00Z', total_records_ingested: 4 },
+    { client_id: 'c2', client_name: 'remote-collector-new', health: 'unknown',
+      last_heartbeat: null, total_records_ingested: 0 }
+  ];
+  window.renderLiveEvents({ health: {
+    collectors: fixture,
+    source_databases: [
+      { source_database_id: 'sd1', client_name: 'remote-collector-src', health: 'stale',
+        last_push: '2026-07-01T00:00:00Z', record_count: 1 }
+    ],
+    last_ingest_timestamp: new Date().toISOString()
+  } });
+  var html = eventsFeedEl.innerHTML;
+  assert(html.indexOf('remote-collector-stale') !== -1, 'stale remote collector alert present');
+  assert(html.indexOf('remote-collector-new') !== -1, 'unknown remote collector alert present');
+  // Source Databases view rendering is untouched.
+  assert(html.indexOf('Source DB') !== -1 && html.indexOf('remote-collector-src') !== -1,
+    'Source Databases alerts (source_databases[]) remain unchanged');
+})();
+
+console.log('\u25B6 issue #751 \u2014 index.html / style.css markup');
+
+(function () {
+  var html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert(html.indexOf('<th>Last Heartbeat</th>') !== -1,
+    'index.html: Collectors table has the heartbeat-oriented header');
+  assert(html.indexOf('<th>Records</th>') !== -1,
+    'index.html: cumulative record count remains a secondary column');
+  assert(html.indexOf('<span class="kpi-label">Healthy Remote Collectors</span>') !== -1,
+    'index.html: KPI label reads "Healthy Remote Collectors" (liveness-first remote set)');
+  var css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
+  assert(css.indexOf('.dist-heartbeat') !== -1, 'style.css: heartbeat recency styling present');
+  assert(css.indexOf('.dist-status') !== -1, 'style.css: liveness status styling present');
 })();

@@ -462,7 +462,7 @@ operator-only routes add the gates described under
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Application health check. Returns `status`, `version`, `database` connectivity, collector status (healthy/stale/unknown per credential), source-database health, and last-ingest timestamp. Exempt from API-key auth. Graceful — always returns 200 even if the database is down. |
+| `GET` | `/health` | Application health check. Returns `status`, `version`, `database` connectivity, collector status (healthy/stale/unknown — one client-level row per remote-collector client, i.e. clients whose registered name begins with `remote-collector`; liveness and record totals aggregated across the client's collector credentials and watched source databases), source-database health, and last-ingest timestamp. Exempt from API-key auth. Graceful — always returns 200 even if the database is down. |
 
 ### Admin — Client Registry
 
@@ -773,11 +773,11 @@ is cached for 10 minutes) and renders:
 
 | Section | Data Source | Description |
 |---------|-------------|-------------|
-| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Active tokens, estimated cost, session count, healthy collectors, source databases |
+| **KPI Cards** | `/health`, `/api/v1/usage/aggregates` | Active tokens, estimated cost, session count, healthy remote collectors, source databases |
 | **Model Mix** | `/api/v1/usage/aggregates?group_by=model` | Token/cost breakdown by LLM model |
 | **Operational Events** | Recent usage records | Real-time feed of incoming telemetry events |
-| **Collector Distribution** | `/admin/clients` | Collector status overview (healthy/stale/unknown) |
-| **Collectors Table** | `/admin/clients` + health data | Per-collector name, status, last ingest, sessions, tokens, cost |
+| **Collector Distribution** | `/health` (`collectors[]`) | Liveness-first bars for client-level remote collectors — health status and last heartbeat are primary; cumulative record count is secondary context |
+| **Collectors Table** | `/health` (`collectors[]`) | Client-level remote-collector rows: name, status, last heartbeat, records |
 | **Agents & LLMs** | `/api/v1/usage/records` | Per-client model usage with request counts and cost |
 | **Agent Usage** | `/api/v1/usage/aggregates?group_by=agent` | Dynamic per-agent aggregate rows (token breakdown, estimated cost, request count), grouped by recorded agent identity with missing identities as `unknown`, ordered by total token usage descending |
 | **Recent Sessions** | `/api/v1/usage/sessions` | Client, session title, model, token/cost totals, duration, and status |

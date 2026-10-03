@@ -452,6 +452,35 @@ them is write-only. The Admin API Key does not satisfy the operator gate;
 the three credential types are never shared across pipelines.
 _Avoid_: admin key, collector token (when the operator role is meant)
 
+**Remote Collector Health**:
+The client-level collector-health contract on `GET /health` (`collectors[]`,
+issues #749/#750). One row per OpenCode Client whose registered name begins
+with the `remote-collector` prefix (`REMOTE_COLLECTOR_CLIENT_PREFIX`);
+integration identities such as `awx-execution-bindings` and
+`watcher-dispatcher` are excluded by the prefix rule, never by a denylist.
+Each row carries `client_id`, `client_name`, `last_heartbeat` (MAX ingest
+activity across the client's non-revoked Collector Credentials and watched
+source databases), and `total_records_ingested` (SUM across the client's
+credentials). Credential identity (`credential_id`) is not the monitored
+identity. Health states are `healthy` / `stale` / `unknown`, derived from
+`last_heartbeat` against `settings.heartbeat_threshold` (default 300s); a
+recent heartbeat is `healthy` even at zero records. Source-database health
+remains independently reported. Aurora Glass presents this set
+liveness-first (issue #751): the Collector Distribution, Healthy Collectors
+KPI, Collectors table, stale/unknown operational alerts, and the
+LIVE/DEGRADED/OFFLINE indicator all consume the same filtered client-level
+remote-collector set — heartbeat recency is primary, cumulative record
+count is secondary context.
+_Avoid_: per-credential collector health, credential-level collectors[],
+record-volume-primary collector views
+
+**Remote Collector Heartbeat**:
+The liveness signal for a remote-collector client: an empty ingest batch or
+a data-bearing ingest from any of the client's collector credentials or
+watched source databases. Surfaced as `last_heartbeat` on the client-level
+Remote Collector Health row.
+_Avoid_: data-bearing ingest only, credential-level heartbeat
+
 **Retention Tier**:
 One of the configurable data-lifecycle buckets for the AFK outcome +
 reporting read-model (issue #483, ADR 0022), declared on Settings and

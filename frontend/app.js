@@ -2159,6 +2159,65 @@
     return { label: 'Connected', className: 'connected' };
   }
 
+  // ── Collector liveness — shared filtered client-level set (issue #751) ──
+  // The /health collectors[] contract is client-level and narrowed to
+  // remote-collector clients (issues #749/#750).  Aurora Glass derives its
+  // filtered client-level collector set through this single helper so the
+  // Collector Distribution, Healthy Collectors KPI, Collectors table,
+  // operational stale/unknown alerts, and the LIVE/DEGRADED/OFFLINE
+  // indicator all present the same set.  Liveness (health + last_heartbeat)
+  // is primary; total_records_ingested is secondary context only and never
+  // determines health or suppresses an idle healthy collector.
+
+  /** Derive the client-level remote-collector rows from
+   *  health.collectors.  The backend already narrows collectors[] to
+   *  qualifying remote-collector clients (issue #749), so this helper trusts
+   *  that server-side filter and does NOT re-filter by client-name prefix.
+   *  One row per client (deduped by client_id, falling back to client_name)
+   *  so credential-level duplicates never render twice.  Returns
+   *  liveness-first rows carrying health, last_heartbeat, and the secondary
+   *  cumulative record total.  Pure — no DOM access. */
+  function deriveRemoteCollectors(collectors) {
+    if (!collectors || !collectors.length) return [];
+    var seen = {};
+    var rows = [];
+    collectors.forEach(function (c) {
+      if (!c) return;
+      var key = c.client_id || c.client_name;
+      if (seen[key]) return;
+      seen[key] = true;
+      rows.push({
+        client_id: c.client_id || null,
+        client_name: c.client_name,
+        health: c.health || 'unknown',
+        last_heartbeat: c.last_heartbeat || null,
+        total_records_ingested: c.total_records_ingested || 0
+      });
+    });
+    return rows;
+  }
+
+  /** LIVE / DEGRADED / OFFLINE / NO DATA from the filtered collector rows.
+   *  Derived only from the client-level remote-collector set — excluded
+   *  clients never influence the indicator.  Pure — no DOM access. */
+  function deriveCollectorLiveness(rows) {
+    var list = rows || [];
+    var total = list.length;
+    if (total === 0) return { label: 'NO DATA', className: 'live-indicator error' };
+    var healthy = list.filter(function (c) { return c.health === 'healthy'; }).length;
+    if (healthy === total) return { label: 'LIVE', className: 'live-indicator' };
+    if (healthy > 0) return { label: 'DEGRADED', className: 'live-indicator stale' };
+    return { label: 'OFFLINE', className: 'live-indicator error' };
+  }
+
+  /** Liveness-primary bar percentage — driven by health status, never by the
+   *  cumulative record count (an idle healthy collector keeps a full bar). */
+  function collectorLivenessWidth(health) {
+    if (health === 'healthy') return 100;
+    if (health === 'stale') return 50;
+    return 10;
+  }
+
   function renderHeader(data) {
     var now = new Date();
     els.timestamp.textContent = now.toLocaleString('en-US', {
@@ -2179,25 +2238,15 @@
       els.dbStatus.textContent = 'DB: ' + (h.database || 'unknown');
       els.dbStatus.className = 'db-status ' + (h.database === 'connected' ? 'connected' : 'disconnected');
 
-      // Live indicator based on collector health
-      var collectors = h.collectors || [];
-      var healthyCount = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
-      var totalCollectors = collectors.length;
+      // Live indicator based on the filtered client-level remote-collector
+      // set (issue #751) — excluded integration clients never influence
+      // liveness.
+      var collectorRows = deriveRemoteCollectors(h.collectors);
+      var liveness = deriveCollectorLiveness(collectorRows);
 
       var live = els.liveIndicator;
-      if (totalCollectors === 0) {
-        live.textContent = 'NO DATA';
-        live.className = 'live-indicator error';
-      } else if (healthyCount === totalCollectors) {
-        live.textContent = 'LIVE';
-        live.className = 'live-indicator';
-      } else if (healthyCount > 0) {
-        live.textContent = 'DEGRADED';
-        live.className = 'live-indicator stale';
-      } else {
-        live.textContent = 'OFFLINE';
-        live.className = 'live-indicator error';
-      }
+      live.textContent = liveness.label;
+      live.className = liveness.className;
     }
   }
 
@@ -2292,12 +2341,13 @@
       }
     }
 
-    // Collectors from health — gated on kpi-collectors card freshness
+    // Collectors from health — gated on kpi-collectors card freshness.
+    // Counts only the filtered client-level remote-collector set (issue #751).
     if (shouldRenderPanel(panelStates, 'kpi-collectors')) {
       if (data.health) {
-        var collectors = data.health.collectors || [];
-        var healthyCol = collectors.filter(function (c) { return c.health === 'healthy'; }).length;
-        els.kpiCollectors.textContent = healthyCol + ' / ' + collectors.length;
+        var collectorRows = deriveRemoteCollectors(data.health.collectors);
+        var healthyCol = collectorRows.filter(function (c) { return c.health === 'healthy'; }).length;
+        els.kpiCollectors.textContent = healthyCol + ' / ' + collectorRows.length;
       }
     }
 
@@ -2365,7 +2415,10 @@
       return;
     }
 
-    var collectors = data.health.collectors || [];
+    // Collector alerts are generated only for the filtered client-level
+    // remote-collector set (issue #751) — excluded integration clients never
+    // raise stale/unknown alerts.  Source-DB alerts below are unchanged.
+    var collectors = deriveRemoteCollectors(data.health.collectors);
     var srcDbs = data.health.source_databases || [];
     var lastIngest = data.health.last_ingest_timestamp;
 
@@ -2467,33 +2520,30 @@
     els.eventsFeed.innerHTML = html;
   }
 
-  /** Collector Distribution — health bar per collector */
+  /** Collector Distribution — liveness-first bar per client-level remote
+   *  collector (issue #751).  Status and heartbeat recency are the primary
+   *  signals; the cumulative record count is secondary context and never
+   *  determines the bar (an idle healthy collector keeps a full bar). */
   function renderCollectorDistribution(data) {
     applyPanelFreshness('collector-dist');
     if (!shouldRenderPanel(panelStates, 'collector-dist')) return; // failed fetch → keep previous bars
 
-    if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
-      els.collectorDist.innerHTML = '<p class="empty-state">No collectors registered' + errorIndicator('health') + '</p>';
+    var collectors = data.health ? deriveRemoteCollectors(data.health.collectors) : [];
+    if (collectors.length === 0) {
+      els.collectorDist.innerHTML = '<p class="empty-state">No remote collectors registered' + errorIndicator('health') + '</p>';
       return;
     }
 
-    var collectors = data.health.collectors;
-    var maxRecords = 0;
-    collectors.forEach(function (c) {
-      if (c.total_records_ingested > maxRecords) maxRecords = c.total_records_ingested;
-    });
-
     var html = '';
     collectors.forEach(function (c) {
-      var pct = maxRecords > 0 ? (c.total_records_ingested / maxRecords * 100) : 0;
-      var healthWidth = c.health === 'healthy' ? 100 : c.health === 'stale' ? 40 : 20;
+      var width = collectorLivenessWidth(c.health);
       html += '<div class="dist-row">' +
         '<span class="dist-name" title="' + escHtml(c.client_name) + '">' + escHtml(c.client_name) + '</span>' +
         '<div class="dist-bar-track">' +
-          '<div class="dist-bar-healthy" style="width:' + (c.health === 'healthy' ? Math.max(pct, 5) : 0) + '%"></div>' +
-          '<div class="dist-bar-stale" style="width:' + (c.health === 'stale' ? Math.max(pct * 0.3, 3) : 0) + '%"></div>' +
-          '<div class="dist-bar-unknown" style="width:' + (c.health === 'unknown' ? Math.max(pct * 0.1, 2) : 0) + '%"></div>' +
+          '<div class="dist-bar-' + c.health + '" style="width:' + width + '%"></div>' +
         '</div>' +
+        '<span class="dist-status">' + badge(c.health, 'badge-' + c.health).outerHTML + '</span>' +
+        '<span class="dist-heartbeat">last seen ' + escHtml(fmtRelative(c.last_heartbeat)) + '</span>' +
         '<span class="dist-tokens">' + fmtNum(c.total_records_ingested) + ' recs</span>' +
         '</div>';
     });
@@ -2501,18 +2551,19 @@
     els.collectorDist.innerHTML = html;
   }
 
-  /** Collectors Table */
+  /** Collectors Table — client-level remote-collector rows (issue #751). */
   function renderCollectorsTable(data) {
     applyPanelFreshness('collectors');
     if (!shouldRenderPanel(panelStates, 'collectors')) return; // failed fetch → keep previous rows
 
-    if (!data.health || !data.health.collectors || data.health.collectors.length === 0) {
-      els.collectorsTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No collectors' + errorIndicator('health') + '</td></tr>';
+    var collectors = data.health ? deriveRemoteCollectors(data.health.collectors) : [];
+    if (collectors.length === 0) {
+      els.collectorsTbody.innerHTML = '<tr><td colspan="4" class="empty-state">No remote collectors' + errorIndicator('health') + '</td></tr>';
       return;
     }
 
     var html = '';
-    data.health.collectors.forEach(function (c) {
+    collectors.forEach(function (c) {
       var badgeCls = 'badge-' + c.health;
       html += '<tr>' +
         '<td>' + escHtml(c.client_name) + '</td>' +
@@ -2548,7 +2599,7 @@
 
       // Try to associate with a client/collector health status
       if (data.health && data.health.collectors) {
-        var hasHealthy = data.health.collectors.some(function (c) { return c.health === 'healthy'; });
+        var hasHealthy = deriveRemoteCollectors(data.health.collectors).some(function (c) { return c.health === 'healthy'; });
         status = hasHealthy ? 'active' : status;
       }
 
@@ -5760,6 +5811,14 @@
   window.fmtKpiTokenBreakdown = fmtKpiTokenBreakdown;
   window.renderKPIs = renderKPIs;
   window.aggregateSummaryBuckets = aggregateSummaryBuckets;
+  // Issue #751: collector liveness-first views — the shared helper that
+  // derives the filtered client-level remote-collector set, the liveness
+  // derivation, and the collector renderers join the window test seam.
+  window.deriveRemoteCollectors = deriveRemoteCollectors;
+  window.deriveCollectorLiveness = deriveCollectorLiveness;
+  window.renderCollectorDistribution = renderCollectorDistribution;
+  window.renderCollectorsTable = renderCollectorsTable;
+  window.renderLiveEvents = renderLiveEvents;
   // Agent Runs date-filter state + Clear control (issue #7) — pure state
   // helper, DOM sync, the Clear action, the filter reader (UTC-boundary
   // conversion regression), and the wiring entry point for the test harness.

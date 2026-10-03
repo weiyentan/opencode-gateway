@@ -766,19 +766,29 @@ class TestAuroraGlassApiContract:
     async def test_collector_health_kpis_contract(self):
         """The health endpoint keeps the collector/source-database shapes
         app.js reads for the Healthy Collectors / Source Databases KPI
-        cards: collectors[].health and source_databases[].health."""
+        cards: collectors[].health and source_databases[].health.
+        Since issue #750 collectors[] rows are client-level (client_name
+        identity; last_heartbeat/total_records_ingested aggregated across
+        the client's credentials and watched source databases)."""
         mock_pool = AsyncMock()
         mock_conn = AsyncMock()
         mock_pool.acquire = AsyncMock(return_value=mock_conn)
         mock_pool.release = AsyncMock()
 
         now = datetime.now(timezone.utc)  # noqa: UP017
+        # Issue #750: collectors[] rows are client-level; the collector
+        # summary query returns one signal row per non-revoked credential.
         collector_row = MagicMock()
         collector_row.__getitem__.side_effect = {
             "credential_id": str(_CREDENTIAL_ID),
-            "client_name": "legacy-client",
-            "last_heartbeat": now,
-            "total_records_ingested": 42,
+            "client_id": str(_CREDENTIAL_ID),
+            # /health collectors are filtered to remote-collector* clients
+            # (issue #749); the source-databases summary below is NOT
+            # filtered, so it keeps a non-matching client name.
+            "client_name": "remote-collector-ws-a",
+            "credential_last_heartbeat": now,
+            "credential_records": 42,
+            "source_last_seen": None,
         }.__getitem__
         source_db_row = MagicMock()
         source_db_row.__getitem__.side_effect = {
@@ -803,9 +813,12 @@ class TestAuroraGlassApiContract:
         data = response.json()["data"]
         assert "collectors" in data and "source_databases" in data
         assert data["collectors"][0]["health"] == "healthy"
-        assert data["collectors"][0]["client_name"] == "legacy-client"
+        assert data["collectors"][0]["client_name"] == "remote-collector-ws-a"
+        assert data["collectors"][0]["total_records_ingested"] == 42
+        assert data["collectors"][0]["last_heartbeat"] is not None
         assert data["source_databases"][0]["health"] == "healthy"
         assert data["source_databases"][0]["record_count"] == 42
+        assert data["source_databases"][0]["client_name"] == "legacy-client"
 
 
 # ══════════════════════════════════════════════════════════════════════════
