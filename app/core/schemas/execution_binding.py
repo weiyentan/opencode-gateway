@@ -789,3 +789,143 @@ class ExecutionBindingHistoryResponse(BaseModel):
         default_factory=list,
         description="All execution bindings for the resource (full history)",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Recovery checkpoint schemas (issue #754)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A recovery ref is a Git branch/ref name; a commit SHA is 40 (SHA-1) or 64
+# (SHA-256) hex characters.  Bounds are deliberately generous so a future
+# forge is never rejected, while still refusing an unbounded payload.
+MAX_RECOVERY_REF_LENGTH = 1024
+MAX_RECOVERY_COMMIT_SHA_LENGTH = 128
+
+
+class RecoveryCheckpointCreateRequest(BaseModel):
+    """Recovery-checkpoint write payload (issue #754).
+
+    Carries the emergency recovery branch/ref that survived a failed AFK
+    execution and the commit SHA it points at.  The owning execution is
+    identified by the path (``{awx_job_id}``), never by the body — a
+    checkpoint is execution-scoped and cannot be re-parented.
+
+    Example request body::
+
+        {
+          "ref": "ai/recovery/emergency-10219/tmp/issue-57-store-optional-profile-avatars",
+          "commit_sha": "bce8392508357d5316bb3a0263da3132727b78c3"
+        }
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "ref": (
+                    "ai/recovery/emergency-10219/"
+                    "tmp/issue-57-store-optional-profile-avatars"
+                ),
+                "commit_sha": "bce8392508357d5316bb3a0263da3132727b78c3",
+            }
+        },
+    )
+
+    ref: str = Field(
+        min_length=1,
+        max_length=MAX_RECOVERY_REF_LENGTH,
+        description="Emergency recovery branch/ref that survived the failure",
+    )
+    commit_sha: str = Field(
+        min_length=1,
+        max_length=MAX_RECOVERY_COMMIT_SHA_LENGTH,
+        description="Commit SHA the recovery ref points at",
+    )
+
+
+class RecoveryCheckpointResponse(BaseModel):
+    """One persisted recovery checkpoint (issue #754).
+
+    Exposes the execution-scoped identity — the owning AWX job id and the
+    AFK run id inherited from the execution binding — plus the recovery ref,
+    commit SHA, and creation metadata.
+
+    Example response body (inside the ``{status, data, error}`` envelope)::
+
+        {
+          "id": "6f1c1e2a-6d3b-4f1e-9c2a-1b2c3d4e5f60",
+          "awx_job_id": "10219",
+          "afk_run_id": "01M3ZCZ0772PVC4DJFVRZB97P6",
+          "ref": "ai/recovery/emergency-10219/tmp/issue-57-store-optional-profile-avatars",
+          "commit_sha": "bce8392508357d5316bb3a0263da3132727b78c3",
+          "created_at": "2026-10-03T12:00:00Z"
+        }
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "6f1c1e2a-6d3b-4f1e-9c2a-1b2c3d4e5f60",
+                "awx_job_id": "10219",
+                "afk_run_id": "01M3ZCZ0772PVC4DJFVRZB97P6",
+                "ref": (
+                    "ai/recovery/emergency-10219/"
+                    "tmp/issue-57-store-optional-profile-avatars"
+                ),
+                "commit_sha": "bce8392508357d5316bb3a0263da3132727b78c3",
+                "created_at": "2026-10-03T12:00:00Z",
+            }
+        },
+    )
+
+    id: str = Field(description="Gateway-assigned checkpoint id (UUID)")
+    awx_job_id: str = Field(description="Owning AWX execution job id")
+    afk_run_id: str | None = Field(
+        default=None,
+        description=(
+            "Owning AFK run ULID inherited from the execution binding; None "
+            "for a legacy binding that predates the mandatory afk_run_id"
+        ),
+    )
+    ref: str = Field(description="Emergency recovery branch/ref")
+    commit_sha: str = Field(description="Commit SHA the recovery ref points at")
+    created_at: datetime = Field(description="Checkpoint creation timestamp")
+
+
+class RecoveryCheckpointListResponse(BaseModel):
+    """Every recovery checkpoint of one AWX execution (issue #754).
+
+    Ordered deterministically by ``created_at ASC, id ASC`` (earliest
+    first).  An execution with no checkpoints returns an empty
+    ``checkpoints`` list; an unknown execution returns 404 before this shape
+    is produced.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "awx_job_id": "10219",
+                "checkpoints": [
+                    {
+                        "id": "6f1c1e2a-6d3b-4f1e-9c2a-1b2c3d4e5f60",
+                        "awx_job_id": "10219",
+                        "afk_run_id": "01M3ZCZ0772PVC4DJFVRZB97P6",
+                        "ref": (
+                            "ai/recovery/emergency-10219/"
+                            "tmp/issue-57-store-optional-profile-avatars"
+                        ),
+                        "commit_sha": (
+                            "bce8392508357d5316bb3a0263da3132727b78c3"
+                        ),
+                        "created_at": "2026-10-03T12:00:00Z",
+                    }
+                ],
+            }
+        }
+    )
+
+    awx_job_id: str = Field(description="Owning AWX execution job id")
+    checkpoints: list[RecoveryCheckpointResponse] = Field(
+        default_factory=list,
+        description="Recovery checkpoints for the execution (deterministic order)",
+    )
