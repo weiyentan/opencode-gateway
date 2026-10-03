@@ -21,6 +21,7 @@ from afk_outcomes.models import (
     ExecutionOutcome,
     EntityType,
     Provider,
+    RecoveryCheckpoint,
     RunSessionLink,
 )
 from afk_outcomes.serialization import ULIDSource
@@ -114,6 +115,43 @@ def _row_to_execution_binding(row: asyncpg.Record) -> ExecutionBinding:
         afk_run_id=row.get("afk_run_id"),
         trigger_type=row.get("trigger_type"),
     )
+
+
+def _row_to_recovery_checkpoint(row: asyncpg.Record) -> RecoveryCheckpoint:
+    """Convert a ``recovery_checkpoints`` row to a :class:`RecoveryCheckpoint`.
+
+    ``afk_run_id`` is nullable on the table (legacy execution bindings may
+    carry no run); the UUID is stringified so the domain model stays free of
+    database types.
+    """
+    return RecoveryCheckpoint(
+        checkpoint_id=str(row["id"]),
+        awx_job_id=str(row["awx_job_id"]),
+        afk_run_id=row["afk_run_id"],
+        ref=row["ref"],
+        commit_sha=row["commit_sha"],
+        created_at=row["created_at"],
+    )
+
+
+@dataclass(frozen=True)
+class CreateRecoveryCheckpointResult:
+    """Result of a recovery-checkpoint create-or-replay attempt (issue #754).
+
+    Returned by
+    :meth:`AsyncpgOutcomeRepository.create_or_replay_recovery_checkpoint`:
+
+    * ``is_created=True`` — a genuinely-new checkpoint row was inserted.
+    * ``is_created=False`` with ``checkpoint`` set — an identical replay
+      (same ``awx_job_id`` + ``ref`` + ``commit_sha``) returned the existing
+      row without mutation.
+    * ``execution_missing=True`` — no execution binding exists for the AWX
+      job id; nothing was inserted (the caller surfaces a 404).
+    """
+
+    checkpoint: RecoveryCheckpoint | None = None
+    is_created: bool = False
+    execution_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -978,6 +1016,97 @@ class _ExecutionBindingsRepositoryMixin:
         if row is None:
             return None
         return _row_to_execution_binding(row)
+
+    async def create_or_replay_recovery_checkpoint(
+        self,
+        *,
+        awx_job_id: str,
+        ref: str,
+        commit_sha: str,
+    ) -> CreateRecoveryCheckpointResult:
+        """Idempotently persist one execution-scoped recovery checkpoint.
+
+        The execution binding is the authority: the checkpoint is linked to
+        the existing row by its natural ``awx_job_id`` and inherits that
+        execution's ``afk_run_id``.  A missing execution returns
+        ``execution_missing=True`` without inserting anything (the caller
+        surfaces a 404).
+
+        Idempotency is the database's: ``INSERT ... ON CONFLICT
+        (awx_job_id, ref, commit_sha) DO NOTHING RETURNING ...`` is the
+        linearisation point.  A genuinely-new checkpoint returns
+        ``is_created=True``; an identical replay re-reads and returns the
+        existing row.  Distinct refs pointing at the same SHA are distinct
+        rows because ``ref`` is part of the uniqueness key.
+
+        The write NEVER touches the owning ``execution_bindings`` row — the
+        checkpoint is additive recovery metadata, so the execution's
+        outcome, failure metadata, session, and resource binding are
+        untouched.
+        """
+        numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
+        async with self._conn.transaction():
+            binding = await self._conn.fetchrow(
+                "SELECT afk_run_id FROM execution_bindings WHERE awx_job_id = $1",
+                numeric_awx_job_id,
+            )
+            if binding is None:
+                return CreateRecoveryCheckpointResult(execution_missing=True)
+
+            inserted = await self._conn.fetch(
+                """
+                INSERT INTO recovery_checkpoints
+                    (awx_job_id, afk_run_id, ref, commit_sha, created_at)
+                VALUES ($1, $2, $3, $4, now())
+                ON CONFLICT (awx_job_id, ref, commit_sha) DO NOTHING
+                RETURNING id, awx_job_id, afk_run_id, ref, commit_sha, created_at
+                """,
+                numeric_awx_job_id,
+                binding["afk_run_id"],
+                ref,
+                commit_sha,
+            )
+            if inserted:
+                return CreateRecoveryCheckpointResult(
+                    checkpoint=_row_to_recovery_checkpoint(inserted[0]),
+                    is_created=True,
+                )
+
+            existing = await self._conn.fetchrow(
+                """
+                SELECT id, awx_job_id, afk_run_id, ref, commit_sha, created_at
+                FROM recovery_checkpoints
+                WHERE awx_job_id = $1 AND ref = $2 AND commit_sha = $3
+                """,
+                numeric_awx_job_id,
+                ref,
+                commit_sha,
+            )
+            return CreateRecoveryCheckpointResult(
+                checkpoint=_row_to_recovery_checkpoint(existing),
+            )
+
+    async def list_recovery_checkpoints(
+        self, awx_job_id: str
+    ) -> list[RecoveryCheckpoint]:
+        """Return every recovery checkpoint for one AWX execution.
+
+        Ordered deterministically by ``created_at ASC, id ASC`` (earliest
+        first, ``id`` as the tie-breaker for same-timestamp rows), mirroring
+        the sibling execution-binding list methods.  An execution with no
+        checkpoints reads back as an empty list; an unknown execution also
+        reads back empty (the caller distinguishes 404 before calling this).
+        """
+        rows = await self._conn.fetch(
+            """
+            SELECT id, awx_job_id, afk_run_id, ref, commit_sha, created_at
+            FROM recovery_checkpoints
+            WHERE awx_job_id = $1
+            ORDER BY created_at ASC, id ASC
+            """,
+            _parse_awx_job_id(awx_job_id),
+        )
+        return [_row_to_recovery_checkpoint(row) for row in rows]
 
     async def list_execution_bindings_for_resource(
         self,
