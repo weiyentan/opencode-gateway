@@ -5,10 +5,12 @@
 # Kafka, AWX, or collector-database access.
 #
 # Pipeline: validate → build → smoke-start → publish to GHCR.
-# - Validation (ruff / import check) runs before any publish.
+# - Validation (ruff / pytest v1 contract suite / forbidden-import check) runs
+#   before any publish.
 # - Build is multi-stage, non-root, runtime-only OPENCODE_GATEWAY_URL/API_KEY.
-# - Smoke-start proves the image can start the MCP server with externally
-#   supplied config; startup failure fails the job and blocks publish.
+# - Smoke-start speaks the MCP protocol to the container over stdio and proves
+#   the completed server exposes exactly the eight approved v1 tools; startup
+#   failure fails the job and blocks publish.
 # - Publish uses GHCR (ghcr.io) by default with immutable + branch/release tags.
 # - No Postgres/Kafka/AWX services are required; the pipeline is independent of
 #   systems behind the Gateway API boundary.
@@ -50,13 +52,18 @@ jobs:
 
       - name: Lint MCP project
         run: |
-          ruff check opencode-gateway-mcp/ || echo "ruff: no Python files to lint yet (container contract only)"
+          ruff check opencode-gateway-mcp/
+
+      - name: Run MCP v1 contract suite (pytest)
+        run: |
+          pip install --no-cache-dir "./opencode-gateway-mcp[dev]"
+          python -m pytest opencode-gateway-mcp/tests -q
 
       - name: Verify no Postgres/Kafka/AWX imports in MCP
         run: |
           set -euo pipefail
-          if grep -r -E "import (asyncpg|aiokafka|psycopg|sqlalchemy)" opencode-gateway-mcp/ 2>/dev/null; then
-            echo "error: MCP must not import Postgres/Kafka libraries" >&2
+          if grep -r -E "import (asyncpg|aiokafka|confluent_kafka|psycopg|sqlalchemy|awxkit|kafka|redis|motor|boto3|pymongo)" opencode-gateway-mcp/ 2>/dev/null; then
+            echo "error: MCP must not import Postgres/Kafka/AWX libraries" >&2
             exit 1
           fi
           if grep -r -E "OPENCODE_GATEWAY_API_KEY" opencode-gateway-mcp/Dockerfile 2>/dev/null | grep -q "ENV.*OPENCODE"; then
@@ -117,43 +124,127 @@ jobs:
           set -euo pipefail
           echo "Smoke: container must fail closed without OPENCODE_GATEWAY_URL/API_KEY"
           if docker run --rm ghcr.io/${{ github.repository_owner }}/opencode-gateway-mcp:smoke 2>&1; then
-            echo "error: container should have exited 1 without env" >&2
+            echo "error: container should have exited non-zero without env" >&2
             exit 1
           fi
-          echo "smoke without env correctly failed (exit 1)"
+          echo "smoke without env correctly failed closed"
 
-      - name: Smoke-start — succeeds with externally supplied config
+      - name: Smoke-start — MCP handshake exposes exactly the eight v1 tools
         run: |
           set -euo pipefail
-          # Start container detached with required runtime env (not baked).
-          CID=$(docker run -d \
-            -e OPENCODE_GATEWAY_URL=http://example.invalid \
-            -e OPENCODE_GATEWAY_API_KEY=dummy-smoke-key \
-            ghcr.io/${{ github.repository_owner }}/opencode-gateway-mcp:smoke)
-          # Give entrypoint time to validate env and print "ready".
-          sleep 3
-          LOGS=$(docker logs "$CID" 2>&1 || true)
-          echo "$LOGS"
-          # Fail if secret leaked into logs.
-          if echo "$LOGS" | grep -q "dummy-smoke-key"; then
-            echo "error: API key leaked into container logs" >&2
-            docker rm -f "$CID" >/dev/null 2>&1 || true
-            exit 1
-          fi
-          if ! echo "$LOGS" | grep -q "ready"; then
-            echo "error: container did not reach ready state" >&2
-            docker logs "$CID" 2>&1 || true
-            docker rm -f "$CID" >/dev/null 2>&1 || true
-            exit 1
-          fi
-          # Container should still be running (smoke stub loops).
-          if ! docker ps --filter "id=$CID" --format "{{.ID}}" | grep -q "$CID"; then
-            echo "error: container exited unexpectedly" >&2
-            docker logs "$CID" 2>&1 || true
-            exit 1
-          fi
-          docker rm -f "$CID" >/dev/null
-          echo "smoke with env passed — no secret in logs"
+          export SMOKE_IMAGE="ghcr.io/${{ github.repository_owner }}/opencode-gateway-mcp:smoke"
+          export SMOKE_API_KEY="dummy-smoke-key-766"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import threading
+          import time
+
+          # The approved v1 read-only tool surface (ADR 0031). The container smoke
+          # proves the published image starts the completed MCP server and exposes
+          # exactly this set — no more, no less.
+          EXPECTED_TOOLS = {
+              "get_afk_activity_summary",
+              "list_afk_runs",
+              "get_afk_run_story",
+              "get_model_usage",
+              "get_agent_usage",
+              "get_change_request_story",
+              "get_gateway_health",
+              "get_correlation_issues",
+          }
+
+          image = os.environ["SMOKE_IMAGE"]
+          api_key = os.environ["SMOKE_API_KEY"]
+
+          proc = subprocess.Popen(
+              [
+                  "docker", "run", "--rm", "-i",
+                  "-e", "OPENCODE_GATEWAY_URL=http://example.invalid",
+                  "-e", f"OPENCODE_GATEWAY_API_KEY={api_key}",
+                  image,
+              ],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+          )
+
+          def send(payload):
+              assert proc.stdin is not None, "container stdin closed"
+              proc.stdin.write(json.dumps(payload) + "\n")
+              proc.stdin.flush()
+
+          output = []
+
+          def read_stdout():
+              assert proc.stdout is not None, "container stdout closed"
+              for line in proc.stdout:
+                  output.append(line.strip())
+
+          reader = threading.Thread(target=read_stdout, daemon=True)
+          reader.start()
+
+          send({
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "initialize",
+              "params": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {},
+                  "clientInfo": {"name": "mcp-smoke", "version": "1.0.0"},
+              },
+          })
+          time.sleep(1)
+          send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+          time.sleep(0.5)
+          send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+
+          tools = None
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              for line in list(output):
+                  try:
+                      obj = json.loads(line)
+                  except (ValueError, TypeError):
+                      continue
+                  if isinstance(obj, dict) and obj.get("id") == 2:
+                      tools = obj.get("result", {}).get("tools", [])
+                      break
+              if tools is not None:
+                  break
+              time.sleep(0.25)
+
+          if proc.stdin is not None:
+              proc.stdin.close()
+          try:
+              proc.wait(timeout=10)
+          except subprocess.TimeoutExpired:
+              proc.kill()
+              proc.wait(timeout=10)
+          stderr = proc.stderr.read() if proc.stderr is not None else ""
+
+          if tools is None:
+              sys.stderr.write("MCP tools/list handshake returned no tools\n")
+              sys.stderr.write(stderr + "\n")
+              sys.exit(1)
+          names = {tool["name"] for tool in tools}
+          if names != EXPECTED_TOOLS:
+              sys.stderr.write(
+                  f"tool surface mismatch: expected {sorted(EXPECTED_TOOLS)}, "
+                  f"got {sorted(names)}\n"
+              )
+              sys.exit(1)
+          if api_key in stderr or api_key in "\n".join(output):
+              sys.stderr.write("API key leaked into container logs\n")
+              sys.exit(1)
+          print(
+              f"smoke passed: container exposes exactly {len(names)} v1 tools, "
+              "no secret in logs"
+          )
+          PY
 
       - name: Push MCP image to GHCR
         if: github.event_name != 'pull_request'
