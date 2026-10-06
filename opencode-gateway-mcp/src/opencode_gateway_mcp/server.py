@@ -2,10 +2,11 @@
 
 The adapter is deliberately read-only: it calls only ``GET /health``,
 ``GET /api/v1/afk/dashboard/summary``,
-``GET /api/v1/afk-outcomes/runs`` and
-``GET /api/v1/usage/aggregates`` (group_by=model/agent) on the published
-Gateway API, and no write/admin or generic passthrough capability is exposed.
-No per-AFK-run model attribution is performed.
+``GET /api/v1/afk-outcomes/runs``,
+``GET /api/v1/usage/aggregates`` (group_by=model/agent),
+``GET /api/v1/afk-outcomes/runs/{afk_run_id}`` and
+``GET /api/v1/afk/executions/runs/{afk_run_id}`` on the published Gateway API,
+and no write/admin or generic passthrough capability is exposed.
 """
 
 from __future__ import annotations
@@ -72,6 +73,16 @@ AGENT_USAGE_TOOL_DESCRIPTION = (
     "group_by=agent semantics, session/record counts, token and cache fields, "
     "provider breakdown, and estimated cost with nulls preserved. No per-AFK-run "
     "model attribution is performed."
+)
+
+STORY_TOOL_DESCRIPTION = (
+    "Return the complete AFK run story for one afk_run_id: the canonical run detail "
+    "(issues, change requests, reviews, commits, merge events, agents, sessions, "
+    "usage/cost) from GET /api/v1/afk-outcomes/runs/{afk_run_id} plus the full "
+    "run-scoped AWX execution history including failed attempts and retries from "
+    "GET /api/v1/afk/executions/runs/{afk_run_id} using the same explicit afk_run_id. "
+    "Approved failure reason/summary metadata is preserved without raw prompts/stdout/secrets; "
+    "no additional relationships are inferred; nulls and errors are preserved."
 )
 
 
@@ -231,6 +242,91 @@ class UsageAggregateRow(BaseModel):
     provider_breakdown: dict[str, int] = {}
     project_label: str | None = None
     agent: str | None = None
+
+
+# ── AFK run story models ────────────────────────────────────────────────
+
+
+class AfkRunSummary(BaseModel):
+    """The run aggregate as reported by the canonical run-detail API."""
+
+    model_config = ConfigDict(extra="allow")
+
+    afk_run_id: str
+    provider: str | None = None
+    title: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    outcome_status: str | None = None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+
+
+class AfkUsageAggregate(BaseModel):
+    """Per-run usage/cost aggregates preserving nulls and token vocabulary."""
+
+    model_config = ConfigDict(extra="allow")
+
+    active_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    estimated_cost_usd: float | str | None = None
+    message_count: int | None = None
+    session_count: int | None = None
+
+
+class AfkExecutionBinding(BaseModel):
+    """One AWX execution binding as reported by the run-scoped execution history.
+
+    Approved failure metadata (failure_reason/failure_summary) is carried verbatim
+    — bounded and redacted by the Gateway — without raw prompts, stdout, or secrets.
+    ``extra="allow"`` preserves unknown future fields; nulls are preserved.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    binding_id: str | None = None
+    awx_job: dict[str, Any] | None = None
+    external_session_id: str | None = None
+    external_session_ids: list[str] | None = None
+    resource: dict[str, Any] | None = None
+    outcome: str | None = None
+    afk_run_id: str | None = None
+    trigger_type: str | None = None
+    source_event_id: str | None = None
+    branch: str | None = None
+    title: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    failure_reason: str | None = None
+    failure_summary: str | None = None
+
+
+class AfkRunStory(BaseModel):
+    """Complete AFK run story combining canonical run-detail and execution history.
+
+    All collections and scalars are preserved exactly as the Gateway reports them,
+    including ``None``/``null``. No additional relationships are inferred by the
+    adapter — the story is the mechanical composition of the two run-scoped APIs
+    keyed by the same explicit ``afk_run_id``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    afk_run_id: str
+    run: AfkRunSummary | dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    issues: list[dict[str, Any]] = []
+    change_requests: list[dict[str, Any]] = []
+    reviews: list[dict[str, Any]] = []
+    commits: list[dict[str, Any]] = []
+    merge_events: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+    agents: list[str] = []
+    usage: AfkUsageAggregate | dict[str, Any] | None = None
+    executions: list[AfkExecutionBinding] = []
 
 
 def create_server(
@@ -394,6 +490,57 @@ def create_server(
         except ValidationError:
             raise ToolError(
                 "OpenCode Gateway returned an unexpected /api/v1/usage/aggregates payload shape"
+            ) from None
+
+    @server.tool(description=STORY_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def get_afk_run_story(afk_run_id: str) -> AfkRunStory:
+        """Return the complete AFK run story for one ``afk_run_id``.
+
+        Composition rule is mechanical: the same explicit ``afk_run_id`` is used
+        for both ``GET /api/v1/afk-outcomes/runs/{afk_run_id}`` (canonical
+        run-detail) and ``GET /api/v1/afk/executions/runs/{afk_run_id}``
+        (run-scoped AWX execution history). No additional relationships are
+        invented. A failure in either required call is surfaced as an
+        MCP-visible error rather than a partial success. ``null`` values are
+        preserved.
+        """
+        if not isinstance(afk_run_id, str) or not afk_run_id.strip():
+            raise ToolError("afk_run_id must be a non-empty string")
+        trimmed = afk_run_id.strip()
+        try:
+            detail = await gateway.get_afk_run_detail(trimmed)
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            executions_raw = await gateway.get_afk_executions_for_run(trimmed)
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            executions = [AfkExecutionBinding.model_validate(item) for item in executions_raw]
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/afk/executions/runs/{afk_run_id} payload shape"
+            ) from None
+        story_payload: dict[str, Any] = {
+            "afk_run_id": trimmed,
+            "run": detail.get("run"),
+            "outcome": detail.get("outcome"),
+            "issues": detail.get("issues", []),
+            "change_requests": detail.get("change_requests", []),
+            "reviews": detail.get("reviews", []),
+            "commits": detail.get("commits", []),
+            "merge_events": detail.get("merge_events", []),
+            "sessions": detail.get("sessions", []),
+            "agents": detail.get("agents", []),
+            "usage": detail.get("usage"),
+            "executions": [e.model_dump(mode="json", exclude_none=False) for e in executions],
+        }
+        try:
+            return AfkRunStory.model_validate(story_payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected afk run story payload shape"
             ) from None
 
     return server

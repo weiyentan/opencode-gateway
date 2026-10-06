@@ -105,6 +105,60 @@ class GatewayClient:
             "Accept": "application/json",
         }
 
+    async def _get_json(self, path: str) -> Any:
+        """Fetch ``GET {path}`` and return the JSON-decoded body.
+
+        - Raises :class:`GatewayConnectionError` for transport failures.
+        - Raises :class:`GatewayHTTPError` for 4xx/5xx with credential-free message.
+        - Raises :class:`GatewayResponseError` for non-JSON or non-object/list bodies.
+        - Unwraps the Gateway envelope ``{status: "ok", data: ...}`` when present;
+          otherwise returns the payload unchanged (so controlled mocks may supply
+          either shape).
+        """
+        url = f"{self._config.base_url}{path}"
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(url, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(path, response.status_code, response.reason_phrase)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned a non-JSON {path} response"
+            ) from None
+        # Unwrap the standard Gateway envelope when present.
+        if isinstance(payload, dict) and payload.get("status") == "ok" and "data" in payload:
+            return payload["data"]
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an error envelope for {path}"
+            )
+        return payload
+
+    async def get_health(self) -> dict[str, Any]:
+        """Fetch ``GET /health`` and return the JSON object unchanged.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        result = await self._get_json("/health")
+        if not isinstance(result, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected /health payload shape"
+            )
+        return result
+
     async def list_afk_runs(
         self,
         *,
@@ -194,40 +248,6 @@ class GatewayClient:
             )
         return payload
 
-    async def get_health(self) -> dict[str, Any]:
-        """Fetch ``GET /health`` and return the JSON object unchanged.
-
-        Raises a :class:`GatewayError` with a credential-free message for
-        transport failures, non-2xx responses, and unparseable bodies.
-        """
-        url = f"{self._config.base_url}/health"
-        try:
-            if self._http_client is not None:
-                response = await self._http_client.get(
-                    url, headers=self._headers(), timeout=self._timeout
-                )
-            else:
-                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
-                    response = await http_client.get(url, headers=self._headers())
-        except httpx.HTTPError as exc:
-            raise GatewayConnectionError(
-                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
-                f"({type(exc).__name__})"
-            ) from None
-        if response.status_code >= 400:
-            raise GatewayHTTPError("/health", response.status_code, response.reason_phrase)
-        try:
-            payload = response.json()
-        except ValueError:
-            raise GatewayResponseError(
-                "OpenCode Gateway returned a non-JSON /health response"
-            ) from None
-        if not isinstance(payload, dict):
-            raise GatewayResponseError(
-                "OpenCode Gateway returned an unexpected /health payload shape"
-            )
-        return payload
-
     async def get_afk_dashboard_summary(
         self,
         *,
@@ -286,9 +306,6 @@ class GatewayClient:
                 "OpenCode Gateway returned a non-JSON "
                 "/api/v1/afk/dashboard/summary response"
             ) from None
-        # Unwrap the ``{status: "ok", data: ...}`` envelope when the Gateway
-        # is running with the response-envelope middleware; preserve the inner
-        # payload verbatim otherwise (MockTransport tests return unwrapped inner).
         if (
             isinstance(payload, dict)
             and payload.get("status") == "ok"
@@ -362,10 +379,6 @@ class GatewayClient:
             raise GatewayResponseError(
                 "OpenCode Gateway returned a non-JSON /api/v1/usage/aggregates response"
             ) from None
-        # The aggregates endpoint returns a bare JSON array (not the envelope's
-        # ``data`` wrapper) when accessed via the raw client; the FastAPI envelope
-        # is stripped by httpx when the test mock returns the inner list directly.
-        # Normalize both: if the payload is a dict with ``data``, unwrap it.
         if isinstance(payload, dict) and "data" in payload:
             inner = payload["data"]
             if not isinstance(inner, list):
@@ -378,3 +391,41 @@ class GatewayClient:
                 "OpenCode Gateway returned an unexpected /api/v1/usage/aggregates payload shape"
             )
         return payload  # type: ignore[return-value]
+
+    async def get_afk_run_detail(self, afk_run_id: str) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/afk-outcomes/runs/{afk_run_id}``.
+
+        Returns the canonical run-detail payload (run, outcome, issues,
+        change_requests, reviews, commits, merge_events, sessions, agents,
+        usage) as reported by the Gateway. ``null`` values are preserved
+        exactly as returned.
+
+        Raises a :class:`GatewayError` for transport failures, non-2xx
+        responses, and unparseable bodies.
+        """
+        path = f"/api/v1/afk-outcomes/runs/{afk_run_id}"
+        result = await self._get_json(path)
+        if not isinstance(result, dict):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return result
+
+    async def get_afk_executions_for_run(self, afk_run_id: str) -> list[dict[str, Any]]:
+        """Fetch ``GET /api/v1/afk/executions/runs/{afk_run_id}``.
+
+        Returns the complete execution-attempt history for the run as a list
+        of execution binding read payloads, including failed attempts and
+        retries, in the order returned by the Gateway. ``null`` / ``None``
+        values are preserved.
+
+        Raises a :class:`GatewayError` for transport failures, non-2xx
+        responses, and unparseable bodies.
+        """
+        path = f"/api/v1/afk/executions/runs/{afk_run_id}"
+        result = await self._get_json(path)
+        if not isinstance(result, list):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return result
