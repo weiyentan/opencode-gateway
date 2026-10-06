@@ -162,7 +162,12 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    assert [tool.name for tool in tools.tools] == ["get_gateway_health"]
+    # Bootstrap slice asserted only health; with later slices the MCP exposes
+    # the read-only semantic tools added since bootstrap.
+    assert "get_gateway_health" in [tool.name for tool in tools.tools]
+    assert set(tool.name for tool in tools.tools).issubset(
+        {"get_gateway_health", "get_change_request_story"}
+    )
 
 
 async def test_gateway_4xx_is_surfaced_as_mcp_error_without_exposing_api_key() -> None:

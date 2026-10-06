@@ -137,4 +137,71 @@ class GatewayClient:
             raise GatewayResponseError(
                 "OpenCode Gateway returned an unexpected /health payload shape"
             )
+        # Envelope-unwrap: the Gateway wraps all JSON in {status:"ok", data:...}
+        # for non-/health as well; unwrap when present, preserving raw shape
+        # for backward compatibility with direct-payload mocks.
+        if payload.get("status") == "ok" and "data" in payload and isinstance(
+            payload["data"], dict
+        ):
+            # Only unwrap if the inner data looks like health (has version/database)
+            # or is clearly an envelope; for health we keep backward compat with
+            # direct payload by unwrapping to the inner dict when envelope detected.
+            inner = payload["data"]
+            if isinstance(inner, dict) and ("version" in inner or "database" in inner):
+                return inner
+        return payload
+
+    async def get_change_request_detail(
+        self, provider: str, repository: str, external_number: str
+    ) -> dict[str, Any]:
+        """Fetch change-request detail via the published Gateway API.
+
+        Calls ``GET /api/v1/afk-outcomes/change-requests/``
+        ``{provider}/{repository}/{external_number}`` and returns the JSON
+        object unchanged (envelope-unwrapped). Raises a :class:`GatewayError`
+        with a credential-free message for transport failures, non-2xx
+        responses, and unparseable bodies. Only this read-only path is ever
+        called; no issue reverse lookup or generic passthrough is performed.
+        """
+        from urllib.parse import quote
+
+        # Repository may contain slashes (group/project); preserve them.
+        encoded_provider = quote(provider, safe="")
+        encoded_repository = quote(repository, safe="/")
+        encoded_number = quote(external_number, safe="")
+        path = (
+            f"/api/v1/afk-outcomes/change-requests/"
+            f"{encoded_provider}/{encoded_repository}/{encoded_number}"
+        )
+        url = f"{self._config.base_url}{path}"
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(url, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(path, response.status_code, response.reason_phrase)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON change-request response"
+            ) from None
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected change-request payload shape"
+            )
+        # Unwrap envelope when present: {status:"ok", data:{...}}
+        if payload.get("status") == "ok" and "data" in payload:
+            inner = payload["data"]
+            if isinstance(inner, dict):
+                return inner
         return payload
