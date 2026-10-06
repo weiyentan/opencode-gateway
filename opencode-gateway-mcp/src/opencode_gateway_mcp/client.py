@@ -138,3 +138,78 @@ class GatewayClient:
                 "OpenCode Gateway returned an unexpected /health payload shape"
             )
         return payload
+
+    async def get_afk_dashboard_summary(
+        self,
+        *,
+        from_date: str,
+        to_date: str,
+        provider: str | None = None,
+        repository: str | None = None,
+        interval: str = "daily",
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/afk/dashboard/summary`` with explicit UTC-calendar semantics.
+
+        The caller must supply explicit ``from_date``/``to_date`` (ISO-8601 calendar
+        dates, UTC); no implicit "today" is substituted. ``interval`` is ``daily``
+        or ``monthly`` per the Gateway contract. ``provider``/``repository`` are
+        optional scopes forwarded verbatim. The rollup is UTC-calendar based; the
+        method preserves Gateway string representations and nulls without coercion.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        url = f"{self._config.base_url}/api/v1/afk/dashboard/summary"
+        params: dict[str, str] = {
+            "from_date": from_date,
+            "to_date": to_date,
+            "interval": interval,
+        }
+        if provider is not None:
+            params["provider"] = provider
+        if repository is not None:
+            params["repository"] = repository
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, params=params, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(
+                        url, params=params, headers=self._headers()
+                    )
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(
+                "/api/v1/afk/dashboard/summary",
+                response.status_code,
+                response.reason_phrase,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON "
+                "/api/v1/afk/dashboard/summary response"
+            ) from None
+        # Unwrap the ``{status: "ok", data: ...}`` envelope when the Gateway
+        # is running with the response-envelope middleware; preserve the inner
+        # payload verbatim otherwise (MockTransport tests return unwrapped inner).
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and "data" in payload
+            and isinstance(payload["data"], dict)
+        ):
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/afk/dashboard/summary payload shape"
+            )
+        return payload
