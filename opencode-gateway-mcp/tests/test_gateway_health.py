@@ -162,7 +162,7 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    # Superset: health + activity + runs + model + agent + run_story (6 tools at this stage)
+    # Superset: all 8 read-only semantic tools (health + 7 domain tools)
     tool_names = {tool.name for tool in tools.tools}
     assert "get_gateway_health" in tool_names
     assert "get_afk_activity_summary" in tool_names
@@ -170,6 +170,8 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
     assert "get_model_usage" in tool_names
     assert "get_agent_usage" in tool_names
     assert "get_afk_run_story" in tool_names
+    assert "get_change_request_story" in tool_names
+    assert "get_correlation_issues" in tool_names
     # No write/admin or generic passthrough.
     assert tool_names.isdisjoint({"write", "admin", "passthrough"})
 

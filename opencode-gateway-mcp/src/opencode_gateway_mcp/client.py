@@ -429,3 +429,108 @@ class GatewayClient:
                 f"OpenCode Gateway returned an unexpected {path} payload shape"
             )
         return result
+
+    async def get_change_request_detail(
+        self, provider: str, repository: str, external_number: str
+    ) -> dict[str, Any]:
+        """Fetch change-request detail via the published Gateway API.
+
+        Calls ``GET /api/v1/afk-outcomes/change-requests/``
+        ``{provider}/{repository}/{external_number}`` and returns the JSON
+        object unchanged (envelope-unwrapped). Raises a :class:`GatewayError`
+        with a credential-free message for transport failures, non-2xx
+        responses, and unparseable bodies. Only this read-only path is ever
+        called; no issue reverse lookup or generic passthrough is performed.
+        """
+        from urllib.parse import quote
+
+        encoded_provider = quote(provider, safe="")
+        encoded_repository = quote(repository, safe="/")
+        encoded_number = quote(external_number, safe="")
+        path = (
+            f"/api/v1/afk-outcomes/change-requests/"
+            f"{encoded_provider}/{encoded_repository}/{encoded_number}"
+        )
+        url = f"{self._config.base_url}{path}"
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(url, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(path, response.status_code, response.reason_phrase)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON change-request response"
+            ) from None
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected change-request payload shape"
+            )
+        if payload.get("status") == "ok" and "data" in payload:
+            inner = payload["data"]
+            if isinstance(inner, dict):
+                return inner
+        return payload
+
+    async def get_correlation_issues(
+        self,
+        *,
+        reason: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/afk-outcomes/correlations`` and return the paginated payload.
+
+        Only one Gateway request is ever issued — no silent crawl. ``reason``
+        is ``ambiguous`` or ``unmatched`` when supplied; ``limit``/``offset``
+        are forwarded exactly as provided.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        path = "/api/v1/afk-outcomes/correlations"
+        url = f"{self._config.base_url}{path}"
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if reason is not None:
+            params["reason"] = reason
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, headers=self._headers(), params=params, timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(url, headers=self._headers(), params=params)
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(path, response.status_code, response.reason_phrase)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned a non-JSON {path} response"
+            ) from None
+        if isinstance(payload, dict) and payload.get("status") == "ok" and "data" in payload:
+            inner = payload["data"]
+            if isinstance(inner, dict):
+                return inner
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return payload
