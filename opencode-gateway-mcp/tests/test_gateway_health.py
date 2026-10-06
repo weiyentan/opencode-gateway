@@ -155,6 +155,7 @@ async def test_health_values_are_preserved_without_reinterpretation() -> None:
 
 
 async def test_only_the_read_only_health_tool_is_exposed() -> None:
+    # After issue #763 the adapter exposes two read-only tools: health + afk run story.
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=HEALTHY_PAYLOAD)
 
@@ -162,7 +163,9 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    assert [tool.name for tool in tools.tools] == ["get_gateway_health"]
+    assert sorted(tool.name for tool in tools.tools) == sorted(
+        ["get_gateway_health", "get_afk_run_story"]
+    )
 
 
 async def test_gateway_4xx_is_surfaced_as_mcp_error_without_exposing_api_key() -> None:
