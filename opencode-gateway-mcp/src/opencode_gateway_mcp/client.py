@@ -105,6 +105,95 @@ class GatewayClient:
             "Accept": "application/json",
         }
 
+    async def list_afk_runs(
+        self,
+        *,
+        repository: str | None = None,
+        provider: str | None = None,
+        outcome: str | None = None,
+        started_from: str | None = None,
+        started_to: str | None = None,
+        finished_from: str | None = None,
+        finished_to: str | None = None,
+        seen_from: str | None = None,
+        seen_to: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/afk-outcomes/runs`` with explicit filters.
+
+        The MCP tool exposes ``provider``; the Gateway's query parameter is
+        ``origin`` — this method translates ``provider`` to ``origin`` and
+        forwards all other supported filters verbatim. Only one page is fetched;
+        ``limit``/``offset`` are forwarded as-is without silent crawling.
+        Null/unavailable values from the Gateway are preserved unchanged.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        url = f"{self._config.base_url}/api/v1/afk-outcomes/runs"
+        params: dict[str, str] = {}
+        if repository is not None:
+            params["repository"] = repository
+        if provider is not None:
+            params["origin"] = provider
+        if outcome is not None:
+            params["outcome"] = outcome
+        if started_from is not None:
+            params["started_from"] = started_from
+        if started_to is not None:
+            params["started_to"] = started_to
+        if finished_from is not None:
+            params["finished_from"] = finished_from
+        if finished_to is not None:
+            params["finished_to"] = finished_to
+        if seen_from is not None:
+            params["seen_from"] = seen_from
+        if seen_to is not None:
+            params["seen_to"] = seen_to
+        if limit is not None:
+            params["limit"] = str(limit)
+        if offset is not None:
+            params["offset"] = str(offset)
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, params=params, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(
+                        url, params=params, headers=self._headers()
+                    )
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(
+                "/api/v1/afk-outcomes/runs",
+                response.status_code,
+                response.reason_phrase,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON "
+                "/api/v1/afk-outcomes/runs response"
+            ) from None
+        if isinstance(payload, dict) and payload.get("status") == "ok" and "data" in payload:
+            data = payload["data"]
+            if isinstance(data, dict):
+                payload = data
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/afk-outcomes/runs payload shape"
+            )
+        return payload
+
     async def get_health(self) -> dict[str, Any]:
         """Fetch ``GET /health`` and return the JSON object unchanged.
 
