@@ -1,36 +1,33 @@
 ## Summary
-
 This automated develop-loop run implemented the following issues:
-
 | Issue | Title |
 |-------|-------|
-| #749 | Filter collector health to remote-collector clients |
-| #750 | Aggregate remote collector health at client level |
-| #751 | Make Aurora Glass collector views liveness-first |
-
-## Implemented Issues
-
-- **#749** — Filter collector health to remote-collector clients
-  - Filter `/health` `collectors[]` to only remote-collector clients (`remote-collector*` prefix) instead of reporting all clients.
-- **#750** — Aggregate remote collector health at client level
-  - Aggregate remote collector health at the client level rather than per individual collector instance.
-- **#751** — Make Aurora Glass collector views liveness-first
-  - Reorder Aurora Glass collector views so liveness/health status is shown first, with identity details secondary.
+| #758 | Containerize and publish opencode-gateway-mcp through CI |
+| #759 | Bootstrap opencode-gateway-mcp with Gateway health tool |
+| #760 | Expose AFK activity summaries through MCP |
+| #761 | Expose filtered AFK run discovery through MCP |
+| #762 | Expose model and agent usage through MCP |
+| #763 | Expose complete AFK run story through MCP |
+| #764 | Expose PR and MR AFK history through MCP |
+| #765 | Expose AFK correlation quality problems through MCP |
+| #766 | Prove the complete opencode-gateway-mcp v1 contract |
 
 ## Changes
-
-- Filter `/health` to remote-collector* clients: the health endpoint's collector list now only includes clients whose registered name starts with `remote-collector`, so operational health signals aren't diluted by unrelated ingestion clients.
-- Aggregate remote collector health at client level: collector health rows are rolled up to the owning client, giving one health signal per client rather than one per collector credential/instance.
-- Make Aurora Glass collector views liveness-first: dashboard and status views lead with liveness (up/stale/down) so operators see service health before collector metadata.
+- Containerized MCP adapter with multi-stage Dockerfile (GHCR publish) — `opencode-gateway-mcp/Dockerfile`, `pyproject.toml`, `.github/workflows/mcp-publish.yml`
+- Bootstrapped MCP server with `get_gateway_health` (health + version probe)
+- Added `get_afk_activity_summary`, `list_afk_runs`, `get_model_usage`/`get_agent_usage`, `get_afk_run_story`, `get_change_request_story`, `get_correlation_issues` (8 tools total — full v1 surface in `opencode-gateway-mcp/src/opencode_gateway_mcp/server.py` + `client.py`)
+- Added v1 contract gate with 61 tests (`test_v1_contract.py` + per-tool suites), updated workflow smoke to 8-tool handshake
+- Updated `docs/mcp/README.md` with MCP v1 8-tool documentation
 
 ## Review
+A consolidated diff review is available at .status/handoff/diff-review.md
 
-A consolidated diff review is available at `.status/handoff/diff-review.md` (includes per-issue diff reviews for #749, #750, and #751).
-
-Closes #749
-Closes #750
-Closes #751
-
----
-
-*Note: Changes were pushed directly to `ai/feat/issues-749-750-751` by the autonomous develop-loop.*
+Closes #758
+Closes #759
+Closes #760
+Closes #761
+Closes #762
+Closes #763
+Closes #764
+Closes #765
+Closes #766
