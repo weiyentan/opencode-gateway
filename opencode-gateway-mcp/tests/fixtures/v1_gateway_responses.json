@@ -1,0 +1,449 @@
+{
+  "_comment": "Representative captured OpenCode Gateway responses for the v1 MCP contract gate. Shapes mirror the published Gateway API exactly; the contract test replays them through the complete MCP server. Breaking Gateway response-shape drift updates these bodies and must fail the MCP schema check.",
+  "get_gateway_health": {
+    "arguments": {},
+    "responses": [
+      {
+        "path": "/health",
+        "body": {
+          "status": "ok",
+          "version": "0.4.2",
+          "database": "connected",
+          "last_ingest_timestamp": null,
+          "collectors": [
+            {
+              "client_id": "11111111-1111-1111-1111-111111111111",
+              "client_name": "remote-collector-runner-a",
+              "last_heartbeat": null,
+              "total_records_ingested": 42,
+              "health": "unknown"
+            },
+            {
+              "client_id": "22222222-2222-2222-2222-222222222222",
+              "client_name": "remote-collector-runner-b",
+              "last_heartbeat": "2026-10-07T09:15:00+00:00",
+              "total_records_ingested": 7,
+              "health": "healthy"
+            }
+          ],
+          "source_databases": []
+        }
+      }
+    ],
+    "sentinel_paths": [["version"], ["collectors", 0, "health"]],
+    "null_paths": [["last_ingest_timestamp"], ["collectors", 0, "last_heartbeat"]]
+  },
+  "get_afk_activity_summary": {
+    "arguments": {
+      "from_date": "2026-09-01",
+      "to_date": "2026-09-30",
+      "interval": "daily"
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk/dashboard/summary",
+        "body": {
+          "interval": "daily",
+          "from_date": "2026-09-01",
+          "to_date": "2026-09-30",
+          "provider": null,
+          "repository": null,
+          "buckets": [
+            {
+              "period_start": "2026-09-01",
+              "provider": "github",
+              "repository": "acme/proj",
+              "runs_started": 2,
+              "change_requests_opened": 1,
+              "change_requests_merged": 1,
+              "change_requests_closed": 0,
+              "execution_count": 3,
+              "successful_execution_count": 2,
+              "failed_execution_count": 1,
+              "cancelled_execution_count": 0,
+              "session_count": 4,
+              "input_tokens": 1000,
+              "output_tokens": 500,
+              "cache_read_tokens": 200,
+              "cache_write_tokens": 100,
+              "estimated_cost_usd": null,
+              "derived_at": "2026-09-30T03:00:00+00:00",
+              "oldest_derived_at": "2026-09-01T03:00:00+00:00"
+            }
+          ],
+          "derived_at": null,
+          "oldest_derived_at": "2026-09-01T03:00:00+00:00"
+        }
+      }
+    ],
+    "sentinel_paths": [["buckets", 0, "period_start"], ["buckets", 0, "execution_count"]],
+    "null_paths": [["derived_at"], ["buckets", 0, "estimated_cost_usd"]]
+  },
+  "list_afk_runs": {
+    "arguments": {
+      "repository": "acme/proj",
+      "limit": 1,
+      "offset": 0
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk-outcomes/runs",
+        "body": {
+          "status": "ok",
+          "data": {
+            "items": [
+              {
+                "afk_run_id": "01H5K6XYZABCDEF1234567890",
+                "provider": "github",
+                "title": "Fix issue #42",
+                "started_at": "2026-10-07T09:00:00+00:00",
+                "finished_at": null,
+                "outcome_status": "open",
+                "first_seen_at": "2026-10-07T09:00:00+00:00",
+                "last_seen_at": "2026-10-07T09:10:00+00:00"
+              }
+            ],
+            "total": 1,
+            "limit": 1,
+            "offset": 0
+          }
+        }
+      }
+    ],
+    "sentinel_paths": [["items", 0, "afk_run_id"], ["total"]],
+    "null_paths": [["items", 0, "finished_at"]]
+  },
+  "get_model_usage": {
+    "arguments": {
+      "start_date": "2026-09-01",
+      "end_date": "2026-09-30"
+    },
+    "responses": [
+      {
+        "path": "/api/v1/usage/aggregates",
+        "body": {
+          "status": "ok",
+          "data": [
+            {
+              "group_value": "claude-sonnet-4-20250514",
+              "total_input_tokens": 1000,
+              "total_output_tokens": 500,
+              "total_cached_tokens": 10,
+              "total_reasoning_tokens": 5,
+              "total_cache_read_tokens": 200,
+              "total_cache_write_tokens": 100,
+              "total_estimated_cost_usd": null,
+              "record_count": 10,
+              "session_count": 3,
+              "model_count": 1,
+              "cache_hit_ratio": null,
+              "provider_breakdown": {"anthropic": 10},
+              "project_label": null,
+              "agent": null
+            }
+          ]
+        }
+      }
+    ],
+    "sentinel_paths": [[0, "group_value"], [0, "total_input_tokens"]],
+    "null_paths": [[0, "total_estimated_cost_usd"], [0, "cache_hit_ratio"]]
+  },
+  "get_agent_usage": {
+    "arguments": {
+      "start_date": "2026-09-01",
+      "end_date": "2026-09-30"
+    },
+    "responses": [
+      {
+        "path": "/api/v1/usage/aggregates",
+        "body": {
+          "status": "ok",
+          "data": [
+            {
+              "group_value": "unknown",
+              "total_input_tokens": 300,
+              "total_output_tokens": 100,
+              "total_cached_tokens": 0,
+              "total_reasoning_tokens": 0,
+              "total_cache_read_tokens": 0,
+              "total_cache_write_tokens": 0,
+              "total_estimated_cost_usd": null,
+              "record_count": 2,
+              "session_count": 2,
+              "model_count": 1,
+              "cache_hit_ratio": null,
+              "provider_breakdown": {},
+              "project_label": null,
+              "agent": null
+            }
+          ]
+        }
+      }
+    ],
+    "sentinel_paths": [[0, "group_value"], [0, "record_count"]],
+    "null_paths": [[0, "total_estimated_cost_usd"], [0, "agent"]]
+  },
+  "get_afk_run_story": {
+    "arguments": {
+      "afk_run_id": "01H5K6XYZABCDEF1234567890"
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk-outcomes/runs/01H5K6XYZABCDEF1234567890",
+        "body": {
+          "status": "ok",
+          "data": {
+            "run": {
+              "afk_run_id": "01H5K6XYZABCDEF1234567890",
+              "provider": "github",
+              "title": "Fix issue #42",
+              "started_at": "2026-10-07T09:00:00+00:00",
+              "finished_at": null,
+              "outcome_status": null,
+              "first_seen_at": "2026-10-07T09:00:00+00:00",
+              "last_seen_at": "2026-10-07T09:10:00+00:00"
+            },
+            "outcome": {
+              "status": "open",
+              "change_request_ids": [],
+              "resolved_issue_ids": [],
+              "merge_event_id": null,
+              "merged_at": null
+            },
+            "issues": [],
+            "change_requests": [],
+            "reviews": [],
+            "commits": [],
+            "merge_events": [],
+            "sessions": [
+              {
+                "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "external_session_id": "ses_abc123",
+                "started_at": "2026-10-07T09:01:00+00:00",
+                "finished_at": null,
+                "inferred": true,
+                "agent": "code-editor",
+                "message_count": 5,
+                "total_input_tokens": 500,
+                "total_output_tokens": 250,
+                "total_cache_read_tokens": 100,
+                "total_cache_write_tokens": 50,
+                "total_estimated_cost_usd": null,
+                "parent_session_id": null
+              }
+            ],
+            "agents": ["code-editor"],
+            "usage": {
+              "active_tokens": 750,
+              "input_tokens": 500,
+              "output_tokens": 250,
+              "cache_read_tokens": 100,
+              "cache_write_tokens": 50,
+              "estimated_cost_usd": null,
+              "message_count": 5,
+              "session_count": 1
+            }
+          }
+        }
+      },
+      {
+        "path": "/api/v1/afk/executions/runs/01H5K6XYZABCDEF1234567890",
+        "body": {
+          "status": "ok",
+          "data": [
+            {
+              "binding_id": "11111111-1111-1111-1111-111111111111",
+              "awx_job": {"job_id": "101", "job_template_id": 10},
+              "external_session_id": "ses_abc123",
+              "external_session_ids": ["ses_abc123"],
+              "resource": {
+                "provider": "github",
+                "repository": "github.com/acme/proj",
+                "resource_type": "change_request",
+                "resource_number": "42"
+              },
+              "outcome": "failed",
+              "afk_run_id": "01H5K6XYZABCDEF1234567890",
+              "trigger_type": "eda",
+              "source_event_id": "evt_001",
+              "branch": "branch/afk-42",
+              "title": "Fix issue #42",
+              "started_at": "2026-10-07T09:00:00+00:00",
+              "finished_at": "2026-10-07T09:02:00+00:00",
+              "failure_reason": "job failed",
+              "failure_summary": "exit code 1: tests failed"
+            },
+            {
+              "binding_id": "22222222-2222-2222-2222-222222222222",
+              "awx_job": {"job_id": "102", "job_template_id": 10},
+              "external_session_id": "ses_def456",
+              "external_session_ids": ["ses_def456"],
+              "resource": null,
+              "outcome": "completed",
+              "afk_run_id": "01H5K6XYZABCDEF1234567890",
+              "trigger_type": "eda",
+              "source_event_id": "evt_002",
+              "branch": "branch/afk-42",
+              "title": "Fix issue #42",
+              "started_at": "2026-10-07T09:05:00+00:00",
+              "finished_at": "2026-10-07T09:10:00+00:00",
+              "failure_reason": null,
+              "failure_summary": null
+            }
+          ]
+        }
+      }
+    ],
+    "sentinel_paths": [["run", "afk_run_id"], ["executions", 0, "outcome"]],
+    "null_paths": [["run", "finished_at"], ["executions", 1, "failure_summary"]]
+  },
+  "get_change_request_story": {
+    "arguments": {
+      "provider": "github",
+      "repository": "acme/proj",
+      "external_number": "42"
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk-outcomes/change-requests/github/acme/proj/42",
+        "body": {
+          "status": "ok",
+          "data": {
+            "change_request": {
+              "provider": "github",
+              "repository": "acme/proj",
+              "external_id": "42",
+              "resource_type": "change_request",
+              "provider_state": "merged",
+              "total_estimated_cost_usd": null,
+              "latest_linked_activity": "2026-10-06T18:00:00Z",
+              "provider_state_observed_at": "2026-10-06T17:59:00Z",
+              "merged_at": "2026-10-06T17:58:00Z",
+              "title": "Fix the thing",
+              "executions": {"total": 2, "running": 0, "completed": 1, "failed": 1, "cancelled": 0}
+            },
+            "afk_runs": [
+              {
+                "afk_run_id": "01HAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "provider": "github",
+                "title": "AFK run 1",
+                "started_at": "2026-10-06T10:00:00Z",
+                "finished_at": "2026-10-06T11:00:00Z",
+                "outcome_status": "merged",
+                "first_seen_at": "2026-10-06T10:00:00Z",
+                "last_seen_at": "2026-10-06T11:00:00Z",
+                "link_sources": ["change_request_binding"]
+              }
+            ],
+            "executions": [
+              {
+                "awx_job": {"job_id": "100", "job_template_id": 10},
+                "external_session_id": "ses_abc",
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "afk_run_id": "01HAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "outcome": "completed",
+                "purpose": "implementation",
+                "trigger_type": "eda",
+                "source_event_id": "evt-1",
+                "branch": "feat/fix",
+                "title": "Fix the thing",
+                "started_at": "2026-10-06T10:05:00Z",
+                "finished_at": "2026-10-06T10:55:00Z",
+                "duration_seconds": 3000.0,
+                "failure_reason": null,
+                "failure_summary": null,
+                "total_input_tokens": 10000,
+                "total_output_tokens": 5000,
+                "total_cache_read_tokens": 2000,
+                "total_cache_write_tokens": 300,
+                "estimated_cost_usd": 1.11
+              }
+            ],
+            "sessions": [],
+            "usage": {
+              "active_tokens": 15000,
+              "input_tokens": 10000,
+              "output_tokens": 5000,
+              "cache_read_tokens": 2000,
+              "cache_write_tokens": 300,
+              "estimated_cost_usd": null,
+              "message_count": 10,
+              "session_count": 0
+            },
+            "total_estimated_cost_usd": null,
+            "merge_state": {"state": "merged", "merged_at": "2026-10-06T17:58:00Z"},
+            "timeline": {
+              "events": [
+                {
+                  "event_type": "change_request.merged",
+                  "occurred_at": "2026-10-06T17:58:00Z",
+                  "observed_via": "webhook",
+                  "snapshot_at": "2026-10-06T17:58:05Z",
+                  "actor": "bob"
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "sentinel_paths": [["change_request", "external_id"], ["afk_runs", 0, "link_sources"]],
+    "null_paths": [["change_request", "total_estimated_cost_usd"], ["executions", 0, "failure_summary"]]
+  },
+  "get_correlation_issues": {
+    "arguments": {
+      "reason": "ambiguous",
+      "limit": 2,
+      "offset": 0
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk-outcomes/correlations",
+        "body": {
+          "status": "ok",
+          "data": {
+            "items": [
+              {
+                "entity_id": "issue:42",
+                "entity_type": "issue",
+                "external_id": "42",
+                "provider": "github",
+                "repository": "acme/app",
+                "afk_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "method": "temporal_inference",
+                "reason": "ambiguous",
+                "correlation_confidence": 0.0,
+                "candidates": ["issue:42", "issue:43"],
+                "evidence": [],
+                "resolver_version": "2",
+                "created_at": "2026-10-07T09:00:00+00:00",
+                "provisional": true
+              },
+              {
+                "entity_id": "afk_run:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "entity_type": "afk_run",
+                "external_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "provider": "gitlab",
+                "repository": "acme/other",
+                "afk_run_id": null,
+                "method": "issue_reference",
+                "reason": "unmatched",
+                "correlation_confidence": 0.0,
+                "candidates": [],
+                "evidence": [],
+                "resolver_version": "2",
+                "created_at": "2026-10-07T09:01:00+00:00",
+                "provisional": true
+              }
+            ],
+            "total": 2,
+            "limit": 2,
+            "offset": 0
+          }
+        }
+      }
+    ],
+    "sentinel_paths": [["items", 0, "reason"], ["total"]],
+    "null_paths": [["items", 1, "afk_run_id"]]
+  }
+}
