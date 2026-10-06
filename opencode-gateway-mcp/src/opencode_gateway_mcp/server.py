@@ -1,8 +1,7 @@
-"""MCP server bootstrap and the ``get_gateway_health`` tool.
+"""MCP server bootstrap and the read-only correlation quality tools.
 
-The adapter is deliberately read-only: ``get_gateway_health`` is the only
-registered tool, it calls only ``GET /health`` on the published Gateway API,
-and no write/admin or generic passthrough capability is exposed.
+The adapter is deliberately read-only: tools call only published Gateway GET
+endpoints and no write/admin or generic passthrough capability is exposed.
 """
 
 from __future__ import annotations
@@ -30,6 +29,15 @@ HEALTH_TOOL_DESCRIPTION = (
     "Gateway status/version, database connectivity, most recent ingest, remote "
     "collector health, and source-database health. Values (including "
     "healthy/stale/unknown and nulls) are preserved exactly as the Gateway reports them."
+)
+
+CORRELATIONS_TOOL_DESCRIPTION = (
+    "Return unresolved AFK correlation quality problems from "
+    "GET /api/v1/afk-outcomes/correlations: unresolved correlation identity, "
+    "AFK run identity, entity identity, reason (ambiguous or unmatched), "
+    "candidates, and provenance. Supports optional reason filtering "
+    "(ambiguous/unmatched) and explicit limit/offset pagination without "
+    "silent crawl. Nulls are preserved and candidates are never tie-broken."
 )
 
 
@@ -75,12 +83,44 @@ class GatewayHealth(BaseModel):
     source_databases: list[SourceDatabaseHealth] = []
 
 
+class CorrelationIssue(BaseModel):
+    """One unresolved correlation row, passed through verbatim."""
+
+    model_config = ConfigDict(extra="allow")
+
+    entity_id: str
+    entity_type: str
+    external_id: str
+    provider: str
+    repository: str
+    afk_run_id: str | None = None
+    method: str
+    reason: str | None = None
+    correlation_confidence: float = 0.0
+    candidates: list[str] = []
+    evidence: list[Any] = []
+    resolver_version: str | None = None
+    created_at: str | None = None
+    provisional: bool = True
+
+
+class CorrelationIssuesResult(BaseModel):
+    """Paginated unresolved correlation quality problems."""
+
+    model_config = ConfigDict(extra="allow")
+
+    items: list[CorrelationIssue]
+    total: int
+    limit: int
+    offset: int
+
+
 def create_server(
     config: GatewayConfig,
     *,
     http_client: httpx.AsyncClient | None = None,
 ) -> MCPServer:
-    """Create the MCP server with the read-only health tool registered.
+    """Create the MCP server with the read-only tools registered.
 
     ``http_client`` lets callers (tests) supply a controlled HTTP transport;
     when omitted the client owns its own ``httpx.AsyncClient``.
@@ -99,6 +139,25 @@ def create_server(
         except ValidationError:
             raise ToolError(
                 "OpenCode Gateway returned an unexpected /health payload shape"
+            ) from None
+
+    @server.tool(description=CORRELATIONS_TOOL_DESCRIPTION)
+    async def get_correlation_issues(
+        reason: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> CorrelationIssuesResult:
+        try:
+            payload: dict[str, Any] = await gateway.get_correlation_issues(
+                reason=reason, limit=limit, offset=offset
+            )
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return CorrelationIssuesResult.model_validate(payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected correlations payload shape"
             ) from None
 
     return server

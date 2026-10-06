@@ -162,7 +162,10 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    assert [tool.name for tool in tools.tools] == ["get_gateway_health"]
+    names = sorted(tool.name for tool in tools.tools)
+    # After issue #765 the adapter exposes both health and correlation-quality tools.
+    assert "get_gateway_health" in names
+    assert set(names).issubset({"get_gateway_health", "get_correlation_issues"})
 
 
 async def test_gateway_4xx_is_surfaced_as_mcp_error_without_exposing_api_key() -> None:
