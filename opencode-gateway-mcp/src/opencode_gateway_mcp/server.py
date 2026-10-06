@@ -1,9 +1,11 @@
 """MCP server bootstrap and the read-only semantic tools.
 
 The adapter is deliberately read-only: it calls only ``GET /health``,
-``GET /api/v1/afk/dashboard/summary`` and
-``GET /api/v1/afk-outcomes/runs`` on the published Gateway API, and no
-write/admin or generic passthrough capability is exposed.
+``GET /api/v1/afk/dashboard/summary``,
+``GET /api/v1/afk-outcomes/runs`` and
+``GET /api/v1/usage/aggregates`` (group_by=model/agent) on the published
+Gateway API, and no write/admin or generic passthrough capability is exposed.
+No per-AFK-run model attribution is performed.
 """
 
 from __future__ import annotations
@@ -50,6 +52,26 @@ AFK_RUNS_TOOL_DESCRIPTION = (
     "rejected rather than emulated. Null/unavailable values are preserved "
     "verbatim and Gateway 4xx/5xx are surfaced as MCP errors without exposing "
     "credentials."
+)
+
+MODEL_USAGE_TOOL_DESCRIPTION = (
+    "Return usage aggregates grouped by model for an explicit date range from "
+    "GET /api/v1/usage/aggregates?group_by=model. Requires start_date and end_date "
+    "(ISO-8601). Optional Gateway-supported filters (client_id, model, session_id) "
+    "are passed through only where the base API supports them. Preserves "
+    "group_by=model semantics, session/record counts, token and cache fields, "
+    "provider breakdown, and estimated cost with nulls preserved. No per-AFK-run "
+    "model attribution is performed."
+)
+
+AGENT_USAGE_TOOL_DESCRIPTION = (
+    "Return usage aggregates grouped by agent for an explicit date range from "
+    "GET /api/v1/usage/aggregates?group_by=agent. Requires start_date and end_date "
+    "(ISO-8601). Optional Gateway-supported filters (client_id, model, session_id) "
+    "are passed through only where the base API supports them. Preserves "
+    "group_by=agent semantics, session/record counts, token and cache fields, "
+    "provider breakdown, and estimated cost with nulls preserved. No per-AFK-run "
+    "model attribution is performed."
 )
 
 
@@ -183,6 +205,34 @@ class ListAFKRunsResult(BaseModel):
     offset: int = 0
 
 
+class UsageAggregateRow(BaseModel):
+    """One usage aggregate row preserved from GET /api/v1/usage/aggregates.
+
+    Mirrors ``app.core.schemas.usage.AggregateRow`` but preserves nulls and
+    unknown future fields via ``extra="allow"``. Token, cache, session/record,
+    provider breakdown, and cost fields are returned exactly as the Gateway
+    reports them; ``None`` stays ``None``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    group_value: str
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_estimated_cost_usd: Any = None
+    record_count: int = 0
+    session_count: int = 0
+    model_count: int = 0
+    cache_hit_ratio: float | None = None
+    provider_breakdown: dict[str, int] = {}
+    project_label: str | None = None
+    agent: str | None = None
+
+
 def create_server(
     config: GatewayConfig,
     *,
@@ -196,7 +246,7 @@ def create_server(
     gateway = GatewayClient(config, http_client=http_client)
     server: MCPServer = MCPServer(SERVER_NAME, version=SERVER_VERSION)
 
-    @server.tool(description=HEALTH_TOOL_DESCRIPTION)
+    @server.tool(description=HEALTH_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
     async def get_gateway_health() -> GatewayHealth:
         try:
             payload: dict[str, Any] = await gateway.get_health()
@@ -209,7 +259,7 @@ def create_server(
                 "OpenCode Gateway returned an unexpected /health payload shape"
             ) from None
 
-    @server.tool(description=AFK_ACTIVITY_TOOL_DESCRIPTION)
+    @server.tool(description=AFK_ACTIVITY_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
     async def get_afk_activity_summary(
         from_date: str,
         to_date: str,
@@ -244,7 +294,7 @@ def create_server(
                 "/api/v1/afk/dashboard/summary payload shape"
             ) from None
 
-    @server.tool(description=AFK_RUNS_TOOL_DESCRIPTION)
+    @server.tool(description=AFK_RUNS_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
     async def list_afk_runs(
         repository: str | None = None,
         provider: str | None = None,
@@ -290,6 +340,60 @@ def create_server(
             raise ToolError(
                 "OpenCode Gateway returned an unexpected "
                 "/api/v1/afk-outcomes/runs payload shape"
+            ) from None
+
+    @server.tool(description=MODEL_USAGE_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def get_model_usage(
+        start_date: str,
+        end_date: str,
+        client_id: str | None = None,
+        model: str | None = None,
+        session_id: str | None = None,
+    ) -> list[UsageAggregateRow]:
+        """Return usage aggregates grouped by model for the explicit date range."""
+        try:
+            rows = await gateway.get_usage_aggregates(
+                start_date=start_date,
+                end_date=end_date,
+                group_by="model",
+                client_id=client_id,
+                model=model,
+                session_id=session_id,
+            )
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return [UsageAggregateRow.model_validate(r) for r in rows]
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected /api/v1/usage/aggregates payload shape"
+            ) from None
+
+    @server.tool(description=AGENT_USAGE_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def get_agent_usage(
+        start_date: str,
+        end_date: str,
+        client_id: str | None = None,
+        model: str | None = None,
+        session_id: str | None = None,
+    ) -> list[UsageAggregateRow]:
+        """Return usage aggregates grouped by agent for the explicit date range."""
+        try:
+            rows = await gateway.get_usage_aggregates(
+                start_date=start_date,
+                end_date=end_date,
+                group_by="agent",
+                client_id=client_id,
+                model=model,
+                session_id=session_id,
+            )
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return [UsageAggregateRow.model_validate(r) for r in rows]
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected /api/v1/usage/aggregates payload shape"
             ) from None
 
     return server

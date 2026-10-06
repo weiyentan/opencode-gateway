@@ -162,13 +162,13 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    # Superset: keep health plus both tools added in layers 760 and 761.
-    # The test asserts the two known tools are present at this merge step;
-    # later merges extend the set and health-specific assertions remain valid.
+    # Superset: health + activity + runs + model + agent (5 tools at this stage)
     tool_names = {tool.name for tool in tools.tools}
     assert "get_gateway_health" in tool_names
     assert "get_afk_activity_summary" in tool_names
     assert "list_afk_runs" in tool_names
+    assert "get_model_usage" in tool_names
+    assert "get_agent_usage" in tool_names
     # No write/admin or generic passthrough.
     assert tool_names.isdisjoint({"write", "admin", "passthrough"})
 
@@ -252,3 +252,371 @@ def test_adapter_has_no_direct_storage_or_orchestration_access() -> None:
         flags=re.MULTILINE,
     )
     assert forbidden == []
+
+
+# ── Model and agent usage tests ────────────────────────────────────────────
+
+MODEL_PAYLOAD: list[dict[str, Any]] = [
+    {
+        "group_value": "claude-sonnet-4-20250514",
+        "total_input_tokens": 1000,
+        "total_output_tokens": 500,
+        "total_cached_tokens": 10,
+        "total_reasoning_tokens": 5,
+        "total_cache_read_tokens": 200,
+        "total_cache_write_tokens": 100,
+        "total_estimated_cost_usd": "1.23",
+        "record_count": 10,
+        "session_count": 3,
+        "model_count": 1,
+        "cache_hit_ratio": 0.1667,
+        "provider_breakdown": {"anthropic": 10},
+        "project_label": None,
+        "agent": None,
+    },
+    {
+        "group_value": "gpt-4o",
+        "total_input_tokens": 2000,
+        "total_output_tokens": 800,
+        "total_cached_tokens": 0,
+        "total_reasoning_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_estimated_cost_usd": "2.50",
+        "record_count": 5,
+        "session_count": 2,
+        "model_count": 1,
+        "cache_hit_ratio": None,
+        "provider_breakdown": {"openai": 5},
+        "project_label": None,
+        "agent": None,
+        "future_model_field": {"nested": [1, None]},
+    },
+]
+
+AGENT_PAYLOAD: list[dict[str, Any]] = [
+    {
+        "group_value": "coder",
+        "total_input_tokens": 1500,
+        "total_output_tokens": 600,
+        "total_cached_tokens": 5,
+        "total_reasoning_tokens": 3,
+        "total_cache_read_tokens": 150,
+        "total_cache_write_tokens": 80,
+        "total_estimated_cost_usd": "1.80",
+        "record_count": 7,
+        "session_count": 4,
+        "model_count": 2,
+        "cache_hit_ratio": 0.09,
+        "provider_breakdown": {"anthropic": 7},
+        "project_label": None,
+        "agent": "coder",
+    },
+    {
+        "group_value": "unknown",
+        "total_input_tokens": 300,
+        "total_output_tokens": 100,
+        "total_cached_tokens": 0,
+        "total_reasoning_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
+        "total_estimated_cost_usd": None,
+        "record_count": 2,
+        "session_count": 2,
+        "model_count": 1,
+        "cache_hit_ratio": None,
+        "provider_breakdown": {},
+        "project_label": None,
+        "agent": "unknown",
+    },
+]
+
+
+async def _call_tool(
+    server: MCPServer, name: str, arguments: dict[str, Any]
+) -> Any:
+    async with Client(server) as mcp_client:
+        return await mcp_client.call_tool(name, arguments)
+
+
+async def test_get_model_usage_calls_aggregates_with_group_by_model() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        seen["auth"] = request.headers.get("authorization")
+        assert set(request.url.params.keys()) == {"start_date", "end_date", "group_by"}
+        assert request.url.params["group_by"] == "model"
+        return httpx.Response(200, json=MODEL_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_model_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is False
+    assert seen["method"] == "GET"
+    assert seen["path"] == "/api/v1/usage/aggregates"
+    assert seen["auth"] == f"Bearer {GATEWAY_API_KEY}"
+    assert seen["query"]["start_date"] == "2025-07-01T00:00:00Z"
+    assert seen["query"]["end_date"] == "2025-07-31T23:59:59Z"
+    assert seen["query"]["group_by"] == "model"
+
+    structured = result.structured_content
+    assert structured is not None
+    import json
+
+    rows: Any = structured
+    if isinstance(structured, dict) and "result" in structured:
+        rows = structured["result"]
+    if not isinstance(rows, list):
+        text = result.content[0].text if result.content else ""
+        try:
+            parsed = json.loads(text)
+            rows = parsed if isinstance(parsed, list) else parsed.get("result", parsed)
+        except Exception:
+            pass
+    assert isinstance(rows, list)
+    assert len(rows) == 2
+    assert rows[0]["group_value"] == "claude-sonnet-4-20250514"
+    assert rows[0]["total_input_tokens"] == 1000
+    assert rows[0]["total_cache_read_tokens"] == 200
+    assert rows[0]["record_count"] == 10
+    assert rows[0]["session_count"] == 3
+    assert rows[0]["provider_breakdown"] == {"anthropic": 10}
+    assert rows[0]["total_estimated_cost_usd"] == "1.23"
+    assert rows[1]["future_model_field"] == {"nested": [1, None]}
+
+
+async def test_get_agent_usage_calls_aggregates_with_group_by_agent() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["query"] = dict(request.url.params)
+        assert request.url.params["group_by"] == "agent"
+        return httpx.Response(200, json=AGENT_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_agent_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is False
+    assert seen["query"]["group_by"] == "agent"
+    import json
+
+    structured = result.structured_content
+    rows: Any = structured
+    if isinstance(structured, dict) and "result" in structured:
+        rows = structured["result"]
+    if not isinstance(rows, list):
+        text = result.content[0].text if result.content else ""
+        try:
+            parsed = json.loads(text)
+            rows = parsed if isinstance(parsed, list) else parsed.get("result", parsed)
+        except Exception:
+            pass
+    assert isinstance(rows, list)
+    assert rows[0]["group_value"] == "coder"
+    assert rows[0]["agent"] == "coder"
+    assert rows[1]["agent"] == "unknown"
+
+
+async def test_model_usage_preserves_token_cache_session_cost_and_provider_breakdown() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=MODEL_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_model_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is False
+    import json
+
+    structured = result.structured_content
+    rows: Any = structured
+    if isinstance(structured, dict) and "result" in structured:
+        rows = structured["result"]
+    if not isinstance(rows, list):
+        text = result.content[0].text if result.content else ""
+        try:
+            parsed = json.loads(text)
+            rows = parsed if isinstance(parsed, list) else parsed.get("result", parsed)
+        except Exception:
+            pass
+    assert isinstance(rows, list)
+    first = rows[0]
+    assert first["total_input_tokens"] == 1000
+    assert first["total_output_tokens"] == 500
+    assert first["total_cached_tokens"] == 10
+    assert first["total_reasoning_tokens"] == 5
+    assert first["total_cache_read_tokens"] == 200
+    assert first["total_cache_write_tokens"] == 100
+    assert first["record_count"] == 10
+    assert first["session_count"] == 3
+    assert first["provider_breakdown"] == {"anthropic": 10}
+    assert first["total_estimated_cost_usd"] == "1.23"
+    assert first["cache_hit_ratio"] == 0.1667
+
+
+async def test_agent_usage_preserves_nulls() -> None:
+    null_payload: list[dict[str, Any]] = [
+        {
+            "group_value": "claude-sonnet-4-20250514",
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cached_tokens": 0,
+            "total_reasoning_tokens": 0,
+            "total_cache_read_tokens": 0,
+            "total_cache_write_tokens": 0,
+            "total_estimated_cost_usd": None,
+            "record_count": 0,
+            "session_count": 0,
+            "model_count": 0,
+            "cache_hit_ratio": None,
+            "provider_breakdown": {},
+            "project_label": None,
+            "agent": None,
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=null_payload)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_agent_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is False
+    import json
+
+    structured = result.structured_content
+    rows: Any = structured
+    if isinstance(structured, dict) and "result" in structured:
+        rows = structured["result"]
+    if not isinstance(rows, list):
+        text = result.content[0].text if result.content else ""
+        try:
+            parsed = json.loads(text)
+            rows = parsed if isinstance(parsed, list) else parsed.get("result", parsed)
+        except Exception:
+            pass
+    assert isinstance(rows, list)
+    assert rows[0]["total_estimated_cost_usd"] is None
+    assert rows[0]["cache_hit_ratio"] is None
+    assert rows[0]["provider_breakdown"] == {}
+
+
+async def test_optional_filters_are_passed_through_when_provided() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json=MODEL_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_model_usage",
+            {
+                "start_date": "2025-07-01T00:00:00Z",
+                "end_date": "2025-07-31T23:59:59Z",
+                "client_id": "11111111-1111-1111-1111-111111111111",
+                "model": "gpt-4o",
+            },
+        )
+
+    assert result.is_error is False
+    assert seen["params"]["client_id"] == "11111111-1111-1111-1111-111111111111"
+    assert seen["params"]["model"] == "gpt-4o"
+    assert seen["params"]["group_by"] == "model"
+    assert "session_id" not in seen["params"]
+
+
+async def test_agent_usage_optional_session_id_passthrough() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json=AGENT_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_agent_usage",
+            {
+                "start_date": "2025-07-01T00:00:00Z",
+                "end_date": "2025-07-31T23:59:59Z",
+                "session_id": "22222222-2222-2222-2222-222222222222",
+            },
+        )
+
+    assert result.is_error is False
+    assert seen["params"]["session_id"] == "22222222-2222-2222-2222-222222222222"
+    assert seen["params"]["group_by"] == "agent"
+
+
+async def test_no_per_afk_run_filter_is_sent() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        assert "afk_run_id" not in seen["params"]
+        assert "run_id" not in seen["params"]
+        return httpx.Response(200, json=MODEL_PAYLOAD)
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_model_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is False
+
+
+async def test_model_usage_gateway_4xx_is_surfaced_without_exposing_api_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"detail": f"invalid bearer token {GATEWAY_API_KEY}"},
+        )
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_model_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is True
+    text = result.content[0].text if result.content else ""
+    assert "400" in text
+    assert GATEWAY_API_KEY not in text
+
+
+async def test_agent_usage_gateway_5xx_is_surfaced() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream unavailable")
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "get_agent_usage",
+            {"start_date": "2025-07-01T00:00:00Z", "end_date": "2025-07-31T23:59:59Z"},
+        )
+
+    assert result.is_error is True
+    assert "503" in result.content[0].text
