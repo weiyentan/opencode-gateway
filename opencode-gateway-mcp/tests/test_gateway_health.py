@@ -162,7 +162,11 @@ async def test_only_the_read_only_health_tool_is_exposed() -> None:
         async with Client(server) as mcp_client:
             tools = await mcp_client.list_tools()
 
-    assert [tool.name for tool in tools.tools] == ["get_gateway_health"]
+    # Health plus the AFK activity summary are the two read-only semantic tools
+    # (no write/admin or generic passthrough). Order is registration order.
+    assert sorted(tool.name for tool in tools.tools) == sorted(
+        ["get_gateway_health", "get_afk_activity_summary"]
+    )
 
 
 async def test_gateway_4xx_is_surfaced_as_mcp_error_without_exposing_api_key() -> None:
