@@ -534,3 +534,57 @@ class GatewayClient:
                 f"OpenCode Gateway returned an unexpected {path} payload shape"
             )
         return payload
+
+    async def get_correlation_issues(
+        self,
+        *,
+        reason: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/afk-outcomes/correlations`` and return the paginated payload.
+
+        Only one Gateway request is ever issued — no silent crawl. ``reason``
+        is ``ambiguous`` or ``unmatched`` when supplied; ``limit``/``offset``
+        are forwarded exactly as provided.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        path = "/api/v1/afk-outcomes/correlations"
+        url = f"{self._config.base_url}{path}"
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if reason is not None:
+            params["reason"] = reason
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, headers=self._headers(), params=params, timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(url, headers=self._headers(), params=params)
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(path, response.status_code, response.reason_phrase)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON correlations response"
+            ) from None
+        if not isinstance(payload, dict):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected correlations payload shape"
+            )
+        # Unwrap the standard {status: "ok", data: ...} envelope when present so
+        # callers see the paginated {items, total, limit, offset} shape directly.
+        if payload.get("status") == "ok" and isinstance(payload.get("data"), dict):
+            inner: Any = payload["data"]
+            if isinstance(inner.get("items"), list):
+                return inner  # type: ignore[no-any-return]
+        return payload  # type: ignore[no-any-return]
