@@ -113,6 +113,64 @@
     "sentinel_paths": [["items", 0, "afk_run_id"], ["total"]],
     "null_paths": [["items", 0, "finished_at"]]
   },
+  "list_change_requests": {
+    "arguments": {
+      "provider": "gitlab",
+      "repository": "group/project",
+      "provider_state": "merged",
+      "limit": 20,
+      "offset": 0
+    },
+    "responses": [
+      {
+        "path": "/api/v1/afk-outcomes/change-requests",
+        "body": {
+          "status": "ok",
+          "data": {
+            "items": [
+              {
+                "provider": "gitlab",
+                "repository": "group/project",
+                "external_id": "11",
+                "provider_state": "merged",
+                "total_estimated_cost_usd": "0.42",
+                "latest_linked_activity": "2026-10-07T01:04:36+00:00",
+                "provider_state_observed_at": "2026-10-07T01:04:36+00:00",
+                "executions": {
+                  "total": 1,
+                  "running": 0,
+                  "completed": 1,
+                  "failed": 0,
+                  "cancelled": 0
+                }
+              },
+              {
+                "provider": "gitlab",
+                "repository": "group/project",
+                "external_id": "12",
+                "provider_state": "open",
+                "total_estimated_cost_usd": null,
+                "latest_linked_activity": "2026-10-07T02:00:00+00:00",
+                "provider_state_observed_at": null,
+                "executions": {
+                  "total": 0,
+                  "running": 0,
+                  "completed": 0,
+                  "failed": 0,
+                  "cancelled": 0
+                }
+              }
+            ],
+            "total": 2,
+            "limit": 20,
+            "offset": 0
+          }
+        }
+      }
+    ],
+    "sentinel_paths": [["items", 0, "external_id"], ["items", 0, "total_estimated_cost_usd"], ["total"]],
+    "null_paths": [["items", 1, "total_estimated_cost_usd"], ["items", 1, "provider_state_observed_at"]]
+  },
   "get_model_usage": {
     "arguments": {
       "start_date": "2026-09-01",

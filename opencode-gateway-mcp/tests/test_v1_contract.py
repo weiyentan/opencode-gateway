@@ -1,6 +1,6 @@
 """v1 acceptance gate: the complete opencode-gateway-mcp contract (ADR 0031).
 
-This module proves the finished MCP surface together: exactly the eight approved
+This module proves the finished MCP surface together: exactly the nine approved
 read-only tools, public MCP-boundary behavior for every tool against a controlled
 Gateway HTTP mock, boundary invariants (no writes, no passthrough, no direct
 Postgres/Kafka/AWX access, no secret leakage, no silent crawling, no natural
@@ -46,6 +46,7 @@ EXPECTED_TOOL_NAMES = frozenset(
     {
         "get_afk_activity_summary",
         "list_afk_runs",
+        "list_change_requests",
         "get_afk_run_story",
         "get_model_usage",
         "get_agent_usage",
@@ -76,6 +77,17 @@ EXPECTED_PARAMETERS: dict[str, frozenset[str]] = {
             "offset",
         }
     ),
+    "list_change_requests": frozenset(
+        {
+            "provider",
+            "repository",
+            "provider_state",
+            "activity_from",
+            "activity_to",
+            "limit",
+            "offset",
+        }
+    ),
     "get_model_usage": frozenset({"start_date", "end_date", "client_id", "model", "session_id"}),
     "get_agent_usage": frozenset({"start_date", "end_date", "client_id", "model", "session_id"}),
     "get_afk_run_story": frozenset({"afk_run_id"}),
@@ -87,6 +99,7 @@ EXPECTED_REQUIRED: dict[str, frozenset[str]] = {
     "get_gateway_health": frozenset(),
     "get_afk_activity_summary": frozenset({"from_date", "to_date"}),
     "list_afk_runs": frozenset(),
+    "list_change_requests": frozenset(),
     "get_model_usage": frozenset({"start_date", "end_date"}),
     "get_agent_usage": frozenset({"start_date", "end_date"}),
     "get_afk_run_story": frozenset({"afk_run_id"}),
@@ -99,6 +112,7 @@ TOOL_ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_gateway_health": {},
     "get_afk_activity_summary": {"from_date": "2026-09-01", "to_date": "2026-09-30"},
     "list_afk_runs": {},
+    "list_change_requests": {},
     "get_model_usage": {"start_date": "2026-09-01", "end_date": "2026-09-30"},
     "get_agent_usage": {"start_date": "2026-09-01", "end_date": "2026-09-30"},
     "get_afk_run_story": {"afk_run_id": "01H5K6XYZABCDEF1234567890"},
@@ -117,6 +131,7 @@ APPROVED_PATH_PATTERNS = (
     re.compile(r"^/api/v1/afk-outcomes/runs$"),
     re.compile(r"^/api/v1/afk-outcomes/runs/[^/]+$"),
     re.compile(r"^/api/v1/afk/executions/runs/[^/]+$"),
+    re.compile(r"^/api/v1/afk-outcomes/change-requests$"),
     re.compile(r"^/api/v1/afk-outcomes/change-requests/[^/]+/.+$"),
     re.compile(r"^/api/v1/usage/aggregates$"),
     re.compile(r"^/api/v1/afk-outcomes/correlations$"),
@@ -185,10 +200,10 @@ async def _list_tool_descriptions(server: MCPServer) -> dict[str, str | None]:
     return {tool.name: tool.description for tool in tools.tools}
 
 
-# ── Tool surface: exactly eight approved read-only tools ────────────────────
+# ── Tool surface: exactly nine approved read-only tools ─────────────────────
 
 
-async def test_exactly_the_eight_approved_read_only_tools_are_exposed() -> None:
+async def test_exactly_the_nine_approved_read_only_tools_are_exposed() -> None:
     async with Client(create_server(_config())) as mcp_client:
         tools = await mcp_client.list_tools()
 
@@ -238,7 +253,7 @@ async def test_every_tool_schema_exposes_only_approved_parameters(tool_name: str
     assert (tool.description or "").strip(), f"{tool_name} must carry a description"
 
 
-# ── Public MCP-boundary behavior for all eight tools ────────────────────────
+# ── Public MCP-boundary behavior for all nine tools ─────────────────────────
 
 
 @pytest.mark.parametrize("tool_name", sorted(EXPECTED_TOOL_NAMES))
@@ -317,6 +332,68 @@ async def test_pagination_is_explicit_and_never_silently_crawls() -> None:
     assert result.is_error is False
     assert request_count == 1, "list_afk_runs must return one explicit page, never crawl"
     assert _payload(result)["total"] == 100
+
+
+async def test_change_request_summary_matches_frontend_contract_and_preserves_cost() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        params = dict(request.url.params)
+        assert params == {
+            "provider": "gitlab",
+            "repository": "group/project",
+            "provider_state": "merged",
+            "activity_from": "2026-10-07T00:00:00+13:00",
+            "activity_to": "2026-10-08T00:15:00+13:00",
+            "limit": "20",
+            "offset": "0",
+        }
+        body = {
+            "items": [
+                {
+                    "provider": "gitlab",
+                    "repository": "group/project",
+                    "external_id": "11",
+                    "provider_state": "merged",
+                    "total_estimated_cost_usd": "0.42",
+                    "latest_linked_activity": "2026-10-07T01:04:36+00:00",
+                    "provider_state_observed_at": "2026-10-07T01:04:36+00:00",
+                    "executions": {
+                        "total": 1,
+                        "running": 0,
+                        "completed": 1,
+                        "failed": 0,
+                        "cancelled": 0,
+                    },
+                }
+            ],
+            "total": 1,
+            "limit": 20,
+            "offset": 0,
+        }
+        return httpx.Response(200, json={"status": "ok", "data": body})
+
+    async with _server_with(handler) as server:
+        result = await _call_tool(
+            server,
+            "list_change_requests",
+            {
+                "provider": "gitlab",
+                "repository": "group/project",
+                "provider_state": "merged",
+                "activity_from": "2026-10-07T00:00:00+13:00",
+                "activity_to": "2026-10-08T00:15:00+13:00",
+                "limit": 20,
+                "offset": 0,
+            },
+        )
+
+    assert result.is_error is False
+    payload = _payload(result)
+    assert payload["items"][0]["total_estimated_cost_usd"] == "0.42"
+    assert len(seen) == 1
+    assert seen[0].url.path == "/api/v1/afk-outcomes/change-requests"
 
 
 async def test_correlation_pagination_is_explicit_and_never_silently_crawls() -> None:

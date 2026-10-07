@@ -237,7 +237,33 @@ Backed by:
 
 - `GET /api/v1/usage/aggregates?group_by=agent`
 
-### 6. `get_change_request_story`
+### 6. `list_change_requests`
+
+Purpose:
+Return the same per-change-request summary rows used by the Gateway frontend
+from `GET /api/v1/afk-outcomes/change-requests`. Each row preserves provider,
+repository, PR/MR external_id, provider lifecycle state,
+`total_estimated_cost_usd`, latest linked activity, and execution counts.
+
+Inputs:
+
+- optional `provider` = `github` or `gitlab`
+- optional `repository`
+- optional `provider_state` = `open` / `closed` / `merged`
+- optional `activity_from`
+- optional `activity_to`
+- `limit`
+- `offset`
+
+Backed by:
+
+- `GET /api/v1/afk-outcomes/change-requests`
+
+Supports explicit `limit`/`offset` pagination without silent crawling. Cost is
+never recalculated in the MCP; the Gateway-owned value is returned verbatim,
+including null when unavailable.
+
+### 7. `get_change_request_story`
 
 Purpose:
 Return AFK evidence for one GitHub PR or GitLab MR.
@@ -255,7 +281,7 @@ Backed by:
 The response may include provider state, merge time, AFK runs, AWX executions,
 sessions, usage/cost, and timeline/provenance.
 
-### 7. `get_gateway_health`
+### 8. `get_gateway_health`
 
 Purpose:
 Return service and ingestion health.
@@ -271,7 +297,7 @@ Backed by:
 The response includes Gateway status/version, database connectivity, most recent
 ingest, remote collector health, and source-database health.
 
-### 8. `get_correlation_issues`
+### 9. `get_correlation_issues`
 
 Purpose:
 Expose unresolved correlation quality problems.
@@ -403,7 +429,7 @@ mapping to the existing Gateway API.
 ## v1 acceptance boundary
 
 v1 is successful when an MCP client can answer the accepted question catalogue using
-the eight read-only semantic tools without direct database access and without
+the nine read-only semantic tools without direct database access and without
 inventing relationships the Gateway has not exposed.
 
 When the dedicated `opencode-gateway-mcp` repository is created, copy this context

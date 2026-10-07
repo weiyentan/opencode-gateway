@@ -2,7 +2,8 @@
 
 The adapter is deliberately read-only: it calls only published Gateway GET
 endpoints — ``GET /health``, ``GET /api/v1/afk/dashboard/summary``,
-``GET /api/v1/afk-outcomes/runs``, ``GET /api/v1/usage/aggregates``,
+``GET /api/v1/afk-outcomes/runs``, ``GET /api/v1/afk-outcomes/change-requests``,
+``GET /api/v1/usage/aggregates``,
 ``GET /api/v1/afk-outcomes/runs/{afk_run_id}``,
 ``GET /api/v1/afk/executions/runs/{afk_run_id}``,
 ``GET /api/v1/afk-outcomes/change-requests/{provider}/{repository}/{external_number}``,
@@ -59,6 +60,17 @@ AFK_RUNS_TOOL_DESCRIPTION = (
     "credentials."
 )
 
+CHANGE_REQUESTS_TOOL_DESCRIPTION = (
+    "Return the same per-change-request summary rows used by the Gateway frontend "
+    "from GET /api/v1/afk-outcomes/change-requests. Each row preserves provider, "
+    "repository, PR/MR external_id, provider lifecycle state, "
+    "total_estimated_cost_usd, latest linked activity, and execution counts. "
+    "Supports provider, repository, provider_state, explicit activity windows, "
+    "and explicit limit/offset pagination without silent crawling. Cost is never "
+    "recalculated in the MCP; the Gateway-owned value is returned verbatim, "
+    "including null when unavailable."
+)
+
 MODEL_USAGE_TOOL_DESCRIPTION = (
     "Return usage aggregates grouped by model for an explicit date range from "
     "GET /api/v1/usage/aggregates?group_by=model. Requires start_date and end_date "
@@ -108,6 +120,7 @@ CORRELATIONS_TOOL_DESCRIPTION = (
 )
 
 _VALID_PROVIDERS = frozenset({"github", "gitlab"})
+_VALID_PROVIDER_STATES = frozenset({"open", "closed", "merged"})
 
 
 class CollectorHealth(BaseModel):
@@ -240,6 +253,44 @@ class ListAFKRunsResult(BaseModel):
     offset: int = 0
 
 
+class ChangeRequestExecutionCounts(BaseModel):
+    """Aggregated execution counts for one change request."""
+
+    model_config = ConfigDict(extra="allow")
+
+    total: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
+class ChangeRequestSummaryRow(BaseModel):
+    """One frontend change-request summary row from the Gateway."""
+
+    model_config = ConfigDict(extra="allow")
+
+    provider: str
+    repository: str
+    external_id: str
+    provider_state: str | None = None
+    total_estimated_cost_usd: Any | None = None
+    latest_linked_activity: str | None = None
+    provider_state_observed_at: str | None = None
+    executions: ChangeRequestExecutionCounts | dict[str, Any] | None = None
+
+
+class ListChangeRequestsResult(BaseModel):
+    """Paginated change-request summary result used by the frontend table."""
+
+    model_config = ConfigDict(extra="allow")
+
+    items: list[ChangeRequestSummaryRow] = []
+    total: int = 0
+    limit: int = 0
+    offset: int = 0
+
+
 class UsageAggregateRow(BaseModel):
     """One usage aggregate row preserved from GET /api/v1/usage/aggregates.
 
@@ -354,18 +405,6 @@ class AfkRunStory(BaseModel):
 
 
 # ── Change-request story models (GET /api/v1/afk-outcomes/change-requests/...) ──
-
-
-class ChangeRequestExecutionCounts(BaseModel):
-    """Aggregated execution counts for one change request."""
-
-    model_config = ConfigDict(extra="allow")
-
-    total: int = 0
-    running: int = 0
-    completed: int = 0
-    failed: int = 0
-    cancelled: int = 0
 
 
 class ChangeRequestDetailSummary(BaseModel):
@@ -656,6 +695,45 @@ def create_server(
             raise ToolError(
                 "OpenCode Gateway returned an unexpected "
                 "/api/v1/afk-outcomes/runs payload shape"
+            ) from None
+
+    @server.tool(description=CHANGE_REQUESTS_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def list_change_requests(
+        provider: str | None = None,
+        repository: str | None = None,
+        provider_state: str | None = None,
+        activity_from: str | None = None,
+        activity_to: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> ListChangeRequestsResult:
+        """Return the frontend's change-request summary contract verbatim."""
+        if provider is not None and provider not in _VALID_PROVIDERS:
+            valid = ", ".join(sorted(_VALID_PROVIDERS))
+            raise ToolError(f"Invalid provider: {provider!r}. Valid values: {valid}")
+        if provider_state is not None and provider_state not in _VALID_PROVIDER_STATES:
+            valid = ", ".join(sorted(_VALID_PROVIDER_STATES))
+            raise ToolError(
+                f"Invalid provider_state: {provider_state!r}. Valid values: {valid}"
+            )
+        try:
+            payload: dict[str, Any] = await gateway.list_change_requests(
+                provider=provider,
+                repository=repository,
+                provider_state=provider_state,
+                activity_from=activity_from,
+                activity_to=activity_to,
+                limit=limit,
+                offset=offset,
+            )
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return ListChangeRequestsResult.model_validate(payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/afk-outcomes/change-requests payload shape"
             ) from None
 
     @server.tool(description=MODEL_USAGE_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
