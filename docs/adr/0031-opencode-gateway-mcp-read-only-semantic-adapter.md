@@ -1,6 +1,6 @@
 # 0031 — Expose OpenCode Gateway through a separate read-only semantic MCP adapter
 
-Status: accepted
+Status: accepted — amended 2026-10-08 (v1.1 adds `list_change_requests`; nine tools)
 
 ## Context
 
@@ -26,16 +26,17 @@ The v1 adapter is read-only and communicates only with the published OpenCode Ga
 HTTP API using Gateway API-key authentication.
 
 The MCP exposes semantic, question-oriented tools rather than mirroring every REST
-endpoint. The initial tool set is:
+endpoint. The v1 tool set (as amended 2026-10-08 — v1.1, nine tools) is:
 
-1. `get_afk_activity_summary`
-2. `list_afk_runs`
-3. `get_afk_run_story`
-4. `get_model_usage`
-5. `get_agent_usage`
-6. `get_change_request_story`
-7. `get_gateway_health`
-8. `get_correlation_issues`
+1. `get_afk_activity_summary` — `GET /api/v1/afk/dashboard/summary`
+2. `list_afk_runs` — `GET /api/v1/afk-outcomes/runs`
+3. `get_afk_run_story` — `GET /api/v1/afk-outcomes/runs/{afk_run_id}` + `GET /api/v1/afk/executions/runs/{afk_run_id}` (only approved composite)
+4. `get_model_usage` — `GET /api/v1/usage/aggregates?group_by=model`
+5. `get_agent_usage` — `GET /api/v1/usage/aggregates?group_by=agent`
+6. `list_change_requests` — `GET /api/v1/afk-outcomes/change-requests`
+7. `get_change_request_story` — `GET /api/v1/afk-outcomes/change-requests/{provider}/{repository}/{external_number}`
+8. `get_gateway_health` — `GET /health`
+9. `get_correlation_issues` — `GET /api/v1/afk-outcomes/correlations`
 
 Tool results remain structured Gateway facts. Narrative interpretation belongs to the
 calling model.
@@ -93,8 +94,33 @@ Configuration starts with:
 When the dedicated `opencode-gateway-mcp` repository is created:
 
 1. seed it with the MCP context document;
-2. implement the eight read-only tools against the documented Gateway APIs;
+2. implement the nine read-only tools against the documented Gateway APIs;
 3. add contract tests using representative Gateway responses;
 4. keep Gateway/API enhancements separate from MCP implementation issues;
 5. review any future write capability through a new ADR rather than extending v1 by
-   default.
+    default.
+
+## Amendment 2026-10-08 — v1.1: add `list_change_requests`
+
+**Status: accepted (amends the eight-tool v1 as shipped).**
+
+PR [#770](https://github.com/weiyentan/opencode-gateway/pull/770)
+(`feat/mcp-change-request-summary`) added `list_change_requests` backed by
+`GET /api/v1/afk-outcomes/change-requests` — the same per-change-request
+summary rows used by the Gateway frontend (provider, repository,
+`external_id`, provider lifecycle state, `total_estimated_cost_usd`,
+latest linked activity, execution counts, with explicit `limit`/`offset`
+pagination and no silent crawling or cost reconstruction).
+
+Code, tests, and CI (`opencode-gateway-mcp`, `mcp-publish.yml`) already assert
+**nine** approved read-only tools. The original ADR text listed eight; this
+amendment corrects the governing record to nine and adds the ninth catalogue
+entry above. All other ADR 0031 constraints remain unchanged (read-only,
+published Gateway API only, no direct Postgres/Kafka/AWX/collector access,
+no generic passthrough, no silent crawling, no invented correlation, UTC
+calendar and null-preservation rules).
+
+History preserved: the initial acceptance enumerated eight tools (items 1–8
+before `list_change_requests`); this amendment extends the approved set to
+nine. No superseding ADR is required — ADR 0031 remains the governing
+decision as amended.
