@@ -454,6 +454,90 @@ class GatewayClient:
             )
         return result
 
+    async def list_change_requests(
+        self,
+        *,
+        provider: str | None = None,
+        repository: str | None = None,
+        provider_state: str | None = None,
+        activity_from: str | None = None,
+        activity_to: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch the frontend change-request summary list contract.
+
+        Calls ``GET /api/v1/afk-outcomes/change-requests`` with the same
+        filters used by the Gateway frontend. The response preserves the
+        per-change-request ``total_estimated_cost_usd``, provider lifecycle
+        state, latest linked activity, execution counts, and explicit
+        pagination. Only one page is fetched; no silent crawling or local
+        cost reconstruction is performed.
+        """
+        url = f"{self._config.base_url}/api/v1/afk-outcomes/change-requests"
+        params: dict[str, str] = {}
+        if provider is not None:
+            params["provider"] = provider
+        if repository is not None:
+            params["repository"] = repository
+        if provider_state is not None:
+            params["provider_state"] = provider_state
+        if activity_from is not None:
+            params["activity_from"] = activity_from
+        if activity_to is not None:
+            params["activity_to"] = activity_to
+        if limit is not None:
+            params["limit"] = str(limit)
+        if offset is not None:
+            params["offset"] = str(offset)
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, params=params, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(
+                        url, params=params, headers=self._headers(), timeout=self._timeout
+                    )
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(
+                "/api/v1/afk-outcomes/change-requests",
+                response.status_code,
+                response.reason_phrase,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON "
+                "/api/v1/afk-outcomes/change-requests response"
+            ) from None
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an error envelope for "
+                "/api/v1/afk-outcomes/change-requests"
+            )
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and isinstance(payload.get("data"), dict)
+        ):
+            inner = payload["data"]
+            if isinstance(inner.get("items"), list):
+                payload = inner
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/afk-outcomes/change-requests payload shape"
+            )
+        return payload
+
     async def get_change_request_detail(
         self, provider: str, repository: str, external_number: str
     ) -> dict[str, Any]:
