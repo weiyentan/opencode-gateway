@@ -14,6 +14,7 @@ and candidates are never tie-broken.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Any
 
@@ -816,14 +817,55 @@ def create_server(
 
 
 def main() -> None:
-    """Run the MCP server over stdio using environment configuration."""
+    """Run the MCP server using environment configuration.
+
+    The default transport remains stdio for local/CLI compatibility. Set
+    OPENCODE_MCP_TRANSPORT=streamable-http for Kubernetes/tunnel deployments.
+    """
     try:
         config = GatewayConfig.from_env()
     except GatewayConfigError as exc:
-        # stderr only: stdout is the MCP stdio protocol channel.
+        # stderr only: stdout may be the MCP stdio protocol channel.
         print(f"{SERVER_NAME}: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
-    create_server(config).run()
+
+    server = create_server(config)
+    transport = os.environ.get("OPENCODE_MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport == "stdio":
+        server.run()
+        return
+
+    if transport != "streamable-http":
+        print(
+            f"{SERVER_NAME}: OPENCODE_MCP_TRANSPORT must be "
+            "'stdio' or 'streamable-http'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    host = os.environ.get("OPENCODE_MCP_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    raw_port = os.environ.get("OPENCODE_MCP_PORT", "8000").strip()
+    try:
+        port = int(raw_port)
+    except ValueError:
+        print(f"{SERVER_NAME}: OPENCODE_MCP_PORT must be an integer", file=sys.stderr)
+        raise SystemExit(1) from None
+    if not 1 <= port <= 65535:
+        print(
+            f"{SERVER_NAME}: OPENCODE_MCP_PORT must be between 1 and 65535",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    server.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+    )
 
 
 if __name__ == "__main__":
