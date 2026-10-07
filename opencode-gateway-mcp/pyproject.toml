@@ -9,7 +9,7 @@ description = "Read-only semantic MCP adapter for the published OpenCode Gateway
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=2.0,<3",
-    "httpx>=0.27",
+    "httpx>=0.27,<1.0",
 ]
 
 [project.optional-dependencies]

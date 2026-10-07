@@ -13,6 +13,7 @@ and candidates are never tie-broken.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any
 
@@ -725,12 +726,13 @@ def create_server(
         if not isinstance(afk_run_id, str) or not afk_run_id.strip():
             raise ToolError("afk_run_id must be a non-empty string")
         trimmed = afk_run_id.strip()
+        # The two required calls are issued concurrently; a failure in either
+        # one is surfaced as a single MCP-visible error, never a partial success.
         try:
-            detail = await gateway.get_afk_run_detail(trimmed)
-        except GatewayError as exc:
-            raise ToolError(str(exc)) from None
-        try:
-            executions_raw = await gateway.get_afk_executions_for_run(trimmed)
+            detail, executions_raw = await asyncio.gather(
+                gateway.get_afk_run_detail(trimmed),
+                gateway.get_afk_executions_for_run(trimmed),
+            )
         except GatewayError as exc:
             raise ToolError(str(exc)) from None
         try:
@@ -820,7 +822,7 @@ def main() -> None:
     except GatewayConfigError as exc:
         # stderr only: stdout is the MCP stdio protocol channel.
         print(f"{SERVER_NAME}: {exc}", file=sys.stderr)
-        raise SystemExit(2) from None
+        raise SystemExit(1) from None
     create_server(config).run()
 
 

@@ -439,7 +439,7 @@ def test_server_fails_closed_without_environment_configuration() -> None:
         cwd=str(PACKAGE_DIR),
     )
 
-    assert process.returncode != 0, "server must fail closed without configuration"
+    assert process.returncode == 1, "server must fail closed without configuration"
     assert "OPENCODE_GATEWAY_URL" in process.stderr
     assert process.stdout == "", "stdout is the MCP protocol channel and must stay clean"
 

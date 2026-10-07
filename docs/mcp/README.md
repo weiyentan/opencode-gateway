@@ -84,20 +84,22 @@ Build the image locally (no secrets needed at build time):
 docker build -f opencode-gateway-mcp/Dockerfile -t opencode-gateway-mcp:local .
 ```
 
-Run with externally supplied config (same shape CI smoke uses):
+Run with externally supplied config (same shape CI smoke uses; stdio needs stdin attached):
 
 ```bash
-docker run --rm \
+docker run --rm -i \
   -e OPENCODE_GATEWAY_URL=https://gateway.example.com \
   -e OPENCODE_GATEWAY_API_KEY="$OPENCODE_GATEWAY_API_KEY" \
   ghcr.io/weiyentan/opencode-gateway-mcp:master
 # or locally built tag:
-# docker run --rm -e OPENCODE_GATEWAY_URL=... -e OPENCODE_GATEWAY_API_KEY=... opencode-gateway-mcp:local
+# docker run --rm -i -e OPENCODE_GATEWAY_URL=... -e OPENCODE_GATEWAY_API_KEY=... opencode-gateway-mcp:local
 ```
 
-The container validates env on startup, prints `opencode-gateway-mcp ready` and
-`ready` to stderr/stdout without logging the API key, and stays alive speaking MCP
-over stdio. Missing or malformed env causes exit 1 with an error to stderr.
+The container validates `OPENCODE_GATEWAY_URL` and `OPENCODE_GATEWAY_API_KEY`
+on startup and stays alive speaking MCP over stdio. Stdout is the MCP protocol
+channel, so no banner is printed there; the error message goes to stderr and the
+API key is never logged. Missing or malformed env causes exit 1 with an error
+(e.g. `opencode-gateway-mcp: OPENCODE_GATEWAY_URL is not set`) to stderr.
 
 Smoke validation (CI equivalent) — must fail without env, pass with env:
 
@@ -105,10 +107,13 @@ Smoke validation (CI equivalent) — must fail without env, pass with env:
 # should fail closed (exit 1)
 docker run --rm opencode-gateway-mcp:local; echo $?
 
-# should start and stay alive
-CID=$(docker run -d -e OPENCODE_GATEWAY_URL=http://example.invalid -e OPENCODE_GATEWAY_API_KEY=dummy opencode-gateway-mcp:local)
-sleep 2; docker logs "$CID"; docker ps | grep "$CID" && echo "smoke passed"
-docker rm -f "$CID"
+# should start and speak MCP over stdio (stdin attached; the piped initialize
+# request gets a JSON-RPC response on stdout, then EOF ends the session)
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0.0"}}}' \
+  | docker run --rm -i \
+      -e OPENCODE_GATEWAY_URL=http://example.invalid \
+      -e OPENCODE_GATEWAY_API_KEY=dummy \
+      opencode-gateway-mcp:local
 ```
 
 ## Architecture notes

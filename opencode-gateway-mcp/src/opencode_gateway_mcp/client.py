@@ -12,7 +12,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -123,7 +123,9 @@ class GatewayClient:
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
-                    response = await http_client.get(url, headers=self._headers())
+                    response = await http_client.get(
+                        url, headers=self._headers(), timeout=self._timeout
+                    )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
                 f"Could not reach the OpenCode Gateway at {self._config.base_url} "
@@ -217,7 +219,7 @@ class GatewayClient:
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
                     response = await http_client.get(
-                        url, params=params, headers=self._headers()
+                        url, params=params, headers=self._headers(), timeout=self._timeout
                     )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
@@ -237,10 +239,21 @@ class GatewayClient:
                 "OpenCode Gateway returned a non-JSON "
                 "/api/v1/afk-outcomes/runs response"
             ) from None
-        if isinstance(payload, dict) and payload.get("status") == "ok" and "data" in payload:
-            data = payload["data"]
-            if isinstance(data, dict):
-                payload = data
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an error envelope for "
+                "/api/v1/afk-outcomes/runs"
+            )
+        # Unwrap the paginated {status: "ok", data: {items, ...}} envelope when
+        # present; a data object without an items list is returned unchanged.
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and isinstance(payload.get("data"), dict)
+        ):
+            inner = payload["data"]
+            if isinstance(inner.get("items"), list):
+                payload = inner
         if not isinstance(payload, dict):
             raise GatewayResponseError(
                 "OpenCode Gateway returned an unexpected "
@@ -286,7 +299,7 @@ class GatewayClient:
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
                     response = await http_client.get(
-                        url, params=params, headers=self._headers()
+                        url, params=params, headers=self._headers(), timeout=self._timeout
                     )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
@@ -306,6 +319,11 @@ class GatewayClient:
                 "OpenCode Gateway returned a non-JSON "
                 "/api/v1/afk/dashboard/summary response"
             ) from None
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an error envelope for "
+                "/api/v1/afk/dashboard/summary"
+            )
         if (
             isinstance(payload, dict)
             and payload.get("status") == "ok"
@@ -362,7 +380,7 @@ class GatewayClient:
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
                     response = await http_client.get(
-                        url, headers=self._headers(), params=params
+                        url, headers=self._headers(), params=params, timeout=self._timeout
                     )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
@@ -379,6 +397,10 @@ class GatewayClient:
             raise GatewayResponseError(
                 "OpenCode Gateway returned a non-JSON /api/v1/usage/aggregates response"
             ) from None
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an error envelope for /api/v1/usage/aggregates"
+            )
         if isinstance(payload, dict) and "data" in payload:
             inner = payload["data"]
             if not isinstance(inner, list):
@@ -403,7 +425,8 @@ class GatewayClient:
         Raises a :class:`GatewayError` for transport failures, non-2xx
         responses, and unparseable bodies.
         """
-        path = f"/api/v1/afk-outcomes/runs/{afk_run_id}"
+        encoded_id = quote(afk_run_id, safe="")
+        path = f"/api/v1/afk-outcomes/runs/{encoded_id}"
         result = await self._get_json(path)
         if not isinstance(result, dict):
             raise GatewayResponseError(
@@ -422,7 +445,8 @@ class GatewayClient:
         Raises a :class:`GatewayError` for transport failures, non-2xx
         responses, and unparseable bodies.
         """
-        path = f"/api/v1/afk/executions/runs/{afk_run_id}"
+        encoded_id = quote(afk_run_id, safe="")
+        path = f"/api/v1/afk/executions/runs/{encoded_id}"
         result = await self._get_json(path)
         if not isinstance(result, list):
             raise GatewayResponseError(
@@ -442,8 +466,6 @@ class GatewayClient:
         responses, and unparseable bodies. Only this read-only path is ever
         called; no issue reverse lookup or generic passthrough is performed.
         """
-        from urllib.parse import quote
-
         encoded_provider = quote(provider, safe="")
         encoded_repository = quote(repository, safe="/")
         encoded_number = quote(external_number, safe="")
@@ -459,7 +481,9 @@ class GatewayClient:
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
-                    response = await http_client.get(url, headers=self._headers())
+                    response = await http_client.get(
+                        url, headers=self._headers(), timeout=self._timeout
+                    )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
                 f"Could not reach the OpenCode Gateway at {self._config.base_url} "
@@ -473,6 +497,10 @@ class GatewayClient:
             raise GatewayResponseError(
                 "OpenCode Gateway returned a non-JSON change-request response"
             ) from None
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an error envelope for {path}"
+            )
         if not isinstance(payload, dict):
             raise GatewayResponseError(
                 "OpenCode Gateway returned an unexpected change-request payload shape"
@@ -511,7 +539,9 @@ class GatewayClient:
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
-                    response = await http_client.get(url, headers=self._headers(), params=params)
+                    response = await http_client.get(
+                        url, headers=self._headers(), params=params, timeout=self._timeout
+                    )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
                 f"Could not reach the OpenCode Gateway at {self._config.base_url} "
@@ -528,6 +558,10 @@ class GatewayClient:
         if not isinstance(payload, dict):
             raise GatewayResponseError(
                 "OpenCode Gateway returned an unexpected correlations payload shape"
+            )
+        if payload.get("status") == "error":
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an error envelope for {path}"
             )
         # Unwrap the standard {status: "ok", data: ...} envelope when present so
         # callers see the paginated {items, total, limit, offset} shape directly.
