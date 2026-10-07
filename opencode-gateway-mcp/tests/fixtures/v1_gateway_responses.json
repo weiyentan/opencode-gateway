@@ -30,26 +30,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "version"
-      ],
-      [
-        "collectors",
-        0,
-        "health"
-      ]
-    ],
-    "null_paths": [
-      [
-        "last_ingest_timestamp"
-      ],
-      [
-        "collectors",
-        0,
-        "last_heartbeat"
-      ]
-    ]
+    "sentinel_paths": [["version"], ["collectors", 0, "health"]],
+    "null_paths": [["last_ingest_timestamp"], ["collectors", 0, "last_heartbeat"]]
   },
   "get_afk_activity_summary": {
     "arguments": {
@@ -94,28 +76,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "buckets",
-        0,
-        "period_start"
-      ],
-      [
-        "buckets",
-        0,
-        "execution_count"
-      ]
-    ],
-    "null_paths": [
-      [
-        "derived_at"
-      ],
-      [
-        "buckets",
-        0,
-        "estimated_cost_usd"
-      ]
-    ]
+    "sentinel_paths": [["buckets", 0, "period_start"], ["buckets", 0, "execution_count"]],
+    "null_paths": [["derived_at"], ["buckets", 0, "estimated_cost_usd"]]
   },
   "list_afk_runs": {
     "arguments": {
@@ -148,23 +110,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "items",
-        0,
-        "afk_run_id"
-      ],
-      [
-        "total"
-      ]
-    ],
-    "null_paths": [
-      [
-        "items",
-        0,
-        "finished_at"
-      ]
-    ]
+    "sentinel_paths": [["items", 0, "afk_run_id"], ["total"]],
+    "null_paths": [["items", 0, "finished_at"]]
   },
   "list_change_requests": {
     "arguments": {
@@ -221,33 +168,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "items",
-        0,
-        "external_id"
-      ],
-      [
-        "items",
-        0,
-        "total_estimated_cost_usd"
-      ],
-      [
-        "total"
-      ]
-    ],
-    "null_paths": [
-      [
-        "items",
-        1,
-        "total_estimated_cost_usd"
-      ],
-      [
-        "items",
-        1,
-        "provider_state_observed_at"
-      ]
-    ]
+    "sentinel_paths": [["items", 0, "external_id"], ["items", 0, "total_estimated_cost_usd"], ["total"]],
+    "null_paths": [["items", 1, "total_estimated_cost_usd"], ["items", 1, "provider_state_observed_at"]]
   },
   "get_model_usage": {
     "arguments": {
@@ -273,9 +195,7 @@
               "session_count": 3,
               "model_count": 1,
               "cache_hit_ratio": null,
-              "provider_breakdown": {
-                "anthropic": 10
-              },
+              "provider_breakdown": {"anthropic": 10},
               "project_label": null,
               "agent": null
             }
@@ -283,26 +203,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        0,
-        "group_value"
-      ],
-      [
-        0,
-        "total_input_tokens"
-      ]
-    ],
-    "null_paths": [
-      [
-        0,
-        "total_estimated_cost_usd"
-      ],
-      [
-        0,
-        "cache_hit_ratio"
-      ]
-    ]
+    "sentinel_paths": [[0, "group_value"], [0, "total_input_tokens"]],
+    "null_paths": [[0, "total_estimated_cost_usd"], [0, "cache_hit_ratio"]]
   },
   "get_agent_usage": {
     "arguments": {
@@ -336,26 +238,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        0,
-        "group_value"
-      ],
-      [
-        0,
-        "record_count"
-      ]
-    ],
-    "null_paths": [
-      [
-        0,
-        "total_estimated_cost_usd"
-      ],
-      [
-        0,
-        "agent"
-      ]
-    ]
+    "sentinel_paths": [[0, "group_value"], [0, "record_count"]],
+    "null_paths": [[0, "total_estimated_cost_usd"], [0, "agent"]]
   },
   "get_afk_run_story": {
     "arguments": {
@@ -406,9 +290,7 @@
                 "parent_session_id": null
               }
             ],
-            "agents": [
-              "code-editor"
-            ],
+            "agents": ["code-editor"],
             "usage": {
               "active_tokens": 750,
               "input_tokens": 500,
@@ -429,14 +311,9 @@
           "data": [
             {
               "binding_id": "11111111-1111-1111-1111-111111111111",
-              "awx_job": {
-                "job_id": "101",
-                "job_template_id": 10
-              },
+              "awx_job": {"job_id": "101", "job_template_id": 10},
               "external_session_id": "ses_abc123",
-              "external_session_ids": [
-                "ses_abc123"
-              ],
+              "external_session_ids": ["ses_abc123"],
               "resource": {
                 "provider": "github",
                 "repository": "github.com/acme/proj",
@@ -456,14 +333,9 @@
             },
             {
               "binding_id": "22222222-2222-2222-2222-222222222222",
-              "awx_job": {
-                "job_id": "102",
-                "job_template_id": 10
-              },
+              "awx_job": {"job_id": "102", "job_template_id": 10},
               "external_session_id": "ses_def456",
-              "external_session_ids": [
-                "ses_def456"
-              ],
+              "external_session_ids": ["ses_def456"],
               "resource": null,
               "outcome": "completed",
               "afk_run_id": "01H5K6XYZABCDEF1234567890",
@@ -480,28 +352,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "run",
-        "afk_run_id"
-      ],
-      [
-        "executions",
-        0,
-        "outcome"
-      ]
-    ],
-    "null_paths": [
-      [
-        "run",
-        "finished_at"
-      ],
-      [
-        "executions",
-        1,
-        "failure_summary"
-      ]
-    ]
+    "sentinel_paths": [["run", "afk_run_id"], ["executions", 0, "outcome"]],
+    "null_paths": [["run", "finished_at"], ["executions", 1, "failure_summary"]]
   },
   "get_change_request_story": {
     "arguments": {
@@ -526,13 +378,7 @@
               "provider_state_observed_at": "2026-10-06T17:59:00Z",
               "merged_at": "2026-10-06T17:58:00Z",
               "title": "Fix the thing",
-              "executions": {
-                "total": 2,
-                "running": 0,
-                "completed": 1,
-                "failed": 1,
-                "cancelled": 0
-              }
+              "executions": {"total": 2, "running": 0, "completed": 1, "failed": 1, "cancelled": 0}
             },
             "afk_runs": [
               {
@@ -544,17 +390,12 @@
                 "outcome_status": "merged",
                 "first_seen_at": "2026-10-06T10:00:00Z",
                 "last_seen_at": "2026-10-06T11:00:00Z",
-                "link_sources": [
-                  "change_request_binding"
-                ]
+                "link_sources": ["change_request_binding"]
               }
             ],
             "executions": [
               {
-                "awx_job": {
-                  "job_id": "100",
-                  "job_template_id": 10
-                },
+                "awx_job": {"job_id": "100", "job_template_id": 10},
                 "external_session_id": "ses_abc",
                 "session_id": "11111111-1111-1111-1111-111111111111",
                 "afk_run_id": "01HAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -566,7 +407,7 @@
                 "title": "Fix the thing",
                 "started_at": "2026-10-06T10:05:00Z",
                 "finished_at": "2026-10-06T10:55:00Z",
-                "duration_seconds": 3000,
+                "duration_seconds": 3000.0,
                 "failure_reason": null,
                 "failure_summary": null,
                 "total_input_tokens": 10000,
@@ -588,10 +429,7 @@
               "session_count": 0
             },
             "total_estimated_cost_usd": null,
-            "merge_state": {
-              "state": "merged",
-              "merged_at": "2026-10-06T17:58:00Z"
-            },
+            "merge_state": {"state": "merged", "merged_at": "2026-10-06T17:58:00Z"},
             "timeline": {
               "events": [
                 {
@@ -607,28 +445,8 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "change_request",
-        "external_id"
-      ],
-      [
-        "afk_runs",
-        0,
-        "link_sources"
-      ]
-    ],
-    "null_paths": [
-      [
-        "change_request",
-        "total_estimated_cost_usd"
-      ],
-      [
-        "executions",
-        0,
-        "failure_summary"
-      ]
-    ]
+    "sentinel_paths": [["change_request", "external_id"], ["afk_runs", 0, "link_sources"]],
+    "null_paths": [["change_request", "total_estimated_cost_usd"], ["executions", 0, "failure_summary"]]
   },
   "get_correlation_issues": {
     "arguments": {
@@ -652,11 +470,8 @@
                 "afk_run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "method": "temporal_inference",
                 "reason": "ambiguous",
-                "correlation_confidence": 0,
-                "candidates": [
-                  "issue:42",
-                  "issue:43"
-                ],
+                "correlation_confidence": 0.0,
+                "candidates": ["issue:42", "issue:43"],
                 "evidence": [],
                 "resolver_version": "2",
                 "created_at": "2026-10-07T09:00:00+00:00",
@@ -671,7 +486,7 @@
                 "afk_run_id": null,
                 "method": "issue_reference",
                 "reason": "unmatched",
-                "correlation_confidence": 0,
+                "correlation_confidence": 0.0,
                 "candidates": [],
                 "evidence": [],
                 "resolver_version": "2",
@@ -686,22 +501,7 @@
         }
       }
     ],
-    "sentinel_paths": [
-      [
-        "items",
-        0,
-        "reason"
-      ],
-      [
-        "total"
-      ]
-    ],
-    "null_paths": [
-      [
-        "items",
-        1,
-        "afk_run_id"
-      ]
-    ]
+    "sentinel_paths": [["items", 0, "reason"], ["total"]],
+    "null_paths": [["items", 1, "afk_run_id"]]
   }
 }
