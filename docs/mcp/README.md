@@ -62,19 +62,22 @@ Immutable tags (`short SHA`, `full SHA`, semver) never move; branch/`latest` tag
 move with new pushes. Consumers that need reproducibility should pin the short or
 full SHA or a semver tag.
 
-## Required runtime environment variables
+## Runtime environment variables
 
-The container **fails closed** if either variable is missing. They are supplied at
-runtime and are never baked into image layers or emitted in build logs.
+The container **fails closed** if either required Gateway variable is missing. Values
+are supplied at runtime and are never baked into image layers or emitted in build logs.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENCODE_GATEWAY_URL` | yes | Gateway base URL, e.g. `https://gateway.example.com` or `http://host.docker.internal:8000`. Must be `http(s)://`. |
-| `OPENCODE_GATEWAY_API_KEY` | yes | Gateway API key (bearer token for `Authorization: Bearer …`). Never logged or returned through MCP tool results. |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OPENCODE_GATEWAY_URL` | yes | — | Gateway base URL, e.g. `https://gateway.example.com` or `http://host.docker.internal:8000`. Must be `http(s)://`. |
+| `OPENCODE_GATEWAY_API_KEY` | yes | — | Gateway API key (bearer token for `Authorization: Bearer …`). Never logged or returned through MCP tool results. |
+| `OPENCODE_MCP_TRANSPORT` | no | `stdio` | Use `stdio` for local/CLI clients or `streamable-http` for remote/tunnel deployments. |
+| `OPENCODE_MCP_HOST` | no | `0.0.0.0` | Bind address when `OPENCODE_MCP_TRANSPORT=streamable-http`. |
+| `OPENCODE_MCP_PORT` | no | `8000` | Listen port when `OPENCODE_MCP_TRANSPORT=streamable-http`. |
 
-No other configuration is required — `OPENCODE_GATEWAY_URL` and
-`OPENCODE_GATEWAY_API_KEY` remain the only required runtime inputs for the v1
-container. Future optional flags would be additive.
+The Streamable HTTP endpoint is `/mcp`. It runs stateless with JSON responses, which
+matches the OpenAI Secure MCP Tunnel deployment pattern while keeping stdio as the
+backward-compatible default.
 
 ## Local container startup
 
@@ -96,10 +99,21 @@ docker run --rm -i \
 ```
 
 The container validates `OPENCODE_GATEWAY_URL` and `OPENCODE_GATEWAY_API_KEY`
-on startup and stays alive speaking MCP over stdio. Stdout is the MCP protocol
-channel, so no banner is printed there; the error message goes to stderr and the
-API key is never logged. Missing or malformed env causes exit 1 with an error
-(e.g. `opencode-gateway-mcp: OPENCODE_GATEWAY_URL is not set`) to stderr.
+on startup. With the default `stdio` transport, stdout remains the MCP protocol
+channel. For Kubernetes/OpenAI Secure MCP Tunnel deployments, set
+`OPENCODE_MCP_TRANSPORT=streamable-http`; the server then listens on
+`0.0.0.0:8000/mcp` by default. Missing or malformed configuration exits non-zero
+without logging the Gateway API key.
+
+Example Streamable HTTP startup:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e OPENCODE_GATEWAY_URL=https://gateway.example.com \
+  -e OPENCODE_GATEWAY_API_KEY="$OPENCODE_GATEWAY_API_KEY" \
+  -e OPENCODE_MCP_TRANSPORT=streamable-http \
+  ghcr.io/weiyentan/opencode-gateway-mcp:master
+```
 
 Smoke validation (CI equivalent) — must fail without env, pass with env:
 
