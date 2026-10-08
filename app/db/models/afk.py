@@ -591,6 +591,54 @@ class ExecutionBinding(Base):
     )
 
 
+class RecoveryCheckpoint(Base):
+    """Durable recovery metadata for one failed AFK execution (migration 0049).
+
+    One row per ``(execution, ref, commit_sha)``: the emergency recovery
+    branch/ref that survived a failed execution plus the commit SHA it
+    points at.  A checkpoint is execution-scoped — it references an existing
+    ``execution_bindings`` row by its natural ``awx_job_id`` and inherits
+    that execution's ``afk_run_id``.  It is additive recovery metadata, not a
+    new AFK Run and never a rewrite of the execution outcome.
+
+    The ``UNIQUE (awx_job_id, ref, commit_sha)`` constraint makes a repeated
+    write idempotent; distinct refs pointing at the same SHA are preserved
+    because ``ref`` is part of the key.  Runtime access is raw asyncpg — the
+    ``afk_outcomes.repository.AsyncpgOutcomeRepository`` is the only writer.
+    """
+
+    __tablename__ = "recovery_checkpoints"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "awx_job_id",
+            "ref",
+            "commit_sha",
+            name="uq_recovery_checkpoints_execution_ref_sha",
+        ),
+        Index("ix_recovery_checkpoints_afk_run_id", "afk_run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    awx_job_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("execution_bindings.awx_job_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    afk_run_id: Mapped[Optional[str]] = mapped_column(
+        String(26),
+        ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ref: Mapped[str] = mapped_column(String(1024), nullable=False)
+    commit_sha: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class ClosureLink(Base):
     """The derived current state of one change-request->issue link (migration 0036).
 

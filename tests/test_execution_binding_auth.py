@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -553,3 +554,58 @@ class TestTerminalUpdateAuth:
             },
         )
         assert resp.status_code == 200
+
+
+class TestRecoveryCheckpointAuth:
+    """The recovery-checkpoint write path uses the dedicated-client credential."""
+
+    @pytest.mark.asyncio
+    async def test_post_rejects_other_client_credential_403(self) -> None:
+        """A valid credential owned by another client is rejected with 403."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=_auth_row(client_name="other-client"))
+
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/42/recovery-checkpoints",
+            json={"ref": "ai/recovery/x", "commit_sha": "a" * 40},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_post_accepts_dedicated_client_credential(self) -> None:
+        """The dedicated AWX client passes the gate and persists a checkpoint."""
+        conn = AsyncMock()
+        mock_tx = AsyncMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        conn.transaction = MagicMock(return_value=mock_tx)
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                mock_row({"afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY"}),
+            ]
+        )
+        checkpoint_row = mock_row(
+            {
+                "id": uuid.uuid4(),
+                "awx_job_id": 42,
+                "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
+                "ref": "ai/recovery/x",
+                "commit_sha": "a" * 40,
+                "created_at": datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc),
+            }
+        )
+        conn.fetch = AsyncMock(return_value=[checkpoint_row])
+
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/42/recovery-checkpoints",
+            json={"ref": "ai/recovery/x", "commit_sha": "a" * 40},
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()["data"]
+        assert data["awx_job_id"] == "42"
+        assert data["ref"] == "ai/recovery/x"

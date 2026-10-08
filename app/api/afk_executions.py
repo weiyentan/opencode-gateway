@@ -78,6 +78,7 @@ from afk_outcomes.models import (
     ExecutionBinding,
     Provider,
     ProviderResourceIdentity,
+    RecoveryCheckpoint,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
 from afk_outcomes.serialization import MonotonicULID
@@ -95,6 +96,9 @@ from app.core.schemas.execution_binding import (
     ExecutionBindingHistoryResponse,
     ExecutionBindingReadResponse,
     ExecutionBindingUpdateRequest,
+    RecoveryCheckpointCreateRequest,
+    RecoveryCheckpointListResponse,
+    RecoveryCheckpointResponse,
 )
 from app.core.telemetry import timed_operation
 from app.core.timeouts import db_timeout as _db_timeout
@@ -293,6 +297,20 @@ def _binding_to_read_response(binding: ExecutionBinding) -> ExecutionBindingRead
         finished_at=binding.finished_at,
         failure_reason=binding.failure_reason,
         failure_summary=binding.failure_summary,
+    )
+
+
+def _checkpoint_to_response(
+    checkpoint: RecoveryCheckpoint,
+) -> RecoveryCheckpointResponse:
+    """Convert a domain :class:`RecoveryCheckpoint` to its API read response."""
+    return RecoveryCheckpointResponse(
+        id=checkpoint.checkpoint_id,
+        awx_job_id=checkpoint.awx_job_id,
+        afk_run_id=checkpoint.afk_run_id,
+        ref=checkpoint.ref,
+        commit_sha=checkpoint.commit_sha,
+        created_at=checkpoint.created_at,
     )
 
 
@@ -552,6 +570,139 @@ async def update_execution_binding(
             detail="Execution binding disappeared after terminal update",
         )
     return _binding_to_read_response(saved)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST/GET /{awx_job_id}/recovery-checkpoints — execution-scoped recovery
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post(
+    "/{awx_job_id}/recovery-checkpoints",
+    response_model=RecoveryCheckpointResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "description": (
+                "Idempotent replay — existing checkpoint returned unchanged"
+            )
+        },
+        status.HTTP_201_CREATED: {
+            "description": "New recovery checkpoint persisted"
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "No execution binding for this AWX job"
+        },
+    },
+)
+async def create_recovery_checkpoint(
+    awx_job_id: str,
+    body: RecoveryCheckpointCreateRequest,
+    request: Request,
+    response: Response,
+    auth: dict = Depends(require_awx_execution_binding_credential),
+    conn: asyncpg.Connection = Depends(get_session),
+) -> RecoveryCheckpointResponse:
+    """Persist one execution-scoped AFK recovery checkpoint (issue #754).
+
+    Records an emergency recovery branch/ref (and the commit SHA it points
+    at) that survived a failed AFK execution.  The checkpoint is linked to
+    the existing ``execution_bindings`` row named by the path's
+    ``awx_job_id`` and therefore to that execution's ``afk_run_id`` — it is
+    **not** a new AFK Run and never rewrites the execution's failed outcome,
+    failure metadata, session, or resource binding.
+
+    **Idempotent** by ``(awx_job_id, ref, commit_sha)``:
+
+    * New checkpoint → ``201 Created``.
+    * Identical replay → ``200 OK`` with the existing checkpoint unchanged.
+    * Distinct refs pointing at the same SHA → distinct checkpoints.
+
+    **Fail closed** — an unknown ``awx_job_id`` returns ``404`` without
+    writing anything.
+
+    Write auth follows the execution-binding path: the global Admin API Key
+    (``ApiKeyMiddleware``) plus a collector credential attributable to the
+    dedicated AWX execution-binding client
+    (``AWX_EXECUTION_BINDING_CLIENT_NAME``).
+    """
+    awx_job_id = _validate_awx_job_id(awx_job_id)
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.insert.recovery_checkpoint", "db"):
+            async with _db_timeout(
+                "db.insert.recovery_checkpoint",
+                settings.database_timeout_seconds,
+            ):
+                result = await repo.create_or_replay_recovery_checkpoint(
+                    awx_job_id=awx_job_id,
+                    ref=body.ref,
+                    commit_sha=body.commit_sha,
+                )
+
+    if result.execution_missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Execution binding not found for AWX job: {awx_job_id}",
+        )
+    if result.checkpoint is None:
+        # Should not happen — a missing execution is handled above, and
+        # either the insert succeeded or the replay re-read a row.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist recovery checkpoint",
+        )
+
+    response.status_code = (
+        status.HTTP_201_CREATED if result.is_created else status.HTTP_200_OK
+    )
+    return _checkpoint_to_response(result.checkpoint)
+
+
+@router.get(
+    "/{awx_job_id}/recovery-checkpoints",
+    response_model=RecoveryCheckpointListResponse,
+)
+async def list_recovery_checkpoints(
+    request: Request,
+    awx_job_id: str,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> RecoveryCheckpointListResponse:
+    """List every recovery checkpoint of one AWX execution (issue #754).
+
+    Execution-scoped and read-only.  Ordered deterministically by
+    ``created_at ASC, id ASC`` (earliest first).  An existing execution with
+    no checkpoints returns an empty ``checkpoints`` list (``200``); an
+    unknown ``awx_job_id`` fails closed with ``404``.
+
+    Requires only the Admin API Key (``ApiKeyMiddleware``) — no collector
+    credential is needed, mirroring the other execution-binding read paths.
+    Watchers can still read the checkpoints after the originating AWX job
+    has completed or failed.
+    """
+    awx_job_id = _validate_awx_job_id(awx_job_id)
+
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        binding = await repo.get_execution_binding_by_awx_job_id(awx_job_id)
+        if binding is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution binding not found for AWX job: {awx_job_id}",
+            )
+        async with timed_operation("db.query.recovery_checkpoints", "db"):
+            async with _db_timeout(
+                "db.query.recovery_checkpoints",
+                settings.database_timeout_seconds,
+            ):
+                checkpoints = await repo.list_recovery_checkpoints(awx_job_id)
+
+    return RecoveryCheckpointListResponse(
+        awx_job_id=awx_job_id,
+        checkpoints=[_checkpoint_to_response(c) for c in checkpoints],
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

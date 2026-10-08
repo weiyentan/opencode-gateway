@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -831,6 +832,29 @@ class ExecutionBinding(BaseModel):
                 self, "external_session_ids", [self.external_session_id]
             )
         return self
+
+
+@dataclass(frozen=True)
+class RecoveryCheckpoint:
+    """One durable recovery checkpoint of a failed AFK execution (issue #754).
+
+    Execution-scoped recovery metadata: the emergency recovery branch/ref
+    that survived a failed execution and the commit SHA it points at.  A
+    checkpoint is linked to an existing AWX execution (``awx_job_id``) and
+    therefore to that execution's ``afk_run_id``.  It is not a new AFK Run
+    and never rewrites the failed execution's outcome.
+
+    Identity is ``(awx_job_id, ref, commit_sha)``: repeated observation is a
+    no-op, while distinct refs pointing at the same SHA are distinct
+    checkpoints.
+    """
+
+    checkpoint_id: str
+    awx_job_id: str
+    afk_run_id: str | None
+    ref: str
+    commit_sha: str
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------

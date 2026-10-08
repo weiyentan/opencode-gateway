@@ -80,12 +80,14 @@ from afk_outcomes.repository.crud import (
 )
 from afk_outcomes.repository.executions import (
     CreateAFKExecutionBindingResult,
+    CreateRecoveryCheckpointResult,
     ProvisionAFKRunResult,
     UpdateExecutionBindingResult,
     _ExecutionBindingsRepositoryMixin,
     _decode_session_ids,
     _parse_awx_job_id,
     _row_to_execution_binding,
+    _row_to_recovery_checkpoint,
 )
 from afk_outcomes.repository.lifecycle import (
     ChangeRequestBindingResult,
@@ -100,6 +102,7 @@ __all__ = [
     "ChangeRequestLookupResult",
     "ClosureRebuildResult",
     "CreateAFKExecutionBindingResult",
+    "CreateRecoveryCheckpointResult",
     "ProvisionAFKRunResult",
     "RESOLVER_VERSION",
     "UpdateAFKRunResult",
@@ -115,6 +118,7 @@ __all__ = [
     "_parse_awx_job_id",
     "_provider_event_id",
     "_row_to_execution_binding",
+    "_row_to_recovery_checkpoint",
     "_source_reference_json",
     "_split_entity_id",
     "_to_closure_fact",

@@ -156,6 +156,20 @@ provider payload. Recognizable secret-bearing values are redacted before the
 summary is persisted, and the stored value has a fixed maximum length of 1000 characters.
 _Avoid_: failure transcript, raw failure output, AWX payload
 
+**Recovery Checkpoint**:
+Durable recovery metadata produced by a failed AFK develop execution: an
+emergency recovery branch/ref that survived the failure plus the commit SHA
+it points at (`recovery_checkpoints`, migration 0049). A Recovery Checkpoint
+is execution-scoped — it is linked to an existing AWX Execution Binding by
+its `awx_job_id` and therefore to that binding's `afk_run_id`. It is **not**
+a new AFK Run and never rewrites the originating execution's failed outcome,
+failure metadata, session, or resource binding. Persistence is idempotent by
+`(awx_job_id, ref, commit_sha)`: a repeated POST is one row, while distinct
+refs pointing at the same SHA are distinct checkpoints. Readable via
+`POST`/`GET /api/v1/afk/executions/{awx_job_id}/recovery-checkpoints` in a
+deterministic order even after the originating AWX job completed or failed.
+_Avoid_: AFK Run, execution outcome, best-checkpoint selection
+
 **Observed Message**:
 A Gateway-owned row (`observed_messages`, migration 0029) projecting one
 OpenCode `message` row: its identity, session linkage, role/agent/mode
@@ -1459,6 +1473,7 @@ manages.
 - An **AFK Run** has exactly one **AWX Execution Binding**, and that binding contains many uniquely identified **AWX Executions**; each execution may carry optional **Stable Resource Identity** and **External Session ID** metadata
 - An **AWX Execution Binding** is idempotent by AWX job identity: repeating the same binding is a no-op, conflicting data for the same AWX job is rejected, and a new AWX job for the same resource creates a separate binding (applies to both `POST /api/v1/afk/executions` and `PATCH /api/v1/afk/executions/{awx_job_id}`; `PATCH` uses non-erasing fill-ins for late-discovered session/resource and never overwrites terminal history)
 - A GitHub pull request and GitLab merge request are both represented as a `change_request` **Stable Resource Identity** when a resource is present; provider identity is supplied at the API boundary rather than an internal Gateway database ID
+- An **AWX Execution Binding** owns zero, one, or many **Recovery Checkpoints**, keyed idempotently by `(awx_job_id, ref, commit_sha)`; distinct refs pointing at the same SHA are preserved as distinct checkpoints, and writing them never mutates the owning execution's outcome, failure metadata, session, or resource binding
 - An **AWX Execution Binding** may carry the originating EDA `source_event_id` (required when `trigger_type=eda`), `trigger_type`, branch metadata, title, `started_at`/`finished_at`, and a bounded redacted failure summary (only on non-completed outcomes); it never stores raw `extra_vars`, stdout, prompts, tokens, or arbitrary AWX payloads
 - The execution-binding API exposes a two-phase write path — `POST /api/v1/afk/executions` for `running` provisioning or direct terminal persistence and `PATCH /api/v1/afk/executions/{awx_job_id}` for `running`→terminal transitions — plus read paths by AWX job identity or stable provider resource identity; read results preserve the full history including `running` and failed-to-successful retries
 - The execution-binding write path uses a dedicated **Collector Credential** for the AWX integration; it does not reuse the `opencode-collector` credential or the **Admin API Key**
