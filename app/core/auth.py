@@ -46,8 +46,12 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
       checking.
     """
 
-    # Paths that bypass API key authentication (e.g., health checks)
-    EXEMPT_PATHS: frozenset[str] = frozenset({"/health"})
+    # Paths that bypass API key authentication (e.g., health checks).
+    #
+    # /live and /ready (issue #772) are the Kubernetes probe endpoints:
+    # kubelet never presents an API key, so they MUST be reachable without
+    # credentials.  Do not broaden this set to unrelated routes.
+    EXEMPT_PATHS: frozenset[str] = frozenset({"/health", "/live", "/ready"})
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint

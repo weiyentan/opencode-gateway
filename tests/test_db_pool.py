@@ -166,17 +166,76 @@ class TestGetSessionDependency:
         mock_pool.release.assert_called_once_with(mock_conn)
 
     @pytest.mark.asyncio
-    async def test_get_session_raises_when_pool_is_none(self):
-        """get_session() should raise when app.state.pool is None."""
+    async def test_get_session_raises_503_when_pool_is_none(self):
+        """get_session() should raise HTTPException 503 when app.state.pool is
+        None — never the old 'NoneType' AttributeError (issue #772)."""
         from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
 
         from app.db.session import get_session
 
         request = MagicMock()
         request.app.state.pool = None
 
-        with pytest.raises(AttributeError):
+        with pytest.raises(HTTPException) as exc_info:
             await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_pool_attribute_absent(self):
+        """get_session() should raise HTTPException 503 when app.state has no
+        pool attribute at all (never AttributeError)."""
+        from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        # request.app.state.pool intentionally never set
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_pool_uninitialized(self):
+        """get_session() should raise HTTPException 503 when the registered
+        DatabasePool has no underlying asyncpg pool yet (pool.pool is None)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        mock_pool = AsyncMock()
+        mock_pool.pool = None
+        request.app.state.pool = mock_pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_acquisition_fails(self):
+        """get_session() should raise HTTPException 503 when the pool's
+        acquire() fails (PostgreSQL unreachable) — not a bare 500."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        mock_pool = AsyncMock()
+        mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        request.app.state.pool = mock_pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
 
 
 class TestLifespanIntegration:

@@ -1,0 +1,125 @@
+---
+# Kubernetes Deployment for the OpenCode Gateway API service.
+#
+# Source-of-truth probe configuration (issue #772):
+#
+#   livenessProbe  -> GET /live   (200 while the FastAPI process serves
+#                                  requests; NEVER touches PostgreSQL)
+#   readinessProbe -> GET /ready  (200 only when the Gateway has an
+#                                  initialized, usable PostgreSQL pool;
+#                                  503 otherwise — bounded 2s probe)
+#
+# Behaviour during a PostgreSQL outage:
+#   * /ready returns 503  -> kubelet marks the pod NotReady, the Service
+#     stops routing traffic to it;
+#   * /live keeps returning 200 -> kubelet does NOT restart a healthy API
+#     process solely because the database is down.  The pod recovers by
+#     itself once Postgres is reachable again (pool present at startup);
+#     a pool that was never initialized at startup requires a controlled
+#     restart (automatic reconnection is tracked separately in #773).
+#
+# If this deployment is applied from an authoritative deployment
+# repository distinct from this repo, mirror these probe paths and
+# timeout/threshold values there — they are the contract.
+#
+#   kubectl apply -f k8s/gateway-deployment.yaml
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencode-gateway
+  labels:
+    app: opencode-gateway
+    component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode-gateway
+      component: api
+  template:
+    metadata:
+      labels:
+        app: opencode-gateway
+        component: api
+    spec:
+      containers:
+        - name: opencode-gateway
+          image: ${REGISTRY}/opencode-gateway:${IMAGE_TAG}
+          command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: GATEWAY_HOST
+              value: "0.0.0.0"
+            - name: GATEWAY_PORT
+              value: "8000"
+            - name: GATEWAY_DATABASE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-host
+            - name: GATEWAY_DATABASE_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-port
+            - name: GATEWAY_DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-name
+            - name: GATEWAY_DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-user
+            - name: GATEWAY_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: database-password
+            - name: GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: gateway-api-key
+            - name: GATEWAY_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opencode-gateway-secrets
+                  key: gateway-operator-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # Liveness: /live is process-liveness ONLY — it never checks
+          # PostgreSQL, so a DB outage can never trigger a restart
+          # (issue #772). timeoutSeconds must be >= the app's bounded
+          # /ready probe timeout (2s) so kubelet never cancels a probe
+          # that is still legitimately evaluating.
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness: /ready performs a bounded (2s) PostgreSQL pool
+          # acquisition check. During a DB outage it returns 503, which
+          # marks the pod NotReady — traffic stops, the pod is NOT
+          # restarted (liveness stays green).
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      restartPolicy: Always

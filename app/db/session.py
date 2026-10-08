@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator
 
 import asyncpg
-from fastapi import Request
+from fastapi import HTTPException, Request, status
 
 from app.core.config import Settings
 
@@ -63,9 +63,30 @@ class DatabasePool:
 
 
 async def get_session(request: Request) -> AsyncIterator[asyncpg.Connection]:
-    """FastAPI dependency that yields a database connection from the pool."""
-    db_pool: DatabasePool = request.app.state.pool  # type: ignore[attr-defined]
-    conn = await db_pool.acquire()
+    """FastAPI dependency that yields a database connection from the pool.
+
+    Fails safely when PostgreSQL is unavailable (issue #772): a missing,
+    absent, or uninitialized pool — and a failed connection acquisition —
+    raise a controlled 503 Service Unavailable through the standard API
+    error envelope, instead of the former ``AttributeError``/``RuntimeError``
+    that surfaced as an unhandled 500.  The healthy path is unchanged.
+    """
+    db_pool: DatabasePool | None = getattr(request.app.state, "pool", None)
+    if db_pool is None or db_pool.pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection pool is not initialized",
+        )
+
+    try:
+        conn = await db_pool.acquire()
+    except Exception as exc:  # noqa: BLE001 — DB outage must map to 503
+        logger.warning("Database connection acquisition failed", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from exc
+
     try:
         yield conn
     finally:
