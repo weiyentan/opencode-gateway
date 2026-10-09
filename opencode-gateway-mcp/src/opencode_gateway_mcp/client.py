@@ -745,3 +745,26 @@ class GatewayClient:
                 "OpenCode Gateway returned an unexpected /api/v1/usage/agent-runs payload shape"
             )
         return payload
+
+    async def get_agent_run_detail(self, session_id: str) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/usage/agent-runs/{session_id}``.
+
+        ``session_id`` is the internal Gateway UUID (``sessions.id``), not the
+        external OpenCode ``ses_*`` identifier. The path component is URL-encoded
+        with ``quote(session_id, safe="")``. Returns the
+        ``AgentRunDetail`` payload (aggregated facts only — no raw transcript,
+        message parts, or prompts) with nullable ``parent_session_id``,
+        ``parent_internal_id``, ``child_summaries``, ``session_context``,
+        ``todo_rows``, and ``total_estimated_cost_usd`` preserved verbatim.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        encoded_id = quote(session_id, safe="")
+        path = f"/api/v1/usage/agent-runs/{encoded_id}"
+        result = await self._get_json(path)
+        if not isinstance(result, dict):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return result
