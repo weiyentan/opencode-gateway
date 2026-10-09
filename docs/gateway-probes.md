@@ -90,13 +90,18 @@ readinessProbe:
   failureThreshold: 3
 ```
 
-If the live cluster applies the Gateway Deployment from an authoritative
-deployment repository distinct from this repo, that repository's manifest
-must mirror these paths and timeout/threshold values — they are the
-contract. `timeoutSeconds` (3s) is kept above the application's internal
-2s `/ready` bound so kubelet never cancels a probe that is still
-legitimately evaluating. Do not modify CNPG / PostgreSQL operator
-resources as part of this contract.
+This manifest is the authoritative source of truth for Gateway probes in
+this repository — verified: `k8s/gateway-deployment.yaml` is the sole
+Gateway Deployment manifest in `k8s/` (no `charts/` or alternative
+manifests exist); `kubectl apply -f k8s/gateway-deployment.yaml` applies
+this exact probe configuration (`livenessProbe` → `/live`,
+`readinessProbe` → `/ready`, `timeoutSeconds: 3` > `2.0`).
+If an external deployment repository maintains a copy of this Deployment,
+that copy must keep these probe paths and timeout/threshold values
+identical — they are the contract. `timeoutSeconds` (3s) is kept above
+the application's internal 2s `/ready` bound so kubelet never cancels a
+probe that is still legitimately evaluating. Do not modify CNPG /
+PostgreSQL operator resources as part of this contract.
 
 ## Operator behaviour during a PostgreSQL outage
 

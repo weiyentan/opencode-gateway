@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     # GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS,
     # GATEWAY_RECONNECT_MAX_BACKOFF_SECONDS, GATEWAY_RECONNECT_JITTER_RATIO.
     reconnect_timeout_seconds: float = Field(default=10.0, gt=0)
-    reconnect_initial_backoff_seconds: float = Field(default=1.0, ge=0)
+    reconnect_initial_backoff_seconds: float = Field(default=1.0, gt=0)
     reconnect_max_backoff_seconds: float = Field(default=60.0, gt=0)
     reconnect_jitter_ratio: float = Field(default=0.2, ge=0, le=1)
 

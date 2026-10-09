@@ -115,12 +115,13 @@ class DatabasePool:
     async def release(self, conn: asyncpg.Connection) -> None:
         """Release a connection back to the pool.
 
-        The underlying asyncpg ``release`` is shielded against task
-        cancellation, so a connection is always returned to the pool it
-        was acquired from even when the request is cancelled mid-flight.
+        The release is wrapped in :func:`asyncio.shield`, so a connection
+        is still returned to the pool it was acquired from even when the
+        request is cancelled mid-flight — cancellation reaches the caller,
+        never the in-flight release.
         """
         if self._pool is not None:
-            await self._pool.release(conn)
+            await asyncio.shield(self._pool.release(conn))
 
     async def test_connection(self) -> None:
         """Verify the pool hands out a usable connection.

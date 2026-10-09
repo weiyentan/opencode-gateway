@@ -137,6 +137,48 @@ class TestDatabasePoolEdgeCases:
             await db_pool.close()
             await db_pool.close()  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_release_is_shielded_from_caller_cancellation(self):
+        """A cancelled caller must not abort an in-flight pool release.
+
+        The release is shielded (issue #773) so the connection is still
+        returned to the pool it was acquired from when the request is
+        cancelled mid-release.
+        """
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        release_started = asyncio.Event()
+        release_may_finish = asyncio.Event()
+        released: list[object] = []
+
+        async def _slow_release(conn):
+            release_started.set()
+            await release_may_finish.wait()
+            released.append(conn)
+
+        mock_asyncpg_pool = MagicMock(spec=["release"])
+        mock_asyncpg_pool.release = AsyncMock(side_effect=_slow_release)
+        mock_create_pool = AsyncMock(return_value=mock_asyncpg_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(Settings())
+            await db_pool.connect()
+
+        mock_conn = MagicMock()
+        task = asyncio.create_task(db_pool.release(mock_conn))
+        await release_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The shutdown of the caller must not cancel the in-flight release.
+        release_may_finish.set()
+        for _ in range(100):
+            if released:
+                break
+            await asyncio.sleep(0)
+        assert released == [mock_conn]
+
 
 class TestGetSessionDependency:
     """Tests for the get_session FastAPI dependency."""

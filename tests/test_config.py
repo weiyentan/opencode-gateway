@@ -352,14 +352,22 @@ def test_reconnect_settings_reject_invalid_values(monkeypatch, field, env, value
         Settings()
 
 
-def test_reconnect_initial_backoff_zero_allowed(monkeypatch):
-    """A zero initial backoff is allowed (retry immediately after failure)."""
+def test_reconnect_initial_backoff_must_be_positive(monkeypatch):
+    """A zero initial backoff is rejected — it would permit a busy loop (#773 AC4).
+
+    A small positive value stays valid (tests use it for fast retries).
+    """
     monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
-    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0")
+    from pydantic import ValidationError
+
     from app.core.config import Settings
 
-    settings = Settings()
-    assert settings.reconnect_initial_backoff_seconds == 0.0
+    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        Settings()
+
+    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0.1")
+    assert Settings().reconnect_initial_backoff_seconds == 0.1
 
 
 # ── AFK outcome consumer config validation (issue #458) ──────────────────

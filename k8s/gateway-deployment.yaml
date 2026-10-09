@@ -18,11 +18,15 @@
 #     automatically once PostgreSQL is reachable (startup and runtime
 #     outages, no pod restart required).
 #
-# If this deployment is applied from an authoritative deployment
-# repository distinct from this repo, mirror these probe paths and
-# timeout/threshold values there — they are the contract.
+# This manifest is the authoritative source of truth for Gateway probes
+# in this repository — verified as the sole Gateway Deployment manifest
+# in k8s/ (no charts/ or alternative manifests). Apply directly:
 #
 #   kubectl apply -f k8s/gateway-deployment.yaml
+#
+# If an external deployment repository maintains a copy of this
+# Deployment, that copy must keep these probe paths and
+# timeout/threshold values identical — they are the contract.
 #
 apiVersion: apps/v1
 kind: Deployment
