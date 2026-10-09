@@ -7,7 +7,8 @@ endpoints — ``GET /health``, ``GET /api/v1/afk/dashboard/summary``,
 ``GET /api/v1/afk-outcomes/runs/{afk_run_id}``,
 ``GET /api/v1/afk/executions/runs/{afk_run_id}``,
 ``GET /api/v1/afk-outcomes/change-requests/{provider}/{repository}/{external_number}``,
-and ``GET /api/v1/afk-outcomes/correlations`` — and no write/admin or generic
+``GET /api/v1/afk-outcomes/correlations``,
+and ``GET /api/v1/usage/agent-runs/{session_id}`` — and no write/admin or generic
 passthrough capability is exposed. No per-AFK-run model attribution is performed
 and candidates are never tie-broken.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import uuid
 from typing import Any
 
 import httpx
@@ -117,6 +119,18 @@ CORRELATIONS_TOOL_DESCRIPTION = (
     "candidates, and provenance. Supports optional reason filtering "
     "(ambiguous/unmatched) and explicit limit/offset pagination without "
     "silent crawl. Nulls are preserved and candidates are never tie-broken."
+)
+
+SESSION_DETAIL_TOOL_DESCRIPTION = (
+    "Return an individual OpenCode Agent Run detail from "
+    "GET /api/v1/usage/agent-runs/{session_id} preserving parent and child/subagent "
+    "relationships. The path param is the internal Gateway session UUID (sessions.id), "
+    "not the external OpenCode ses_* identifier — passing ses_* is rejected with a "
+    "validation error. Response preserves status/currentStatus, internal/external IDs, "
+    "session context, todo counts/rows, agent/model/project identity, usage tokens "
+    "and nullable estimated cost without inference over nulls, child_summaries and "
+    "parent_session_id/parent_internal_id nullable preservation, and aggregated facts "
+    "without raw prompts, transcripts, or message parts."
 )
 
 _VALID_PROVIDERS = frozenset({"github", "gitlab"})
@@ -588,6 +602,83 @@ class CorrelationIssuesResult(BaseModel):
     offset: int
 
 
+# ── Agent Run detail models (GET /api/v1/usage/agent-runs/{session_id}) ──
+
+
+class AgentRunTodoRow(BaseModel):
+    """One Todo Snapshot item within an agent run detail view."""
+
+    model_config = ConfigDict(extra="allow")
+
+    content: str
+    status: str
+    priority: str | None = None
+    position: int | None = None
+
+
+class AgentRunChildSummary(BaseModel):
+    """A summary of a child agent run — used in the detail view."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    external_session_id: str | None = None
+    status: str
+    currentStatus: str
+    agent: str | None = None
+    message_count: int = 0
+
+
+class AgentRunDetail(BaseModel):
+    """Full detail view for a single agent run, keyed by internal session UUID.
+
+    Mirrors ``app.core.schemas.usage.AgentRunDetail`` — aggregated facts only
+    (no raw transcript, message parts, or prompts). Timestamps stay strings so
+    the Gateway's own representation is preserved, ``None`` stays ``None``, and
+    ``extra="allow"`` keeps unknown future Gateway fields. Nullable parent,
+    child, context, todo, cost, and provider fields are preserved without
+    inference.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    external_session_id: str | None = None
+    client_id: str
+    source_database_id: str
+    title: str | None = None
+    status: str
+    currentStatus: str
+    agent: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_id: str | None = None
+    parent_session_id: str | None = None
+    parent_internal_id: str | None = None
+    child_summaries: list[AgentRunChildSummary] = []
+    todo_rows: list[AgentRunTodoRow] = []
+    todo_total: int = 0
+    todo_completed: int = 0
+    todo_blocked: int = 0
+    code_changes_total: int = 0
+    code_change_count: int = 0
+    code_change_additions: int = 0
+    code_change_deletions: int = 0
+    session_context: dict[str, Any] | None = None
+    message_count: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    primary_provider: str | None = None
+    total_estimated_cost_usd: Any | None = None
+    first_message_at: str | None = None
+    last_message_at: str | None = None
+    loki_search_url: str | None = None
+
+
 def create_server(
     config: GatewayConfig,
     *,
@@ -889,6 +980,53 @@ def create_server(
         except ValidationError:
             raise ToolError(
                 "OpenCode Gateway returned an unexpected correlations payload shape"
+            ) from None
+
+    @server.tool(description=SESSION_DETAIL_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def get_session_detail(session_id: str) -> AgentRunDetail:
+        """Return detail for one Agent Run by internal Gateway UUID.
+
+        Calls only ``GET /api/v1/usage/agent-runs/{session_id}`` where
+        ``session_id`` is the internal Gateway session UUID (``sessions.id``),
+        not the external OpenCode ``ses_*`` identifier. Validates the UUID
+        shape before issuing the Gateway request; wrong types (empty string,
+        external ``ses_*``, or non-UUID) are rejected as MCP-visible validation
+        errors without touching the Gateway. Nullable ``parent_session_id``,
+        ``parent_internal_id``, ``child_summaries``, ``session_context``,
+        ``todo_rows``, and ``total_estimated_cost_usd`` are preserved verbatim
+        without inference. Only aggregated facts are returned — no raw prompts,
+        transcripts, or message parts.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ToolError(
+                "session_id must be a non-empty string: expected internal Gateway "
+                "session UUID (sessions.id), not external ses_* identifier"
+            )
+        trimmed = session_id.strip()
+        # Reject external ses_* identifiers explicitly — they are not valid here.
+        if trimmed.startswith("ses_"):
+            raise ToolError(
+                f"Invalid session_id {trimmed!r}: expected internal Gateway session UUID, "
+                "not external ses_* identifier. Obtain the internal UUID from list_sessions "
+                "or GET /api/v1/usage/agent-runs."
+            )
+        try:
+            uuid.UUID(trimmed)
+        except ValueError:
+            raise ToolError(
+                f"Invalid session_id {trimmed!r}: expected UUID-formatted internal Gateway "
+                "session UUID (e.g. 11111111-1111-1111-1111-111111111111)"
+            ) from None
+        try:
+            payload: dict[str, Any] = await gateway.get_agent_run_detail(trimmed)
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return AgentRunDetail.model_validate(payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/usage/agent-runs/{session_id} payload shape"
             ) from None
 
     return server

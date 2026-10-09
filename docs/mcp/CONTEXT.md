@@ -312,6 +312,42 @@ Backed by:
 
 - `GET /api/v1/afk-outcomes/correlations`
 
+### 10. `get_session_detail`
+
+Purpose:
+Return an individual OpenCode Agent Run detail preserving parent and
+child/subagent relationships. Follow-on to `list_sessions` (#775): obtain the
+internal Gateway session UUID from the list, then request detail to inspect
+parents and subagents.
+
+Inputs:
+
+- `session_id` — internal Gateway session UUID (``sessions.id``), not the
+  external OpenCode ``ses_*`` identifier. The tool validates UUID shape and
+  rejects ``ses_*`` values before calling the Gateway. The path component is
+  URL-encoded with ``quote(session_id, safe="")``.
+
+Backed by:
+
+- `GET /api/v1/usage/agent-runs/{session_id}` returning ``AgentRunDetail``
+  (``app/core/schemas/usage.py``) — aggregated facts only, without raw
+  prompts, transcripts, or message parts.
+
+Response preserves ``status``/``currentStatus``, internal/external IDs,
+``session_context`` (nullable), ``todo_rows``/``todo_total``/``todo_completed``/
+``todo_blocked``, ``agent``/``model``/``project_label``/``workspace_id``,
+usage tokens (``total_input_tokens``, ``total_output_tokens``,
+``total_cache_read_tokens``, ``total_cache_write_tokens``,
+``total_reasoning_tokens``, ``primary_provider``) and nullable
+``total_estimated_cost_usd`` without inference over nulls.
+``parent_session_id`` (external) and ``parent_internal_id`` (internal UUID)
+are both preserved as nullable — a null means no parent, not an inferred value.
+``child_summaries`` preserves each child's internal UUID, external session ID,
+computed status, agent, and message count. The tool does not expose raw
+prompts/transcripts/message parts or secrets and performs no direct database
+access; Gateway 404/4xx/5xx and invalid payload shapes are surfaced as
+credential-safe MCP errors.
+
 ## Response philosophy
 
 MCP tools return structured Gateway facts, not pre-written narrative answers.
@@ -429,7 +465,7 @@ mapping to the existing Gateway API.
 ## v1 acceptance boundary
 
 v1 is successful when an MCP client can answer the accepted question catalogue using
-the nine read-only semantic tools without direct database access and without
+the ten read-only semantic tools without direct database access and without
 inventing relationships the Gateway has not exposed.
 
 When the dedicated `opencode-gateway-mcp` repository is created, copy this context
