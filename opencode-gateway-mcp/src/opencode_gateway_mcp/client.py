@@ -654,3 +654,94 @@ class GatewayClient:
             if isinstance(inner.get("items"), list):
                 return inner  # type: ignore[no-any-return]
         return payload  # type: ignore[no-any-return]
+
+    async def list_agent_runs(
+        self,
+        *,
+        client_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        agent: str | None = None,
+        external_project_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/usage/agent-runs`` with explicit filters.
+
+        The MCP tool ``list_sessions`` mirrors the Aurora Glass Agent Runs
+        list. Filters ``client_id``, ``from_date``, ``to_date``, ``agent``,
+        ``external_project_id`` (the stable project identity, not a
+        repository string), and ``status`` (``running``/``stale``/
+        ``completed``/``blocked``/``unknown`` — the Gateway-computed activity
+        heuristic, not a proven live OS/tmux process) are forwarded verbatim.
+        ``limit`` (1–1000) and ``offset`` (>=0) are explicit pagination
+        without silent crawling. Only one page is fetched; null/unavailable
+        values are preserved without coercion. No ``repository`` filter is
+        supported — use ``external_project_id``.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        url = f"{self._config.base_url}/api/v1/usage/agent-runs"
+        params: dict[str, str] = {}
+        if client_id is not None:
+            params["client_id"] = client_id
+        if from_date is not None:
+            params["from_date"] = from_date
+        if to_date is not None:
+            params["to_date"] = to_date
+        if agent is not None:
+            params["agent"] = agent
+        if external_project_id is not None:
+            params["external_project_id"] = external_project_id
+        if status is not None:
+            params["status"] = status
+        if limit is not None:
+            params["limit"] = str(limit)
+        if offset is not None:
+            params["offset"] = str(offset)
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(
+                    url, params=params, headers=self._headers(), timeout=self._timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
+                    response = await http_client.get(
+                        url, params=params, headers=self._headers(), timeout=self._timeout
+                    )
+        except httpx.HTTPError as exc:
+            raise GatewayConnectionError(
+                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
+                f"({type(exc).__name__})"
+            ) from None
+        if response.status_code >= 400:
+            raise GatewayHTTPError(
+                "/api/v1/usage/agent-runs",
+                response.status_code,
+                response.reason_phrase,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GatewayResponseError(
+                "OpenCode Gateway returned a non-JSON /api/v1/usage/agent-runs response"
+            ) from None
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an error envelope for /api/v1/usage/agent-runs"
+            )
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and isinstance(payload.get("data"), dict)
+        ):
+            inner = payload["data"]
+            if isinstance(inner.get("items"), list):
+                payload = inner
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise GatewayResponseError(
+                "OpenCode Gateway returned an unexpected /api/v1/usage/agent-runs payload shape"
+            )
+        return payload

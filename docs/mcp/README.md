@@ -8,7 +8,7 @@ rules, and non-goals live in [CONTEXT.md](CONTEXT.md).
 
 ## Available tools (v1)
 
-The published container ships exactly the nine approved read-only tools. Each tool
+The published container ships exactly the ten approved read-only tools. Each tool
 calls only its documented Gateway GET endpoint via the authenticated HTTP client
 (`OPENCODE_GATEWAY_URL` + `OPENCODE_GATEWAY_API_KEY`):
 
@@ -23,10 +23,21 @@ calls only its documented Gateway GET endpoint via the authenticated HTTP client
 | `list_change_requests` | `GET /api/v1/afk-outcomes/change-requests` |
 | `get_change_request_story` | `GET /api/v1/afk-outcomes/change-requests/{provider}/{repository}/{external_number}` |
 | `get_correlation_issues` | `GET /api/v1/afk-outcomes/correlations` |
+| `list_sessions` | `GET /api/v1/usage/agent-runs` |
 
 No write/admin, reconcile, ingest, provisioning, generic passthrough, silent crawling,
 or direct Postgres/Kafka/AWX/collector access is exposed. See [CONTEXT.md](CONTEXT.md)
 for input shapes, UTC/pagination/null-preservation rules, and parked gaps.
+
+`list_sessions` returns the same paginated Agent Run list used by Aurora Glass —
+including internal/external session IDs, title, computed status, agent, project,
+model, activity timestamps, token counts, cost, and child counts — with explicit
+`limit` (1–1000, default 50) / `offset` (>=0) pagination and no silent crawling.
+Status is the Gateway-computed activity heuristic (`running`/`stale`/`completed`/
+`blocked`/`unknown` derived from `last_message_at`, `message_count` and
+`parent_session_id` against quiet/stale/unknown thresholds), not a proven live
+OS/tmux process probe; a `running` result must not be treated as a confirmed
+live process. No `repository` filter exists — use `external_project_id`.
 
 ## Image name
 
@@ -136,14 +147,14 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 - Multi-stage build (`python:3.12-slim` builder → runtime), lean venv, no build tools in runtime.
 - Runs as non-root user `mcp` (`USER mcp`).
 - No Postgres/Kafka/AWX/collector code or dependencies are included.
-- Supports ADR 0031 (as amended v1.1): read-only HTTP adapter with exactly the nine v1 tools above; tool results are structured Gateway facts passed through without reinterpretation or invented correlation.
+- Supports ADR 0031 (as amended v1.1): read-only HTTP adapter with exactly the ten v1 tools above; tool results are structured Gateway facts passed through without reinterpretation or invented correlation.
 - Build logs never contain `OPENCODE_GATEWAY_API_KEY`; runtime logs never echo it; tool results and errors never expose the key.
 
 ## CI publishing flow
 
 `mcp-publish.yml` runs `validate` (ruff + forbidden-import check) before `build-and-smoke`.
 The image is built with `load: true` to a smoke tag, smoke-tested (fail-closed + success with env,
-MCP smoke proves the completed server exposes exactly the nine v1 tools, no secret in logs), and
+MCP smoke proves the completed server exposes exactly the ten v1 tools, no secret in logs), and
 only then rebuilt and pushed to GHCR with the immutable+branch/release tags. Pull-request builds
 are validated and smoke-tested but never pushed.
 

@@ -312,6 +312,52 @@ Backed by:
 
 - `GET /api/v1/afk-outcomes/correlations`
 
+### 10. `list_sessions`
+
+Purpose:
+List live and historical OpenCode agent sessions — the same paginated Agent Run
+list used by Aurora Glass. Answers "which sessions are running or recently ran,
+and what did they do" without claiming a proven live OS/tmux process probe.
+
+Inputs:
+
+- optional `client_id` (UUID string)
+- optional `from_date` (ISO-8601 — filter sessions last active on or after this date)
+- optional `to_date` (ISO-8601 — filter sessions last active on or before this date)
+- optional `agent` (exact match)
+- optional `external_project_id` (exact match on `project_id` — the stable project
+  identity, not a repository string; no `repository` filter exists)
+- optional `status` = `running` / `stale` / `completed` / `blocked` / `unknown`
+- `limit` = 1–1000 (default 50)
+- `offset` >= 0
+
+Backed by:
+
+- `GET /api/v1/usage/agent-runs`
+
+Each row preserves internal Gateway UUID `id`, external `ses_*` ID, title, computed
+`status`/`currentStatus`, agent, `project_id`/`project_label`/`workspace_id`,
+`model` (from Session Context, may be null), `last_updated_at`, `child_run_count`,
+token fields (`total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`,
+`total_cache_write_tokens`, `total_reasoning_tokens`), `message_count`,
+`total_estimated_cost_usd` (nullable), and todo/code-change summaries. Pagination
+and nulls are preserved as the Gateway reports them; no silent crawling is
+performed.
+
+**Status is computed, not proven.** `status` / `currentStatus` is the
+Gateway-computed activity heuristic derived on read from `last_message_at`,
+`message_count`, and `parent_session_id` against configurable quiet (15 min),
+stale (2 h), and unknown (48 h) thresholds — not a proven live OS or tmux
+process check. In order: `unknown` when no messages / no `last_message_at`;
+`running` when `age < quiet`; `completed` when `quiet ≤ age < stale` and no
+parent; `blocked` when `quiet ≤ age < stale` and has parent; `stale` when
+`stale ≤ age < unknown` (observability gap, not a known termination); `unknown`
+when `age ≥ unknown`. Boundaries are strict (exactly at a threshold falls to the
+next bucket). A `running` result therefore means "recent Gateway activity within
+the quiet window", not "a confirmed live process"; a `stale` result is not a
+terminal failure. Callers that need proven liveness must use a Runner VM
+process probe, not this list.
+
 ## Response philosophy
 
 MCP tools return structured Gateway facts, not pre-written narrative answers.
@@ -429,7 +475,7 @@ mapping to the existing Gateway API.
 ## v1 acceptance boundary
 
 v1 is successful when an MCP client can answer the accepted question catalogue using
-the nine read-only semantic tools without direct database access and without
+the ten read-only semantic tools without direct database access and without
 inventing relationships the Gateway has not exposed.
 
 When the dedicated `opencode-gateway-mcp` repository is created, copy this context

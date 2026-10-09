@@ -503,5 +503,58 @@
     ],
     "sentinel_paths": [["items", 0, "reason"], ["total"]],
     "null_paths": [["items", 1, "afk_run_id"]]
+  },
+  "list_sessions": {
+    "arguments": {},
+    "responses": [
+      {
+        "path": "/api/v1/usage/agent-runs",
+        "body": {
+          "status": "ok",
+          "data": {
+            "items": [
+              {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "external_session_id": "ses_abc123456789",
+                "client_id": "22222222-2222-2222-2222-222222222222",
+                "source_database_id": "33333333-3333-3333-3333-333333333333",
+                "title": "coder — ses_abc123456",
+                "status": "running",
+                "currentStatus": "running",
+                "agent": "coder",
+                "project_id": "proj-123",
+                "project_label": "acme/proj",
+                "workspace_id": "ws-1",
+                "todo_total": 5,
+                "todo_completed": 3,
+                "todo_blocked": 0,
+                "code_changes_total": 2,
+                "code_change_count": 2,
+                "code_change_additions": 10,
+                "code_change_deletions": 2,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "total_cached_tokens": 10,
+                "total_cache_read_tokens": 200,
+                "total_cache_write_tokens": 100,
+                "total_reasoning_tokens": 5,
+                "primary_provider": "anthropic",
+                "total_estimated_cost_usd": "1.23",
+                "message_count": 10,
+                "last_updated_at": "2026-09-01T10:00:00Z",
+                "child_run_count": 1,
+                "session_title": "Fix issue #42",
+                "model": "claude-sonnet-4-20250514"
+              }
+            ],
+            "total": 1,
+            "limit": 50,
+            "offset": 0
+          }
+        }
+      }
+    ],
+    "sentinel_paths": [["items", 0, "id"], ["total"]],
+    "null_paths": []
   }
 }
