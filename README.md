@@ -239,7 +239,7 @@ Key configuration variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GATEWAY_ENV` | `production` | `production` (API key required) or `development` (no key needed locally) |
-| `GATEWAY_API_KEY` | *(empty)* | **Admin API Key** — master bearer token protecting all non-`/health` routes (`Authorization: Bearer <key>`) |
+| `GATEWAY_API_KEY` | *(empty)* | **Admin API Key** — master bearer token protecting all non-`/health`, `/live`, `/ready` routes (`Authorization: Bearer <key>`) |
 | `GATEWAY_ALLOW_INSECURE_AUTH` | `false` | Explicit insecure-auth opt-in for production (loud warning) |
 | `GATEWAY_HOST` | `0.0.0.0` | Server bind address |
 | `GATEWAY_PORT` | `8000` | Server port |
@@ -290,10 +290,20 @@ Key configuration variables:
 | `GATEWAY_RETENTION_AFK_PAYLOAD_DAYS` | `90` | Retention tier (ADR 0022): redacted payload storage; min 0 (`0` = never swept) |
 | `GATEWAY_RETENTION_DLQ_MAX_AGE_DAYS` | `30` | Retention tier (ADR 0022): DLQ operational max — records strictly older than this on `engineering.events.normalized.dlq` are escalated by the DLQ sweep (`--dlq-sweep`) to `engineering.events.normalized.dlq-expired`; min 0 (`0` = never swept) |
 | `GATEWAY_ACTIVE_TOKENS_DEPRECATION_SUNSET` | `2026-11-20T00:00:00+00:00` | Sunset instant for the deprecated `active_tokens` field (`input + output`). While the current server instant is strictly before this instant, every usage query response carries `Deprecation: active_tokens; sunset=<ISO-8601>`. Set a past date to end the 90-day window (header stops being emitted) |
+| `GATEWAY_RECONNECT_TIMEOUT_SECONDS` | `10.0` | Per-attempt timeout (seconds) for supervised database reconnect — bounds each connect and connection-test attempt (issue #773) |
+| `GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS` | `1.0` | Initial backoff (seconds) for supervised reconnect retries; doubles each attempt until the cap |
+| `GATEWAY_RECONNECT_MAX_BACKOFF_SECONDS` | `60.0` | Cap (seconds) for reconnect backoff; a sustained outage keeps retrying at this bounded rate |
+| `GATEWAY_RECONNECT_JITTER_RATIO` | `0.2` | Jitter ratio applied to reconnect backoff (`± ratio`, capped at the max) |
 
 > **Note:** The Gateway supports **graceful degradation** — if PostgreSQL is
-> unreachable at startup, the app still starts and the health endpoint
-> returns `"database": "disconnected"` instead of crashing.
+> unreachable at startup, the app still starts with `GET /live` `200`,
+> `GET /ready` `503`, and `GET /health` `"database": "disconnected"` instead of
+> crashing. Database-backed APIs return structured `503 SERVICE_UNAVAILABLE`
+> (not `500`). The pool is supervised with bounded reconnect — connectivity is
+> retried in the background with capped exponential backoff and jitter, and the
+> Gateway becomes ready automatically once PostgreSQL is reachable again (no pod
+> restart). See [Gateway Probe Contracts](docs/gateway-probes.md) for probe
+> semantics and operator behaviour.
 
 > **Observability:** The Gateway emits structured timing log events —
 > `request.completed` (per-request wall-clock duration, status code,
@@ -354,8 +364,8 @@ proxy at `http://localhost:8080/docs`.
 
 > **A note on environments:** with `GATEWAY_ENV=development` no API key is
 > required (local convenience). In `production`, `GATEWAY_API_KEY` is
-> mandatory and every non-`/health` route rejects requests without
-> `Authorization: Bearer <api-key>`.
+> mandatory and every non-`/health`, `/live`, `/ready` route rejects requests without
+> `Authorization: Bearer <api-key>` (probes are exempt — see [Gateway Probe Contracts](docs/gateway-probes.md)).
 
 **Dashboard:** When running with Docker Compose (see below), open
 [http://localhost:8080/](http://localhost:8080/) in a browser to view the
@@ -405,7 +415,7 @@ never shared across pipelines (ADR 0022, CONTEXT.md):
 
 | Credential | Env / store | Transport | Gates |
 |------------|-------------|-----------|-------|
-| **Admin API Key** | `GATEWAY_API_KEY` | `Authorization: Bearer <key>` | **Every** non-`/health` route, via `ApiKeyMiddleware` (layer 1 of Two-Layer Auth) |
+| **Admin API Key** | `GATEWAY_API_KEY` | `Authorization: Bearer <key>` | **Every** non-`/health`, `/live`, `/ready` route, via `ApiKeyMiddleware` (layer 1 of Two-Layer Auth) |
 | **Collector / integration credential** | `collector_credentials` rows (SHA-256 `token_hash`), owned by an OpenCode Client | Preferred: `X-Collector-Token: <token>`; legacy fallback: `Authorization: Bearer <token>` when the dedicated header is absent | The `/ingest` and `/cursor` collector paths, the reporting-ingest write path, and write paths requiring a client identity — via `require_collector_token` (layer 2) |
 | **Operator Token** | `GATEWAY_OPERATOR_TOKEN` | `X-Operator-Token` header (never `Authorization`) | Operator-only read surfaces: `GET /api/v1/reporting/resources`, `/resources/detail`, `/session-links`, via `require_operator_token`. Fails closed when unset |
 
@@ -454,15 +464,17 @@ Client and credential administration happens through the admin API below
 All responses use the `{status, data, error}` envelope. Success responses
 are `{"status": "ok", "data": ...}`; errors are
 `{"status": "error", "error": {"code": ..., "message": ...}}`. Every route
-except `/health` is protected by the Admin API Key; the write and
+except `/health`, `/live`, and `/ready` is protected by the Admin API Key; the write and
 operator-only routes add the gates described under
 [Authentication](#authentication).
 
-### Health
+### Health and Probes
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Application health check. Returns `status`, `version`, `database` connectivity, collector status (healthy/stale/unknown — one client-level row per remote-collector client, i.e. clients whose registered name begins with `remote-collector`; liveness and record totals aggregated across the client's collector credentials and watched source databases), source-database health, and last-ingest timestamp. Exempt from API-key auth. Graceful — always returns 200 even if the database is down. |
+| `GET` | `/live` | Kubernetes **liveness** probe — `200 {"status":"ok","data":{"alive":true}}` while the FastAPI process can serve requests; never touches PostgreSQL, so a database outage never restarts a healthy pod. Exempt from API-key auth. See [Gateway Probe Contracts](docs/gateway-probes.md). |
+| `GET` | `/ready` | Kubernetes **readiness** probe — `200` only when the pool is initialized and a bounded `SELECT 1` succeeds within `READY_PROBE_TIMEOUT_SECONDS` (2.0s); `503 SERVICE_UNAVAILABLE` otherwise (missing/uninitialized pool, failed acquisition, or probe timeout) through the standard error envelope. Exempt from API-key auth. The pod becomes `NotReady` without restarting while reconnecting. See [Gateway Probe Contracts](docs/gateway-probes.md). |
+| `GET` | `/health` | Application health check. Returns `status`, `version`, `database` connectivity, collector status (healthy/stale/unknown — one client-level row per remote-collector client, i.e. clients whose registered name begins with `remote-collector`; liveness and record totals aggregated across the client's collector credentials and watched source databases), source-database health, and last-ingest timestamp. Exempt from API-key auth. Graceful — always returns 200 even if the database is down. Not used as a Kubernetes probe. |
 
 ### Admin — Client Registry
 
@@ -823,7 +835,7 @@ opencode-gateway/
 │   ├── main.py                   # Production entry point (uvicorn)
 │   ├── api/
 │   │   ├── __init__.py
-│   │   ├── health.py             # GET /health endpoint
+│   │   ├── health.py             # GET /health, /live and /ready endpoints
 │   │   ├── admin_clients.py      # Admin CRUD for clients + tokens
 │   │   ├── admin_quarantines.py  # GET /admin/quarantined-identities
 │   │   ├── admin_reconcile.py    # POST /admin/reconcile-historical-duplicates
@@ -936,6 +948,7 @@ opencode-gateway/
 | Document | Purpose |
 |----------|---------|
 | [CONTEXT.md](CONTEXT.md) | Canonical domain vocabulary for the observability + AFK lifecycle-recording service |
+| [docs/gateway-probes.md](docs/gateway-probes.md) | Kubernetes liveness/readiness probe contracts, `503` failure mode, and supervised reconnect operator behaviour (issues #772/#773) |
 | [docs/adr/](docs/adr/) | Architecture Decision Records — persistence, correlation, and schema semantics |
 | [docs/afk-outcome-validation.md](docs/afk-outcome-validation.md) | AFK reconstruction validation findings |
 | [docs/afk-outcome-contract-validation.md](docs/afk-outcome-contract-validation.md) | AFK outcome contract validation |

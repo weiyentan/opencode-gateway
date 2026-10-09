@@ -9,14 +9,14 @@
 #                                  initialized, usable PostgreSQL pool;
 #                                  503 otherwise — bounded 2s probe)
 #
-# Behaviour during a PostgreSQL outage:
+# Behaviour during a PostgreSQL outage (issues #772/#773):
 #   * /ready returns 503  -> kubelet marks the pod NotReady, the Service
 #     stops routing traffic to it;
 #   * /live keeps returning 200 -> kubelet does NOT restart a healthy API
-#     process solely because the database is down.  The pod recovers by
-#     itself once Postgres is reachable again (pool present at startup);
-#     a pool that was never initialized at startup requires a controlled
-#     restart (automatic reconnection is tracked separately in #773).
+#     process solely because the database is down.  The Gateway supervises
+#     its pool — it retries with capped backoff and becomes Ready again
+#     automatically once PostgreSQL is reachable (startup and runtime
+#     outages, no pod restart required).
 #
 # If this deployment is applied from an authoritative deployment
 # repository distinct from this repo, mirror these probe paths and
