@@ -300,6 +300,76 @@ def test_existing_pool_settings_unchanged(monkeypatch):
     assert settings.database_connection_timeout == 30
 
 
+# ── Database reconnect supervision (issue #773) ───────────────────────────
+
+
+def test_reconnect_setting_defaults(monkeypatch):
+    """Reconnect supervision settings have sane bounded defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.reconnect_timeout_seconds == 10.0
+    assert settings.reconnect_initial_backoff_seconds == 1.0
+    assert settings.reconnect_max_backoff_seconds == 60.0
+    assert settings.reconnect_jitter_ratio == 0.2
+
+
+def test_reconnect_settings_override_from_env(monkeypatch):
+    """GATEWAY_RECONNECT_* env vars override the reconnect defaults."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv("GATEWAY_RECONNECT_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0.5")
+    monkeypatch.setenv("GATEWAY_RECONNECT_MAX_BACKOFF_SECONDS", "30")
+    monkeypatch.setenv("GATEWAY_RECONNECT_JITTER_RATIO", "0.1")
+    from app.core.config import Settings
+
+    settings = Settings()
+    assert settings.reconnect_timeout_seconds == 5.0
+    assert settings.reconnect_initial_backoff_seconds == 0.5
+    assert settings.reconnect_max_backoff_seconds == 30.0
+    assert settings.reconnect_jitter_ratio == 0.1
+
+
+@pytest.mark.parametrize(
+    "field, env, value",
+    [
+        ("reconnect_timeout_seconds", "GATEWAY_RECONNECT_TIMEOUT_SECONDS", "0"),
+        ("reconnect_max_backoff_seconds", "GATEWAY_RECONNECT_MAX_BACKOFF_SECONDS", "0"),
+        ("reconnect_jitter_ratio", "GATEWAY_RECONNECT_JITTER_RATIO", "1.5"),
+        ("reconnect_jitter_ratio", "GATEWAY_RECONNECT_JITTER_RATIO", "-0.1"),
+    ],
+)
+def test_reconnect_settings_reject_invalid_values(monkeypatch, field, env, value):
+    """Non-positive timeouts/backoff caps and out-of-range jitter are rejected."""
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    monkeypatch.setenv(env, value)
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_reconnect_initial_backoff_must_be_positive(monkeypatch):
+    """A zero initial backoff is rejected — it would permit a busy loop (#773 AC4).
+
+    A small positive value stays valid (tests use it for fast retries).
+    """
+    monkeypatch.setenv("GATEWAY_API_KEY", "test-key")
+    from pydantic import ValidationError
+
+    from app.core.config import Settings
+
+    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        Settings()
+
+    monkeypatch.setenv("GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS", "0.1")
+    assert Settings().reconnect_initial_backoff_seconds == 0.1
+
+
 # ── AFK outcome consumer config validation (issue #458) ──────────────────
 
 

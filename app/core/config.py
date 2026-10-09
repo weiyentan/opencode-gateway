@@ -80,6 +80,24 @@ class Settings(BaseSettings):
     database_max_inactive_connection_lifetime: int = 1800
     database_ssl: str | None = None
 
+    # Database reconnect supervision (issue #773).  The Gateway supervises
+    # its PostgreSQL pool: a failed startup connect is not permanent, and
+    # post-startup acquisition failures trigger exactly one supervised
+    # reconnect cycle (single-flight, never one task per request).  Each
+    # connect/verify attempt is bounded by ``reconnect_timeout_seconds``;
+    # retries use capped exponential backoff — doubling from
+    # ``reconnect_initial_backoff_seconds`` up to
+    # ``reconnect_max_backoff_seconds`` — scaled by uniform jitter in
+    # ``[1 - reconnect_jitter_ratio, 1 + reconnect_jitter_ratio]`` so a
+    # sustained outage can never busy-loop or log without bound.  Maps to
+    # GATEWAY_RECONNECT_TIMEOUT_SECONDS,
+    # GATEWAY_RECONNECT_INITIAL_BACKOFF_SECONDS,
+    # GATEWAY_RECONNECT_MAX_BACKOFF_SECONDS, GATEWAY_RECONNECT_JITTER_RATIO.
+    reconnect_timeout_seconds: float = Field(default=10.0, gt=0)
+    reconnect_initial_backoff_seconds: float = Field(default=1.0, gt=0)
+    reconnect_max_backoff_seconds: float = Field(default=60.0, gt=0)
+    reconnect_jitter_ratio: float = Field(default=0.2, ge=0, le=1)
+
     # Timeout budgets (seconds) for layered request processing
     #   database: per-query timeout via asyncio.timeout
     #   status_computation: _compute_status timeout
