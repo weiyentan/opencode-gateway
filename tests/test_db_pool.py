@@ -231,11 +231,15 @@ class TestGetSessionDependency:
         request = MagicMock()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        # The single-flight unavailable signal is synchronous on the real
+        # DatabasePool; the mock mirrors the interface without a coroutine.
+        mock_pool.notify_unavailable = MagicMock()
         request.app.state.pool = mock_pool
 
         with pytest.raises(HTTPException) as exc_info:
             await get_session(request).__anext__()
         assert exc_info.value.status_code == 503
+        mock_pool.notify_unavailable.assert_called_once()
 
 
 class TestLifespanIntegration:
@@ -243,15 +247,30 @@ class TestLifespanIntegration:
 
     @staticmethod
     def _make_acquirable_pool() -> AsyncMock:
-        """Return a mock asyncpg.Pool whose acquire() supports async with."""
+        """Return a mock asyncpg.Pool whose acquire() mirrors the real API:
+        awaitable (``conn = await pool.acquire()``) AND an async context
+        manager (``async with pool.acquire() as conn``) — like asyncpg's
+        ``PoolAcquireContext`` (required by the issue #773 supervisor's
+        candidate connection test and ``check_required_tables``)."""
         mock_conn = AsyncMock()
-        mock_ctx = MagicMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        class _AcquireResult:
+            def __await__(self):
+                async def _get() -> AsyncMock:
+                    return mock_conn
+
+                return _get().__await__()
+
+            async def __aenter__(self) -> AsyncMock:
+                return mock_conn
+
+            async def __aexit__(self, *exc_info) -> None:
+                return None
 
         mock_pool = AsyncMock()
         # acquire() is NOT a coroutine — it returns an async context manager
-        mock_pool.acquire = MagicMock(return_value=mock_ctx)
+        # that is also directly awaitable
+        mock_pool.acquire = MagicMock(return_value=_AcquireResult())
         return mock_pool
 
     @pytest.mark.asyncio

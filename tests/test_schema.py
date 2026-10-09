@@ -31,7 +31,8 @@ class TestSchemaLifespanIntegration:
 
     @pytest.mark.asyncio
     async def test_schema_sourced_on_startup(self):
-        """The factory lifespan should call ensure_schema() after pool connection."""
+        """The factory lifespan's pool supervisor (issue #773) should call
+        ensure_schema() before publishing the pool."""
         from app.core.factory import create_app
 
         mock_asyncpg_pool = AsyncMock()
@@ -39,7 +40,9 @@ class TestSchemaLifespanIntegration:
 
         with patch(
             "app.db.session.asyncpg.create_pool", mock_create_pool
-        ), patch("app.core.factory.ensure_schema") as mock_ensure:
+        ), patch(
+            "app.db.session.ensure_schema", new=AsyncMock()
+        ) as mock_ensure:
             app = create_app()
             async with app.router.lifespan_context(app):
                 pass

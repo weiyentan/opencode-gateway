@@ -62,6 +62,9 @@ def client_broken_db():
     """Return an httpx AsyncClient against an app with a pool whose acquire raises."""
     mock_pool = AsyncMock()
     mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+    # Mirror the synchronous DatabasePool.notify_unavailable() interface
+    # (issue #773) so the failure path does not create an unawaited coroutine.
+    mock_pool.notify_unavailable = MagicMock()
     app = create_app()
     app.state.pool = mock_pool
     transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -271,6 +274,7 @@ class TestReadyProbe:
         app = create_app()
         mock_pool = AsyncMock()
         mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        mock_pool.notify_unavailable = MagicMock()
         app.state.pool = mock_pool  # type: ignore[attr-defined]
 
         async with _client(app) as client:
@@ -288,6 +292,7 @@ class TestReadyProbe:
         )
         app = create_app()
         mock_pool = AsyncMock()
+        mock_pool.notify_unavailable = MagicMock()
 
         async def _hang() -> None:
             await asyncio.sleep(10)

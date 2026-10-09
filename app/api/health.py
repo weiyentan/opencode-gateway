@@ -303,6 +303,9 @@ async def health(request: Request) -> HealthResponse:
         db_status = "connected"
     except Exception:
         logger.warning("Health endpoint: database acquire failed", exc_info=True)
+        # Single-flight reconnect trigger (issue #773): the supervisor
+        # performs one reconnect cycle; never one task per request.
+        db_pool.notify_unavailable()
         return HealthResponse(version=_get_version(), database="disconnected")
 
     # Enrich with collector / source-database health when connected
@@ -369,12 +372,17 @@ async def ready(request: Request) -> dict[str, bool]:
         await asyncio.wait_for(_probe(), timeout=READY_PROBE_TIMEOUT_SECONDS)
     except (asyncio.TimeoutError, TimeoutError):  # noqa: UP041 — py39 backport compat
         logger.warning("Ready probe: timed out after %.1fs", READY_PROBE_TIMEOUT_SECONDS)
+        # Single-flight reconnect trigger (issue #773): a probe failure is a
+        # prompt unavailability signal; the supervisor runs one reconnect
+        # cycle instead of one task per probe/request.
+        db_pool.notify_unavailable()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database readiness probe timed out",
         ) from None
     except Exception as exc:  # noqa: BLE001 — any probe failure means not ready
         logger.warning("Ready probe: database acquisition failed", exc_info=exc)
+        db_pool.notify_unavailable()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database is unavailable",
