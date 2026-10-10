@@ -3,7 +3,8 @@
 The adapter is deliberately read-only: it calls only published Gateway GET
 endpoints — ``GET /health``, ``GET /api/v1/afk/dashboard/summary``,
 ``GET /api/v1/afk-outcomes/runs``, ``GET /api/v1/afk-outcomes/change-requests``,
-``GET /api/v1/usage/aggregates``,
+``GET /api/v1/usage/aggregates``, ``GET /api/v1/usage/agent-runs``,
+``GET /api/v1/usage/agent-runs/{session_id}``,
 ``GET /api/v1/afk-outcomes/runs/{afk_run_id}``,
 ``GET /api/v1/afk/executions/runs/{afk_run_id}``,
 ``GET /api/v1/afk-outcomes/change-requests/{provider}/{repository}/{external_number}``,
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import uuid
 from typing import Any
 
 import httpx
@@ -119,8 +121,41 @@ CORRELATIONS_TOOL_DESCRIPTION = (
     "silent crawl. Nulls are preserved and candidates are never tie-broken."
 )
 
+LIST_SESSIONS_TOOL_DESCRIPTION = (
+    "List live and historical OpenCode agent sessions via "
+    "GET /api/v1/usage/agent-runs — the same paginated Agent Run list used by "
+    "Aurora Glass. Supports filters client_id, from_date, to_date, agent, "
+    "external_project_id, status (running/stale/completed/blocked/unknown), "
+    "and explicit limit (1–1000, default 50) / offset (>=0) pagination without "
+    "silent crawling. Status is the Gateway-computed activity heuristic "
+    "(quiet/stale/unknown thresholds, not a proven live OS/tmux process check): "
+    "running means recent activity within the quiet window, stale means an "
+    "observability gap beyond the stale threshold, completed/blocked means "
+    "recent quiet with/without a parent, and unknown means no messages or "
+    "beyond the unknown threshold — it must not be treated as a proven live "
+    "process probe. Session IDs, models, activity timestamps, token fields and "
+    "nullable cost survive serialization without alteration; pagination and "
+    "nulls are preserved as the Gateway reports them. No repository filter is "
+    "supported — use external_project_id."
+)
+
+SESSION_DETAIL_TOOL_DESCRIPTION = (
+    "Return an individual OpenCode Agent Run detail from "
+    "GET /api/v1/usage/agent-runs/{session_id} preserving parent and child/subagent "
+    "relationships. The path param is the internal Gateway session UUID (sessions.id), "
+    "not the external OpenCode ses_* identifier — passing ses_* is rejected with a "
+    "validation error. Response preserves status/currentStatus, internal/external IDs, "
+    "session context, todo counts/rows, agent/model/project identity, usage tokens "
+    "and nullable estimated cost without inference over nulls, child_summaries and "
+    "parent_session_id/parent_internal_id nullable preservation, and aggregated facts "
+    "without raw prompts, transcripts, or message parts."
+)
+
 _VALID_PROVIDERS = frozenset({"github", "gitlab"})
 _VALID_PROVIDER_STATES = frozenset({"open", "closed", "merged"})
+_VALID_AGENT_RUN_STATUSES = frozenset(
+    {"running", "stale", "completed", "blocked", "unknown"}
+)
 
 
 class CollectorHealth(BaseModel):
@@ -588,6 +623,181 @@ class CorrelationIssuesResult(BaseModel):
     offset: int
 
 
+# ── Agent Run list models (GET /api/v1/usage/agent-runs) ─────────────────
+
+
+class AgentRunSummary(BaseModel):
+    """One Agent Run Summary row preserving Gateway facts verbatim.
+
+    Mirrors ``GET /api/v1/usage/agent-runs`` / ``app.core.schemas.usage.AgentRunSummary``
+    but preserves the Gateway's own string representation for IDs and timestamps
+    (UUIDs and datetimes arrive as strings), keeps ``None`` as ``None``, and
+    allows unknown future fields via ``extra="allow"``. ``status`` /
+    ``currentStatus`` is the Gateway-computed activity heuristic — a quiet /
+    stale / unknown threshold derivation from ``last_message_at``, ``message_count``
+    and ``parent_session_id`` — not a proven live OS/tmux process probe.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    external_session_id: str | None = None
+    client_id: str | None = None
+    source_database_id: str | None = None
+    title: str | None = None
+    status: str
+    currentStatus: str
+    agent: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_id: str | None = None
+    todo_total: int = 0
+    todo_completed: int = 0
+    todo_blocked: int = 0
+    code_changes_total: int = 0
+    code_change_count: int = 0
+    code_change_additions: int = 0
+    code_change_deletions: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    primary_provider: str | None = None
+    total_estimated_cost_usd: Any | None = None
+    message_count: int = 0
+    last_updated_at: str | None = None
+    child_run_count: int = 0
+    session_title: str | None = None
+    model: str | None = None
+
+
+class AgentRunTodoRow(BaseModel):
+    """One Todo Snapshot item within an agent run detail view.
+
+    Explicit allowlist: ``extra="ignore"`` drops any other Gateway key so
+    unknown/sensitive fields are never forwarded through the MCP surface.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    content: str
+    status: str
+    priority: str | None = None
+    position: int | None = None
+
+
+class AgentRunChildSummary(BaseModel):
+    """A summary of a child agent run — used in the detail view.
+
+    Explicit allowlist: ``extra="ignore"`` drops any other Gateway key so
+    unknown/sensitive fields are never forwarded through the MCP surface.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    external_session_id: str | None = None
+    status: str
+    currentStatus: str
+    agent: str | None = None
+    message_count: int = 0
+
+
+class AgentRunSessionContext(BaseModel):
+    """Allowlisted Session Context sub-fields for an agent run detail view.
+
+    The Gateway builds this block from ``opencode_session_contexts`` for
+    ``GET /api/v1/usage/agent-runs/{session_id}`` with exactly these keys
+    (``app/api/usage.py``). ``extra="ignore"`` drops every other key —
+    including prompt, transcript, message_parts, extra_vars, or any future
+    unknown field — so only vetted facts reach the MCP caller.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_model: str | None = None
+    title: str | None = None
+    source_directory: str | None = None
+    source_path: str | None = None
+    code_change_additions: int | None = None
+    code_change_deletions: int | None = None
+
+
+class AgentRunDetail(BaseModel):
+    """Full detail view for a single agent run, keyed by internal session UUID.
+
+    Mirrors ``app.core.schemas.usage.AgentRunDetail`` — aggregated facts only
+    (no raw transcript, message parts, or prompts). Timestamps stay strings so
+    the Gateway's own representation is preserved and ``None`` stays ``None``.
+    The model is an explicit allowlist: ``extra="ignore"`` drops unknown or
+    sensitive Gateway keys at every nesting level (a hostile ``prompt``,
+    ``transcript``, ``message_parts``, or ``extra_vars`` never passes through),
+    ``session_context`` only carries its allowlisted sub-fields, and nullable
+    parent, child, context, todo, cost, and provider fields are preserved
+    without inference.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    external_session_id: str | None = None
+    client_id: str
+    source_database_id: str
+    title: str | None = None
+    status: str
+    currentStatus: str
+    agent: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_id: str | None = None
+    parent_session_id: str | None = None
+    parent_internal_id: str | None = None
+    child_summaries: list[AgentRunChildSummary] = []
+    todo_rows: list[AgentRunTodoRow] = []
+    todo_total: int = 0
+    todo_completed: int = 0
+    todo_blocked: int = 0
+    code_changes_total: int = 0
+    code_change_count: int = 0
+    code_change_additions: int = 0
+    code_change_deletions: int = 0
+    session_context: AgentRunSessionContext | None = None
+    message_count: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    primary_provider: str | None = None
+    total_estimated_cost_usd: Any | None = None
+    first_message_at: str | None = None
+    last_message_at: str | None = None
+    loki_search_url: str | None = None
+
+
+class ListSessionsResult(BaseModel):
+    """Paginated Agent Runs list returned by ``list_sessions``.
+
+    Mirrors ``GET /api/v1/usage/agent-runs`` as ``PaginatedResponse[AgentRunSummary]``
+    with explicit pagination and ``total``. ``items``/``total``/``limit``/``offset``
+    are required so an incomplete successful Gateway body fails validation
+    instead of silently defaulting to an empty page. Null/unavailable values are
+    preserved without coercion, and the ``status`` field remains the
+    Gateway-computed activity heuristic (running/stale/completed/blocked/unknown),
+    not a proven live process status.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    items: list[AgentRunSummary]
+    total: int
+    limit: int
+    offset: int
+
+
 def create_server(
     config: GatewayConfig,
     *,
@@ -889,6 +1099,112 @@ def create_server(
         except ValidationError:
             raise ToolError(
                 "OpenCode Gateway returned an unexpected correlations payload shape"
+            ) from None
+
+    @server.tool(description=LIST_SESSIONS_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def list_sessions(
+        client_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        agent: str | None = None,
+        external_project_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> ListSessionsResult:
+        """List live and historical OpenCode agent sessions.
+
+        Calls only ``GET /api/v1/usage/agent-runs`` via the authenticated
+        Gateway HTTP client. Supported filters — ``client_id``, ``from_date``,
+        ``to_date``, ``agent``, ``external_project_id``, and ``status``
+        (``running``/``stale``/``completed``/``blocked``/``unknown``) — are
+        forwarded verbatim with explicit ``limit`` (1–1000, default 50) /
+        ``offset`` (>=0) pagination without silent crawling. No ``repository``
+        filter is supported; use ``external_project_id``. ``status`` is the
+        Gateway-computed activity heuristic (quiet/stale/unknown thresholds,
+        ``message_count`` and ``parent_session_id``) — not a proven live
+        OS/tmux process probe — and ``running`` never means a confirmed live
+        process. Gateway 4xx/5xx, bad shapes, and connection errors are
+        surfaced as MCP-visible errors without exposing credentials; invalid
+        ``status``/``limit``/``offset`` are rejected before the Gateway call.
+        """
+        if status is not None and status not in _VALID_AGENT_RUN_STATUSES:
+            valid = ", ".join(sorted(_VALID_AGENT_RUN_STATUSES))
+            raise ToolError(f"Invalid status: {status!r}. Valid values: {valid}")
+        if limit is not None and not (1 <= limit <= 1000):
+            raise ToolError(f"Invalid limit: {limit!r}. Must be between 1 and 1000")
+        if offset is not None and offset < 0:
+            raise ToolError(f"Invalid offset: {offset!r}. Must be >= 0")
+        try:
+            payload: dict[str, Any] = await gateway.list_agent_runs(
+                client_id=client_id,
+                from_date=from_date,
+                to_date=to_date,
+                agent=agent,
+                external_project_id=external_project_id,
+                status=status,
+                limit=limit,
+                offset=offset,
+            )
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return ListSessionsResult.model_validate(payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/usage/agent-runs payload shape"
+            ) from None
+
+    @server.tool(description=SESSION_DETAIL_TOOL_DESCRIPTION)  # type: ignore[untyped-decorator]
+    async def get_session_detail(session_id: str) -> AgentRunDetail:
+        """Return detail for one Agent Run by internal Gateway UUID.
+
+        Calls only ``GET /api/v1/usage/agent-runs/{session_id}`` where
+        ``session_id`` is the internal Gateway session UUID (``sessions.id``),
+        not the external OpenCode ``ses_*`` identifier. Validates the UUID
+        shape before issuing the Gateway request; wrong types (empty string,
+        external ``ses_*``, or non-UUID) are rejected as MCP-visible validation
+        errors without touching the Gateway. Nullable ``parent_session_id``,
+        ``parent_internal_id``, ``child_summaries``, ``session_context``,
+        ``todo_rows``, and ``total_estimated_cost_usd`` are preserved verbatim
+        without inference. Only aggregated facts are returned — no raw prompts,
+        transcripts, or message parts.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ToolError(
+                "session_id must be a non-empty string: expected internal Gateway "
+                "session UUID (sessions.id), not external ses_* identifier"
+            )
+        trimmed = session_id.strip()
+        # Reject external ses_* identifiers explicitly — they are not valid here.
+        if trimmed.startswith("ses_"):
+            raise ToolError(
+                f"Invalid session_id {trimmed!r}: expected internal Gateway session UUID, "
+                "not external ses_* identifier. Obtain the internal UUID from list_sessions "
+                "or GET /api/v1/usage/agent-runs."
+            )
+        # Permissive shape check: `uuid.UUID` also accepts non-canonical forms
+        # (e.g. no-hyphen hex, braces, urn prefix). The Gateway remains the
+        # authority on exact identity and returns 404/400 for unknown IDs; this
+        # only rejects obviously wrong input before the Gateway call.
+        try:
+            uuid.UUID(trimmed)
+        except ValueError:
+            raise ToolError(
+                f"Invalid session_id {trimmed!r}: expected UUID-formatted internal Gateway "
+                "session UUID (e.g. 11111111-1111-1111-1111-111111111111)"
+            ) from None
+        try:
+            payload: dict[str, Any] = await gateway.get_agent_run_detail(trimmed)
+        except GatewayError as exc:
+            raise ToolError(str(exc)) from None
+        try:
+            return AgentRunDetail.model_validate(payload)
+        except ValidationError:
+            raise ToolError(
+                "OpenCode Gateway returned an unexpected "
+                "/api/v1/usage/agent-runs/{session_id} payload shape"
             ) from None
 
     return server

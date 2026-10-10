@@ -105,8 +105,10 @@ class GatewayClient:
             "Accept": "application/json",
         }
 
-    async def _get_json(self, path: str) -> Any:
-        """Fetch ``GET {path}`` and return the JSON-decoded body.
+    async def _get_json(
+        self, path: str, *, params: dict[str, str] | None = None
+    ) -> Any:
+        """Fetch ``GET {path}`` (with optional query ``params``) and return the JSON-decoded body.
 
         - Raises :class:`GatewayConnectionError` for transport failures.
         - Raises :class:`GatewayHTTPError` for 4xx/5xx with credential-free message.
@@ -119,12 +121,12 @@ class GatewayClient:
         try:
             if self._http_client is not None:
                 response = await self._http_client.get(
-                    url, headers=self._headers(), timeout=self._timeout
+                    url, params=params, headers=self._headers(), timeout=self._timeout
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
                     response = await http_client.get(
-                        url, headers=self._headers(), timeout=self._timeout
+                        url, params=params, headers=self._headers(), timeout=self._timeout
                     )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
@@ -654,3 +656,83 @@ class GatewayClient:
             if isinstance(inner.get("items"), list):
                 return inner  # type: ignore[no-any-return]
         return payload  # type: ignore[no-any-return]
+
+    async def list_agent_runs(
+        self,
+        *,
+        client_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        agent: str | None = None,
+        external_project_id: str | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/usage/agent-runs`` with explicit filters.
+
+        The MCP tool ``list_sessions`` mirrors the Aurora Glass Agent Runs
+        list. Filters ``client_id``, ``from_date``, ``to_date``, ``agent``,
+        ``external_project_id`` (the stable project identity, not a
+        repository string), and ``status`` (``running``/``stale``/
+        ``completed``/``blocked``/``unknown`` — the Gateway-computed activity
+        heuristic, not a proven live OS/tmux process) are forwarded verbatim.
+        ``limit`` (1–1000) and ``offset`` (>=0) are explicit pagination
+        without silent crawling. Only one page is fetched; null/unavailable
+        values are preserved without coercion. No ``repository`` filter is
+        supported — use ``external_project_id``.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        path = "/api/v1/usage/agent-runs"
+        params: dict[str, str] = {}
+        if client_id is not None:
+            params["client_id"] = client_id
+        if from_date is not None:
+            params["from_date"] = from_date
+        if to_date is not None:
+            params["to_date"] = to_date
+        if agent is not None:
+            params["agent"] = agent
+        if external_project_id is not None:
+            params["external_project_id"] = external_project_id
+        if status is not None:
+            params["status"] = status
+        if limit is not None:
+            params["limit"] = str(limit)
+        if offset is not None:
+            params["offset"] = str(offset)
+        # Delegate transport/error/envelope handling to the shared `_get_json`
+        # helper: connection errors, credential-free 4xx/5xx errors, JSON
+        # parsing, and the standard `{status: "ok", data: {...}}` unwrap all
+        # follow the same code path as the other read-only client methods.
+        payload = await self._get_json(path, params=params)
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return payload
+
+    async def get_agent_run_detail(self, session_id: str) -> dict[str, Any]:
+        """Fetch ``GET /api/v1/usage/agent-runs/{session_id}``.
+
+        ``session_id`` is the internal Gateway UUID (``sessions.id``), not the
+        external OpenCode ``ses_*`` identifier. The path component is URL-encoded
+        with ``quote(session_id, safe="")``. Returns the
+        ``AgentRunDetail`` payload (aggregated facts only — no raw transcript,
+        message parts, or prompts) with nullable ``parent_session_id``,
+        ``parent_internal_id``, ``child_summaries``, ``session_context``,
+        ``todo_rows``, and ``total_estimated_cost_usd`` preserved verbatim.
+
+        Raises a :class:`GatewayError` with a credential-free message for
+        transport failures, non-2xx responses, and unparseable bodies.
+        """
+        encoded_id = quote(session_id, safe="")
+        path = f"/api/v1/usage/agent-runs/{encoded_id}"
+        result = await self._get_json(path)
+        if not isinstance(result, dict):
+            raise GatewayResponseError(
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
+            )
+        return result

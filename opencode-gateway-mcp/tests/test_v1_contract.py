@@ -1,6 +1,6 @@
 """v1 acceptance gate: the complete opencode-gateway-mcp contract (ADR 0031).
 
-This module proves the finished MCP surface together: exactly the nine approved
+This module proves the finished MCP surface together: exactly the eleven approved
 read-only tools, public MCP-boundary behavior for every tool against a controlled
 Gateway HTTP mock, boundary invariants (no writes, no passthrough, no direct
 Postgres/Kafka/AWX access, no secret leakage, no silent crawling, no natural
@@ -53,6 +53,8 @@ EXPECTED_TOOL_NAMES = frozenset(
         "get_change_request_story",
         "get_gateway_health",
         "get_correlation_issues",
+        "list_sessions",
+        "get_session_detail",
     }
 )
 
@@ -93,6 +95,19 @@ EXPECTED_PARAMETERS: dict[str, frozenset[str]] = {
     "get_afk_run_story": frozenset({"afk_run_id"}),
     "get_change_request_story": frozenset({"provider", "repository", "external_number"}),
     "get_correlation_issues": frozenset({"reason", "limit", "offset"}),
+    "list_sessions": frozenset(
+        {
+            "client_id",
+            "from_date",
+            "to_date",
+            "agent",
+            "external_project_id",
+            "status",
+            "limit",
+            "offset",
+        }
+    ),
+    "get_session_detail": frozenset({"session_id"}),
 }
 
 EXPECTED_REQUIRED: dict[str, frozenset[str]] = {
@@ -105,6 +120,8 @@ EXPECTED_REQUIRED: dict[str, frozenset[str]] = {
     "get_afk_run_story": frozenset({"afk_run_id"}),
     "get_change_request_story": frozenset({"provider", "repository", "external_number"}),
     "get_correlation_issues": frozenset(),
+    "list_sessions": frozenset(),
+    "get_session_detail": frozenset({"session_id"}),
 }
 
 # Minimal valid arguments per tool (used for negative/error matrix tests).
@@ -122,6 +139,8 @@ TOOL_ARGUMENTS: dict[str, dict[str, Any]] = {
         "external_number": "42",
     },
     "get_correlation_issues": {},
+    "list_sessions": {},
+    "get_session_detail": {"session_id": "11111111-1111-1111-1111-111111111111"},
 }
 
 # The only Gateway paths the v1 adapter is allowed to call, as anchor patterns.
@@ -135,6 +154,8 @@ APPROVED_PATH_PATTERNS = (
     re.compile(r"^/api/v1/afk-outcomes/change-requests/[^/]+/.+$"),
     re.compile(r"^/api/v1/usage/aggregates$"),
     re.compile(r"^/api/v1/afk-outcomes/correlations$"),
+    re.compile(r"^/api/v1/usage/agent-runs$"),
+    re.compile(r"^/api/v1/usage/agent-runs/[^/]+$"),
 )
 
 # Parameters that would indicate a generic arbitrary HTTP passthrough tool.
@@ -200,10 +221,10 @@ async def _list_tool_descriptions(server: MCPServer) -> dict[str, str | None]:
     return {tool.name: tool.description for tool in tools.tools}
 
 
-# ── Tool surface: exactly nine approved read-only tools ─────────────────────
+# ── Tool surface: exactly eleven approved read-only tools ─────────────────────
 
 
-async def test_exactly_the_nine_approved_read_only_tools_are_exposed() -> None:
+async def test_exactly_the_eleven_approved_read_only_tools_are_exposed() -> None:
     async with Client(create_server(_config())) as mcp_client:
         tools = await mcp_client.list_tools()
 
@@ -253,13 +274,18 @@ async def test_every_tool_schema_exposes_only_approved_parameters(tool_name: str
     assert (tool.description or "").strip(), f"{tool_name} must carry a description"
 
 
-# ── Public MCP-boundary behavior for all nine tools ─────────────────────────
+# ── Public MCP-boundary behavior for all eleven tools ─────────────────────────
 
 
 @pytest.mark.parametrize("tool_name", sorted(EXPECTED_TOOL_NAMES))
 async def test_every_tool_replays_fixture_through_public_mcp_boundary(tool_name: str) -> None:
     """Each tool call through the public MCP surface returns its fixture facts,
     preserves nulls, and calls exactly the approved read-only endpoints."""
+    if tool_name not in FIXTURES:
+        pytest.fail(
+            f"no v1 fixture for {tool_name}; every approved v1 tool must carry one "
+            "so Gateway response-shape drift is detected"
+        )
     entry: Any = FIXTURES[tool_name]
     seen: list[httpx.Request] = []
 
