@@ -105,8 +105,10 @@ class GatewayClient:
             "Accept": "application/json",
         }
 
-    async def _get_json(self, path: str) -> Any:
-        """Fetch ``GET {path}`` and return the JSON-decoded body.
+    async def _get_json(
+        self, path: str, *, params: dict[str, str] | None = None
+    ) -> Any:
+        """Fetch ``GET {path}`` (with optional query ``params``) and return the JSON-decoded body.
 
         - Raises :class:`GatewayConnectionError` for transport failures.
         - Raises :class:`GatewayHTTPError` for 4xx/5xx with credential-free message.
@@ -119,12 +121,12 @@ class GatewayClient:
         try:
             if self._http_client is not None:
                 response = await self._http_client.get(
-                    url, headers=self._headers(), timeout=self._timeout
+                    url, params=params, headers=self._headers(), timeout=self._timeout
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as http_client:
                     response = await http_client.get(
-                        url, headers=self._headers(), timeout=self._timeout
+                        url, params=params, headers=self._headers(), timeout=self._timeout
                     )
         except httpx.HTTPError as exc:
             raise GatewayConnectionError(
@@ -683,7 +685,7 @@ class GatewayClient:
         Raises a :class:`GatewayError` with a credential-free message for
         transport failures, non-2xx responses, and unparseable bodies.
         """
-        url = f"{self._config.base_url}/api/v1/usage/agent-runs"
+        path = "/api/v1/usage/agent-runs"
         params: dict[str, str] = {}
         if client_id is not None:
             params["client_id"] = client_id
@@ -701,48 +703,14 @@ class GatewayClient:
             params["limit"] = str(limit)
         if offset is not None:
             params["offset"] = str(offset)
-        try:
-            if self._http_client is not None:
-                response = await self._http_client.get(
-                    url, params=params, headers=self._headers(), timeout=self._timeout
-                )
-            else:
-                async with httpx.AsyncClient(timeout=self._timeout) as http_client:
-                    response = await http_client.get(
-                        url, params=params, headers=self._headers(), timeout=self._timeout
-                    )
-        except httpx.HTTPError as exc:
-            raise GatewayConnectionError(
-                f"Could not reach the OpenCode Gateway at {self._config.base_url} "
-                f"({type(exc).__name__})"
-            ) from None
-        if response.status_code >= 400:
-            raise GatewayHTTPError(
-                "/api/v1/usage/agent-runs",
-                response.status_code,
-                response.reason_phrase,
-            )
-        try:
-            payload = response.json()
-        except ValueError:
-            raise GatewayResponseError(
-                "OpenCode Gateway returned a non-JSON /api/v1/usage/agent-runs response"
-            ) from None
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            raise GatewayResponseError(
-                "OpenCode Gateway returned an error envelope for /api/v1/usage/agent-runs"
-            )
-        if (
-            isinstance(payload, dict)
-            and payload.get("status") == "ok"
-            and isinstance(payload.get("data"), dict)
-        ):
-            inner = payload["data"]
-            if isinstance(inner.get("items"), list):
-                payload = inner
+        # Delegate transport/error/envelope handling to the shared `_get_json`
+        # helper: connection errors, credential-free 4xx/5xx errors, JSON
+        # parsing, and the standard `{status: "ok", data: {...}}` unwrap all
+        # follow the same code path as the other read-only client methods.
+        payload = await self._get_json(path, params=params)
         if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
             raise GatewayResponseError(
-                "OpenCode Gateway returned an unexpected /api/v1/usage/agent-runs payload shape"
+                f"OpenCode Gateway returned an unexpected {path} payload shape"
             )
         return payload
 

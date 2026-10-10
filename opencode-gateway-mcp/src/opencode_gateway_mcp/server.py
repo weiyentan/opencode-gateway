@@ -1151,6 +1151,10 @@ def create_server(
                 "not external ses_* identifier. Obtain the internal UUID from list_sessions "
                 "or GET /api/v1/usage/agent-runs."
             )
+        # Permissive shape check: `uuid.UUID` also accepts non-canonical forms
+        # (e.g. no-hyphen hex, braces, urn prefix). The Gateway remains the
+        # authority on exact identity and returns 404/400 for unknown IDs; this
+        # only rejects obviously wrong input before the Gateway call.
         try:
             uuid.UUID(trimmed)
         except ValueError:

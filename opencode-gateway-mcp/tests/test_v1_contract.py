@@ -224,7 +224,7 @@ async def _list_tool_descriptions(server: MCPServer) -> dict[str, str | None]:
 # ── Tool surface: exactly eleven approved read-only tools ─────────────────────
 
 
-async def test_exactly_the_nine_approved_read_only_tools_are_exposed() -> None:
+async def test_exactly_the_eleven_approved_read_only_tools_are_exposed() -> None:
     async with Client(create_server(_config())) as mcp_client:
         tools = await mcp_client.list_tools()
 

@@ -150,7 +150,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 - Multi-stage build (`python:3.12-slim` builder → runtime), lean venv, no build tools in runtime.
 - Runs as non-root user `mcp` (`USER mcp`).
 - No Postgres/Kafka/AWX/collector code or dependencies are included.
-- Supports ADR 0031 (as amended v1.1): read-only HTTP adapter with exactly the eleven v1 tools above; tool results are structured Gateway facts passed through without reinterpretation or invented correlation.
+- Supports ADR 0031 (as amended v1.2): read-only HTTP adapter with exactly the eleven v1 tools above; tool results are structured Gateway facts passed through without reinterpretation or invented correlation.
 - Build logs never contain `OPENCODE_GATEWAY_API_KEY`; runtime logs never echo it; tool results and errors never expose the key.
 
 ## CI publishing flow
