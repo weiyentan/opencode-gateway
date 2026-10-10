@@ -282,7 +282,10 @@ async def test_every_tool_replays_fixture_through_public_mcp_boundary(tool_name:
     """Each tool call through the public MCP surface returns its fixture facts,
     preserves nulls, and calls exactly the approved read-only endpoints."""
     if tool_name not in FIXTURES:
-        pytest.skip(f"no v1 fixture yet for {tool_name} — covered by dedicated tests")
+        pytest.fail(
+            f"no v1 fixture for {tool_name}; every approved v1 tool must carry one "
+            "so Gateway response-shape drift is detected"
+        )
     entry: Any = FIXTURES[tool_name]
     seen: list[httpx.Request] = []
 

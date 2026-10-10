@@ -461,6 +461,53 @@ async def test_list_sessions_bad_shape_is_surfaced_as_mcp_error() -> None:
     assert "unexpected" in result.content[0].text.lower()
 
 
+async def test_list_sessions_incomplete_pagination_fails_closed() -> None:
+    """Pagination fields are required by contract: a successful Gateway body
+    missing any of items/total/limit/offset must surface an MCP error rather
+    than silently defaulting to zero.
+    """
+    incomplete_bodies = [
+        {"items": []},
+        {"items": [], "total": 0},
+        {"items": [], "total": 0, "limit": 50},
+        {"items": [], "total": 0, "offset": 0},
+        {"items": [], "limit": 50, "offset": 0},
+        {"items": [], "total": 0, "limit": 50, "offset": 0, "extra": "ignored"},
+    ]
+    # The last body is complete: it must still succeed.
+    complete_body = incomplete_bodies.pop()
+
+    for body in incomplete_bodies:
+        def handler(request: httpx.Request, _body=body) -> httpx.Response:  # type: ignore[no-untyped-def]
+            return httpx.Response(200, json={"status": "ok", "data": _body})
+
+        async with _server_with(handler) as server:
+            result = await _call_list_sessions(server, {})
+
+        missing = sorted({"items", "total", "limit", "offset"} - set(body))
+        assert result.is_error is True, (
+            f"missing pagination fields {missing} must not become a silent success"
+        )
+        text = result.content[0].text
+        assert "payload shape" in text.lower()
+        assert GATEWAY_API_KEY not in text
+
+    def complete_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "data": complete_body})
+
+    async with _server_with(complete_handler) as server:
+        result = await _call_list_sessions(server, {})
+
+    assert result.is_error is False
+    structured = result.structured_content
+    assert structured is not None
+    assert structured["items"] == []
+    assert structured["total"] == 0
+    assert structured["limit"] == 50
+    assert structured["offset"] == 0
+    assert structured["extra"] == "ignored"
+
+
 async def test_list_sessions_non_json_is_surfaced_safely() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"not json", headers={"content-type": "text/plain"})

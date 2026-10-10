@@ -674,9 +674,13 @@ class AgentRunSummary(BaseModel):
 
 
 class AgentRunTodoRow(BaseModel):
-    """One Todo Snapshot item within an agent run detail view."""
+    """One Todo Snapshot item within an agent run detail view.
 
-    model_config = ConfigDict(extra="allow")
+    Explicit allowlist: ``extra="ignore"`` drops any other Gateway key so
+    unknown/sensitive fields are never forwarded through the MCP surface.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     content: str
     status: str
@@ -685,9 +689,13 @@ class AgentRunTodoRow(BaseModel):
 
 
 class AgentRunChildSummary(BaseModel):
-    """A summary of a child agent run — used in the detail view."""
+    """A summary of a child agent run — used in the detail view.
 
-    model_config = ConfigDict(extra="allow")
+    Explicit allowlist: ``extra="ignore"`` drops any other Gateway key so
+    unknown/sensitive fields are never forwarded through the MCP surface.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     external_session_id: str | None = None
@@ -697,18 +705,41 @@ class AgentRunChildSummary(BaseModel):
     message_count: int = 0
 
 
+class AgentRunSessionContext(BaseModel):
+    """Allowlisted Session Context sub-fields for an agent run detail view.
+
+    The Gateway builds this block from ``opencode_session_contexts`` for
+    ``GET /api/v1/usage/agent-runs/{session_id}`` with exactly these keys
+    (``app/api/usage.py``). ``extra="ignore"`` drops every other key —
+    including prompt, transcript, message_parts, extra_vars, or any future
+    unknown field — so only vetted facts reach the MCP caller.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_model: str | None = None
+    title: str | None = None
+    source_directory: str | None = None
+    source_path: str | None = None
+    code_change_additions: int | None = None
+    code_change_deletions: int | None = None
+
+
 class AgentRunDetail(BaseModel):
     """Full detail view for a single agent run, keyed by internal session UUID.
 
     Mirrors ``app.core.schemas.usage.AgentRunDetail`` — aggregated facts only
     (no raw transcript, message parts, or prompts). Timestamps stay strings so
-    the Gateway's own representation is preserved, ``None`` stays ``None``, and
-    ``extra="allow"`` keeps unknown future Gateway fields. Nullable parent,
-    child, context, todo, cost, and provider fields are preserved without
-    inference.
+    the Gateway's own representation is preserved and ``None`` stays ``None``.
+    The model is an explicit allowlist: ``extra="ignore"`` drops unknown or
+    sensitive Gateway keys at every nesting level (a hostile ``prompt``,
+    ``transcript``, ``message_parts``, or ``extra_vars`` never passes through),
+    ``session_context`` only carries its allowlisted sub-fields, and nullable
+    parent, child, context, todo, cost, and provider fields are preserved
+    without inference.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     id: str
     external_session_id: str | None = None
@@ -732,7 +763,7 @@ class AgentRunDetail(BaseModel):
     code_change_count: int = 0
     code_change_additions: int = 0
     code_change_deletions: int = 0
-    session_context: dict[str, Any] | None = None
+    session_context: AgentRunSessionContext | None = None
     message_count: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
@@ -751,7 +782,9 @@ class ListSessionsResult(BaseModel):
     """Paginated Agent Runs list returned by ``list_sessions``.
 
     Mirrors ``GET /api/v1/usage/agent-runs`` as ``PaginatedResponse[AgentRunSummary]``
-    with explicit pagination and ``total``. Null/unavailable values are
+    with explicit pagination and ``total``. ``items``/``total``/``limit``/``offset``
+    are required so an incomplete successful Gateway body fails validation
+    instead of silently defaulting to an empty page. Null/unavailable values are
     preserved without coercion, and the ``status`` field remains the
     Gateway-computed activity heuristic (running/stale/completed/blocked/unknown),
     not a proven live process status.
@@ -759,10 +792,10 @@ class ListSessionsResult(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    items: list[AgentRunSummary] = []
-    total: int = 0
-    limit: int = 0
-    offset: int = 0
+    items: list[AgentRunSummary]
+    total: int
+    limit: int
+    offset: int
 
 
 def create_server(

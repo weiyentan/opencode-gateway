@@ -482,6 +482,90 @@ async def test_does_not_return_raw_transcript_or_secrets() -> None:
     assert GATEWAY_API_KEY not in serialized
 
 
+def _hostile_detail_payload() -> dict[str, Any]:
+    """Detail payload where a hostile Gateway smuggles sensitive fields at
+    every nesting level. The explicit detail allowlist must strip them all.
+    """
+    context = dict(DETAIL_PAYLOAD["session_context"])
+    context.update(
+        {
+            "prompt": "TOP-SECRET-PROMPT",
+            "transcript": [{"role": "user", "content": "TOP-SECRET-TRANSCRIPT"}],
+            "message_parts": [{"type": "text", "text": "TOP-SECRET-PART"}],
+            "extra_vars": {"token": "TOP-SECRET-EXTRA-VARS"},
+        }
+    )
+    child = dict(DETAIL_PAYLOAD["child_summaries"][0])
+    child.update(
+        {
+            "prompt": "TOP-SECRET-CHILD-PROMPT",
+            "message_parts": ["TOP-SECRET-CHILD-PART"],
+            "extra_vars": {"k": "TOP-SECRET-CHILD-EXTRA"},
+        }
+    )
+    todo = dict(DETAIL_PAYLOAD["todo_rows"][0])
+    todo.update(
+        {
+            "prompt": "TOP-SECRET-TODO-PROMPT",
+            "transcript": "TOP-SECRET-TODO-TRANSCRIPT",
+            "extra_vars": {"k": "TOP-SECRET-TODO-EXTRA"},
+        }
+    )
+    payload = dict(DETAIL_PAYLOAD)
+    payload.update(
+        {
+            "session_context": context,
+            "child_summaries": [child],
+            "todo_rows": [todo],
+            "prompt": "TOP-SECRET-TOP-PROMPT",
+            "transcript": "TOP-SECRET-TOP-TRANSCRIPT",
+            "message_parts": [{"type": "text", "text": "TOP-SECRET-TOP-PART"}],
+            "extra_vars": {"token": "TOP-SECRET-TOP-EXTRA"},
+        }
+    )
+    return payload
+
+
+async def test_hostile_gateway_fields_are_stripped_from_detail_response() -> None:
+    """Defense-in-depth: a hostile Gateway response carrying prompt/transcript/
+    message_parts/extra_vars at any nesting level must not pass those fields
+    through the MCP surface, while the allowlisted facts survive.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api/v1/usage/agent-runs/{SESSION_ID}":
+            return httpx.Response(200, json=_envelope(_hostile_detail_payload()))
+        return _not_found()
+
+    async with _server_with(handler) as server:
+        result = await _call_detail(server)
+
+    assert result.is_error is False
+    sc = result.structured_content
+    assert sc is not None
+    # No secret value from any injected sensitive field survives serialization.
+    assert "TOP-SECRET" not in str(sc)
+
+    # Forbidden fields are absent at the top level and inside nested blocks.
+    for forbidden in ("prompt", "transcript", "message_parts", "extra_vars"):
+        assert forbidden not in sc
+        assert forbidden not in sc["session_context"]
+        assert forbidden not in sc["child_summaries"][0]
+        assert forbidden not in sc["todo_rows"][0]
+
+    # Allowlisted facts still survive intact.
+    assert sc["id"] == SESSION_ID
+    assert sc["status"] == "completed"
+    assert sc["session_context"]["session_model"] == "claude-sonnet-4-20250514"
+    assert sc["session_context"]["title"] == "Implement feature X"
+    assert sc["session_context"]["source_directory"] == "/workspace/proj"
+    assert sc["session_context"]["source_path"] == "/workspace/proj/file.py"
+    assert sc["child_summaries"][0]["id"] == CHILD_ID
+    assert sc["child_summaries"][0]["agent"] == "subagent"
+    assert sc["todo_rows"][0]["content"] == "Write tests"
+    assert sc["todo_rows"][0]["status"] == "completed"
+
+
 # ── Adapter boundary ──────────────────────────────────────────────────────
 
 
