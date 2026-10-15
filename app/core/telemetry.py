@@ -51,9 +51,42 @@ logger = logging.getLogger(__name__)
 
 # Stable event names — do not rename; downstream log consumers depend on them.
 EVENT_REQUEST_COMPLETED = "request.completed"
+# Reserved: intentionally not emitted.  The middleware reuses
+# request.completed at ERROR level for failed requests (enhanced with
+# exception_class/sqlstate diagnostics), so downstream consumers that
+# count exactly one terminal request event per request stay stable.
+# Kept so consumers referencing the name remain forward-compatible.
+EVENT_REQUEST_FAILED = "request.failed"
 EVENT_OPERATION_COMPLETED = "operation.completed"
 EVENT_OPERATION_TIMEOUT = "operation.timeout"
 EVENT_LOCK_ACQUIRED = "lock.acquired"
+
+
+def _extract_sqlstate(exc: BaseException) -> str | None:
+    """Return the SQLSTATE from an asyncpg/Postgres exception, if present.
+
+    Checks ``sqlstate`` and ``pgcode`` on the exception and its
+    ``__cause__``/``__context__`` chain.  Returns a plain string or None;
+    never logs parameter values or message bodies.
+    """
+    for candidate in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if candidate is None:
+            continue
+        for attr in ("sqlstate", "pgcode"):
+            val = getattr(candidate, attr, None)
+            if val is not None:
+                try:
+                    s = str(val)
+                except Exception:
+                    continue
+                if s:
+                    return s
+    return None
+
+
+def _exception_class_name(exc: BaseException) -> str:
+    """Return a safe, redacted exception class identifier (module.qualname)."""
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
 # Default operation timeout budget in milliseconds when
 # GATEWAY_OPERATION_TIMEOUT_MS is unset or invalid.
@@ -310,19 +343,72 @@ async def timeout_operation(
 # ── Request middleware ──────────────────────────────────────────────────────
 
 
-def _endpoint_name(request: Request) -> str:
-    """Return a stable endpoint name for the request.
+# API path prefix used to recognise fully-qualified route templates.
+# Route objects expose router-relative paths on some Starlette versions,
+# so a candidate without this prefix is not usable as an endpoint name.
+_API_PATH_PREFIX = "/api/v1"
 
-    Prefers the matched route's path format (e.g. ``/items/{item_id}``)
-    so that requests are grouped by route rather than by raw URL; falls
-    back to the raw path (query string excluded) when no route matched
-    (e.g. 404s).
+
+def _route_path_attr(route: object, name: str) -> str | None:
+    """Return a route path attribute as a usable path string, if present.
+
+    Returns the attribute value when it is a non-empty string beginning
+    with ``/``; otherwise ``None`` so callers can fall through to the
+    next source.
+    """
+    value = getattr(route, name, None)
+    if isinstance(value, str) and value.startswith("/"):
+        return value
+    return None
+
+
+def _endpoint_name(request: Request) -> str:
+    """Return a version-stable, fully-qualified endpoint name.
+
+    Requests are grouped by route template rather than by raw URL, so the
+    name must not depend on the installed Starlette/FastAPI version.  Route
+    objects expose different path attributes across versions: the
+    preferred ``path_format`` route template (e.g.
+    ``/api/v1/usage/aggregates``) may be router-relative and omit the API
+    prefix on newer versions (e.g. ``/aggregates``).
+
+    Resolution order:
+
+    1. The matched route's ``path_format`` or ``path`` when either carries
+       the API prefix — the canonical fully-qualified route template.  On
+       most versions ``path_format`` is already full; on versions where it
+       is router-relative, ``path`` often retains the full path.
+    2. When neither attribute carries the API prefix but the concrete
+       request path does, the captured template is router-relative, so the
+       concrete path (query string excluded) is used — always
+       version-stable.  For ``/api/v1/usage/aggregates`` the concrete path
+       equals the route template; for the execution timeline it contains
+       the session UUID but keeps the ``/api/v1/execution`` segment, so
+       requests remain identifiable.
+    3. Otherwise the captured template is complete as-is (non-API routes
+       such as ``/health`` or test routes like ``/items/{item_id}``).
+    4. Requests with no matched route (e.g. 404s, mounted sub-apps) fall
+       through to the concrete path.
     """
     route = request.scope.get("route")
-    path_format = getattr(route, "path_format", None)
-    if isinstance(path_format, str):
-        return path_format
-    return request.url.path
+    concrete = request.url.path
+    if route is not None:
+        path_format = _route_path_attr(route, "path_format")
+        route_path = _route_path_attr(route, "path")
+        # 1. Prefer whichever attribute carries the fully-qualified API path.
+        for candidate in (path_format, route_path):
+            if candidate is not None and candidate.startswith(_API_PATH_PREFIX):
+                return candidate
+        template = path_format or route_path
+        if template is not None:
+            # 2. Router-relative template vs API-prefixed concrete path:
+            #    the concrete path is the version-stable fully-qualified form.
+            if concrete.startswith(_API_PATH_PREFIX):
+                return concrete
+            # 3. Non-API route: the captured template is complete as-is.
+            return template
+    # 4. Concrete path fallback.
+    return concrete
 
 
 class RequestTimingMiddleware(BaseHTTPMiddleware):
@@ -358,28 +444,75 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
         start = time.perf_counter()
         try:
             response = await call_next(request)
-        except Exception:
+        except BaseException as exc:
+            # KeyboardInterrupt/SystemExit must not be swallowed — they are
+            # not request failures and should propagate to the runtime.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
             duration_ms = (time.perf_counter() - start) * 1000
-            logger.info(
+            endpoint = _endpoint_name(request)
+            exception_class = _exception_class_name(exc)
+            sqlstate = _extract_sqlstate(exc)
+            # One identifiable diagnostic log event for the failed request.
+            # Carries correlation_id, route (endpoint), elapsed time, safe
+            # exception class and SQLSTATE when present.  No params, bodies,
+            # or secrets are logged — only the class name and code.
+            # Emits a single request.completed event enhanced with the
+            # diagnostic fields so downstream consumers and existing tests
+            # that count exactly one request.completed log continue to pass.
+            #
+            # exc_info preserves the traceback for diagnosability.  The
+            # traceback is rendered through RedactingFormatter, which scans
+            # the fully formatted string (message + traceback) and redacts
+            # secret-like values — see app.core.logging.
+            logger.error(
                 EVENT_REQUEST_COMPLETED,
+                exc_info=exc,
                 extra={
-                    "endpoint": _endpoint_name(request),
+                    "endpoint": endpoint,
                     "duration_ms": round(duration_ms, 3),
                     "status_code": 500,
                     "correlation_id": correlation_id,
+                    "exception_class": exception_class,
+                    "sqlstate": sqlstate,
+                    "method": request.method,
                 },
             )
-            raise
+            # Build a safe envelope error response that preserves the
+            # correlation header so the failed request and its log can be
+            # matched without PostgreSQL logs.  Do not leak exception
+            # messages, SQL, or parameter values.
+            from fastapi.responses import JSONResponse
+
+            resp = JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "error": {"code": "INTERNAL_ERROR", "message": "Internal server error"},
+                },
+            )
+            resp.headers[self.HEADER] = correlation_id
+            return resp
 
         duration_ms = (time.perf_counter() - start) * 1000
         response.headers[self.HEADER] = correlation_id
-        logger.info(
-            EVENT_REQUEST_COMPLETED,
-            extra={
-                "endpoint": _endpoint_name(request),
-                "duration_ms": round(duration_ms, 3),
-                "status_code": response.status_code,
-                "correlation_id": correlation_id,
-            },
-        )
+        # 5xx responses produced by exception handlers (e.g. 504 from
+        # timeout) are already handled inside call_next and arrive here as
+        # normal responses.  Emit request.completed at the usual level;
+        # the unhandled-exception path above covers raised failures and
+        # attaches the traceback there.  Here no exception object exists —
+        # there is no traceback to attach — so the safe diagnostic
+        # placeholders keep the log shape uniform.
+        extra: dict[str, object] = {
+            "endpoint": _endpoint_name(request),
+            "duration_ms": round(duration_ms, 3),
+            "status_code": response.status_code,
+            "correlation_id": correlation_id,
+        }
+        if response.status_code >= 500:
+            extra["exception_class"] = None
+            extra["sqlstate"] = None
+            logger.error(EVENT_REQUEST_COMPLETED, extra=extra)
+        else:
+            logger.info(EVENT_REQUEST_COMPLETED, extra=extra)
         return response

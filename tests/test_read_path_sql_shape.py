@@ -468,13 +468,13 @@ class TestAgentRunsSqlShape:
         # Status filter is $1, reference timestamp is $2.
         assert count_params[0] == "running"
         assert isinstance(count_params[1], datetime)
-        assert "s.last_message_at > $2 - interval" in count_flat
+        assert "s.last_message_at > ($2::timestamptz) - interval" in count_flat
 
         data_sql, data_params = _fetch_calls(mock_conn)[0]
         data_flat = _norm(data_sql)
         assert "page_ids" in data_flat
         assert "status_expr" in data_flat or "running" in data_flat
-        assert "s.last_message_at > $2 - interval" in data_flat
+        assert "s.last_message_at > ($2::timestamptz) - interval" in data_flat
         assert "LIMIT $3" in data_flat
         assert "OFFSET $4" in data_flat
         assert data_params[0] == "running"
