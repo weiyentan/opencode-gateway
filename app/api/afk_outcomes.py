@@ -644,6 +644,119 @@ _CHANGE_REQUEST_GROUPED_SQL = """
                  ec.latest_exec_at
 """
 
+#: Lightweight grouped aggregation without the costly session-cost enrichment.
+#: Used for identity-page selection (count + ordered pagination) before
+#: joining page-scoped cost. Keeps the same ordering/activity/state
+#: columns so filters and ORDER BY apply before the page limit.
+_CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL = """
+        SELECT
+            i.provider AS provider,
+            i.repository AS repository,
+            i.external_id AS external_id,
+{provider_state_sql}            AS provider_state,
+            GREATEST(
+                MAX(r.last_seen_at),
+                MAX(es.latest_event_at),
+                MAX(ec.latest_exec_at)
+            ) AS latest_activity_at,
+            MAX(es.latest_event_at) AS provider_state_observed_at,
+            MAX(ec.latest_exec_at) AS latest_execution_activity,
+            COALESCE(ec.total, 0) AS execution_total,
+            COALESCE(ec.running, 0) AS execution_running,
+            COALESCE(ec.completed, 0) AS execution_completed,
+            COALESCE(ec.failed, 0) AS execution_failed,
+            COALESCE(ec.cancelled, 0) AS execution_cancelled
+        FROM identities i
+        LEFT JOIN event_state es
+            ON es.provider = i.provider
+           AND es.repository = i.repository
+           AND es.external_id = i.external_id
+        LEFT JOIN run_refs rr
+            ON rr.provider = i.provider
+           AND rr.repository = i.repository
+           AND rr.external_id = i.external_id
+        LEFT JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
+        LEFT JOIN exec_counts ec
+            ON ec.provider = i.provider
+           AND ec.repository = i.repository
+           AND ec.external_id = i.external_id
+        {inner_where}
+        GROUP BY i.provider, i.repository, i.external_id,
+                 es.latest_merged_at, es.latest_closed_at, es.latest_opened_at,
+                 es.latest_event_at,
+                 ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
+                 ec.latest_exec_at
+"""
+
+#: Base CTEs for change-request summary without the costly global
+#: session-cost aggregate.  Cost is joined only for the ordered page
+#: identities (issue #779) so pagination reduces enrichment work while
+#: total still reflects all matches and state/activity filters still
+#: apply before the page limit.
+_CHANGE_REQUEST_BASE_CTES = """
+    WITH identities AS (
+        SELECT provider, repository, external_id
+        FROM engineering_events
+        WHERE entity_type = 'change_request'
+        UNION
+        SELECT change_request_provider, change_request_repository,
+               change_request_external_id
+        FROM afk_runs
+        WHERE change_request_provider IS NOT NULL
+          AND change_request_repository IS NOT NULL
+          AND change_request_external_id IS NOT NULL
+        UNION
+        SELECT provider, repository_url, entity_number
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider IS NOT NULL
+          AND repository_url IS NOT NULL
+          AND entity_number IS NOT NULL
+    ),
+    run_refs AS (
+        SELECT change_request_provider AS provider,
+               change_request_repository AS repository,
+               change_request_external_id AS external_id,
+               afk_run_id
+        FROM afk_runs
+        WHERE change_request_provider IS NOT NULL
+          AND change_request_repository IS NOT NULL
+          AND change_request_external_id IS NOT NULL
+        UNION
+        SELECT provider, repository, external_id, afk_run_id
+        FROM afk_run_entities
+        WHERE entity_type = 'change_request'
+    ),
+    event_state AS (
+        SELECT provider, repository, external_id,
+               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
+                   AS latest_merged_at,
+               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.closed')
+                   AS latest_closed_at,
+               MAX(occurred_at) FILTER (WHERE event_type IN ({open_types}))
+                   AS latest_opened_at,
+               MAX(occurred_at) AS latest_event_at
+        FROM engineering_events
+        WHERE entity_type = 'change_request'
+        GROUP BY provider, repository, external_id
+    ),
+    exec_counts AS (
+        SELECT provider, repository_url AS repository, entity_number AS external_id,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE outcome = 'running') AS running,
+               COUNT(*) FILTER (WHERE outcome = 'completed') AS completed,
+               COUNT(*) FILTER (WHERE outcome = 'failed') AS failed,
+               COUNT(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
+               MAX(COALESCE(finished_at, started_at, created_at)) AS latest_exec_at
+        FROM execution_bindings
+        WHERE entity_type = 'change_request'
+          AND provider IS NOT NULL
+          AND repository_url IS NOT NULL
+          AND entity_number IS NOT NULL
+        GROUP BY provider, repository_url, entity_number
+    )
+"""
+
 _CHANGE_REQUEST_CTES = """
     WITH identities AS (
         SELECT provider, repository, external_id
@@ -735,7 +848,11 @@ def _build_change_request_queries(
     Identity filters (provider, repository) apply pre-aggregation on the
     ``identities`` CTE; the derived provider-state filter and the activity
     window apply post-aggregation on the ``summary`` wrapper, so the
-    paginated ``total`` reflects the full filter set.
+    paginated ``total`` reflects the full filter set.  The data query
+    chooses the ordered identity page before page-only cost enrichment
+    (issue #779): ``summary``/``paged`` order and filter before the
+    ``LIMIT``/``OFFSET``, then a page-scoped ``session_cost`` CTE left-joins
+    cost only for those identities.
     """
     params: list[object] = []
     inner_filters: list[str] = []
@@ -759,20 +876,71 @@ def _build_change_request_queries(
         params.append(activity_to)
     post_where = f"WHERE {' AND '.join(post_filters)}" if post_filters else ""
 
-    ctes = _CHANGE_REQUEST_CTES.format(open_types=_OPEN_EVENT_TYPES)
-    grouped = _CHANGE_REQUEST_GROUPED_SQL.format(
+    base_ctes = _CHANGE_REQUEST_BASE_CTES.format(open_types=_OPEN_EVENT_TYPES)
+    grouped_without_cost = _CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL.format(
         inner_where=inner_where, provider_state_sql=_PROVIDER_STATE_SQL
     )
 
-    count_sql = f"SELECT COUNT(*) FROM (\n{ctes}{grouped}\n) AS summary {post_where}"
+    # Count over the full filtered set — no LIMIT and no session_cost.
+    count_sql = (
+        f"{base_ctes}, summary AS ({grouped_without_cost}) "
+        f"SELECT COUNT(*) FROM summary {post_where}"
+    )
+
+    # Data query: choose ordered page first, then page-scoped cost enrichment.
+    # ``paged`` is filtered + ordered + limited from ``summary`` using the
+    # same ``summary.*`` predicates so state/activity filters apply before
+    # the page limit (and total still counts all matches). ``session_cost``
+    # then aggregates deduplicated sessions only for ``paged`` identities.
+    limit_idx = len(params) + 1
+    offset_idx = len(params) + 2
     data_sql = f"""
-{ctes}SELECT * FROM (
-{grouped}
-) AS summary
-{post_where}
-ORDER BY summary.latest_execution_activity DESC NULLS LAST,
-         summary.provider ASC, summary.repository ASC, summary.external_id ASC
-LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+{base_ctes},
+summary AS ({grouped_without_cost}),
+paged AS (
+    SELECT * FROM summary {post_where}
+    ORDER BY summary.latest_execution_activity DESC NULLS LAST,
+             summary.provider ASC, summary.repository ASC, summary.external_id ASC
+    LIMIT ${limit_idx} OFFSET ${offset_idx}
+),
+session_cost AS (
+    SELECT sc.provider, sc.repository, sc.external_id,
+           SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
+    FROM (
+        SELECT DISTINCT rr.provider, rr.repository, rr.external_id,
+                        ars.session_id AS session_id
+        FROM run_refs rr
+        JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
+        JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+        WHERE ars.session_id IS NOT NULL
+          AND (rr.provider, rr.repository, rr.external_id) IN (
+              SELECT provider, repository, external_id FROM paged
+          )
+    ) sc
+    LEFT JOIN sessions sess ON sess.id = sc.session_id
+    GROUP BY sc.provider, sc.repository, sc.external_id
+)
+SELECT
+    paged.provider,
+    paged.repository,
+    paged.external_id,
+    paged.provider_state,
+    paged.latest_activity_at,
+    paged.provider_state_observed_at,
+    paged.latest_execution_activity,
+    paged.execution_total,
+    paged.execution_running,
+    paged.execution_completed,
+    paged.execution_failed,
+    paged.execution_cancelled,
+    session_cost.total_estimated_cost_usd AS total_estimated_cost_usd
+FROM paged
+LEFT JOIN session_cost
+  ON session_cost.provider = paged.provider
+ AND session_cost.repository = paged.repository
+ AND session_cost.external_id = paged.external_id
+ORDER BY paged.latest_execution_activity DESC NULLS LAST,
+         paged.provider ASC, paged.repository ASC, paged.external_id ASC
 """
     return count_sql, data_sql, params
 

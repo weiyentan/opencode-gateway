@@ -363,9 +363,12 @@ class TestChangeRequestSummaryQueries:
         assert "FROM engineering_events" in data_sql
         assert "FROM afk_runs" in data_sql
         assert "FROM execution_bindings" in data_sql
-        # Count wraps the same grouped body.
-        assert count_sql.startswith("SELECT COUNT(*) FROM (")
+        # Count reflects the full filtered set (no LIMIT) — may use a CTE
+        # ``summary`` rather than a wrapped subquery after the page-then-
+        # enrich refactor (issue #779).
+        assert "SELECT COUNT(*) FROM summary" in count_sql
         assert "GROUP BY i.provider, i.repository, i.external_id" in count_sql
+        assert "WITH identities AS" in count_sql
 
     def test_excludes_executions_without_durable_change_request_identity(self):
         build = self._builder()
@@ -494,3 +497,156 @@ class TestChangeRequestSummaryQueries:
             _mk_summary_row(total_estimated_cost_usd=None)
         )
         assert mapped.total_estimated_cost_usd is None
+
+
+# ── Page-scoped cost enrichment (issue #779) ────────────────────────────────
+
+
+class TestChangeRequestSummaryPageScopedCost:
+    """Cost is enriched only for the ordered identity page, not globally.
+
+    The data query must choose the eligible ordered page before the costly
+    ``afk_run_sessions → sessions`` cost aggregation so a small LIMIT reduces
+    work while ``total`` still reflects all matches.  State/activity
+    post-filters must apply before the page limit.
+    """
+
+    def _builder(self):
+        from app.api.afk_outcomes import _build_change_request_queries
+
+        return _build_change_request_queries
+
+    def test_count_excludes_session_cost(self):
+        build = self._builder()
+        count_sql, _, _ = build(None, None, None, None, None)
+        # Count must not pay for session_cost — it is page-only.
+        assert "session_cost" not in count_sql
+        assert "afk_run_sessions" not in count_sql
+        assert "SELECT COUNT(*) FROM summary" in count_sql
+
+    def test_data_uses_paged_session_cost(self):
+        build = self._builder()
+        _, data_sql, _ = build(None, None, None, None, None)
+        # Data query defines a paged identity set then page-scoped cost.
+        assert "WITH identities AS" in data_sql
+        assert "summary AS (" in data_sql
+        assert "paged AS (" in data_sql
+        assert "session_cost AS (" in data_sql
+        # Page-scoped cost is filtered to the chosen identities only.
+        assert "FROM paged" in data_sql
+        assert "IN (" in data_sql
+        assert "SELECT DISTINCT rr.provider" in data_sql
+        # Still deduplicates sessions by internal session_id before SUM.
+        assert "DISTINCT" in data_sql
+        assert "session_id" in data_sql
+        # Ordering is execution-activity-first with tie-breakers.
+        assert "ORDER BY summary.latest_execution_activity DESC NULLS LAST" in data_sql
+        assert "ORDER BY paged.latest_execution_activity DESC NULLS LAST" in data_sql
+
+    def test_unfiltered_limit_3_and_30_use_page_scoped_cost(self):
+        build = self._builder()
+        for limit in (3, 30):
+            count_sql, data_sql, _ = build(None, None, None, None, None)
+            # Unfiltered page still orders by execution activity before limit.
+            assert "ORDER BY summary.latest_execution_activity DESC NULLS LAST" in data_sql
+            # Cost is still page-scoped even when no filters are present.
+            assert "session_cost AS (" in data_sql
+            # Total still counts all matches — count has no LIMIT.
+            assert "LIMIT" not in count_sql
+            assert "session_cost" not in count_sql
+
+    def test_filtered_post_filters_apply_before_page_limit(self):
+        build = self._builder()
+        count_sql, data_sql, params = build(
+            "github",
+            "acme/proj",
+            "merged",
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+        )
+        # Identity filters push down to the grouped aggregation (pre-filter).
+        assert "i.provider = $1" in data_sql
+        assert "i.repository = $2" in data_sql
+        # State/activity filters apply on summary before the page limit.
+        assert "summary.provider_state = $3" in data_sql
+        assert "summary.latest_activity_at >=" in data_sql
+        # Filtered count reflects the full filtered set (params include all filters).
+        assert "summary.provider_state" in count_sql
+        assert "summary.latest_activity_at" in count_sql
+        # Page limit still after those filters.
+        assert "paged AS (" in data_sql
+        assert "LIMIT $6 OFFSET $7" in data_sql or "LIMIT $6" in data_sql
+        assert params == [
+            "github",
+            "acme/proj",
+            "merged",
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unfiltered_and_filtered_paths_return_200_with_correct_total(
+        self, mock_conn: AsyncMock
+    ):
+        """Exercise the HTTP layer for limit=3, limit=30 and a filtered page.
+
+        Verifies the endpoint still returns HTTP 200, preserves ``total``
+        (full match count) and pagination, and surfaces per-page costs.
+        """
+        from tests.conftest import create_client
+
+        # First page: limit=3
+        mock_conn.fetchval = AsyncMock(return_value=5)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_summary_row(external_id="1"),
+                _mk_summary_row(external_id="2"),
+                _mk_summary_row(external_id="3"),
+            ]
+        )
+        client = create_client(mock_conn)
+        async with client as c:
+            resp = await c.get(_ENDPOINT, params={"limit": 3})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total"] == 5
+        assert data["limit"] == 3
+        assert len(data["items"]) == 3
+        # Cost for page rows is still surfaced (not nulled by page scoping).
+        assert all(item["total_estimated_cost_usd"] is not None for item in data["items"])
+
+        # Larger page: limit=30 (same total, more room)
+        mock_conn.fetchval = AsyncMock(return_value=5)
+        mock_conn.fetch = AsyncMock(
+            return_value=[_mk_summary_row(external_id=str(i)) for i in range(30)]
+        )
+        client = create_client(mock_conn)
+        async with client as c:
+            resp = await c.get(_ENDPOINT, params={"limit": 30})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total"] == 5
+        assert data["limit"] == 30
+        assert len(data["items"]) == 30
+
+        # Filtered path: provider + repository + state + activity window
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(return_value=[_mk_summary_row()])
+        client = create_client(mock_conn)
+        async with client as c:
+            resp = await c.get(
+                _ENDPOINT,
+                params={
+                    "provider": "github",
+                    "repository": "acme/proj",
+                    "provider_state": "merged",
+                    "activity_from": "2026-08-01T00:00:00Z",
+                    "activity_to": "2026-08-02T00:00:00Z",
+                    "limit": 3,
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total"] == 1
+        assert len(data["items"]) == 1
+        assert data["items"][0]["provider_state"] == "merged"
