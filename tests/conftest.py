@@ -106,11 +106,13 @@ def _skip_migrations_in_unit_tests() -> None:
     Unit tests use mock database connections — Alembic cannot run real
     migrations against them.  Individual test files that need to verify
     ensure_schema behaviour (e.g. test_schema.py) apply their own
-    targeted patches inside the test function body.
+    targeted patches inside the test function body.  Issue #773 moved
+    schema initialization into the database-pool reconnect supervisor
+    (``app.db.session``), so the autouse patch targets that reference.
     """
     from unittest.mock import patch
 
-    with patch("app.core.factory.ensure_schema", AsyncMock()):
+    with patch("app.db.session.ensure_schema", AsyncMock()):
         yield
 
 

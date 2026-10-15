@@ -23,7 +23,11 @@ def test_create_app_returns_fastapi_instance():
 
 @pytest.mark.asyncio
 async def test_lifespan_connects_and_closes_pool():
-    """The simplified lifespan should connect the pool, run ensure_schema, and close on shutdown."""
+    """The simplified lifespan should connect the pool, run ensure_schema, and close on shutdown.
+
+    Issue #773: schema initialization moved into the pool supervisor
+    (``app.db.session``), which verifies candidates before publishing them.
+    """
     from app.core.factory import create_app
 
     mock_asyncpg_pool = AsyncMock()
@@ -31,14 +35,17 @@ async def test_lifespan_connects_and_closes_pool():
 
     with patch(
         "app.db.session.asyncpg.create_pool", mock_create_pool
-    ), patch("app.core.factory.ensure_schema") as mock_ensure:
+    ), patch("app.db.session.ensure_schema", new=AsyncMock()) as mock_ensure:
         app = create_app(configure_logging=False)
         async with app.router.lifespan_context(app):
             # Pool should be connected and stored on app.state
             assert app.state.pool is not None
+            assert app.state.pool.pool is mock_asyncpg_pool
 
-        # ensure_schema should have been called
+        # ensure_schema should have been called with the underlying asyncpg pool
         mock_ensure.assert_called_once()
+        assert mock_ensure.call_args[0][0] is mock_asyncpg_pool
+        mock_asyncpg_pool.close.assert_called_once()
 
 
 @pytest.mark.asyncio
