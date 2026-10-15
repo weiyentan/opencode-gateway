@@ -516,6 +516,17 @@ class TestChangeRequestSummaryPageScopedCost:
 
         return _build_change_request_queries
 
+    def test_with_keyword_is_explicit_in_builder_not_hidden_in_constant(self):
+        build = self._builder()
+        count_sql, data_sql, _ = build(None, None, None, None, None)
+        # The shared CTE-body constant carries no leading ``WITH`` keyword —
+        # the builder writes it exactly once so comma-appending further CTEs
+        # never depends on text hidden inside a constant (issue #779 review).
+        assert count_sql.startswith("WITH identities AS (")
+        assert count_sql.count("WITH ") == 1
+        assert data_sql.startswith("\nWITH identities AS (")
+        assert data_sql.count("WITH ") == 1
+
     def test_count_excludes_session_cost(self):
         build = self._builder()
         count_sql, _, _ = build(None, None, None, None, None)
@@ -532,10 +543,15 @@ class TestChangeRequestSummaryPageScopedCost:
         assert "summary AS (" in data_sql
         assert "paged AS (" in data_sql
         assert "session_cost AS (" in data_sql
-        # Page-scoped cost is filtered to the chosen identities only.
+        # Page-scoped cost is filtered to the chosen identities only, via a
+        # planner-friendly JOIN on the paged identity set — never a row-value
+        # ``IN (SELECT ... FROM paged)`` subquery (issue #779 review).
         assert "FROM paged" in data_sql
-        assert "IN (" in data_sql
         assert "SELECT DISTINCT rr.provider" in data_sql
+        assert "JOIN paged ON paged.provider = rr.provider" in data_sql
+        assert "AND paged.repository = rr.repository" in data_sql
+        assert "AND paged.external_id = rr.external_id" in data_sql
+        assert "(rr.provider, rr.repository, rr.external_id) IN (" not in data_sql
         # Still deduplicates sessions by internal session_id before SUM.
         assert "DISTINCT" in data_sql
         assert "session_id" in data_sql

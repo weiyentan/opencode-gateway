@@ -594,56 +594,6 @@ _PROVIDER_STATE_SQL = """
             END
 """
 
-#: The grouped aggregation body shared by the count and data queries.  Built
-#: with the identity filters (``{inner_where}``) applied pre-aggregation;
-#: state/activity filters are applied on the outer ``summary`` wrapper.
-_CHANGE_REQUEST_GROUPED_SQL = """
-        SELECT
-            i.provider AS provider,
-            i.repository AS repository,
-            i.external_id AS external_id,
-{provider_state_sql}            AS provider_state,
-            GREATEST(
-                MAX(r.last_seen_at),
-                MAX(es.latest_event_at),
-                MAX(ec.latest_exec_at)
-            ) AS latest_activity_at,
-            MAX(es.latest_event_at) AS provider_state_observed_at,
-            MAX(ec.latest_exec_at) AS latest_execution_activity,
-            COALESCE(ec.total, 0) AS execution_total,
-            COALESCE(ec.running, 0) AS execution_running,
-            COALESCE(ec.completed, 0) AS execution_completed,
-            COALESCE(ec.failed, 0) AS execution_failed,
-            COALESCE(ec.cancelled, 0) AS execution_cancelled,
-            (
-                SELECT ts.total_estimated_cost_usd
-                FROM session_cost ts
-                WHERE ts.provider = i.provider
-                  AND ts.repository = i.repository
-                  AND ts.external_id = i.external_id
-            ) AS total_estimated_cost_usd
-        FROM identities i
-        LEFT JOIN event_state es
-            ON es.provider = i.provider
-           AND es.repository = i.repository
-           AND es.external_id = i.external_id
-        LEFT JOIN run_refs rr
-            ON rr.provider = i.provider
-           AND rr.repository = i.repository
-           AND rr.external_id = i.external_id
-        LEFT JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
-        LEFT JOIN exec_counts ec
-            ON ec.provider = i.provider
-           AND ec.repository = i.repository
-           AND ec.external_id = i.external_id
-        {inner_where}
-        GROUP BY i.provider, i.repository, i.external_id,
-                 es.latest_merged_at, es.latest_closed_at, es.latest_opened_at,
-                 es.latest_event_at,
-                 ec.total, ec.running, ec.completed, ec.failed, ec.cancelled,
-                 ec.latest_exec_at
-"""
-
 #: Lightweight grouped aggregation without the costly session-cost enrichment.
 #: Used for identity-page selection (count + ordered pagination) before
 #: joining page-scoped cost. Keeps the same ordering/activity/state
@@ -688,13 +638,16 @@ _CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL = """
                  ec.latest_exec_at
 """
 
-#: Base CTEs for change-request summary without the costly global
-#: session-cost aggregate.  Cost is joined only for the ordered page
+#: Shared base CTE body for the change-request summary — ``identities``,
+#: ``run_refs``, ``event_state``, and ``exec_counts`` — without any leading
+#: ``WITH`` keyword and without the costly global session-cost aggregate.
+#: The query builder writes ``WITH`` explicitly and comma-appends the
+#: aggregation CTEs, so composition never depends on text hidden inside this
+#: constant (issue #779 review).  Cost is joined only for the ordered page
 #: identities (issue #779) so pagination reduces enrichment work while
 #: total still reflects all matches and state/activity filters still
 #: apply before the page limit.
-_CHANGE_REQUEST_BASE_CTES = """
-    WITH identities AS (
+_CHANGE_REQUEST_BASE_CTES_BODY = """identities AS (
         SELECT provider, repository, external_id
         FROM engineering_events
         WHERE entity_type = 'change_request'
@@ -726,84 +679,6 @@ _CHANGE_REQUEST_BASE_CTES = """
         SELECT provider, repository, external_id, afk_run_id
         FROM afk_run_entities
         WHERE entity_type = 'change_request'
-    ),
-    event_state AS (
-        SELECT provider, repository, external_id,
-               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.merged')
-                   AS latest_merged_at,
-               MAX(occurred_at) FILTER (WHERE event_type = 'change_request.closed')
-                   AS latest_closed_at,
-               MAX(occurred_at) FILTER (WHERE event_type IN ({open_types}))
-                   AS latest_opened_at,
-               MAX(occurred_at) AS latest_event_at
-        FROM engineering_events
-        WHERE entity_type = 'change_request'
-        GROUP BY provider, repository, external_id
-    ),
-    exec_counts AS (
-        SELECT provider, repository_url AS repository, entity_number AS external_id,
-               COUNT(*) AS total,
-               COUNT(*) FILTER (WHERE outcome = 'running') AS running,
-               COUNT(*) FILTER (WHERE outcome = 'completed') AS completed,
-               COUNT(*) FILTER (WHERE outcome = 'failed') AS failed,
-               COUNT(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
-               MAX(COALESCE(finished_at, started_at, created_at)) AS latest_exec_at
-        FROM execution_bindings
-        WHERE entity_type = 'change_request'
-          AND provider IS NOT NULL
-          AND repository_url IS NOT NULL
-          AND entity_number IS NOT NULL
-        GROUP BY provider, repository_url, entity_number
-    )
-"""
-
-_CHANGE_REQUEST_CTES = """
-    WITH identities AS (
-        SELECT provider, repository, external_id
-        FROM engineering_events
-        WHERE entity_type = 'change_request'
-        UNION
-        SELECT change_request_provider, change_request_repository,
-               change_request_external_id
-        FROM afk_runs
-        WHERE change_request_provider IS NOT NULL
-          AND change_request_repository IS NOT NULL
-          AND change_request_external_id IS NOT NULL
-        UNION
-        SELECT provider, repository_url, entity_number
-        FROM execution_bindings
-        WHERE entity_type = 'change_request'
-          AND provider IS NOT NULL
-          AND repository_url IS NOT NULL
-          AND entity_number IS NOT NULL
-    ),
-    run_refs AS (
-        SELECT change_request_provider AS provider,
-               change_request_repository AS repository,
-               change_request_external_id AS external_id,
-               afk_run_id
-        FROM afk_runs
-        WHERE change_request_provider IS NOT NULL
-          AND change_request_repository IS NOT NULL
-          AND change_request_external_id IS NOT NULL
-        UNION
-        SELECT provider, repository, external_id, afk_run_id
-        FROM afk_run_entities
-        WHERE entity_type = 'change_request'
-    ),
-    session_cost AS (
-        SELECT sc.provider, sc.repository, sc.external_id,
-               SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
-        FROM (
-            SELECT DISTINCT rr.provider, rr.repository, rr.external_id,
-                            ars.session_id AS session_id
-            FROM run_refs rr
-            JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
-            JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
-            WHERE ars.session_id IS NOT NULL
-        ) sc
-        LEFT JOIN sessions sess ON sess.id = sc.session_id
-        GROUP BY sc.provider, sc.repository, sc.external_id
     ),
     event_state AS (
         SELECT provider, repository, external_id,
@@ -876,14 +751,17 @@ def _build_change_request_queries(
         params.append(activity_to)
     post_where = f"WHERE {' AND '.join(post_filters)}" if post_filters else ""
 
-    base_ctes = _CHANGE_REQUEST_BASE_CTES.format(open_types=_OPEN_EVENT_TYPES)
+    base_ctes_body = _CHANGE_REQUEST_BASE_CTES_BODY.format(open_types=_OPEN_EVENT_TYPES)
     grouped_without_cost = _CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL.format(
         inner_where=inner_where, provider_state_sql=_PROVIDER_STATE_SQL
     )
 
-    # Count over the full filtered set — no LIMIT and no session_cost.
+    # Count over the full filtered set — no LIMIT and no session_cost.  The
+    # shared CTE body carries no ``WITH`` keyword; it is written explicitly
+    # here so the comma-appended ``summary`` CTE never depends on text hidden
+    # inside the constant (issue #779 review).
     count_sql = (
-        f"{base_ctes}, summary AS ({grouped_without_cost}) "
+        f"WITH {base_ctes_body}, summary AS ({grouped_without_cost}) "
         f"SELECT COUNT(*) FROM summary {post_where}"
     )
 
@@ -895,7 +773,7 @@ def _build_change_request_queries(
     limit_idx = len(params) + 1
     offset_idx = len(params) + 2
     data_sql = f"""
-{base_ctes},
+WITH {base_ctes_body},
 summary AS ({grouped_without_cost}),
 paged AS (
     SELECT * FROM summary {post_where}
@@ -912,10 +790,10 @@ session_cost AS (
         FROM run_refs rr
         JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
         JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+        JOIN paged ON paged.provider = rr.provider
+                  AND paged.repository = rr.repository
+                  AND paged.external_id = rr.external_id
         WHERE ars.session_id IS NOT NULL
-          AND (rr.provider, rr.repository, rr.external_id) IN (
-              SELECT provider, repository, external_id FROM paged
-          )
     ) sc
     LEFT JOIN sessions sess ON sess.id = sc.session_id
     GROUP BY sc.provider, sc.repository, sc.external_id
