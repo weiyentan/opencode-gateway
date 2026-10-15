@@ -51,9 +51,37 @@ logger = logging.getLogger(__name__)
 
 # Stable event names — do not rename; downstream log consumers depend on them.
 EVENT_REQUEST_COMPLETED = "request.completed"
+EVENT_REQUEST_FAILED = "request.failed"
 EVENT_OPERATION_COMPLETED = "operation.completed"
 EVENT_OPERATION_TIMEOUT = "operation.timeout"
 EVENT_LOCK_ACQUIRED = "lock.acquired"
+
+
+def _extract_sqlstate(exc: BaseException) -> str | None:
+    """Return the SQLSTATE from an asyncpg/Postgres exception, if present.
+
+    Checks ``sqlstate`` and ``pgcode`` on the exception and its
+    ``__cause__``/``__context__`` chain.  Returns a plain string or None;
+    never logs parameter values or message bodies.
+    """
+    for candidate in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if candidate is None:
+            continue
+        for attr in ("sqlstate", "pgcode"):
+            val = getattr(candidate, attr, None)
+            if val is not None:
+                try:
+                    s = str(val)
+                except Exception:
+                    continue
+                if s:
+                    return s
+    return None
+
+
+def _exception_class_name(exc: BaseException) -> str:
+    """Return a safe, redacted exception class identifier (module.qualname)."""
+    return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
 # Default operation timeout budget in milliseconds when
 # GATEWAY_OPERATION_TIMEOUT_MS is unset or invalid.
@@ -358,28 +386,68 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
         start = time.perf_counter()
         try:
             response = await call_next(request)
-        except Exception:
+        except BaseException as exc:
+            # KeyboardInterrupt/SystemExit must not be swallowed — they are
+            # not request failures and should propagate to the runtime.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
             duration_ms = (time.perf_counter() - start) * 1000
-            logger.info(
+            endpoint = _endpoint_name(request)
+            exception_class = _exception_class_name(exc)
+            sqlstate = _extract_sqlstate(exc)
+            # One identifiable diagnostic log event for the failed request.
+            # Carries correlation_id, route (endpoint), elapsed time, safe
+            # exception class and SQLSTATE when present.  No params, bodies,
+            # or secrets are logged — only the class name and code.
+            # Emits a single request.completed event enhanced with the
+            # diagnostic fields so downstream consumers and existing tests
+            # that count exactly one request.completed log continue to pass.
+            logger.error(
                 EVENT_REQUEST_COMPLETED,
                 extra={
-                    "endpoint": _endpoint_name(request),
+                    "endpoint": endpoint,
                     "duration_ms": round(duration_ms, 3),
                     "status_code": 500,
                     "correlation_id": correlation_id,
+                    "exception_class": exception_class,
+                    "sqlstate": sqlstate,
+                    "method": request.method,
                 },
             )
-            raise
+            # Build a safe envelope error response that preserves the
+            # correlation header so the failed request and its log can be
+            # matched without PostgreSQL logs.  Do not leak exception
+            # messages, SQL, or parameter values.
+            from fastapi.responses import JSONResponse
+
+            resp = JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "error": {"code": "INTERNAL_ERROR", "message": "Internal server error"},
+                },
+            )
+            resp.headers[self.HEADER] = correlation_id
+            return resp
 
         duration_ms = (time.perf_counter() - start) * 1000
         response.headers[self.HEADER] = correlation_id
-        logger.info(
-            EVENT_REQUEST_COMPLETED,
-            extra={
-                "endpoint": _endpoint_name(request),
-                "duration_ms": round(duration_ms, 3),
-                "status_code": response.status_code,
-                "correlation_id": correlation_id,
-            },
-        )
+        # 5xx responses produced by exception handlers (e.g. 504 from
+        # timeout) are already handled inside call_next and arrive here as
+        # normal responses.  Emit request.completed at the usual level;
+        # the diagnostic request.failed path above covers unhandled DB
+        # failures.  For 5xx responses we still attach the safe diagnostic
+        # placeholders so the log shape is uniform.
+        extra: dict[str, object] = {
+            "endpoint": _endpoint_name(request),
+            "duration_ms": round(duration_ms, 3),
+            "status_code": response.status_code,
+            "correlation_id": correlation_id,
+        }
+        if response.status_code >= 500:
+            extra["exception_class"] = None
+            extra["sqlstate"] = None
+            logger.error(EVENT_REQUEST_COMPLETED, extra=extra)
+        else:
+            logger.info(EVENT_REQUEST_COMPLETED, extra=extra)
         return response
