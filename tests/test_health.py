@@ -1,5 +1,6 @@
-"""Tests for the GET /health endpoint."""
+"""Tests for the GET /health, /live, and /ready endpoints."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,23 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.core.factory import create_app
+
+
+def _client(app, *, api_key: Optional[str] = None) -> AsyncClient:
+    """Return an httpx AsyncClient for *app* with an optional API key header.
+
+    ``api_key=None`` (the default) sends no ``Authorization`` header at all
+    — used to exercise the probe auth exemptions.  Pass ``api_key`` to
+    authenticate (needed for DB-backed API requests).
+    """
+    headers = {}
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers=headers,
+    )
 
 
 @pytest.fixture
@@ -44,6 +62,9 @@ def client_broken_db():
     """Return an httpx AsyncClient against an app with a pool whose acquire raises."""
     mock_pool = AsyncMock()
     mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+    # Mirror the synchronous DatabasePool.notify_unavailable() interface
+    # (issue #773) so the failure path does not create an unawaited coroutine.
+    mock_pool.notify_unavailable = MagicMock()
     app = create_app()
     app.state.pool = mock_pool
     transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -119,6 +140,257 @@ class TestHealthDatabaseDisconnected:
         assert response.status_code == 200
         payload = response.json()
         assert payload["data"]["database"] == "disconnected"
+
+
+class TestLiveProbe:
+    """Issue #772 — GET /live is a lightweight process-liveness probe.
+
+    It must return 200 while the FastAPI process can serve requests,
+    WITHOUT checking PostgreSQL and without API credentials.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_returns_200_without_api_key_and_without_pool(self):
+        """/live is auth-exempt and succeeds even when app.state.pool is None."""
+        app = create_app()
+        app.state.pool = None  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/live")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert payload["data"] == {"alive": True}
+
+    @pytest.mark.asyncio
+    async def test_live_returns_200_when_pool_attribute_absent(self):
+        """/live must not require request.app.state.pool to exist at all
+        (no lifespan run, attribute never set)."""
+        app = create_app()
+
+        async with _client(app) as client:
+            response = await client.get("/live")
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_live_returns_200_when_database_broken(self):
+        """/live stays 200 even when the pool's acquire raises — liveness
+        must never depend on PostgreSQL (kubelet must not restart the pod
+        solely because the DB is down)."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/live")
+
+        assert response.status_code == 200
+        # The probe must not have touched the pool at all
+        mock_pool.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_returns_200_with_healthy_pool(self):
+        """/live also succeeds when the pool is healthy (normal case)."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/live")
+
+        assert response.status_code == 200
+        mock_pool.acquire.assert_not_called()
+
+
+class TestReadyProbe:
+    """Issue #772 — GET /ready reports PostgreSQL usability for Kubernetes.
+
+    Returns 200 (auth-exempt) only when the pool is initialized and a
+    bounded connection acquisition succeeds; 503 otherwise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ready_returns_200_when_pool_initialized_and_acquire_succeeds(self):
+        """Healthy initialized pool (mock) → 200 with an ok envelope."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire = AsyncMock(return_value=mock_conn)
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "ok"
+        assert payload["data"] == {"ready": True}
+        mock_pool.release.assert_awaited_once_with(mock_conn)
+
+    @pytest.mark.asyncio
+    async def test_ready_returns_503_when_pool_is_none(self):
+        """Missing pool (the postgres-unavailable startup state) → 503."""
+        app = create_app()
+        app.state.pool = None  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+        error = response.json()["error"]
+        assert error["code"] == "SERVICE_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_ready_returns_503_when_pool_attribute_absent(self):
+        """No pool attribute on app.state at all → 503, never AttributeError."""
+        app = create_app()
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_ready_returns_503_when_pool_uninitialized(self):
+        """DatabasePool registered but inner asyncpg pool never connected
+        (``pool.pool is None``) → 503."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_pool.pool = None
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_ready_returns_503_when_connection_acquisition_fails(self):
+        """Broken pool whose acquire raises → 503 (bounded probe, no hang)."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        mock_pool.notify_unavailable = MagicMock()
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_ready_bounded_probe_timeout(self, monkeypatch):
+        """A hanging acquisition must yield 503 within the bounded probe
+        timeout instead of hanging the request (issue #772)."""
+        monkeypatch.setattr(
+            "app.api.health.READY_PROBE_TIMEOUT_SECONDS", 0.05
+        )
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_pool.notify_unavailable = MagicMock()
+
+        async def _hang() -> None:
+            await asyncio.sleep(10)
+
+        mock_pool.acquire = AsyncMock(side_effect=_hang)
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
+
+
+class TestProbeAuthExemptions:
+    """Issue #772 — Kubernetes probes must work without API credentials.
+
+    Exemptions are limited to /health, /live, and /ready; unrelated routes
+    keep requiring the Admin API Key.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_and_ready_are_auth_exempt(self):
+        """With GATEWAY_API_KEY configured (conftest), /live and /ready are
+        reachable WITHOUT an Authorization header."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire = AsyncMock(return_value=mock_conn)
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app) as client:  # no Authorization header
+            live = await client.get("/live")
+            ready = await client.get("/ready")
+
+        assert live.status_code == 200
+        assert ready.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_ready_503_still_auth_exempt_not_401(self):
+        """An unauthenticated /ready during a DB outage returns the 503
+        readiness verdict — never a 401 (kubelet has no credentials)."""
+        app = create_app()
+        app.state.pool = None  # type: ignore[attr-defined]
+
+        async with _client(app) as client:  # no Authorization header
+            response = await client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json()["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_unrelated_routes_still_require_api_key(self):
+        """Auth exemptions must not broaden: DB-backed routes without a key
+        still get 401."""
+        app = create_app()
+        app.state.pool = None  # type: ignore[attr-defined]
+
+        async with _client(app) as client:  # no Authorization header
+            response = await client.get("/api/v1/afk-outcomes/change-requests")
+
+        assert response.status_code == 401
+
+
+class TestDbBackedRequestServiceUnavailable:
+    """Issue #772 — DB-backed requests fail with a structured 503 envelope
+    when the pool is missing, never 'NoneType' AttributeError or a bare 500."""
+
+    @pytest.mark.asyncio
+    async def test_change_requests_returns_structured_503_when_pool_missing(self):
+        """GET /api/v1/afk-outcomes/change-requests with an authenticated
+        request and no pool → structured 503 via the error envelope."""
+        app = create_app()
+        app.state.pool = None  # type: ignore[attr-defined]
+
+        async with _client(app, api_key="test-api-key") as client:
+            response = await client.get("/api/v1/afk-outcomes/change-requests")
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["status"] == "error"
+        assert payload["error"]["code"] == "SERVICE_UNAVAILABLE"
+        assert "NoneType" not in payload["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_change_requests_returns_503_when_pool_uninitialized(self):
+        """Registered-but-uninitialized pool (pool.pool is None) also yields
+        a structured 503, not a RuntimeError 500."""
+        app = create_app()
+        mock_pool = AsyncMock()
+        mock_pool.pool = None
+        app.state.pool = mock_pool  # type: ignore[attr-defined]
+
+        async with _client(app, api_key="test-api-key") as client:
+            response = await client.get("/api/v1/afk-outcomes/change-requests")
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "SERVICE_UNAVAILABLE"
 
 def _iso_z(ts: datetime) -> str:
     """Serialize an aware datetime the way the /health response does (Z suffix)."""

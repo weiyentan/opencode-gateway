@@ -11,8 +11,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.core.config import get_settings
-from app.db.schema import ensure_schema
-from app.db.session import DatabasePool
+from app.db.session import DatabasePoolSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,9 @@ def create_app(
 
     The application initialises a Postgres connection pool on startup
     and closes it on shutdown.  If Postgres is unreachable the app logs
-    a warning and continues without a pool.
+    a warning and continues without a pool, and a supervised reconnect
+    loop (issue #773) keeps retrying in the background so the Gateway
+    recovers automatically once connectivity returns.
 
     Args:
         on_startup: Optional list of callbacks to run on startup.
@@ -66,32 +67,33 @@ def create_app(
         for hook in startup_hooks:
             await _invoke_hook(hook)
 
-        # --- Postgres pool ---
-        pool = DatabasePool(settings)
-        try:
-            await pool.connect()
-            app.state.pool = pool  # type: ignore[attr-defined]
-        except Exception:
-            logger.warning(
-                "Postgres unavailable — starting without database pool",
-                exc_info=True,
-            )
-            app.state.pool = None  # type: ignore[attr-defined]
-
-        # --- Schema migration (Alembic) ---
-        # Only run if the pool connected successfully.  Schema migration
-        # failures are NOT treated as graceful degradation — they are a
-        # hard startup error because missing tables would cause runtime
-        # failures in API endpoints.
-        if app.state.pool is not None and app.state.pool.pool is not None:  # type: ignore[attr-defined]
-            await ensure_schema(app.state.pool.pool)  # type: ignore[attr-defined]
+        # --- Postgres pool with supervised lifecycle (issue #773) ---
+        # The DatabasePoolSupervisor is the focused lifecycle owner: it
+        # runs the initial connect attempt (bounded per-attempt timeout),
+        # keeps retrying across a prolonged outage with capped exponential
+        # backoff + jitter, verifies every candidate with a connection
+        # test AND the required schema initialization (ensure_schema)
+        # before publishing it as app.state.pool, and replaces the pool
+        # automatically after post-startup failures.  A failed startup
+        # connect is therefore never a permanent ``app.state.pool = None``:
+        # the Gateway reconnects on its own and becomes Ready again once
+        # PostgreSQL is reachable.  Requests that observe acquisition
+        # failures merely signal the single-flight wake; they never spawn
+        # reconnect tasks.
+        pool_supervisor = DatabasePoolSupervisor(
+            settings,
+            publish=lambda db_pool: setattr(app.state, "pool", db_pool),
+        )
+        await pool_supervisor.start()
+        app.state.pool_supervisor = pool_supervisor  # type: ignore[attr-defined]
 
         yield
 
-        # --- Postgres pool shutdown ---
-        db_pool: DatabasePool | None = app.state.pool  # type: ignore[attr-defined]
-        if db_pool is not None:
-            await db_pool.close()
+        # --- Postgres pool shutdown (supervised) ---
+        # Cancels and awaits the reconnect loop, then closes the active
+        # pool, retired pools, and any in-flight candidate — no leaked
+        # tasks or connections.
+        await pool_supervisor.stop()
 
         # --- user-provided shutdown hooks ---
         for hook in shutdown_hooks:
