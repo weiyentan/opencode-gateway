@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 # Stable event names — do not rename; downstream log consumers depend on them.
 EVENT_REQUEST_COMPLETED = "request.completed"
+# Reserved: intentionally not emitted.  The middleware reuses
+# request.completed at ERROR level for failed requests (enhanced with
+# exception_class/sqlstate diagnostics), so downstream consumers that
+# count exactly one terminal request event per request stay stable.
+# Kept so consumers referencing the name remain forward-compatible.
 EVENT_REQUEST_FAILED = "request.failed"
 EVENT_OPERATION_COMPLETED = "operation.completed"
 EVENT_OPERATION_TIMEOUT = "operation.timeout"
@@ -338,19 +343,72 @@ async def timeout_operation(
 # ── Request middleware ──────────────────────────────────────────────────────
 
 
-def _endpoint_name(request: Request) -> str:
-    """Return a stable endpoint name for the request.
+# API path prefix used to recognise fully-qualified route templates.
+# Route objects expose router-relative paths on some Starlette versions,
+# so a candidate without this prefix is not usable as an endpoint name.
+_API_PATH_PREFIX = "/api/v1"
 
-    Prefers the matched route's path format (e.g. ``/items/{item_id}``)
-    so that requests are grouped by route rather than by raw URL; falls
-    back to the raw path (query string excluded) when no route matched
-    (e.g. 404s).
+
+def _route_path_attr(route: object, name: str) -> str | None:
+    """Return a route path attribute as a usable path string, if present.
+
+    Returns the attribute value when it is a non-empty string beginning
+    with ``/``; otherwise ``None`` so callers can fall through to the
+    next source.
+    """
+    value = getattr(route, name, None)
+    if isinstance(value, str) and value.startswith("/"):
+        return value
+    return None
+
+
+def _endpoint_name(request: Request) -> str:
+    """Return a version-stable, fully-qualified endpoint name.
+
+    Requests are grouped by route template rather than by raw URL, so the
+    name must not depend on the installed Starlette/FastAPI version.  Route
+    objects expose different path attributes across versions: the
+    preferred ``path_format`` route template (e.g.
+    ``/api/v1/usage/aggregates``) may be router-relative and omit the API
+    prefix on newer versions (e.g. ``/aggregates``).
+
+    Resolution order:
+
+    1. The matched route's ``path_format`` or ``path`` when either carries
+       the API prefix — the canonical fully-qualified route template.  On
+       most versions ``path_format`` is already full; on versions where it
+       is router-relative, ``path`` often retains the full path.
+    2. When neither attribute carries the API prefix but the concrete
+       request path does, the captured template is router-relative, so the
+       concrete path (query string excluded) is used — always
+       version-stable.  For ``/api/v1/usage/aggregates`` the concrete path
+       equals the route template; for the execution timeline it contains
+       the session UUID but keeps the ``/api/v1/execution`` segment, so
+       requests remain identifiable.
+    3. Otherwise the captured template is complete as-is (non-API routes
+       such as ``/health`` or test routes like ``/items/{item_id}``).
+    4. Requests with no matched route (e.g. 404s, mounted sub-apps) fall
+       through to the concrete path.
     """
     route = request.scope.get("route")
-    path_format = getattr(route, "path_format", None)
-    if isinstance(path_format, str):
-        return path_format
-    return request.url.path
+    concrete = request.url.path
+    if route is not None:
+        path_format = _route_path_attr(route, "path_format")
+        route_path = _route_path_attr(route, "path")
+        # 1. Prefer whichever attribute carries the fully-qualified API path.
+        for candidate in (path_format, route_path):
+            if candidate is not None and candidate.startswith(_API_PATH_PREFIX):
+                return candidate
+        template = path_format or route_path
+        if template is not None:
+            # 2. Router-relative template vs API-prefixed concrete path:
+            #    the concrete path is the version-stable fully-qualified form.
+            if concrete.startswith(_API_PATH_PREFIX):
+                return concrete
+            # 3. Non-API route: the captured template is complete as-is.
+            return template
+    # 4. Concrete path fallback.
+    return concrete
 
 
 class RequestTimingMiddleware(BaseHTTPMiddleware):
@@ -402,8 +460,14 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
             # Emits a single request.completed event enhanced with the
             # diagnostic fields so downstream consumers and existing tests
             # that count exactly one request.completed log continue to pass.
+            #
+            # exc_info preserves the traceback for diagnosability.  The
+            # traceback is rendered through RedactingFormatter, which scans
+            # the fully formatted string (message + traceback) and redacts
+            # secret-like values — see app.core.logging.
             logger.error(
                 EVENT_REQUEST_COMPLETED,
+                exc_info=exc,
                 extra={
                     "endpoint": endpoint,
                     "duration_ms": round(duration_ms, 3),
@@ -435,9 +499,10 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
         # 5xx responses produced by exception handlers (e.g. 504 from
         # timeout) are already handled inside call_next and arrive here as
         # normal responses.  Emit request.completed at the usual level;
-        # the diagnostic request.failed path above covers unhandled DB
-        # failures.  For 5xx responses we still attach the safe diagnostic
-        # placeholders so the log shape is uniform.
+        # the unhandled-exception path above covers raised failures and
+        # attaches the traceback there.  Here no exception object exists —
+        # there is no traceback to attach — so the safe diagnostic
+        # placeholders keep the log shape uniform.
         extra: dict[str, object] = {
             "endpoint": _endpoint_name(request),
             "duration_ms": round(duration_ms, 3),

@@ -285,3 +285,55 @@ class TestFailedReadDiagnosticLogging:
         assert matching[0].correlation_id == resp.headers["X-Correlation-ID"]
         # Route is the execution timeline pattern
         assert "execution" in matching[0].endpoint
+
+    @pytest.mark.asyncio
+    async def test_diagnostic_log_does_not_leak_secrets(
+        self, caplog: pytest.LogCaptureFixture, mock_conn: AsyncMock
+    ) -> None:
+        """Diagnostic log for a failed read does not leak auth or SQL material.
+
+        Uses broad matching (status 500 + exception_class) so the assertion
+        is independent of exact endpoint spelling, and relies solely on
+        _assert_no_secret_leakage which checks Bearer/test-api-key/SELECT/INSERT.
+        The client is created with the default Bearer test-api-key header,
+        ensuring redaction is exercised on every CI run without depending on
+        prior endpoint assertions.
+        """
+        caplog.set_level(logging.INFO, logger=_TELEMETRY_LOGGER)
+
+        mock_conn.fetch = AsyncMock(side_effect=_FakeDBError("boom", sqlstate="42P01"))
+        mock_conn.fetchrow = AsyncMock(side_effect=_FakeDBError("boom", sqlstate="42P01"))
+        mock_conn.fetchval = AsyncMock(side_effect=_FakeDBError("boom", sqlstate="42P01"))
+
+        # create_client injects Authorization: Bearer test-api-key by default
+        client = create_client(mock_conn)
+        async with client as c:
+            resp = await c.get(
+                "/api/v1/usage/aggregates",
+                params={
+                    "start_date": "2025-07-01T00:00:00Z",
+                    "end_date": "2025-07-31T23:59:59Z",
+                },
+            )
+
+        assert resp.status_code == 500
+
+        records = _records(caplog)
+        # Broad matching: any failed-request diagnostic log, no endpoint == check
+        matching = [
+            r
+            for r in records
+            if getattr(r, "status_code", None) == 500
+            and getattr(r, "exception_class", None) is not None
+        ]
+        assert len(matching) == 1, f"expected one diagnostic log, got {len(matching)}: {records}"
+        rec = matching[0]
+        # Verifies Bearer / test-api-key / SELECT / INSERT are absent from
+        # both formatted string and key extra attrs.
+        _assert_no_secret_leakage(rec)
+        # Additional explicit check: diagnostic attrs themselves do not carry SQL
+        formatted = logging.Formatter().format(rec)
+        assert "SELECT" not in formatted
+        assert "INSERT" not in formatted
+        assert "Bearer" not in formatted
+        assert "test-api-key" not in formatted
