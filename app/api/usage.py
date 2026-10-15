@@ -1520,7 +1520,7 @@ async def _fetch_agent_runs(
         params.append(status_filter)
         status_filter_placeholder = f"${len(params)}"
         params.append(status_now)
-        now_placeholder = f"${len(params)}"
+        now_placeholder = f"(${len(params)}::timestamptz)"
         status_expr = _status_case_expression(
             quiet_threshold_minutes=quiet_threshold_minutes,
             stale_threshold_hours=stale_threshold_hours,
