@@ -594,10 +594,11 @@ _PROVIDER_STATE_SQL = """
             END
 """
 
-#: The grouped aggregation body shared by the count and data queries.  Built
-#: with the identity filters (``{inner_where}``) applied pre-aggregation;
-#: state/activity filters are applied on the outer ``summary`` wrapper.
-_CHANGE_REQUEST_GROUPED_SQL = """
+#: Lightweight grouped aggregation without the costly session-cost enrichment.
+#: Used for identity-page selection (count + ordered pagination) before
+#: joining page-scoped cost. Keeps the same ordering/activity/state
+#: columns so filters and ORDER BY apply before the page limit.
+_CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL = """
         SELECT
             i.provider AS provider,
             i.repository AS repository,
@@ -614,14 +615,7 @@ _CHANGE_REQUEST_GROUPED_SQL = """
             COALESCE(ec.running, 0) AS execution_running,
             COALESCE(ec.completed, 0) AS execution_completed,
             COALESCE(ec.failed, 0) AS execution_failed,
-            COALESCE(ec.cancelled, 0) AS execution_cancelled,
-            (
-                SELECT ts.total_estimated_cost_usd
-                FROM session_cost ts
-                WHERE ts.provider = i.provider
-                  AND ts.repository = i.repository
-                  AND ts.external_id = i.external_id
-            ) AS total_estimated_cost_usd
+            COALESCE(ec.cancelled, 0) AS execution_cancelled
         FROM identities i
         LEFT JOIN event_state es
             ON es.provider = i.provider
@@ -644,8 +638,16 @@ _CHANGE_REQUEST_GROUPED_SQL = """
                  ec.latest_exec_at
 """
 
-_CHANGE_REQUEST_CTES = """
-    WITH identities AS (
+#: Shared base CTE body for the change-request summary — ``identities``,
+#: ``run_refs``, ``event_state``, and ``exec_counts`` — without any leading
+#: ``WITH`` keyword and without the costly global session-cost aggregate.
+#: The query builder writes ``WITH`` explicitly and comma-appends the
+#: aggregation CTEs, so composition never depends on text hidden inside this
+#: constant (issue #779 review).  Cost is joined only for the ordered page
+#: identities (issue #779) so pagination reduces enrichment work while
+#: total still reflects all matches and state/activity filters still
+#: apply before the page limit.
+_CHANGE_REQUEST_BASE_CTES_BODY = """identities AS (
         SELECT provider, repository, external_id
         FROM engineering_events
         WHERE entity_type = 'change_request'
@@ -677,20 +679,6 @@ _CHANGE_REQUEST_CTES = """
         SELECT provider, repository, external_id, afk_run_id
         FROM afk_run_entities
         WHERE entity_type = 'change_request'
-    ),
-    session_cost AS (
-        SELECT sc.provider, sc.repository, sc.external_id,
-               SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
-        FROM (
-            SELECT DISTINCT rr.provider, rr.repository, rr.external_id,
-                            ars.session_id AS session_id
-            FROM run_refs rr
-            JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
-            JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
-            WHERE ars.session_id IS NOT NULL
-        ) sc
-        LEFT JOIN sessions sess ON sess.id = sc.session_id
-        GROUP BY sc.provider, sc.repository, sc.external_id
     ),
     event_state AS (
         SELECT provider, repository, external_id,
@@ -735,7 +723,11 @@ def _build_change_request_queries(
     Identity filters (provider, repository) apply pre-aggregation on the
     ``identities`` CTE; the derived provider-state filter and the activity
     window apply post-aggregation on the ``summary`` wrapper, so the
-    paginated ``total`` reflects the full filter set.
+    paginated ``total`` reflects the full filter set.  The data query
+    chooses the ordered identity page before page-only cost enrichment
+    (issue #779): ``summary``/``paged`` order and filter before the
+    ``LIMIT``/``OFFSET``, then a page-scoped ``session_cost`` CTE left-joins
+    cost only for those identities.
     """
     params: list[object] = []
     inner_filters: list[str] = []
@@ -759,20 +751,74 @@ def _build_change_request_queries(
         params.append(activity_to)
     post_where = f"WHERE {' AND '.join(post_filters)}" if post_filters else ""
 
-    ctes = _CHANGE_REQUEST_CTES.format(open_types=_OPEN_EVENT_TYPES)
-    grouped = _CHANGE_REQUEST_GROUPED_SQL.format(
+    base_ctes_body = _CHANGE_REQUEST_BASE_CTES_BODY.format(open_types=_OPEN_EVENT_TYPES)
+    grouped_without_cost = _CHANGE_REQUEST_GROUPED_WITHOUT_COST_SQL.format(
         inner_where=inner_where, provider_state_sql=_PROVIDER_STATE_SQL
     )
 
-    count_sql = f"SELECT COUNT(*) FROM (\n{ctes}{grouped}\n) AS summary {post_where}"
+    # Count over the full filtered set — no LIMIT and no session_cost.  The
+    # shared CTE body carries no ``WITH`` keyword; it is written explicitly
+    # here so the comma-appended ``summary`` CTE never depends on text hidden
+    # inside the constant (issue #779 review).
+    count_sql = (
+        f"WITH {base_ctes_body}, summary AS ({grouped_without_cost}) "
+        f"SELECT COUNT(*) FROM summary {post_where}"
+    )
+
+    # Data query: choose ordered page first, then page-scoped cost enrichment.
+    # ``paged`` is filtered + ordered + limited from ``summary`` using the
+    # same ``summary.*`` predicates so state/activity filters apply before
+    # the page limit (and total still counts all matches). ``session_cost``
+    # then aggregates deduplicated sessions only for ``paged`` identities.
+    limit_idx = len(params) + 1
+    offset_idx = len(params) + 2
     data_sql = f"""
-{ctes}SELECT * FROM (
-{grouped}
-) AS summary
-{post_where}
-ORDER BY summary.latest_execution_activity DESC NULLS LAST,
-         summary.provider ASC, summary.repository ASC, summary.external_id ASC
-LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+WITH {base_ctes_body},
+summary AS ({grouped_without_cost}),
+paged AS (
+    SELECT * FROM summary {post_where}
+    ORDER BY summary.latest_execution_activity DESC NULLS LAST,
+             summary.provider ASC, summary.repository ASC, summary.external_id ASC
+    LIMIT ${limit_idx} OFFSET ${offset_idx}
+),
+session_cost AS (
+    SELECT sc.provider, sc.repository, sc.external_id,
+           SUM(sess.total_estimated_cost_usd) AS total_estimated_cost_usd
+    FROM (
+        SELECT DISTINCT rr.provider, rr.repository, rr.external_id,
+                        ars.session_id AS session_id
+        FROM run_refs rr
+        JOIN afk_runs r ON r.afk_run_id = rr.afk_run_id
+        JOIN afk_run_sessions ars ON ars.afk_run_id = r.afk_run_id
+        JOIN paged ON paged.provider = rr.provider
+                  AND paged.repository = rr.repository
+                  AND paged.external_id = rr.external_id
+        WHERE ars.session_id IS NOT NULL
+    ) sc
+    LEFT JOIN sessions sess ON sess.id = sc.session_id
+    GROUP BY sc.provider, sc.repository, sc.external_id
+)
+SELECT
+    paged.provider,
+    paged.repository,
+    paged.external_id,
+    paged.provider_state,
+    paged.latest_activity_at,
+    paged.provider_state_observed_at,
+    paged.latest_execution_activity,
+    paged.execution_total,
+    paged.execution_running,
+    paged.execution_completed,
+    paged.execution_failed,
+    paged.execution_cancelled,
+    session_cost.total_estimated_cost_usd AS total_estimated_cost_usd
+FROM paged
+LEFT JOIN session_cost
+  ON session_cost.provider = paged.provider
+ AND session_cost.repository = paged.repository
+ AND session_cost.external_id = paged.external_id
+ORDER BY paged.latest_execution_activity DESC NULLS LAST,
+         paged.provider ASC, paged.repository ASC, paged.external_id ASC
 """
     return count_sql, data_sql, params
 
