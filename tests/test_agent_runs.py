@@ -1339,10 +1339,10 @@ class TestPageBeforeEnrichment:
         assert "WHERE sub._status" not in sql
         assert "= $1" in sql
         assert sql.index("= $1") < sql.index("LIMIT $")
-        assert "s.last_message_at > $2 - interval" in sql
+        assert "s.last_message_at > ($2::timestamptz) - interval" in sql
         # The count query keeps the same predicate and binding shape.
         count_flat = _norm_sql(count_sql)
-        assert "s.last_message_at > $2 - interval" in count_flat
+        assert "s.last_message_at > ($2::timestamptz) - interval" in count_flat
 
 
 # ══════════════════════════════════════════════════════════════════════════

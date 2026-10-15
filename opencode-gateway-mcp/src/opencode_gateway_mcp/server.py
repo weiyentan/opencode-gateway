@@ -30,7 +30,10 @@ from opencode_gateway_mcp.client import (
     GatewayClient,
     GatewayConfig,
     GatewayConfigError,
+    GatewayConnectionError,
     GatewayError,
+    GatewayHTTPError,
+    GatewayResponseError,
 )
 
 SERVER_NAME = "opencode-gateway-mcp"
@@ -156,6 +159,32 @@ _VALID_PROVIDER_STATES = frozenset({"open", "closed", "merged"})
 _VALID_AGENT_RUN_STATUSES = frozenset(
     {"running", "stale", "completed", "blocked", "unknown"}
 )
+
+
+def _gateway_error_to_tool_error(exc: GatewayError) -> ToolError:
+    """Map upstream Gateway failures to distinct upstream-failure ToolErrors.
+
+    HTTP 500, HTTP 404, and timeout/connection errors each get a distinct
+    safe code/category never confused with local invalid-argument validation.
+    Messages remain credential- and body-safe because ``exc`` is already
+    redacted (no API key, headers, or raw Gateway body).
+    """
+    msg = str(exc)
+    if isinstance(exc, GatewayConnectionError):
+        # Timeout is distinct from generic connection failure; both are upstream.
+        if "timeout" in msg.lower():
+            return ToolError(f"Gateway upstream timeout: {msg} [UPSTREAM_TIMEOUT]")
+        return ToolError(f"Gateway upstream connection failure: {msg} [UPSTREAM_CONNECTION_ERROR]")
+    if isinstance(exc, GatewayHTTPError):
+        code = exc.status_code
+        if 500 <= code < 600:
+            return ToolError(f"Gateway upstream failure (HTTP {code}): {msg} [UPSTREAM_ERROR]")
+        if code == 404:
+            return ToolError(f"Gateway resource not found (HTTP 404): {msg} [UPSTREAM_NOT_FOUND]")
+        return ToolError(f"Gateway request failed (HTTP {code}): {msg} [UPSTREAM_HTTP_{code}]")
+    if isinstance(exc, GatewayResponseError):
+        return ToolError(f"Gateway upstream response error: {msg} [UPSTREAM_RESPONSE_ERROR]")
+    return ToolError(f"Gateway upstream error: {msg} [UPSTREAM_ERROR]")
 
 
 class CollectorHealth(BaseModel):
@@ -816,7 +845,7 @@ def create_server(
         try:
             payload: dict[str, Any] = await gateway.get_health()
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return GatewayHealth.model_validate(payload)
         except ValidationError:
@@ -850,7 +879,7 @@ def create_server(
                 interval=interval,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return AFKActivitySummary.model_validate(payload)
         except ValidationError:
@@ -898,7 +927,7 @@ def create_server(
                 offset=offset,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return ListAFKRunsResult.model_validate(payload)
         except ValidationError:
@@ -937,7 +966,7 @@ def create_server(
                 offset=offset,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return ListChangeRequestsResult.model_validate(payload)
         except ValidationError:
@@ -965,7 +994,7 @@ def create_server(
                 session_id=session_id,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return [UsageAggregateRow.model_validate(r) for r in rows]
         except ValidationError:
@@ -992,7 +1021,7 @@ def create_server(
                 session_id=session_id,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return [UsageAggregateRow.model_validate(r) for r in rows]
         except ValidationError:
@@ -1023,7 +1052,7 @@ def create_server(
                 gateway.get_afk_executions_for_run(trimmed),
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             executions = [AfkExecutionBinding.model_validate(item) for item in executions_raw]
         except ValidationError:
@@ -1074,7 +1103,7 @@ def create_server(
                 provider.strip(), repository.strip(), external_number.strip()
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return ChangeRequestStory.model_validate(payload)
         except ValidationError:
@@ -1093,7 +1122,7 @@ def create_server(
                 reason=reason, limit=limit, offset=offset
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return CorrelationIssuesResult.model_validate(payload)
         except ValidationError:
@@ -1147,7 +1176,7 @@ def create_server(
                 offset=offset,
             )
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return ListSessionsResult.model_validate(payload)
         except ValidationError:
@@ -1198,7 +1227,7 @@ def create_server(
         try:
             payload: dict[str, Any] = await gateway.get_agent_run_detail(trimmed)
         except GatewayError as exc:
-            raise ToolError(str(exc)) from None
+            raise _gateway_error_to_tool_error(exc) from None
         try:
             return AgentRunDetail.model_validate(payload)
         except ValidationError:
