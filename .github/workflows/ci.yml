@@ -63,6 +63,7 @@ jobs:
             tests/integration/test_afk_run_api_compatibility.py \
             tests/integration/test_execution_reconciliation_integration.py \
             tests/integration/test_afk_dashboard_golden_dataset.py \
+            tests/integration/test_db_reconnect_smoke.py \
             -v -m integration
 
       - name: Lint Python

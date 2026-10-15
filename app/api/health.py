@@ -1,15 +1,24 @@
 """Health check endpoint — reports application status, database connectivity,
 and collector/source-database health.
+
+Also hosts the Kubernetes probe endpoints introduced by issue #772:
+
+* ``GET /live`` — process-liveness probe.  Returns 200 while the FastAPI
+  process can serve requests; it deliberately never touches PostgreSQL.
+* ``GET /ready`` — readiness probe.  Returns 200 only when the Gateway has
+  an initialized, usable PostgreSQL pool; 503 for a missing/uninitialized
+  pool, a failed bounded connection acquisition, or a broken connection.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
@@ -27,6 +36,12 @@ router = APIRouter(tags=["health"])
 # construction — an include-prefix rule filters new integration clients
 # without maintaining a denylist.
 REMOTE_COLLECTOR_CLIENT_PREFIX = "remote-collector"
+
+# Short bounded probe timeout for GET /ready (issue #772): the readiness
+# probe must answer quickly so a PostgreSQL outage can never hang kubelet
+# probes or request workers.  Kubernetes probe timeouts in the deployment
+# manifest must be at least this value.
+READY_PROBE_TIMEOUT_SECONDS: float = 2.0
 
 
 
@@ -288,6 +303,9 @@ async def health(request: Request) -> HealthResponse:
         db_status = "connected"
     except Exception:
         logger.warning("Health endpoint: database acquire failed", exc_info=True)
+        # Single-flight reconnect trigger (issue #773): the supervisor
+        # performs one reconnect cycle; never one task per request.
+        db_pool.notify_unavailable()
         return HealthResponse(version=_get_version(), database="disconnected")
 
     # Enrich with collector / source-database health when connected
@@ -302,3 +320,72 @@ async def health(request: Request) -> HealthResponse:
         collectors=collectors,
         source_databases=source_dbs,
     )
+
+
+# ── Kubernetes probes (issue #772) ────────────────────────────────────────
+
+
+@router.get("/live")
+async def live() -> dict[str, bool]:
+    """Lightweight Kubernetes liveness probe.
+
+    Returns 200 while the FastAPI process can serve requests.  It is
+    deliberately free of any database check or collector query: kubelet
+    uses liveness to decide whether to RESTART the pod, so PostgreSQL
+    unavailability must never fail this probe (a DB outage marks the pod
+    NotReady via /ready, it does not restart it).
+    """
+    return {"alive": True}
+
+
+@router.get("/ready")
+async def ready(request: Request) -> dict[str, bool]:
+    """Kubernetes readiness probe — 200 only when PostgreSQL is usable.
+
+    Returns 503 (through the standard error envelope) when:
+
+    * the connection pool is missing (``app.state.pool`` is None/absent);
+    * the registered pool is uninitialized (no underlying asyncpg pool);
+    * a bounded connection acquisition fails (PostgreSQL unreachable,
+      broken connection, or the probe times out).
+
+    The whole probe runs under ``READY_PROBE_TIMEOUT_SECONDS`` so kubelet
+    probes and request workers can never hang on a DB outage.
+    """
+    db_pool: DatabasePool | None = getattr(request.app.state, "pool", None)
+    if db_pool is None or db_pool.pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection pool is not initialized",
+        )
+
+    async def _probe() -> None:
+        conn = await db_pool.acquire()
+        try:
+            # Round-trip verifies the acquired connection is actually usable,
+            # not merely handed out by a pool whose backend is gone.
+            await conn.fetchval("SELECT 1")
+        finally:
+            await db_pool.release(conn)
+
+    try:
+        await asyncio.wait_for(_probe(), timeout=READY_PROBE_TIMEOUT_SECONDS)
+    except (asyncio.TimeoutError, TimeoutError):  # noqa: UP041 — py39 backport compat
+        logger.warning("Ready probe: timed out after %.1fs", READY_PROBE_TIMEOUT_SECONDS)
+        # Single-flight reconnect trigger (issue #773): a probe failure is a
+        # prompt unavailability signal; the supervisor runs one reconnect
+        # cycle instead of one task per probe/request.
+        db_pool.notify_unavailable()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database readiness probe timed out",
+        ) from None
+    except Exception as exc:  # noqa: BLE001 — any probe failure means not ready
+        logger.warning("Ready probe: database acquisition failed", exc_info=exc)
+        db_pool.notify_unavailable()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable",
+        ) from exc
+
+    return {"ready": True}

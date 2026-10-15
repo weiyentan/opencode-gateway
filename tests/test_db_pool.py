@@ -137,6 +137,48 @@ class TestDatabasePoolEdgeCases:
             await db_pool.close()
             await db_pool.close()  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_release_is_shielded_from_caller_cancellation(self):
+        """A cancelled caller must not abort an in-flight pool release.
+
+        The release is shielded (issue #773) so the connection is still
+        returned to the pool it was acquired from when the request is
+        cancelled mid-release.
+        """
+        from app.core.config import Settings
+        from app.db.session import DatabasePool
+
+        release_started = asyncio.Event()
+        release_may_finish = asyncio.Event()
+        released: list[object] = []
+
+        async def _slow_release(conn):
+            release_started.set()
+            await release_may_finish.wait()
+            released.append(conn)
+
+        mock_asyncpg_pool = MagicMock(spec=["release"])
+        mock_asyncpg_pool.release = AsyncMock(side_effect=_slow_release)
+        mock_create_pool = AsyncMock(return_value=mock_asyncpg_pool)
+        with patch("app.db.session.asyncpg.create_pool", mock_create_pool):
+            db_pool = DatabasePool(Settings())
+            await db_pool.connect()
+
+        mock_conn = MagicMock()
+        task = asyncio.create_task(db_pool.release(mock_conn))
+        await release_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The shutdown of the caller must not cancel the in-flight release.
+        release_may_finish.set()
+        for _ in range(100):
+            if released:
+                break
+            await asyncio.sleep(0)
+        assert released == [mock_conn]
+
 
 class TestGetSessionDependency:
     """Tests for the get_session FastAPI dependency."""
@@ -166,17 +208,80 @@ class TestGetSessionDependency:
         mock_pool.release.assert_called_once_with(mock_conn)
 
     @pytest.mark.asyncio
-    async def test_get_session_raises_when_pool_is_none(self):
-        """get_session() should raise when app.state.pool is None."""
+    async def test_get_session_raises_503_when_pool_is_none(self):
+        """get_session() should raise HTTPException 503 when app.state.pool is
+        None — never the old 'NoneType' AttributeError (issue #772)."""
         from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
 
         from app.db.session import get_session
 
         request = MagicMock()
         request.app.state.pool = None
 
-        with pytest.raises(AttributeError):
+        with pytest.raises(HTTPException) as exc_info:
             await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_pool_attribute_absent(self):
+        """get_session() should raise HTTPException 503 when app.state has no
+        pool attribute at all (never AttributeError)."""
+        from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        # request.app.state.pool intentionally never set
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_pool_uninitialized(self):
+        """get_session() should raise HTTPException 503 when the registered
+        DatabasePool has no underlying asyncpg pool yet (pool.pool is None)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        mock_pool = AsyncMock()
+        mock_pool.pool = None
+        request.app.state.pool = mock_pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_get_session_raises_503_when_acquisition_fails(self):
+        """get_session() should raise HTTPException 503 when the pool's
+        acquire() fails (PostgreSQL unreachable) — not a bare 500."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastapi import HTTPException
+
+        from app.db.session import get_session
+
+        request = MagicMock()
+        mock_pool = AsyncMock()
+        mock_pool.acquire = AsyncMock(side_effect=OSError("Connection refused"))
+        # The single-flight unavailable signal is synchronous on the real
+        # DatabasePool; the mock mirrors the interface without a coroutine.
+        mock_pool.notify_unavailable = MagicMock()
+        request.app.state.pool = mock_pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_session(request).__anext__()
+        assert exc_info.value.status_code == 503
+        mock_pool.notify_unavailable.assert_called_once()
 
 
 class TestLifespanIntegration:
@@ -184,15 +289,30 @@ class TestLifespanIntegration:
 
     @staticmethod
     def _make_acquirable_pool() -> AsyncMock:
-        """Return a mock asyncpg.Pool whose acquire() supports async with."""
+        """Return a mock asyncpg.Pool whose acquire() mirrors the real API:
+        awaitable (``conn = await pool.acquire()``) AND an async context
+        manager (``async with pool.acquire() as conn``) — like asyncpg's
+        ``PoolAcquireContext`` (required by the issue #773 supervisor's
+        candidate connection test and ``check_required_tables``)."""
         mock_conn = AsyncMock()
-        mock_ctx = MagicMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_ctx.__aexit__ = AsyncMock(return_value=None)
+
+        class _AcquireResult:
+            def __await__(self):
+                async def _get() -> AsyncMock:
+                    return mock_conn
+
+                return _get().__await__()
+
+            async def __aenter__(self) -> AsyncMock:
+                return mock_conn
+
+            async def __aexit__(self, *exc_info) -> None:
+                return None
 
         mock_pool = AsyncMock()
         # acquire() is NOT a coroutine — it returns an async context manager
-        mock_pool.acquire = MagicMock(return_value=mock_ctx)
+        # that is also directly awaitable
+        mock_pool.acquire = MagicMock(return_value=_AcquireResult())
         return mock_pool
 
     @pytest.mark.asyncio
