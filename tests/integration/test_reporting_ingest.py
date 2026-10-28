@@ -1,7 +1,8 @@
 """Integration tests for the reporting-ingestion write path (issue #479).
 
-Runs against the docker-compose Postgres (port 5433) and verifies the actual
-database-enforced guarantees of ``POST /api/v1/reporting/ingest/deliveries``:
+Runs against an isolated, disposable PostgreSQL 16 database and verifies the
+actual database-enforced guarantees of
+``POST /api/v1/reporting/ingest/deliveries``:
 
 * the ``reporting_deliveries`` UNIQUE (provider, delivery_id) constraint plus
   ``ON CONFLICT DO NOTHING`` absorb a redelivery — exactly one row;
@@ -13,20 +14,34 @@ database-enforced guarantees of ``POST /api/v1/reporting/ingest/deliveries``:
 
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as a
+disposable PostgreSQL 16 database.  Start one outside Kubernetes before
+running::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_test \\
+        -e POSTGRES_USER=opencode_test \\
+        -e POSTGRES_PASSWORD=opencode_test \\
+        -p 5433:5432 postgres:16-alpine
+
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_reporting_ingest.py -v -m integration
+
+    docker stop opencode-gateway-test-db
 
 Connection parameters come from the standard Gateway environment variables
-(defaulting to the ``docker-compose.test.yml`` service).  The test skips
-gracefully when the database is not reachable.
+(defaulting to ``localhost:5433``).  ``GATEWAY_TEST_DISPOSABLE_DB=1`` is the
+operator's explicit attestation that the database is disposable; missing
+attestation, an unreachable server, a non-test database name, a Kubernetes
+target, or a non-PostgreSQL-16 server fails closed instead of skipping.  CI
+runs this suite against a dedicated ``postgres:16`` service container.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -34,17 +49,27 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+from fastapi import Request
 
 from app.core.identity import hash_token
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
+
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
@@ -55,38 +80,40 @@ _API_KEY = "test-api-key"
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
+    return _TARGET.dsn()
 
 
-async def _can_connect() -> bool:
+async def _drop_all_tables() -> None:
+    """Drop every public table — the retry path for a corrupt schema state."""
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
     try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
+        await conn.execute(_DROP_ALL_SQL)
+    finally:
         await conn.close()
-        return True
-    except Exception:
-        return False
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``_migrated_schema`` (and therefore before any destructive
+    migration reset).  A missing attestation, unreachable server, non-test
+    database name, Kubernetes target, or wrong server version raises an error
+    — never a skip, so CI cannot go green on an unverified or skipped target.
+    """
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the test database to ``head`` once per module.
 
+    Deliberately synchronous: alembic's ``env.py`` calls ``asyncio.run``,
+    which cannot run inside the pytest-asyncio event loop.  A failed first
+    attempt (e.g. leftover partial tables) drops every public table and
+    retries from scratch.  The drop only runs after
+    ``_verified_disposable_database`` has proven the target disposable.
+    """
     import alembic.command
     import alembic.config
 
@@ -97,24 +124,30 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     try:
         alembic.command.upgrade(alembic_cfg, "head")
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
+        asyncio.run(_drop_all_tables())
         alembic.command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture
+async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
+    """Function-scoped pool on the migrated test database.
+
+    pytest-asyncio runs every async test in a fresh event loop, and an
+    asyncpg pool is bound to the loop that created it.  Teardown removes the
+    rows this suite writes so each test starts from a clean slate; it never
+    drops tables, so it cannot destroy state another suite may still need.
+    """
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
 
     yield pool
 
     async with pool.acquire() as conn:
         await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
+            "TRUNCATE reporting_deliveries, delivery_state_trails CASCADE"
         )
+        await conn.execute("DELETE FROM collector_credentials")
+        await conn.execute("DELETE FROM opencode_clients")
     await pool.close()
 
 
@@ -169,8 +202,13 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
     Overrides ``get_session`` to acquire/release a real connection and sends
     the bearer token matching both the API-key middleware and the seeded
     collector credential (``hash_token("test-api-key")``).
+
+    ``Request`` is imported at module level (not inside this function): the
+    module uses ``from __future__ import annotations``, so the override's
+    ``request: Request`` annotation is a string that FastAPI resolves
+    against this module's globals — without a module-level import it is
+    misread as a query parameter and the request fails with a 422.
     """
-    from fastapi import Request
     from httpx import ASGITransport, AsyncClient
 
     from app.core.factory import create_app
@@ -243,7 +281,11 @@ async def test_same_delivery_twice_persists_one_row(db_pool: asyncpg.Pool) -> No
         assert row["provider"] == "github"
         assert row["event_type"] == "normalized"
         assert row["client_id"] == client_id
-        assert row["payload"]["repository"] == "acme/backend"
+        # asyncpg returns ``jsonb`` as text unless the pool installs a codec.
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert payload["repository"] == "acme/backend"
 
 
 @pytest.mark.integration
