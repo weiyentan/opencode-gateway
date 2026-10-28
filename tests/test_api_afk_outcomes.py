@@ -15,6 +15,7 @@ and 400 for invalid filter values.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -171,12 +172,12 @@ def _mk_correlation_row(
     repository: str = "acme/proj",
     entity_type: str = "issue",
     external_id: str = "37",
-    afk_run_id: str | None = None,
+    afk_run_id: str = _RUN_ID,
     method: str = "temporal_inference",
     reason: str | None = None,
     correlation_confidence: float = 0.4,
-    candidates: list | None = None,
-    evidence: list | None = None,
+    candidates: object = None,
+    evidence: object = None,
     resolver_version: str | None = "1",
     created_at: datetime | None = _A_TS,
 ):
@@ -191,7 +192,7 @@ def _mk_correlation_row(
             "reason": reason,
             "correlation_confidence": correlation_confidence,
             "candidates": candidates if candidates is not None else [],
-            "evidence": evidence or [],
+            "evidence": evidence if evidence is not None else [],
             "resolver_version": resolver_version,
             "created_at": created_at,
         }
@@ -613,7 +614,9 @@ class TestListCorrelations:
         assert item["correlation_confidence"] == 0.4
         assert item["resolver_version"] == "1"
         assert item["provisional"] is True
-        assert item["afk_run_id"] is None  # unresolved state
+        # Migration 0027 makes afk_run_id NOT NULL: even an unresolved
+        # low-confidence link is attributed to the run that produced it.
+        assert item["afk_run_id"] == _RUN_ID
 
     @pytest.mark.asyncio
     async def test_empty_results(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -683,6 +686,150 @@ class TestListCorrelations:
         item = response.json()["data"]["items"][0]
         assert item["reason"] == "unmatched"
         assert item["candidates"] == []
+
+    @pytest.mark.asyncio
+    async def test_jsonb_string_empty_candidates_decode_to_empty_list(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Plain asyncpg returns JSONB as a JSON-encoded string (``'[]'``).
+
+        The row must decode to ``candidates: []`` with HTTP 200 — never a
+        response-validation 500.
+        """
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="unmatched",
+                    reason="unmatched",
+                    correlation_confidence=0.0,
+                    candidates="[]",
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/afk-outcomes/correlations",
+                params={"reason": "unmatched"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+        item = data["items"][0]
+        assert item["reason"] == "unmatched"
+        assert item["candidates"] == []
+        assert item["afk_run_id"] == _RUN_ID
+
+    @pytest.mark.asyncio
+    async def test_jsonb_string_populated_candidates_decode_to_list(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A non-empty JSONB string array decodes to ``list[str]``, keeping
+        every candidate value."""
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="ambiguous",
+                    reason="ambiguous",
+                    correlation_confidence=0.0,
+                    candidates='["change_request:300", "change_request:310"]',
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get(
+                "/api/v1/afk-outcomes/correlations",
+                params={"reason": "ambiguous"},
+            )
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["candidates"] == ["change_request:300", "change_request:310"]
+
+    @pytest.mark.asyncio
+    async def test_jsonb_string_evidence_is_decoded_not_dropped(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Serialized JSONB evidence decodes into the existing evidence shape,
+        preserving the stored provenance instead of silently returning []."""
+        evidence = [
+            {
+                "kind": "title_match",
+                "source_entity_id": "change_request:300",
+                "detail": "title=Fix caching bug",
+                "weight": 1.0,
+            }
+        ]
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="unmatched",
+                    reason="unmatched",
+                    correlation_confidence=0.0,
+                    evidence=json.dumps(evidence),
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk-outcomes/correlations")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["evidence"] == evidence
+
+    @pytest.mark.asyncio
+    async def test_already_decoded_jsonb_candidates_and_evidence_still_work(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """Already-decoded list inputs (custom codecs / mocks) remain accepted
+        unchanged."""
+        evidence = [
+            {
+                "kind": "branch_name",
+                "source_entity_id": "issue:42",
+                "detail": "afk-42",
+                "weight": 0.5,
+            }
+        ]
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                _mk_correlation_row(
+                    entity_type="afk_run",
+                    external_id=_RUN_ID,
+                    afk_run_id=_RUN_ID,
+                    method="ambiguous",
+                    reason="ambiguous",
+                    correlation_confidence=0.0,
+                    candidates=["issue:42", "issue:43"],
+                    evidence=evidence,
+                )
+            ]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk-outcomes/correlations")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["candidates"] == ["issue:42", "issue:43"]
+        assert item["evidence"] == evidence
 
     @pytest.mark.asyncio
     async def test_reason_filter_narrows_query(self, client: AsyncClient, mock_conn: AsyncMock):
@@ -761,3 +908,33 @@ class TestEnvelopeAndReadOnly:
             for method in app.openapi()["paths"][path]
         }
         assert methods == {"GET"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Unresolved-correlation public contract
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TestUnresolvedCorrelationContract:
+    """The published row contract mirrors migration 0027's NOT NULL run identity."""
+
+    def test_afk_run_id_is_required_and_non_nullable(self) -> None:
+        from pydantic import ValidationError
+
+        from app.core.schemas.afk import UnresolvedCorrelationRow
+
+        base = dict(
+            entity_id=f"afk_run:{_RUN_ID}",
+            entity_type="afk_run",
+            external_id=_RUN_ID,
+            provider="github",
+            repository="acme/proj",
+            method="unmatched",
+            reason="unmatched",
+        )
+
+        with pytest.raises(ValidationError):
+            UnresolvedCorrelationRow(**base)  # type: ignore[arg-type]
+
+        with pytest.raises(ValidationError):
+            UnresolvedCorrelationRow(afk_run_id=None, **base)  # type: ignore[arg-type]

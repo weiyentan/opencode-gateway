@@ -521,7 +521,8 @@ class UnresolvedCorrelationRow(BaseModel):
     ``provisional`` marker that is always ``True`` (an unresolved correlation
     is, by definition, not confidently resolved to an entity link).
 
-    Two kinds of row are surfaced:
+    Two kinds of row are surfaced; both are attributed to the run that
+    produced them (``afk_run_id`` is NOT NULL — migration 0027):
 
     * **Low-confidence links** — ``reason`` is ``None`` and ``candidates`` is
       empty; ``entity_id``/``entity_type``/``external_id`` are the real
@@ -538,9 +539,11 @@ class UnresolvedCorrelationRow(BaseModel):
     external_id: str
     provider: str
     repository: str
-    afk_run_id: str | None = Field(
-        default=None,
-        description="Attributed run, or None when not yet attributed (unresolved)",
+    afk_run_id: str = Field(
+        description=(
+            "Owning run id (required — unresolved_correlations.afk_run_id is "
+            "NOT NULL, migration 0027)"
+        )
     )
     method: str
     reason: str | None = Field(
