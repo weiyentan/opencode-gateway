@@ -1,7 +1,7 @@
 """Integration concurrency tests for the provisional AFK run lifecycle (issue #589).
 
-Runs against the docker-compose Postgres (port 5433) and verifies the actual
-database-enforced guarantees of ``/api/v1/afk/executions/runs``:
+Runs against an isolated, disposable PostgreSQL 16 database and verifies the
+actual database-enforced guarantees of ``/api/v1/afk/executions/runs``:
 
 * Concurrent identical provisioning of the same
   ``(provider, host, source_event_id)`` key — exactly one 201 Created and
@@ -16,11 +16,25 @@ database-enforced guarantees of ``/api/v1/afk/executions/runs``:
 
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as a
+disposable PostgreSQL 16 database.  Start one outside Kubernetes before
+running::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/test_afk_lifecycle_concurrency.py -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_test \\
+        -e POSTGRES_USER=opencode_test \\
+        -e POSTGRES_PASSWORD=opencode_test \\
+        -p 5433:5432 postgres:16-alpine
+
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_afk_lifecycle_concurrency.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+``GATEWAY_TEST_DISPOSABLE_DB=1`` is the operator's explicit attestation that
+the database is disposable; without it the safety preflight fails closed.
+CI runs this suite against a dedicated ``postgres:16`` service container.
 
 Fixture layout notes
 --------------------
@@ -53,14 +67,16 @@ import pytest
 from fastapi import Request
 
 from app.core.identity import hash_token
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 _API_KEY = "test-api-key"
 
@@ -89,10 +105,7 @@ _DROP_ALL_SQL = (
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
+    return _TARGET.dsn()
 
 
 def _migration_env() -> dict[str, str]:
@@ -101,11 +114,11 @@ def _migration_env() -> dict[str, str]:
     env.update(
         {
             "GATEWAY_ENV": "development",
-            "GATEWAY_DATABASE_HOST": _DEFAULT_HOST,
-            "GATEWAY_DATABASE_PORT": str(_DEFAULT_PORT),
-            "GATEWAY_DATABASE_NAME": _DEFAULT_DB,
-            "GATEWAY_DATABASE_USER": _DEFAULT_USER,
-            "GATEWAY_DATABASE_PASSWORD": _DEFAULT_PASSWORD,
+            "GATEWAY_DATABASE_HOST": _TARGET.host,
+            "GATEWAY_DATABASE_PORT": str(_TARGET.port),
+            "GATEWAY_DATABASE_NAME": _TARGET.name,
+            "GATEWAY_DATABASE_USER": _TARGET.user,
+            "GATEWAY_DATABASE_PASSWORD": _TARGET.password,
         }
     )
     return env
@@ -164,33 +177,27 @@ async def _drop_all_tables() -> None:
         await conn.close()
 
 
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncio.wait_for(asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0)
-        await conn.close()
-        return True
-    except Exception:
-        return False
+@pytest.fixture(scope="module")
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``_migrated_schema`` (and therefore before any destructive
+    migration reset).  A missing attestation, unreachable server, non-test
+    database name, Kubernetes target, or wrong server version raises an error
+    — never a skip, so CI cannot go green on an unverified or skipped target.
+    """
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
-
-
-@pytest.fixture(scope="module")
-def _migrated_schema(_integration_db_available: bool) -> None:
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
     """Migrate the test database to ``head`` once per module.
 
     Deliberately synchronous: the migration subprocess must not run inside
     the pytest-asyncio event loop (alembic's env.py calls ``asyncio.run``).
     A failed first attempt (e.g. leftover partial tables) drops every
-    public table and retries from scratch.
+    public table and retries from scratch.  The drop only runs after
+    ``_verified_disposable_database`` has proven the target disposable.
     """
     try:
         _run_migrations()

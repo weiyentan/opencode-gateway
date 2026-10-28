@@ -25,6 +25,24 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Dedicated disposable PostgreSQL for the destructive AFK concurrency
+      # and reporting-ingestion suites.  This container is separate from the
+      # shared ``postgres`` service above so their migration-reset/teardown
+      # can never erase another suite's data.
+      postgres-isolated:
+        image: postgres:16
+        env:
+          POSTGRES_DB: opencode_gateway_disposable_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d opencode_gateway_disposable_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -68,6 +86,96 @@ jobs:
             tests/integration/test_change_request_summary.py \
             tests/integration/test_afk_outcomes_correlations_jsonb.py \
             -v -m integration
+
+      # Required gate: the AFK lifecycle concurrency and reporting-ingestion
+      # suites migrate the schema and can drop all public tables.  They run
+      # only against the dedicated disposable postgres-isolated container,
+      # with an explicit disposable-target attestation.  A missing database,
+      # a failed test, a collection error, or an unexpected skip fails CI.
+      - name: Run isolated AFK concurrency and reporting ingestion tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_afk_lifecycle_concurrency.py \
+            tests/integration/test_reporting_ingest.py \
+            -v -m integration \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
+
+      - name: Verify all six isolated PostgreSQL tests executed and passed
+        if: always()
+        env:
+          ISOLATED_PG_JUNIT: ${{ runner.temp }}/isolated-postgres-report.xml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          EXPECTED = {
+              "test_concurrent_provision_same_key_same_payload",
+              "test_concurrent_provision_same_key_different_payload",
+              "test_concurrent_bind_same_change_request",
+              "test_same_delivery_twice_persists_one_row",
+              "test_unique_constraint_enforced_at_sql_level",
+              "test_trail_unique_constraint_enforced_at_sql_level",
+          }
+
+          report = os.environ["ISOLATED_PG_JUNIT"]
+          if not os.path.exists(report):
+              print(f"::error::Isolated PostgreSQL JUnit report is missing: {report}")
+              sys.exit(1)
+
+          cases = list(ET.parse(report).getroot().iter("testcase"))
+          seen = {}
+          problems = []
+          for case in cases:
+              name = case.get("name", "<unnamed>")
+              classname = case.get("classname", "<unknown>")
+              if case.find("skipped") is not None:
+                  state = "SKIPPED"
+                  problems.append(f"{classname}::{name} was skipped")
+              elif case.find("failure") is not None or case.find("error") is not None:
+                  state = "FAILED"
+                  problems.append(f"{classname}::{name} failed")
+              else:
+                  state = "PASSED"
+              seen[name] = state
+              print(f"{state:7} {classname}::{name}")
+
+          missing = sorted(EXPECTED - set(seen))
+          unexpected = sorted(set(seen) - EXPECTED)
+          if len(cases) != len(EXPECTED):
+              problems.append(
+                  f"expected {len(EXPECTED)} test cases, collected {len(cases)}"
+              )
+          if missing:
+              problems.append(f"missing test cases: {missing}")
+          if unexpected:
+              problems.append(f"unexpected test cases: {unexpected}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          passed = sum(1 for state in seen.values() if state == "PASSED")
+          skipped = sum(1 for state in seen.values() if state == "SKIPPED")
+          failed = sum(1 for state in seen.values() if state == "FAILED")
+          print(
+              "Isolated PostgreSQL gate: "
+              f"{len(cases)} collected, {passed} passed, {failed} failed, "
+              f"{skipped} skipped, 0 errors"
+          )
+          PY
 
       - name: Lint Python
         run: ruff check .
