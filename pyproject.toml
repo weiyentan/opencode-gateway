@@ -32,13 +32,28 @@ ignore = ["UP045", "UP007", "UP017", "UP035", "E501", "I001"]
 python_version = "3.12"
 strict = true
 # Pre-existing type debt scoped for the CI-wiring PR (#532).
-# - ignore_missing_imports: asyncpg/aiokafka ship no type stubs (import-untyped noise).
 # - disable_error_code type-arg: bare dict/list annotations are cosmetic, not bugs.
 # - disable_error_code unused-ignore: the codebase carries stale `# type: ignore` comments.
 # - overrides: modules with pre-existing type errors are scoped with ignore_errors=true
 #   (tracked for future cleanup). The rest of the codebase remains strictly checked.
-ignore_missing_imports = true
+# - missing-import handling (issue #823): global ignore_missing_imports removed.
+#   Per-package overrides below justify the two genuinely untyped third-party deps:
+#   asyncpg 0.31.0 — no py.typed marker, no types-asyncpg stub on PyPI, import-not-found
+#   aiokafka 0.12.0 — no py.typed marker, no types-aiokafka stub on PyPI, import-untyped
+#   All other third-party imports (fastapi, pydantic, sqlalchemy, httpx, starlette,
+#   uvicorn, pydantic-settings, alembic) ship inline py.typed and are fully checked.
 disable_error_code = ["type-arg", "unused-ignore"]
+
+# Targeted missing-import handling — justified per-package (issue #823).
+# asyncpg: untyped C-extension DB driver, no upstream stubs available at baseline.
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+
+# aiokafka: Kafka client, untyped at baseline, no upstream stubs available.
+[[tool.mypy.overrides]]
+module = ["aiokafka", "aiokafka.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [
