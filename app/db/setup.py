@@ -13,14 +13,16 @@ On startup the Gateway:
 3. Fails fast with a clear error message naming the missing relations, so
    an incomplete schema is never published as a ready connection pool.
 
-Required-relation inventory (issue #825)
-----------------------------------------
-The required set is the identity layer plus the canonical usage/ingestion
+Required-relation inventory (issues #825, #832)
+-----------------------------------------------
+The required set is the identity layer, the canonical usage/ingestion
 ledger relations that today's Gateway API and ``POST /ingest`` path touch
-on every request.  A successful ``alembic upgrade head`` creates all of
-them; the runtime check exists because an ``alembic_version`` sitting at
-head does not prove every expected relation is still present (a relation
-can be dropped manually, or a migration can fail part-way).
+on every request, and the AFK reporting/event-consumer relations that the
+always-registered AFK API routers and enabled consumer paths require.  A
+successful ``alembic upgrade head`` creates all of them; the runtime check
+exists because an ``alembic_version`` sitting at head does not prove every
+expected relation is still present (a relation can be dropped manually, or
+a migration can fail part-way).
 
 Included:
 
@@ -35,6 +37,20 @@ Included:
 * client/project rollup — ``client_project_rollup`` is maintained inside
   the canonical ingest transaction, so a missing rollup breaks the same
   requests that write ``usage_events``.
+* AFK reporting read-model (issue #832) — ``afk_runs``, ``afk_run_sessions``,
+  ``afk_run_entities``, ``engineering_events``, ``delivery_log`` and
+  ``unresolved_correlations`` back the always-registered AFK outcome/run
+  APIs, the AFK outcome consumer's facts transaction
+  (``delivery_log`` + ``engineering_events``), and the backfill/seeded run
+  persistence path.
+* AFK run provisioning and execution bindings (issue #832) —
+  ``afk_run_delivery_batches`` is written by the provisioning transaction of
+  ``POST /api/v1/afk/executions/runs``; ``execution_bindings`` and
+  ``recovery_checkpoints`` back the ``/api/v1/afk/executions`` read/write
+  surface.
+* Reporting deliveries (issue #832) — ``reporting_deliveries`` and
+  ``delivery_state_trails`` back the always-registered reporting ingest
+  endpoint and the operator-gated reporting read API.
 
 Deliberately excluded (recorded here so the inventory does not drift):
 
@@ -44,20 +60,26 @@ Deliberately excluded (recorded here so the inventory does not drift):
   and ``observed_tool_calls`` are populated only from optional batch
   arrays.  Per-projection failures are isolated and reported as
   ``projection_rejected``; their absence must never block the usage ledger.
-* AFK reporting read-model — ``afk_runs``, ``afk_run_entities``,
-  ``afk_run_sessions``, ``engineering_events``, ``delivery_log``,
-  ``execution_bindings`` and the closure/recovery projections.  They are
-  required by the AFK reporting surfaces and are covered by the separate
-  AFK outcome coverage slice (#832), which extends this validation from
-  usage into the enabled AFK paths.
+* Derived / rebuildable AFK projections — ``closure_links``,
+  ``closure_episodes`` and ``closure_unresolved`` are recomputed from
+  immutable ``engineering_events`` facts after the facts transaction
+  commits.  The recompute is best-effort and never blocks ingestion, so a
+  missing projection degrades the derived closure view rather than an
+  enabled write path.
 * Derived read-models — ``afk_dashboard_daily``, ``usage_dashboard_daily``
   and ``reporting_resource_aggregates`` are rebuildable summaries refreshed
-  out of band.
-* Reporting ingestion — ``reporting_deliveries`` / ``delivery_state_trails``
-  belong to the reporting ingest/read pipeline, not the usage ingest path.
-* Admin/repair-only relations (e.g. ``source_identity_resolutions``) and
+  out of band; their absence degrades a dashboard, never the facts path.
+* ``resource_session_associations`` — the exact resource/session association
+  write seam has no active service or API caller yet; the reporting
+  session-links read path derives provisional links from
+  ``afk_run_sessions``.
+* Admin/repair-only relations — ``execution_outcome_corrections`` (operator
+  correction CLI audit), ``source_identity_resolutions`` and
   ``alembic_version`` (Alembic migration metadata, not an application
   relation).
+* Defunct execution-era relations — tables such as ``jobs``, ``runners`` and
+  ``workspaces`` were removed by the observability refactor (issue #207) and
+  must never be required again.
 
 When a new source-of-truth relation becomes part of an active API or
 ingestion path, add it here in the same change that introduces its query
@@ -77,8 +99,9 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 # Relations that MUST exist after migrations have been applied.  This is the
-# identity layer plus the canonical usage/ingestion ledger — see the module
-# docstring for the inventory rationale and the deliberately excluded sets.
+# identity layer, the canonical usage/ingestion ledger and the active AFK
+# reporting/event-consumer relations — see the module docstring for the
+# inventory rationale and the deliberately excluded sets.
 _REQUIRED_TABLES: list[str] = [
     # ── Identity layer ───────────────────────────────────────────────
     "opencode_clients",
@@ -97,6 +120,20 @@ _REQUIRED_TABLES: list[str] = [
     "usage_ingest_attempts",
     # ── Client/project rollup (written inside the ingest transaction) ─
     "client_project_rollup",
+    # ── AFK reporting read-model + consumer facts (issue #832) ────────
+    "afk_runs",
+    "afk_run_sessions",
+    "afk_run_entities",
+    "afk_run_delivery_batches",
+    "engineering_events",
+    "delivery_log",
+    "unresolved_correlations",
+    # ── AFK execution bindings + recovery checkpoints (issue #832) ────
+    "execution_bindings",
+    "recovery_checkpoints",
+    # ── Reporting ingest/read pipeline (issue #832) ───────────────────
+    "reporting_deliveries",
+    "delivery_state_trails",
 ]
 
 # Resolved once when the module is loaded.
@@ -134,7 +171,7 @@ async def run_migrations() -> None:
 
 
 async def check_required_tables(pool: asyncpg.Pool) -> None:
-    """Verify all required usage/ingestion relations exist in the database.
+    """Verify all required usage/ingestion and AFK reporting relations exist.
 
     Queries ``information_schema.tables`` for the public schema and
     compares the result against the canonical list of required relations

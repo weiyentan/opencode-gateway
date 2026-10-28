@@ -2,9 +2,9 @@
 
 Covers the delegation contract (Alembic migrations run first, then the
 required-relation check), failure propagation, and the pool-supervisor
-guarantee from issue #825: a candidate pool whose active usage/ingestion
-schema is incomplete is never published, and the missing relation is
-reported while the bounded retry loop keeps running.
+guarantees from issues #825 and #832: a candidate pool whose active
+usage/ingestion or AFK reporting schema is incomplete is never published, and
+the missing relation is reported while the bounded retry loop keeps running.
 """
 
 from __future__ import annotations
@@ -16,6 +16,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.db.setup import _REQUIRED_TABLES
+
+# Rebuildable projections, dashboard rollups, repair-only audit tables and
+# repository seams with no active service caller (issue #832).
+_OPTIONAL_OR_DERIVED_TABLES = frozenset(
+    {
+        "resource_session_associations",
+        "closure_links",
+        "closure_episodes",
+        "closure_unresolved",
+        "afk_dashboard_daily",
+        "usage_dashboard_daily",
+        "reporting_resource_aggregates",
+        "execution_outcome_corrections",
+    }
+)
 
 
 def _settings(**overrides):
@@ -215,5 +230,143 @@ class TestIncompleteSchemaNeverPublishesPool:
                 await asyncio.sleep(0.005)
 
             assert len(published) == 2, "retry must publish the complete schema"
+            assert published[-1].pool is complete
+            await supervisor.stop()
+
+
+class TestAfkOutcomeSchemaNeverPublishesPool:
+    """Issue #832 — missing AFK reporting relations block candidate publication."""
+
+    @pytest.mark.asyncio
+    async def test_missing_afk_event_relation_blocks_publication_and_names_relation(
+        self, caplog
+    ):
+        """Complete usage schema but missing ``engineering_events`` → no pool."""
+        from app.db import schema as schema_module
+        from app.db.session import DatabasePoolSupervisor
+
+        existing = set(_REQUIRED_TABLES) - {"engineering_events"}
+        inner = _make_acquirable_pool(existing)
+        published: list = []
+
+        with patch(
+            "app.db.session.asyncpg.create_pool", AsyncMock(return_value=inner)
+        ), patch(
+            "app.db.schema.run_migrations", AsyncMock()
+        ), patch(
+            "app.db.session.ensure_schema", new=schema_module.ensure_schema
+        ), caplog.at_level(logging.WARNING, logger="app.db.session"):
+            supervisor = DatabasePoolSupervisor(_settings(), publish=published.append)
+            await supervisor.start()
+
+            assert supervisor.pool is None, (
+                "an AFK-incomplete candidate must never be published"
+            )
+            assert published == [None], "only the not-ready sentinel is published"
+            assert inner.close.await_count >= 1, "failed candidate must be closed"
+            await supervisor.stop()
+
+        assert "engineering_events" in caplog.text
+        # The complete usage/ingestion layer must not be blamed.
+        assert "usage_events" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_missing_afk_reporting_relation_blocks_publication(
+        self, caplog
+    ):
+        """Complete usage schema but missing ``delivery_state_trails`` → no pool."""
+        from app.db import schema as schema_module
+        from app.db.session import DatabasePoolSupervisor
+
+        existing = set(_REQUIRED_TABLES) - {"delivery_state_trails"}
+        inner = _make_acquirable_pool(existing)
+        published: list = []
+
+        with patch(
+            "app.db.session.asyncpg.create_pool", AsyncMock(return_value=inner)
+        ), patch(
+            "app.db.schema.run_migrations", AsyncMock()
+        ), patch(
+            "app.db.session.ensure_schema", new=schema_module.ensure_schema
+        ), caplog.at_level(logging.WARNING, logger="app.db.session"):
+            supervisor = DatabasePoolSupervisor(_settings(), publish=published.append)
+            await supervisor.start()
+
+            assert supervisor.pool is None
+            assert published == [None]
+            assert inner.close.await_count >= 1
+            await supervisor.stop()
+
+        assert "delivery_state_trails" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_complete_required_schema_publishes_with_optional_features_off(
+        self,
+    ):
+        """Required relations are enough with optional features disabled.
+
+        Derived/rebuildable relations are deliberately absent and the AFK
+        outcome consumer is disabled — startup must still publish the pool.
+        """
+        from app.db import schema as schema_module
+        from app.db.session import DatabasePoolSupervisor
+
+        existing = set(_REQUIRED_TABLES) - _OPTIONAL_OR_DERIVED_TABLES
+        inner = _make_acquirable_pool(existing)
+        published: list = []
+        settings = _settings(afk_outcomes_consumer_enabled=False)
+
+        with patch(
+            "app.db.session.asyncpg.create_pool", AsyncMock(return_value=inner)
+        ), patch(
+            "app.db.schema.run_migrations", AsyncMock()
+        ), patch(
+            "app.db.session.ensure_schema", new=schema_module.ensure_schema
+        ):
+            supervisor = DatabasePoolSupervisor(settings, publish=published.append)
+            await supervisor.start()
+
+            assert supervisor.pool is not None, (
+                "a complete required set must publish regardless of optional "
+                "feature flags"
+            )
+            assert supervisor.pool.pool is inner
+            assert published[-1] is supervisor.pool
+            assert inner.close.await_count == 0, "a published pool is not closed"
+            await supervisor.stop()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_publishes_after_missing_afk_relation_appears(self):
+        """The bounded retry loop recovers once the AFK relation exists."""
+        from app.db import schema as schema_module
+        from app.db.session import DatabasePoolSupervisor
+
+        incomplete = _make_acquirable_pool(set(_REQUIRED_TABLES) - {"delivery_log"})
+        complete = _make_acquirable_pool(set(_REQUIRED_TABLES))
+        candidates = [incomplete, complete]
+        published: list = []
+
+        async def _create_pool(**kwargs):
+            return candidates.pop(0)
+
+        with patch(
+            "app.db.session.asyncpg.create_pool", AsyncMock(side_effect=_create_pool)
+        ), patch(
+            "app.db.schema.run_migrations", AsyncMock()
+        ), patch(
+            "app.db.session.ensure_schema", new=schema_module.ensure_schema
+        ):
+            supervisor = DatabasePoolSupervisor(_settings(), publish=published.append)
+            await supervisor.start()
+            assert supervisor.pool is None
+            assert published == [None]
+
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while len(published) < 2 and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.005)
+
+            assert len(published) == 2, (
+                "reconnect must publish once the missing AFK relation appears"
+            )
             assert published[-1].pool is complete
             await supervisor.stop()
