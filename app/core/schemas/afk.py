@@ -276,7 +276,7 @@ class AFKRunDetail(RunDetail):
     response shape.
     """
 
-    run: AFKRunSummary  # type: ignore[assignment]
+    run: AFKRunSummary
 
 
 class ChangeRequestExecutionCounts(BaseModel):

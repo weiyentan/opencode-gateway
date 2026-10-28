@@ -34,11 +34,10 @@ strict = true
 # Pre-existing type debt scoped for the CI-wiring PR (#532).
 # - ignore_missing_imports: asyncpg/aiokafka ship no type stubs (import-untyped noise).
 # - disable_error_code type-arg: bare dict/list annotations are cosmetic, not bugs.
-# - disable_error_code unused-ignore: the codebase carries stale `# type: ignore` comments.
 # - overrides: modules with pre-existing type errors are scoped with ignore_errors=true
 #   (tracked for future cleanup). The rest of the codebase remains strictly checked.
 ignore_missing_imports = true
-disable_error_code = ["type-arg", "unused-ignore"]
+disable_error_code = ["type-arg"]
 
 [[tool.mypy.overrides]]
 module = [
