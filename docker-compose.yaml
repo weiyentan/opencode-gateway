@@ -111,10 +111,15 @@ services:
     restart: unless-stopped
 
   # ── AFK Outcome Consumer ─────────────────────────────────────────────
-  # Live ingestion for AFK Outcome Observability: consumes the normalized
-  # provider-events topic (``engineering.events.normalized``, issue #531) in
-  # its OWN group (``opencode-normalized-events``) and writes canonical
-  # engineering events to Postgres, plus a scheduled reconciliation loop.
+  # Live Kafka-only ingestion for AFK Outcome Observability: consumes the
+  # normalized provider-events topic (``engineering.events.normalized``,
+  # issue #531) in its OWN group (``opencode-normalized-events``) and writes
+  # canonical engineering events to Postgres. Startup is Kafka-only
+  # (issues #536/#537) — no scheduled reconciliation loop; terminal states
+  # (merged/closed) the topic does not carry are converged by the explicit,
+  # operator-invoked AFK Backfill CLI (``scripts/afk_backfill.py`` — see
+  # README Consumer Operations). The consumer's ``_reconcile_loop`` /
+  # ``_reconcile_once`` helpers remain for archival/manual use only.
   afk-outcomes-consumer:
     build:
       context: .
@@ -130,11 +135,17 @@ services:
       GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC: ${GATEWAY_NORMALIZED_EVENTS_DLQ_TOPIC:-engineering.events.normalized.dlq}
       GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID: ${GATEWAY_NORMALIZED_EVENTS_CONSUMER_GROUP_ID:-opencode-normalized-events}
       GATEWAY_AFK_OUTCOMES_PROVIDER: ${GATEWAY_AFK_OUTCOMES_PROVIDER:-github}
-      # The consumer always needs a repository to reconcile — the Settings
-      # validator fires on startup when the flag is on and the repository is
-      # empty (the default below makes a misconfigured deployment fail fast).
+      # Repository for the preserved manual/archival reconciliation path
+      # (``_reconcile_once`` / ``scripts/afk_backfill.py``) — not a scheduled
+      # startup loop. The Settings validator fails fast when the consumer is
+      # enabled and this is empty (the default below makes a misconfigured
+      # deployment fail fast).
       GATEWAY_AFK_OUTCOMES_CONSUMER_ENABLED: "true"
       GATEWAY_AFK_OUTCOMES_REPOSITORY: ${GATEWAY_AFK_OUTCOMES_REPOSITORY:-}
+      # Compatibility/manual-backfill settings (``_reconcile_loop`` archival
+      # path and ``scripts/afk_backfill.py`` bounded window) — not scheduled
+      # at startup; see README Consumer Operations and
+      # ``app/consumer/afk_consumer.py`` docstring (issues #536/#537).
       GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_CADENCE_SECONDS:-3600}
       GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS: ${GATEWAY_AFK_OUTCOMES_RECONCILE_WINDOW_SECONDS:-86400}
       GATEWAY_DATABASE_HOST: postgres
