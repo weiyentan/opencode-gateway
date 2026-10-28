@@ -66,6 +66,7 @@ jobs:
             tests/integration/test_db_reconnect_smoke.py \
             tests/test_agent_runs_status_filter_pg.py \
             tests/integration/test_change_request_summary.py \
+            tests/integration/test_afk_outcomes_correlations_jsonb.py \
             -v -m integration
 
       - name: Lint Python
