@@ -22,9 +22,9 @@
 | fastapi | 0.115.2 | `pip freeze` |
 | pydantic | 2.13.4 | `pip freeze` |
 | sqlalchemy[asyncio] | 2.x (via `requirements.txt`: `sqlalchemy[asyncio]>=2.0.0,<3.0.0`) |  |
-| No type-stub packages installed | `pip freeze` shows no `types-asyncpg`, `types-aiokafka`, `types-*` | Verified `pip show types-asyncpg` → not found |
+| No type-stub packages installed | `pip freeze` shows no installed `asyncpg-stubs` or `types-*` packages | `pip show types-asyncpg` → not found (that package does not exist); `asyncpg-stubs` exists on PyPI but is **not installed** (see §3) |
 
-Both `asyncpg` and `aiokafka` ship **no** `py.typed` marker and **no** inline `.pyi` stubs in the installed distributions (`uv pip` / `pip show -f`). Mypy therefore reports `import-untyped` / “Skipping analyzing … missing library stubs”.
+Both `asyncpg` and `aiokafka` ship **no** `py.typed` marker, so mypy does not treat their bundled files as typed (asyncpg includes a few internal `.pyi` files, but no public `py.typed` marker) and reports `import-untyped` / “Skipping analyzing … missing library stubs” (`uv pip` / `pip show -f`).
 
 ### 1.2 Shipped mypy Configuration (unchanged in this slice)
 
@@ -144,8 +144,8 @@ The 13 `ignore_errors` modules are **suppressed**; only the 75 strict-scoped sou
 |-------------------|---------------|--------|----------------|-------|
 | `unused-ignore` | `disable_error_code = ["unused-ignore"]` | **5** | 4 files | All in eligible strict modules; 0 in `ignore_errors` modules |
 | `type-arg` | `disable_error_code = ["type-arg"]` | **43** | 13 files | All in eligible strict modules |
-| `import-untyped` (`ignore_missing_imports`) | `ignore_missing_imports = true` | **28** | 25 files | All in eligible strict modules; `asyncpg` 23 errors, `aiokafka` 5 errors |
-| **All three lifted together** | `false` + no disables | **76** | 32 files | 5 + 43 + 28 = 76; no overlap beyond distinct codes |
+| `import-untyped` (`ignore_missing_imports`) | `ignore_missing_imports = true` | **28** | 25 files | 24 `app/` strict modules + `scripts/afk_backfill.py` (followed via import); `asyncpg` 23 errors, `aiokafka` 5 errors |
+| **All three lifted together** | `false` + no disables | **76** | 34 files | 5 + 43 + 28 = 76; no overlap beyond distinct codes; reproduced as `Found 76 errors in 34 files (checked 88 source files)` |
 
 Shipped baseline with all waivers active: **0 errors** (88 files, strict, overrides active).
 
@@ -181,11 +181,11 @@ All four modules are **eligible strict** (none in the 13 `ignore_errors` list; `
 
 All 13 are eligible strict modules. No `type-arg` errors were observed in the 13 `ignore_errors` modules when overrides are active.
 
-#### 2.1.3 `import-untyped` — 28 errors in 25 strict modules
+#### 2.1.3 `import-untyped` — 28 errors in 25 files
 
 All `import-untyped` errors map to two external packages that lack stubs:
 
-- `asyncpg` — 23 errors across 22 files (every direct `import asyncpg` in strict code)
+- `asyncpg` — 23 errors across 23 files (every direct `import asyncpg` in strict code, including `scripts/afk_backfill.py`, which mypy follows via imports)
 - `aiokafka` — 5 errors across 2 files (`app/consumer/consumer.py` imports `aiokafka`, `aiokafka.errors`, `aiokafka.structs`; `app/consumer/dlq_sweep.py` imports `aiokafka`, `aiokafka.structs`)
 
 Full file list (strict only):
@@ -218,7 +218,7 @@ app/api/afk_executions.py
 app/api/afk_runs.py
 ```
 
-All 25 are eligible strict modules; `scripts/afk_backfill.py` appears because mypy follows imports from `app/` even though the target is `app/ afk_outcomes/`. It is **not** counted as `ignore_errors` scope but is a candidate for a scoped override if `scripts/` is later type-checked.
+Of the 25 files, 24 are `app/` modules in the strict target set. `scripts/afk_backfill.py` appears because mypy follows imports from `app/` even though the target is `app/ afk_outcomes/`; its `asyncpg` error is included in the counts above, and it is **not** an `ignore_errors` module. It is a candidate for a scoped override if `scripts/` is later type-checked.
 
 ### 2.2 Distinguishing `ignore_errors` modules (#787–#793 series)
 
@@ -275,10 +275,12 @@ Two external packages trigger `import-untyped` when `ignore_missing_imports = fa
 
 | Package | Version | `py.typed`? | `types-*` on PyPI? | Upstream stubs? | Resolution without unsound `Any` | Recommended action |
 |---------|---------|-------------|---------------------|-----------------|----------------------------------|--------------------|
-| `asyncpg` | 0.31.0 | **No** (checked installed distribution, no `py.typed`) | `types-asyncpg` **does not exist**; no `asyncpg-stubs` on PyPI | **No** — neither typeshed nor `pandora` stub package exists | **Scoped override** or **local stub**: adding a per-module `[[tool.mypy.overrides]]` with `ignore_missing_imports = true` for the ~25 `asyncpg`-importing modules would silence the waiver without `Any`, but perpetuates the global waiver. A **local stub file** (`stubs/asyncpg/__init__.pyi` with `mypy_path`) or a vendored `py.typed` shim would resolve soundly; contributing `py.typed` upstream is ideal but out of scope for this slice. | **Hold on global `ignore_missing_imports` until local stubs or upstream `py.typed` is available.** Short-term, keep global `true`; long-term, add a local `stubs/` directory and set `mypy_path = stubs` plus `ignore_missing_imports = false` scoped only to `asyncpg`/`aiokafka` importers, so the rest of the codebase is `import-untyped`-strict. |
-| `aiokafka` (+ `aiokafka.errors`, `aiokafka.structs`) | 0.12.0 | **No** (`aiokafka` distribution has no `py.typed`, no `.pyi`) | `types-aiokafka` **does not exist** | **No** | Same as `asyncpg`: scoped `ignore_missing_imports` per importer or local stubs. Because `aiokafka` is used in only 2 strict files + 1 ignored file, a scoped override is low-noise. | Same as above — global `ignore_missing_imports = true` is the least-wrong hold until local stubs exist. |
+| `asyncpg` | 0.31.0 | **No** (checked installed distribution, no `py.typed`) | `types-asyncpg` **does not exist**; **`asyncpg-stubs` exists** on PyPI — latest **0.32.0**, with the **0.31.x** line tracking `asyncpg` 0.31.x (e.g. `asyncpg-stubs==0.31.3` requires `asyncpg>=0.31,<0.32`) and declaring Python 3.12 support | **No upstream/typeshed stubs**; `asyncpg-stubs` is **third-party** (Development Status: **Beta**, GitHub `bryanforbes/asyncpg-stubs`) and a PEP 561 stub-only package | **Package stubs (preferred)**, **scoped override**, or **local stub**: install `asyncpg-stubs` pinned to a compatible 0.31.x release (trial result below); per-module `[[tool.mypy.overrides]]` with `ignore_missing_imports = true` for the asyncpg-importing modules, or a local `stubs/asyncpg/__init__.pyi` with `mypy_path`, remain fallbacks; contributing `py.typed` upstream is still ideal but out of scope for this slice. | **Adopt `asyncpg-stubs` (pinned compatible) as the package-stub path; the global `ignore_missing_imports` hold can be reconsidered for `asyncpg` once the stub-induced call-site errors are fixed (see trial below).** Short-term, keep global `true`; when lifting, install `asyncpg-stubs>=0.31,<0.32`, fix the surfaced call-site errors, and keep scoped overrides/local stubs only for `aiokafka` (no stub package exists). |
+| `aiokafka` (+ `aiokafka.errors`, `aiokafka.structs`) | 0.12.0 | **No** (`aiokafka` distribution has no `py.typed`, no `.pyi`) | `types-aiokafka` **does not exist**; `aiokafka-stubs` **does not exist** either (both PyPI lookups → 404) | **No** | **Scoped override** or **local stubs**: same as `asyncpg`, but no package-stub option exists for `aiokafka`. Because `aiokafka` is used in only 2 strict files + 1 ignored file, a scoped override is low-noise. | Keep global `ignore_missing_imports = true` until local stubs (or a scoped per-importer override) cover `aiokafka`; this is the only remaining blocker after `asyncpg-stubs` is adopted. |
 
-**No `Any`-unsound workaround is needed:** Both packages can be handled with **scoped `ignore_missing_imports`** (per-module overrides) or **local stub files**, neither of which introduces `Any` into the checked code. A global `ignore_missing_imports = false` without stubs would be correct but noisy (28 → 39 errors after cleanup), so the hold is intentional.
+**`asyncpg-stubs` trial (reproduced):** Extracting `asyncpg-stubs==0.31.3` and adding it to mypy's search path (`pip install --no-deps --target /tmp/asyncpg_stubs_0313 asyncpg-stubs==0.31.3`; `PYTHONPATH=/tmp/asyncpg_stubs_0313 mypy --config-file /tmp/mypy.import.ini app/ afk_outcomes/`) removes all **23** `asyncpg` `import-untyped` errors (28 errors in 25 files → 19 errors in 7 files). The 5 `aiokafka` errors remain, and **14 stricter-typing errors** surface at `asyncpg` call sites: `create_pool` keyword overloads (`app/db/session.py`), `PoolConnectionProxy` vs `Connection` (`app/db/session.py`, `scripts/afk_backfill.py`), and optional `Record` results from `fetchrow` (`app/api/admin_clients.py`, `app/api/admin_resolve_source_identity.py`, `app/api/afk_outcomes.py`). The package-stub path is therefore viable but not zero-cost; those call-site fixes belong with the waiver-lift PR.
+
+**No `Any`-unsound workaround is needed:** `asyncpg` can be covered by the third-party **`asyncpg-stubs` package** (pinned to 0.31.x), and both packages can alternatively be handled with **scoped `ignore_missing_imports`** (per-module overrides) or **local stub files**; none of these introduces `Any` into the checked code. The remaining `aiokafka` gap has no package-stub option (`types-aiokafka` and `aiokafka-stubs` are both 404), so it needs local stubs or a scoped override. A global `ignore_missing_imports = false` without stubs/overrides would be correct but noisy (28 → 39 errors after cleanup), so the hold is intentional.
 
 **Other packages:** Verified that `sqlalchemy[asyncio]`, `fastapi`, `pydantic`, `asyncio`, `typing`, etc., cause no `import-untyped` under `false` — their stubs or `py.typed` are present.
 
@@ -296,9 +298,9 @@ The global waivers must **not** be lifted until the 13 `ignore_errors` modules a
 
 3. **Then `type-arg` (medium cost, cosmetic):** 43 strict + 32 hidden = **75 total** `type-arg` errors. Each is a bare `dict`/`list` without `[...]` args. Fix by adding precise args where trivial (`dict[str, Any]`, `list[str]`, etc.) or `dict[str, object]` for mixed JSON; no logic change. Batched PR(s) scoped to `app/db/models/`, `app/core/schemas/`, `app/api/`.
 
-4. **Finally `ignore_missing_imports` (hold until stubs):** 28 strict + 11 hidden = **39 total** `import-untyped` errors, all `asyncpg`/`aiokafka`. Do **not** flip global `false` until local stubs or upstream `py.typed` exists. Instead, add a `stubs/` directory with minimal `asyncpg`/`aiokafka` stubs and set `mypy_path = stubs` + per-importer overrides, then flip global. This avoids unsound `Any`.
+4. **Finally `ignore_missing_imports` (requires stub provisioning):** 28 strict + 11 hidden = **39 total** `import-untyped` errors, all `asyncpg`/`aiokafka`. Do **not** flip global `false` until stubs are in place. For `asyncpg`, **`asyncpg-stubs` is a viable package-stub path**: pin the 0.31.x line (`asyncpg-stubs>=0.31,<0.32`) so it tracks `asyncpg` 0.31.0, install it, and fix the ~14 stricter-typing call-site errors it surfaces (§3); the global hold can then be reconsidered for `asyncpg`. For `aiokafka`, no stub package exists, so add minimal local stubs and/or a per-importer scoped override. Once both are covered, flip the global waiver. This avoids unsound `Any`.
 
-This sequencing follows the parent #806 principle: *global diagnostics are restored only after module-scoped debt is gone*, and `import-untyped` is last because it requires external stub work.
+This sequencing follows the parent #806 principle: *global diagnostics are restored only after module-scoped debt is gone*, and `import-untyped` is last because it requires stub provisioning (`asyncpg-stubs` for `asyncpg`, local stubs or scoped overrides for `aiokafka`).
 
 ### 4.2 Exact Follow-Up Thresholds (gates for future slices)
 
@@ -355,4 +357,4 @@ No runtime, schema, deployment, or CI gate changes were made in this slice. The 
 
 ---
 
-*This report is the bounded evidence deliverable for #815. It proposes no runtime or CI gate changes and intentionally holds `ignore_missing_imports` until stubs exist. See §4 for sequencing and exact gated thresholds.*
+*This report is the bounded evidence deliverable for #815. It proposes no runtime or CI gate changes and intentionally holds `ignore_missing_imports` until stub provisioning is in place (`asyncpg-stubs` exists and is viable; `aiokafka` still requires local stubs or a scoped override). See §4 for sequencing and exact gated thresholds.*
