@@ -35,6 +35,7 @@ parameterised filters with 400 on invalid enum/date values, and the
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -145,13 +146,33 @@ def _validate_window(
         )
 
 
-def _parse_evidence(raw: object) -> list[CorrelationEvidence]:
-    """Parse a JSONB evidence array into :class:`CorrelationEvidence` items."""
-    if not raw:
-        return []
+def _decode_jsonb_array(raw: object) -> list:
+    """Decode a JSONB array column into a Python list.
+
+    asyncpg returns JSONB columns as JSON-encoded ``str`` (no type codec is
+    registered — the same convention as
+    :func:`app.api.closure_relationships._decode_candidates`); unit-test mock
+    rows and custom codecs provide already-decoded lists.  Both shapes are
+    accepted.  A non-list value (including ``None``) becomes ``[]``.
+    """
+    if isinstance(raw, str):
+        raw = json.loads(raw)
     if not isinstance(raw, list):
         return []
-    return [CorrelationEvidence.model_validate(item) for item in raw]
+    return raw
+
+
+def _parse_evidence(raw: object) -> list[CorrelationEvidence]:
+    """Parse a JSONB evidence array into :class:`CorrelationEvidence` items.
+
+    The JSONB value may arrive as a JSON-encoded ``str`` (plain asyncpg) or an
+    already-decoded list; both are accepted so stored provenance is never
+    silently replaced by an empty list.
+    """
+    return [
+        CorrelationEvidence.model_validate(item)
+        for item in _decode_jsonb_array(raw)
+    ]
 
 
 def _parse_job_template_ids(raw: str) -> list[int]:
@@ -538,7 +559,7 @@ async def _fetch_correlations(
             method=r["method"],
             reason=r["reason"],
             correlation_confidence=r["correlation_confidence"],
-            candidates=r["candidates"] or [],
+            candidates=_decode_jsonb_array(r["candidates"]),
             evidence=_parse_evidence(r["evidence"]),
             resolver_version=r["resolver_version"],
             created_at=r["created_at"],
