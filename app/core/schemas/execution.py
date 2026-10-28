@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -48,7 +48,7 @@ class ObservedMessage(BaseModel):
     source_updated_at: int | None = None
     source_created_at_tz: datetime | None = None
     source_updated_at_tz: datetime | None = None
-    data: dict | None = None
+    data: dict[str, Any] | None = None
 
 
 class ObservedPart(BaseModel):
@@ -65,7 +65,7 @@ class ObservedPart(BaseModel):
     source_updated_at: int | None = None
     source_created_at_tz: datetime | None = None
     source_updated_at_tz: datetime | None = None
-    data: dict | None = None
+    data: dict[str, Any] | None = None
 
 
 class ObservedToolCall(BaseModel):
@@ -79,8 +79,8 @@ class ObservedToolCall(BaseModel):
     session_id: uuid.UUID | None = None
     tool_name: str
     tool_status: str | None = None
-    tool_input: dict | list | str | int | float | bool | None = None
-    tool_output: dict | list | str | int | float | bool | None = None
+    tool_input: dict[str, Any] | list[Any] | str | int | float | bool | None = None
+    tool_output: dict[str, Any] | list[Any] | str | int | float | bool | None = None
     source_created_at: int | None = None
     source_created_at_tz: datetime | None = None
 
@@ -126,4 +126,4 @@ class TimelineEvent(BaseModel):
     part_type: str
     source_created_at: int | None = None
     source_created_at_tz: datetime | None = None
-    data: dict | None = None
+    data: dict[str, Any] | None = None

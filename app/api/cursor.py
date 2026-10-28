@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -54,7 +55,7 @@ async def get_cursor(
     source_database_id: uuid.UUID = Query(
         ..., description="Source database UUID to query cursor for"
     ),
-    _auth: dict = Depends(require_collector_token),
+    _auth: dict[str, Any] = Depends(require_collector_token),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> CursorResponse:
     """Return cursor state for a source database.
