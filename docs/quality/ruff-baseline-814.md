@@ -12,10 +12,10 @@
 |------|---------|-----------:|------:|--------:|---------------|-------|
 | **I001** | unsorted / unformatted imports (isort) | **99** (`86` w/o isolated MCP delta) | 90 | 99 (100%) | `alembic/` 32, `tests/` 32, `opencode-gateway-mcp/` 13*, `app/` 8, `afk_outcomes/` 7 | mechanical |
 | **UP035** | deprecated `typing` import (`List`→`list`, etc.) | **42** | 42 | 42 (100%) | `alembic/` 35, `scripts/` 4 | mechanical |
-| **UP007** | `Union[X,Y]` / `Optional[X]` → `X | Y` (`non-pep604-annotation-union`) | **73** | 25 | 72/73 (99%) | `alembic/` 72, `app/api/usage.py` 1 | mechanical* |
-| **UP045** | `Optional[X]` → `X | None` (`non-pep604-annotation-optional`) | **212** | 9 | 212 (100%) | `app/db/models/` 189 (projection 89 + afk 61 + ingest 17…), `scripts/` 21 | mechanical |
-| **UP017** | `datetime.timezone.utc` → `datetime.UTC` | **99** | 45 | 99 (100%) | `tests/` 75, `app/` 14, `scripts/` 8 | **semantics-sensitive** (intentional py39 compat) |
-| **E501** | line too long (>100) | **212** | 37 | 0 (0%) | `app/api/ingest.py` 76, `app/core/` 12, `tests/` 86 | mechanical (formatting) |
+| **UP007** | `Union[X,Y]` / `Optional[X]` → `X \| Y` (`non-pep604-annotation-union`) | **73** | 25 | 72/73 (99%) | `alembic/` 72, `app/api/usage.py` 1 | mechanical* |
+| **UP045** | `Optional[X]` → `X \| None` (`non-pep604-annotation-optional`) | **212** | 9 | 212 (100%) | `app/db/models/` 189 (projection 89 + afk 61 + ingest 17…), `scripts/` 21 | mechanical |
+| **UP017** | `datetime.timezone.utc` → `datetime.UTC` | **99** | 45 | 99 (100%) | `tests/` 75, `app/` 14, `scripts/` 8 | mechanical — autofix-safe; `requires-python >=3.12` (`pyproject.toml:5`) already satisfies the 3.11+ floor (earlier py39 retention) |
+| **E501** | line too long (>100) | **212** | 37 | 0 (0%) | `app/api/` 82 (`ingest.py` 76), `app/core/` 25, `tests/` 86 | mechanical (formatting) |
 | **Total** | globally suppressed surface | **737** violations | — | — | — | — |
 
 \* I001 isolated 99 vs non-isolated `ruff check --select I001` 86: delta is 13 `opencode-gateway-mcp/` files that are sorted per that subproject's own `pyproject.toml` (see §3). They are *not* suppressed by the top-level ignore — isolated `--isolated` uses global defaults. CI `ruff check .` still visits `opencode-gateway-mcp/` (see `ruff check --show-files` 309 files) but per-directory config makes them pass.
@@ -41,19 +41,19 @@ Total `noqa` directives: **288** occurrences. Breakdown by code (distinct occurr
 
 | Code | Count | Typical sites | Justification |
 |------|------:|---------------|---------------|
-| `UP017` | 119 | `afk_outcomes/models.py` 2, `afk_outcomes/providers/github.py` 2, `afk_outcomes/serialization.py` 2, `app/consumer/*` 4+, `tests/integration/test_afk_consumer.py` 10, `scripts/afk_e2e_test.py` 3, file-header `# ruff: noqa: UP017` in `app/api/admin_reconcile.py`, `tests/test_admin_reconcile.py`, `scripts/backfill_tool_calls.py`, `scripts/seed.py` | **Intentional py39 compat** — `timezone.utc` preserved because `datetime.UTC` is 3.11+. Every occurrence carries ` - datetime.UTC is 3.11+` reason. *Do not bulk-fix without dropping py39 support.* |
+| `UP017` | 119 | `afk_outcomes/models.py` 2, `afk_outcomes/providers/github.py` 2, `afk_outcomes/serialization.py` 2, `app/consumer/*` 4+, `tests/integration/test_afk_consumer.py` 10, `scripts/afk_e2e_test.py` 3, file-header `# ruff: noqa: UP017` in `app/api/admin_reconcile.py`, `tests/test_admin_reconcile.py`, `scripts/backfill_tool_calls.py`, `scripts/seed.py` | **Historical py39 compat** — `timezone.utc` was preserved while 3.9 importability was required, when `datetime.UTC` (3.11+) was not guaranteed. That floor is gone: `requires-python = ">=3.12"` (`pyproject.toml:5`) and Dockerfiles/CI run Python 3.12, so `datetime.UTC` is available. Of the 119 directives, **56 carry an inline rationale** (42 ` - datetime.UTC is 3.11+`, plus variant/em-dash notes) and **63 are bare `noqa: UP017` with no inline reason**. Autofix-safe (99 fixable) — eligible for the mechanical slice. |
 | `UP007` | 42 | `alembic/versions/0018`, `0033`, `0035`, `0036`, `0037`… (3 per file: `down_revision`, `branch_labels`, `depends_on: Union[str, …]`) | Alembic scaffolding template uses `Union`. Mechanical but migrations are append-only; low value vs churn. |
 | `BLE001` | 42 | `afk_outcomes/service/execution_reconciliation.py` 2, `app/consumer/*`, `scripts/*`, `app/db/session.py` 8 | `except Exception` broad catch — intentional (reconciliation/consumer resilience). Unrelated to suppressed six. |
 | `E402` | 39 | `app/db/*`, `scripts/*` | `import` not at top due to circular / env setup — intentional. |
 | `F401` | 15 | `alembic/env.py` (`Base` registers models) | Unused import is side-effect import — intentional. |
 | `UP042` | 13 | `afk_outcomes/models.py` StrEnum classes, `afk_outcomes/service/execution_reconciliation.py` | `class X(str, Enum)` → `StrEnum` is 3.11+; `keep importable on 3.9` — intentional compat, not suppressed globally. |
 | `E501` | 7 | `opencode-gateway-mcp/tests/test_afk_run_story.py:552`, `test_change_request_story.py` 6 | Long assertion strings / httpx response literals in tests — narrow, justified (readability vs wrap). Not a global suppression replacement. |
-| `UP041` | 4 | — | — |
-| Other | 7 | `F811`, `F841`, `UP036`, `UP046`, `PLW0603`, `E731` | Isolated, justified. |
+| `UP041` | 4 | `app/api/health.py:373`, `app/db/session.py:268`, `app/db/session.py:300`, `tests/integration/test_db_reconnect_smoke.py:99` | Inline rationale at all four — `py39 backport compat` / `py39 compat` (catching `(asyncio.TimeoutError, TimeoutError)`). Same retired py39 floor; stale under `requires-python >=3.12` and removable in a follow-up (not one of the six globally ignored rules). |
+| Other | 7 | `tests/integration/test_execution_cost_attribution.py:327` (F841), `tests/test_afk_outcomes_closure_integration.py:316` (E731), `tests/test_api_afk_executions.py:28` (F811), `app/core/schemas/execution.py:22` (UP046), `app/core/schemas/usage.py:619` (UP046), `app/core/telemetry.py:220` (UP036), `scripts/validate_github_pr_path.py:491` (PLW0603) | 2 of 7 carry inline rationale — `root parent linkage` (F841) and `identity normalizer for unit tests` (E731). The other 5 are **bare — no inline rationale** (F811, both UP046, UP036, PLW0603) and require justification before retention. |
 
 **No `noqa: I001` / `noqa: UP035` / `noqa: UP045` found** — those suppressed rules have zero narrow exceptions; all suppressed violations are invisible (caught by global `ignore`, not by `noqa`). That is exactly the debt this baseline surfaces — *do not treat ignored violations as solved.*
 
-The `UP017` and `UP007` `noqa`s are *additive* on top of the global ignore: even after the global ignore is removed, those 119 + 42 `noqa` lines would still silence violations. They are narrow, reasoned, and should remain; they are not “suppression floods”.
+The `UP017` and `UP007` `noqa`s are *additive* on top of the global ignore: even after the global ignore is removed, those 119 + 42 `noqa` lines would still silence violations. They are narrow and not “suppression floods”, but the `UP017` set is stale debt — 63 are bare and the other 56 carry the retired py39 rationale — so clear it in the UP017 mechanical slice rather than retaining it.
 
 ## 4. Per-rule isolated evidence
 
@@ -77,7 +77,8 @@ The `UP017` and `UP007` `noqa`s are *additive* on top of the global ignore: even
 | 1 | `app/api/afk_runs.py`, `app/api/reporting_ingest.py`, `app/api/usage.py`, `app/consumer/afk_consumer.py`, `app/core/factory.py`, `app/core/reconciliation.py`, `app/core/schemas/identity.py`, `app/db/models/reporting.py` |
 | 1 | `opencode-gateway-mcp/src/opencode_gateway_mcp/server.py` + 12 mcp test files (only under `--isolated`; pass under subproject config) |
 | 1 | `scripts/backfill_afk_dashboard_daily.py`, `scripts/backfill_usage_dashboard_daily.py`, `scripts/refresh_usage_dashboard_daily.py`, `scripts/verify_afk_dashboard_daily.py`, `scripts/verify_helpers.py`, `scripts/verify_reporting_resource_aggregates.py` |
-| 1 | 35 further test files (1 each — full list reproducible via JSON; see §8) |
+| 1 | `run_frontend_tests.py` |
+| 1 | 20 further test files (1 each — full list reproducible via JSON; see §8) |
 
 - **Safe-automation candidate:** **Yes — exact, fully mechanical, 100% autofixable** (`ruff check --select I001 --fix`). Single import-block re-sort per file, no semantics. Churn is broad (90 files) but per-file diff is tiny and reviewable. Small-file cluster strategy applies (see §6).
 - **Hotspots:** `tests/test_auth.py` (7) is the densest; otherwise uniformly 1 per file — no high-density file.
@@ -137,10 +138,10 @@ The `UP017` and `UP007` `noqa`s are *additive* on top of the global ignore: even
 | 4 | `tests/test_ingest.py` |
 | 3 | `scripts/validate_github_pr_path.py`, `tests/test_afk_outcomes_change_request_detail.py`, `tests/test_afk_outcomes_models.py`, `tests/test_read_path_parity_usage.py`, `tests/test_usage.py` |
 | 2 | `alembic/versions/0035_observation_key_observed_via_snapshot_at.py`, `app/api/ingest.py`, `scripts/verify_helpers.py`, and 6 more tests |
-| 1 | 20 further files (1 each) |
+| 1 | 26 further files (1 each) |
 
-- **Safe-automation candidate:** **No — semantics-sensitive / intentionally retained.** 119 existing `noqa: UP017` directives (see §3) document `datetime.UTC` is 3.11+ and the codebase intentionally keeps `timezone.utc` for py39 importability (`afk_outcomes/models.py` header, etc.). Autofix would silently drop py39 compat. Treat as *do not fix* until `requires-python` is raised to `>=3.11` and the `noqa` justifications are revisited.
-- **Hotspots / risk:** `tests/` dominates, but production `app/` 14 hits are spread; any bulk edit would touch core reconciliation/ingest paths and break the documented compat contract.
+- **Safe-automation candidate:** **Yes — autofix-safe, mechanical.** `requires-python = ">=3.12"` (`pyproject.toml:5`), and the Dockerfiles/CI run Python 3.12, so the 3.11+ floor for `datetime.UTC` is already satisfied. All 99 violations are fixable (`ruff check --select UP017 --fix` — see §8 for the exact `UP017` invocation). The 119 existing `noqa: UP017` directives are remnants of the earlier py39 floor: 56 carry an inline rationale, 63 are bare, and all should be cleared alongside the autofix. *Historical note:* retention was intentional while py39 importability was required — that constraint no longer applies.
+- **Hotspots / risk:** `tests/` dominates (75 violations), but the 14 production `app/` hits are spread across ingest/reconciliation paths. The diff is wide (45 files) yet purely mechanical once the stale `noqa` directives are removed; no runtime semantics change under py312.
 
 ### E501 — `line-too-long`
 
@@ -170,25 +171,25 @@ The `UP017` and `UP007` `noqa`s are *additive* on top of the global ignore: even
 |------|:-----------:|:-------:|---------------:|------------|-------|
 | I001 | ✓ | `--fix` safe | None | Broad (90 files, 1 per file) | Smallest per-file diff; ideal first slice. |
 | UP035 | ✓ | `--fix` safe | None (py312) | Broad (42 files, 1 per file) | Single-line import rewrites. |
-| UP007 | ✓* | `--fix` safe (72/73) | Low — needs runtime `X | Y` support; CI is py312 so safe; 1 unsafe flagged | Medium (25 files, 3 per alembic) | Keep with UP045 if desired (both PEP604). |
+| UP007 | ✓* | `--fix` safe (72/73) | Low — needs runtime `X \| Y` support; CI is py312 so safe; 1 unsafe flagged | Medium (25 files, 3 per alembic) | Keep with UP045 if desired (both PEP604). |
 | UP045 | ✓ | `--fix` safe | None (py312) | Narrow but dense (9 files, up to 89 per file) | Mechanical but slice by hotspot file. |
 | E501 | ✓ | none | None (formatting) | Medium (37 files, top 76) | Manual wrap; hotspot `ingest.py`. |
-| UP017 | ✗ | `--fix` would break compat | **High** — intentional py39 compat; 119 `noqa` already document retention | Broad (45 files) | *Do not fix* until `requires-python >=3.11`. |
+| UP017 | ✓ | `--fix` safe | None (py312) — `datetime.UTC` available since 3.11 | Broad (45 files) | Historical py39 retention only; `requires-python >=3.12` (`pyproject.toml:5`) already satisfies the floor. Clear the 119 stale `noqa` (63 bare, 56 reasoned). |
 
 ## 6. Proposed safe order and bounded slices
 
-**Principle:** mechanical + autofixable first, narrow high-density files in solo slices, broad 1-per-file rules batched, semantics-sensitive last (or never). Every slice should remove one `ignore` entry at a time and run `ruff check --select <RULE>` + `pytest` + `mypy` before merging.
+**Principle:** mechanical + autofixable first, narrow high-density files in solo slices, broad 1-per-file rules batched, non-autofixable formatting last. Every slice should remove one `ignore` entry at a time and run `ruff check --select <RULE>` + `pytest` + `mypy` before merging.
 
 **Recommended order (lowest risk → highest):**
 
 1. **I001** — import sort. Slice as 2-3 batches: (a) `app/` + `afk_outcomes/` (15 files), (b) `alembic/` (32), (c) `tests/` + `scripts/` + `mcp` (balance). Each batch `ruff check --select I001 --fix . && ruff check --select I001 .` → drop `I001` from `ignore`.
 2. **UP035** — deprecated typing imports. One slice or two: (a) `alembic/` batch (35 files), (b) `scripts/` + `afk_outcomes/` + `tests/` (7). All `--fix`.
-3. **UP007** — PEP604 union. One slice: all 25 files (24 alembic one-liners + `app/api/usage.py`). Fix with `--fix`, verify the one unsafe flagged line manually.
-4. **UP045** — PEP604 optional. Two slices: (a) hotspot `app/db/models/projection.py` (89) alone, (b) `app/db/models/afk.py` (61) + remaining 7 files. Both `--fix`.
-5. **E501** — line length. Four bounded slices: (a) `app/api/ingest.py` (76) solo, (b) `app/core/` + `app/api/admin_*` + `afk_outcomes/` (remainder app), (c) `scripts/` (14), (d) `tests/` batched by 10 files. Manual wrap, no autofix; use `ruff format` preview per file.
-6. **UP017** — **last, or retain indefinitely**. Only un-suppress after `requires-python >=3.11` and after auditing the 119 `noqa` compat justifications. If pursued, treat as a single mechanical slice gated on version bump, not a silent s/ `timezone.utc`/ `UTC`/ .
+3. **UP017** — `datetime.UTC`. One mechanical slice: all 45 files, `ruff check --select UP017 --fix .`, then delete the 119 now-obsolete `noqa: UP017` directives (63 bare, 56 with the retired py39 rationale) and drop `UP017` from `ignore`. No version bump needed — `requires-python >=3.12` already exceeds the 3.11+ floor.
+4. **UP007** — PEP604 union. One slice: all 25 files (24 alembic one-liners + `app/api/usage.py`). Fix with `--fix`, verify the one unsafe flagged line manually.
+5. **UP045** — PEP604 optional. Two slices: (a) hotspot `app/db/models/projection.py` (89) alone, (b) `app/db/models/afk.py` (61) + remaining 7 files. Both `--fix`.
+6. **E501** — line length. Four bounded slices: (a) `app/api/ingest.py` (76) solo, (b) `app/core/` (25) + `app/api/admin_*` + `afk_outcomes/` (remainder app), (c) `scripts/` (14), (d) `tests/` batched by 10 files. Manual wrap, no autofix; use `ruff format` preview per file.
 
-**Why this order:** I001/UP035 have zero semantics risk and smallest per-file diffs → validate CI wiring first. UP007/UP045 share PEP604 semantics and are co-located in `alembic/` vs `app/db/models/` → batch after imports are settled. E501 is non-autofixable and high churn → defer until mechanical rules are out of the way to avoid merge conflicts. UP017 is intentionally retained for compat → last or never.
+**Why this order:** I001/UP035/UP017 have zero semantics risk and smallest per-file diffs → validate CI wiring first. UP007/UP045 share PEP604 semantics and are co-located in `alembic/` vs `app/db/models/` → batch after imports are settled. E501 is non-autofixable and high churn → last, to avoid merge conflicts.
 
 **Small-file clusters for extensive rules:**
 
