@@ -72,7 +72,7 @@ def _coerce_outcome_value(item: Any) -> str:
         if isinstance(candidate, str):
             return candidate
         if hasattr(candidate, "value"):
-            return str(candidate.value)  # type: ignore[no-any-return]
+            return str(candidate.value)
         return str(candidate)
 
     if isinstance(item, ExecutionOutcome):
@@ -80,7 +80,7 @@ def _coerce_outcome_value(item: Any) -> str:
     if isinstance(item, str):
         return item
     if hasattr(item, "value"):
-        return str(item.value)  # type: ignore[no-any-return]
+        return str(item.value)
     return str(item)
 
 

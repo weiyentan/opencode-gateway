@@ -77,7 +77,7 @@ class ResponseEnvelopeMiddleware(BaseHTTPMiddleware):
         # versions used .body_iterator — we support both via getattr).
         if hasattr(response, "body_iterator"):
             body = b""
-            async for chunk in response.body_iterator:  # type: ignore[union-attr]
+            async for chunk in response.body_iterator:
                 body += chunk
         else:
             body = response.body  # type: ignore[assignment]
