@@ -896,7 +896,12 @@ opencode-gateway/
 │           └── reporting.py      # ORM models: reporting deliveries / state trails
 ├── afk_outcomes/                 # Pure-domain AFK outcome package
 │   ├── models.py                 # Domain models, enums, resolver versions
-│   ├── repository.py             # AsyncpgOutcomeRepository (facts, runs, bindings, associations, projection)
+│   ├── repository/               # AsyncpgOutcomeRepository package (raw-asyncpg, no app imports)
+│   │   ├── __init__.py           # Facade: composes four seams, re-exports AsyncpgOutcomeRepository
+│   │   ├── crud.py               # Core CRUD (save/get, associations, event recording + helpers)
+│   │   ├── executions.py         # AWX execution bindings (two-phase write + read paths)
+│   │   ├── lifecycle.py          # Provisional AFK run lifecycle (provision/bind/update)
+│   │   └── closure_projection.py # Closure-episode projection recompute + rebuild
 │   ├── correlation.py            # CorrelationEngine
 │   ├── closure_episodes.py       # Closure-episode projector (pure domain)
 │   ├── associations.py           # Exact resource↔session association resolver
@@ -984,6 +989,8 @@ opencode-gateway/
 | [0026](docs/adr/0026-afk-run-id-database-relationships.md) | AFK Run ID Database Relationships | Accepted |
 | [0028](docs/adr/0028-change-request-owns-afk-run-lifecycle.md) | Change Request Owns AFK Run Lifecycle | Accepted |
 | [0029](docs/adr/0029-gateway-reporting-boundary.md) | Gateway Remains a Reporting Service | Accepted |
+| [0030](docs/adr/0030-superseded-adr-retention-policy.md) | Superseded ADR Retention Policy | Accepted |
+| [0031](docs/adr/0031-opencode-gateway-mcp-read-only-semantic-adapter.md) | Expose OpenCode Gateway through a separate read-only semantic MCP adapter | Accepted |
 
 Detailed schema, correlation, and database semantics live in the ADRs and
 in `CONTEXT.md`; this README deliberately links them rather than duplicating
