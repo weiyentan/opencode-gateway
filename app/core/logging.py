@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Literal
 
 from app.core.secrets import REDACTED, is_secret_key
 
@@ -64,7 +65,7 @@ class RedactingFormatter(logging.Formatter):
         self,
         fmt: str | None = None,
         datefmt: str | None = None,
-        style: str = "%",
+        style: Literal["%", "{", "$"] = "%",
         *,
         redacted_placeholder: str = REDACTED,
     ) -> None:
@@ -109,17 +110,26 @@ class RedactingFormatter(logging.Formatter):
     def _replace_match(self, match: re.Match[str]) -> str:
         """Called for each key=value match — replace value if key is secret."""
         key = match.group("key")
+        if key is None:
+            return match.group(0)
         if not self._is_secret_key_match(key):
             return match.group(0)
 
         full = match.group(0)
         # Prefer the quoted groups; fall back to the unquoted group.
-        value = (
-            match.group("dqvalue")
-            or match.group("sqvalue")
-            or match.group("value")
-        )
-        if value is None:
+        # Use explicit None checks so the type is narrow and accurate;
+        # an empty quoted value (e.g. KEY="") has no secret to redact
+        # and would corrupt the message if we replaced "".
+        dqvalue = match.group("dqvalue")
+        sqvalue = match.group("sqvalue")
+        unquoted = match.group("value")
+        if dqvalue is not None:
+            value: str | None = dqvalue
+        elif sqvalue is not None:
+            value = sqvalue
+        else:
+            value = unquoted
+        if value is None or value == "":
             return full
         return full.replace(value, self._placeholder, 1)
 
