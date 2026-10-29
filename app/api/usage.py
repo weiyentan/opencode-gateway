@@ -2449,7 +2449,10 @@ async def _fetch_records_with_context_grouped(
 # ── Records-with-context endpoint ─────────────────────────────────────────
 
 
-@router.get("/records-with-context", response_model=PaginatedResponse | list[RecordWithContextGroupedRow])
+@router.get(
+    "/records-with-context",
+    response_model=PaginatedResponse | list[RecordWithContextGroupedRow],
+)
 async def get_records_with_context(
     request: Request,
     response: Response,

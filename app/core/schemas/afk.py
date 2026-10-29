@@ -324,7 +324,10 @@ class ChangeRequestSummaryRow(BaseModel):
     )
     resource_type: str = Field(
         default="change_request",
-        description="Fixed resource type — GitHub PRs and GitLab MRs both normalize to change_request",
+        description=(
+            "Fixed resource type — GitHub PRs and GitLab MRs both "
+            "normalize to change_request"
+        ),
     )
     provider_state: str | None = Field(
         default=None,
@@ -548,12 +551,18 @@ class UnresolvedCorrelationRow(BaseModel):
     method: str
     reason: str | None = Field(
         default=None,
-        description="ambiguous | unmatched for engine unresolved outcomes; None for low-confidence links",
+        description=(
+            "ambiguous | unmatched for engine unresolved outcomes; "
+            "None for low-confidence links"
+        ),
     )
     correlation_confidence: float = 0.0
     candidates: list[str] = Field(
         default_factory=list,
-        description="Competing candidate entity ids (ambiguous); empty for unmatched and low-confidence links",
+        description=(
+            "Competing candidate entity ids (ambiguous); "
+            "empty for unmatched and low-confidence links"
+        ),
     )
     evidence: list[CorrelationEvidence] = Field(default_factory=list)
     resolver_version: str | None = None

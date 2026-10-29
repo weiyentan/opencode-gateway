@@ -234,7 +234,9 @@ class ExecutionReconciler:
         # bounded by the semaphore to avoid overwhelming the AWX API).
         semaphore = asyncio.Semaphore(self._max_concurrency)
 
-        async def _semaphored_lookup(binding: object) -> tuple[int | None, AWXJobState | None, str | None]:
+        async def _semaphored_lookup(
+            binding: object,
+        ) -> tuple[int | None, AWXJobState | None, str | None]:
             async with semaphore:
                 return await self._lookup_job(binding)
 
@@ -296,7 +298,9 @@ class ExecutionReconciler:
         )
         return summary
 
-    async def _lookup_job(self, binding: object) -> tuple[int | None, AWXJobState | None, str | None]:
+    async def _lookup_job(
+        self, binding: object
+    ) -> tuple[int | None, AWXJobState | None, str | None]:
         """Look up the AWX job status for one binding. Returns (job_id, state, error_detail).
 
         Does NOT touch the database — pure HTTP lookup.
