@@ -29,8 +29,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -39,103 +37,72 @@ import pytest
 import pytest_asyncio
 from fastapi import Request
 
+from tests.integration._disposable_postgres import DatabaseTarget, verify_disposable_target
+
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+_TARGET = DatabaseTarget.from_env()
 
 _API_KEY = "test-api-key"
 _ENDPOINT = "/api/v1/afk-outcomes/correlations"
 
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    return _TARGET.dsn()
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB."""
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
-def _migration_script_dir() -> str:
-    """Return a Python-3.9-import-safe copy of the alembic script directory.
-
-    The pre-existing 0024/0025 migrations evaluate ``str | None`` module-level
-    annotations, which cannot import on Python 3.9.  Copy ``env.py`` and the
-    version modules to a temp dir with ``from __future__ import annotations``
-    injected so the revision map builds on 3.9 without touching the shipped
-    migrations — the migration bodies are byte-for-byte identical.
-    """
-    src = _PROJ_ROOT / "alembic"
-    dst = Path(tempfile.mkdtemp(prefix="gateway-alembic-"))
-    shutil.copy(src / "env.py", dst / "env.py")
-    (dst / "versions").mkdir()
-    for version in sorted((src / "versions").glob("*.py")):
-        text = version.read_text()
-        if not text.startswith("from __future__ import annotations"):
-            text = "from __future__ import annotations\n" + text
-        (dst / "versions" / version.name).write_text(text)
-    return str(dst)
-
-
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+@pytest.fixture(scope="module")
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the test database to ``head`` using the unmodified revision chain."""
 
     import alembic.command
     import alembic.config
 
     sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    migration_dir = _migration_script_dir()
-    alembic_cfg.set_main_option("script_location", migration_dir)
+    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
 
     def _upgrade() -> None:
         alembic.command.upgrade(alembic_cfg, "head")
 
-    # alembic/env.py's online path drives asyncpg via ``asyncio.run``, which
-    # cannot execute inside this fixture's running event loop — run the
-    # upgrade in a worker thread where no loop is running.
+    async def _drop_all() -> None:
+        conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+        try:
+            await conn.execute(_DROP_ALL_SQL)
+        finally:
+            await conn.close()
+
     try:
-        await asyncio.to_thread(_upgrade)
+        asyncio.run(asyncio.to_thread(_upgrade))
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
-        await asyncio.to_thread(_upgrade)
+        asyncio.run(_drop_all())
+        asyncio.run(asyncio.to_thread(_upgrade))
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
 
     yield pool
 
-    shutil.rmtree(migration_dir, ignore_errors=True)
+    async with pool.acquire() as conn:
+        await conn.execute(_DROP_ALL_SQL)
     await pool.close()
 
 

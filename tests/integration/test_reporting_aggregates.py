@@ -41,15 +41,12 @@ from app.core.reporting_aggregates import (
     get_aggregate,
 )
 from app.core.repository import normalize_repository_url
+from tests.integration._disposable_postgres import DatabaseTarget, verify_disposable_target
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+_TARGET = DatabaseTarget.from_env()
 
 UTC = timezone.utc
 
@@ -59,39 +56,27 @@ _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)
 _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
 _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    return _TARGET.dsn()
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB."""
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the test database to ``head`` using the unmodified revision chain."""
 
     import alembic.command
     import alembic.config
@@ -100,27 +85,30 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
+
+    async def _drop_all() -> None:
+        conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+        try:
+            await conn.execute(_DROP_ALL_SQL)
+        finally:
+            await conn.close()
+
     try:
-        alembic.command.upgrade(alembic_cfg, "head")
+        asyncio.run(asyncio.to_thread(alembic.command.upgrade, alembic_cfg, "head"))
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
-        alembic.command.upgrade(alembic_cfg, "head")
+        asyncio.run(_drop_all())
+        asyncio.run(asyncio.to_thread(alembic.command.upgrade, alembic_cfg, "head"))
+
+
+@pytest.fixture(scope="module")
+async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
 
     yield pool
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
-        )
+        await conn.execute(_DROP_ALL_SQL)
     await pool.close()
 
 
