@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -115,7 +115,7 @@ class AFKRun(Base):
         DateTime(timezone=True), nullable=True
     )
     outcome_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    outcome: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    outcome: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -287,7 +287,7 @@ class AFKRunEntityLink(Base):
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False
     )
-    evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     superseded_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -352,7 +352,7 @@ class EngineeringEvent(Base):
         String, nullable=True
     )
     actor: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     observation_key: Mapped[str] = mapped_column(String, nullable=False)
     observed_via: Mapped[str] = mapped_column(
         String, nullable=False, server_default=text("'webhook'")
@@ -451,8 +451,8 @@ class UnresolvedCorrelation(Base):
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False
     )
-    candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    candidates: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
@@ -505,7 +505,7 @@ class ResourceSessionAssociation(Base):
     repository: Mapped[str] = mapped_column(String, nullable=False)
     resource_type: Mapped[str] = mapped_column(String, nullable=False)
     resource_number: Mapped[str] = mapped_column(String, nullable=False)
-    source_reference: Mapped[list] = mapped_column(
+    source_reference: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -556,7 +556,7 @@ class ExecutionBinding(Base):
     # every external OpenCode session id attributed to the execution,
     # deduplicated with the first entry as the primary session.  Nullable —
     # historical / run-level-only bindings carry no collection.
-    external_session_ids: Mapped[Optional[list]] = mapped_column(
+    external_session_ids: Mapped[Optional[list[str]]] = mapped_column(
         JSONB, nullable=True
     )
     provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -791,7 +791,7 @@ class ClosureUnresolved(Base):
         DateTime(timezone=True), nullable=False
     )
     reason: Mapped[str] = mapped_column(String, nullable=False)
-    candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     derived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

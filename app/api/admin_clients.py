@@ -7,6 +7,7 @@ separate dependency used by future collector-facing endpoints.
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -152,7 +153,7 @@ async def update_client(
 
     # Build dynamic SET clause from supplied fields only
     set_parts: list[str] = []
-    params: list = []
+    params: list[Any] = []
     idx = 1
 
     for field_name in ("name", "description", "is_active"):

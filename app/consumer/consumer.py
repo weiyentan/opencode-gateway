@@ -184,7 +184,7 @@ class Consumer:
 
         while self._running:
             try:
-                iterator = self._consumer.__aiter__()  # type: ignore[union-attr]
+                iterator = self._consumer.__aiter__()
                 while self._running:
                     try:
                         msg = await asyncio.wait_for(

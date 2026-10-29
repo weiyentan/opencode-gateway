@@ -333,7 +333,7 @@ async def create_execution_binding(
     body: ExecutionBindingCreateRequest,
     request: Request,
     response: Response,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
     """Persist one execution binding from AWX.
@@ -492,7 +492,7 @@ async def update_execution_binding(
     awx_job_id: str,
     body: ExecutionBindingUpdateRequest,
     request: Request,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ExecutionBindingReadResponse:
     """Transition one binding from ``running`` to a terminal outcome (issue #590).
@@ -599,7 +599,7 @@ async def create_recovery_checkpoint(
     body: RecoveryCheckpointCreateRequest,
     request: Request,
     response: Response,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> RecoveryCheckpointResponse:
     """Persist one execution-scoped AFK recovery checkpoint (issue #754).
@@ -846,7 +846,7 @@ async def provision_afk_run_lifecycle(
     body: AFKRunProvisionRequest,
     request: Request,
     response: Response,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AFKRunLifecycleResponse:
     """Provision one provisional AFK run lifecycle (issues #589, #595).
@@ -942,7 +942,7 @@ async def bind_lifecycle_change_request(
     afk_run_id: str,
     body: ChangeRequestBindingRequest,
     request: Request,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AFKRunLifecycleResponse:
     """Bind one change request to a provisional lifecycle (issue #589).
