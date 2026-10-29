@@ -266,11 +266,16 @@ here.
 From the repo root, on a host with docker and provider credentials:
 
 ```sh
-# 1. Start the integration Postgres (port 5433).
+# 1. Start the disposable integration Postgres (port 5433) — matches the
+#    CI postgres-isolated profile (postgres:16-alpine,
+#    POSTGRES_DB=opencode_gateway_disposable_test, POSTGRES_USER=test,
+#    POSTGRES_PASSWORD=test, GATEWAY_TEST_DISPOSABLE_DB=1).
 docker compose -f docker-compose.test.yml up -d
 
-# 2. Run the contract + replay/redelivery integration suite.
-pytest tests/integration/test_afk_consumer.py -v -m integration
+# 2. Run the contract + replay/redelivery integration suite (requires
+#    disposable attestation).
+GATEWAY_TEST_DISPOSABLE_DB=1 GATEWAY_ENV=development \
+  pytest tests/integration/test_afk_consumer.py -v -m integration
 
 # 3. (Optional) live backfill over the real repository history.
 GITHUB_TOKEN=<token> python scripts/afk_backfill.py \

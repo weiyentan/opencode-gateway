@@ -91,12 +91,22 @@ Tests use `pytest` with `pytest-asyncio` (`asyncio_mode = auto`). Most tests moc
 
 ### Integration test database
 
-A dedicated Docker Compose file starts a Postgres container on port 5433 for tests that need a real database:
+A dedicated Docker Compose file starts a disposable PostgreSQL 16 container on port 5433 for tests that need a real database. It matches the CI `postgres-isolated` service profile (`postgres:16-alpine`, `POSTGRES_DB=opencode_gateway_disposable_test`, `POSTGRES_USER=test`, `POSTGRES_PASSWORD=test` on `localhost:5433`) and requires the disposable attestation `GATEWAY_TEST_DISPOSABLE_DB=1` (with `GATEWAY_ENV` not `production`) — the guard in `tests/integration/_disposable_postgres.py` rejects any other target before the first connection (see [ADR 0032](docs/adr/0032-required-integration-test-execution-contract.md)):
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
-pytest tests/ -v -k "db"
+GATEWAY_TEST_DISPOSABLE_DB=1 GATEWAY_ENV=development pytest tests/ -v -k "db"
 docker compose -f docker-compose.test.yml down -v
+```
+
+Equivalently with `docker run` (same profile as the error hint in `_disposable_postgres.py`):
+
+```bash
+docker run --rm -d --name opencode-gateway-test-db \
+  -e POSTGRES_DB=opencode_gateway_disposable_test \
+  -e POSTGRES_USER=test \
+  -e POSTGRES_PASSWORD=test \
+  -p 5433:5432 postgres:16-alpine
 ```
 
 ### E2E smoke test
