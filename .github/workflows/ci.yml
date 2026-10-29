@@ -177,6 +177,114 @@ jobs:
           )
           PY
 
+      # Required gate: the AFK consumer and backfill CLI suites exercise
+      # delivery deduplication, canonical event identity, replay convergence,
+      # and backfill idempotency against real PostgreSQL.  They migrate the
+      # schema and drop the public tables, so they run on the same dedicated
+      # disposable postgres-isolated service, in their own step after the
+      # six-case gate above.  GitHub Actions runs steps sequentially, so this
+      # DROP TABLE teardown cannot race a sibling suite (the six-case JUnit
+      # report has already been verified by the time this step runs).
+      - name: Run AFK consumer and backfill convergence tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_afk_consumer.py \
+            tests/integration/test_afk_outcomes_cli.py \
+            -v -m integration \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/afk-consumer-backfill-report.xml"
+
+      # No-skip proof: the suites verify the disposable target in a fixture,
+      # so a missing database is an error rather than a skip.  This gate
+      # additionally requires every expected case to be present and passing.
+      # A missing/empty report, a collection error, an all-skipped module, or
+      # any failure blocks CI.
+      - name: Verify AFK consumer and backfill tests executed and passed
+        if: always()
+        env:
+          AFK_CONSUMER_BACKFILL_JUNIT: ${{ runner.temp }}/afk-consumer-backfill-report.xml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          EXPECTED = {
+              # tests/integration/test_afk_consumer.py
+              "test_normalized_bridge_persists_canonical_change_request",
+              "test_record_event_redelivery_produces_no_duplicate_rows",
+              "test_reconciliation_window_converges_merged_outcome",
+              "test_cross_path_event_dedup_when_occurred_at_agrees",
+              "test_cross_path_event_distinct_when_occurred_at_differs",
+              "test_replay_convergence_live_then_replay",
+              "test_replay_convergence_replay_then_live",
+              "test_redelivery_creates_no_duplicate_rows_across_full_path",
+              "test_normalized_edited_persists_as_canonical_updated",
+              "test_normalized_reopened_persists_as_canonical_reopened",
+              "test_normalized_edited_redelivery_is_idempotent",
+              "test_late_event_with_older_occurred_at_enriches_trail",
+              # tests/integration/test_afk_outcomes_cli.py
+              "test_backfill_rerun_converges_and_dry_run_matches_stored",
+              "test_bounded_window_reconciliation_on_second_run",
+          }
+
+          report = os.environ["AFK_CONSUMER_BACKFILL_JUNIT"]
+          if not os.path.exists(report):
+              print(f"::error::AFK consumer/backfill JUnit report is missing: {report}")
+              sys.exit(1)
+
+          cases = list(ET.parse(report).getroot().iter("testcase"))
+          seen = {}
+          problems = []
+          for case in cases:
+              name = case.get("name", "<unnamed>")
+              classname = case.get("classname", "<unknown>")
+              if case.find("skipped") is not None:
+                  state = "SKIPPED"
+                  problems.append(f"{classname}::{name} was skipped")
+              elif case.find("failure") is not None or case.find("error") is not None:
+                  state = "FAILED"
+                  problems.append(f"{classname}::{name} failed")
+              else:
+                  state = "PASSED"
+              seen[name] = state
+              print(f"{state:7} {classname}::{name}")
+
+          missing = sorted(EXPECTED - set(seen))
+          unexpected = sorted(set(seen) - EXPECTED)
+          if len(cases) != len(EXPECTED):
+              problems.append(
+                  f"expected {len(EXPECTED)} test cases, collected {len(cases)}"
+              )
+          if missing:
+              problems.append(f"missing test cases: {missing}")
+          if unexpected:
+              problems.append(f"unexpected test cases: {unexpected}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          passed = sum(1 for state in seen.values() if state == "PASSED")
+          skipped = sum(1 for state in seen.values() if state == "SKIPPED")
+          failed = sum(1 for state in seen.values() if state == "FAILED")
+          print(
+              "AFK consumer/backfill gate: "
+              f"{len(cases)} collected, {passed} passed, {failed} failed, "
+              f"{skipped} skipped, 0 errors"
+          )
+          PY
+
       - name: Lint Python
         run: ruff check .
 

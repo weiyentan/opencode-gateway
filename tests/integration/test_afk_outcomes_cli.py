@@ -1,7 +1,7 @@
 """Integration tests for the AFK outcome backfill CLI (issue #449).
 
-Runs ``scripts.afk_backfill.run_backfill`` against the docker-compose
-Postgres (port 5433) with a fake GitHub API client, and verifies:
+Runs ``scripts.afk_backfill.run_backfill`` against the dedicated disposable
+PostgreSQL 16 service (port 5433) with a fake GitHub API client, and verifies:
 
 * a real backfill run over a window, followed by a re-run of the same
   window, converges with no duplicate rows (deterministic session-keyed
@@ -9,24 +9,37 @@ Postgres (port 5433) with a fake GitHub API client, and verifies:
 * the dry-run report writes nothing and its counts match the resolution a
   real write stores for the same window (``afk_run_entities`` buckets).
 
+No external provider API is contacted: every request is served by
+``FakeGitHubApi``.
+
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as a
+disposable PostgreSQL 16 database.  Start one outside Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_test \\
+        -e POSTGRES_USER=opencode_test \\
+        -e POSTGRES_PASSWORD=opencode_test \\
+        -p 5433:5432 postgres:16-alpine
 
-Connection parameters come from the standard Gateway environment variables
-(defaulting to the ``docker-compose.test.yml`` service).
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_afk_outcomes_cli.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+A missing attestation, an unreachable server, a non-test database name, a
+Kubernetes target, or a non-PostgreSQL-16 server fails closed instead of
+skipping.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,15 +48,17 @@ import pytest
 
 from afk_outcomes.providers.github import GitHubAdapter
 from scripts.afk_backfill import BackfillReport, run_backfill
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 REPOSITORY = "weiyentan/opencode-gateway"
@@ -54,38 +69,58 @@ RUN_FINISH = datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC)
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
+    return _TARGET.dsn()
 
 
-async def _can_connect() -> bool:
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+# Clear every data table but preserve the migration bookkeeping so each test
+# starts from a clean slate without re-running migrations.
+_TRUNCATE_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+    "AND tablename <> 'alembic_version') LOOP "
+    "EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+
+async def _drop_all_tables() -> None:
+    """Drop every public table — the retry path for a corrupt schema state."""
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
     try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
+        await conn.execute(_DROP_ALL_SQL)
+    finally:
         await conn.close()
-        return True
-    except Exception:
-        return False
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``_migrated_schema`` (and therefore before the destructive
+    migration reset).  A missing attestation, unreachable server, non-test
+    database name, Kubernetes target, or wrong server version raises an error
+    — never a skip, so CI cannot go green on an unverified or skipped target.
+    """
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the disposable database to ``head`` once per module.
 
+    Deliberately synchronous: alembic's ``env.py`` calls ``asyncio.run``,
+    which cannot run inside the pytest-asyncio event loop.  A first attempt
+    that fails (e.g. leftover partial tables) drops every public table and
+    retries from scratch; the drop only runs after the target was verified as
+    disposable.
+    """
     import alembic.command
     import alembic.config
 
@@ -96,24 +131,30 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     try:
         alembic.command.upgrade(alembic_cfg, "head")
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
+        asyncio.run(_drop_all_tables())
         alembic.command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture
+async def db_pool(_migrated_schema: None) -> AsyncIterator[asyncpg.Pool]:
+    """Function-scoped pool on the migrated disposable database.
+
+    pytest-asyncio runs each async test in a fresh event loop and an asyncpg
+    pool is bound to the loop that created it, so the pool cannot be shared
+    across tests.  Every test starts and finishes with an empty schema (the
+    migration version row is preserved) so global row-count assertions stay
+    deterministic.
+    """
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        await conn.execute(_TRUNCATE_ALL_SQL)
 
     yield pool
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
-        )
+        await conn.execute(_TRUNCATE_ALL_SQL)
     await pool.close()
 
 
@@ -361,7 +402,8 @@ async def test_backfill_rerun_converges_and_dry_run_matches_stored(
             assert getattr(real, name) == getattr(dry, name), name
         after_first = await _table_counts(conn)
         assert after_first["afk_runs"] == 1
-        assert after_first["afk_run_entities"] == 4  # CR + 2 issues + noise commit
+        # Owning change request + 2 issues + branch commit + review lineage.
+        assert after_first["afk_run_entities"] == 5
         assert after_first["delivery_log"] == 1
 
         # Re-run of the same window converges — no duplicate rows anywhere.
