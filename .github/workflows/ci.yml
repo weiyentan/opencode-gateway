@@ -25,24 +25,6 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-      # Dedicated disposable PostgreSQL for the destructive AFK concurrency
-      # and reporting-ingestion suites.  This container is separate from the
-      # shared ``postgres`` service above so their migration-reset/teardown
-      # can never erase another suite's data.
-      postgres-isolated:
-        image: postgres:16
-        env:
-          POSTGRES_DB: opencode_gateway_disposable_test
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U test -d opencode_gateway_disposable_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +43,9 @@ jobs:
 
       - run: pytest --maxfail=5 -v -m "not integration"
 
+      # Shared, non-destructive PostgreSQL suites.  Destructive suites that
+      # migrate/reset the schema live in the disposable-postgres job below so
+      # they can never erase this database's data.
       - name: Run AFK PostgreSQL integration tests
         env:
           GATEWAY_DATABASE_HOST: localhost
@@ -73,115 +58,13 @@ jobs:
           pytest \
             tests/integration/test_afk_run_convergence.py \
             tests/integration/test_afk_outcomes_repository.py \
-            tests/integration/test_execution_cost_attribution.py \
             tests/integration/test_afk_lifecycle_multi_stage.py \
             tests/integration/test_afk_lifecycle_provenance.py \
-            tests/integration/test_execution_bindings.py \
-            tests/integration/test_recovery_checkpoints.py \
             tests/integration/test_afk_run_api_compatibility.py \
-            tests/integration/test_execution_reconciliation_integration.py \
             tests/integration/test_afk_dashboard_golden_dataset.py \
             tests/integration/test_db_reconnect_smoke.py \
             tests/test_agent_runs_status_filter_pg.py \
-            tests/integration/test_change_request_summary.py \
-            tests/integration/test_afk_outcomes_correlations_jsonb.py \
             -v -m integration
-
-      # Required gate: the AFK lifecycle concurrency and reporting-ingestion
-      # suites migrate the schema and can drop all public tables.  They run
-      # only against the dedicated disposable postgres-isolated container,
-      # with an explicit disposable-target attestation.  A missing database,
-      # a failed test, a collection error, or an unexpected skip fails CI.
-      - name: Run isolated AFK concurrency and reporting ingestion tests
-        env:
-          GATEWAY_ENV: development
-          GATEWAY_DATABASE_HOST: localhost
-          GATEWAY_DATABASE_PORT: "5433"
-          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
-          GATEWAY_DATABASE_USER: test
-          GATEWAY_DATABASE_PASSWORD: test
-          GATEWAY_TEST_DISPOSABLE_DB: "1"
-        run: |
-          set -euo pipefail
-          pytest \
-            tests/integration/test_afk_lifecycle_concurrency.py \
-            tests/integration/test_reporting_ingest.py \
-            -v -m integration \
-            -p no:cacheprovider \
-            --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
-
-      - name: Verify all six isolated PostgreSQL tests executed and passed
-        if: always()
-        env:
-          ISOLATED_PG_JUNIT: ${{ runner.temp }}/isolated-postgres-report.xml
-        run: |
-          python - <<'PY'
-          import os
-          import sys
-          import xml.etree.ElementTree as ET
-
-          EXPECTED = {
-              "test_concurrent_provision_same_key_same_payload",
-              "test_concurrent_provision_same_key_different_payload",
-              "test_concurrent_bind_same_change_request",
-              "test_same_delivery_twice_persists_one_row",
-              "test_unique_constraint_enforced_at_sql_level",
-              "test_trail_unique_constraint_enforced_at_sql_level",
-          }
-
-          report = os.environ["ISOLATED_PG_JUNIT"]
-          if not os.path.exists(report):
-              print(f"::error::Isolated PostgreSQL JUnit report is missing: {report}")
-              sys.exit(1)
-
-          cases = list(ET.parse(report).getroot().iter("testcase"))
-          seen = {}
-          problems = []
-          for case in cases:
-              name = case.get("name", "<unnamed>")
-              classname = case.get("classname", "<unknown>")
-              if case.find("skipped") is not None:
-                  state = "SKIPPED"
-                  problems.append(f"{classname}::{name} was skipped")
-              elif case.find("failure") is not None or case.find("error") is not None:
-                  state = "FAILED"
-                  problems.append(f"{classname}::{name} failed")
-              else:
-                  state = "PASSED"
-              seen[name] = state
-              print(f"{state:7} {classname}::{name}")
-
-          missing = sorted(EXPECTED - set(seen))
-          unexpected = sorted(set(seen) - EXPECTED)
-          if len(cases) != len(EXPECTED):
-              problems.append(
-                  f"expected {len(EXPECTED)} test cases, collected {len(cases)}"
-              )
-          if missing:
-              problems.append(f"missing test cases: {missing}")
-          if unexpected:
-              problems.append(f"unexpected test cases: {unexpected}")
-
-          if problems:
-              for problem in problems:
-                  print(f"::error::{problem}")
-              sys.exit(1)
-
-          passed = sum(1 for state in seen.values() if state == "PASSED")
-          skipped = sum(1 for state in seen.values() if state == "SKIPPED")
-          failed = sum(1 for state in seen.values() if state == "FAILED")
-          print(
-              "Isolated PostgreSQL gate: "
-              f"{len(cases)} collected, {passed} passed, {failed} failed, "
-              f"{skipped} skipped, 0 errors"
-          )
-          PY
-
-      - name: Lint Python
-        run: ruff check .
-
-      - name: Type-check application
-        run: mypy app/ afk_outcomes/
 
       - name: Test frontend pure functions
         run: node frontend/tests/test_pure_functions.js
@@ -194,3 +77,185 @@ jobs:
 
       - name: Test AFK dashboard summary
         run: node frontend/tests/test_afk_dashboard_summary.js
+
+  # Dedicated disposable-PostgreSQL job.  Every suite here migrates the schema
+  # to ``head`` and may drop every public table on retry/teardown, so it runs
+  # against its own postgres-isolated service (port 5433) with an explicit
+  # disposable-target attestation.  Keeping it out of the shared ``test`` job
+  # means these destructive suites can never erase another suite's data, and
+  # the seven migrated integration files are never executed twice.
+  disposable-postgres:
+    name: Disposable PostgreSQL integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres-isolated:
+        image: postgres:16
+        env:
+          POSTGRES_DB: opencode_gateway_disposable_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d opencode_gateway_disposable_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      GATEWAY_ENV: development
+      GATEWAY_TEST_DISPOSABLE_DB: "1"
+      GATEWAY_DATABASE_HOST: localhost
+      GATEWAY_DATABASE_PORT: "5433"
+      GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+      GATEWAY_DATABASE_USER: test
+      GATEWAY_DATABASE_PASSWORD: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run disposable PostgreSQL integration tests
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_afk_lifecycle_concurrency.py \
+            tests/integration/test_reporting_ingest.py \
+            tests/integration/test_change_request_summary.py \
+            tests/integration/test_afk_outcomes_correlations_jsonb.py \
+            tests/integration/test_reporting_aggregates.py \
+            tests/integration/test_execution_bindings.py \
+            tests/integration/test_execution_cost_attribution.py \
+            tests/integration/test_execution_reconciliation_integration.py \
+            tests/integration/test_recovery_checkpoints.py \
+            -v -m integration \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
+
+      # Required gate: every expected module must contribute its exact test
+      # count, and no case may be skipped.  The module map replaced the old
+      # six-name set so test_reporting_aggregates.py (and the other migrated
+      # suites) cannot silently fall out of the pytest invocation again.
+      - name: Verify all disposable PostgreSQL tests executed and passed
+        if: always()
+        env:
+          ISOLATED_PG_JUNIT: ${{ runner.temp }}/isolated-postgres-report.xml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          EXPECTED_MODULES = {
+              "tests.integration.test_afk_lifecycle_concurrency": 3,
+              "tests.integration.test_reporting_ingest": 3,
+              "tests.integration.test_change_request_summary": 2,
+              "tests.integration.test_afk_outcomes_correlations_jsonb": 1,
+              "tests.integration.test_reporting_aggregates": 6,
+              "tests.integration.test_execution_bindings": 37,
+              "tests.integration.test_execution_cost_attribution": 9,
+              "tests.integration.test_execution_reconciliation_integration": 7,
+              "tests.integration.test_recovery_checkpoints": 9,
+          }
+          EXPECTED_TOTAL = sum(EXPECTED_MODULES.values())
+
+          report = os.environ["ISOLATED_PG_JUNIT"]
+          if not os.path.exists(report):
+              print(f"::error::Disposable PostgreSQL JUnit report is missing: {report}")
+              sys.exit(1)
+
+          cases = list(ET.parse(report).getroot().iter("testcase"))
+          counts = {}
+          seen = set()
+          problems = []
+          for case in cases:
+              name = case.get("name", "<unnamed>")
+              classname = case.get("classname", "<unknown>")
+              case_id = f"{classname}::{name}"
+              if case_id in seen:
+                  problems.append(f"duplicate test case: {case_id}")
+              seen.add(case_id)
+              counts[classname] = counts.get(classname, 0) + 1
+              if case.find("skipped") is not None:
+                  state = "SKIPPED"
+                  problems.append(f"{case_id} was skipped")
+              elif case.find("failure") is not None or case.find("error") is not None:
+                  state = "FAILED"
+                  problems.append(f"{case_id} failed")
+              else:
+                  state = "PASSED"
+              print(f"{state:7} {case_id}")
+
+          if counts != EXPECTED_MODULES:
+              for module, expected in sorted(EXPECTED_MODULES.items()):
+                  actual = counts.get(module, 0)
+                  if actual != expected:
+                      problems.append(
+                          f"{module}: expected {expected} test cases, collected {actual}"
+                      )
+              for module in sorted(set(counts) - set(EXPECTED_MODULES)):
+                  problems.append(
+                      f"unexpected test module: {module} ({counts[module]} cases)"
+                  )
+          if len(cases) != EXPECTED_TOTAL:
+              problems.append(
+                  f"expected {EXPECTED_TOTAL} test cases in total, "
+                  f"collected {len(cases)}"
+              )
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          print(
+              "Disposable PostgreSQL gate: "
+              f"{len(cases)} collected, {len(cases)} passed, "
+              "0 failed, 0 skipped, 0 errors"
+          )
+          PY
+
+  # Lint and type-check are independent jobs so an integration failure can
+  # never skip them.  They run for every pull-request head SHA.
+  lint:
+    name: Lint (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Lint Python
+        run: ruff check .
+
+  typecheck:
+    name: Type-check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Type-check application
+        run: mypy app/ afk_outcomes/

@@ -25,12 +25,10 @@ The test skips gracefully when the database is not reachable.
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
@@ -41,12 +39,7 @@ from app.core.reporting_aggregates import (
     get_aggregate,
 )
 from app.core.repository import normalize_repository_url
-from tests.integration._disposable_postgres import DatabaseTarget, verify_disposable_target
-
-_PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
-_ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
-
-_TARGET = DatabaseTarget.from_env()
+from tests.integration._disposable_postgres import target_dsn as _dsn
 
 UTC = timezone.utc
 
@@ -56,49 +49,6 @@ _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)
 _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
 _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
-_DROP_ALL_SQL = (
-    "DO $$ DECLARE r RECORD; BEGIN "
-    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-    "END LOOP; END $$;"
-)
-
-
-def _dsn() -> str:
-    return _TARGET.dsn()
-
-
-@pytest.fixture(scope="module")
-def _verified_disposable_database() -> DatabaseTarget:
-    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB."""
-    return asyncio.run(verify_disposable_target(_TARGET))
-
-
-@pytest.fixture(scope="module")
-def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
-    """Migrate the test database to ``head`` using the unmodified revision chain."""
-
-    import alembic.command
-    import alembic.config
-
-    sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
-    alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
-    alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-
-    async def _drop_all() -> None:
-        conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
-        try:
-            await conn.execute(_DROP_ALL_SQL)
-        finally:
-            await conn.close()
-
-    try:
-        asyncio.run(asyncio.to_thread(alembic.command.upgrade, alembic_cfg, "head"))
-    except Exception:
-        asyncio.run(_drop_all())
-        asyncio.run(asyncio.to_thread(alembic.command.upgrade, alembic_cfg, "head"))
-
 
 @pytest.fixture(scope="module")
 async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
@@ -107,8 +57,6 @@ async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
 
     yield pool
 
-    async with pool.acquire() as conn:
-        await conn.execute(_DROP_ALL_SQL)
     await pool.close()
 
 

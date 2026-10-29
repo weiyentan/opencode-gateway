@@ -38,13 +38,10 @@ CI runs this suite against a dedicated ``postgres:16`` service container.
 
 Fixture layout notes
 --------------------
-* **Migrations run in a subprocess** (module-scoped): alembic's ``env.py``
-  wraps its async engine in ``asyncio.run()``, which cannot run inside the
-  pytest-asyncio event loop.  The subprocess tries the in-process
-  interpreter first and falls back to a uv-managed Python 3.12 interpreter
-  when the in-process interpreter is older than the repo's ``>=3.12`` floor
-  (the migration chain uses PEP 604 annotations that Python 3.9 cannot
-  import).
+* **Migrations are module-scoped** via the shared ``_verified_disposable_database``
+  and ``_migrated_schema`` fixtures in ``tests/integration/conftest.py``: the
+  upgrade runs in a worker thread where alembic's ``env.py`` can call
+  ``asyncio.run()`` safely, and teardown drops every public table.
 * **``db_pool`` is function-scoped**: pytest-asyncio 0.26 runs every async
   test in a fresh event loop, and an asyncpg pool is bound to the loop that
   created it — a module-scoped pool would be used across loops.  Each test
@@ -56,27 +53,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
-import subprocess
-import sys
 import uuid
-from pathlib import Path
 
 import asyncpg
 import pytest
 from fastapi import Request
 
 from app.core.identity import hash_token
-from tests.integration._disposable_postgres import (
-    DatabaseTarget,
-    verify_disposable_target,
-)
-
-_PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
-
-# Resolved once at import (never connects); the safety preflight in
-# ``_verified_disposable_database`` verifies it before any destructive step.
-_TARGET = DatabaseTarget.from_env()
+from tests.integration._disposable_postgres import target_dsn as _dsn
 
 _API_KEY = "test-api-key"
 
@@ -85,125 +69,6 @@ _API_KEY = "test-api-key"
 _AWX_CLIENT_NAME = "awx-execution-bindings"
 
 _LIFECYCLE_PROVISION_PATH = "/api/v1/afk/executions/runs"
-
-# Packages the uv-managed migration fallback must provide (the alembic env
-# chain imports app.core.config + app.db.models, which need pydantic).
-_UV_MIGRATION_PACKAGES = (
-    "alembic",
-    "sqlalchemy[asyncio]",
-    "asyncpg",
-    "pydantic",
-    "pydantic-settings",
-)
-
-_DROP_ALL_SQL = (
-    "DO $$ DECLARE r RECORD; BEGIN "
-    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-    "END LOOP; END $$;"
-)
-
-
-def _dsn() -> str:
-    return _TARGET.dsn()
-
-
-def _migration_env() -> dict[str, str]:
-    """Environment for the migration subprocess — point app settings at the test DB."""
-    env = dict(os.environ)
-    env.update(
-        {
-            "GATEWAY_ENV": "development",
-            "GATEWAY_DATABASE_HOST": _TARGET.host,
-            "GATEWAY_DATABASE_PORT": str(_TARGET.port),
-            "GATEWAY_DATABASE_NAME": _TARGET.name,
-            "GATEWAY_DATABASE_USER": _TARGET.user,
-            "GATEWAY_DATABASE_PASSWORD": _TARGET.password,
-        }
-    )
-    return env
-
-
-def _migration_commands() -> list[list[str]]:
-    """Candidate ``alembic upgrade head`` commands, most preferred first.
-
-    The in-process interpreter is tried first.  When it is older than the
-    repo's Python 3.12 floor, a uv-managed 3.12 interpreter carries the
-    migration chain instead.
-    """
-    commands: list[list[str]] = [[sys.executable, "-m", "alembic", "upgrade", "head"]]
-    uv = shutil.which("uv")
-    if uv is not None:
-        cmd = [uv, "run", "--no-project", "--python", "3.12"]
-        for package in _UV_MIGRATION_PACKAGES:
-            cmd += ["--with", package]
-        cmd += ["python", "-m", "alembic", "upgrade", "head"]
-        commands.append(cmd)
-    return commands
-
-
-def _run_migrations() -> None:
-    """Apply all alembic migrations against the test database.
-
-    Raises :class:`RuntimeError` when every candidate command fails.
-    """
-    env = _migration_env()
-    failures: list[str] = []
-    for cmd in _migration_commands():
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=_PROJ_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return
-            failures.append(f"{cmd[:2]}: {result.stderr.strip()[-500:]}")
-        except OSError as exc:
-            failures.append(f"{cmd[:2]}: {exc}")
-    raise RuntimeError(
-        "Failed to apply database migrations with any interpreter:\n" + "\n".join(failures)
-    )
-
-
-async def _drop_all_tables() -> None:
-    """Drop every public table — the retry path for a corrupt schema state."""
-    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
-    try:
-        await conn.execute(_DROP_ALL_SQL)
-    finally:
-        await conn.close()
-
-
-@pytest.fixture(scope="module")
-def _verified_disposable_database() -> DatabaseTarget:
-    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
-
-    Runs before ``_migrated_schema`` (and therefore before any destructive
-    migration reset).  A missing attestation, unreachable server, non-test
-    database name, Kubernetes target, or wrong server version raises an error
-    — never a skip, so CI cannot go green on an unverified or skipped target.
-    """
-    return asyncio.run(verify_disposable_target(_TARGET))
-
-
-@pytest.fixture(scope="module")
-def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
-    """Migrate the test database to ``head`` once per module.
-
-    Deliberately synchronous: the migration subprocess must not run inside
-    the pytest-asyncio event loop (alembic's env.py calls ``asyncio.run``).
-    A failed first attempt (e.g. leftover partial tables) drops every
-    public table and retries from scratch.  The drop only runs after
-    ``_verified_disposable_database`` has proven the target disposable.
-    """
-    try:
-        _run_migrations()
-    except RuntimeError:
-        asyncio.run(_drop_all_tables())
-        _run_migrations()
 
 
 @pytest.fixture
