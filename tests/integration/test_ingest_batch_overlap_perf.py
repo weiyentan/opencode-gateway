@@ -1,82 +1,217 @@
-"""Production-sized integration test for batch-level overlap detection (issue #416).
+"""Opt-in production-scale overlap benchmark for canonical ingest (issue #835).
 
-Verifies that a 100-record ingest batch performs at most one historical overlap
-query even when ``usage_ingest_attempts`` contains a production-scale history
-(~100k rows), and that quarantined records never produce accounting side effects.
+Classification
+--------------
+This module is an **optional performance benchmark**, not a required pull-request
+test.  Ordinary PR CI does **not** exercise it: the module carries the
+``profiling`` marker (excluded by the default ``pytest`` addopts and by the
+``-m "not integration"`` unit run) and is deliberately absent from every
+required CI job in ``.github/workflows/ci.yml``.  It runs only when explicitly
+requested, either through the ``workflow_dispatch``-only
+``.github/workflows/benchmark-overlap.yml`` workflow or manually as documented
+below.
 
-Prerequisites
--------------
-Start the standalone test Postgres container before running::
+What it proves
+--------------
+Against a production-shaped ``usage_ingest_attempts`` fixture of
+``ATTEMPTS_FIXTURE_COUNT`` (~123k) rows, a ``BATCH_SIZE`` (100) record ingest
+batch must:
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+* complete within ``REQUEST_BUDGET_SECONDS`` (20s, the Gateway request timeout);
+* execute **exactly one** set-based historical overlap query over
+  ``usage_events`` (never the old per-record ``usage_ingest_attempts``
+  self-join);
+* leave session, canonical-event, rollup, and raw-record accounting untouched
+  when the batch is quarantined for identity overlap.
 
-The test reads database connection parameters from the standard Gateway
-environment variables (``GATEWAY_DATABASE_HOST``, ``GATEWAY_DATABASE_PORT``,
-``GATEWAY_DATABASE_NAME``, ``GATEWAY_DATABASE_USER``,
-``GATEWAY_DATABASE_PASSWORD``).  The ``docker-compose.test.yml`` service
-is configured to match the defaults expected by these tests.
+Query counts are measured deterministically at the connection boundary
+(:class:`_CountingConnection`), so the benchmark does not depend on the
+``pg_stat_statements`` extension or on server preload configuration.  Every
+test prints ``[overlap-benchmark]`` metric lines; run with ``-s`` to see them
+in CI logs.
 
-Environment variables
----------------------
-GATEWAY_DATABASE_HOST
-    Host of the test database (defaults to ``localhost``).
-GATEWAY_DATABASE_PORT
-    Port of the test database (defaults to ``5433`` to match
-    ``docker-compose.test.yml``).
-GATEWAY_DATABASE_NAME
-    Database name (defaults to ``opencode_gateway_test``).
-GATEWAY_DATABASE_USER
-    Database user (defaults to ``opencode_test``).
-GATEWAY_DATABASE_PASSWORD
-    Database password (defaults to ``opencode_test``).
+Manual entrypoint
+-----------------
+Start a disposable PostgreSQL 16 container outside Kubernetes, then run::
+
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_benchmark_test \\
+        -e POSTGRES_USER=bench \\
+        -e POSTGRES_PASSWORD=bench \\
+        -p 5433:5432 postgres:16-alpine
+
+    GATEWAY_ENV=development \\
+    GATEWAY_TEST_DISPOSABLE_DB=1 \\
+    GATEWAY_RUN_OVERLAP_BENCHMARK=1 \\
+    GATEWAY_DATABASE_HOST=localhost \\
+    GATEWAY_DATABASE_PORT=5433 \\
+    GATEWAY_DATABASE_NAME=opencode_gateway_benchmark_test \\
+    GATEWAY_DATABASE_USER=bench \\
+    GATEWAY_DATABASE_PASSWORD=bench \\
+        pytest tests/integration/test_ingest_batch_overlap_perf.py \\
+            -v -m profiling -s -p no:cacheprovider
+
+    docker stop opencode-gateway-test-db
+
+Safety
+------
+This benchmark seeds ~123k rows, migrates the schema, and drops every table in
+the ``public`` schema on teardown.  ``verify_disposable_target`` therefore runs
+**before** any write and fails closed unless the target is positively attested
+as disposable: ``GATEWAY_TEST_DISPOSABLE_DB=1``, a ``_test`` database-name
+suffix, a non-production ``GATEWAY_ENV``, a non-Kubernetes process/host, and
+PostgreSQL 16.  When the benchmark is explicitly requested, an unreachable or
+non-disposable database raises :class:`DisposableDatabaseError` and surfaces as
+a test error — it is never converted into a green skip.
+
+Without ``GATEWAY_RUN_OVERLAP_BENCHMARK=1`` the module skips with an explicit
+"not requested" reason; that is the only skip path and it never masks a
+requested benchmark run.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
+import subprocess
+import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import pytest
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
+
 # ── Repository paths ─────────────────────────────────────────────────────
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
-_ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-# ── Default connection parameters matching docker-compose.test.yml ───────
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight verifies it
+# before any migration, fixture insert, or teardown drop.
+_TARGET = DatabaseTarget.from_env()
 
 # ── Request budget (seconds) ────────────────────────────────────────────
 # The Gateway's total_request_timeout_seconds defaults to 20 in config.py.
-# The issue specifies a 35-second budget; we use the lower config default
-# (20s) as a stricter bound.  A 100-record batch with batch-level overlap
-# detection should complete in well under 5 seconds even with a 100k-row
-# fixture; the old per-record approach would need >2 minutes and time out.
+# A 100-record batch with batch-level overlap detection should complete in
+# well under 5 seconds even with a 123k-row fixture; the old per-record
+# approach would need >2 minutes and time out.
 REQUEST_BUDGET_SECONDS = 20.0
 
 # ── Production-scale fixture size ────────────────────────────────────────
 # The production evidence from issue #416 reports ~123k usage_ingest_attempts
-# rows.  We seed at this scale so the integration environment mirrors the
-# production query plan.
+# rows.  We seed at this scale so the benchmark mirrors the production query
+# plan.
 ATTEMPTS_FIXTURE_COUNT = 123_000
 
 # ── Batch size for ingest test ───────────────────────────────────────────
 BATCH_SIZE = 100
 
-logger = logging.getLogger(__name__)
+# ── Opt-in switch ────────────────────────────────────────────────────────
+# The benchmark seeds ~123k rows and resets the public schema; it must never
+# run incidentally (e.g. from a broad ``pytest tests/integration`` invocation).
+BENCHMARK_OPT_IN_ENV = "GATEWAY_RUN_OVERLAP_BENCHMARK"
+
+# ── Query-count budget ───────────────────────────────────────────────────
+# Exactly one batch-level overlap query is expected per 100-record batch.
+OVERLAP_QUERY_BUDGET = 1
+
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+# Applied to every test in this module: ``integration`` for the shared marker
+# vocabulary and ``profiling`` so the default test run excludes the benchmark.
+pytestmark = [pytest.mark.integration, pytest.mark.profiling]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Query instrumentation
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class OverlapQueryCounter:
+    """Counts overlap-related SQL executed for one ingest request."""
+
+    overlap_queries: int = 0
+    legacy_overlap_queries: int = 0
+    total_queries: int = 0
+
+
+def _normalize_query(query: Any) -> str:
+    return " ".join(str(query).split())
+
+
+def _record_query(counter: OverlapQueryCounter, query: Any) -> None:
+    text = _normalize_query(query)
+    counter.total_queries += 1
+    # The batch-level ``check_batch_overlap`` query compares the whole batch
+    # with ``source_record_id = ANY($n::text[])`` in one statement.
+    if "usage_events" in text and "= ANY(" in text and "source_record_id" in text:
+        counter.overlap_queries += 1
+    # The removed per-record scan self-joined usage_ingest_attempts on
+    # original_source_record_id.  Any match is a regression to issue #416.
+    if (
+        "usage_ingest_attempts" in text
+        and "JOIN" in text.upper()
+        and "original_source_record_id" in text
+    ):
+        counter.legacy_overlap_queries += 1
+
+
+class _CountingConnection:
+    """Transparent asyncpg connection proxy that records overlap queries.
+
+    FastAPI caches ``get_session`` per request, so the auth dependency and the
+    ingest handler share this proxy; every query the request issues passes
+    through :meth:`_record` exactly once.
+    """
+
+    def __init__(self, conn: asyncpg.Connection, counter: OverlapQueryCounter) -> None:
+        self._conn = conn
+        self._counter = counter
+
+    async def fetch(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_query(self._counter, query)
+        return await self._conn.fetch(query, *args, **kwargs)
+
+    async def fetchrow(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_query(self._counter, query)
+        return await self._conn.fetchrow(query, *args, **kwargs)
+
+    async def fetchval(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_query(self._counter, query)
+        return await self._conn.fetchval(query, *args, **kwargs)
+
+    async def execute(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+        _record_query(self._counter, query)
+        return await self._conn.execute(query, *args, **kwargs)
+
+    async def executemany(self, query: Any, args: Any, **kwargs: Any) -> Any:
+        _record_query(self._counter, query)
+        return await self._conn.executemany(query, args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        # transaction(), copy_records_to_table(), is_closed(), etc.
+        return getattr(self._conn, name)
+
+
+def _emit_metrics(label: str, **values: Any) -> None:
+    """Print one visible benchmark metric line (requires pytest ``-s``)."""
+    rendered = ", ".join(f"{key}={value}" for key, value in values.items())
+    print(f"[overlap-benchmark] {label}: {rendered}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -85,24 +220,8 @@ logger = logging.getLogger(__name__)
 
 
 def _dsn() -> str:
-    """Build an asyncpg DSN from environment variables or defaults."""
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    """Return True if the test database is reachable."""
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5),
-            timeout=10.0,
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    """Build an asyncpg DSN from the verified disposable target."""
+    return _TARGET.dsn()
 
 
 def _utcnow() -> datetime:
@@ -113,97 +232,102 @@ def _mk_ts() -> datetime:
     return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
 
 
+async def _drop_all_tables() -> None:
+    """Drop every public table — the retry path for a corrupt schema state."""
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+    try:
+        await conn.execute(_DROP_ALL_SQL)
+    finally:
+        await conn.close()
+
+
+def _migration_env() -> dict[str, str]:
+    """Environment for the Alembic subprocess — point app settings at the target."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "GATEWAY_ENV": "development",
+            "GATEWAY_DATABASE_HOST": _TARGET.host,
+            "GATEWAY_DATABASE_PORT": str(_TARGET.port),
+            "GATEWAY_DATABASE_NAME": _TARGET.name,
+            "GATEWAY_DATABASE_USER": _TARGET.user,
+            "GATEWAY_DATABASE_PASSWORD": _TARGET.password,
+        }
+    )
+    return env
+
+
+def _run_alembic_upgrade() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=_PROJ_ROOT,
+        env=_migration_env(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Fixtures
 # ══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    """Module-level check: skip the entire module if the test DB is absent."""
-    if not asyncio.run(_can_connect()):
+def _benchmark_opt_in() -> None:
+    """Require the explicit benchmark opt-in before touching the database."""
+    if os.environ.get(BENCHMARK_OPT_IN_ENV) != "1":
         pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
+            "Optional production-scale overlap benchmark not requested. "
+            f"Set {BENCHMARK_OPT_IN_ENV}=1 (plus the disposable-Postgres "
+            "environment) to run it explicitly. This skip never applies to a "
+            "requested benchmark run."
         )
-    return True
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    """Create a dedicated asyncpg pool, run Alembic migrations, and return it.
+def _verified_disposable_database(_benchmark_opt_in: None) -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
 
-    The pool is shared across all tests in the module and closed after the
-    last test completes.
+    Runs before ``_migrated_schema``, ``_seed``, and the per-test pools, so no
+    migration, fixture insert, or teardown drop can execute against an
+    unverified target.  A missing attestation, unreachable server, non-test
+    database name, Kubernetes target, or wrong server version raises an error
+    — never a skip, so a requested benchmark cannot go green without a real
+    disposable database.
     """
-    # ── Build pool ───────────────────────────────────────────────────
-    pool = await asyncpg.create_pool(
-        dsn=_dsn(),
-        min_size=2,
-        max_size=5,
-    )
-    assert pool is not None
+    return asyncio.run(verify_disposable_target(_TARGET))
 
-    # ── Run Alembic migrations ───────────────────────────────────────
-    import alembic.command
-    import alembic.config
 
-    # Override the sqlalchemy.url so Alembic connects to the test DB.
-    # Build a sync psycopg URL that Alembic can use for DDL.
-    sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
-    alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
-    alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
-        alembic.command.upgrade(alembic_cfg, "head")
-    except Exception:
-        # Downgrade any lingering dirty state and retry once.
-        try:
-            alembic.command.downgrade(alembic_cfg, "base")
-        except Exception:
-            pass
-        # Drop all tables manually as a last-resort reset
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
+@pytest.fixture(scope="module")
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the disposable database to ``head`` once per benchmark run.
+
+    Deliberately synchronous: ``alembic/env.py`` calls ``asyncio.run``, which
+    cannot run inside the pytest-asyncio event loop, so the migration runs in
+    a subprocess.  A failed first attempt (e.g. leftover partial tables) drops
+    every public table and retries from scratch.
+    """
+    result = _run_alembic_upgrade()
+    if result.returncode != 0:
+        asyncio.run(_drop_all_tables())
+        retry = _run_alembic_upgrade()
+        if retry.returncode != 0:
+            raise RuntimeError(
+                f"alembic upgrade head failed against {_TARGET.describe()}\n"
+                f"first attempt:\n{result.stdout}\n{result.stderr}\n"
+                f"retry after drop:\n{retry.stdout}\n{retry.stderr}"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
-
-    yield pool
-
-    # ── Cleanup: drop all tables so the next run starts fresh ────────
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
-    except Exception:
-        pass
-    finally:
-        await pool.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Fixture data — production-scale seed
 # ══════════════════════════════════════════════════════════════════════════
 
-# These are populated per-module by the _seed fixture and stored as module
-# globals so individual test functions can reference them without repeating
-# the seed logic.
 
-_SEED: dict = {}
-
-
-@pytest.fixture(scope="module")
-async def _seed(db_pool: asyncpg.Pool) -> dict:
-    """Seed the test database with production-scale data for an existing
-    identity, then return a dict of generated IDs for use by tests.
+async def _seed_database() -> dict:
+    """Seed production-scale data for an existing identity.
 
     Creates, in order:
     - 1 ``opencode_client`` (existing identity owner)
@@ -222,11 +346,8 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
     overlap with the test batch (so the batch overlap query has something
     to find when an overlapping identity is tested).
     """
-    global _SEED
-    if _SEED:
-        return _SEED  # already seeded in this module
-
-    async with db_pool.acquire() as conn:
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=30)
+    try:
         now = _utcnow()
 
         # ── 1. opencode_client ──────────────────────────────────────
@@ -326,15 +447,15 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
         # Use a single multi-row INSERT for speed — 123k individual INSERTs
         # would take minutes.  We batch in chunks of 1000 to avoid exceeding
         # statement parameter limits.
-        CHUNK = 1000
+        chunk_size_limit = 1000
         base_ts = _mk_ts()
 
-        for offset in range(0, ATTEMPTS_FIXTURE_COUNT, CHUNK):
-            chunk_size = min(CHUNK, ATTEMPTS_FIXTURE_COUNT - offset)
+        for offset in range(0, ATTEMPTS_FIXTURE_COUNT, chunk_size_limit):
+            chunk_size = min(chunk_size_limit, ATTEMPTS_FIXTURE_COUNT - offset)
             placeholders = []
             params = []
             for i in range(chunk_size):
-                idx = offset + i
+                index = offset + i
                 p = i * 8
                 placeholders.append(
                     f"(${p + 1}, ${p + 2}, ${p + 3}, ${p + 4}, "
@@ -344,7 +465,7 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
                     uuid.uuid4(),                    # id
                     None,                            # usage_event_id
                     existing_identity_id,            # source_identity_id
-                    f"existing-rec-{idx:06d}",       # original_source_record_id
+                    f"existing-rec-{index:06d}",     # original_source_record_id
                     '{}',                            # record_jsonb
                     batch_id,                        # ingest_batch_id
                     "accepted",                      # outcome
@@ -381,8 +502,15 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
                 now,
             )
 
-        # Build the seed dict for test use
-        seed_data = {
+        # Verify the seed count
+        attempts_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM usage_ingest_attempts"
+        )
+        assert attempts_count == ATTEMPTS_FIXTURE_COUNT, (
+            f"Expected {ATTEMPTS_FIXTURE_COUNT} attempts, got {attempts_count}"
+        )
+
+        return {
             "client_id": client_id,
             "credential_id": cred_id,
             "source_db_id": source_db_id,
@@ -394,17 +522,35 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
             "base_ts": base_ts,
             "attempts_count": ATTEMPTS_FIXTURE_COUNT,
         }
-        _SEED = seed_data
+    finally:
+        await conn.close()
 
-        # Verify the seed count
-        cnt = await conn.fetchval(
-            "SELECT COUNT(*) FROM usage_ingest_attempts"
-        )
-        assert cnt == ATTEMPTS_FIXTURE_COUNT, (
-            f"Expected {ATTEMPTS_FIXTURE_COUNT} attempts, got {cnt}"
-        )
 
-        return _SEED
+@pytest.fixture(scope="module")
+def _seed(_migrated_schema: None) -> dict:
+    """Seed the production-scale fixture once, then drop it on teardown."""
+    seed_data = asyncio.run(_seed_database())
+    try:
+        yield seed_data
+    finally:
+        # The disposable target was verified before the seed; teardown can
+        # safely reset the public schema for the next run.
+        asyncio.run(_drop_all_tables())
+
+
+@pytest.fixture
+async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
+    """Create a function-scoped asyncpg pool bound to the current test loop."""
+    pool = await asyncpg.create_pool(
+        dsn=_dsn(),
+        min_size=2,
+        max_size=5,
+    )
+    assert pool is not None
+    try:
+        yield pool
+    finally:
+        await pool.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -414,17 +560,20 @@ async def _seed(db_pool: asyncpg.Pool) -> dict:
 
 def _build_ingest_app_for_integration(
     db_pool: asyncpg.Pool,
+    counter: OverlapQueryCounter,
     *,
     api_key: str | None = "test-api-key",
 ) -> AsyncClient:
-    """Build a FastAPI TestClient connected to the real integration DB pool.
+    """Build a FastAPI AsyncClient connected to the real benchmark DB pool.
 
-    Disables the API-key middleware when ``api_key`` is ``None``; provides
-    an ``Authorization: Bearer <api_key>`` header otherwise so the
-    middleware passes — the bearer token must exactly match
-    ``GATEWAY_API_KEY``, pinned to ``test-api-key`` by ``tests/conftest.py``
-    (the seeded collector credential hash matches it), so both auth layers
-    succeed.  ``GATEWAY_ENV=development`` does not bypass API-key checks.
+    The ``get_session`` override yields an instrumented connection so every
+    query issued by the request is classified for the overlap-query metric.
+    Disables the API-key middleware when ``api_key`` is ``None``; provides an
+    ``Authorization: Bearer <api_key>`` header otherwise so the middleware
+    passes — the bearer token must exactly match ``GATEWAY_API_KEY``, pinned
+    to ``test-api-key`` by ``tests/conftest.py`` (the seeded collector
+    credential hash matches it), so both auth layers succeed.
+    ``GATEWAY_ENV=development`` does not bypass API-key checks.
     """
     from app.core.factory import create_app
     from app.db.session import get_session
@@ -436,7 +585,7 @@ def _build_ingest_app_for_integration(
     async def _override_get_session(request: Request):
         conn = await db_pool.acquire()
         try:
-            yield conn
+            yield _CountingConnection(conn, counter)
         finally:
             await db_pool.release(conn)
 
@@ -448,6 +597,32 @@ def _build_ingest_app_for_integration(
 
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     return AsyncClient(transport=transport, base_url="http://test", headers=headers)
+
+
+async def _insert_source_identity(
+    conn: asyncpg.Connection,
+    *,
+    client_id: uuid.UUID,
+    source_db_id: uuid.UUID,
+) -> uuid.UUID:
+    """Register the already-known identity for a second source database.
+
+    The ingest path's ``resolve_canonical_identity`` SELECT expects
+    ``canonical_parent_id`` on the row it returns; pre-registering the
+    identity keeps this benchmark focused on the batch-overlap and quarantine
+    accounting contract rather than on first-contact identity discovery.
+    """
+    identity_id = uuid.uuid4()
+    await conn.execute(
+        """INSERT INTO source_identities
+           (id, client_id, collector_source_id, is_canonical, created_at)
+           VALUES ($1, $2, $3, true, $4)""",
+        identity_id,
+        client_id,
+        str(source_db_id),
+        _utcnow(),
+    )
+    return identity_id
 
 
 def _valid_ingest_payload(
@@ -477,14 +652,10 @@ def _valid_ingest_payload(
     }
 
 
-@pytest.mark.integration
+@pytest.mark.asyncio
 class TestIngestBatchOverlapPerformance:
-    """Integration tests for batch-level overlap detection (issue #416).
+    """Opt-in benchmark for batch-level overlap detection (issue #416)."""
 
-    All tests share the module-scoped ``db_pool`` and ``_seed`` fixtures.
-    """
-
-    @pytest.mark.asyncio
     async def test_100_record_batch_completes_within_request_budget(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -500,6 +671,7 @@ class TestIngestBatchOverlapPerformance:
         batch-level check runs once and completes in well under a second.
         """
         seed = _seed
+        counter = OverlapQueryCounter()
 
         # ── Build 100 records with UNIQUE source_record_ids that do NOT
         #     overlap with the existing identity's usage_events. ──────
@@ -526,22 +698,44 @@ class TestIngestBatchOverlapPerformance:
             records=records,
         )
 
-        client = _build_ingest_app_for_integration(db_pool)
+        client = _build_ingest_app_for_integration(db_pool, counter)
 
         start = time.monotonic()
         async with client as c:
             response = await c.post("/ingest", json=payload)
         elapsed = time.monotonic() - start
 
+        data = response.json().get("data", {}) if response.status_code == 200 else {}
+        _emit_metrics(
+            "non_overlapping_batch_passed",
+            fixture_attempt_rows=ATTEMPTS_FIXTURE_COUNT,
+            batch_size=BATCH_SIZE,
+            elapsed_seconds=f"{elapsed:.3f}",
+            request_budget_seconds=REQUEST_BUDGET_SECONDS,
+            overlap_queries=counter.overlap_queries,
+            overlap_query_budget=OVERLAP_QUERY_BUDGET,
+            legacy_overlap_queries=counter.legacy_overlap_queries,
+            accepted=data.get("accepted_count"),
+            rejected=data.get("rejected_count"),
+        )
+
         assert response.status_code == 200, (
             f"Expected 200, got {response.status_code}: "
             f"{response.json()}"
         )
-        data = response.json()["data"]
         assert data["accepted_count"] == BATCH_SIZE, (
             f"Expected {BATCH_SIZE} accepted, got {data['accepted_count']}"
         )
         assert data["rejected_count"] == 0
+
+        assert counter.overlap_queries == OVERLAP_QUERY_BUDGET, (
+            f"Expected exactly {OVERLAP_QUERY_BUDGET} batch-level overlap query "
+            f"for {BATCH_SIZE} records, counted {counter.overlap_queries}"
+        )
+        assert counter.legacy_overlap_queries == 0, (
+            f"Legacy per-record overlap scan detected: "
+            f"{counter.legacy_overlap_queries} queries"
+        )
 
         assert elapsed < REQUEST_BUDGET_SECONDS, (
             f"Batch of {BATCH_SIZE} records took {elapsed:.2f}s — "
@@ -549,7 +743,6 @@ class TestIngestBatchOverlapPerformance:
             f"Per-record overlap scan regression suspected."
         )
 
-    @pytest.mark.asyncio
     async def test_overlapping_identity_is_quarantined_before_accounting(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -566,6 +759,7 @@ class TestIngestBatchOverlapPerformance:
         overlapping records to reside under the same client.
         """
         seed = _seed
+        counter = OverlapQueryCounter()
         async with db_pool.acquire() as conn:
             # ── Create a second source_database under the SAME client ──
             # A different collector_source_id will result in a new
@@ -584,6 +778,11 @@ class TestIngestBatchOverlapPerformance:
                 seed["client_id"],
                 seed["credential_id"],
                 now,
+            )
+            await _insert_source_identity(
+                conn,
+                client_id=seed["client_id"],
+                source_db_id=new_source_db_id,
             )
 
             # ── Snapshot pre-ingest state (before quota request) ─────
@@ -627,7 +826,7 @@ class TestIngestBatchOverlapPerformance:
             records=records,
         )
 
-        client = _build_ingest_app_for_integration(db_pool)
+        client = _build_ingest_app_for_integration(db_pool, counter)
 
         async with client as c:
             response = await c.post("/ingest", json=payload)
@@ -718,7 +917,34 @@ class TestIngestBatchOverlapPerformance:
                 f"got {attempt_count}"
             )
 
-    @pytest.mark.asyncio
+        _emit_metrics(
+            "quarantined_batch_accounting_effects",
+            fixture_attempt_rows=ATTEMPTS_FIXTURE_COUNT,
+            batch_size=BATCH_SIZE,
+            overlap_queries=counter.overlap_queries,
+            overlap_query_budget=OVERLAP_QUERY_BUDGET,
+            legacy_overlap_queries=counter.legacy_overlap_queries,
+            sessions_delta=after_sessions - before_sessions,
+            usage_events_delta=after_events - before_events,
+            client_project_rollup_delta=after_rollup - before_rollup,
+            opencode_usage_records_delta=after_records - before_records,
+            quarantines_delta=after_quarantines - before_quarantines,
+            quarantined_attempts=attempt_count,
+        )
+
+        assert counter.overlap_queries == OVERLAP_QUERY_BUDGET, (
+            f"Expected exactly {OVERLAP_QUERY_BUDGET} batch-level overlap query "
+            f"for {BATCH_SIZE} records, counted {counter.overlap_queries}"
+        )
+        assert counter.legacy_overlap_queries == 0, (
+            f"Legacy per-record overlap scan detected: "
+            f"{counter.legacy_overlap_queries} queries"
+        )
+        assert after_sessions == before_sessions
+        assert after_events == before_events
+        assert after_rollup == before_rollup
+        assert after_records == before_records
+
     async def test_mixed_valid_and_invalid_records_retain_per_record_outcomes(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -739,6 +965,7 @@ class TestIngestBatchOverlapPerformance:
            practice.
         """
         seed = _seed
+        counter = OverlapQueryCounter()
         async with db_pool.acquire() as conn:
             now = _utcnow()
 
@@ -756,6 +983,11 @@ class TestIngestBatchOverlapPerformance:
                 seed["client_id"],
                 seed["credential_id"],
                 now,
+            )
+            await _insert_source_identity(
+                conn,
+                client_id=seed["client_id"],
+                source_db_id=second_source_db_id,
             )
 
         # Build a mixed batch: 5 invalid (negative tokens) + 5 valid
@@ -790,7 +1022,7 @@ class TestIngestBatchOverlapPerformance:
             records=mixed_records,
         )
 
-        client = _build_ingest_app_for_integration(db_pool)
+        client = _build_ingest_app_for_integration(db_pool, counter)
         async with client as c:
             response = await c.post("/ingest", json=payload)
 
@@ -830,35 +1062,31 @@ class TestIngestBatchOverlapPerformance:
                     f"{result.get('index', '?')}"
                 )
 
-    @pytest.mark.asyncio
+        _emit_metrics(
+            "mixed_batch_outcomes",
+            batch_size=len(mixed_records),
+            overlap_queries=counter.overlap_queries,
+            overlap_query_budget=OVERLAP_QUERY_BUDGET,
+            legacy_overlap_queries=counter.legacy_overlap_queries,
+            accepted=accepted_count,
+            rejected=rejected_count,
+        )
+
+        assert counter.overlap_queries == OVERLAP_QUERY_BUDGET
+
     async def test_batch_overlap_uses_one_query_with_production_fixture(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
-        """Verify that a non-overlapping batch performs at most one query
-        against ``usage_ingest_attempts`` for historical overlap detection.
+        """Verify that a non-overlapping 100-record batch performs exactly one
+        query against ``usage_events`` for historical overlap detection.
 
-        Uses ``pg_stat_statements`` to count the number of queries matching
-        the overlap scan pattern.  Falls back to timing-based assertion if
-        ``pg_stat_statements`` is unavailable, but the timing of a 100-record
-        batch against a 123k-attempt fixture is itself a strong regression
-        guard (the old per-record scan would need >2 minutes).
+        Query counting happens at the connection boundary: the ingest request's
+        ``get_session`` dependency yields an instrumented connection, so the
+        metric is independent of ``pg_stat_statements`` availability.  The
+        timing assertion remains a second regression guard — the old
+        per-record scan would need >2 minutes against the 123k-attempt fixture.
         """
-        # Try to enable pg_stat_statements tracking
-        async with db_pool.acquire() as conn:
-            pgss_available = False
-            try:
-                await conn.execute(
-                    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
-                )
-                await conn.execute(
-                    "SELECT pg_stat_statements_reset()"
-                )
-                pgss_available = True
-            except Exception as exc:
-                logger.info(
-                    "pg_stat_statements unavailable (%s); "
-                    "relying on timing-based assertion", exc,
-                )
+        counter = OverlapQueryCounter()
 
         # ── Build 100 non-overlapping records ────────────────────────
         records = [
@@ -880,49 +1108,39 @@ class TestIngestBatchOverlapPerformance:
             records=records,
         )
 
-        client = _build_ingest_app_for_integration(db_pool)
+        client = _build_ingest_app_for_integration(db_pool, counter)
 
         start = time.monotonic()
         async with client as c:
             response = await c.post("/ingest", json=payload)
         elapsed = time.monotonic() - start
 
+        data = response.json().get("data", {}) if response.status_code == 200 else {}
+        _emit_metrics(
+            "overlap_query_count",
+            fixture_attempt_rows=ATTEMPTS_FIXTURE_COUNT,
+            batch_size=BATCH_SIZE,
+            elapsed_seconds=f"{elapsed:.3f}",
+            overlap_queries=counter.overlap_queries,
+            overlap_query_budget=OVERLAP_QUERY_BUDGET,
+            legacy_overlap_queries=counter.legacy_overlap_queries,
+            total_queries=counter.total_queries,
+            accepted=data.get("accepted_count"),
+        )
+
         assert response.status_code == 200
-        data = response.json()["data"]
         assert data["accepted_count"] == BATCH_SIZE
 
-        if pgss_available:
-            async with db_pool.acquire() as conn:
-                # Count queries that scan usage_ingest_attempts with a
-                # self-join or group-by pattern (the old per-record query).
-                # We expect ZERO such queries.
-                old_pattern_count = await conn.fetchval(
-                    """SELECT COALESCE(SUM(calls), 0)
-                       FROM pg_stat_statements
-                       WHERE query ILIKE '%usage_ingest_attempts%'
-                         AND query ILIKE '%JOIN%usage_ingest_attempts%'
-                         AND query ILIKE '%original_source_record_id%'"""
-                )
-                # Count batch overlap queries (the new single-set query)
-                batch_pattern_count = await conn.fetchval(
-                    """SELECT COALESCE(SUM(calls), 0)
-                       FROM pg_stat_statements
-                       WHERE query ILIKE '%usage_events%'
-                         AND query ILIKE '%source_record_id%'
-                         AND query ILIKE '%ANY%'"""
-                )
-
-                assert old_pattern_count == 0, (
-                    f"Old per-record overlap scan detected: "
-                    f"{old_pattern_count} query calls matching "
-                    f"the usage_ingest_attempts self-join pattern. "
-                    f"Regression to issue #416."
-                )
-                assert batch_pattern_count >= 1, (
-                    "Batch overlap query not found in pg_stat_statements. "
-                    "Expected at least 1 call matching the "
-                    "usage_events ANY($2) pattern."
-                )
+        assert counter.overlap_queries == OVERLAP_QUERY_BUDGET, (
+            f"Expected exactly {OVERLAP_QUERY_BUDGET} batch-level overlap query "
+            f"for {BATCH_SIZE} records, counted {counter.overlap_queries}"
+        )
+        assert counter.legacy_overlap_queries == 0, (
+            f"Old per-record overlap scan detected: "
+            f"{counter.legacy_overlap_queries} query calls matching "
+            f"the usage_ingest_attempts self-join pattern. "
+            f"Regression to issue #416."
+        )
 
         # Timing assertion: with batch overlap detection, a 100-record
         # batch against a 123k-attempt fixture finishes in seconds, not

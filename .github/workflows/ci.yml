@@ -110,6 +110,12 @@ jobs:
             -p no:cacheprovider \
             --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
 
+      # The production-scale batch-overlap benchmark (123k-attempt fixture,
+      # 100-record batch) is intentionally NOT part of this required PR
+      # workflow: it would add minutes to every change.  Run it explicitly via
+      # the workflow_dispatch-only ".github/workflows/benchmark-overlap.yml"
+      # workflow, or manually with GATEWAY_RUN_OVERLAP_BENCHMARK=1 (see the
+      # module docstring in tests/integration/test_ingest_batch_overlap_perf.py).
       - name: Verify all six isolated PostgreSQL tests executed and passed
         if: always()
         env:
