@@ -39,6 +39,17 @@ REQUIRED_POSTGRES_MAJOR = 16
 _DISPOSABLE_DB_SUFFIX = "_test"
 _FORBIDDEN_ENVIRONMENTS = frozenset({"production", "prod"})
 
+#: SQL that drops every table in the ``public`` schema (``CASCADE``).
+#: Shared by the disposable-DB suites for the migration retry and module
+#: teardown; only valid after :func:`verify_disposable_target` has proven the
+#: target disposable.
+DROP_ALL_TABLES_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
 
 class DisposableDatabaseError(RuntimeError):
     """The configured database cannot be proven to be a disposable target."""
@@ -74,6 +85,11 @@ class DatabaseTarget:
     def describe(self) -> str:
         """Human-readable target for failure messages (never includes the password)."""
         return f"{self.host}:{self.port}/{self.name}"
+
+
+def target_dsn(target: DatabaseTarget | None = None) -> str:
+    """Return the DSN for the disposable target (resolved from env if omitted)."""
+    return (target or DatabaseTarget.from_env()).dsn()
 
 
 def _require_environment_attestation(target: DatabaseTarget) -> None:

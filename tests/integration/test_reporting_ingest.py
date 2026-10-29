@@ -40,36 +40,17 @@ runs this suite against a dedicated ``postgres:16`` service container.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
 from fastapi import Request
 
 from app.core.identity import hash_token
-from tests.integration._disposable_postgres import (
-    DatabaseTarget,
-    verify_disposable_target,
-)
-
-_PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
-_ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
-
-# Resolved once at import (never connects); the safety preflight in
-# ``_verified_disposable_database`` verifies it before any destructive step.
-_TARGET = DatabaseTarget.from_env()
-
-_DROP_ALL_SQL = (
-    "DO $$ DECLARE r RECORD; BEGIN "
-    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-    "END LOOP; END $$;"
-)
+from tests.integration._disposable_postgres import target_dsn as _dsn
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
@@ -77,55 +58,6 @@ UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 # collector credential hash and the bearer token are both derived from it so
 # the API-key middleware and require_collector_token both pass.
 _API_KEY = "test-api-key"
-
-
-def _dsn() -> str:
-    return _TARGET.dsn()
-
-
-async def _drop_all_tables() -> None:
-    """Drop every public table — the retry path for a corrupt schema state."""
-    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
-    try:
-        await conn.execute(_DROP_ALL_SQL)
-    finally:
-        await conn.close()
-
-
-@pytest.fixture(scope="module")
-def _verified_disposable_database() -> DatabaseTarget:
-    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
-
-    Runs before ``_migrated_schema`` (and therefore before any destructive
-    migration reset).  A missing attestation, unreachable server, non-test
-    database name, Kubernetes target, or wrong server version raises an error
-    — never a skip, so CI cannot go green on an unverified or skipped target.
-    """
-    return asyncio.run(verify_disposable_target(_TARGET))
-
-
-@pytest.fixture(scope="module")
-def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
-    """Migrate the test database to ``head`` once per module.
-
-    Deliberately synchronous: alembic's ``env.py`` calls ``asyncio.run``,
-    which cannot run inside the pytest-asyncio event loop.  A failed first
-    attempt (e.g. leftover partial tables) drops every public table and
-    retries from scratch.  The drop only runs after
-    ``_verified_disposable_database`` has proven the target disposable.
-    """
-    import alembic.command
-    import alembic.config
-
-    sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
-    alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
-    alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
-        alembic.command.upgrade(alembic_cfg, "head")
-    except Exception:
-        asyncio.run(_drop_all_tables())
-        alembic.command.upgrade(alembic_cfg, "head")
 
 
 @pytest.fixture
