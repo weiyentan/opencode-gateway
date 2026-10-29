@@ -40,6 +40,7 @@ strict = true
 #   aiokafka 0.12.0 — no py.typed marker, no types-aiokafka stub on PyPI, import-untyped
 #   All other third-party imports (fastapi, pydantic, sqlalchemy, httpx, starlette,
 #   uvicorn, pydantic-settings, alembic) ship inline py.typed and are fully checked.
+# - No disable_error_code remains — type-arg and unused-ignore are fully enforced (issues #821, #822).
 
 # Targeted missing-import handling — justified per-package (issue #823).
 # asyncpg: untyped C-extension DB driver, no upstream stubs available at baseline.

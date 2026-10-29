@@ -12,7 +12,7 @@ Recorded on the runner used for this slice (CI pins Python 3.12; local runner is
 
 ```
 python --version            # 3.9.25 (runner) — mypy python_version = 3.12 (pinned)
-python -m mypy --version    # mypy 2.4.0 (compiled: yes)  [pip show mypy 1.19.1 in same env]
+python -m mypy --version    # mypy 1.19.1
 pip show asyncpg            # 0.31.0 — no py.typed, no types-asyncpg on PyPI
 pip show aiokafka            # 0.12.0 — no py.typed, no types-aiokafka on PyPI
 pip show fastapi             # 0.115.2 — ships py.typed
@@ -76,7 +76,7 @@ pytest -q --ignore=tests/integration
   covering the package and its submodules (`asyncpg.*`, `aiokafka.*`) with
   `ignore_missing_imports = true` and inline justification comments in `pyproject.toml`.
 - All other imports remain strictly checked (`strict = true`, `python_version = 3.12`);
-  `disable_error_code = ["type-arg", "unused-ignore"]` unchanged (owned by #821/#822).
+  no `disable_error_code` remains — `type-arg` and `unused-ignore` are now fully enforced (issues #821, #822).
 
 ## HITL / unresolved decisions
 
@@ -88,7 +88,10 @@ commands above. If stubs ever appear (`types-asyncpg` / `types-aiokafka`),
 prefer installing the stub over the override.
 
 Coordination: this slice touches `pyproject.toml` [tool.mypy] — sibling slices
-#821 and #822 touch `disable_error_code` and `ignore_errors` overrides on the
-same file. Coordinator merges via `git merge`; this slice adds only the two
-`ignore_missing_imports` override blocks and removes the global line, so
+#821 and #822 removed `disable_error_code` (no `disable_error_code` remains —
+`type-arg` and `unused-ignore` are now fully enforced) and scoped
+`ignore_errors` overrides on the same file. Coordinator merges via `git merge`;
+final consolidated state has no `disable_error_code` and no global
+`ignore_missing_imports` — only two per-package `ignore_missing_imports`
+overrides (asyncpg, aiokafka) plus scoped `ignore_errors` for legacy debt, so
 conflicts are limited to the `[tool.mypy]` header comments.

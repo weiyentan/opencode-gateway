@@ -451,7 +451,7 @@ class UnresolvedCorrelation(Base):
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False
     )
-    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    candidates: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -485,8 +485,8 @@ class ObservedToolCall(Base):
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
     tool_name: Mapped[str] = mapped_column(String, nullable=False)
     tool_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    tool_input: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    tool_output: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    tool_input: Mapped[Optional[dict[str, Any] | list[Any] | str | int | float | bool]] = mapped_column(JSONB, nullable=True)
+    tool_output: Mapped[Optional[dict[str, Any] | list[Any] | str | int | float | bool]] = mapped_column(JSONB, nullable=True)
     source_created_at: Mapped[Optional[int]] = mapped_column(
         BigInteger, nullable=True
     )
