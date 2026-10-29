@@ -212,6 +212,63 @@ current read path: 0018 predates `usage_events` (0021), so the read
 endpoints would not function. The baseline is instead head schema with
 the 8 indexes dropped, isolating migration 0019's exact effect.
 
+## Opt-in live harness (issue #836)
+
+The measurement protocol is executable as
+`tests/integration/test_read_path_live_protocol.py`. It is **not** part of
+required pull-request validation: ordinary CI runs only the pure
+plan/latency helper tests (`TestPlanHelpers`), and every live test skips
+unless an operator explicitly opts in.
+
+### Invocation
+
+Manual local run against a read-only replica (or a separately approved
+read-only target):
+
+```bash
+export READ_PATH_LIVE_ENABLED=1
+export READ_PATH_LIVE_DATABASE_URL='postgresql://reader:***@replica:5432/gateway'
+pytest tests/integration/test_read_path_live_protocol.py -v -m integration
+```
+
+`READ_PATH_LIVE_DATABASE_URL` takes precedence. If it is unset, **all** of
+`GATEWAY_DATABASE_HOST` / `_PORT` / `_NAME` / `_USER` / `_PASSWORD` must be
+supplied; there are no credential defaults. A DSN alone does **not** opt
+in — `READ_PATH_LIVE_ENABLED=1` is required.
+
+GitHub Actions: trigger the `CI` workflow manually (`workflow_dispatch`)
+with `read_path_live: true`. The `read-path-live` job reads the
+`READ_PATH_LIVE_DATABASE_URL` repository secret, is skipped for every
+push/PR event, and is not a required merge check.
+
+### Safety boundary
+
+- Every connection opens a `READ ONLY` transaction with
+  `SET LOCAL statement_timeout = 30000`; both boundaries are verified
+  (`transaction_read_only = on`, 30 s) before any probe runs, and the
+  transaction is rolled back on teardown.
+- Only `SELECT` / `EXPLAIN (ANALYZE, BUFFERS)` probes run. The harness
+  never issues schema changes, seed data, or destructive fixture teardown.
+- The DSN is never logged. Failure messages name only
+  `host:port/database`; user and password are stripped.
+- The target must be a read-only replica or a separately approved
+  read-only target — never the primary.
+
+### Failure semantics (no false green)
+
+- Not requested → live tests skip safely; pure helpers still run.
+- Requested but credentials missing or incomplete → fail.
+- Requested but the target is unreachable → fail.
+- Requested but zero probes executed → fail.
+
+### Reporting
+
+Each probe captures an `EXPLAIN (ANALYZE, BUFFERS)` plan plus warm-cache
+p50/p95 latency (10 measured runs after 2 warmups). Compare a candidate
+against a baseline with `compare_latency`; report buffers and temp spill
+(`Temp Read/Written Blocks`, `Sort Method: external`). A sequential scan
+is informational, never a failure by itself.
+
 ## Environment note (for future measurement slices)
 
 The repo requires Python ≥ 3.12 (`pyproject.toml` `requires-python`).
