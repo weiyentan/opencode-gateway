@@ -14,6 +14,12 @@ import logging
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from typing import TypedDict
+
+try:
+    from typing import NotRequired  # type: ignore[attr-defined]
+except ImportError:
+    from typing_extensions import NotRequired  # type: ignore[import-not-found]
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -315,6 +321,24 @@ class IngestResponse(BaseModel):
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────
+
+
+class _CanonicalEventResult(TypedDict):
+    """Typed return value of :func:`_record_canonical_event`.
+
+    The canonical-event recorder returns a mix of UUID and text values.  A
+    single ``dict[str, UUID | None]`` annotation used to describe all of
+    them, which forced text fields (``status``/``reason``) into a UUID slot
+    and made the per-record result path type-unsafe.  ``status`` and
+    ``reason`` are optional because the early "model/session row missing"
+    returns carry only the identifiers; callers already treat a missing
+    status as the record's pre-existing outcome.
+    """
+
+    event_id: uuid.UUID | None
+    attempt_id: uuid.UUID | None
+    status: NotRequired[str]
+    reason: NotRequired[str | None]
 
 
 def _utcnow() -> datetime:
@@ -1932,7 +1956,7 @@ async def _record_canonical_event(
     *,
     canonical_identity_id: uuid.UUID,
     cost_only: bool = False,
-) -> dict[str, uuid.UUID | None]:
+) -> _CanonicalEventResult:
     """Record a canonical event for an accepted first-delivery record.
 
     Quarantine, overlap detection, and cross-identity conflict checks
@@ -2262,7 +2286,7 @@ async def _record_canonical_event(
         )
 
 
-    result: dict[str, uuid.UUID | None] = {
+    result: _CanonicalEventResult = {
         "event_id": event_id,
         "attempt_id": attempt_id,
         "status": outcome_str,
@@ -2279,7 +2303,7 @@ async def _record_canonical_event(
 async def ingest_usage(
     body: IngestRequest,
     request: Request,
-    auth: dict = Depends(require_collector_token),
+    auth: dict[str, str] = Depends(require_collector_token),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> IngestResponse:
     """Accept a batch of usage records from an authenticated collector.
