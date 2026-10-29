@@ -6,7 +6,7 @@ separate dependency used by future collector-facing endpoints.
 """
 
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status

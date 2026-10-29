@@ -10,7 +10,7 @@ Gateway architecture.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID

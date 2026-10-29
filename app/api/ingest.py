@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import date, datetime, UTC
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 import asyncpg

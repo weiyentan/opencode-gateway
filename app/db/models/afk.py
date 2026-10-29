@@ -22,7 +22,7 @@ Retention tiers (issue #483, ADR 0022 — configurable via ``GATEWAY_RETENTION_*
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, UTC
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     BigInteger,

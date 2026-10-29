@@ -35,7 +35,7 @@ on migration 0031):
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, String, UniqueConstraint
 from sqlalchemy import text as sa_text

@@ -28,10 +28,10 @@ Protocol reference: ``docs/adr/0017-migration-0019-index-measurement.md``.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, UTC
+from collections.abc import Iterable, Mapping
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from collections.abc import Iterable, Mapping
 
 import pytest
 

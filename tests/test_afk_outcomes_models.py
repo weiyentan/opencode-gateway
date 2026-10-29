@@ -7,7 +7,7 @@ identical key whether it arrives naive, as UTC, or with any other UTC offset
 — and distinct instants must derive distinct keys.
 """
 
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import UTC, datetime, timedelta, timezone
 
 from afk_outcomes.models import build_observation_key
 

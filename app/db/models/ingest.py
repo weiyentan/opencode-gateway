@@ -10,7 +10,7 @@ Gateway architecture.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (

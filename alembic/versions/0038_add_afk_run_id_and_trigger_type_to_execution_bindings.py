@@ -17,8 +17,8 @@ Revises:     0037
 Create Date: 2026-08-23
 """
 
-from typing import Union
 from collections.abc import Sequence
+from typing import Union
 
 import sqlalchemy as sa
 

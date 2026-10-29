@@ -20,7 +20,7 @@ they exercise the real entry point without a database.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest

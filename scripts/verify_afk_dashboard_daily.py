@@ -42,9 +42,9 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Any
-from collections.abc import Mapping, Sequence
 
 import asyncpg
 

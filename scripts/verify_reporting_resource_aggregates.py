@@ -43,8 +43,8 @@ import json
 import logging
 import os
 import sys
-from datetime import date
 from collections.abc import Sequence
+from datetime import date
 
 import asyncpg
 

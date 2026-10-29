@@ -43,7 +43,7 @@ Revises:     0034
 import hashlib
 import json
 from collections.abc import Sequence
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Union
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest

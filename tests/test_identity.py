@@ -8,7 +8,7 @@ the existing test conventions (httpx AsyncClient + mock asyncpg).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

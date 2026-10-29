@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone, UTC
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock  # noqa: F811
 

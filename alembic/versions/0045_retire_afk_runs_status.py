@@ -19,8 +19,8 @@ recoverable (the column carried no semantics the change-request lifecycle
 does not already cover).
 """
 
-from typing import Union
 from collections.abc import Sequence
+from typing import Union
 
 import sqlalchemy as sa
 

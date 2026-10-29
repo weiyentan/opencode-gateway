@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from collections.abc import Callable
 
 from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.models import (

@@ -45,11 +45,11 @@ import json
 import os
 import secrets as _secrets
 import sys
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import httpx
 

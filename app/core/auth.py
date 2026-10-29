@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from datetime import UTC
 
 import asyncpg
 from fastapi import Depends, HTTPException, Request, status
@@ -31,7 +32,6 @@ from starlette.responses import Response
 from app.core.config import get_settings
 from app.core.identity import hash_token
 from app.db.session import get_session
-from datetime import UTC
 
 logger = logging.getLogger(__name__)
 

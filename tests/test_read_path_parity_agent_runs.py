@@ -26,7 +26,7 @@ Protocol reference: ``docs/adr/0017-migration-0019-index-measurement.md``.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest

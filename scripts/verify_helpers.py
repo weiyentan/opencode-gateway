@@ -15,10 +15,10 @@ Provides:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, UTC
-from typing import Any
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from app.core.reporting_aggregates import (  # noqa: E402
     resource_identity_from_payload,

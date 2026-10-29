@@ -4,8 +4,8 @@ Revision ID: 0044
 Revises:     0043
 """
 
-from typing import Union
 from collections.abc import Sequence
+from typing import Union
 
 from alembic import op
 

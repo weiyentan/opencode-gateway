@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest

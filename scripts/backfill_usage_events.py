@@ -32,7 +32,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 import asyncpg
 

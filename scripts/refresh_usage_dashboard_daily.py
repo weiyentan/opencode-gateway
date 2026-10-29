@@ -48,7 +48,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 
 import asyncpg
 

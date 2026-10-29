@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict

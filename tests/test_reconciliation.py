@@ -19,7 +19,7 @@ Uses the shared ``mock_row`` / ``mock_conn`` fixtures from
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone, UTC
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 

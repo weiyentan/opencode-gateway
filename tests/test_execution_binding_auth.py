@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

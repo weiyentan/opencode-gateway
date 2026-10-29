@@ -36,8 +36,8 @@ Revises:     0038
 Create Date: 2026-08-24
 """
 
-from typing import Union
 from collections.abc import Sequence
+from typing import Union
 
 import sqlalchemy as sa
 

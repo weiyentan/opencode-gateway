@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 
 from fastapi import APIRouter, HTTPException, Request, status

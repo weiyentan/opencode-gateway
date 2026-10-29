@@ -25,7 +25,7 @@ are protected by the global :class:`~app.core.auth.ApiKeyMiddleware`.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status

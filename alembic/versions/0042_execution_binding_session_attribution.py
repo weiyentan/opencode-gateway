@@ -18,8 +18,8 @@ Revises:     0041
 Create Date: 2026-09-01
 """
 
-from typing import Union
 from collections.abc import Sequence
+from typing import Union
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql

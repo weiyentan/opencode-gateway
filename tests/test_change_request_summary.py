@@ -23,7 +23,7 @@ auth, and the query-builder/mapper layer.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, UTC
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
