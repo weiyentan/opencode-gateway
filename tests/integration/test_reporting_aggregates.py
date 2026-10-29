@@ -20,7 +20,8 @@ Start the standalone test Postgres container before running::
     pytest tests/integration/ -v -m integration
     docker compose -f docker-compose.test.yml down -v
 
-The test skips gracefully when the database is not reachable.
+The suite fails closed when the disposable database is not reachable (or
+cannot be proven disposable) — it never skips.
 """
 
 from __future__ import annotations
@@ -53,37 +54,24 @@ _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
 _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
 
-def _encode_jsonb(value: object) -> str:
-    """Encode a JSONB parameter, passing through pre-serialized strings.
+def _decode_jsonb(value: object) -> object:
+    """Decode a raw-asyncpg JSONB column value for assertions.
 
-    ``enrich_aggregate`` binds ``json.dumps(...)`` strings to ``::jsonb``
-    parameters; encoding those again would persist a JSON string instead of
-    a JSON object.
+    Production registers no ``set_type_codec`` for ``jsonb``
+    (``app/db/session.py``), so asyncpg returns JSONB columns as JSON
+    strings.  The suite must therefore decode explicitly instead of relying
+    on a test-only pool codec that the app-under-test never installs.
     """
-    return value if isinstance(value, str) else json.dumps(value)
-
-
-async def _init_connection(conn: asyncpg.Connection) -> None:
-    """Decode JSONB values into Python objects on every pooled connection.
-
-    Raw asyncpg returns ``jsonb`` as ``str``.  This suite asserts on the
-    aggregate ``payload`` as a mapping, and ``enrich_aggregate`` merges the
-    stored payload as a mapping, so the pool decodes JSONB consistently for
-    both the app-under-test and the direct assertions.
-    """
-    await conn.set_type_codec(
-        "jsonb",
-        schema="pg_catalog",
-        encoder=_encode_jsonb,
-        decoder=json.loads,
-    )
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(
-        dsn=_dsn(), min_size=2, max_size=5, init=_init_connection
-    )
+    # No ``init`` hook: the pool must decode JSONB exactly as production does
+    # (raw strings), so the multi-delivery tests exercise the real ingest path.
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
 
     yield pool
@@ -126,9 +114,11 @@ def _make_payload(
     }
 
 
-def _without_resource(payload: dict) -> dict:
+def _without_resource(payload: object) -> dict:
     """Strip the per-resource identity so *state* payloads can be compared."""
-    return {k: v for k, v in payload.items() if k != "resource"}
+    decoded = _decode_jsonb(payload)
+    assert isinstance(decoded, dict)
+    return {k: v for k, v in decoded.items() if k != "resource"}
 
 
 async def _seed_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
@@ -220,8 +210,10 @@ async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None
     assert row is not None
     assert row["repository_url"] == "github.com/Acme/Backend"
     assert row["last_delivery_id"].startswith("delivery-")
-    assert row["payload"]["status"] == "open"
-    assert row["payload"]["title"] == "in progress"
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
+    assert payload["status"] == "open"
+    assert payload["title"] == "in progress"
 
 
 @pytest.mark.integration
@@ -271,11 +263,13 @@ async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool
     async with db_pool.acquire() as conn:
         row = await get_aggregate(conn, identity)
     assert row is not None
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
     # conflicting fields stay at the newer event's values (no regression)
-    assert row["payload"]["status"] == "closed"
-    assert row["payload"]["title"] == "done"
+    assert payload["status"] == "closed"
+    assert payload["title"] == "done"
     # absent key from the late event is filled forward
-    assert row["payload"]["labels"] == ["bug"]
+    assert payload["labels"] == ["bug"]
 
 
 @pytest.mark.integration
