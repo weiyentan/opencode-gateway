@@ -32,10 +32,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
-from unittest.mock import AsyncMock
 
 _CLIENT_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()

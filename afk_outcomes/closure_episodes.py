@@ -51,6 +51,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from pydantic import BaseModel, Field
+
 from afk_outcomes.models import (
     CLOSURE_RESOLVER_VERSION,
     ClosureCandidate,
@@ -65,7 +67,6 @@ from afk_outcomes.models import (
     IssueLinksSnapshot,
     Provider,
 )
-from pydantic import BaseModel, Field
 
 # ── key shapes ───────────────────────────────────────────────────────────────
 

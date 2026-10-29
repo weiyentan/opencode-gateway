@@ -55,13 +55,13 @@ import asyncpg
 # Allow running from any location by resolving the repo root relative to this script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.core.reporting_aggregates import (  # noqa: E402
+    AGGREGATE_LOCK_CLASS,
+)
 from app.core.usage_dashboard_daily import (  # noqa: E402
     USAGE_DASHBOARD_LOCK_CLASS,
     acquire_bucket_lock,
     recompute_bucket,
-)
-from app.core.reporting_aggregates import (  # noqa: E402
-    AGGREGATE_LOCK_CLASS,
 )
 from scripts.backfill_client_project_rollup import (  # noqa: E402
     _get_pool,

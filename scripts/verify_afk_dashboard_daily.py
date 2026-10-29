@@ -50,23 +50,30 @@ import asyncpg
 # Allow running from any location by resolving the repo root relative to this script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.core.afk_dashboard_daily import (  # noqa: E402
+    CR_EVENT_FILTER,
+    UNAMBIGUOUS_CTE,
+)
+from app.core.afk_dashboard_daily import (
+    METRIC_COLUMNS as AFK_DASHBOARD_METRIC_COLUMNS,
+)
 from app.core.config import get_settings  # noqa: E402
 
 # Shared helpers (issue #729): comparison types, window parsing, pure helpers.
 from scripts.verify_helpers import (  # noqa: E402
     Mismatch,
     VerificationWindow,
-    compare_afk_dashboard_daily_rows as _compare_afk_rows,
-    exit_code as _exit_code,
-    format_mismatch as _format_mismatch,
     group_mismatches,
     parse_window,
 )
-
-from app.core.afk_dashboard_daily import (  # noqa: E402
-    CR_EVENT_FILTER,
-    METRIC_COLUMNS as AFK_DASHBOARD_METRIC_COLUMNS,
-    UNAMBIGUOUS_CTE,
+from scripts.verify_helpers import (
+    compare_afk_dashboard_daily_rows as _compare_afk_rows,
+)
+from scripts.verify_helpers import (
+    exit_code as _exit_code,
+)
+from scripts.verify_helpers import (
+    format_mismatch as _format_mismatch,
 )
 
 logger = logging.getLogger("verify_afk_dashboard_daily")

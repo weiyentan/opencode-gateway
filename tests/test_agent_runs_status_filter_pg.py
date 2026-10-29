@@ -40,7 +40,6 @@ from app.api.usage import (
     _status_case_expression,
 )
 
-
 UTC = timezone.utc
 
 _VALID_STATUSES = ("running", "completed", "blocked", "stale", "unknown")

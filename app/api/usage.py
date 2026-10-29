@@ -26,6 +26,8 @@ from fastapi import (
     Response,
     status,
 )
+from pydantic import BaseModel as _BaseModel
+from pydantic import Field as _Field
 
 from app.core.config import Settings, get_settings
 from app.core.formatting import format_model_output
@@ -43,7 +45,6 @@ from app.core.telemetry import timed_operation, timeout_operation
 from app.core.timeouts import db_timeout as _db_timeout
 from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
-from pydantic import BaseModel as _BaseModel, Field as _Field
 
 logger = logging.getLogger(__name__)
 

@@ -53,8 +53,8 @@ package (``app``) — only stdlib + ``afk_outcomes`` + ``httpx``.
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum

@@ -142,13 +142,13 @@ def create_app(
     app.add_exception_handler(TimeoutError, timeout_exception_handler)
     app.add_exception_handler(asyncio.TimeoutError, timeout_exception_handler)
 
+    from app.api.admin_afk_reconcile import router as admin_afk_reconcile_router
     from app.api.admin_clients import router as admin_clients_router
     from app.api.admin_quarantines import router as admin_quarantines_router
     from app.api.admin_reconcile import router as admin_reconcile_router
     from app.api.admin_resolve_source_identity import (
         router as admin_resolve_source_identity_router,
     )
-    from app.api.admin_afk_reconcile import router as admin_afk_reconcile_router
     from app.api.afk_dashboard_summary import (
         router as afk_dashboard_summary_router,
     )

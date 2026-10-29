@@ -672,8 +672,8 @@ async def test_refresh_and_backfill_discover_same_active_buckets(
     db_pool: asyncpg.Pool,
 ) -> None:
     """Refresh and backfill discover the same (day, provider, repository) set."""
-    from scripts.refresh_afk_dashboard_daily import DISCOVERY_SQL as REFRESH_DISCOVERY
     from scripts.backfill_afk_dashboard_daily import DISCOVERY_SQL as BACKFILL_DISCOVERY
+    from scripts.refresh_afk_dashboard_daily import DISCOVERY_SQL as REFRESH_DISCOVERY
 
     async with db_pool.acquire() as conn:
         # Both discovery queries should find the same buckets for the window.
@@ -704,8 +704,8 @@ async def test_daily_summary_metrics_additive(db_pool: asyncpg.Pool) -> None:
     async with db_pool.acquire() as conn:
         await _recompute_all_buckets(conn)
 
-        from app.core.schemas.afk_dashboard import AFKDashboardSummary
         from app.api.afk_dashboard_summary import _fetch_summary
+        from app.core.schemas.afk_dashboard import AFKDashboardSummary
 
         summary = await _fetch_summary(
             conn,

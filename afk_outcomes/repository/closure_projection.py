@@ -27,8 +27,8 @@ from afk_outcomes.models import (
     EngineeringEntity,
     EngineeringEvent,
     EntityType,
-    IssueLinkTarget,
     IssueLinksSnapshot,
+    IssueLinkTarget,
     Provider,
 )
 from afk_outcomes.repository.crud import _split_entity_id

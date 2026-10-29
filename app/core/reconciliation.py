@@ -58,14 +58,32 @@ import asyncpg
 # below is *imported*, never redefined here.
 from app.core.merge_policy import (
     COST_FIELD as COST_FIELD,
+)
+from app.core.merge_policy import (
     DELTA_FIELDS as DELTA_FIELDS,
+)
+from app.core.merge_policy import (
     ROLLUP_FIELDS as ROLLUP_FIELDS,
+)
+from app.core.merge_policy import (
     SESSION_FIELD_MAP as SESSION_FIELD_MAP,
+)
+from app.core.merge_policy import (
     SESSION_TOKEN_FIELDS as SESSION_TOKEN_FIELDS,
+)
+from app.core.merge_policy import (
     DeltaResult as DeltaResult,
+)
+from app.core.merge_policy import (
     IngestOutcome as IngestOutcome,
+)
+from app.core.merge_policy import (
     _to_decimal as _to_decimal,
+)
+from app.core.merge_policy import (
     compute_delta as compute_delta,
+)
+from app.core.merge_policy import (
     validate_no_negative_totals as validate_no_negative_totals,
 )
 

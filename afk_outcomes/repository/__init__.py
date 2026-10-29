@@ -60,19 +60,19 @@ import asyncpg
 
 from afk_outcomes.interfaces import OutcomeRepository
 from afk_outcomes.repository.closure_projection import (
-    ClosureRebuildResult,
-    _ClosureProjectionRepositoryMixin,
     _CLOSURE_RELEVANT_EVENT_TYPES,
+    ClosureRebuildResult,
     _closure_fact_issue_keys,
+    _ClosureProjectionRepositoryMixin,
     _decode_jsonb,
     _issue_links_from_payload,
     _to_closure_fact,
 )
 from afk_outcomes.repository.crud import (
+    _RESOLVED_ROLE,
+    _RUN_LEVEL_ENTITY_TYPE,
     RESOLVER_VERSION,
     _CrudRepositoryMixin,
-    _RUN_LEVEL_ENTITY_TYPE,
-    _RESOLVED_ROLE,
     _evidence_json,
     _provider_event_id,
     _source_reference_json,
@@ -83,8 +83,8 @@ from afk_outcomes.repository.executions import (
     CreateRecoveryCheckpointResult,
     ProvisionAFKRunResult,
     UpdateExecutionBindingResult,
-    _ExecutionBindingsRepositoryMixin,
     _decode_session_ids,
+    _ExecutionBindingsRepositoryMixin,
     _parse_awx_job_id,
     _row_to_execution_binding,
     _row_to_recovery_checkpoint,

@@ -22,7 +22,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import AsyncClient
 
-
 # ── Shared test data ──────────────────────────────────────────────────────
 
 _CLIENT_ID = uuid.uuid4()
@@ -1830,7 +1829,8 @@ class TestAgentRunsAuth:
     @pytest.mark.asyncio
     async def test_list_requires_auth(self, mock_conn: AsyncMock):
         """GET /api/v1/usage/agent-runs without auth returns 401."""
-        from httpx import ASGITransport, AsyncClient as HttpxClient
+        from httpx import ASGITransport
+        from httpx import AsyncClient as HttpxClient
 
         from app.core.factory import create_app
 
@@ -1849,7 +1849,8 @@ class TestAgentRunsAuth:
     @pytest.mark.asyncio
     async def test_detail_requires_auth(self, mock_conn: AsyncMock):
         """GET /api/v1/usage/agent-runs/{id} without auth returns 401."""
-        from httpx import ASGITransport, AsyncClient as HttpxClient
+        from httpx import ASGITransport
+        from httpx import AsyncClient as HttpxClient
 
         from app.core.factory import create_app
 

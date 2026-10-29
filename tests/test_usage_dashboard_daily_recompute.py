@@ -18,10 +18,10 @@ from unittest.mock import AsyncMock
 from app.core.usage_dashboard_daily import (
     COMPUTE_QUERIES,
     METRIC_COLUMNS,
+    UPSERT_SQL,
     USAGE_DASHBOARD_LOCK_CLASS,
     USAGE_DASHBOARD_ROLLUP_VERSION,
     USAGE_SQL,
-    UPSERT_SQL,
     acquire_bucket_lock,
     bucket_lock_key,
     compute_bucket_metrics,

@@ -10,7 +10,6 @@ from pathlib import Path
 from alembic.command import downgrade, upgrade
 from alembic.config import Config
 
-
 ROOT = Path(__file__).resolve().parent.parent
 ALEMBIC_DIR = ROOT / "alembic"
 MIGRATION = ALEMBIC_DIR / "versions" / "0044_add_execution_bindings_afk_run_lookup_index.py"

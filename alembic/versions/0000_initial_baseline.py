@@ -6,7 +6,6 @@ will add observability-specific tables in new migration files.
 
 from typing import Sequence, Union
 
-
 # revision identifiers, used by Alembic.
 revision: str = "0000"
 down_revision: Union[str, None] = None

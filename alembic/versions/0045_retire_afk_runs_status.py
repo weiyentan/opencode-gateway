@@ -22,8 +22,8 @@ does not already cover).
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
 
+from alembic import op
 
 revision: str = "0045"
 down_revision: Union[str, None] = "0044"  # noqa: UP007
