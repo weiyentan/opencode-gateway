@@ -33,21 +33,11 @@ CONFIG_PATH = REPO_ROOT / "mypy-strict-ingest.ini"
 TARGET = "app/api/ingest.py"
 
 #: Diagnostics that remain while the shipped ``app.api.ingest`` exemption is
-#: still in place.  Each entry is ``(error_code, message_pattern, max_count)``
-#: and belongs to a later slice: ``#831`` owns the remaining enrichment
-#: diagnostics (and the eventual exemption removal).  ``#830`` persistence
-#: diagnostics are now resolved.
-DOCUMENTED_REMAINING: tuple[tuple[str, str, int], ...] = (
-    # #831 — cache-token delta casts (enrichment)
-    ("call-overload", r'No overload variant of "int" matches argument type "object"', 2),
-    # #831 — JSONB serialization narrowing (enrichment)
-    (
-        "assignment",
-        r'Incompatible types in assignment \(expression has type "str \| None", '
-        r'variable has type "dict\[Any, Any\] \| None"\)',
-        2,
-    ),
-)
+#: still in place.  After #831 the gate is restored and this tuple is empty:
+#: the isolated strict check must report 0 errors, matching
+#: ``python -m mypy app/ afk_outcomes/``.  Any diagnostic — including a
+#: future enrichment or collector regression — fails the test.
+DOCUMENTED_REMAINING: tuple[tuple[str, str, int], ...] = ()
 
 
 def _run_isolated_mypy(cache_dir: Path) -> list[dict[str, Any]]:

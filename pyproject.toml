@@ -51,7 +51,6 @@ module = [
   "afk_outcomes.repository.closure_projection",
   "afk_outcomes.providers.gitlab",
   "app.api.usage",
-  "app.api.ingest",
   "app.core.factory",
   "app.core.identity",
   "app.consumer.afk_consumer",

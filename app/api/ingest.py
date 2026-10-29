@@ -563,9 +563,17 @@ async def _apply_replay_merge(
         cr_delta: int = 0
         cw_delta: int = 0
         if "cache_read_tokens" in fillable_columns:
-            cr_delta = int(fillable_columns["cache_read_tokens"])  # type: ignore[arg-type]
+            raw_cr = fillable_columns["cache_read_tokens"]
+            if isinstance(raw_cr, int):
+                cr_delta = raw_cr
+            elif isinstance(raw_cr, str):
+                cr_delta = int(raw_cr)
         if "cache_write_tokens" in fillable_columns:
-            cw_delta = int(fillable_columns["cache_write_tokens"])  # type: ignore[arg-type]
+            raw_cw = fillable_columns["cache_write_tokens"]
+            if isinstance(raw_cw, int):
+                cw_delta = raw_cw
+            elif isinstance(raw_cw, str):
+                cw_delta = int(raw_cw)
 
         # Apply session aggregate repair — only for positive deltas and
         # only when session_id is resolved.
@@ -1537,8 +1545,8 @@ async def _process_message(
         else _normalise_ms_to_datetime(msg.source_updated_at)
     )
 
-    data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
-    data = _serialize_jsonb(data)
+    redacted_msg_data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
+    data_json: str | None = _serialize_jsonb(redacted_msg_data)
 
     new_id = uuid.uuid4()
     await conn.execute(
@@ -1602,7 +1610,7 @@ async def _process_message(
         source_created_at_tz,
         source_updated_at_tz,
         now,
-        data,
+        data_json,
     )
     return True
 
@@ -1641,8 +1649,8 @@ async def _process_part(
         else _normalise_ms_to_datetime(part.source_updated_at)
     )
 
-    data = _redact_and_truncate_payload(part.data, part_data_max_chars)
-    data = _serialize_jsonb(data)
+    redacted_part_data = _redact_and_truncate_payload(part.data, part_data_max_chars)
+    part_data_json: str | None = _serialize_jsonb(redacted_part_data)
 
     # Reuse the stored row id on replay so the tool-call row's part_id FK stays
     # valid: the observed_parts upsert does not include `id` in its SET list,
@@ -1709,7 +1717,7 @@ async def _process_part(
             source_created_at_tz,
             source_updated_at_tz,
             now,
-            data,
+            part_data_json,
         )
 
         if part.part_type == "tool" and tool_name is not None:
@@ -1788,7 +1796,7 @@ async def _process_part(
                 source_created_at_tz,
                 source_updated_at_tz,
                 now,
-                data,
+                part_data_json,
             )
         elif part.part_type == "tool" and tool_name is None:
             logger.warning(
