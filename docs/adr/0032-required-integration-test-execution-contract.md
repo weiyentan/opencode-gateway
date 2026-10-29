@@ -34,13 +34,17 @@ verification) must remain green and must not be weakened.
 
 Destructive suites call
 `tests.integration._disposable_postgres.verify_disposable_target` before any
-migration or write.  The guard accepts exactly one profile:
+migration or write.  The guard accepts exactly one service profile with one of
+two approved database names:
 
 * `GATEWAY_TEST_DISPOSABLE_DB=1` operator attestation;
 * `GATEWAY_ENV` is not `production`/`prod`;
 * loopback host (`localhost` or `127.0.0.1`);
 * port `5433` — the `postgres-isolated` GitHub Actions service mapping;
-* database `opencode_gateway_disposable_test`;
+* database `opencode_gateway_disposable_test` for the required gates, or
+  `opencode_gateway_benchmark_test` for the optional benchmark workflow — both
+  are the separate isolated instances on the same `loopback:5433`/`test`
+  profile (see `.github/workflows/benchmark-overlap.yml`);
 * user `test` with a non-empty password;
 * database name ends with `_test`;
 * not running inside Kubernetes and not an in-cluster service host;

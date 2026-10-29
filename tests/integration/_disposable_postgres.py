@@ -15,8 +15,10 @@ before a caller executes any destructive statement:
   (``GATEWAY_TEST_DISPOSABLE_DB=1``);
 * ``GATEWAY_ENV`` is not production;
 * the target is the dedicated disposable service profile: loopback host,
-  port 5433, database ``opencode_gateway_disposable_test``, and the dedicated
-  ``test`` user with a non-empty password;
+  port 5433, an approved database name — ``opencode_gateway_disposable_test``
+  for the required gates or ``opencode_gateway_benchmark_test`` for the
+  optional benchmark workflow — and the dedicated ``test`` user with a
+  non-empty password;
 * the target database name ends with ``_test``;
 * the process is not running inside Kubernetes and the host is not an
   in-cluster service name;
@@ -54,8 +56,17 @@ REQUIRED_POSTGRES_MAJOR = 16
 #: (including the shared ``postgres`` service on 5432) is refused before the
 #: first connection attempt.
 DISPOSABLE_DATABASE_NAME = "opencode_gateway_disposable_test"
+
+#: The separate isolated database provisioned by the optional overlap
+#: benchmark workflow on the same loopback/``test``-user service profile.
+BENCHMARK_DATABASE_NAME = "opencode_gateway_benchmark_test"
+
 DISPOSABLE_DATABASE_USER = "test"
 DISPOSABLE_DATABASE_PORT = 5433
+
+#: Every database name the dedicated service profile may target.  Both names
+#: are explicit ``_test`` databases; nothing else is ever accepted.
+APPROVED_DATABASE_NAMES = frozenset({DISPOSABLE_DATABASE_NAME, BENCHMARK_DATABASE_NAME})
 
 _DISPOSABLE_DB_SUFFIX = "_test"
 _APPROVED_HOSTS = frozenset({"localhost", "127.0.0.1"})
@@ -154,11 +165,12 @@ def _require_dedicated_ci_profile(target: DatabaseTarget) -> None:
             f"{DISPOSABLE_DATABASE_PORT}."
         )
 
-    if target.name != DISPOSABLE_DATABASE_NAME:
+    if target.name not in APPROVED_DATABASE_NAMES:
         raise DisposableDatabaseError(
             f"Refusing destructive database operations against database "
-            f"{target.name!r}: destructive suites may only target the dedicated "
-            f"disposable database {DISPOSABLE_DATABASE_NAME!r}."
+            f"{target.name!r}: destructive suites may only target the approved "
+            "disposable databases "
+            f"{sorted(APPROVED_DATABASE_NAMES)!r}."
         )
 
     if target.user != DISPOSABLE_DATABASE_USER:

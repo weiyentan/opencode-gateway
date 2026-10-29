@@ -36,8 +36,8 @@ Start a disposable PostgreSQL 16 container outside Kubernetes, then run::
 
     docker run --rm -d --name opencode-gateway-test-db \\
         -e POSTGRES_DB=opencode_gateway_benchmark_test \\
-        -e POSTGRES_USER=bench \\
-        -e POSTGRES_PASSWORD=bench \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
         -p 5433:5432 postgres:16-alpine
 
     GATEWAY_ENV=development \\
@@ -46,8 +46,8 @@ Start a disposable PostgreSQL 16 container outside Kubernetes, then run::
     GATEWAY_DATABASE_HOST=localhost \\
     GATEWAY_DATABASE_PORT=5433 \\
     GATEWAY_DATABASE_NAME=opencode_gateway_benchmark_test \\
-    GATEWAY_DATABASE_USER=bench \\
-    GATEWAY_DATABASE_PASSWORD=bench \\
+    GATEWAY_DATABASE_USER=test \\
+    GATEWAY_DATABASE_PASSWORD=test \\
         pytest tests/integration/test_ingest_batch_overlap_perf.py \\
             -v -m profiling -s -p no:cacheprovider
 
@@ -58,11 +58,13 @@ Safety
 This benchmark seeds ~123k rows, migrates the schema, and drops every table in
 the ``public`` schema on teardown.  ``verify_disposable_target`` therefore runs
 **before** any write and fails closed unless the target is positively attested
-as disposable: ``GATEWAY_TEST_DISPOSABLE_DB=1``, a ``_test`` database-name
-suffix, a non-production ``GATEWAY_ENV``, a non-Kubernetes process/host, and
-PostgreSQL 16.  When the benchmark is explicitly requested, an unreachable or
-non-disposable database raises :class:`DisposableDatabaseError` and surfaces as
-a test error — it is never converted into a green skip.
+as disposable: ``GATEWAY_TEST_DISPOSABLE_DB=1``, an approved ``_test``
+database name (``opencode_gateway_benchmark_test`` or
+``opencode_gateway_disposable_test``), a non-production ``GATEWAY_ENV``, a
+non-Kubernetes process/host, and PostgreSQL 16.  When the benchmark is
+explicitly requested, an unreachable or non-disposable database raises
+:class:`DisposableDatabaseError` and surfaces as a test error — it is never
+converted into a green skip.
 
 Without ``GATEWAY_RUN_OVERLAP_BENCHMARK=1`` the module skips with an explicit
 "not requested" reason; that is the only skip path and it never masks a

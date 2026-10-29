@@ -119,8 +119,28 @@ async def test_non_dedicated_database_is_refused_before_connect(
         password=approved_target.password,
     )
 
-    with pytest.raises(guard.DisposableDatabaseError, match="dedicated disposable database"):
+    with pytest.raises(guard.DisposableDatabaseError, match="approved disposable databases"):
         await guard.verify_disposable_target(target)
+
+
+async def test_benchmark_database_is_approved(
+    monkeypatch: pytest.MonkeyPatch, approved_target: guard.DatabaseTarget
+) -> None:
+    target = guard.DatabaseTarget(
+        host=approved_target.host,
+        port=approved_target.port,
+        name=guard.BENCHMARK_DATABASE_NAME,
+        user=approved_target.user,
+        password=approved_target.password,
+    )
+    connection = _FakeConnection(current_database=guard.BENCHMARK_DATABASE_NAME)
+    _use_fake_connection(monkeypatch, connection)
+
+    resolved = await guard.verify_disposable_target(target)
+
+    assert resolved == target
+    assert connection.queries == ["SELECT current_database()", "SHOW server_version_num"]
+    assert connection.closed is True
 
 
 async def test_non_dedicated_credentials_are_refused_before_connect(
