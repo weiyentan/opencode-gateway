@@ -17,7 +17,8 @@ Revision ID: 0030
 Revises:     0029
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op

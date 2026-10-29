@@ -48,7 +48,8 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import httpx
 

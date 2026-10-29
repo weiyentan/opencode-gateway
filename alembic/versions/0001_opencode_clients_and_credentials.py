@@ -9,7 +9,8 @@ Revises:     0000
 Create Date: 2025-07-16
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 from alembic import op
 import sqlalchemy as sa

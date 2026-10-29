@@ -26,7 +26,7 @@ select = ["E", "F", "I", "UP"]
 # These rules carry widespread pre-existing violations across the codebase that are
 # tracked for future cleanup. The gate remains active for all other rules, including
 # the F-rules that catch real bugs (unused imports, unused variables, redefinitions).
-ignore = ["UP045", "UP007", "UP017", "UP035", "E501", "I001"]
+ignore = ["UP045", "UP007", "UP017", "E501", "I001"]
 
 [tool.mypy]
 python_version = "3.12"

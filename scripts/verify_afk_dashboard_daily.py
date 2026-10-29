@@ -43,7 +43,8 @@ import logging
 import os
 import sys
 from datetime import date
-from typing import Any, Mapping, Sequence
+from typing import Any
+from collections.abc import Mapping, Sequence
 
 import asyncpg
 

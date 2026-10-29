@@ -14,7 +14,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from collections.abc import Callable
 
 from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.models import (

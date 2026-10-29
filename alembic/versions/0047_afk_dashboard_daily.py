@@ -17,7 +17,8 @@ Revision ID: 0047
 Revises:     0046
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 from alembic import op
 

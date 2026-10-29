@@ -21,7 +21,8 @@ Revises:     0042
 Create Date: 2026-09-05
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
