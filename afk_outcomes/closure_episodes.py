@@ -184,9 +184,15 @@ def _derive_link_states(facts: Sequence[ClosureFact]) -> dict[_LinkKey, str]:
             continue
 
         # park branch: never arbitrarily win a conflicting same-timestamp pair
-        candidates: list[frozenset[tuple[str, str, str]]] = resolution[1]  # type: ignore[assignment]
-        common: frozenset[tuple[str, str, str]] = frozenset.intersection(*candidates) if candidates else frozenset()
-        union: frozenset[tuple[str, str, str]] = frozenset.union(*candidates) if candidates else frozenset()
+        candidates: list[frozenset[tuple[str, str, str]]] = (
+            resolution[1]  # type: ignore[assignment]
+        )
+        common: frozenset[tuple[str, str, str]] = (
+            frozenset.intersection(*candidates) if candidates else frozenset()
+        )
+        union: frozenset[tuple[str, str, str]] = (
+            frozenset.union(*candidates) if candidates else frozenset()
+        )
         for link in common:
             states[link] = ClosureLinkState.ACTIVE.value
         for link in union - common:

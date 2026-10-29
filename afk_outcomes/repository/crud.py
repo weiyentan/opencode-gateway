@@ -627,7 +627,12 @@ class _CrudRepositoryMixin:
 
         for row in entity_rows:
             entity_id = f"{row['entity_type']}:{row['external_id']}"
-            entity_key = (row["provider"], row["repository"], row["entity_type"], row["external_id"])
+            entity_key = (
+                row["provider"],
+                row["repository"],
+                row["entity_type"],
+                row["external_id"],
+            )
             if entity_key not in seen_entities:
                 seen_entities.add(entity_key)
                 entities.append(
