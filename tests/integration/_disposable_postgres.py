@@ -62,6 +62,7 @@ DISPOSABLE_DATABASE_NAME = "opencode_gateway_disposable_test"
 BENCHMARK_DATABASE_NAME = "opencode_gateway_benchmark_test"
 
 DISPOSABLE_DATABASE_USER = "test"
+DISPOSABLE_DATABASE_PASSWORD = "test"
 DISPOSABLE_DATABASE_PORT = 5433
 
 #: Every database name the dedicated service profile may target.  Both names
@@ -105,7 +106,9 @@ class DatabaseTarget:
             ),
             name=os.environ.get("GATEWAY_DATABASE_NAME", DISPOSABLE_DATABASE_NAME),
             user=os.environ.get("GATEWAY_DATABASE_USER", DISPOSABLE_DATABASE_USER),
-            password=os.environ.get("GATEWAY_DATABASE_PASSWORD", "test"),
+            password=os.environ.get(
+                "GATEWAY_DATABASE_PASSWORD", DISPOSABLE_DATABASE_PASSWORD
+            ),
         )
 
     def dsn(self) -> str:
@@ -254,7 +257,7 @@ async def verify_disposable_target(
             "  docker run --rm -d --name opencode-gateway-test-db \\\n"
             f"    -e POSTGRES_DB={DISPOSABLE_DATABASE_NAME} \\\n"
             f"    -e POSTGRES_USER={DISPOSABLE_DATABASE_USER} \\\n"
-            f"    -e POSTGRES_PASSWORD={DISPOSABLE_DATABASE_USER} \\\n"
+            f"    -e POSTGRES_PASSWORD={DISPOSABLE_DATABASE_PASSWORD} \\\n"
             "    -p 5433:5432 postgres:16-alpine"
         ) from exc
 

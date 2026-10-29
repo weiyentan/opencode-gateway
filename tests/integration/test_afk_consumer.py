@@ -840,7 +840,11 @@ async def test_normalized_edited_persists_as_canonical_updated(db_pool: asyncpg.
         assert row["entity_type"] == "change_request"
         assert row["event_type"] == "change_request.updated"
         assert row["external_id"] == "500"
-        payload = json.loads(row["payload"])
+        # asyncpg returns ``jsonb`` as text unless the pool installs a codec;
+        # some pools return an already-decoded dict.
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
         assert payload.get("source_resource_type") == "pull_request"
         assert payload.get("source_action") == "edited"
         assert payload.get("payload_ref") == {

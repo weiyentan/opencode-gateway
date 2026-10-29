@@ -97,9 +97,22 @@ from tests.integration._disposable_postgres import (
 # ── Repository paths ─────────────────────────────────────────────────────
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Resolved once at import (never connects); the safety preflight verifies it
-# before any migration, fixture insert, or teardown drop.
-_TARGET = DatabaseTarget.from_env()
+# Resolved inside ``_verified_disposable_database`` (never at import) so an
+# in-process environment override applied after collection is still honoured.
+# The safety preflight verifies the resolved target before any migration,
+# fixture insert, or teardown drop.
+_TARGET: DatabaseTarget | None = None
+
+
+def _resolved_target() -> DatabaseTarget:
+    """Return the target resolved and verified by the module fixture."""
+    if _TARGET is None:
+        raise RuntimeError(
+            "disposable database target is unresolved; "
+            "_verified_disposable_database must run before any database access"
+        )
+    return _TARGET
+
 
 # ── Request budget (seconds) ────────────────────────────────────────────
 # The Gateway's total_request_timeout_seconds defaults to 20 in config.py.
@@ -223,7 +236,7 @@ def _emit_metrics(label: str, **values: Any) -> None:
 
 def _dsn() -> str:
     """Build an asyncpg DSN from the verified disposable target."""
-    return _TARGET.dsn()
+    return _resolved_target().dsn()
 
 
 def _utcnow() -> datetime:
@@ -245,15 +258,16 @@ async def _drop_all_tables() -> None:
 
 def _migration_env() -> dict[str, str]:
     """Environment for the Alembic subprocess — point app settings at the target."""
+    target = _resolved_target()
     env = dict(os.environ)
     env.update(
         {
             "GATEWAY_ENV": "development",
-            "GATEWAY_DATABASE_HOST": _TARGET.host,
-            "GATEWAY_DATABASE_PORT": str(_TARGET.port),
-            "GATEWAY_DATABASE_NAME": _TARGET.name,
-            "GATEWAY_DATABASE_USER": _TARGET.user,
-            "GATEWAY_DATABASE_PASSWORD": _TARGET.password,
+            "GATEWAY_DATABASE_HOST": target.host,
+            "GATEWAY_DATABASE_PORT": str(target.port),
+            "GATEWAY_DATABASE_NAME": target.name,
+            "GATEWAY_DATABASE_USER": target.user,
+            "GATEWAY_DATABASE_PASSWORD": target.password,
         }
     )
     return env
@@ -299,6 +313,8 @@ def _verified_disposable_database(_benchmark_opt_in: None) -> DatabaseTarget:
     — never a skip, so a requested benchmark cannot go green without a real
     disposable database.
     """
+    global _TARGET
+    _TARGET = DatabaseTarget.from_env()
     return asyncio.run(verify_disposable_target(_TARGET))
 
 
@@ -317,7 +333,7 @@ def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
         retry = _run_alembic_upgrade()
         if retry.returncode != 0:
             raise RuntimeError(
-                f"alembic upgrade head failed against {_TARGET.describe()}\n"
+                f"alembic upgrade head failed against {_resolved_target().describe()}\n"
                 f"first attempt:\n{result.stdout}\n{result.stderr}\n"
                 f"retry after drop:\n{retry.stdout}\n{retry.stderr}"
             )
