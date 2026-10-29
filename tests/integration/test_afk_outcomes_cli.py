@@ -1,7 +1,7 @@
 """Integration tests for the AFK outcome backfill CLI (issue #449).
 
-Runs ``scripts.afk_backfill.run_backfill`` against the docker-compose
-Postgres (port 5433) with a fake GitHub API client, and verifies:
+Runs ``scripts.afk_backfill.run_backfill`` against the dedicated disposable
+PostgreSQL 16 service (port 5433) with a fake GitHub API client, and verifies:
 
 * a real backfill run over a window, followed by a re-run of the same
   window, converges with no duplicate rows (deterministic session-keyed
@@ -11,20 +11,28 @@ Postgres (port 5433) with a fake GitHub API client, and verifies:
 
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as the
+dedicated disposable PostgreSQL 16 service.  Start one outside Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
+        -p 5433:5432 postgres:16-alpine
 
-Connection parameters come from the standard Gateway environment variables
-(defaulting to the ``docker-compose.test.yml`` service).
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_afk_outcomes_cli.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+A missing attestation, a mismatched DSN, an unreachable server, a
+non-test database name, a Kubernetes target, or a non-PostgreSQL-16 server
+fails closed instead of skipping.
 """
 
 from __future__ import annotations
 
-import asyncio
-import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -35,15 +43,17 @@ import pytest
 
 from afk_outcomes.providers.github import GitHubAdapter
 from scripts.afk_backfill import BackfillReport, run_backfill
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 REPOSITORY = "weiyentan/opencode-gateway"
@@ -54,35 +64,25 @@ RUN_FINISH = datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC)
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    return _TARGET.dsn()
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``db_pool`` (and therefore before any destructive migration
+    reset).  A missing attestation, unapproved/mismatched DSN, unreachable
+    server, Kubernetes target, or wrong server version raises an error — never
+    a skip.
+    """
+    import asyncio
+
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
+async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
 

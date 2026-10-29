@@ -8,6 +8,12 @@ queries, compare a candidate against a baseline, and decide keep/drop on
 observed evidence.  This module turns that protocol into an independently
 runnable harness.
 
+Classification (issue #826): **read-only protocol, explicitly opt-in**.  This
+suite performs no writes, so it is deliberately *not* subject to the
+``GATEWAY_TEST_DISPOSABLE_DB`` attestation used by destructive suites.  Its
+live tests skip when no live database is configured; it must never be wired
+into a required CI job unless the invocation explicitly requests a database.
+
 Running
 -------
 CI (no database): the pure plan/latency helpers below are exercised, and
