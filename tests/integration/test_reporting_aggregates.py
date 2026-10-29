@@ -34,6 +34,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from app.core.identity import hash_token
 from app.core.reporting_aggregates import (
@@ -76,9 +77,9 @@ async def _can_connect() -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def _integration_db_available() -> bool:
+    if not await _can_connect():
         pytest.skip(
             "Test Postgres database not available.  Start it with:\n"
             "  docker compose -f docker-compose.test.yml up -d"
@@ -86,7 +87,7 @@ def _integration_db_available() -> bool:
     return True
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
@@ -98,8 +99,15 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
         alembic.command.upgrade(alembic_cfg, "head")
+
+    # alembic/env.py's online path drives asyncpg via ``asyncio.run``, which
+    # cannot execute inside this fixture's running event loop — run the
+    # upgrade in a worker thread where no loop is running.
+    try:
+        await asyncio.to_thread(_upgrade)
     except Exception:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -108,7 +116,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.to_thread(_upgrade)
 
     yield pool
 
@@ -202,7 +210,7 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None:
     """Ingesting a delivery with a ``resource`` object creates one aggregate row."""
     async with db_pool.acquire() as conn:
@@ -243,7 +251,7 @@ async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool) -> None:
     """A stale delivery (older occurred_at) never regresses newer state."""
     async with db_pool.acquire() as conn:
@@ -297,7 +305,7 @@ async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -> None:
     """Replay convergence: ingestion order does not affect the final aggregate."""
     async with db_pool.acquire() as conn:
@@ -396,7 +404,7 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_three_event_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -457,7 +465,7 @@ async def test_three_event_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_none_key_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -526,7 +534,7 @@ async def test_none_key_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unique_identity_constraint_enforced(db_pool: asyncpg.Pool) -> None:
     """A second direct INSERT of the same identity key is rejected."""
     async with db_pool.acquire() as conn:

@@ -49,6 +49,7 @@ from typing import Any
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Connection configuration
@@ -347,14 +348,51 @@ async def _can_connect() -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
-def live_db_available() -> bool:
-    import asyncio
+#: Base tables the read probes depend on.  Destructive integration modules in
+#: the shared CI database drop every public table in teardown, so this module
+#: must skip rather than raise ``UndefinedTableError`` when the schema is gone.
+_REQUIRED_TABLES: tuple[str, ...] = (
+    "afk_runs",
+    "observed_models",
+    "opencode_clients",
+    "opencode_session_contexts",
+    "opencode_session_todos",
+    "opencode_source_projects",
+    "sessions",
+    "usage_events",
+)
 
-    if not asyncio.run(_can_connect()):
+
+async def _required_tables_exist() -> bool:
+    """Return True when every table the read probes depend on exists."""
+    try:
+        conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+    except Exception:
+        return False
+    try:
+        missing = await conn.fetchval(
+            "SELECT count(*) FROM unnest($1::text[]) AS tbl(name)"
+            " WHERE to_regclass('public.' || tbl.name) IS NULL",
+            list(_REQUIRED_TABLES),
+        )
+        return int(missing or 0) == 0
+    except Exception:
+        return False
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def live_db_available() -> bool:
+    if not await _can_connect():
         pytest.skip(
             "Live PostgreSQL not available.  Set READ_PATH_LIVE_DATABASE_URL "
             "(or GATEWAY_DATABASE_* / start docker-compose.test.yml)."
+        )
+    if not await _required_tables_exist():
+        pytest.skip(
+            "Schema not migrated — required tables missing.  Run "
+            "`alembic upgrade head` against the live database."
         )
     return True
 
@@ -369,6 +407,11 @@ async def readonly_conn(live_db_available: bool):
     point at a production replica.
     """
     conn = await asyncpg.connect(dsn=_dsn(), timeout=10)
+    if await conn.fetchval("SELECT to_regclass('public.usage_events')") is None:
+        # Defensive: a destructive sibling suite dropped the schema between
+        # this module's availability check and the connection.
+        await conn.close()
+        pytest.skip("Schema not migrated — required tables missing")
     tx = conn.transaction(readonly=True)
     await tx.start()
     await conn.execute(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}")
