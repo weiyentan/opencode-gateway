@@ -21,7 +21,7 @@ repeated executions, missing data, and identity boundaries.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -598,7 +598,7 @@ class TestChangeRequestDetail:
                     outcome="completed",
                     purpose="implementation",
                     started_at=datetime(
-                        2026, 8, 1, 9, 0, 0, tzinfo=timezone.utc
+                        2026, 8, 1, 9, 0, 0, tzinfo=UTC
                     ),
                     title="Develop-Loop: Implemented issues #343-#347",
                 ),
@@ -610,7 +610,7 @@ class TestChangeRequestDetail:
                     outcome="completed",
                     purpose="review",
                     started_at=datetime(
-                        2026, 8, 1, 11, 0, 0, tzinfo=timezone.utc
+                        2026, 8, 1, 11, 0, 0, tzinfo=UTC
                     ),
                     title="MR Review Runner",
                 ),
@@ -622,7 +622,7 @@ class TestChangeRequestDetail:
                     outcome="completed",
                     purpose="review",
                     started_at=datetime(
-                        2026, 8, 1, 13, 0, 0, tzinfo=timezone.utc
+                        2026, 8, 1, 13, 0, 0, tzinfo=UTC
                     ),
                     title="MR Review Runner rerun",
                 ),

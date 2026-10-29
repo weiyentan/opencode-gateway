@@ -14,8 +14,6 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Union
-
 import asyncpg
 from fastapi import (
     APIRouter,
@@ -2450,7 +2448,7 @@ async def _fetch_records_with_context_grouped(
 # ── Records-with-context endpoint ─────────────────────────────────────────
 
 
-@router.get("/records-with-context", response_model=Union[PaginatedResponse, list[RecordWithContextGroupedRow]])
+@router.get("/records-with-context", response_model=PaginatedResponse | list[RecordWithContextGroupedRow])
 async def get_records_with_context(
     request: Request,
     response: Response,

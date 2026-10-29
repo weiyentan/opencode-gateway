@@ -20,7 +20,7 @@ they exercise the real entry point without a database.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 from unittest.mock import AsyncMock
 
 import pytest
@@ -56,7 +56,7 @@ class TestWindow:
 
     def test_default_as_of_is_today_utc(self):
         start, end = refresh._resolve_window(2)
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         assert end == today
         assert start == today - timedelta(days=1)
 

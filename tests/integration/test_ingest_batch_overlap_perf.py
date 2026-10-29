@@ -40,7 +40,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import asyncpg
@@ -106,11 +106,11 @@ async def _can_connect() -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
-    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 # ══════════════════════════════════════════════════════════════════════════

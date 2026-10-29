@@ -31,7 +31,7 @@ Protocol: see ``docs/adr/0017-migration-0019-index-measurement.md``.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 import pytest
 from httpx import AsyncClient
@@ -39,8 +39,8 @@ from unittest.mock import AsyncMock
 
 _CLIENT_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
-_START = datetime(2025, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
-_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=timezone.utc)
+_START = datetime(2025, 7, 1, 0, 0, 0, tzinfo=UTC)
+_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=UTC)
 
 _RANGE = {
     "start_date": _START.isoformat(),

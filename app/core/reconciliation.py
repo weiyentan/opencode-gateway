@@ -401,7 +401,7 @@ def _rollup_day(reported_at: datetime) -> Any:
     import datetime as _dt
 
     if reported_at.tzinfo is not None:
-        return reported_at.astimezone(_dt.timezone.utc).date()
+        return reported_at.astimezone(_dt.UTC).date()
     return reported_at.date()
 
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 import pytest
@@ -76,8 +76,8 @@ def _capture_agent_runs_sql() -> tuple[str, tuple]:
         _fetch_agent_runs(
             conn,
             client_id=uuid.uuid4(),
-            from_date=datetime(2025, 7, 1, tzinfo=timezone.utc),
-            to_date=datetime(2025, 7, 31, 23, 59, 59, tzinfo=timezone.utc),
+            from_date=datetime(2025, 7, 1, tzinfo=UTC),
+            to_date=datetime(2025, 7, 31, 23, 59, 59, tzinfo=UTC),
             agent=None,
             external_project_id=None,
             status_filter=None,

@@ -10,7 +10,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,11 +28,11 @@ _CREDENTIAL_ID = uuid.uuid4()
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
-    return datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2026, 7, 26, 12, 0, 0, tzinfo=UTC)
 
 
 # ── Mock helpers ─────────────────────────────────────────────────────────────

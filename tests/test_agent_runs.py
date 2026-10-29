@@ -14,7 +14,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -29,7 +29,7 @@ _CLIENT_ID = uuid.uuid4()
 _SOURCE_DB_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
 
-_NOW = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 # External session IDs — OpenCode-style ses_* IDs
 _EXTERNAL_ID_A = "ses_a001"
@@ -631,9 +631,8 @@ class TestAgentRunsList:
         """limit/offset combine with agent/status/date filters: filter params
         precede the trailing limit/offset SQL args, and pagination metadata
         reflects the requested page (issue #426 — paging keeps filters)."""
-        from datetime import timezone
 
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         row = _mk_session_row(
             session_id=_SESSION_ID,
             agent="code-editor",
@@ -737,9 +736,8 @@ class TestAgentRunsList:
     @pytest.mark.asyncio
     async def test_running_status_for_recent_session(self, client: AsyncClient, mock_conn: AsyncMock):
         """A session with recent last_message_at is marked running."""
-        from datetime import timezone
 
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=recent,
@@ -826,9 +824,8 @@ class TestAgentRunsList:
     @pytest.mark.asyncio
     async def test_filters_by_status(self, client: AsyncClient, mock_conn: AsyncMock):
         """status query param filters by computed status."""
-        from datetime import timezone
 
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=recent,
@@ -1439,9 +1436,8 @@ class TestAgentRunsDetail:
     @pytest.mark.asyncio
     async def test_detail_includes_child_summaries(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail includes child_run summaries with id, external_session_id, status, agent, message_count."""
-        from datetime import timezone
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             external_session_id=_EXTERNAL_ID_A,
@@ -1582,10 +1578,9 @@ class TestAgentRunsDetail:
     @pytest.mark.asyncio
     async def test_detail_status_computed_on_read(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail status is computed from session recency, not stored."""
-        from datetime import timezone
 
         # Active session → running
-        recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent = datetime.now(UTC) - timedelta(minutes=5)
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=recent,
@@ -1608,9 +1603,8 @@ class TestAgentRunsDetail:
     async def test_detail_blocked_status_with_parent(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail status is blocked when session has parent and is quiet beyond
         the running threshold but within the stale window (15 min–2 h)."""
-        from datetime import timezone
 
-        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        old = datetime.now(UTC) - timedelta(hours=1)
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=old,
@@ -1635,9 +1629,8 @@ class TestAgentRunsDetail:
     async def test_detail_stale_status_beyond_stale_window(self, client: AsyncClient, mock_conn: AsyncMock):
         """Detail status is stale (not blocked) when a session has a parent
         but has been quiet 2+ hours (PRD open question #3)."""
-        from datetime import timezone
 
-        old = datetime.now(timezone.utc) - timedelta(hours=24)
+        old = datetime.now(UTC) - timedelta(hours=24)
         session_row = _mk_session_row(
             session_id=_SESSION_ID,
             last_message_at=old,

@@ -19,7 +19,7 @@ Uses the shared ``mock_row`` / ``mock_conn`` fixtures from
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -56,7 +56,7 @@ def _event(**overrides: object) -> dict:
         "session_id": _event_uuid(),
         "client_id": uuid.uuid4(),
         "project_id": "test-project",
-        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc),
+        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC),
     }
     row.update(overrides)
     return row
@@ -601,7 +601,7 @@ class TestConcurrentSameEventDelivery:
         ingest attempt.  No double-insert.
         """
         import asyncio
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import MagicMock, patch
 
         from app.api.ingest import IngestRecord, _record_canonical_event
@@ -813,7 +813,7 @@ class TestLockSerializationLatency:
         """10 concurrent deliveries serialise with acceptable overhead."""
         import asyncio
         import time
-        from datetime import datetime, timezone
+        from datetime import datetime
         from unittest.mock import patch
 
         from app.api.ingest import IngestRecord, _record_canonical_event

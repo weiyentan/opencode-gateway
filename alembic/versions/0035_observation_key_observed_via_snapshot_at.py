@@ -43,7 +43,7 @@ Revises:     0034
 import hashlib
 import json
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from enum import Enum
 from typing import Union
 
@@ -86,8 +86,8 @@ def _observation_key(
         entity_type.value if isinstance(entity_type, Enum) else str(entity_type)
     )
     if occurred_at.tzinfo is None:
-        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-    occurred_at_value = occurred_at.astimezone(timezone.utc).isoformat()
+        occurred_at = occurred_at.replace(tzinfo=UTC)
+    occurred_at_value = occurred_at.astimezone(UTC).isoformat()
     canonical = json.dumps(
         {
             "provider": provider_value,

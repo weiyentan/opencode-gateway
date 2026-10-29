@@ -48,7 +48,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 
 import asyncpg
 
@@ -216,7 +216,7 @@ def _resolve_window(
     """
     if days < 1:
         raise ValueError(f"days must be >= 1, got {days}")
-    end_day = as_of if as_of is not None else datetime.now(timezone.utc).date()
+    end_day = as_of if as_of is not None else datetime.now(UTC).date()
     start_day = end_day - timedelta(days=days - 1)
     return start_day, end_day
 

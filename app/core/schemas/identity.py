@@ -2,7 +2,6 @@
 
 import uuid
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,7 +13,7 @@ class ClientCreate(BaseModel):
     """Payload for creating a new OpenCode client."""
 
     name: str
-    description: Optional[str] = None
+    description: str | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -23,10 +22,10 @@ class ClientUpdate(BaseModel):
     All fields are optional — only supplied fields are applied.
     """
 
-    name: Optional[str] = None
-    description: Optional[str] = None
-    is_active: Optional[bool] = None
-    canonical_name: Optional[str] = None
+    name: str | None = None
+    description: str | None = None
+    is_active: bool | None = None
+    canonical_name: str | None = None
 
 
 class ClientRead(BaseModel):
@@ -36,8 +35,8 @@ class ClientRead(BaseModel):
 
     id: uuid.UUID
     name: str
-    canonical_name: Optional[str] = None
-    description: Optional[str] = None
+    canonical_name: str | None = None
+    description: str | None = None
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -49,7 +48,7 @@ class ClientRead(BaseModel):
 class TokenProvisionRequest(BaseModel):
     """Payload for provisioning a new collector credential token."""
 
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class TokenProvisionResponse(BaseModel):
@@ -65,7 +64,7 @@ class TokenProvisionResponse(BaseModel):
     id: uuid.UUID
     client_id: uuid.UUID
     token_prefix: str
-    label: Optional[str] = None
+    label: str | None = None
     created_at: datetime
 
 
@@ -77,10 +76,10 @@ class TokenRead(BaseModel):
     id: uuid.UUID
     client_id: uuid.UUID
     token_prefix: str
-    label: Optional[str] = None
-    last_used_at: Optional[datetime] = None
+    label: str | None = None
+    last_used_at: datetime | None = None
     created_at: datetime
-    revoked_at: Optional[datetime] = None
+    revoked_at: datetime | None = None
 
 
 class ClientWithTokens(ClientRead):

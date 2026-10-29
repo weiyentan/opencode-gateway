@@ -48,7 +48,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 import httpx
 
@@ -222,7 +222,7 @@ def _missing(required: Sequence[str], environ: Mapping[str, str]) -> list[str]:
 
 
 def load_config(
-    environ: Mapping[str, str], argv: Optional[list[str]] = None
+    environ: Mapping[str, str], argv: list[str] | None = None
 ) -> E2EConfig:
     """Resolve the harness configuration from environment variables and flags.
 
@@ -319,7 +319,7 @@ async def poll_until(
     interval: float,
     timeout: float,
     what: str,
-    report: Optional[Callable[[int, float], None]] = None,
+    report: Callable[[int, float], None] | None = None,
 ) -> Any:
     """Poll ``predicate`` until it returns a non-None value, else raise.
 
@@ -349,7 +349,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - datetime.UTC is 3.11+
 
 
-def _parse_iso(value: Any) -> Optional[datetime]:
+def _parse_iso(value: Any) -> datetime | None:
     if value is None:
         return None
     try:
@@ -446,7 +446,7 @@ class ProviderClient(Protocol):
     ) -> dict[str, Any]: ...
     async def find_change_request_for_issue(
         self, slug: str, issue_number: str
-    ) -> Optional[dict[str, Any]]: ...
+    ) -> dict[str, Any] | None: ...
     async def get_change_request_state(
         self, slug: str, cr_number: str
     ) -> dict[str, Any]: ...
@@ -474,7 +474,7 @@ class GitHubClient:
         org: str,
         *,
         base_url: str = DEFAULT_GITHUB_API_BASE,
-        transport: Optional[httpx.BaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         headers = {
             "Accept": "application/vnd.github+json",
@@ -531,7 +531,7 @@ class GitHubClient:
 
     async def find_change_request_for_issue(
         self, slug: str, issue_number: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         response = await self._request(
             "GET",
             f"/repos/{slug}/pulls",
@@ -618,7 +618,7 @@ class GitLabClient:
         group: str,
         *,
         base_url: str = DEFAULT_GITLAB_API_BASE,
-        transport: Optional[httpx.BaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         headers: dict[str, str] = {}
         if token:
@@ -688,7 +688,7 @@ class GitLabClient:
 
     async def find_change_request_for_issue(
         self, slug: str, issue_number: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         response = await self._request(
             "GET",
             f"/projects/{self._project_path(slug)}/merge_requests",
@@ -787,7 +787,7 @@ class GatewayClient:
         operator_token: str = "",
         *,
         base_url: str = DEFAULT_GATEWAY_BASE_URL,
-        transport: Optional[httpx.BaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"}
         self._operator_token = operator_token
@@ -801,7 +801,7 @@ class GatewayClient:
         return await self._client.get(path, params=params)
 
     @staticmethod
-    def _data(response: httpx.Response) -> Optional[dict[str, Any]]:
+    def _data(response: httpx.Response) -> dict[str, Any] | None:
         body = response.json()
         data = body.get("data")
         return data if isinstance(data, dict) else None
@@ -822,7 +822,7 @@ class GatewayClient:
         items = (body.get("data") or {}).get("items") or []
         return [dict(item) for item in items]
 
-    async def get_afk_run_detail(self, afk_run_id: str) -> Optional[dict[str, Any]]:
+    async def get_afk_run_detail(self, afk_run_id: str) -> dict[str, Any] | None:
         response = await self._get(f"/api/v1/afk-outcomes/runs/{afk_run_id}")
         if response.status_code == 404:
             return None
@@ -851,7 +851,7 @@ class GatewayClient:
 
     async def get_closure_answer(
         self, provider: str, repository: str, external_id: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         response = await self._get(
             "/api/v1/closure-relationships/issues/current",
             params={"provider": provider, "repository": repository, "external_id": external_id},
@@ -864,7 +864,7 @@ class GatewayClient:
 
     async def get_reporting_detail(
         self, provider: str, repository_url: str, resource_type: str, resource_number: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         response = await self._get(
             "/api/v1/reporting/resources/detail",
             params={
@@ -919,9 +919,9 @@ async def run_provider_scenario(
     """
     result = ScenarioResult(provider=provider)
     name = _repo_name(config, provider)
-    slug: Optional[str] = None
-    issue_number: Optional[str] = None
-    cr_number: Optional[str] = None
+    slug: str | None = None
+    issue_number: str | None = None
+    cr_number: str | None = None
     repository_identity = ""
 
     async def run_step(
@@ -1052,7 +1052,7 @@ async def run_provider_scenario(
         log(f"  {len(bindings)} execution binding(s) observed")
         return {"bindings": bindings}
 
-    async def _nonempty_bindings() -> Optional[list[dict[str, Any]]]:
+    async def _nonempty_bindings() -> list[dict[str, Any]] | None:
         bindings = await gateway.list_execution_bindings(
             provider, repository_identity, cr_number or ""
         )
@@ -1090,7 +1090,7 @@ async def run_provider_scenario(
         log("  fix observed and re-review approved")
         return {"approval": approval}
 
-    async def _fix_seen(since: datetime) -> Optional[int]:
+    async def _fix_seen(since: datetime) -> int | None:
         count = await provider_client.count_new_commits(slug or "", cr_number or "", since)
         return count if count > 0 else None
 
@@ -1107,7 +1107,7 @@ async def run_provider_scenario(
     async def issue_closure() -> dict:
         what = f"{provider} issue #{issue_number} closure after merge"
 
-        async def closed_state() -> Optional[dict[str, Any]]:
+        async def closed_state() -> dict[str, Any] | None:
             state = await provider_client.get_issue_state(slug or "", issue_number or "")
             return state if state.get("state") == "closed" else None
 
@@ -1141,7 +1141,7 @@ async def run_provider_scenario(
     async def gateway_afk_run() -> dict:
         what = f"gateway AFK run containing change_request:{cr_number}"
 
-        async def candidate() -> Optional[dict[str, Any]]:
+        async def candidate() -> dict[str, Any] | None:
             runs = await gateway.list_afk_runs(repository_identity)
             for run in runs:
                 detail = await gateway.get_afk_run_detail(run["afk_run_id"])
@@ -1426,7 +1426,7 @@ async def _run(config: E2EConfig, log: Callable[[str], None]) -> int:
     return 0 if overall == "pass" else 1
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Entry point — resolve config, run preflight + scenarios, return exit code.
 
     Exit codes: 0 = all checks passed; 1 = at least one check failed; 2 =

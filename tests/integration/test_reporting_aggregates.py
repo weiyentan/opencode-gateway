@@ -29,7 +29,7 @@ import asyncio
 import itertools
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import asyncpg
@@ -51,7 +51,7 @@ _DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
 _DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
 _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
 
-UTC = timezone.utc
+UTC = UTC
 
 _API_KEY = "test-api-key"
 

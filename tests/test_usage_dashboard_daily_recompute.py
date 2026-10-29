@@ -11,7 +11,7 @@ The tests are pure unit tests (mock asyncpg connection) — no live database.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -29,7 +29,7 @@ from app.core.usage_dashboard_daily import (
     upsert_bucket,
 )
 
-UTC = timezone.utc
+UTC = UTC
 
 _DAY = date(2026, 9, 23)
 _PROVIDER = "anthropic"
