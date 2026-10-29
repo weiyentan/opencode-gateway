@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
-"""Seed script for populating the OpenCode Gateway database with sample data.
+"""Legacy seed script for execution-era sample data (issue #827 fail-closed).
 
-Connects using the same ``DatabasePool`` / ``Settings`` infrastructure as the
-main Gateway application.  Accepts command-line flags to control the volume of
-generated data.  Idempotent — safe to run multiple times.
+Populates execution-era tables (``runners``, ``workspaces``, ``gateway_jobs``,
+``runner_observations``, ``workspace_observations``,
+``opencode_instance_observations``) which are no longer part of the Gateway's
+observability domain (see issue #809).  The script is **not** idempotent
+despite historical claims: ``_seed_runners`` / ``_seed_workspaces`` /
+``_seed_jobs`` generate fresh ``uuid.uuid4()`` per row with
+``ON CONFLICT (id) DO NOTHING`` — a new UUID never conflicts on replay, so
+re-running inserts fresh rows.  ``_seed_observations`` inserts unconditionally.
+
+Fail-closed safety (issue #827): the command refuses every target that is not
+explicitly attested disposable via ``--confirm=<database_name>``.  Attestation
+is validated **before** pool creation, migration or any insert; absent or
+mismatched confirmation raises ``SystemExit`` with actionable text.  Migration
+errors are fatal and halt before inserts; redundant second alembic invocation
+has been removed (single ``ensure_schema`` path).
 
 Usage::
 
-    python scripts/seed.py --runners 2 --workspaces 2 --jobs 3 --observations 5
+    python scripts/seed.py --confirm my_disposable_db --runners 2 --workspaces 2 --jobs 3 --observations 5
 
-    # Also accepts short flags
-    python scripts/seed.py -r 5 -w 10 -j 15 -o 20
+    # Also accepts short flags plus --confirm alias --yes
+    python scripts/seed.py --confirm opencode_gateway_test -r 5 -w 10 -j 15 -o 20
 
     # Run with --help for a full listing
     python scripts/seed.py --help
+
+Do not run against production, shared, or Kubernetes databases.  A future
+follow-up (issue #810) will retire or replace this tool with deterministic
+observability fixtures.
 """
 
 from __future__ import annotations
@@ -65,7 +81,10 @@ EXECUTOR_TYPES = ["local", "awx"]
 
 
 # ---------------------------------------------------------------------------
-# Idempotent helpers — each INSERT uses ON CONFLICT DO NOTHING.
+# Legacy helpers — NOT idempotent despite ON CONFLICT guards (issue #809/#827).
+# Each call generates fresh uuid.uuid4() values; a new UUID never conflicts
+# on replay, so re-running inserts fresh rows rather than converging. See
+# _assert_disposable_target for the full replay-idempotency analysis.
 # ---------------------------------------------------------------------------
 
 
@@ -231,9 +250,51 @@ async def _seed_observations(
 # ---------------------------------------------------------------------------
 
 
+def _assert_disposable_target(settings: Settings, confirm: str | None) -> None:
+    """Fail closed unless the target database is explicitly attested disposable.
+
+    The legacy seed command may run migrations and insert execution-era sample
+    rows.  It must refuse every target that is not explicitly attested disposable
+    via ``--confirm=<database_name>``.  This check runs before any pool creation,
+    migration or insert.
+
+    Why random identifiers do not establish replay idempotency (issue #809/#827):
+    ``_seed_runners`` / ``_seed_workspaces`` / ``_seed_jobs`` generate a fresh
+    ``uuid.uuid4()`` per row and use ``ON CONFLICT (id) DO NOTHING``.  A new UUID
+    never conflicts on replay, so re-running the tool inserts fresh sample rows
+    rather than converging on a stable fixture set.  ``_seed_observations`` inserts
+    new UUIDs unconditionally without any conflict clause.  The ``ON CONFLICT``
+    guards therefore mask only accidental collisions, not logical idempotency.
+
+    Args:
+        settings: Resolved Gateway settings (database host/name).
+        confirm: Value of ``--confirm`` supplied on the CLI.
+
+    Raises:
+        SystemExit: When attestation is absent or does not exactly match the
+            target database name.  The message is actionable and names the
+            expected confirmation value.
+    """
+    expected = settings.database_name
+    if confirm is None or confirm != expected:
+        raise SystemExit(
+            f"Refusing to seed database '{expected}' at "
+            f"{settings.database_host}:{settings.database_port} without explicit "
+            f"disposable-database attestation. Re-run with --confirm='{expected}' "
+            f"to attest this target is disposable and may be overwritten. "
+            f"This command may run migrations and insert execution-era sample rows; "
+            f"never use it against production, shared, or Kubernetes databases."
+        )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Seed the OpenCode Gateway database with sample data.",
+        description=(
+            "Legacy seed for execution-era sample data (issue #827). "
+            "Requires --confirm=<database_name> to attest the target is "
+            "disposable; refuses every non-attested target and fails closed "
+            "before pool creation, migration or inserts."
+        ),
     )
     parser.add_argument(
         "--runners",
@@ -263,11 +324,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_OBSERVATIONS,
         help=f"Number of observation records to create (default: {DEFAULT_OBSERVATIONS})",
     )
+    parser.add_argument(
+        "--confirm",
+        "--yes",
+        dest="confirm",
+        type=str,
+        default=None,
+        help="Explicit disposable-database attestation: must equal the target "
+        "database name (e.g. --confirm='opencode_gateway_test') to confirm the "
+        "target is disposable and safe to overwrite. Without this flag the "
+        "command refuses to run.",
+    )
     return parser.parse_args(argv)
 
 
 async def _run(args: argparse.Namespace) -> None:
     settings = Settings()
+    # Fail closed before any side effect: pool creation, migration or inserts.
+    _assert_disposable_target(settings, getattr(args, "confirm", None))
 
     pool = DatabasePool(settings)
     try:
@@ -276,9 +350,10 @@ async def _run(args: argparse.Namespace) -> None:
             logger.error("Failed to connect to the database. Check your settings.")
             sys.exit(1)
 
-        # Ensure both schemas exist.
+        # Single migration path: ensure_schema runs Alembic and validates tables.
+        # Migration errors are fatal and halt before any inserts (no second
+        # alembic invocation, no warning-and-continue).
         await ensure_schema(pool.pool)
-        await _ensure_alembic_schema(settings)
 
         logger.info(
             "Connected to %s:%d/%s as %s.",
@@ -297,30 +372,6 @@ async def _run(args: argparse.Namespace) -> None:
         logger.info("Seed complete.")
     finally:
         await pool.close()
-
-
-async def _ensure_alembic_schema(settings: Settings) -> None:
-    """Run Alembic migrations to create ORM-managed tables (runners, observations)."""
-    import subprocess
-
-    env = os.environ.copy()
-    env["GATEWAY_DATABASE_HOST"] = settings.database_host
-    env["GATEWAY_DATABASE_PORT"] = str(settings.database_port)
-    env["GATEWAY_DATABASE_NAME"] = settings.database_name
-    env["GATEWAY_DATABASE_USER"] = settings.database_user
-    env["GATEWAY_DATABASE_PASSWORD"] = settings.database_password
-
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=_proj_root,
-    )
-    if result.returncode != 0:
-        logger.warning("Alembic upgrade returned non-zero: %s", result.stderr)
-    else:
-        logger.info("Alembic migrations applied.")
 
 
 def main(argv: list[str] | None = None) -> None:
