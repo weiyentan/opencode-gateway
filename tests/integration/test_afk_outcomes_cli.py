@@ -9,6 +9,9 @@ PostgreSQL 16 service (port 5433) with a fake GitHub API client, and verifies:
 * the dry-run report writes nothing and its counts match the resolution a
   real write stores for the same window (``afk_run_entities`` buckets).
 
+No external provider API is contacted: every request is served by
+``FakeGitHubApi``.
+
 Prerequisites
 -------------
 This suite migrates the schema and can drop every table in the ``public``
@@ -33,8 +36,10 @@ fails closed instead of skipping.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,25 +72,56 @@ def _dsn() -> str:
     return _TARGET.dsn()
 
 
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+# Clear every data table but preserve the migration bookkeeping so each test
+# starts from a clean slate without re-running migrations.
+_TRUNCATE_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+    "AND tablename <> 'alembic_version') LOOP "
+    "EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+
+async def _drop_all_tables() -> None:
+    """Drop every public table — the retry path for a corrupt schema state."""
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+    try:
+        await conn.execute(_DROP_ALL_SQL)
+    finally:
+        await conn.close()
+
+
 @pytest.fixture(scope="module")
 def _verified_disposable_database() -> DatabaseTarget:
     """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
 
-    Runs before ``db_pool`` (and therefore before any destructive migration
-    reset).  A missing attestation, unapproved/mismatched DSN, unreachable
-    server, Kubernetes target, or wrong server version raises an error — never
-    a skip.
+    Runs before ``_migrated_schema`` (and therefore before the destructive
+    migration reset).  A missing attestation, unapproved/mismatched DSN,
+    unreachable server, non-test database name, Kubernetes target, or wrong
+    server version raises an error — never a skip, so CI cannot go green on
+    an unverified or skipped target.
     """
-    import asyncio
-
     return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the disposable database to ``head`` once per module.
 
+    Deliberately synchronous: alembic's ``env.py`` calls ``asyncio.run``,
+    which cannot run inside the pytest-asyncio event loop.  A first attempt
+    that fails (e.g. leftover partial tables) drops every public table and
+    retries from scratch; the drop only runs after the target was verified as
+    disposable.
+    """
     import alembic.command
     import alembic.config
 
@@ -96,24 +132,30 @@ async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool
     try:
         alembic.command.upgrade(alembic_cfg, "head")
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
+        asyncio.run(_drop_all_tables())
         alembic.command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture
+async def db_pool(_migrated_schema: None) -> AsyncIterator[asyncpg.Pool]:
+    """Function-scoped pool on the migrated disposable database.
+
+    pytest-asyncio runs each async test in a fresh event loop and an asyncpg
+    pool is bound to the loop that created it, so the pool cannot be shared
+    across tests.  Every test starts and finishes with an empty schema (the
+    migration version row is preserved) so global row-count assertions stay
+    deterministic.
+    """
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        await conn.execute(_TRUNCATE_ALL_SQL)
 
     yield pool
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
-        )
+        await conn.execute(_TRUNCATE_ALL_SQL)
     await pool.close()
 
 
@@ -361,7 +403,8 @@ async def test_backfill_rerun_converges_and_dry_run_matches_stored(
             assert getattr(real, name) == getattr(dry, name), name
         after_first = await _table_counts(conn)
         assert after_first["afk_runs"] == 1
-        assert after_first["afk_run_entities"] == 4  # CR + 2 issues + noise commit
+        # Owning change request + 2 issues + branch commit + review lineage.
+        assert after_first["afk_run_entities"] == 5
         assert after_first["delivery_log"] == 1
 
         # Re-run of the same window converges — no duplicate rows anywhere.
