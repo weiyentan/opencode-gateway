@@ -17,25 +17,34 @@ into a required CI job unless the invocation explicitly requests a database.
 Running
 -------
 CI (no database): the pure plan/latency helpers below are exercised, and
-every live test skips cleanly.  Nothing here requires Docker.
+every live test skips cleanly because live measurement is **not requested**.
+Nothing here requires Docker and ordinary pull requests never run it.
 
-Against a live PostgreSQL replica::
+Opt-in against a read-only replica (or a separately approved read-only
+target)::
 
-    export READ_PATH_LIVE_DATABASE_URL=postgresql://user:pass@replica:5432/gateway
+    export READ_PATH_LIVE_ENABLED=1
+    export READ_PATH_LIVE_DATABASE_URL=postgresql://reader:pass@replica:5432/gateway
     pytest tests/integration/test_read_path_live_protocol.py -v -m integration
 
-``READ_PATH_LIVE_DATABASE_URL`` takes precedence; when unset, the standard
-Gateway variables are used (``GATEWAY_DATABASE_HOST`` / ``_PORT`` / ``_NAME``
-/ ``_USER`` / ``_PASSWORD``), matching the sibling integration modules and
-``docker-compose.test.yml``.
+The opt-in is deliberate: a DSN alone does **not** enable live measurement.
+``READ_PATH_LIVE_ENABLED`` must be explicitly truthy.  When
+``READ_PATH_LIVE_DATABASE_URL`` is unset, complete
+``GATEWAY_DATABASE_HOST`` / ``_PORT`` / ``_NAME`` / ``_USER`` /
+``_PASSWORD`` credentials may be used instead; no credential defaults are
+assumed.  Once opted in, missing credentials, an unreachable target, or
+zero executed live probes **fail** the run rather than skipping green.
 
 Safety
 ------
 Every connection opens a **READ ONLY** transaction with a bounded
-``statement_timeout``.  Only ``SELECT`` / ``EXPLAIN`` statements run — the
-harness never writes, so pointing it at a replica (or any production
-database with a real replica) cannot mutate data; ``EXPLAIN ANALYZE``
-executes the read query but performs no writes.
+``statement_timeout`` (30 s), verifies both boundaries before any probe
+runs, and is rolled back on teardown.  Only ``SELECT`` / ``EXPLAIN``
+statements run — the harness never issues schema changes, seed data, or
+destructive teardown, so pointing it at a replica cannot mutate data;
+``EXPLAIN ANALYZE`` executes the read query but performs no writes.
+Credentials are never logged: failure messages name only
+``host:port/database``.
 
 Interpreting results
 ---------------------
@@ -50,7 +59,9 @@ from __future__ import annotations
 import json
 import os
 import statistics
+from datetime import datetime, timezone
 from typing import Any, Iterable
+from urllib.parse import quote, urlsplit
 
 import asyncpg
 import pytest
@@ -59,17 +70,33 @@ import pytest
 #  Connection configuration
 # ══════════════════════════════════════════════════════════════════════════
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+#: Explicit opt-in flag.  Ordinary PR/CI runs never set this; the live
+#: protocol only runs when an operator deliberately enables it.
+LIVE_ENABLED_ENV = "READ_PATH_LIVE_ENABLED"
+
+#: Optional DSN override for the read-only replica / approved target.
+LIVE_DATABASE_URL_ENV = "READ_PATH_LIVE_DATABASE_URL"
+
+#: Fallback credential source, matching the sibling integration modules.
+#: Every value is required once live measurement is opted in; there are no
+#: credential defaults.
+GATEWAY_DB_ENV_VARS = (
+    "GATEWAY_DATABASE_HOST",
+    "GATEWAY_DATABASE_PORT",
+    "GATEWAY_DATABASE_NAME",
+    "GATEWAY_DATABASE_USER",
+    "GATEWAY_DATABASE_PASSWORD",
+)
 
 # Bound every statement so a pathological plan cannot pin the replica.
 _STATEMENT_TIMEOUT_MS = 30_000
 
-_START = "2025-07-01T00:00:00Z"
-_END = "2025-07-31T23:59:59Z"
+_OPT_IN_VALUES = frozenset({"1", "true", "yes", "on"})
+
+# asyncpg binds ``timestamptz`` parameters from timezone-aware datetimes,
+# not ISO strings; the fixed dashboard window from ADR 0017.
+_START = datetime(2025, 7, 1, tzinfo=timezone.utc)
+_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 # Warm-up + measured iterations, mirroring ADR 0017 ("10 warm-cache
 # executions").  More samples make p95 less sensitive to a single pause.
@@ -77,14 +104,66 @@ _WARMUP = 2
 _MEASURE = 10
 
 
-def _dsn() -> str:
-    """Live-replica DSN: explicit override wins, else Gateway env vars."""
-    override = os.environ.get("READ_PATH_LIVE_DATABASE_URL")
+class LiveMeasurementUnavailable(RuntimeError):
+    """An explicitly requested live measurement cannot produce evidence."""
+
+
+def live_opt_in_requested() -> bool:
+    """Whether the operator deliberately opted into live measurement."""
+    return os.environ.get(LIVE_ENABLED_ENV, "").strip().lower() in _OPT_IN_VALUES
+
+
+def describe_target(dsn: str) -> str:
+    """Safe ``host:port/database`` label for *dsn* (credentials stripped)."""
+    try:
+        parts = urlsplit(dsn)
+        host = parts.hostname or "unknown-host"
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return "unknown-host/unknown-database"
+    database = (parts.path or "/").lstrip("/") or "unknown-database"
+    return f"{host}{port}/{database}"
+
+
+def resolve_live_dsn() -> str:
+    """Resolve the live target DSN for an explicitly requested run.
+
+    ``READ_PATH_LIVE_DATABASE_URL`` wins; otherwise every
+    ``GATEWAY_DATABASE_*`` value must be supplied.  Raises
+    :class:`LiveMeasurementUnavailable` when the opt-in flag is absent or
+    when credentials are incomplete — never silently falls back to a default
+    test database.  The returned DSN is never logged.
+    """
+    if not live_opt_in_requested():
+        raise LiveMeasurementUnavailable(
+            f"Live read-path measurement is not enabled. Set "
+            f"{LIVE_ENABLED_ENV}=1 to opt in deliberately."
+        )
+
+    override = os.environ.get(LIVE_DATABASE_URL_ENV, "").strip()
     if override:
         return override
+
+    missing = [
+        name
+        for name in GATEWAY_DB_ENV_VARS
+        if not os.environ.get(name, "").strip()
+    ]
+    if missing:
+        raise LiveMeasurementUnavailable(
+            f"{LIVE_ENABLED_ENV}=1 but no complete live database credentials "
+            f"were configured. Set {LIVE_DATABASE_URL_ENV} or all of "
+            f"{', '.join(GATEWAY_DB_ENV_VARS)} (missing: {', '.join(missing)}). "
+            "Credential values are never logged."
+        )
+
+    user = quote(os.environ["GATEWAY_DATABASE_USER"], safe="")
+    password = quote(os.environ["GATEWAY_DATABASE_PASSWORD"], safe="")
     return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
+        f"postgresql://{user}:{password}"
+        f"@{os.environ['GATEWAY_DATABASE_HOST']}"
+        f":{os.environ['GATEWAY_DATABASE_PORT']}"
+        f"/{os.environ['GATEWAY_DATABASE_NAME']}"
     )
 
 
@@ -343,41 +422,102 @@ def compare_latency(
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def _can_connect() -> bool:
+async def _can_connect(dsn: str) -> bool:
     try:
-        conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
+        conn = await asyncpg.connect(dsn=dsn, timeout=5)
         await conn.close()
         return True
     except Exception:
         return False
 
 
+def require_executed_probes(names: Iterable[str]) -> list[str]:
+    """Return the executed probe names or fail when none ran.
+
+    A live run that executed zero probes has produced no plan or latency
+    evidence; reporting it as green would be a false-positive measurement.
+    """
+    executed = [name for name in names if name]
+    if not executed:
+        raise LiveMeasurementUnavailable(
+            "Live read-path measurement was explicitly requested but zero "
+            "live probes executed; refusing to report green measurement "
+            "evidence."
+        )
+    return executed
+
+
 @pytest.fixture(scope="module")
-def live_db_available() -> bool:
+def live_database_dsn() -> str:
+    """Resolve and verify the opt-in live target.
+
+    Not requested → skip safely (no connection attempt).  Requested but
+    misconfigured or unreachable → fail; a requested measurement must never
+    degrade into a green skip.
+    """
+    if not live_opt_in_requested():
+        pytest.skip(
+            "Live read-path measurement is opt-in and was not requested. "
+            f"Set {LIVE_ENABLED_ENV}=1 and supply {LIVE_DATABASE_URL_ENV} "
+            "(or complete GATEWAY_DATABASE_* credentials) to run it against "
+            "a read-only replica."
+        )
+
+    try:
+        dsn = resolve_live_dsn()
+    except LiveMeasurementUnavailable as exc:
+        pytest.fail(str(exc), pytrace=False)
+
     import asyncio
 
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Live PostgreSQL not available.  Set READ_PATH_LIVE_DATABASE_URL "
-            "(or GATEWAY_DATABASE_* / start docker-compose.test.yml)."
+    if not asyncio.run(_can_connect(dsn)):
+        pytest.fail(
+            f"{LIVE_ENABLED_ENV}=1 but the live read-path target "
+            f"{describe_target(dsn)} is unreachable. Live measurement was "
+            "explicitly requested; this is a failure, not a skip.",
+            pytrace=False,
         )
-    return True
+    return dsn
+
+
+@pytest.fixture(scope="module")
+def live_probe_ledger(live_database_dsn: str) -> list[str]:
+    """Record executed probes and fail the module when none produced evidence."""
+    executed: list[str] = []
+    yield executed
+    require_executed_probes(executed)
 
 
 @pytest.fixture
-async def readonly_conn(live_db_available: bool):
-    """Yield a connection inside a bounded READ ONLY transaction.
+async def readonly_conn(live_database_dsn: str):
+    """Yield a connection inside a verified, bounded READ ONLY transaction.
 
-    The transaction is rolled back on teardown.  ``SET LOCAL
-    statement_timeout`` bounds every statement so a bad plan cannot pin the
-    replica.  This is the safety boundary that makes the harness safe to
-    point at a production replica.
+    Both safety boundaries are proven before any probe runs:
+    ``transaction_read_only = on`` and ``statement_timeout = 30 s``.  The
+    transaction is rolled back on teardown.  This is what makes the harness
+    safe to point at a production read replica.
     """
-    conn = await asyncpg.connect(dsn=_dsn(), timeout=10)
+    conn = await asyncpg.connect(dsn=live_database_dsn, timeout=10)
     tx = conn.transaction(readonly=True)
     await tx.start()
-    await conn.execute(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}")
     try:
+        await conn.execute(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}")
+
+        read_only = await conn.fetchval("SHOW transaction_read_only")
+        assert read_only == "on", (
+            "Refusing live measurement: transaction_read_only is "
+            f"{read_only!r}, expected 'on'."
+        )
+
+        timeout_ms = await conn.fetchval(
+            "SELECT EXTRACT(EPOCH FROM current_setting('statement_timeout')"
+            "::interval) * 1000"
+        )
+        assert int(timeout_ms) == _STATEMENT_TIMEOUT_MS, (
+            "Refusing live measurement: statement_timeout is "
+            f"{timeout_ms} ms, expected {_STATEMENT_TIMEOUT_MS} ms."
+        )
+
         yield conn
     finally:
         try:
@@ -496,24 +636,45 @@ class TestLiveProtocol:
         assert value == "on"
 
     @pytest.mark.asyncio
-    async def test_explain_captures_plan_for_every_probe(
+    async def test_statement_timeout_is_bounded(
         self, readonly_conn: asyncpg.Connection
+    ):
+        timeout_ms = await readonly_conn.fetchval(
+            "SELECT EXTRACT(EPOCH FROM current_setting('statement_timeout')"
+            "::interval) * 1000"
+        )
+        assert int(timeout_ms) == _STATEMENT_TIMEOUT_MS
+
+    @pytest.mark.asyncio
+    async def test_explain_captures_plan_for_every_probe(
+        self,
+        readonly_conn: asyncpg.Connection,
+        live_probe_ledger: list[str],
     ):
         """The protocol's primary artifact: an ANALYZE plan per read query.
 
         A sequential scan is explicitly permitted — the assertion is only
-        that a plan was captured with at least one node.
+        that a plan was captured with at least one node.  Every probe is
+        recorded so an opted-in run that executes none fails instead of
+        reporting green evidence.
         """
+        executed: list[str] = []
         for name, sql, params in _PROBES:
             plan = await capture_explain(readonly_conn, sql, params)
             nodes = node_types(plan)
             assert nodes, f"{name}: EXPLAIN returned no plan nodes"
             # Informational: spill is reported, never asserted to be absent.
             temp_spill_bytes(plan)
+            executed.append(name)
+
+        live_probe_ledger.extend(require_executed_probes(executed))
+        assert executed == probe_names()
 
     @pytest.mark.asyncio
     async def test_latency_comparison_of_candidate_against_baseline(
-        self, readonly_conn: asyncpg.Connection
+        self,
+        readonly_conn: asyncpg.Connection,
+        live_probe_ledger: list[str],
     ):
         """Measure a probe twice and report the candidate/baseline ratio.
 
@@ -528,3 +689,4 @@ class TestLiveProtocol:
         ratios = compare_latency(baseline, candidate)
         assert ratios["p50_ratio"] >= 0
         assert name  # probe identity is part of the reported measurement
+        live_probe_ledger.extend(require_executed_probes([name]))
