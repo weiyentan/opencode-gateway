@@ -35,8 +35,6 @@ from app.core.afk_dashboard_daily import (
     upsert_bucket,
 )
 
-UTC = UTC
-
 _DAY = date(2026, 9, 21)
 _PROVIDER = "gitlab"
 _REPOSITORY = "cloudnative-pg"

@@ -85,6 +85,9 @@ jobs:
             tests/test_agent_runs_status_filter_pg.py \
             tests/integration/test_change_request_summary.py \
             tests/integration/test_afk_outcomes_correlations_jsonb.py \
+            tests/integration/test_reporting_aggregates.py \
+            tests/integration/test_read_path_live_protocol.py \
+            tests/integration/test_ingest_batch_overlap_perf.py \
             -v -m integration
 
       # Required gate: the AFK lifecycle concurrency and reporting-ingestion

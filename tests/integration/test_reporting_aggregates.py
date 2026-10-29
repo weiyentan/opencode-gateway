@@ -51,8 +51,6 @@ _DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
 _DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
 _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
 
-UTC = UTC
-
 _API_KEY = "test-api-key"
 
 _T1 = datetime(2026, 8, 14, 12, 0, 0, tzinfo=UTC)

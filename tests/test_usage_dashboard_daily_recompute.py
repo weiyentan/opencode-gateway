@@ -29,8 +29,6 @@ from app.core.usage_dashboard_daily import (
     upsert_bucket,
 )
 
-UTC = UTC
-
 _DAY = date(2026, 9, 23)
 _PROVIDER = "anthropic"
 
