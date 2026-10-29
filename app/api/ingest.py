@@ -14,7 +14,7 @@ import logging
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import TypedDict
+from typing import TypedDict, cast
 
 try:
     from typing import NotRequired  # type: ignore[attr-defined]
@@ -658,7 +658,7 @@ async def _upsert_model(
             row["id"],
             now,
         )
-        return row["id"]
+        return cast(uuid.UUID, row["id"])
 
 
 async def _resolve_session(
@@ -733,7 +733,7 @@ async def _resolve_session(
         agent,
         parent_session_id,
     )
-    return row["id"]
+    return cast(uuid.UUID, row["id"])
 
 
 # ── Record processor ──────────────────────────────────────────────────────
@@ -2201,9 +2201,9 @@ async def _record_canonical_event(
                     # normal replay-merge path).  A NULL incoming cost was
                     # already excluded upstream (marker never fires for NULL),
                     # so the incoming cost is authoritative.
-                    new_values = {"estimated_cost_usd": record.estimated_cost_usd}
+                    cost_only_values = {"estimated_cost_usd": record.estimated_cost_usd}
                     merge_outcome = await apply_replay_merge(
-                        conn, event_id, new_values,
+                        conn, event_id, cost_only_values,
                         client_id=client_id,
                     )
                     enrichment_filled = await _fill_canonical_text_enrichment(

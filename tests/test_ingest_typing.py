@@ -34,13 +34,12 @@ TARGET = "app/api/ingest.py"
 
 #: Diagnostics that remain while the shipped ``app.api.ingest`` exemption is
 #: still in place.  Each entry is ``(error_code, message_pattern, max_count)``
-#: and belongs to a later slice: ``#830`` owns persistence, ``#831`` owns
-#: enrichment (and the eventual exemption removal).
+#: and belongs to a later slice: ``#831`` owns the remaining enrichment
+#: diagnostics (and the eventual exemption removal).  ``#830`` persistence
+#: diagnostics are now resolved.
 DOCUMENTED_REMAINING: tuple[tuple[str, str, int], ...] = (
     # #831 — cache-token delta casts (enrichment)
     ("call-overload", r'No overload variant of "int" matches argument type "object"', 2),
-    # #830 — UUID returns from asyncpg rows (persistence)
-    ("no-any-return", r'Returning Any from function declared to return "UUID"', 2),
     # #831 — JSONB serialization narrowing (enrichment)
     (
         "assignment",
@@ -48,9 +47,6 @@ DOCUMENTED_REMAINING: tuple[tuple[str, str, int], ...] = (
         r'variable has type "dict\[Any, Any\] \| None"\)',
         2,
     ),
-    # #830 — duplicate ``new_values`` binding in the replay-merge branches
-    # (persistence); the message embeds a line number, so match the prefix.
-    ("no-redef", r'Name "new_values" already defined', 1),
 )
 
 
