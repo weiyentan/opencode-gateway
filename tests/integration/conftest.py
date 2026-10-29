@@ -30,29 +30,33 @@ from tests.integration._disposable_postgres import (
     verify_disposable_target,
 )
 
-# ``verify_disposable_target`` treats an unset ``GATEWAY_ENV`` as production
-# and refuses destructive operations.  Pin the development environment at
-# conftest import time — before any module-scoped fixture runs its preflight —
-# without overriding an explicit operator-provided value.
-os.environ.setdefault("GATEWAY_ENV", "development")
-
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-#: Resolved once at import (never connects); the preflight below verifies it.
-_TARGET = DatabaseTarget.from_env()
-
 
 @pytest.fixture(scope="module")
-def _verified_disposable_database() -> DatabaseTarget:
+def _verified_disposable_database(request: pytest.FixtureRequest) -> DatabaseTarget:
     """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
 
     Runs before ``_migrated_schema`` (and therefore before any destructive
     migration reset).  A missing attestation, unreachable server, non-test
     database name, Kubernetes target, or wrong server version raises an error
     — never a skip, so CI cannot go green on an unverified or skipped target.
+
+    ``verify_disposable_target`` treats an unset ``GATEWAY_ENV`` as production
+    and refuses destructive operations, so this fixture pins the development
+    environment — without overriding an explicit operator-provided value — for
+    the lifetime of the module's fixtures only.  The patch is applied here, not
+    at conftest import time, so collecting this file for a non-integration
+    ``pytest`` run cannot leak ``development`` into tests that assert the
+    production default.  The target is likewise resolved inside the fixture,
+    after the environment is set.
     """
-    return asyncio.run(verify_disposable_target(_TARGET))
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("GATEWAY_ENV", os.environ.get("GATEWAY_ENV", "development"))
+    request.addfinalizer(monkeypatch.undo)
+
+    return asyncio.run(verify_disposable_target(DatabaseTarget.from_env()))
 
 
 @pytest.fixture(scope="module")
@@ -71,7 +75,9 @@ def _migrated_schema(_verified_disposable_database: DatabaseTarget):
     import alembic.command
     import alembic.config
 
-    sync_url = target_dsn(_TARGET).replace("postgresql://", "postgresql+psycopg://")
+    sync_url = target_dsn(_verified_disposable_database).replace(
+        "postgresql://", "postgresql+psycopg://"
+    )
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
@@ -80,7 +86,9 @@ def _migrated_schema(_verified_disposable_database: DatabaseTarget):
         alembic.command.upgrade(alembic_cfg, "head")
 
     async def _drop_all() -> None:
-        conn = await asyncpg.connect(dsn=target_dsn(_TARGET), timeout=5)
+        conn = await asyncpg.connect(
+            dsn=target_dsn(_verified_disposable_database), timeout=5
+        )
         try:
             await conn.execute(DROP_ALL_TABLES_SQL)
         finally:
