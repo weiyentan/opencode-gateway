@@ -44,7 +44,8 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import asyncpg
 import pytest

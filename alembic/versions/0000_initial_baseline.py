@@ -4,7 +4,8 @@ This migration is intentionally empty.  Future slices of the refactor
 will add observability-specific tables in new migration files.
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 # revision identifiers, used by Alembic.
 revision: str = "0000"

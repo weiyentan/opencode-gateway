@@ -25,7 +25,8 @@ and context-join read paths and are retained. See ADR 0017 for the
 before/after plans and latencies.
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 from alembic import op
 

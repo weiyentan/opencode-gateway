@@ -44,7 +44,7 @@ import logging
 import os
 import sys
 from datetime import date
-from typing import Sequence
+from collections.abc import Sequence
 
 import asyncpg
 

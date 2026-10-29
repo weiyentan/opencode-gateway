@@ -32,7 +32,8 @@ Revises:     0048
 Create Date: 2026-10-03
 """
 
-from typing import Sequence, Union
+from typing import Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
