@@ -177,6 +177,45 @@ jobs:
           )
           PY
 
+      # Required-mode execution contract (issue #826, ADR 0032).  Destructive
+      # suites must run on the dedicated postgres-isolated service with
+      # GATEWAY_TEST_DISPOSABLE_DB=1 and must fail closed when the database is
+      # unavailable (never pytest.skip).  A required JUnit report must also
+      # prove that every expected case executed: a missing report, zero
+      # collected cases, any skip/failure/error, or a name mismatch fails.
+      # Subsequent suite-enablement children reuse this pattern.
+      - name: Run required-mode execution contract tests
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/unit/test_disposable_postgres_gate.py \
+            tests/unit/test_required_test_report.py \
+            -v -m "not integration" \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/required-mode-report.xml"
+
+      - name: Verify required-mode JUnit report is non-skipping
+        if: always()
+        env:
+          REQUIRED_MODE_JUNIT: ${{ runner.temp }}/required-mode-report.xml
+        run: |
+          python - <<'PY'
+          import os
+
+          from tests.integration._disposable_postgres import (
+              verify_required_test_report,
+          )
+
+          summary = verify_required_test_report(
+              os.environ["REQUIRED_MODE_JUNIT"], minimum_executed=1
+          )
+          print(
+              "Required-mode execution contract: "
+              f"{summary.total} collected, {summary.passed} passed, "
+              f"{summary.failed} failed, {summary.skipped} skipped"
+          )
+          PY
+
       - name: Lint Python
         run: ruff check .
 

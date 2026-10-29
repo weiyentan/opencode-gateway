@@ -4,38 +4,36 @@ Verifies that a 100-record ingest batch performs at most one historical overlap
 query even when ``usage_ingest_attempts`` contains a production-scale history
 (~100k rows), and that quarantined records never produce accounting side effects.
 
+Classification (issue #826): **optional benchmark**.  It is not part of the
+required pull-request CI path because the production-scale fixture is heavy and
+time-bounded; when it is invoked (manually or by an opt-in workflow) it still
+refuses to run without the disposable-Postgres attestation below.
+
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema, drops every table in the ``public`` schema, and
+seeds ~123k rows, so it refuses to run unless the target is positively verified
+as the dedicated disposable PostgreSQL 16 service.  Start one outside
+Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
+        -p 5433:5432 postgres:16-alpine
 
-The test reads database connection parameters from the standard Gateway
-environment variables (``GATEWAY_DATABASE_HOST``, ``GATEWAY_DATABASE_PORT``,
-``GATEWAY_DATABASE_NAME``, ``GATEWAY_DATABASE_USER``,
-``GATEWAY_DATABASE_PASSWORD``).  The ``docker-compose.test.yml`` service
-is configured to match the defaults expected by these tests.
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_ingest_batch_overlap_perf.py -v -m integration
 
-Environment variables
----------------------
-GATEWAY_DATABASE_HOST
-    Host of the test database (defaults to ``localhost``).
-GATEWAY_DATABASE_PORT
-    Port of the test database (defaults to ``5433`` to match
-    ``docker-compose.test.yml``).
-GATEWAY_DATABASE_NAME
-    Database name (defaults to ``opencode_gateway_test``).
-GATEWAY_DATABASE_USER
-    Database user (defaults to ``opencode_test``).
-GATEWAY_DATABASE_PASSWORD
-    Database password (defaults to ``opencode_test``).
+    docker stop opencode-gateway-test-db
+
+A missing attestation, a mismatched DSN, an unreachable server, a
+non-test database name, a Kubernetes target, or a non-PostgreSQL-16 server
+fails closed instead of skipping.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
@@ -48,16 +46,18 @@ import pytest
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
+
 # ── Repository paths ─────────────────────────────────────────────────────
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-# ── Default connection parameters matching docker-compose.test.yml ───────
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 # ── Request budget (seconds) ────────────────────────────────────────────
 # The Gateway's total_request_timeout_seconds defaults to 20 in config.py.
@@ -85,24 +85,8 @@ logger = logging.getLogger(__name__)
 
 
 def _dsn() -> str:
-    """Build an asyncpg DSN from environment variables or defaults."""
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    """Return True if the test database is reachable."""
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5),
-            timeout=10.0,
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    """Build the asyncpg DSN for the verified disposable target."""
+    return _TARGET.dsn()
 
 
 def _utcnow() -> datetime:
@@ -119,18 +103,21 @@ def _mk_ts() -> datetime:
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    """Module-level check: skip the entire module if the test DB is absent."""
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``db_pool`` (and therefore before any destructive migration,
+    fixture seed, or teardown).  A missing attestation, unapproved/mismatched
+    DSN, unreachable server, Kubernetes target, or wrong server version raises
+    an error — never a skip.
+    """
+    import asyncio
+
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
+async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
     """Create a dedicated asyncpg pool, run Alembic migrations, and return it.
 
     The pool is shared across all tests in the module and closed after the

@@ -1,7 +1,7 @@
 """Integration tests for the current-aggregate layer (issue #480).
 
-Runs against the docker-compose Postgres (port 5433) and verifies the
-database-enforced guarantees of the forward-only current aggregate:
+Runs against the dedicated disposable PostgreSQL 16 service (port 5433) and
+verifies the database-enforced guarantees of the forward-only current aggregate:
 
 * a delivery carrying a ``resource`` object produces exactly one
   ``reporting_resource_aggregates`` row keyed by the normalized identity;
@@ -14,18 +14,28 @@ database-enforced guarantees of the forward-only current aggregate:
 
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as the
+dedicated disposable PostgreSQL 16 service.  Start one outside Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
+        -p 5433:5432 postgres:16-alpine
 
-The test skips gracefully when the database is not reachable.
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_reporting_aggregates.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+A missing attestation, a mismatched DSN, an unreachable server, a
+non-test database name, a Kubernetes target, or a non-PostgreSQL-16 server
+fails closed instead of skipping.
 """
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 import os
 import uuid
@@ -41,15 +51,17 @@ from app.core.reporting_aggregates import (
     get_aggregate,
 )
 from app.core.repository import normalize_repository_url
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 UTC = timezone.utc
 
@@ -61,35 +73,25 @@ _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
-
-
-async def _can_connect() -> bool:
-    try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
-        await conn.close()
-        return True
-    except Exception:
-        return False
+    return _TARGET.dsn()
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``db_pool`` (and therefore before any destructive migration
+    reset).  A missing attestation, unapproved/mismatched DSN, unreachable
+    server, Kubernetes target, or wrong server version raises an error — never
+    a skip.
+    """
+    import asyncio
+
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
+async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
 
