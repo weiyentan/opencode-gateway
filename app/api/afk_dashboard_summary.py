@@ -25,7 +25,7 @@ are protected by the global :class:`~app.core.auth.ApiKeyMiddleware`.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -268,7 +268,7 @@ async def get_afk_dashboard_summary(
     resolved_from, resolved_to = _resolve_date_range(
         from_date_dt,
         to_date_dt,
-        today=datetime.now(timezone.utc).date(),
+        today=datetime.now(UTC).date(),
     )
 
     settings = get_settings()

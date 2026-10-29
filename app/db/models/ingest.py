@@ -10,9 +10,8 @@ Gateway architecture.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from decimal import Decimal
-from typing import Optional
 
 from sqlalchemy import (
     Boolean,
@@ -33,7 +32,7 @@ from app.db.models.base import Base
 
 def _utcnow() -> datetime:
     """Return the current UTC time — usable as a Python-side column default."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class SourceDatabase(Base):
@@ -109,7 +108,7 @@ class Session(Base):
     source_database_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("source_databases.id"), nullable=False
     )
-    external_session_id: Mapped[Optional[str]] = mapped_column(
+    external_session_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     first_message_at: Mapped[datetime] = mapped_column(
@@ -134,13 +133,13 @@ class Session(Base):
     total_cache_write_tokens: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False
     )
-    total_estimated_cost_usd: Mapped[Optional[Decimal]] = mapped_column(
+    total_estimated_cost_usd: Mapped[Decimal | None] = mapped_column(
         Numeric, nullable=True
     )
-    project_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    workspace_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    parent_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    workspace_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent: Mapped[str | None] = mapped_column(String, nullable=True)
+    parent_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class OpenCodeUsageRecord(Base):
@@ -170,7 +169,7 @@ class OpenCodeUsageRecord(Base):
         ForeignKey("source_databases.id"), nullable=False
     )
     source_record_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("sessions.id"), nullable=True
     )
     model_id: Mapped[uuid.UUID] = mapped_column(
@@ -179,7 +178,7 @@ class OpenCodeUsageRecord(Base):
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
     cached_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    estimated_cost_usd: Mapped[Optional[Decimal]] = mapped_column(
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(
         Numeric, nullable=True
     )
     reported_at: Mapped[datetime] = mapped_column(
@@ -188,16 +187,16 @@ class OpenCodeUsageRecord(Base):
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    mode: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    finish_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    reasoning_tokens: Mapped[Optional[int]] = mapped_column(
+    provider: Mapped[str | None] = mapped_column(String, nullable=True)
+    mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    finish_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=0
     )
-    cache_read_tokens: Mapped[Optional[int]] = mapped_column(
+    cache_read_tokens: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=0
     )
-    cache_write_tokens: Mapped[Optional[int]] = mapped_column(
+    cache_write_tokens: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=0
     )
 
@@ -216,10 +215,10 @@ class IngestBatch(Base):
     client_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("opencode_clients.id"), nullable=False
     )
-    collector_version: Mapped[Optional[str]] = mapped_column(
+    collector_version: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    schema_version: Mapped[Optional[str]] = mapped_column(
+    schema_version: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     record_count: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -243,7 +242,7 @@ class IngestAudit(Base):
     )
     record_index: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
-    reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

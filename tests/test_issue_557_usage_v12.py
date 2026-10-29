@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -51,7 +51,7 @@ def _row(data: dict) -> MagicMock:
 
 def _future_sunset_settings(days: int = 45) -> Settings:
     return Settings(
-        active_tokens_deprecation_sunset=datetime.now(timezone.utc)
+        active_tokens_deprecation_sunset=datetime.now(UTC)
         + timedelta(days=days)
     )
 
@@ -65,19 +65,19 @@ class TestActiveTokensDeprecationWindow:
     """The Deprecation header is emitted only inside the 90-day window."""
 
     def test_header_emitted_within_window(self):
-        sunset = datetime.now(timezone.utc) + timedelta(days=45)
+        sunset = datetime.now(UTC) + timedelta(days=45)
         value = _deprecation_header_value(sunset)
         assert value == "active_tokens; sunset=" + sunset.isoformat()
 
     def test_header_omitted_after_sunset(self):
-        past = datetime.now(timezone.utc) - timedelta(days=1)
+        past = datetime.now(UTC) - timedelta(days=1)
         assert _deprecation_header_value(past) is None
 
     def test_header_omitted_when_sunset_unset(self):
         assert _deprecation_header_value(None) is None
 
     def test_header_omitted_exactly_at_sunset(self):
-        sunset = datetime.now(timezone.utc)
+        sunset = datetime.now(UTC)
         assert _deprecation_header_value(sunset) is None
 
 
@@ -153,8 +153,8 @@ class TestSessionSummaryV12Fields:
                 "id": uuid.uuid4(),
                 "client_id": _CLIENT_ID,
                 "source_database_id": _SOURCE_DB_ID,
-                "first_message_at": datetime(2025, 7, 1, tzinfo=timezone.utc),
-                "last_message_at": datetime(2025, 7, 16, tzinfo=timezone.utc),
+                "first_message_at": datetime(2025, 7, 1, tzinfo=UTC),
+                "last_message_at": datetime(2025, 7, 16, tzinfo=UTC),
                 "message_count": 5,
                 "total_input_tokens": 500,
                 "total_output_tokens": 250,
@@ -343,7 +343,7 @@ class TestIngestProviderNormalization:
                     "cached_tokens": 0,
                     "estimated_cost_usd": "0.0035",
                     "reported_at": datetime(
-                        2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc
+                        2025, 7, 16, 12, 0, 0, tzinfo=UTC
                     ).isoformat(),
                     "provider": "",
                 },
@@ -405,7 +405,7 @@ class TestIngestProviderNormalization:
                     "cached_tokens": 0,
                     "estimated_cost_usd": "0.0035",
                     "reported_at": datetime(
-                        2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc
+                        2025, 7, 16, 12, 0, 0, tzinfo=UTC
                     ).isoformat(),
                     "provider": "openai",
                 },
@@ -458,7 +458,7 @@ def _mk_agent_run_v12_row() -> MagicMock:
             "total_cache_read_tokens": 10,
             "total_cache_write_tokens": 5,
             "total_estimated_cost_usd": Decimal("0.0175"),
-            "last_message_at": datetime(2025, 7, 16, tzinfo=timezone.utc),
+            "last_message_at": datetime(2025, 7, 16, tzinfo=UTC),
             "_status": "completed",
             "child_run_count": 0,
             "session_title": None,
@@ -505,8 +505,8 @@ class TestAgentRunV12Fields:
             "client_id": _CLIENT_ID,
             "source_database_id": _SOURCE_DB_ID,
             "external_session_id": "ses_abc123",
-            "first_message_at": datetime(2025, 7, 1, tzinfo=timezone.utc),
-            "last_message_at": datetime(2025, 7, 16, tzinfo=timezone.utc),
+            "first_message_at": datetime(2025, 7, 1, tzinfo=UTC),
+            "last_message_at": datetime(2025, 7, 16, tzinfo=UTC),
             "message_count": 5,
             "total_input_tokens": 500,
             "total_output_tokens": 250,

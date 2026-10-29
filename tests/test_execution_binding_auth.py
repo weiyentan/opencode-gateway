@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -594,7 +594,7 @@ class TestRecoveryCheckpointAuth:
                 "afk_run_id": "01JZABCDEFGHJKLMNPQRSTVWXY",
                 "ref": "ai/recovery/x",
                 "commit_sha": "a" * 40,
-                "created_at": datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc),
+                "created_at": datetime(2026, 10, 3, 12, 0, tzinfo=UTC),
             }
         )
         conn.fetch = AsyncMock(return_value=[checkpoint_row])

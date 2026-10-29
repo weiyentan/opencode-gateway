@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,9 +29,9 @@ _CLIENT_ID = uuid.uuid4()
 _SOURCE_DB_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
 
-_A_TS = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
-_B_TS = datetime(2025, 7, 16, 14, 0, 0, tzinfo=timezone.utc)
-_C_TS = datetime(2025, 7, 17, 8, 0, 0, tzinfo=timezone.utc)
+_A_TS = datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
+_B_TS = datetime(2025, 7, 16, 14, 0, 0, tzinfo=UTC)
+_C_TS = datetime(2025, 7, 17, 8, 0, 0, tzinfo=UTC)
 
 
 def _mk_record_row(

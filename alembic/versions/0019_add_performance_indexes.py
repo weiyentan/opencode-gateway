@@ -25,16 +25,15 @@ and context-join read paths and are retained. See ADR 0017 for the
 before/after plans and latencies.
 """
 
-from typing import Union
 from collections.abc import Sequence
 
 from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "0019"
-down_revision: Union[str, None] = "0018"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "0018"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 _INDEXES: tuple[tuple[str, str, tuple[str, ...]], ...] = (

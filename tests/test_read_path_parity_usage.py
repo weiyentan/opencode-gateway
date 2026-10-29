@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -35,9 +35,9 @@ from tests.test_usage import (
 
 _CLIENT_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
-_T0 = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
-_T1 = datetime(2025, 7, 16, 13, 0, 0, tzinfo=timezone.utc)
-_T2 = datetime(2025, 7, 16, 14, 0, 0, tzinfo=timezone.utc)
+_T0 = datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
+_T1 = datetime(2025, 7, 16, 13, 0, 0, tzinfo=UTC)
+_T2 = datetime(2025, 7, 16, 14, 0, 0, tzinfo=UTC)
 
 _RANGE = {
     "start_date": "2025-07-01T00:00:00Z",

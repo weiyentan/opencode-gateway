@@ -32,7 +32,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 import asyncpg
 
@@ -262,7 +262,7 @@ async def _backfill_record(
 
     # ── Insert canonical event ────────────────────────────────────
     event_id = _uuid.uuid4()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     effective_cached = _effective_cached_tokens(
         row["cached_tokens"], row["cache_read_tokens"], row["cache_write_tokens"],

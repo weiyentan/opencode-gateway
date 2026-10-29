@@ -28,7 +28,7 @@ Protocol reference: ``docs/adr/0017-migration-0019-index-measurement.md``.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 from decimal import Decimal
 from typing import Any
 from collections.abc import Iterable, Mapping
@@ -37,7 +37,7 @@ import pytest
 
 from app.core.reconciliation import ROLLUP_FIELDS, compute_delta
 
-_T0 = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+_T0 = datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 _CLIENT_A = "client-a"
 _PROJECT_1 = "proj-1"
@@ -50,7 +50,7 @@ _PROJECT_1 = "proj-1"
 
 def _day(reported_at: datetime) -> date:
     """UTC day bucket, matching the rollup ``day`` key derivation."""
-    return reported_at.astimezone(timezone.utc).date()
+    return reported_at.astimezone(UTC).date()
 
 
 def _key(row: Mapping[str, Any]) -> tuple[str, str, date]:

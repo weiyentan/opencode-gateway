@@ -23,7 +23,7 @@ auth, and the query-builder/mapper layer.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -440,8 +440,8 @@ class TestChangeRequestSummaryQueries:
         build = self._builder()
         _, data_sql, _ = build(
             None, None, None,
-            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
-            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
         )
         # The optional activity window is a display/filter concern and keeps
         # filtering on the combined latest_activity_at, unchanged.
@@ -577,8 +577,8 @@ class TestChangeRequestSummaryPageScopedCost:
             "github",
             "acme/proj",
             "merged",
-            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
-            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
         )
         # Identity filters push down to the grouped aggregation (pre-filter).
         assert "i.provider = $1" in data_sql
@@ -596,8 +596,8 @@ class TestChangeRequestSummaryPageScopedCost:
             "github",
             "acme/proj",
             "merged",
-            datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
-            datetime(2026, 8, 2, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 8, 2, 0, 0, 0, tzinfo=UTC),
         ]
 
     @pytest.mark.asyncio

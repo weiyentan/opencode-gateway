@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from decimal import Decimal
 from pathlib import Path
 
@@ -181,7 +181,7 @@ async def _seed_session(
         client_id,
         source_database_id,
         external_session_id,
-        datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC),
     )
 
 
@@ -227,7 +227,7 @@ async def _seed_usage_event(
 ) -> None:
     """Insert one usage_events row."""
     if reported_at is None:
-        reported_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        reported_at = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
     source_record_id = f"golden-usage-{uuid.uuid4().hex[:8]}"
     await conn.execute(
         """INSERT INTO usage_events
@@ -267,8 +267,8 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
     - Sessions: one unambiguous (run A only), one ambiguous (runs A + B)
     - Usage events only for the unambiguous session (ambiguous excluded)
     """
-    now = datetime(2026, 1, 15, 8, 0, 0, tzinfo=timezone.utc)
-    day2_now = datetime(2026, 1, 16, 8, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 15, 8, 0, 0, tzinfo=UTC)
+    day2_now = datetime(2026, 1, 16, 8, 0, 0, tzinfo=UTC)
 
     # ── 1. AFK runs ──────────────────────────────────────────────
     # Day 1: runs A and B; Day 2: run C
@@ -337,7 +337,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
 
     # ── 3. Execution bindings ────────────────────────────────────
     # Day 1: 2 completed, 1 failed
-    day1_started = datetime(2026, 1, 15, 9, 0, 0, tzinfo=timezone.utc)
+    day1_started = datetime(2026, 1, 15, 9, 0, 0, tzinfo=UTC)
     for i, outcome in enumerate(["completed", "completed", "failed"]):
         await conn.execute(
             """INSERT INTO execution_bindings
@@ -348,7 +348,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
         )
 
     # Day 2: 1 cancelled
-    day2_started = datetime(2026, 1, 16, 9, 0, 0, tzinfo=timezone.utc)
+    day2_started = datetime(2026, 1, 16, 9, 0, 0, tzinfo=UTC)
     await conn.execute(
         """INSERT INTO execution_bindings
            (afk_run_id, awx_job_id, job_template_id, provider, repository_url, outcome,
@@ -379,7 +379,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
            VALUES ($1, $2, $3, $4, $4)
            ON CONFLICT DO NOTHING""",
         _RUN_A, internal_ses_unambiguous, _EXT_SES_UNAMBIGUOUS,
-        datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC),
     )
 
     # Ambiguous session: linked to BOTH run A and run B
@@ -390,7 +390,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
            VALUES ($1, $2, $3, $4, $4)
            ON CONFLICT DO NOTHING""",
         _RUN_A, internal_ses_ambiguous, _EXT_SES_AMBIGUOUS,
-        datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC),
     )
     # Second link (to run B) — same external_session_id but different afk_run_id
     await conn.execute(
@@ -399,7 +399,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
            VALUES ($1, $2, $3, $4, $4)
            ON CONFLICT DO NOTHING""",
         _RUN_B, internal_ses_ambiguous, f"{_EXT_SES_AMBIGUOUS}-runB",
-        datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 1, 15, 10, 0, 0, tzinfo=UTC),
     )
 
     # ── 6. Usage events (only for unambiguous session) ───────────
@@ -414,7 +414,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
         cache_read_tokens=200,
         cache_write_tokens=50,
         estimated_cost_usd=Decimal("0.15"),
-        reported_at=datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc),
+        reported_at=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
     )
 
     # Usage for the ambiguous session — should be EXCLUDED from rollup
@@ -429,7 +429,7 @@ async def _seed_golden_dataset(conn: asyncpg.Connection) -> None:
         cache_read_tokens=9999,
         cache_write_tokens=9999,
         estimated_cost_usd=Decimal("99.99"),
-        reported_at=datetime(2026, 1, 15, 14, 0, 0, tzinfo=timezone.utc),
+        reported_at=datetime(2026, 1, 15, 14, 0, 0, tzinfo=UTC),
     )
 
 

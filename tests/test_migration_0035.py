@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -148,7 +148,7 @@ def test_downgrade_drops_provenance_columns() -> None:
 @pytest.mark.parametrize(
     "occurred_at",
     [
-        datetime(2026, 8, 1, 10, 30, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC),
         datetime(2026, 8, 1, 16, 0, 0, tzinfo=PLUS_05_30),
         datetime(2026, 8, 1, 10, 30, 0),
     ],

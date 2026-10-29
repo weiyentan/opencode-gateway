@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -32,7 +32,7 @@ _CREDENTIAL_ID = uuid.uuid4()
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _auth_row(

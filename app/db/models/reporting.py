@@ -35,8 +35,7 @@ on migration 0031):
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, UTC
 
 from sqlalchemy import DateTime, String, UniqueConstraint
 from sqlalchemy import text as sa_text
@@ -48,7 +47,7 @@ from app.db.models.base import Base
 
 def _utcnow() -> datetime:
     """Return the current UTC time — usable as a Python-side column default."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class ReportingDelivery(Base):
@@ -80,7 +79,7 @@ class ReportingDelivery(Base):
     provider: Mapped[str] = mapped_column(String, nullable=False)
     delivery_id: Mapped[str] = mapped_column(String, nullable=False)
     event_type: Mapped[str] = mapped_column(String, nullable=False)
-    client_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    client_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
     received_at: Mapped[datetime] = mapped_column(
@@ -149,7 +148,7 @@ class DeliveryStateTrail(Base):
         server_default=sa_text("now()"),
         nullable=False,
     )
-    detail: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,

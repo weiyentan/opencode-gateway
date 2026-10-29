@@ -22,8 +22,7 @@ Retention tiers (issue #483, ADR 0022 — configurable via ``GATEWAY_RETENTION_*
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date, datetime, UTC
 
 from sqlalchemy import (
     BigInteger,
@@ -46,7 +45,7 @@ from app.db.models.base import Base
 
 def _utcnow() -> datetime:
     """Return the current UTC time — usable as a Python-side column default."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class AFKRun(Base):
@@ -107,15 +106,15 @@ class AFKRun(Base):
 
     afk_run_id: Mapped[str] = mapped_column(String(26), primary_key=True)
     provider: Mapped[str] = mapped_column(String, nullable=False)
-    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    started_at: Mapped[Optional[datetime]] = mapped_column(
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    finished_at: Mapped[Optional[datetime]] = mapped_column(
+    finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    outcome_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    outcome: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    outcome_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    outcome: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -124,27 +123,27 @@ class AFKRun(Base):
     )
 
     # ── Provisional lifecycle columns (migration 0039) — all nullable ──
-    host: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    source_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    repository: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    trigger_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    change_request_provider: Mapped[Optional[str]] = mapped_column(
+    host: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    repository: Mapped[str | None] = mapped_column(String, nullable=True)
+    trigger_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    change_request_provider: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    change_request_repository: Mapped[Optional[str]] = mapped_column(
+    change_request_repository: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    change_request_external_id: Mapped[Optional[str]] = mapped_column(
+    change_request_external_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    recovered_from_afk_run_id: Mapped[Optional[str]] = mapped_column(
+    recovered_from_afk_run_id: Mapped[str | None] = mapped_column(
         String(26),
         ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
         nullable=True,
     )
 
     # ── Batch provenance (migration 0040, issue #595) — nullable ──
-    first_delivery_id: Mapped[Optional[str]] = mapped_column(
+    first_delivery_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
 
@@ -176,16 +175,16 @@ class AFKRunSessionLink(Base):
         ForeignKey("afk_runs.afk_run_id", ondelete="CASCADE"),
         nullable=False,
     )
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
-    external_session_id: Mapped[Optional[str]] = mapped_column(
+    external_session_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    started_at: Mapped[Optional[datetime]] = mapped_column(
+    started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    finished_at: Mapped[Optional[datetime]] = mapped_column(
+    finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -274,11 +273,11 @@ class AFKRunEntityLink(Base):
     repository: Mapped[str] = mapped_column(String, nullable=False)
     entity_type: Mapped[str] = mapped_column(String, nullable=False)
     external_id: Mapped[str] = mapped_column(String, nullable=False)
-    owning_change_request_id: Mapped[Optional[str]] = mapped_column(
+    owning_change_request_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     role: Mapped[str] = mapped_column(String, nullable=False)
-    correlation_method: Mapped[Optional[str]] = mapped_column(
+    correlation_method: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     correlation_source: Mapped[str] = mapped_column(
@@ -288,8 +287,8 @@ class AFKRunEntityLink(Base):
         Float, nullable=False
     )
     evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    superseded_at: Mapped[Optional[datetime]] = mapped_column(
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -348,16 +347,16 @@ class EngineeringEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
-    provider_event_id: Mapped[Optional[str]] = mapped_column(
+    provider_event_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    actor: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     observation_key: Mapped[str] = mapped_column(String, nullable=False)
     observed_via: Mapped[str] = mapped_column(
         String, nullable=False, server_default=text("'webhook'")
     )
-    snapshot_at: Mapped[Optional[datetime]] = mapped_column(
+    snapshot_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_ingested_at: Mapped[datetime] = mapped_column(
@@ -390,12 +389,12 @@ class DeliveryLog(Base):
     )
     provider: Mapped[str] = mapped_column(String, nullable=False)
     delivery_id: Mapped[str] = mapped_column(String, nullable=False)
-    afk_run_id: Mapped[Optional[str]] = mapped_column(
+    afk_run_id: Mapped[str | None] = mapped_column(
         String(26),
         ForeignKey("afk_runs.afk_run_id"),
         nullable=True,
     )
-    status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    status: Mapped[str | None] = mapped_column(String, nullable=True)
     delivered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -447,13 +446,13 @@ class UnresolvedCorrelation(Base):
     external_id: Mapped[str] = mapped_column(String, nullable=False)
     afk_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
     method: Mapped[str] = mapped_column(String, nullable=False)
-    reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
     correlation_confidence: Mapped[float] = mapped_column(
         Float, nullable=False
     )
     candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -497,7 +496,7 @@ class ResourceSessionAssociation(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -508,7 +507,7 @@ class ResourceSessionAssociation(Base):
     source_reference: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list
     )
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -551,36 +550,36 @@ class ExecutionBinding(Base):
     )
     awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     job_template_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    external_session_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    external_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     # Normalized session attribution collection (issue #627, migration 0042):
     # every external OpenCode session id attributed to the execution,
     # deduplicated with the first entry as the primary session.  Nullable —
     # historical / run-level-only bindings carry no collection.
-    external_session_ids: Mapped[Optional[list]] = mapped_column(
+    external_session_ids: Mapped[list | None] = mapped_column(
         JSONB, nullable=True
     )
-    provider: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    repository_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    entity_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    entity_number: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    source_event_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    branch: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    failure_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    failure_summary: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String, nullable=True)
+    repository_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    entity_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    entity_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    branch: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    failure_summary: Mapped[str | None] = mapped_column(String, nullable=True)
     # FK to the AFK run this binding produced (issue #582).
-    afk_run_id: Mapped[Optional[str]] = mapped_column(
+    afk_run_id: Mapped[str | None] = mapped_column(
         String(26),
         ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
         nullable=True,
     )
     # Trigger origin (issue #582) — nullable, populated by a later slice.
-    trigger_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    started_at: Mapped[Optional[datetime]] = mapped_column(
+    trigger_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    finished_at: Mapped[Optional[datetime]] = mapped_column(
+    finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -627,7 +626,7 @@ class RecoveryCheckpoint(Base):
         ForeignKey("execution_bindings.awx_job_id", ondelete="CASCADE"),
         nullable=False,
     )
-    afk_run_id: Mapped[Optional[str]] = mapped_column(
+    afk_run_id: Mapped[str | None] = mapped_column(
         String(26),
         ForeignKey("afk_runs.afk_run_id", ondelete="SET NULL"),
         nullable=True,
@@ -683,10 +682,10 @@ class ClosureLink(Base):
     issue_external_id: Mapped[str] = mapped_column(String, nullable=False)
     kind: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
-    revoked_at: Mapped[Optional[datetime]] = mapped_column(
+    revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
     derived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -723,27 +722,27 @@ class ClosureEpisode(Base):
     issue_provider: Mapped[str] = mapped_column(String, nullable=False)
     issue_repository: Mapped[str] = mapped_column(String, nullable=False)
     issue_external_id: Mapped[str] = mapped_column(String, nullable=False)
-    opened_at: Mapped[Optional[datetime]] = mapped_column(
+    opened_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    closed_at: Mapped[Optional[datetime]] = mapped_column(
+    closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     status: Mapped[str] = mapped_column(String, nullable=False)
-    change_request_provider: Mapped[Optional[str]] = mapped_column(
+    change_request_provider: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    change_request_repository: Mapped[Optional[str]] = mapped_column(
+    change_request_repository: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    change_request_external_id: Mapped[Optional[str]] = mapped_column(
+    change_request_external_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
     derived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    superseded_at: Mapped[Optional[datetime]] = mapped_column(
+    superseded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -792,7 +791,7 @@ class ClosureUnresolved(Base):
     )
     reason: Mapped[str] = mapped_column(String, nullable=False)
     candidates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    resolver_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resolver_version: Mapped[str | None] = mapped_column(String, nullable=True)
     derived_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -826,7 +825,7 @@ class ExecutionOutcomeCorrection(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    execution_binding_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    execution_binding_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("execution_bindings.id", ondelete="SET NULL"),
         nullable=True,
@@ -834,10 +833,10 @@ class ExecutionOutcomeCorrection(Base):
     awx_job_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     previous_outcome: Mapped[str] = mapped_column(String, nullable=False)
     new_outcome: Mapped[str] = mapped_column(String, nullable=False)
-    previous_failure_reason: Mapped[Optional[str]] = mapped_column(
+    previous_failure_reason: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    previous_failure_summary: Mapped[Optional[str]] = mapped_column(
+    previous_failure_summary: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     reason: Mapped[str] = mapped_column(String(1000), nullable=False)

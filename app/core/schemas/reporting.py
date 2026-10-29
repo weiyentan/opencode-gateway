@@ -15,7 +15,7 @@ missing/invalid collector tokens (401) fail the whole request.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -48,7 +48,7 @@ class ReportingDeliveryIn(BaseModel):
     def _require_aware(cls, v: datetime) -> datetime:
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("occurred_at must include a timezone offset")
-        return v.astimezone(timezone.utc)
+        return v.astimezone(UTC)
 
 
 class ReportingIngestRequest(BaseModel):

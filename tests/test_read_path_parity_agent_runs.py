@@ -26,7 +26,7 @@ Protocol reference: ``docs/adr/0017-migration-0019-index-measurement.md``.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,7 +43,7 @@ from tests.test_agent_runs import (
 _CLIENT_ID = uuid.uuid4()
 _SOURCE_DB_ID = uuid.uuid4()
 _SESSION_ID = uuid.uuid4()
-_NOW = datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 # ══════════════════════════════════════════════════════════════════════════
