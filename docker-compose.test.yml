@@ -9,19 +9,19 @@
 
 services:
   postgres-test:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: opencode-gateway-test-db
     environment:
-      POSTGRES_DB: opencode_gateway_test
-      POSTGRES_USER: opencode_test
-      POSTGRES_PASSWORD: opencode_test
+      POSTGRES_DB: opencode_gateway_disposable_test
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
     ports:
       - "5433:5432"
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U opencode_test -d opencode_gateway_test",
+          "pg_isready -U test -d opencode_gateway_disposable_test",
         ]
       interval: 5s
       timeout: 3s

@@ -1,7 +1,7 @@
 """Integration tests for the live AFK outcome consumer (issue #451).
 
-Runs against the docker-compose Postgres (port 5433) and verifies the
-database-enforced guarantees of the consumer's write path:
+Runs against the dedicated disposable PostgreSQL 16 service (port 5433) and
+verifies the database-enforced guarantees of the consumer's write path:
 
 * ``record_event`` redelivery is absorbed by ``delivery_log`` UNIQUE and the
   ``engineering_events`` identity UNIQUE (no duplicate rows);
@@ -9,22 +9,38 @@ database-enforced guarantees of the consumer's write path:
   reusing the backfill engine converges a merged terminal outcome for a run
   even when no merge event was delivered on the topic.
 
+No Kafka broker and no external provider API is contacted: Kafka commit/produce
+seams are mocked and GitHub payloads come from ``FakeGitHubApi``.
+
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as the
+dedicated disposable PostgreSQL 16 service.  Start one outside Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
+        -p 5433:5432 postgres:16-alpine
+
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_afk_consumer.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+A missing attestation, a mismatched DSN, an unreachable server, a
+non-test database name, a Kubernetes target, or a non-PostgreSQL-16 server
+fails closed instead of skipping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -46,15 +62,17 @@ from app.consumer.afk_consumer import (
     map_normalized_event,
     map_provider_event,
 )
+from tests.integration._disposable_postgres import (
+    DatabaseTarget,
+    verify_disposable_target,
+)
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
 _ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
 
-_DEFAULT_HOST = os.environ.get("GATEWAY_DATABASE_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
-_DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
-_DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
-_DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
+# Resolved once at import (never connects); the safety preflight in
+# ``_verified_disposable_database`` verifies it before any destructive step.
+_TARGET = DatabaseTarget.from_env()
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 REPOSITORY = "weiyentan/opencode-gateway"
@@ -62,38 +80,59 @@ NORMALIZED_REPOSITORY = "github.com/weiyentan/opencode-gateway"
 
 
 def _dsn() -> str:
-    return (
-        f"postgresql://{_DEFAULT_USER}:{_DEFAULT_PASSWORD}"
-        f"@{_DEFAULT_HOST}:{_DEFAULT_PORT}/{_DEFAULT_DB}"
-    )
+    return _TARGET.dsn()
 
 
-async def _can_connect() -> bool:
+_DROP_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
+    "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+# Clear every data table but preserve the migration bookkeeping so each test
+# starts from a clean slate without re-running migrations.
+_TRUNCATE_ALL_SQL = (
+    "DO $$ DECLARE r RECORD; BEGIN "
+    "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public' "
+    "AND tablename <> 'alembic_version') LOOP "
+    "EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE'; "
+    "END LOOP; END $$;"
+)
+
+
+async def _drop_all_tables() -> None:
+    """Drop every public table — the retry path for a corrupt schema state."""
+    conn = await asyncpg.connect(dsn=_dsn(), timeout=5)
     try:
-        conn = await asyncio.wait_for(
-            asyncpg.connect(dsn=_dsn(), timeout=5), timeout=10.0
-        )
+        await conn.execute(_DROP_ALL_SQL)
+    finally:
         await conn.close()
-        return True
-    except Exception:
-        return False
 
 
 @pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
-        pytest.skip(
-            "Test Postgres database not available.  Start it with:\n"
-            "  docker compose -f docker-compose.test.yml up -d"
-        )
-    return True
+def _verified_disposable_database() -> DatabaseTarget:
+    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
+
+    Runs before ``_migrated_schema`` (and therefore before the destructive
+    migration reset).  A missing attestation, unapproved/mismatched DSN,
+    unreachable server, non-test database name, Kubernetes target, or wrong
+    server version raises an error — never a skip, so CI cannot go green on
+    an unverified or skipped target.
+    """
+    return asyncio.run(verify_disposable_target(_TARGET))
 
 
 @pytest.fixture(scope="module")
-async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
-    assert pool is not None
+def _migrated_schema(_verified_disposable_database: DatabaseTarget) -> None:
+    """Migrate the disposable database to ``head`` once per module.
 
+    Deliberately synchronous: alembic's ``env.py`` calls ``asyncio.run``,
+    which cannot run inside the pytest-asyncio event loop.  A first attempt
+    that fails (e.g. leftover partial tables) drops every public table and
+    retries from scratch; the drop only runs after the target was verified as
+    disposable.
+    """
     import alembic.command
     import alembic.config
 
@@ -104,24 +143,30 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     try:
         alembic.command.upgrade(alembic_cfg, "head")
     except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
+        asyncio.run(_drop_all_tables())
         alembic.command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture
+async def db_pool(_migrated_schema: None) -> AsyncIterator[asyncpg.Pool]:
+    """Function-scoped pool on the migrated disposable database.
+
+    pytest-asyncio runs each async test in a fresh event loop and an asyncpg
+    pool is bound to the loop that created it, so the pool cannot be shared
+    across tests.  Every test starts and finishes with an empty schema (the
+    migration version row is preserved) so global row-count assertions stay
+    deterministic.
+    """
+    pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
+    assert pool is not None
+
+    async with pool.acquire() as conn:
+        await conn.execute(_TRUNCATE_ALL_SQL)
 
     yield pool
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
-        )
+        await conn.execute(_TRUNCATE_ALL_SQL)
     await pool.close()
 
 
@@ -250,16 +295,24 @@ async def test_normalized_bridge_persists_canonical_change_request(db_pool: asyn
     message = NormalizedProviderEvent.model_validate(
         {
             "schema_version": "1.0",
+            "event_type": "normalized",
             "provider": "github",
             "delivery_id": "delivery-normalized-bridge",
-            "resource_type": "pull_request",
-            "resource_id": "441",
-            "repository": REPOSITORY,
+            "resource": {
+                "type": "pull_request",
+                "repository_url": f"https://github.com/{REPOSITORY}",
+                "number": 441,
+            },
             "action": "merged",
             "occurred_at": _iso(merged_at),
             "ingested_at": _iso(now),
             "actor": "carol",
-            "payload_ref": "redacted-payload-ref-441",
+            "redacted_payload": {
+                "reference": {
+                    "provider": "github",
+                    "delivery_id": "delivery-normalized-bridge",
+                }
+            },
         }
     )
     mapped = map_normalized_event(message)
@@ -285,10 +338,10 @@ async def test_normalized_bridge_persists_canonical_change_request(db_pool: asyn
             f"expected canonical change_request entity_type, got {entity_type!r}"
         )
         payload_ref = await conn.fetchval(
-            "SELECT payload->>'payload_ref' FROM engineering_events "
+            "SELECT payload->'payload_ref'->>'delivery_id' FROM engineering_events "
             "WHERE event_type = 'change_request.merged' AND external_id = '441'"
         )
-        assert payload_ref == "redacted-payload-ref-441"
+        assert payload_ref == "delivery-normalized-bridge"
 
 
 @pytest.mark.integration
@@ -430,7 +483,10 @@ async def test_cross_path_event_dedup_when_occurred_at_agrees(db_pool: asyncpg.P
 
     # Backfill path: the adapter derives the same merge event with the same
     # occurred_at (the pull's merged_at equals the live delivery timestamp).
+    # The fixture carries the normalized repository identity the live bridge
+    # records so the timestamp is the only variable under test.
     payloads = _merged_payloads(now)
+    payloads["repository"] = NORMALIZED_REPOSITORY
     payloads["pulls"][0]["merged_at"] = _iso(merged_at)
     consumer = AFKOutcomeConsumer(
         kafka_brokers="broker:9092",
@@ -503,6 +559,7 @@ async def test_cross_path_event_distinct_when_occurred_at_differs(db_pool: async
         )
 
     payloads = _merged_payloads(now)
+    payloads["repository"] = NORMALIZED_REPOSITORY
     payloads["pulls"][0]["merged_at"] = _iso(backfill_at)
     consumer = AFKOutcomeConsumer(
         kafka_brokers="broker:9092",
@@ -783,7 +840,11 @@ async def test_normalized_edited_persists_as_canonical_updated(db_pool: asyncpg.
         assert row["entity_type"] == "change_request"
         assert row["event_type"] == "change_request.updated"
         assert row["external_id"] == "500"
+        # asyncpg returns ``jsonb`` as text unless the pool installs a codec;
+        # some pools return an already-decoded dict.
         payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
         assert payload.get("source_resource_type") == "pull_request"
         assert payload.get("source_action") == "edited"
         assert payload.get("payload_ref") == {
