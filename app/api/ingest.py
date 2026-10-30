@@ -14,12 +14,7 @@ import logging
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import TypedDict, cast
-
-try:
-    from typing import NotRequired  # type: ignore[attr-defined]
-except ImportError:
-    from typing_extensions import NotRequired  # type: ignore[import-not-found]
+from typing import Any, NotRequired, TypedDict, cast
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -132,7 +127,7 @@ class SessionContextPayload(BaseModel):
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
     source_started_at_tz: datetime | None = Field(default=None, description="Source started-at with timezone")
     source_completed_at_tz: datetime | None = Field(default=None, description="Source completed-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class ProjectPayload(BaseModel):
@@ -142,18 +137,18 @@ class ProjectPayload(BaseModel):
     source_project_id: uuid.UUID | None = Field(default=None, description="Source system's own project UUID")
     worktree: str | None = Field(default=None, description="Worktree identifier")
     vcs: str | None = Field(default=None, description="VCS type")
-    sandboxes: dict | None = Field(default=None, description="Sandbox configuration")
+    sandboxes: dict[str, Any] | None = Field(default=None, description="Sandbox configuration")
     name: str | None = Field(default=None, description="Project name")
     display_name: str | None = Field(default=None, description="Project display name")
     icon: str | None = Field(default=None, description="Project icon")
     icon_color: str | None = Field(default=None, description="Project icon color")
     raw_commands: str | None = Field(default=None, description="Raw commands string")
-    parsed_commands: dict | None = Field(default=None, description="Parsed commands dict")
+    parsed_commands: dict[str, Any] | None = Field(default=None, description="Parsed commands dict")
     source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class ProjectDirectoryPayload(BaseModel):
@@ -175,7 +170,7 @@ class ProjectDirectoryPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class SessionTodoPayload(BaseModel):
@@ -191,7 +186,7 @@ class SessionTodoPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class MessagePayload(BaseModel):
@@ -212,7 +207,7 @@ class MessagePayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    data: dict | None = Field(default=None, description="Verbatim message payload (redacted at ingest)")
+    data: dict[str, Any] | None = Field(default=None, description="Verbatim message payload (redacted at ingest)")
 
 
 class PartPayload(BaseModel):
@@ -226,7 +221,7 @@ class PartPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    data: dict | None = Field(default=None, description="Verbatim part payload (redacted at ingest)")
+    data: dict[str, Any] | None = Field(default=None, description="Verbatim part payload (redacted at ingest)")
 
 
 class IngestRequest(BaseModel):
@@ -524,7 +519,7 @@ async def _apply_replay_merge(
 
         # ── Build COALESCE SET clauses for fillable columns ───────────
         set_clauses: list[str] = []
-        params: list = []
+        params: list[Any] = []
         param_idx = 1
         for field_name, incoming in fillable_columns.items():
             set_clauses.append(f"{field_name} = COALESCE({field_name}, ${param_idx})")
@@ -1408,7 +1403,7 @@ async def _process_session_todos(
 # ── Execution transcript helpers (issue #217, ADR 0016) ─────────────────────
 
 
-def _redact_and_truncate_payload(data: dict | None, max_chars: int) -> dict | None:
+def _redact_and_truncate_payload(data: dict[str, Any] | None, max_chars: int) -> dict[str, Any] | None:
     """Redact then truncate a verbatim payload for storage in a JSONB column.
 
     Applies :func:`~app.core.secrets.redact_dict` so secret-like keys never
@@ -1467,7 +1462,7 @@ def _serialize_jsonb(value: object) -> str | None:
 
 
 def _extract_tool_call_facts(
-    data: dict | None,
+    data: dict[str, Any] | None,
 ) -> tuple[str | None, str | None, object, object]:
     """Extract ``(tool_name, tool_status, tool_input, tool_output)`` from part data.
 
