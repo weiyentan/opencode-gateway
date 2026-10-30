@@ -14,6 +14,7 @@ import logging
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from typing import Any, NotRequired, TypedDict, cast
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -126,7 +127,7 @@ class SessionContextPayload(BaseModel):
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
     source_started_at_tz: datetime | None = Field(default=None, description="Source started-at with timezone")
     source_completed_at_tz: datetime | None = Field(default=None, description="Source completed-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class ProjectPayload(BaseModel):
@@ -136,18 +137,18 @@ class ProjectPayload(BaseModel):
     source_project_id: uuid.UUID | None = Field(default=None, description="Source system's own project UUID")
     worktree: str | None = Field(default=None, description="Worktree identifier")
     vcs: str | None = Field(default=None, description="VCS type")
-    sandboxes: dict | None = Field(default=None, description="Sandbox configuration")
+    sandboxes: dict[str, Any] | None = Field(default=None, description="Sandbox configuration")
     name: str | None = Field(default=None, description="Project name")
     display_name: str | None = Field(default=None, description="Project display name")
     icon: str | None = Field(default=None, description="Project icon")
     icon_color: str | None = Field(default=None, description="Project icon color")
     raw_commands: str | None = Field(default=None, description="Raw commands string")
-    parsed_commands: dict | None = Field(default=None, description="Parsed commands dict")
+    parsed_commands: dict[str, Any] | None = Field(default=None, description="Parsed commands dict")
     source_created_at: int | None = Field(default=None, description="Source created-at millisecond timestamp")
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class ProjectDirectoryPayload(BaseModel):
@@ -169,7 +170,7 @@ class ProjectDirectoryPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class SessionTodoPayload(BaseModel):
@@ -185,7 +186,7 @@ class SessionTodoPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    source_payload: dict | None = Field(default=None, description="Redacted source payload snapshot")
+    source_payload: dict[str, Any] | None = Field(default=None, description="Redacted source payload snapshot")
 
 
 class MessagePayload(BaseModel):
@@ -206,7 +207,7 @@ class MessagePayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    data: dict | None = Field(default=None, description="Verbatim message payload (redacted at ingest)")
+    data: dict[str, Any] | None = Field(default=None, description="Verbatim message payload (redacted at ingest)")
 
 
 class PartPayload(BaseModel):
@@ -220,7 +221,7 @@ class PartPayload(BaseModel):
     source_updated_at: int | None = Field(default=None, description="Source updated-at millisecond timestamp")
     source_created_at_tz: datetime | None = Field(default=None, description="Source created-at with timezone")
     source_updated_at_tz: datetime | None = Field(default=None, description="Source updated-at with timezone")
-    data: dict | None = Field(default=None, description="Verbatim part payload (redacted at ingest)")
+    data: dict[str, Any] | None = Field(default=None, description="Verbatim part payload (redacted at ingest)")
 
 
 class IngestRequest(BaseModel):
@@ -315,6 +316,24 @@ class IngestResponse(BaseModel):
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────
+
+
+class _CanonicalEventResult(TypedDict):
+    """Typed return value of :func:`_record_canonical_event`.
+
+    The canonical-event recorder returns a mix of UUID and text values.  A
+    single ``dict[str, UUID | None]`` annotation used to describe all of
+    them, which forced text fields (``status``/``reason``) into a UUID slot
+    and made the per-record result path type-unsafe.  ``status`` and
+    ``reason`` are optional because the early "model/session row missing"
+    returns carry only the identifiers; callers already treat a missing
+    status as the record's pre-existing outcome.
+    """
+
+    event_id: uuid.UUID | None
+    attempt_id: uuid.UUID | None
+    status: NotRequired[str]
+    reason: NotRequired[str | None]
 
 
 def _utcnow() -> datetime:
@@ -500,7 +519,7 @@ async def _apply_replay_merge(
 
         # ── Build COALESCE SET clauses for fillable columns ───────────
         set_clauses: list[str] = []
-        params: list = []
+        params: list[Any] = []
         param_idx = 1
         for field_name, incoming in fillable_columns.items():
             set_clauses.append(f"{field_name} = COALESCE({field_name}, ${param_idx})")
@@ -539,9 +558,17 @@ async def _apply_replay_merge(
         cr_delta: int = 0
         cw_delta: int = 0
         if "cache_read_tokens" in fillable_columns:
-            cr_delta = int(fillable_columns["cache_read_tokens"])  # type: ignore[arg-type]
+            raw_cr = fillable_columns["cache_read_tokens"]
+            if isinstance(raw_cr, int):
+                cr_delta = raw_cr
+            elif isinstance(raw_cr, str):
+                cr_delta = int(raw_cr)
         if "cache_write_tokens" in fillable_columns:
-            cw_delta = int(fillable_columns["cache_write_tokens"])  # type: ignore[arg-type]
+            raw_cw = fillable_columns["cache_write_tokens"]
+            if isinstance(raw_cw, int):
+                cw_delta = raw_cw
+            elif isinstance(raw_cw, str):
+                cw_delta = int(raw_cw)
 
         # Apply session aggregate repair — only for positive deltas and
         # only when session_id is resolved.
@@ -634,7 +661,7 @@ async def _upsert_model(
             row["id"],
             now,
         )
-        return row["id"]
+        return cast(uuid.UUID, row["id"])
 
 
 async def _resolve_session(
@@ -709,7 +736,7 @@ async def _resolve_session(
         agent,
         parent_session_id,
     )
-    return row["id"]
+    return cast(uuid.UUID, row["id"])
 
 
 # ── Record processor ──────────────────────────────────────────────────────
@@ -1376,7 +1403,7 @@ async def _process_session_todos(
 # ── Execution transcript helpers (issue #217, ADR 0016) ─────────────────────
 
 
-def _redact_and_truncate_payload(data: dict | None, max_chars: int) -> dict | None:
+def _redact_and_truncate_payload(data: dict[str, Any] | None, max_chars: int) -> dict[str, Any] | None:
     """Redact then truncate a verbatim payload for storage in a JSONB column.
 
     Applies :func:`~app.core.secrets.redact_dict` so secret-like keys never
@@ -1435,7 +1462,7 @@ def _serialize_jsonb(value: object) -> str | None:
 
 
 def _extract_tool_call_facts(
-    data: dict | None,
+    data: dict[str, Any] | None,
 ) -> tuple[str | None, str | None, object, object]:
     """Extract ``(tool_name, tool_status, tool_input, tool_output)`` from part data.
 
@@ -1513,8 +1540,8 @@ async def _process_message(
         else _normalise_ms_to_datetime(msg.source_updated_at)
     )
 
-    data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
-    data = _serialize_jsonb(data)
+    redacted_msg_data = _redact_and_truncate_payload(msg.data, part_data_max_chars)
+    data_json: str | None = _serialize_jsonb(redacted_msg_data)
 
     new_id = uuid.uuid4()
     await conn.execute(
@@ -1578,7 +1605,7 @@ async def _process_message(
         source_created_at_tz,
         source_updated_at_tz,
         now,
-        data,
+        data_json,
     )
     return True
 
@@ -1617,8 +1644,8 @@ async def _process_part(
         else _normalise_ms_to_datetime(part.source_updated_at)
     )
 
-    data = _redact_and_truncate_payload(part.data, part_data_max_chars)
-    data = _serialize_jsonb(data)
+    redacted_part_data = _redact_and_truncate_payload(part.data, part_data_max_chars)
+    part_data_json: str | None = _serialize_jsonb(redacted_part_data)
 
     # Reuse the stored row id on replay so the tool-call row's part_id FK stays
     # valid: the observed_parts upsert does not include `id` in its SET list,
@@ -1685,7 +1712,7 @@ async def _process_part(
             source_created_at_tz,
             source_updated_at_tz,
             now,
-            data,
+            part_data_json,
         )
 
         if part.part_type == "tool" and tool_name is not None:
@@ -1764,7 +1791,7 @@ async def _process_part(
                 source_created_at_tz,
                 source_updated_at_tz,
                 now,
-                data,
+                part_data_json,
             )
         elif part.part_type == "tool" and tool_name is None:
             logger.warning(
@@ -1932,7 +1959,7 @@ async def _record_canonical_event(
     *,
     canonical_identity_id: uuid.UUID,
     cost_only: bool = False,
-) -> dict[str, uuid.UUID | None]:
+) -> _CanonicalEventResult:
     """Record a canonical event for an accepted first-delivery record.
 
     Quarantine, overlap detection, and cross-identity conflict checks
@@ -2177,9 +2204,9 @@ async def _record_canonical_event(
                     # normal replay-merge path).  A NULL incoming cost was
                     # already excluded upstream (marker never fires for NULL),
                     # so the incoming cost is authoritative.
-                    new_values = {"estimated_cost_usd": record.estimated_cost_usd}
+                    cost_only_values = {"estimated_cost_usd": record.estimated_cost_usd}
                     merge_outcome = await apply_replay_merge(
-                        conn, event_id, new_values,
+                        conn, event_id, cost_only_values,
                         client_id=client_id,
                     )
                     enrichment_filled = await _fill_canonical_text_enrichment(
@@ -2262,7 +2289,7 @@ async def _record_canonical_event(
         )
 
 
-    result: dict[str, uuid.UUID | None] = {
+    result: _CanonicalEventResult = {
         "event_id": event_id,
         "attempt_id": attempt_id,
         "status": outcome_str,
@@ -2279,7 +2306,7 @@ async def _record_canonical_event(
 async def ingest_usage(
     body: IngestRequest,
     request: Request,
-    auth: dict = Depends(require_collector_token),
+    auth: dict[str, str] = Depends(require_collector_token),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> IngestResponse:
     """Accept a batch of usage records from an authenticated collector.
