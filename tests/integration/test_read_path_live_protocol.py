@@ -45,6 +45,7 @@ import json
 import os
 import statistics
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -64,8 +65,8 @@ _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
 # Bound every statement so a pathological plan cannot pin the replica.
 _STATEMENT_TIMEOUT_MS = 30_000
 
-_START = "2025-07-01T00:00:00Z"
-_END = "2025-07-31T23:59:59Z"
+_START = datetime(2025, 7, 1, tzinfo=UTC)
+_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=UTC)
 
 # Warm-up + measured iterations, mirroring ADR 0017 ("10 warm-cache
 # executions").  More samples make p95 less sensitive to a single pause.

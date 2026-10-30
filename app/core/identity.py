@@ -100,7 +100,7 @@ async def resolve_canonical_identity(
             "INSERT INTO source_identities (client_id, collector_source_id) "
             "VALUES ($1, $2) "
             "ON CONFLICT (client_id, collector_source_id) DO NOTHING "
-            "RETURNING id",
+            "RETURNING id, canonical_parent_id",
             client_id,
             collector_source_id,
         )
