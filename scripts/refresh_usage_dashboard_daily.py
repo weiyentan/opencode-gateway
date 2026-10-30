@@ -48,20 +48,20 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import asyncpg
 
 # Allow running from any location by resolving the repo root relative to this script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.core.reporting_aggregates import (  # noqa: E402
+    AGGREGATE_LOCK_CLASS,
+)
 from app.core.usage_dashboard_daily import (  # noqa: E402
     USAGE_DASHBOARD_LOCK_CLASS,
     acquire_bucket_lock,
     recompute_bucket,
-)
-from app.core.reporting_aggregates import (  # noqa: E402
-    AGGREGATE_LOCK_CLASS,
 )
 from scripts.backfill_client_project_rollup import (  # noqa: E402
     _get_pool,
@@ -159,7 +159,7 @@ def _resolve_window(
     """
     if days < 1:
         raise ValueError(f"days must be >= 1, got {days}")
-    end_day = as_of if as_of is not None else datetime.now(timezone.utc).date()
+    end_day = as_of if as_of is not None else datetime.now(UTC).date()
     start_day = end_day - timedelta(days=days - 1)
     return start_day, end_day
 

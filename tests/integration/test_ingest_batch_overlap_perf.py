@@ -40,11 +40,12 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 
@@ -106,11 +107,11 @@ async def _can_connect() -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
-    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -118,10 +119,10 @@ def _mk_ts() -> datetime:
 # ══════════════════════════════════════════════════════════════════════════
 
 
-@pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def _integration_db_available() -> bool:
     """Module-level check: skip the entire module if the test DB is absent."""
-    if not asyncio.run(_can_connect()):
+    if not await _can_connect():
         pytest.skip(
             "Test Postgres database not available.  Start it with:\n"
             "  docker compose -f docker-compose.test.yml up -d"
@@ -129,7 +130,7 @@ def _integration_db_available() -> bool:
     return True
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     """Create a dedicated asyncpg pool, run Alembic migrations, and return it.
 
@@ -154,12 +155,22 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
         alembic.command.upgrade(alembic_cfg, "head")
+
+    def _downgrade() -> None:
+        alembic.command.downgrade(alembic_cfg, "base")
+
+    # alembic/env.py's online path drives asyncpg via ``asyncio.run``, which
+    # cannot execute inside this fixture's running event loop — run the
+    # upgrade in a worker thread where no loop is running.
+    try:
+        await asyncio.to_thread(_upgrade)
     except Exception:
         # Downgrade any lingering dirty state and retry once.
         try:
-            alembic.command.downgrade(alembic_cfg, "base")
+            await asyncio.to_thread(_downgrade)
         except Exception:
             pass
         # Drop all tables manually as a last-resort reset
@@ -170,7 +181,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.to_thread(_upgrade)
 
     yield pool
 
@@ -484,7 +495,7 @@ class TestIngestBatchOverlapPerformance:
     All tests share the module-scoped ``db_pool`` and ``_seed`` fixtures.
     """
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_100_record_batch_completes_within_request_budget(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -549,7 +560,7 @@ class TestIngestBatchOverlapPerformance:
             f"Per-record overlap scan regression suspected."
         )
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_overlapping_identity_is_quarantined_before_accounting(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -718,7 +729,7 @@ class TestIngestBatchOverlapPerformance:
                 f"got {attempt_count}"
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_mixed_valid_and_invalid_records_retain_per_record_outcomes(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):
@@ -830,7 +841,7 @@ class TestIngestBatchOverlapPerformance:
                     f"{result.get('index', '?')}"
                 )
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_batch_overlap_uses_one_query_with_production_fixture(
         self, db_pool: asyncpg.Pool, _seed: dict
     ):

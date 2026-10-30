@@ -27,13 +27,16 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+from fastapi import Request
 
 from app.core.identity import hash_token
 from app.core.reporting_aggregates import (
@@ -50,8 +53,6 @@ _DEFAULT_PORT = int(os.environ.get("GATEWAY_DATABASE_PORT", "5433"))
 _DEFAULT_DB = os.environ.get("GATEWAY_DATABASE_NAME", "opencode_gateway_test")
 _DEFAULT_USER = os.environ.get("GATEWAY_DATABASE_USER", "opencode_test")
 _DEFAULT_PASSWORD = os.environ.get("GATEWAY_DATABASE_PASSWORD", "opencode_test")
-
-UTC = timezone.utc
 
 _API_KEY = "test-api-key"
 
@@ -78,9 +79,9 @@ async def _can_connect() -> bool:
         return False
 
 
-@pytest.fixture(scope="module")
-def _integration_db_available() -> bool:
-    if not asyncio.run(_can_connect()):
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def _integration_db_available() -> bool:
+    if not await _can_connect():
         pytest.skip(
             "Test Postgres database not available.  Start it with:\n"
             "  docker compose -f docker-compose.test.yml up -d"
@@ -88,7 +89,7 @@ def _integration_db_available() -> bool:
     return True
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
@@ -100,8 +101,15 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
     alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
     alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
+
+    def _upgrade() -> None:
         alembic.command.upgrade(alembic_cfg, "head")
+
+    # alembic/env.py's online path drives asyncpg via ``asyncio.run``, which
+    # cannot execute inside this fixture's running event loop — run the
+    # upgrade in a worker thread where no loop is running.
+    try:
+        await asyncio.to_thread(_upgrade)
     except Exception:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -110,7 +118,7 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
                 "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
                 "END LOOP; END $$;"
             )
-        alembic.command.upgrade(alembic_cfg, "head")
+        await asyncio.to_thread(_upgrade)
 
     yield pool
 
@@ -128,10 +136,13 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
 
 
 def _resource(*, repository_url: str, resource_type: str, resource_number: str) -> dict:
+    # Producer-normalized resource shape: ``type``/``number`` (not
+    # ``resource_type``/``resource_number``) — the shape
+    # ``resource_identity_from_payload`` reads.
     return {
         "repository_url": repository_url,
-        "resource_type": resource_type,
-        "resource_number": resource_number,
+        "type": resource_type,
+        "number": resource_number,
     }
 
 
@@ -157,6 +168,26 @@ def _make_payload(
     }
 
 
+def _decode_jsonb(value: object) -> object:
+    """Decode a raw-asyncpg JSONB column value for assertions.
+
+    Production registers no ``set_type_codec`` for ``jsonb``
+    (``app/db/session.py``), so asyncpg returns JSONB columns as JSON
+    strings.  Decode explicitly rather than relying on a test-only pool codec
+    that the app-under-test never installs.
+    """
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _without_resource(payload: object) -> dict:
+    """Strip the per-resource identity so *state* payloads can be compared."""
+    decoded = _decode_jsonb(payload)
+    assert isinstance(decoded, dict)
+    return {k: v for k, v in decoded.items() if k != "resource"}
+
+
 async def _seed_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
     client_id = await conn.fetchval(
         "INSERT INTO opencode_clients (name) VALUES ($1) RETURNING id",
@@ -173,7 +204,6 @@ async def _seed_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
 
 
 def _build_app(db_pool: asyncpg.Pool) -> object:
-    from fastapi import Request
     from httpx import ASGITransport, AsyncClient
 
     from app.core.factory import create_app
@@ -204,7 +234,7 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None:
     """Ingesting a delivery with a ``resource`` object creates one aggregate row."""
     async with db_pool.acquire() as conn:
@@ -238,14 +268,16 @@ async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None
     async with db_pool.acquire() as conn:
         row = await get_aggregate(conn, identity)
     assert row is not None
-    assert row["repository_url"] == "https://github.com/acme/backend"
+    assert row["repository_url"] == "github.com/Acme/Backend"
     assert row["last_delivery_id"].startswith("delivery-")
-    assert row["payload"]["status"] == "open"
-    assert row["payload"]["title"] == "in progress"
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
+    assert payload["status"] == "open"
+    assert payload["title"] == "in progress"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool) -> None:
     """A stale delivery (older occurred_at) never regresses newer state."""
     async with db_pool.acquire() as conn:
@@ -284,22 +316,24 @@ async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool
 
     identity = ResourceIdentity(
         provider="github",
-        repository_url="https://github.com/acme/backend",
+        repository_url=normalize_repository_url(resource["repository_url"]),
         resource_type="issue",
         resource_number="7",
     )
     async with db_pool.acquire() as conn:
         row = await get_aggregate(conn, identity)
     assert row is not None
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
     # conflicting fields stay at the newer event's values (no regression)
-    assert row["payload"]["status"] == "closed"
-    assert row["payload"]["title"] == "done"
+    assert payload["status"] == "closed"
+    assert payload["title"] == "done"
     # absent key from the late event is filled forward
-    assert row["payload"]["labels"] == ["bug"]
+    assert payload["labels"] == ["bug"]
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -> None:
     """Replay convergence: ingestion order does not affect the final aggregate."""
     async with db_pool.acquire() as conn:
@@ -328,10 +362,8 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
             resource_number=number,
         )
 
-    client = _build_app(db_pool)
-
     # Order 1: live then replay → resource "conv-a"
-    async with client as c:
+    async with _build_app(db_pool) as c:
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
@@ -352,7 +384,7 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         )
 
     # Order 2: replay then live → resource "conv-b"
-    async with client as c:
+    async with _build_app(db_pool) as c:
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
@@ -383,22 +415,26 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         )
 
     assert row_a is not None and row_b is not None
-    assert row_a["payload"] == row_b["payload"]
+    payload_a = _without_resource(row_a["payload"])
+    payload_b = _without_resource(row_b["payload"])
+    assert payload_a == payload_b
     assert row_a["last_occurred_at"] == row_b["last_occurred_at"]
-    assert row_a["last_delivery_id"] == row_b["last_delivery_id"]
+    # Delivery ids are intentionally distinct per ordering (the dedup key), so
+    # each resource converges on its own newest live delivery instead.
+    assert row_a["last_delivery_id"] == live["delivery_id"]
+    assert row_b["last_delivery_id"] == live2["delivery_id"]
 
     # The converged state is the newer (live) event's values, with the
     # replay-only key filled forward.
-    assert row_a["payload"] == {
+    assert payload_a == {
         "status": "closed",
         "title": "done",
         "labels": ["bug"],
     }
-    assert row_a["last_delivery_id"] == live["delivery_id"]
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_three_event_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -449,9 +485,9 @@ async def test_three_event_merge_converges_across_arrival_orders(
         )
 
     assert len(rows) == 6
-    first = rows[0]["payload"]
+    first = _without_resource(rows[0]["payload"])
     for row in rows:
-        assert row["payload"] == first
+        assert _without_resource(row["payload"]) == first
     # The converged state takes the newest value per key: y written by e3
     # (newer than e2), x written by e1 — independent of arrival order.
     assert first["x"] == 1
@@ -459,7 +495,7 @@ async def test_three_event_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_none_key_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -516,9 +552,6 @@ async def test_none_key_merge_converges_across_arrival_orders(
     # The ``resource`` object is the aggregate identity and therefore carries
     # a different ``resource_number`` per permutation; strip it so the *state*
     # portion of each row can be compared for convergence.
-    def _without_resource(payload: dict) -> dict:
-        return {k: v for k, v in payload.items() if k != "resource"}
-
     first = _without_resource(rows[0]["payload"])
     first_last_occurred_at = rows[0]["last_occurred_at"]
     assert first == {"a": 7, "b": 1}
@@ -528,7 +561,7 @@ async def test_none_key_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unique_identity_constraint_enforced(db_pool: asyncpg.Pool) -> None:
     """A second direct INSERT of the same identity key is rejected."""
     async with db_pool.acquire() as conn:

@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -67,7 +66,7 @@ class CollectorHealth(BaseModel):
 
     client_id: str = Field(description="UUID of the opencode_clients row")
     client_name: str = Field(description="Name of the OpenCode client")
-    last_heartbeat: Optional[datetime] = Field(
+    last_heartbeat: datetime | None = Field(
         default=None,
         description="Most recent ingest activity across the client's "
         "credentials and watched source databases",
@@ -84,7 +83,7 @@ class SourceDatabaseHealth(BaseModel):
 
     source_database_id: str = Field(description="UUID of the source_databases row")
     client_name: str = Field(description="Name of the associated OpenCode client")
-    last_push: Optional[datetime] = Field(
+    last_push: datetime | None = Field(
         default=None, description="Most recent push (last_seen_at)"
     )
     record_count: int = Field(default=0, description="Total records ingested")
@@ -99,7 +98,7 @@ class HealthResponse(BaseModel):
     database: str = Field(
         default="disconnected", description="Database connectivity status"
     )
-    last_ingest_timestamp: Optional[datetime] = Field(
+    last_ingest_timestamp: datetime | None = Field(
         default=None, description="Most recent ingest across all collectors"
     )
     collectors: list[CollectorHealth] = Field(
@@ -287,7 +286,7 @@ async def health(request: Request) -> HealthResponse:
     collector status, and source-database health.
     """
     db_pool: DatabasePool | None = getattr(request.app.state, "pool", None)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     threshold = get_settings().heartbeat_threshold
 
     if db_pool is None:

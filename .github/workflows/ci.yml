@@ -85,6 +85,7 @@ jobs:
             tests/test_agent_runs_status_filter_pg.py \
             tests/integration/test_change_request_summary.py \
             tests/integration/test_afk_outcomes_correlations_jsonb.py \
+            tests/integration/test_read_path_live_protocol.py \
             -v -m integration
 
       # Required gate: the AFK lifecycle concurrency and reporting-ingestion
@@ -109,6 +110,27 @@ jobs:
             -v -m integration \
             -p no:cacheprovider \
             --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
+
+      # Destructive reporting-aggregate and ingest-overlap suites: they also
+      # migrate/reset the schema and drop every public table in teardown, so
+      # they run against the same disposable postgres-isolated container with
+      # the disposable-target attestation.
+      - name: Run isolated reporting aggregate and ingest overlap tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_reporting_aggregates.py \
+            tests/integration/test_ingest_batch_overlap_perf.py \
+            -v -m integration \
+            -p no:cacheprovider
 
       - name: Verify all six isolated PostgreSQL tests executed and passed
         if: always()

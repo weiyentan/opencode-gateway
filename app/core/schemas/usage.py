@@ -437,25 +437,39 @@ class AgentRunDetail(BaseModel):
         description="Todo items for this run (populated from opencode_session_todos queries)",
     )
     todo_total: int = Field(
-        default=0, ge=0, description="Total todo items (populated from opencode_session_todos queries)"
+        default=0,
+        ge=0,
+        description="Total todo items (populated from opencode_session_todos queries)",
     )
     todo_completed: int = Field(
-        default=0, ge=0, description="Completed todo items (populated from opencode_session_todos queries)"
+        default=0,
+        ge=0,
+        description="Completed todo items (populated from opencode_session_todos queries)",
     )
     todo_blocked: int = Field(
-        default=0, ge=0, description="Blocked todo items (populated from opencode_session_todos queries)"
+        default=0,
+        ge=0,
+        description="Blocked todo items (populated from opencode_session_todos queries)",
     )
     code_changes_total: int = Field(
-        default=0, ge=0, description="Total code changes (populated from opencode_session_contexts queries)"
+        default=0,
+        ge=0,
+        description="Total code changes (populated from opencode_session_contexts queries)",
     )
     code_change_count: int = Field(
-        default=0, ge=0, description="Code change count (populated from opencode_session_contexts queries)"
+        default=0,
+        ge=0,
+        description="Code change count (populated from opencode_session_contexts queries)",
     )
     code_change_additions: int = Field(
-        default=0, ge=0, description="Code change additions (populated from opencode_session_contexts queries)"
+        default=0,
+        ge=0,
+        description="Code change additions (populated from opencode_session_contexts queries)",
     )
     code_change_deletions: int = Field(
-        default=0, ge=0, description="Code change deletions (populated from opencode_session_contexts queries)"
+        default=0,
+        ge=0,
+        description="Code change deletions (populated from opencode_session_contexts queries)",
     )
     session_context: dict[str, object] | None = Field(
         default=None,

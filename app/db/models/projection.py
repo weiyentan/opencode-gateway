@@ -14,9 +14,8 @@ Gateway architecture.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -37,7 +36,7 @@ from app.db.models.base import Base
 
 def _utcnow() -> datetime:
     """Return the current UTC time — usable as a Python-side column default."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class OpenCodeSourceProject(Base):
@@ -70,28 +69,28 @@ class OpenCodeSourceProject(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     external_project_id: Mapped[str] = mapped_column(String, nullable=False)
-    source_project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    source_project_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
-    worktree: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    vcs: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    sandboxes: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    display_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    icon: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    icon_color: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    raw_commands: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    parsed_commands: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    worktree: Mapped[str | None] = mapped_column(String, nullable=True)
+    vcs: Mapped[str | None] = mapped_column(String, nullable=True)
+    sandboxes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    name: Mapped[str | None] = mapped_column(String, nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    icon: Mapped[str | None] = mapped_column(String, nullable=True)
+    icon_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    raw_commands: Mapped[str | None] = mapped_column(String, nullable=True)
+    parsed_commands: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -100,7 +99,7 @@ class OpenCodeSourceProject(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeSessionContext(Base):
@@ -137,73 +136,73 @@ class OpenCodeSessionContext(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
-    parent_external_session_id: Mapped[Optional[str]] = mapped_column(
+    parent_external_session_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    parent_session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    parent_session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
-    external_project_id: Mapped[Optional[str]] = mapped_column(
+    external_project_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
-    source_project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    source_project_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("opencode_source_projects.id"),
         nullable=True,
     )
-    source_directory: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    source_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    title: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    slug: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    session_model: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    session_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
-    source_input_tokens: Mapped[Optional[int]] = mapped_column(
+    source_directory: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    slug: Mapped[str | None] = mapped_column(String, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_cost: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    source_input_tokens: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_output_tokens: Mapped[Optional[int]] = mapped_column(
+    source_output_tokens: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_cached_tokens: Mapped[Optional[int]] = mapped_column(
+    source_cached_tokens: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_reasoning_tokens: Mapped[Optional[int]] = mapped_column(
+    source_reasoning_tokens: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    code_change_count: Mapped[Optional[int]] = mapped_column(
+    code_change_count: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
-    code_change_additions: Mapped[Optional[int]] = mapped_column(
+    code_change_additions: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
-    code_change_deletions: Mapped[Optional[int]] = mapped_column(
+    code_change_deletions: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_started_at: Mapped[Optional[int]] = mapped_column(
+    source_started_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_completed_at: Mapped[Optional[int]] = mapped_column(
+    source_completed_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_started_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_started_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_completed_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_completed_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -212,7 +211,7 @@ class OpenCodeSessionContext(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeProjectDirectory(Base):
@@ -244,18 +243,18 @@ class OpenCodeProjectDirectory(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     directory: Mapped[str] = mapped_column(String, nullable=False)
-    directory_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    strategy: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    directory_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    strategy: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -264,7 +263,7 @@ class OpenCodeProjectDirectory(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedMessage(Base):
@@ -314,29 +313,29 @@ class ObservedMessage(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     external_message_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
-    parent_external_session_id: Mapped[Optional[str]] = mapped_column(
+    parent_external_session_id: Mapped[str | None] = mapped_column(
         String, nullable=True
     )
     role: Mapped[str] = mapped_column(String, nullable=False)
-    agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    mode: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    cost_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
-    input_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    output_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    agent: Mapped[str | None] = mapped_column(String, nullable=True)
+    mode: Mapped[str | None] = mapped_column(String, nullable=True)
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -345,7 +344,7 @@ class ObservedMessage(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedPart(Base):
@@ -393,25 +392,25 @@ class ObservedPart(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     external_part_id: Mapped[str] = mapped_column(String, nullable=False)
-    message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("observed_messages.id"), nullable=True
     )
     external_message_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
     part_type: Mapped[str] = mapped_column(String, nullable=False)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -420,7 +419,7 @@ class ObservedPart(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedToolCall(Base):
@@ -476,27 +475,27 @@ class ObservedToolCall(Base):
         UUID(as_uuid=True), ForeignKey("observed_parts.id"), nullable=False
     )
     external_part_id: Mapped[str] = mapped_column(String, nullable=False)
-    message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("observed_messages.id"), nullable=True
     )
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
     tool_name: Mapped[str] = mapped_column(String, nullable=False)
-    tool_status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    tool_input: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    tool_output: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    tool_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    tool_input: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tool_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -505,7 +504,7 @@ class ObservedToolCall(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeSessionTodo(Base):
@@ -538,24 +537,24 @@ class OpenCodeSessionTodo(Base):
         ForeignKey("source_databases.id", ondelete="CASCADE"), nullable=False
     )
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
-    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=True
     )
-    position: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    priority: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    content_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    source_created_at: Mapped[Optional[int]] = mapped_column(
+    status: Mapped[str | None] = mapped_column(String, nullable=True)
+    priority: Mapped[str | None] = mapped_column(String, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_updated_at: Mapped[Optional[int]] = mapped_column(
+    source_updated_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
-    source_created_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_created_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    source_updated_at_tz: Mapped[Optional[datetime]] = mapped_column(
+    source_updated_at_tz: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     first_seen_at: Mapped[datetime] = mapped_column(
@@ -564,4 +563,4 @@ class OpenCodeSessionTodo(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

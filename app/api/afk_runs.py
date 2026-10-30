@@ -61,6 +61,7 @@ from afk_outcomes.models import (
     Provider,
 )
 from afk_outcomes.repository import AsyncpgOutcomeRepository
+from app.api.afk_executions import require_awx_execution_binding_credential
 from app.core.auth import require_operator_token
 from app.core.config import get_settings
 from app.core.schemas.afk import (
@@ -76,7 +77,6 @@ from app.core.schemas.usage import PaginatedResponse
 from app.core.telemetry import timed_operation
 from app.core.timeouts import db_timeout as _db_timeout
 from app.core.timeouts import request_timeout as _request_timeout
-from app.api.afk_executions import require_awx_execution_binding_credential
 from app.db.session import get_session
 
 router = APIRouter(tags=["afk-runs"])

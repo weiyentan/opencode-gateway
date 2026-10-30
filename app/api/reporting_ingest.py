@@ -39,13 +39,13 @@ from app.core.reporting_aggregates import (
     enrich_aggregate,
     resource_identity_from_payload,
 )
-from app.core.secrets import redact_dict
 from app.core.schemas.reporting import (
     ReportingDeliveryIn,
     ReportingDeliveryResult,
     ReportingIngestRequest,
     ReportingIngestResponse,
 )
+from app.core.secrets import redact_dict
 from app.db.session import get_session
 
 logger = logging.getLogger(__name__)

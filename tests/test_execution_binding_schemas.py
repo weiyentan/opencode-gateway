@@ -14,6 +14,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from afk_outcomes.models import (
+    EntityType,
+    ExecutionOutcome,
+    Provider,
+    TriggerType,
+)
 from app.core.schemas.execution_binding import (
     ExecutionBindingCreateRequest,
     ExecutionBindingHistoryResponse,
@@ -22,13 +28,6 @@ from app.core.schemas.execution_binding import (
     ExecutionBindingUpdateRequest,
     redact_failure_summary,
 )
-from afk_outcomes.models import (
-    EntityType,
-    ExecutionOutcome,
-    Provider,
-    TriggerType,
-)
-
 
 _AFK_RUN_ID = "01JZABCDEFGHJKLMNPQRSTVWXY"
 

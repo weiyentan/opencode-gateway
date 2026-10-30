@@ -19,9 +19,9 @@ import inspect
 import pytest
 
 from afk_outcomes.models import (
+    PROVISIONAL_RUN_STATUS,
     ExecutionBinding,
     ExecutionOutcome,
-    PROVISIONAL_RUN_STATUS,
 )
 from afk_outcomes.run_status import resolve_afk_run_status
 

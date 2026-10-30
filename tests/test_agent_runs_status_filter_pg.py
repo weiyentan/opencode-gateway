@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
@@ -39,9 +39,6 @@ from app.api.usage import (
     _fetch_agent_runs,
     _status_case_expression,
 )
-
-
-UTC = timezone.utc
 
 _VALID_STATUSES = ("running", "completed", "blocked", "stale", "unknown")
 

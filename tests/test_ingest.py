@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,11 +38,11 @@ _SESSION_ID = uuid.uuid4()
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
-    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 def _valid_ingest_payload(
@@ -1725,7 +1725,7 @@ class TestValidationDetailLogging:
                     "output_tokens": 50,
                     "cached_tokens": 0,
                     "estimated_cost_usd": "0.0035",
-                    "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+                    "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC).isoformat(),
                 },
             ],
         }
@@ -1848,7 +1848,7 @@ class TestValidationDetailLogging:
                         "output_tokens": 50,
                         "cached_tokens": 0,
                         "estimated_cost_usd": "0.0035",
-                        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+                        "reported_at": datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC).isoformat(),
                     },
                 ],
             )

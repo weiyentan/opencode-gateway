@@ -15,14 +15,14 @@ Provides:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from app.core.reporting_aggregates import (  # noqa: E402
     resource_identity_from_payload,
 )
-
 
 # ---------------------------------------------------------------------------
 # Window
@@ -48,7 +48,7 @@ class VerificationWindow:
 
 def _today_utc() -> date:
     """The current UTC calendar day (matches the rollup day bucketing)."""
-    return datetime.now(timezone.utc).date()
+    return datetime.now(UTC).date()
 
 
 def parse_window(
@@ -158,7 +158,7 @@ def _as_utc_day(value: datetime) -> date:
     """The UTC calendar day of a timezone-aware (or naive) datetime."""
     if value.tzinfo is None:
         return value.date()
-    return value.astimezone(timezone.utc).date()
+    return value.astimezone(UTC).date()
 
 
 def compare_afk_dashboard_daily_rows(
