@@ -1,7 +1,7 @@
 """Integration tests for the current-aggregate layer (issue #480).
 
-Runs against the docker-compose Postgres (port 5433) and verifies the
-database-enforced guarantees of the forward-only current aggregate:
+Runs against the dedicated disposable PostgreSQL 16 service (port 5433) and
+verifies the database-enforced guarantees of the forward-only current aggregate:
 
 * a delivery carrying a ``resource`` object produces exactly one
   ``reporting_resource_aggregates`` row keyed by the normalized identity;
@@ -14,14 +14,24 @@ database-enforced guarantees of the forward-only current aggregate:
 
 Prerequisites
 -------------
-Start the standalone test Postgres container before running::
+This suite migrates the schema and can drop every table in the ``public``
+schema, so it refuses to run unless the target is positively verified as the
+dedicated disposable PostgreSQL 16 service.  Start one outside Kubernetes::
 
-    docker compose -f docker-compose.test.yml up -d
-    pytest tests/integration/ -v -m integration
-    docker compose -f docker-compose.test.yml down -v
+    docker run --rm -d --name opencode-gateway-test-db \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
+        -p 5433:5432 postgres:16-alpine
 
-The suite fails closed when the disposable database is not reachable (or
-cannot be proven disposable) — it never skips.
+    GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\
+        pytest tests/integration/test_reporting_aggregates.py -v -m integration
+
+    docker stop opencode-gateway-test-db
+
+A missing attestation, a mismatched DSN, an unreachable server, a
+non-test database name, a Kubernetes target, or a non-PostgreSQL-16 server
+fails closed instead of skipping.
 """
 
 from __future__ import annotations

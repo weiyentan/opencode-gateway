@@ -13,6 +13,7 @@ quarantined identity and the identity it overlaps — a double join to
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, Query
@@ -60,7 +61,7 @@ async def list_quarantined_identities(
     by :func:`app.core.identity.get_active_quarantines`.
     """
     conditions = ["q.cleared_at IS NULL"]
-    params: list = []
+    params: list[Any] = []
     if client_id is not None:
         conditions.append(f"si.client_id = ${len(params) + 1}")
         params.append(client_id)

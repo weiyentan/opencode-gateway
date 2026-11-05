@@ -16,7 +16,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -188,7 +188,7 @@ async def _collector_health_summary(
 
     # Group signal rows by client, keeping only qualifying remote-collector
     # clients (issue #749 prefix rule, unchanged).
-    by_client: dict[str, dict] = {}
+    by_client: dict[str, dict[str, Any]] = {}
     for r in rows:
         if not str(r["client_name"]).startswith(REMOTE_COLLECTOR_CLIENT_PREFIX):
             continue

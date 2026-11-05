@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from typing import Any
 from decimal import Decimal
 
 import asyncpg
@@ -146,7 +147,7 @@ def _validate_window(
         )
 
 
-def _decode_jsonb_array(raw: object) -> list:
+def _decode_jsonb_array(raw: object) -> list[Any]:
     """Decode a JSONB array column into a Python list.
 
     asyncpg returns JSONB columns as JSON-encoded ``str`` (no type codec is
