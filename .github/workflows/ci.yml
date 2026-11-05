@@ -5,6 +5,16 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # Live read-path measurement is opt-in only (issue #836).  It is never
+  # selected by ordinary push/PR events and is not required for merge.
+  workflow_dispatch:
+    inputs:
+      read_path_live:
+        description: >-
+          Run the opt-in live read-path protocol against a read-only replica
+          (requires the READ_PATH_LIVE_DATABASE_URL secret)
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -110,6 +120,12 @@ jobs:
             -p no:cacheprovider \
             --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
 
+      # The production-scale batch-overlap benchmark (123k-attempt fixture,
+      # 100-record batch) is intentionally NOT part of this required PR
+      # workflow: it would add minutes to every change.  Run it explicitly via
+      # the workflow_dispatch-only ".github/workflows/benchmark-overlap.yml"
+      # workflow, or manually with GATEWAY_RUN_OVERLAP_BENCHMARK=1 (see the
+      # module docstring in tests/integration/test_ingest_batch_overlap_perf.py).
       - name: Verify all six isolated PostgreSQL tests executed and passed
         if: always()
         env:
@@ -177,6 +193,153 @@ jobs:
           )
           PY
 
+      # Required-mode execution contract (issue #826, ADR 0032).  Destructive
+      # suites must run on the dedicated postgres-isolated service with
+      # GATEWAY_TEST_DISPOSABLE_DB=1 and must fail closed when the database is
+      # unavailable (never pytest.skip).  A required JUnit report must also
+      # prove that every expected case executed: a missing report, zero
+      # collected cases, any skip/failure/error, or a name mismatch fails.
+      # Subsequent suite-enablement children reuse this pattern.
+      - name: Run required-mode execution contract tests
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/unit/test_disposable_postgres_gate.py \
+            tests/unit/test_required_test_report.py \
+            -v -m "not integration" \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/required-mode-report.xml"
+
+      - name: Verify required-mode JUnit report is non-skipping
+        if: always()
+        env:
+          REQUIRED_MODE_JUNIT: ${{ runner.temp }}/required-mode-report.xml
+        run: |
+          python - <<'PY'
+          import os
+
+          from tests.integration._disposable_postgres import (
+              verify_required_test_report,
+          )
+
+          summary = verify_required_test_report(
+              os.environ["REQUIRED_MODE_JUNIT"], minimum_executed=1
+          )
+          print(
+              "Required-mode execution contract: "
+              f"{summary.total} collected, {summary.passed} passed, "
+              f"{summary.failed} failed, {summary.skipped} skipped"
+          )
+          PY
+
+      # Required gate: the AFK consumer and backfill CLI suites exercise
+      # delivery deduplication, canonical event identity, replay convergence,
+      # and backfill idempotency against real PostgreSQL.  They migrate the
+      # schema and drop the public tables, so they run on the same dedicated
+      # disposable postgres-isolated service, in their own step after the
+      # six-case gate above.  GitHub Actions runs steps sequentially, so this
+      # DROP TABLE teardown cannot race a sibling suite (the six-case JUnit
+      # report has already been verified by the time this step runs).
+      - name: Run AFK consumer and backfill convergence tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_afk_consumer.py \
+            tests/integration/test_afk_outcomes_cli.py \
+            -v -m integration \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/afk-consumer-backfill-report.xml"
+
+      # No-skip proof: the suites verify the disposable target in a fixture,
+      # so a missing database is an error rather than a skip.  This gate
+      # additionally requires every expected case to be present and passing.
+      # A missing/empty report, a collection error, an all-skipped module, or
+      # any failure blocks CI.
+      - name: Verify AFK consumer and backfill tests executed and passed
+        if: always()
+        env:
+          AFK_CONSUMER_BACKFILL_JUNIT: ${{ runner.temp }}/afk-consumer-backfill-report.xml
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          EXPECTED = {
+              # tests/integration/test_afk_consumer.py
+              "test_normalized_bridge_persists_canonical_change_request",
+              "test_record_event_redelivery_produces_no_duplicate_rows",
+              "test_reconciliation_window_converges_merged_outcome",
+              "test_cross_path_event_dedup_when_occurred_at_agrees",
+              "test_cross_path_event_distinct_when_occurred_at_differs",
+              "test_replay_convergence_live_then_replay",
+              "test_replay_convergence_replay_then_live",
+              "test_redelivery_creates_no_duplicate_rows_across_full_path",
+              "test_normalized_edited_persists_as_canonical_updated",
+              "test_normalized_reopened_persists_as_canonical_reopened",
+              "test_normalized_edited_redelivery_is_idempotent",
+              "test_late_event_with_older_occurred_at_enriches_trail",
+              # tests/integration/test_afk_outcomes_cli.py
+              "test_backfill_rerun_converges_and_dry_run_matches_stored",
+              "test_bounded_window_reconciliation_on_second_run",
+          }
+
+          report = os.environ["AFK_CONSUMER_BACKFILL_JUNIT"]
+          if not os.path.exists(report):
+              print(f"::error::AFK consumer/backfill JUnit report is missing: {report}")
+              sys.exit(1)
+
+          cases = list(ET.parse(report).getroot().iter("testcase"))
+          seen = {}
+          problems = []
+          for case in cases:
+              name = case.get("name", "<unnamed>")
+              classname = case.get("classname", "<unknown>")
+              if case.find("skipped") is not None:
+                  state = "SKIPPED"
+                  problems.append(f"{classname}::{name} was skipped")
+              elif case.find("failure") is not None or case.find("error") is not None:
+                  state = "FAILED"
+                  problems.append(f"{classname}::{name} failed")
+              else:
+                  state = "PASSED"
+              seen[name] = state
+              print(f"{state:7} {classname}::{name}")
+
+          missing = sorted(EXPECTED - set(seen))
+          unexpected = sorted(set(seen) - EXPECTED)
+          if len(cases) != len(EXPECTED):
+              problems.append(
+                  f"expected {len(EXPECTED)} test cases, collected {len(cases)}"
+              )
+          if missing:
+              problems.append(f"missing test cases: {missing}")
+          if unexpected:
+              problems.append(f"unexpected test cases: {unexpected}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+
+          passed = sum(1 for state in seen.values() if state == "PASSED")
+          skipped = sum(1 for state in seen.values() if state == "SKIPPED")
+          failed = sum(1 for state in seen.values() if state == "FAILED")
+          print(
+              "AFK consumer/backfill gate: "
+              f"{len(cases)} collected, {passed} passed, {failed} failed, "
+              f"{skipped} skipped, 0 errors"
+          )
+          PY
+
       - name: Lint Python
         run: ruff check .
 
@@ -194,3 +357,45 @@ jobs:
 
       - name: Test AFK dashboard summary
         run: node frontend/tests/test_afk_dashboard_summary.js
+
+  # Opt-in live read-path protocol (issue #836).  This job is deliberately
+  # NOT part of pull request validation: it runs only from a manual
+  # workflow_dispatch with read_path_live=true, against a separately approved
+  # read-only target.  The harness enforces a READ ONLY transaction and a
+  # bounded statement_timeout, executes SELECT/EXPLAIN probes only, and fails
+  # (never skips green) when the target is missing or unreachable.
+  read-path-live:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.read_path_live }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Fail closed when the live replica DSN is not configured
+        env:
+          READ_PATH_LIVE_DATABASE_URL: ${{ secrets.READ_PATH_LIVE_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${READ_PATH_LIVE_DATABASE_URL:-}" ]; then
+            echo "::error::READ_PATH_LIVE_DATABASE_URL secret is not configured; refusing to report live measurement evidence."
+            exit 1
+          fi
+
+      - name: Run opt-in live read-path protocol (read-only replica)
+        env:
+          READ_PATH_LIVE_ENABLED: "1"
+          READ_PATH_LIVE_DATABASE_URL: ${{ secrets.READ_PATH_LIVE_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          pytest tests/integration/test_read_path_live_protocol.py \
+            -v -m integration -p no:cacheprovider
