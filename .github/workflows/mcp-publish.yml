@@ -82,6 +82,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Docker Hub intermittently returns 502 while buildx bootstraps and pulls
+      # moby/buildkit:buildx-stable-1.  Pre-pull the same image with bounded
+      # retries so a transient registry error does not fail the smoke test;
+      # once it is local, buildx bootstrap does not need the network.
+      - name: Pre-pull BuildKit image (retry transient Docker Hub failures)
+        run: |
+          set -euo pipefail
+          if docker image inspect moby/buildkit:buildx-stable-1 >/dev/null 2>&1; then
+            echo "BuildKit image already present locally"
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            if docker pull moby/buildkit:buildx-stable-1; then
+              echo "BuildKit image available on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::warning::BuildKit pull failed on attempt ${attempt}/5; retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not pull moby/buildkit:buildx-stable-1 after 5 attempts"
+          exit 1
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

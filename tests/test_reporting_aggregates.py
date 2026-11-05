@@ -76,7 +76,7 @@ def _stored_row(
     *,
     occurred_at: datetime,
     delivery_id: str,
-    payload: dict,
+    payload: dict | str,
     key_provenance: dict | None = None,
 ):
     return mock_row(
@@ -590,6 +590,44 @@ async def test_enrich_update_forward_only_late_event_non_regression(
     assert merged["labels"] == ["bug"]  # absent key filled forward
     assert args[7] == _T2  # last_occurred_at stays at the newer event
     assert args[8] == "d2"
+
+
+@pytest.mark.asyncio
+async def test_enrich_decodes_raw_jsonb_payload_string(
+    mock_conn: AsyncMock,
+) -> None:
+    """PR #853 finding 1: a raw-asyncpg JSONB payload must be decoded first.
+
+    Production registers no JSONB type codec (``app/db/session.py``), so a
+    second delivery's ``fetchrow`` returns the stored payload as a JSON
+    string.  Before the fix ``forward_merge`` passed that string to
+    ``dict(...)`` and raised ``ValueError``.
+    """
+    mock_conn.fetchval = AsyncMock(return_value=True)
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_stored_row(
+            occurred_at=_T1,
+            delivery_id="d1",
+            payload=json.dumps({"status": "open", "title": "in progress"}),
+        )
+    )
+    mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+    await enrich_aggregate(
+        mock_conn,
+        _identity(),
+        _delivery(
+            delivery_id="d2",
+            occurred_at=_T2,
+            payload={"status": "closed"},
+        ),
+    )
+
+    args = mock_conn.execute.call_args.args
+    assert json.loads(args[5]) == {
+        "status": "closed",
+        "title": "in progress",
+    }
 
 
 @pytest.mark.asyncio
