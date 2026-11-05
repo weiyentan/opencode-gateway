@@ -1,0 +1,81 @@
+name: Overlap benchmark (opt-in)
+
+# Opt-in production-scale benchmark for the canonical ingest overlap path
+# (issue #835).  This workflow is deliberately NOT triggered by push or
+# pull_request: it seeds ~123k usage_ingest_attempts rows, so it must never
+# add runtime to required PR CI.  Dispatch it manually when changing the
+# ingest overlap query or its indexes.
+#
+# The benchmark also runs on a dedicated disposable PostgreSQL 16 service
+# (never the shared test database), with an explicit disposable-target
+# attestation.  The safety preflight in tests/integration/_disposable_postgres.py
+# fails closed on an unreachable or non-disposable target; it is never turned
+# into a green skip.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlap-benchmark:
+    name: Production-scale ingest overlap benchmark
+    runs-on: ubuntu-latest
+    # Hard upper bound: the fixture seed plus four bounded benchmark cases
+    # complete in a few minutes; 20 minutes leaves headroom without allowing
+    # a pathological regression to run unbounded.
+    timeout-minutes: 20
+
+    services:
+      # Dedicated disposable PostgreSQL 16 instance for this benchmark only.
+      # Port 5433 mirrors the isolated CI gate and avoids the shared 5432
+      # service used by the required AFK integration tests.
+      postgres-isolated:
+        image: postgres:16
+        env:
+          POSTGRES_DB: opencode_gateway_benchmark_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d opencode_gateway_benchmark_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run opt-in overlap benchmark
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_benchmark_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          # Explicit operator attestation required by the fail-closed
+          # disposable-Postgres preflight.
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+          # Explicit benchmark opt-in: without it the suite skips with a
+          # "not requested" reason instead of seeding ~123k rows.
+          GATEWAY_RUN_OVERLAP_BENCHMARK: "1"
+        # ``-s`` surfaces the ``[overlap-benchmark]`` metric lines (overlap
+        # query count, quarantine accounting deltas, elapsed time).  ``-m
+        # profiling`` overrides the default ``-m "not profiling"`` addopts.
+        run: |
+          set -euo pipefail
+          pytest tests/integration/test_ingest_batch_overlap_perf.py \
+            -v -m profiling -s -p no:cacheprovider \
+            --tb=short

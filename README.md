@@ -991,6 +991,7 @@ opencode-gateway/
 | [0029](docs/adr/0029-gateway-reporting-boundary.md) | Gateway Remains a Reporting Service | Accepted |
 | [0030](docs/adr/0030-superseded-adr-retention-policy.md) | Superseded ADR Retention Policy | Accepted |
 | [0031](docs/adr/0031-opencode-gateway-mcp-read-only-semantic-adapter.md) | Expose OpenCode Gateway through a separate read-only semantic MCP adapter | Accepted |
+| [0032](docs/adr/0032-required-integration-test-execution-contract.md) | Required integration tests use a disposable-Postgres attestation and a non-skip execution contract | Accepted |
 
 Detailed schema, correlation, and database semantics live in the ADRs and
 in `CONTEXT.md`; this README deliberately links them rather than duplicating

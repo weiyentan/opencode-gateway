@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -137,7 +138,7 @@ async def _persist_delivery(
 async def ingest_deliveries(
     body: ReportingIngestRequest,
     request: Request,
-    auth: dict = Depends(require_collector_token),
+    auth: dict[str, Any] = Depends(require_collector_token),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> ReportingIngestResponse:
     """Accept a batch of reporting deliveries from an authenticated collector.

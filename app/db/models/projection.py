@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -74,13 +75,13 @@ class OpenCodeSourceProject(Base):
     )
     worktree: Mapped[str | None] = mapped_column(String, nullable=True)
     vcs: Mapped[str | None] = mapped_column(String, nullable=True)
-    sandboxes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    sandboxes: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     name: Mapped[str | None] = mapped_column(String, nullable=True)
     display_name: Mapped[str | None] = mapped_column(String, nullable=True)
     icon: Mapped[str | None] = mapped_column(String, nullable=True)
     icon_color: Mapped[str | None] = mapped_column(String, nullable=True)
     raw_commands: Mapped[str | None] = mapped_column(String, nullable=True)
-    parsed_commands: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    parsed_commands: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
@@ -99,7 +100,7 @@ class OpenCodeSourceProject(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeSessionContext(Base):
@@ -211,7 +212,7 @@ class OpenCodeSessionContext(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeProjectDirectory(Base):
@@ -263,7 +264,7 @@ class OpenCodeProjectDirectory(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedMessage(Base):
@@ -344,7 +345,7 @@ class ObservedMessage(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedPart(Base):
@@ -419,7 +420,7 @@ class ObservedPart(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class ObservedToolCall(Base):
@@ -484,8 +485,8 @@ class ObservedToolCall(Base):
     external_session_id: Mapped[str] = mapped_column(String, nullable=False)
     tool_name: Mapped[str] = mapped_column(String, nullable=False)
     tool_status: Mapped[str | None] = mapped_column(String, nullable=True)
-    tool_input: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    tool_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tool_input: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(JSONB, nullable=True)
+    tool_output: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(JSONB, nullable=True)
     source_created_at: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
@@ -504,7 +505,7 @@ class ObservedToolCall(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
 class OpenCodeSessionTodo(Base):
@@ -563,4 +564,4 @@ class OpenCodeSessionTodo(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
-    source_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

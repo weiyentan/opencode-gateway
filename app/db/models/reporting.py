@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import DateTime, String, UniqueConstraint
 from sqlalchemy import text as sa_text
@@ -98,7 +99,7 @@ class ReportingDelivery(Base):
         server_default=sa_text("now()"),
         nullable=False,
     )
-    payload: Mapped[dict] = mapped_column(
+    payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,
@@ -148,7 +149,7 @@ class DeliveryStateTrail(Base):
         server_default=sa_text("now()"),
         nullable=False,
     )
-    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,
@@ -211,13 +212,13 @@ class ReportingResourceAggregate(Base):
         server_default=sa_text("now()"),
         nullable=False,
     )
-    payload: Mapped[dict] = mapped_column(
+    payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,
         server_default=sa_text("'{}'::jsonb"),
     )
-    key_provenance: Mapped[dict] = mapped_column(
+    key_provenance: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
         default=dict,

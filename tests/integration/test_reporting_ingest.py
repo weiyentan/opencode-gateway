@@ -20,9 +20,9 @@ disposable PostgreSQL 16 database.  Start one outside Kubernetes before
 running::
 
     docker run --rm -d --name opencode-gateway-test-db \\
-        -e POSTGRES_DB=opencode_gateway_test \\
-        -e POSTGRES_USER=opencode_test \\
-        -e POSTGRES_PASSWORD=opencode_test \\
+        -e POSTGRES_DB=opencode_gateway_disposable_test \\
+        -e POSTGRES_USER=test \\
+        -e POSTGRES_PASSWORD=test \\
         -p 5433:5432 postgres:16-alpine
 
     GATEWAY_ENV=development GATEWAY_TEST_DISPOSABLE_DB=1 \\

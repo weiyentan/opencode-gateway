@@ -39,7 +39,7 @@ class ReportingDeliveryIn(BaseModel):
     occurred_at: datetime = Field(
         description="The message's timestamp — state-trail dedup anchor"
     )
-    payload: dict = Field(
+    payload: dict[str, Any] = Field(
         default_factory=dict, description="Verbatim delivery payload"
     )
 
