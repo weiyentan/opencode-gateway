@@ -14,24 +14,23 @@ so a retried recomputation can never double-count.
 Metric sources and event-time bucketing (all UTC calendar days)
 ---------------------------------------------------------------
 
-====================================  ==========================  ====================================
-Metric                                Canonical table             Event-time column
-====================================  ==========================  ====================================
-``runs_started``                      ``afk_runs``                ``COALESCE(started_at, first_seen_at)``
-``change_requests_opened``            ``engineering_events``      ``occurred_at``
-``change_requests_merged``            ``engineering_events``      ``occurred_at``
-``change_requests_closed``            ``engineering_events``      ``occurred_at``
-``execution_count``                   ``execution_bindings``      ``COALESCE(started_at, created_at)``
-``successful_execution_count``        ``execution_bindings``      ``COALESCE(started_at, created_at)``
-``failed_execution_count``            ``execution_bindings``      ``COALESCE(started_at, created_at)``
-``cancelled_execution_count``         ``execution_bindings``      ``COALESCE(started_at, created_at)``
-``session_count``                     ``afk_run_sessions``        ``COALESCE(started_at, first_seen_at)``
-``input_tokens``                      ``usage_events``            ``reported_at``
-``output_tokens``                     ``usage_events``            ``reported_at``
-``cache_read_tokens``                 ``usage_events``            ``reported_at``
-``cache_write_tokens``                ``usage_events``            ``reported_at``
-``estimated_cost_usd``                ``usage_events``            ``reported_at``
-====================================  ==========================  ====================================
+Metric                          Canonical table         Event-time column
+==============================  ======================  =========================================
+``runs_started``                ``afk_runs``            ``COALESCE(started_at, first_seen_at)``
+``change_requests_opened``      ``engineering_events``  ``occurred_at``
+``change_requests_merged``      ``engineering_events``  ``occurred_at``
+``change_requests_closed``      ``engineering_events``  ``occurred_at``
+``execution_count``             ``execution_bindings``  ``COALESCE(started_at, created_at)``
+``successful_execution_count``  ``execution_bindings``  ``COALESCE(started_at, created_at)``
+``failed_execution_count``      ``execution_bindings``  ``COALESCE(started_at, created_at)``
+``cancelled_execution_count``   ``execution_bindings``  ``COALESCE(started_at, created_at)``
+``session_count``               ``afk_run_sessions``    ``COALESCE(started_at, first_seen_at)``
+``input_tokens``                ``usage_events``        ``reported_at``
+``output_tokens``               ``usage_events``        ``reported_at``
+``cache_read_tokens``           ``usage_events``        ``reported_at``
+``cache_write_tokens``          ``usage_events``        ``reported_at``
+``estimated_cost_usd``          ``usage_events``        ``reported_at``
+==============================  ======================  =========================================
 
 Attribution policy — unresolved and ambiguous data is excluded, never
 guessed:

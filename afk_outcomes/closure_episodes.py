@@ -51,6 +51,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from pydantic import BaseModel, Field
+
 from afk_outcomes.models import (
     CLOSURE_RESOLVER_VERSION,
     ClosureCandidate,
@@ -65,7 +67,6 @@ from afk_outcomes.models import (
     IssueLinksSnapshot,
     Provider,
 )
-from pydantic import BaseModel, Field
 
 # ── key shapes ───────────────────────────────────────────────────────────────
 
@@ -184,9 +185,15 @@ def _derive_link_states(facts: Sequence[ClosureFact]) -> dict[_LinkKey, str]:
             continue
 
         # park branch: never arbitrarily win a conflicting same-timestamp pair
-        candidates: list[frozenset[tuple[str, str, str]]] = resolution[1]  # type: ignore[assignment]
-        common: frozenset[tuple[str, str, str]] = frozenset.intersection(*candidates) if candidates else frozenset()
-        union: frozenset[tuple[str, str, str]] = frozenset.union(*candidates) if candidates else frozenset()
+        candidates: list[frozenset[tuple[str, str, str]]] = (
+            resolution[1]  # type: ignore[assignment]
+        )
+        common: frozenset[tuple[str, str, str]] = (
+            frozenset.intersection(*candidates) if candidates else frozenset()
+        )
+        union: frozenset[tuple[str, str, str]] = (
+            frozenset.union(*candidates) if candidates else frozenset()
+        )
         for link in common:
             states[link] = ClosureLinkState.ACTIVE.value
         for link in union - common:

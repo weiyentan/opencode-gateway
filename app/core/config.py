@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -346,7 +346,7 @@ class Settings(BaseSettings):
     # header stops being emitted).  Maps to
     # GATEWAY_ACTIVE_TOKENS_DEPRECATION_SUNSET.
     active_tokens_deprecation_sunset: datetime = Field(
-        default_factory=lambda: datetime(2026, 11, 20, tzinfo=timezone.utc),
+        default_factory=lambda: datetime(2026, 11, 20, tzinfo=UTC),
         description="Sunset instant of the deprecated active_tokens field",
     )
 

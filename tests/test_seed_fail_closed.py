@@ -204,9 +204,10 @@ def test_parse_args_requires_confirm_flag() -> None:
 
 def test_parse_args_help_mentions_confirm() -> None:
     """Help text must document the disposable attestation requirement."""
-    from scripts.seed import _parse_args
     import inspect
+
     import scripts.seed as seed_mod
+    from scripts.seed import _parse_args
 
     with pytest.raises(SystemExit) as excinfo:
         _parse_args(["--help"])

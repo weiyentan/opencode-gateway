@@ -64,7 +64,10 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 class AFKExecutionReconcileResultItem(BaseModel):
     """Per-binding reconciliation result (credential-free)."""
 
-    awx_job_id: int | None = Field(default=None, description="AWX job id of the examined binding (None when malformed)")
+    awx_job_id: int | None = Field(
+        default=None,
+        description="AWX job id of the examined binding (None when malformed)",
+    )
     result: str = Field(
         description=(
             "Per-binding result kind: updated | already_terminal | "
@@ -98,13 +101,21 @@ class AFKExecutionReconcileResponse(BaseModel):
     )
     examined: int = Field(default=0, description="Running bindings examined")
     updated: int = Field(default=0, description="Bindings transitioned to a terminal outcome")
-    already_terminal: int = Field(default=0, description="Idempotent terminal replays (no mutation)")
+    already_terminal: int = Field(
+        default=0, description="Idempotent terminal replays (no mutation)"
+    )
     missing_job: int = Field(default=0, description="AWX jobs that do not exist")
     binding_missing: int = Field(default=0, description="Bindings that disappeared before update")
-    not_yet_terminal: int = Field(default=0, description="AWX jobs still active — binding stays running")
+    not_yet_terminal: int = Field(
+        default=0, description="AWX jobs still active — binding stays running"
+    )
     conflicts: int = Field(default=0, description="Conflicting re-observations (history preserved)")
-    lookup_errors: int = Field(default=0, description="Per-binding AWX lookup failures (pass continued)")
-    persist_errors: int = Field(default=0, description="Per-binding persistence failures (pass continued)")
+    lookup_errors: int = Field(
+        default=0, description="Per-binding AWX lookup failures (pass continued)"
+    )
+    persist_errors: int = Field(
+        default=0, description="Per-binding persistence failures (pass continued)"
+    )
     results: list[AFKExecutionReconcileResultItem] = Field(default_factory=list)
 
 

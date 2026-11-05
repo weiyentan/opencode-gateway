@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
 from decimal import Decimal
+from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status

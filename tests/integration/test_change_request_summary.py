@@ -121,9 +121,10 @@ async def db_pool(_integration_db_available: bool) -> asyncpg.Pool:
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
 
+    import shutil
+
     import alembic.command
     import alembic.config
-    import shutil
 
     sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
     alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))

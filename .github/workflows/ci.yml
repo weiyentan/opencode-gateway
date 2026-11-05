@@ -120,12 +120,33 @@ jobs:
             -p no:cacheprovider \
             --junitxml="$RUNNER_TEMP/isolated-postgres-report.xml"
 
+      # Destructive reporting-aggregate suite: it migrates/resets the schema
+      # and drops every public table in teardown, so it runs against the same
+      # disposable postgres-isolated container with the disposable-target
+      # attestation (ADR 0032; enrolled per issue #834).
+      - name: Run isolated reporting aggregate tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_reporting_aggregates.py \
+            -v -m integration \
+            -p no:cacheprovider
+
       # The production-scale batch-overlap benchmark (123k-attempt fixture,
       # 100-record batch) is intentionally NOT part of this required PR
       # workflow: it would add minutes to every change.  Run it explicitly via
       # the workflow_dispatch-only ".github/workflows/benchmark-overlap.yml"
       # workflow, or manually with GATEWAY_RUN_OVERLAP_BENCHMARK=1 (see the
       # module docstring in tests/integration/test_ingest_batch_overlap_perf.py).
+
       - name: Verify all six isolated PostgreSQL tests executed and passed
         if: always()
         env:

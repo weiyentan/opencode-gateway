@@ -2,7 +2,6 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,7 +10,7 @@ from httpx import ASGITransport, AsyncClient
 from app.core.factory import create_app
 
 
-def _client(app, *, api_key: Optional[str] = None) -> AsyncClient:
+def _client(app, *, api_key: str | None = None) -> AsyncClient:
     """Return an httpx AsyncClient for *app* with an optional API key header.
 
     ``api_key=None`` (the default) sends no ``Authorization`` header at all
@@ -401,7 +400,7 @@ def _signal_row(
     client_id: str,
     client_name: str,
     *,
-    credential_id: Optional[str] = None,
+    credential_id: str | None = None,
     credential_last_heartbeat=None,
     credential_records: int = 0,
     source_last_seen=None,
