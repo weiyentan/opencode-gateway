@@ -699,7 +699,7 @@ async def update_run(
     afk_run_id: str,
     body: AFKRunUpdateRequest,
     request: Request,
-    auth: dict = Depends(require_awx_execution_binding_credential),
+    auth: dict[str, str] = Depends(require_awx_execution_binding_credential),
     conn: asyncpg.Connection = Depends(get_session),
 ) -> AFKRunSummary:
     """Apply a guarded update to one canonical AFK Run (issue #673/#649).
