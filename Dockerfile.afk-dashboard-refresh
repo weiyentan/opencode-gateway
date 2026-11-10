@@ -13,6 +13,7 @@ WORKDIR /app
 
 # The refresh entrypoint is mounted by Kubernetes.  Only the shared settings
 # and rollup engines are copied into this image; the gateway runtime is not.
+COPY afk_outcomes/ /app/afk_outcomes/
 COPY app/__init__.py /app/app/__init__.py
 COPY app/core/__init__.py /app/app/core/__init__.py
 COPY app/core/config.py /app/app/core/config.py
