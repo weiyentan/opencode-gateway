@@ -105,12 +105,12 @@ def test_identity_extracts_and_normalizes_resource() -> None:
     )
     assert identity is not None
     assert identity.provider == "github"
-    assert identity.repository_url == "github.com/Acme/Backend"
+    assert identity.repository_url == "github.com/acme/backend"
     assert identity.resource_type == "issue"
     assert identity.resource_number == "42"
     assert (
         identity.composite_key
-        == "github:github.com/Acme/Backend:issue:42"
+        == "github:github.com/acme/backend:issue:42"
     )
 
 
@@ -201,12 +201,13 @@ def test_identity_returns_none_when_resource_malformed() -> None:
     )
 
 
-def test_normalize_repository_url_lowercases_and_strips_trailing_slash() -> None:
-    # Hostname is lowercased; path preserves original case (mirrors afk_consumer).
+def test_normalize_repository_url_is_provider_aware() -> None:
     assert normalize_repository_url("https://github.com/Acme/Backend/") == (
-        "github.com/Acme/Backend"
+        "github.com/acme/backend"
     )
-    assert normalize_repository_url("HTTPS://EXAMPLE.COM/Repo") == "example.com/Repo"
+    assert normalize_repository_url(
+        "HTTPS://GitLab.example.com/Group/Project.git", "gitlab"
+    ) == "gitlab.example.com/Group/Project"
     assert normalize_repository_url("https://github.com/acme/backend.git") == (
         "github.com/acme/backend"
     )

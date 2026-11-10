@@ -25,6 +25,7 @@ from afk_outcomes.models import (
     RunSessionLink,
 )
 from afk_outcomes.serialization import ULIDSource
+from afk_outcomes.repository_identity import normalize_repository_key
 
 def _parse_awx_job_id(awx_job_id: str) -> int:
     """Coerce an AWX job id string to int, rejecting non-numeric values.
@@ -373,6 +374,13 @@ class _ExecutionBindingsRepositoryMixin:
         """
         if afk_run_id is None:
             raise ValueError("afk_run_id is required for new execution bindings")
+        if provider is not None and repository is not None:
+            repository = normalize_repository_key(repository, provider.value)
+            if repository is None:
+                return CreateAFKExecutionBindingResult(
+                    afk_run_id=afk_run_id,
+                    is_conflict=True,
+                )
         numeric_awx_job_id = _parse_awx_job_id(awx_job_id)
         # Normalized session attribution (issue #627): the caller supplies the
         # already-normalized collection; a direct repository caller that
@@ -686,6 +694,10 @@ class _ExecutionBindingsRepositoryMixin:
             raise ValueError(
                 "update_execution_binding_terminal requires a terminal outcome"
             )
+        if provider is not None and repository is not None:
+            repository = normalize_repository_key(repository, provider.value)
+            if repository is None:
+                return UpdateExecutionBindingResult(is_conflict=True)
         if failure_reason_provided is None:
             failure_reason_provided = failure_reason is not None
         if failure_summary_provided is None:
@@ -777,7 +789,10 @@ class _ExecutionBindingsRepositoryMixin:
                 and stored_has_resource
                 and not (
                     row["provider"] == provider.value
-                    and row["repository_url"] == repository
+                    and normalize_repository_key(
+                        row["repository_url"], provider.value
+                    )
+                    == repository
                     and row["entity_type"] == EntityType.CHANGE_REQUEST.value
                     and row["entity_number"] == resource_number
                 )
@@ -1123,6 +1138,9 @@ class _ExecutionBindingsRepositoryMixin:
         Different AWX jobs targeting the same GitHub pull request or GitLab
         merge request are both returned.
         """
+        repository = normalize_repository_key(repository, provider.value)
+        if repository is None:
+            return []
         rows = await self._conn.fetch(
             """
             SELECT id, awx_job_id, job_template_id, external_session_id, provider,
@@ -1132,7 +1150,8 @@ class _ExecutionBindingsRepositoryMixin:
                    external_session_ids AS external_session_ids_json
             FROM execution_bindings
             WHERE provider = $1
-              AND repository_url = $2
+              AND ((provider = 'github' AND lower(repository_url) = lower($2))
+                   OR (provider <> 'github' AND repository_url = $2))
               AND entity_type = $3
               AND entity_number = $4
             ORDER BY created_at ASC, id ASC

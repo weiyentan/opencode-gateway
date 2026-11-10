@@ -101,6 +101,25 @@ class AFKRun(Base):
                 "change_request_external_id IS NOT NULL"
             ),
         ),
+        # Provider-aware 1:1 identity: GitHub repository path casing is
+        # insignificant, while GitLab casing remains significant. The exact
+        # index above continues to enforce the existing cross-provider key;
+        # this expression index closes the GitHub case-folding gap.
+        Index(
+            "uq_afk_runs_github_change_request_identity_casefold",
+            text(
+                r"lower(regexp_replace(regexp_replace("
+                r"rtrim(change_request_repository, '/'), '(\.git)+$', '', 'i'), "
+                r"'^([^/]+):(80|443)/', '\1/', 'i'))"
+            ),
+            "change_request_external_id",
+            unique=True,
+            postgresql_where=text(
+                "change_request_provider = 'github' AND "
+                "change_request_repository IS NOT NULL AND "
+                "change_request_external_id IS NOT NULL"
+            ),
+        ),
         # Lookup index for recovery relationships.
         Index("ix_afk_runs_recovered_from", "recovered_from_afk_run_id"),
     )

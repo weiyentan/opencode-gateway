@@ -523,12 +523,18 @@ def test_list_execution_bindings_for_resource_queries_correctly(
     mock_conn.fetch.assert_called_once()
     sql = mock_conn.fetch.call_args[0][0]
     assert "WHERE provider = $1" in sql
-    assert "AND repository_url = $2" in sql
+    assert "lower(repository_url) = lower($2)" in sql
+    assert "repository_url = $2" in sql
     assert "AND entity_type = $3" in sql
     assert "AND entity_number = $4" in sql
     assert "ORDER BY created_at ASC" in sql
     args = mock_conn.fetch.call_args[0][1:]
-    assert args == ("github", "org/repo", "change_request", "42")
+    assert args == (
+        "github",
+        "github.com/org/repo",
+        "change_request",
+        "42",
+    )
 
 
 def test_list_execution_bindings_returns_all_bindings(
@@ -1297,7 +1303,7 @@ class TestUpdateExecutionBindingTerminal:
         args = updates[0][1]
         assert args[4] == "ses_found_later"
         assert args[5] == "github"
-        assert args[6] == "org/repo"
+        assert args[6] == "github.com/org/repo"
         assert args[7] == "change_request"
         assert args[8] == "7"
 
@@ -1778,7 +1784,7 @@ class TestCreateOrReplayProviderCompatibility:
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
         assert len(binds) == 1
         assert binds[0][1][1] == "github"
-        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][2] == "github.com/org/repo"
         assert binds[0][1][3] == "42"
         assert "SET status" not in binds[0][0]
 
@@ -1814,7 +1820,7 @@ class TestCreateOrReplayProviderCompatibility:
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
         assert len(binds) == 1
         assert binds[0][1][1] == "github"
-        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][2] == "github.com/org/repo"
         assert binds[0][1][3] == "42"
         assert "SET status" not in binds[0][0]
 
@@ -1868,6 +1874,9 @@ class TestCreateOrReplayProviderCompatibility:
                         "change_request_repository": "org/repo",
                         "change_request_external_id": "42",
                     }
+                ),
+                mock_row(
+                    {"owner_count": 1, "afk_run_id": "01SUPPLIED00000000000000001"}
                 ),
             ]
         )
@@ -2097,7 +2106,7 @@ class TestUpdateExecutionBindingTerminalLifecycleAuthority:
         binds = _calls_matching(mock_conn, r"UPDATE afk_runs")
         assert len(binds) == 1
         assert binds[0][1][1] == "github"
-        assert binds[0][1][2] == "org/repo"
+        assert binds[0][1][2] == "github.com/org/repo"
         assert binds[0][1][3] == "7"
         assert "SET status" not in binds[0][0]
         assert len(_calls_matching(mock_conn, r"UPDATE execution_bindings")) == 1
@@ -2148,6 +2157,9 @@ class TestUpdateExecutionBindingTerminalLifecycleAuthority:
                         "change_request_repository": "org/repo",
                         "change_request_external_id": "7",
                     }
+                ),
+                mock_row(
+                    {"owner_count": 1, "afk_run_id": "01SUPPLIED00000000000000001"}
                 ),
             ]
         )
@@ -2415,6 +2427,9 @@ class TestUpdateTerminalSessionLink:
                         "change_request_repository": "org/repo",
                         "change_request_external_id": "7",
                     }
+                ),
+                mock_row(
+                    {"owner_count": 1, "afk_run_id": "01SUPPLIED00000000000000001"}
                 ),
             ]
         )

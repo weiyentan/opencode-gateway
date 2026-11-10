@@ -57,7 +57,7 @@ from typing import Any
 
 import asyncpg
 
-from app.core.repository import normalize_repository_url
+from app.core.repository import normalize_repository_key
 from app.core.schemas.reporting import ReportingDeliveryIn
 from app.core.secrets import redact_dict
 
@@ -132,7 +132,7 @@ def resource_identity_from_payload(
     repository_url = resource.get("repository_url")
     if not isinstance(repository_url, str):
         return None
-    repository_url = normalize_repository_url(repository_url)
+    repository_url = normalize_repository_key(repository_url, provider)
     if not repository_url:
         return None
 

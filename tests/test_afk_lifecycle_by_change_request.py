@@ -86,6 +86,32 @@ class TestGetRunByChangeRequest:
         assert cr["resource_number"] == "42"
 
     @pytest.mark.asyncio
+    async def test_lookup_github_identity_folds_owner_and_repository_case(self) -> None:
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetch = AsyncMock(return_value=[mock_row({"afk_run_id": _RUN_ID})])
+        client = create_client(conn)
+
+        response = await client.get(
+            _lookup_url(
+                provider="github",
+                repository="https://GITHUB.com/MaxinNZ/Pfinder.git/",
+                external_id="434",
+            )
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["change_request"]["repository"] == (
+            "github.com/maxinnz/pfinder"
+        )
+        sql, *args = conn.fetch.call_args.args
+        assert "rtrim(change_request_repository, '/')" in sql
+        assert "(\\.git)+$" in sql
+        assert "= lower($2)" in sql
+        assert tuple(args) == ("github", "github.com/maxinnz/pfinder", "434")
+
+    @pytest.mark.asyncio
     async def test_lookup_normalizes_repository(self) -> None:
         from tests.conftest import create_client
 
@@ -248,7 +274,12 @@ class TestGetRunByChangeRequest:
             repository=repository,
             external_id=external_id,
         ))
-        assert resp.status_code == 404
+        expected_status = (
+            400 if provider == "github" and "gitlab.com" in repository else 404
+        )
+        assert resp.status_code == expected_status
+        if expected_status == 400:
+            return
         data = resp.json()
         assert data["status"] == "error"
         assert "not found" in data["error"]["message"].lower()

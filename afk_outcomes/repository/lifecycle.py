@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from afk_outcomes.repository_identity import normalize_repository_key
 from afk_outcomes.models import (
     AFKRunLifecycle,
     Provider,
@@ -21,6 +22,11 @@ from afk_outcomes.models import (
 )
 from afk_outcomes.repository.executions import ProvisionAFKRunResult
 from afk_outcomes.serialization import ULIDSource
+
+_GITHUB_REPOSITORY_IDENTITY_SQL = r"""lower(regexp_replace(
+    regexp_replace(rtrim(change_request_repository, '/'), '(\.git)+$', '', 'i'),
+    '^([^/]+):(80|443)/', '\1/', 'i'
+))"""
 
 
 @dataclass(frozen=True)
@@ -163,8 +169,21 @@ class _LifecycleRepositoryMixin:
         is delegated to :meth:`_batch_provenance_matches`, which is the sole
         authority on batch-provenance matching.
         """
+        provider = existing.get("provider") or requested.get("provider")
+        existing_repository = existing.get("repository")
+        requested_repository = requested.get("repository")
+        if existing_repository is not None and requested_repository is not None:
+            existing_identity = normalize_repository_key(existing_repository, provider)
+            requested_identity = normalize_repository_key(requested_repository, provider)
+            repositories_match = (
+                existing_identity is not None
+                and requested_identity is not None
+                and existing_identity == requested_identity
+            )
+        else:
+            repositories_match = existing_repository == requested_repository
         return (
-            existing.get("repository") == requested.get("repository")
+            repositories_match
             and existing.get("trigger_type") == requested.get("trigger_type")
             and existing.get("title") == requested.get("title")
             and existing.get("recovered_from_afk_run_id")
@@ -230,6 +249,7 @@ class _LifecycleRepositoryMixin:
 
         def _requested_payload() -> dict:
             return {
+                "provider": provider.value,
                 "repository": repository,
                 "trigger_type": trigger_type.value,
                 "title": title,
@@ -240,7 +260,7 @@ class _LifecycleRepositoryMixin:
         async with self._conn.transaction():
             existing = await self._conn.fetchrow(
                 """
-                SELECT afk_run_id, repository, trigger_type, title,
+                SELECT afk_run_id, provider, repository, trigger_type, title,
                        recovered_from_afk_run_id, first_delivery_id
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
@@ -311,7 +331,7 @@ class _LifecycleRepositoryMixin:
             # payloads to distinguish replay from conflict.
             winner = await self._conn.fetchrow(
                 """
-                SELECT afk_run_id, repository, trigger_type, title,
+                SELECT afk_run_id, provider, repository, trigger_type, title,
                        recovered_from_afk_run_id, first_delivery_id
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
@@ -444,11 +464,9 @@ class _LifecycleRepositoryMixin:
           without mutation.
         * **Change request owned by another lifecycle** — returns
           ``is_conflict=True`` without mutation (the 1:1 invariant).
-        * **Same lifecycle, same change request, concurrent** — when the
-          1:1 pre-check finds that the *requested lifecycle itself* is now
-          the owner (a concurrent identical bind committed between our read
-          and the pre-check), it is re-read, validated, and classified as an
-          idempotent replay — never a false ``409`` (issue #600 review).
+        * **Same lifecycle, same change request, concurrent** — the partial
+          unique indexes serialize change-request ownership and a same-run
+          replay is classified idempotently.
         * **Lost race** — a concurrent bind of the same lifecycle is re-read
           and classified as replay or conflict, and a concurrent bind of the
           same change request to another lifecycle (a
@@ -461,35 +479,67 @@ class _LifecycleRepositoryMixin:
         own ``afk_runs`` SELECT and can reuse the row the host method has
         already fetched.
         """
+        repository = normalize_repository_key(repository, provider.value)
+        if repository is None:
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=True,
+            )
         existing_tuple = (
             run.get("change_request_provider"),
             run.get("change_request_repository"),
             run.get("change_request_external_id"),
         )
         if existing_tuple[0] is not None:
-            is_match = existing_tuple == (provider.value, repository, external_id)
+            # A previously stored GitHub binding may retain mixed case from
+            # before provider-aware canonicalization. Reconcile it as the
+            # same identity. Migration 0050 preflights canonical collisions
+            # and installs the matching unique identity index without
+            # rewriting historical values.
+            is_same_request = (
+                existing_tuple[0] == provider.value
+                and normalize_repository_key(existing_tuple[1], provider.value)
+                == repository
+                and existing_tuple[2] == external_id
+            )
+            if not is_same_request:
+                return ChangeRequestBindingResult(
+                    afk_run_id=afk_run_id, is_conflict=True
+                )
             return ChangeRequestBindingResult(
                 afk_run_id=afk_run_id,
-                is_conflict=not is_match,
+                is_conflict=False,
             )
 
         # 1:1 invariant — the change request must not already belong to
         # another lifecycle.  The partial unique index also enforces this
         # under concurrency; this pre-check turns the common case into a
         # clean conflict instead of a constraint violation.
-        other = await self._conn.fetchrow(
-            """
-            SELECT afk_run_id FROM afk_runs
+        owner = await self._conn.fetchrow(
+            f"""
+            SELECT count(*) AS owner_count, min(afk_run_id) AS afk_run_id
+            FROM afk_runs
             WHERE change_request_provider = $1
-              AND change_request_repository = $2
+                  AND ((change_request_provider = 'github'
+                        AND {_GITHUB_REPOSITORY_IDENTITY_SQL} = lower($2))
+                   OR (change_request_provider <> 'github'
+                       AND change_request_repository = $2))
               AND change_request_external_id = $3
             """,
             provider.value,
             repository,
             external_id,
         )
-        if other is not None:
-            if other["afk_run_id"] == afk_run_id:
+        owner_count = owner.get("owner_count") if owner is not None else 0
+        if owner_count is None:
+            owner_count = 1 if owner is not None and owner.get("afk_run_id") else 0
+        if owner_count > 1:
+            return ChangeRequestBindingResult(
+                afk_run_id=afk_run_id,
+                is_conflict=True,
+            )
+        if owner_count:
+            if owner is not None and owner["afk_run_id"] == afk_run_id:
                 # The requested lifecycle itself now owns the change request —
                 # a concurrent identical bind committed between our earlier
                 # read of ``run`` and this pre-check.  Re-read and validate
@@ -506,10 +556,12 @@ class _LifecycleRepositoryMixin:
                     afk_run_id,
                 )
                 is_match = run is not None and (
-                    run["change_request_provider"],
-                    run["change_request_repository"],
-                    run["change_request_external_id"],
-                ) == (provider.value, repository, external_id)
+                    run["change_request_provider"] == provider.value
+                    and normalize_repository_key(
+                        run["change_request_repository"], provider.value
+                    ) == repository
+                    and run["change_request_external_id"] == external_id
+                )
                 return ChangeRequestBindingResult(
                     afk_run_id=afk_run_id,
                     is_conflict=not is_match,
@@ -563,10 +615,12 @@ class _LifecycleRepositoryMixin:
                     afk_run_id,
                 )
                 is_match = run is not None and (
-                    run["change_request_provider"],
-                    run["change_request_repository"],
-                    run["change_request_external_id"],
-                ) == (provider.value, repository, external_id)
+                    run["change_request_provider"] == provider.value
+                    and normalize_repository_key(
+                        run["change_request_repository"], provider.value
+                    ) == repository
+                    and run["change_request_external_id"] == external_id
+                )
                 return ChangeRequestBindingResult(
                     afk_run_id=afk_run_id,
                     is_conflict=not is_match,
@@ -698,11 +752,14 @@ class _LifecycleRepositoryMixin:
         Read-only: issues no writes.
         """
         rows = await self._conn.fetch(
-            """
+            f"""
             SELECT afk_run_id
             FROM afk_runs
             WHERE change_request_provider = $1
-              AND change_request_repository = $2
+              AND ((change_request_provider = 'github'
+                    AND {_GITHUB_REPOSITORY_IDENTITY_SQL} = lower($2))
+                   OR (change_request_provider <> 'github'
+                       AND change_request_repository = $2))
               AND change_request_external_id = $3
             """,
             provider.value,
