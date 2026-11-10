@@ -422,9 +422,9 @@ class TestBindChangeRequest:
             change_request_repository="gitlab.com/cloudnative-pg/cloudnative-pg",
             change_request_external_id="6",
         )
-        # auth → run (already bound same) → readback
+        # auth → run → canonical ownership probe → lifecycle readback
         conn.fetchrow = AsyncMock(
-            side_effect=[_auth_row(), bound_row, bound_row]
+            side_effect=[_auth_row(), bound_row, bound_row, bound_row]
         )
         conn.execute = AsyncMock()
         client = create_client(conn)

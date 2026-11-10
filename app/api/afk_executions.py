@@ -84,7 +84,7 @@ from afk_outcomes.repository import AsyncpgOutcomeRepository
 from afk_outcomes.serialization import MonotonicULID
 from app.core.auth import require_collector_token
 from app.core.config import get_settings
-from app.core.repository import normalize_repository_url
+from app.core.repository import normalize_repository_key, normalize_repository_url
 from app.core.schemas.afk_lifecycle import (
     AFKRunLifecycleResponse,
     AFKRunProvisionRequest,
@@ -173,17 +173,20 @@ def _validate_awx_job_id(awx_job_id: str) -> str:
     return awx_job_id
 
 
-def _normalize_repository_or_400(repository: str) -> str:
+def _normalize_repository_or_400(
+    repository: str, provider: str | None = None
+) -> str:
     """Normalize a repository URL at the API boundary (issue #565).
 
     Uses the canonical :func:`app.core.repository.normalize_repository_url`
     helper — the same normalizer used by the AFK consumer, reporting
     aggregates, and closure projection.  Returns the normalized identity
-    (host lowercased, scheme dropped, trailing slash/.git stripped) or
+    (host lowercased, GitHub path lowercased, GitLab path preserved, scheme
+    dropped, trailing slash/.git stripped) or
     raises a clear 400 when the identity is invalid (not an absolute
     HTTP(S) URL, missing hostname/path, etc.).
     """
-    normalized = normalize_repository_url(repository)
+    normalized = normalize_repository_url(repository, provider)
     if normalized is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -249,7 +252,10 @@ def _binding_conflicts_with(
             return True
         if (
             existing.resource.provider != resource.provider
-            or existing.resource.repository != resource.repository
+            or normalize_repository_key(
+                existing.resource.repository, resource.provider.value
+            )
+            != resource.repository
             or existing.resource.resource_type.value != resource.resource_type
             or existing.resource.resource_number != resource.resource_number
         ):
@@ -373,7 +379,9 @@ async def create_execution_binding(
     # (two-phase provisioning / failed execution, issue #590) skips this.
     normalized_repo = None
     if resource is not None:
-        normalized_repo = _normalize_repository_or_400(resource.repository)
+        normalized_repo = _normalize_repository_or_400(
+            resource.repository, resource.provider.value
+        )
         # Mutate the validated body so conflict comparison and persistence use
         # the canonical identity; provider-native types are already normalized
         # to change_request by the schema's model_validator.
@@ -520,7 +528,9 @@ async def update_execution_binding(
     resource = body.resource
     normalized_repo = None
     if resource is not None:
-        normalized_repo = _normalize_repository_or_400(resource.repository)
+        normalized_repo = _normalize_repository_or_400(
+            resource.repository, resource.provider.value
+        )
         resource.repository = normalized_repo
 
     settings = get_settings()
@@ -798,7 +808,9 @@ async def list_execution_bindings(
         )
 
     # Normalize repository URL at the API boundary before querying (issue #565).
-    normalized_repository_url = _normalize_repository_or_400(repository_url)
+    normalized_repository_url = _normalize_repository_or_400(
+        repository_url, provider
+    )
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -873,7 +885,9 @@ async def provision_afk_run_lifecycle(
     """
     # Normalize the repository identity at the API boundary before any
     # persistence or conflict comparison (same helper as execution bindings).
-    normalized_repo = _normalize_repository_or_400(body.repository)
+    normalized_repo = _normalize_repository_or_400(
+        body.repository, body.provider.value
+    )
     body.repository = normalized_repo
 
     settings = get_settings()
@@ -960,7 +974,9 @@ async def bind_lifecycle_change_request(
     # Normalize the repository identity at the API boundary (same helper as
     # execution bindings); GitHub PRs and GitLab MRs both bind under the
     # canonical change_request identity.
-    normalized_repo = _normalize_repository_or_400(body.repository)
+    normalized_repo = _normalize_repository_or_400(
+        body.repository, body.provider.value
+    )
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):
@@ -1054,7 +1070,7 @@ async def get_run_by_change_request(
     # Normalize the repository identity at the API boundary (same helper as
     # the write paths); GitHub PRs and GitLab MRs both resolve under the
     # canonical change_request identity.
-    normalized_repo = _normalize_repository_or_400(repository)
+    normalized_repo = _normalize_repository_or_400(repository, provider)
 
     settings = get_settings()
     async with _request_timeout(settings.total_request_timeout_seconds):

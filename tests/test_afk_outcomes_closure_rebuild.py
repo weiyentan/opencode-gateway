@@ -43,7 +43,7 @@ from tests.conftest import mock_row
 
 UTC = timezone.utc  # noqa: UP017 - datetime.UTC is 3.11+
 
-REPO = "gitlab.com/cloudnative-pg"
+REPO = "gitlab.com/platform/cloudnative-pg"
 T0 = datetime(2026, 8, 1, 10, 0, 0, tzinfo=UTC)
 
 

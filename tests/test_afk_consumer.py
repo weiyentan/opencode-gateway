@@ -1415,13 +1415,19 @@ def _normalized_payload(**overrides: object) -> dict:
     envelope.  The payload reference is kept in lockstep with the envelope
     unless ``redacted_payload`` is overridden explicitly.
     """
+    provider = overrides.pop("provider", "github")
     resource_type = overrides.pop("resource_type", "pull_request")
     resource_id = overrides.pop("resource_id", "442")
-    repository = overrides.pop("repository", "https://github.com/owner/repo")
+    default_repository = (
+        "https://gitlab.com/group/project"
+        if str(provider) == "gitlab"
+        else "https://github.com/owner/repo"
+    )
+    repository = overrides.pop("repository", default_repository)
     payload: dict[str, object] = {
         "schema_version": "1.0",
         "event_type": "normalized",
-        "provider": "github",
+        "provider": provider,
         "delivery_id": DELIVERY_ID,
         "resource": {
             "type": resource_type,
@@ -1433,7 +1439,7 @@ def _normalized_payload(**overrides: object) -> dict:
         "ingested_at": "2026-08-01T10:31:00Z",
         "actor": "carol",
         "redacted_payload": {
-            "reference": {"provider": "github", "delivery_id": DELIVERY_ID}
+            "reference": {"provider": provider, "delivery_id": DELIVERY_ID}
         },
     }
     payload.update(overrides)
@@ -2780,6 +2786,7 @@ def test_producer_contract_gitlab_merge_request_maps_to_change_request() -> None
             "resource": {
                 **PRODUCER_CONTRACT_EVENT["resource"],
                 "type": "merge_request",
+                "repository_url": "https://gitlab.com/group/project",
             },
         }
     )
@@ -3452,7 +3459,8 @@ def test_validate_rejects_empty_repository() -> None:
     [
         # Basic normalization.
         ("https://github.com/owner/repo", "github.com/owner/repo"),
-        ("https://github.com/Owner/Repo", "github.com/Owner/Repo"),  # path case preserved
+        ("https://github.com/Owner/Repo", "github.com/owner/repo"),  # GitHub folds path case
+        ("https://github.com/MaxinNZ/Pfinder", "github.com/maxinnz/pfinder"),
         ("https://GITHUB.COM/owner/repo", "github.com/owner/repo"),  # hostname lowercased
         # Trailing slash.
         ("https://github.com/owner/repo/", "github.com/owner/repo"),
@@ -3462,19 +3470,10 @@ def test_validate_rejects_empty_repository() -> None:
         # Default ports stripped.
         ("https://github.com:443/owner/repo", "github.com/owner/repo"),
         ("http://github.com:80/owner/repo", "github.com/owner/repo"),
-        # Non-default ports preserved.
-        ("https://github.com:8443/owner/repo", "github.com:8443/owner/repo"),
-        ("http://github.com:8080/owner/repo", "github.com:8080/owner/repo"),
-        # Credentials removed.
-        ("https://user:pass@github.com/owner/repo", "github.com/owner/repo"),
-        # Query string removed.
-        ("https://github.com/owner/repo?ref=main", "github.com/owner/repo"),
-        # Fragment removed.
-        ("https://github.com/owner/repo#readme", "github.com/owner/repo"),
         # GitLab-style.
-        ("https://gitlab.com/group/subgroup/project", "gitlab.com/group/subgroup/project"),
-        # Self-hosted.
-        ("https://git.example.com/org/repo", "git.example.com/org/repo"),
+        ("https://gitlab.com/Group/SubGroup/Project", "gitlab.com/Group/SubGroup/Project"),
+        # Enterprise host identity is retained.
+        ("https://github.example.com/Org/Repo.git/", "github.example.com/org/repo"),
     ],
 )
 def test_normalize_repository_url(raw: str, expected: str) -> None:
@@ -3494,22 +3493,28 @@ def test_normalize_repository_url(raw: str, expected: str) -> None:
         "/owner/repo",  # relative path
         "https:///owner/repo",  # empty hostname
         "https:///",  # no path
+        "https://github.com:8443/owner/repo",
+        "http://github.com:8080/owner/repo",
+        "https://user:pass@github.com/owner/repo",
+        "https://github.com/owner/repo?ref=main",
+        "https://github.com/owner/repo#readme",
+        "https://github.com/owner/repo/extra",
+        "https://github.com//repo",
+        "https://example.com/org/repo",
     ],
 )
 def test_normalize_repository_url_rejects_invalid(raw: str) -> None:
     assert normalize_repository_url(raw) is None
 
 
-def test_normalize_repository_url_credentials_not_in_identity() -> None:
-    """Credentials, query strings, and fragments cannot become part of repository identity."""
-    result = normalize_repository_url(
-        "https://admin:secret@github.com/owner/repo.git?ref=main#section"
+def test_normalize_repository_url_accepts_custom_enterprise_host_with_provider() -> None:
+    assert normalize_repository_url("https://git.internal/Org/Project", "gitlab") == (
+        "git.internal/Org/Project"
     )
-    assert result == "github.com/owner/repo"
-    assert "admin" not in result
-    assert "secret" not in result
-    assert "ref=main" not in result
-    assert "section" not in result
+
+
+def test_normalize_repository_url_rejects_provider_host_mismatch() -> None:
+    assert normalize_repository_url("https://gitlab.com/group/project", "github") is None
 
 
 # ── Validation: distinct DLQ reasons per violation class ────────────────────

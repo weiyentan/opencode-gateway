@@ -227,7 +227,7 @@ class TestCompareReportingAggregates:
             "occurred_at": occurred_at,
             "payload": {
                 "resource": {
-                    "repository_url": "https://gitlab.example.com/cloudnative-pg.git",
+                    "repository_url": "https://gitlab.example.com/platform/cloudnative-pg.git",
                     "type": "merge_request",
                     "number": number,
                 }
@@ -237,7 +237,7 @@ class TestCompareReportingAggregates:
     def _aggregate(self, *, delivery_id, occurred_at, provider="gitlab", number="6"):
         return {
             "provider": provider,
-            "repository_url": "gitlab.example.com/cloudnative-pg",
+            "repository_url": "gitlab.example.com/platform/cloudnative-pg",
             "resource_type": "change_request",
             "resource_number": number,
             "last_occurred_at": occurred_at,
@@ -269,7 +269,7 @@ class TestCompareReportingAggregates:
         mismatch = mismatches[0]
         assert mismatch.source == "reporting_resource_aggregates"
         assert mismatch.provider == "gitlab"
-        assert mismatch.repository == "gitlab.example.com/cloudnative-pg"
+        assert mismatch.repository == "gitlab.example.com/platform/cloudnative-pg"
         assert mismatch.resource_type == "change_request"
         assert mismatch.resource_number == "6"
         assert mismatch.fields["last_delivery_id"].rollup == "d1"
@@ -501,7 +501,7 @@ class TestFetchReportingMismatches:
             [
                 {
                     "provider": "gitlab",
-                    "repository_url": "gitlab.example.com/cloudnative-pg",
+                    "repository_url": "gitlab.example.com/platform/cloudnative-pg",
                     "resource_type": "change_request",
                     "resource_number": "6",
                     "last_occurred_at": t,
@@ -516,7 +516,7 @@ class TestFetchReportingMismatches:
                     "occurred_at": t,
                     "payload": {
                         "resource": {
-                            "repository_url": "https://gitlab.example.com/cloudnative-pg",
+                            "repository_url": "https://gitlab.example.com/platform/cloudnative-pg",
                             "type": "merge_request",
                             "number": "6",
                         }

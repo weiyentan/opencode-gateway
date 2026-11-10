@@ -292,6 +292,42 @@ def test_provision_conflict_detects_repository_difference(mock_conn: AsyncMock) 
     assert result.is_conflict is True
 
 
+def test_provision_replay_matches_historical_mixed_case_github_repository() -> None:
+    """Legacy mixed-case repository strings remain the same GitHub identity."""
+    assert AsyncpgOutcomeRepository.provisioning_payload_matches(
+        {
+            "provider": "github",
+            "repository": "github.com/MaxinNZ/Pfinder",
+            "trigger_type": "eda",
+            "title": "Existing PR",
+            "recovered_from_afk_run_id": None,
+        },
+        {
+            "provider": "github",
+            "repository": "github.com/maxinnz/pfinder",
+            "trigger_type": "eda",
+            "title": "Existing PR",
+            "recovered_from_afk_run_id": None,
+        },
+    )
+    assert not AsyncpgOutcomeRepository.provisioning_payload_matches(
+        {
+            "provider": "gitlab",
+            "repository": "gitlab.com/Group/Project",
+            "trigger_type": "eda",
+            "title": "Existing MR",
+            "recovered_from_afk_run_id": None,
+        },
+        {
+            "provider": "gitlab",
+            "repository": "gitlab.com/group/project",
+            "trigger_type": "eda",
+            "title": "Existing MR",
+            "recovered_from_afk_run_id": None,
+        },
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  provision_afk_run — recovery relationships
 # ══════════════════════════════════════════════════════════════════════════
@@ -414,11 +450,13 @@ def test_bind_other_owner_select_filters_on_change_request_identity(
     repo = AsyncpgOutcomeRepository(mock_conn)
     _run(repo.bind_change_request(**_binding_kwargs()))
 
-    selects = _calls_matching(mock_conn, r"SELECT afk_run_id FROM afk_runs")
+    selects = _calls_matching(mock_conn, r"SELECT count\(\*\) AS owner_count")
     assert len(selects) == 1
     sql, args = selects[0]
     assert "WHERE change_request_provider = $1" in sql
-    assert "AND change_request_repository = $2" in sql
+    assert "rtrim(change_request_repository, '/')" in sql
+    assert "(\\.git)+$" in sql
+    assert "= lower($2)" in sql
     assert "AND change_request_external_id = $3" in sql
     assert args == ("gitlab", "gitlab.com/cnp/cnp", "6")
 
@@ -444,6 +482,57 @@ def test_bind_replay_same_identity_issues_no_update(mock_conn: AsyncMock) -> Non
     assert result.is_bound is False
     assert result.is_conflict is False
     assert result.run_missing is False
+    assert _update_calls(mock_conn) == []
+
+
+def test_bind_reconciles_historical_mixed_case_github_binding(
+    mock_conn: AsyncMock,
+) -> None:
+    row = _bound_run_row(
+        cr_provider="github",
+        cr_repository="github.com/MaxinNZ/Pfinder",
+        cr_external_id="434",
+    )
+    mock_conn.fetchrow = AsyncMock(return_value=row)
+    mock_conn.execute = AsyncMock()
+
+    result = _run(
+        AsyncpgOutcomeRepository(mock_conn).bind_change_request(
+            **_binding_kwargs(
+                provider=Provider.GITHUB,
+                repository="github.com/maxinnz/pfinder",
+                external_id="434",
+            )
+        )
+    )
+
+    assert result.is_conflict is False
+    assert result.is_bound is False
+    assert _update_calls(mock_conn) == []
+
+
+def test_bind_fails_closed_on_historical_casefold_collision(
+    mock_conn: AsyncMock,
+) -> None:
+    unbound = _bound_run_row()
+    collision = mock_row(
+        {"owner_count": 2, "afk_run_id": "01HOTHER000000000000000001"}
+    )
+    mock_conn.fetchrow = AsyncMock(side_effect=[unbound, collision])
+    mock_conn.execute = AsyncMock()
+
+    result = _run(
+        AsyncpgOutcomeRepository(mock_conn).bind_change_request(
+            **_binding_kwargs(
+                provider=Provider.GITHUB,
+                repository="github.com/maxinnz/pfinder",
+                external_id="434",
+            )
+        )
+    )
+
+    assert result.is_conflict is True
+    assert result.is_bound is False
     assert _update_calls(mock_conn) == []
 
 

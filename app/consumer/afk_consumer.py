@@ -383,7 +383,7 @@ def validate_normalized_event(message: NormalizedProviderEvent) -> None:
 
     # ── Repository identity ─────────────────────────────────────────
     repo = message.resource.repository_url
-    normalized = normalize_repository_url(repo)
+    normalized = normalize_repository_url(repo, message.provider.value)
     if normalized is None:
         raise NormalizedEventValidationError(
             f"Invalid repository identity: {repo!r} — "
@@ -434,7 +434,9 @@ def map_normalized_event(
     if event_type not in _CANONICAL_EVENT_TYPES:
         return None
 
-    repository = normalize_repository_url(resource.repository_url)
+    repository = normalize_repository_url(
+        resource.repository_url, message.provider.value
+    )
     if repository is None:
         return None
     number = resource.number
