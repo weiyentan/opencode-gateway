@@ -37,13 +37,15 @@ fails closed instead of skipping.
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import asyncpg
 import pytest
+import pytest_asyncio
+from fastapi import Request
 
 from app.core.identity import hash_token
 from app.core.reporting_aggregates import (
@@ -51,17 +53,7 @@ from app.core.reporting_aggregates import (
     get_aggregate,
 )
 from app.core.repository import normalize_repository_url
-from tests.integration._disposable_postgres import (
-    DatabaseTarget,
-    verify_disposable_target,
-)
-
-_PROJ_ROOT = Path(__file__).resolve().parent.parent.parent
-_ALEMBIC_INI = _PROJ_ROOT / "alembic.ini"
-
-# Resolved once at import (never connects); the safety preflight in
-# ``_verified_disposable_database`` verifies it before any destructive step.
-_TARGET = DatabaseTarget.from_env()
+from tests.integration._disposable_postgres import target_dsn as _dsn
 
 UTC = timezone.utc
 
@@ -72,57 +64,28 @@ _T1_5 = datetime(2026, 8, 14, 12, 30, 0, tzinfo=UTC)
 _T2 = datetime(2026, 8, 15, 12, 0, 0, tzinfo=UTC)
 
 
-def _dsn() -> str:
-    return _TARGET.dsn()
+def _decode_jsonb(value: object) -> object:
+    """Decode a raw-asyncpg JSONB column value for assertions.
 
-
-@pytest.fixture(scope="module")
-def _verified_disposable_database() -> DatabaseTarget:
-    """Fail closed unless the target is an explicitly disposable PostgreSQL 16 DB.
-
-    Runs before ``db_pool`` (and therefore before any destructive migration
-    reset).  A missing attestation, unapproved/mismatched DSN, unreachable
-    server, Kubernetes target, or wrong server version raises an error — never
-    a skip.
+    Production registers no ``set_type_codec`` for ``jsonb``
+    (``app/db/session.py``), so asyncpg returns JSONB columns as JSON
+    strings.  The suite must therefore decode explicitly instead of relying
+    on a test-only pool codec that the app-under-test never installs.
     """
-    import asyncio
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
-    return asyncio.run(verify_disposable_target(_TARGET))
 
-
-@pytest.fixture(scope="module")
-async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool:
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def db_pool(_migrated_schema: None) -> asyncpg.Pool:
+    # No ``init`` hook: the pool must decode JSONB exactly as production does
+    # (raw strings), so the multi-delivery tests exercise the real ingest path.
     pool = await asyncpg.create_pool(dsn=_dsn(), min_size=2, max_size=5)
     assert pool is not None
 
-    import alembic.command
-    import alembic.config
-
-    sync_url = _dsn().replace("postgresql://", "postgresql+psycopg://")
-    alembic_cfg = alembic.config.Config(str(_ALEMBIC_INI))
-    alembic_cfg.set_main_option("script_location", str(_PROJ_ROOT / "alembic"))
-    alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
-    try:
-        alembic.command.upgrade(alembic_cfg, "head")
-    except Exception:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DO $$ DECLARE r RECORD; BEGIN "
-                "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-                "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-                "END LOOP; END $$;"
-            )
-        alembic.command.upgrade(alembic_cfg, "head")
-
     yield pool
 
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DO $$ DECLARE r RECORD; BEGIN "
-            "FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP "
-            "EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; "
-            "END LOOP; END $$;"
-        )
     await pool.close()
 
 
@@ -130,10 +93,12 @@ async def db_pool(_verified_disposable_database: DatabaseTarget) -> asyncpg.Pool
 
 
 def _resource(*, repository_url: str, resource_type: str, resource_number: str) -> dict:
+    # The normalized-event v1 ``resource`` object carries ``type`` and
+    # ``number``; ``resource_identity_from_payload`` reads exactly those keys.
     return {
         "repository_url": repository_url,
-        "resource_type": resource_type,
-        "resource_number": resource_number,
+        "type": resource_type,
+        "number": resource_number,
     }
 
 
@@ -159,6 +124,13 @@ def _make_payload(
     }
 
 
+def _without_resource(payload: object) -> dict:
+    """Strip the per-resource identity so *state* payloads can be compared."""
+    decoded = _decode_jsonb(payload)
+    assert isinstance(decoded, dict)
+    return {k: v for k, v in decoded.items() if k != "resource"}
+
+
 async def _seed_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
     client_id = await conn.fetchval(
         "INSERT INTO opencode_clients (name) VALUES ($1) RETURNING id",
@@ -175,7 +147,13 @@ async def _seed_client(conn: asyncpg.Connection) -> tuple[uuid.UUID, uuid.UUID]:
 
 
 def _build_app(db_pool: asyncpg.Pool) -> object:
-    from fastapi import Request
+    """Build a FastAPI app connected to the real integration DB pool.
+
+    ``Request`` must be imported at module level (never locally): FastAPI
+    resolves the string annotation of the ``get_session`` override through
+    the defining module's globals, and a local import would make ``request``
+    fall back to a query parameter (422 on every route).
+    """
     from httpx import ASGITransport, AsyncClient
 
     from app.core.factory import create_app
@@ -206,7 +184,7 @@ def _build_app(db_pool: asyncpg.Pool) -> object:
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None:
     """Ingesting a delivery with a ``resource`` object creates one aggregate row."""
     async with db_pool.acquire() as conn:
@@ -240,14 +218,16 @@ async def test_aggregate_row_created_after_ingest(db_pool: asyncpg.Pool) -> None
     async with db_pool.acquire() as conn:
         row = await get_aggregate(conn, identity)
     assert row is not None
-    assert row["repository_url"] == "https://github.com/acme/backend"
+    assert row["repository_url"] == "github.com/Acme/Backend"
     assert row["last_delivery_id"].startswith("delivery-")
-    assert row["payload"]["status"] == "open"
-    assert row["payload"]["title"] == "in progress"
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
+    assert payload["status"] == "open"
+    assert payload["title"] == "in progress"
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool) -> None:
     """A stale delivery (older occurred_at) never regresses newer state."""
     async with db_pool.acquire() as conn:
@@ -286,22 +266,24 @@ async def test_late_event_fills_absent_but_never_regresses(db_pool: asyncpg.Pool
 
     identity = ResourceIdentity(
         provider="github",
-        repository_url="https://github.com/acme/backend",
+        repository_url=normalize_repository_url("https://github.com/acme/backend"),
         resource_type="issue",
         resource_number="7",
     )
     async with db_pool.acquire() as conn:
         row = await get_aggregate(conn, identity)
     assert row is not None
+    payload = _decode_jsonb(row["payload"])
+    assert isinstance(payload, dict)
     # conflicting fields stay at the newer event's values (no regression)
-    assert row["payload"]["status"] == "closed"
-    assert row["payload"]["title"] == "done"
+    assert payload["status"] == "closed"
+    assert payload["title"] == "done"
     # absent key from the late event is filled forward
-    assert row["payload"]["labels"] == ["bug"]
+    assert payload["labels"] == ["bug"]
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -> None:
     """Replay convergence: ingestion order does not affect the final aggregate."""
     async with db_pool.acquire() as conn:
@@ -332,8 +314,10 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
 
     client = _build_app(db_pool)
 
-    # Order 1: live then replay → resource "conv-a"
+    # Both orders run against the same client; an httpx AsyncClient cannot be
+    # reopened once its context manager has been exited.
     async with client as c:
+        # Order 1: live then replay → resource "conv-a"
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
@@ -353,8 +337,7 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
             ),
         )
 
-    # Order 2: replay then live → resource "conv-b"
-    async with client as c:
+        # Order 2: replay then live → resource "conv-b"
         await c.post(
             "/api/v1/reporting/ingest/deliveries",
             json=_make_payload(
@@ -385,22 +368,25 @@ async def test_live_then_replay_equals_replay_then_live(db_pool: asyncpg.Pool) -
         )
 
     assert row_a is not None and row_b is not None
-    assert row_a["payload"] == row_b["payload"]
+    # The payload's ``resource`` object carries the per-order resource number,
+    # so only the state portion converges.
+    assert _without_resource(row_a["payload"]) == _without_resource(row_b["payload"])
     assert row_a["last_occurred_at"] == row_b["last_occurred_at"]
-    assert row_a["last_delivery_id"] == row_b["last_delivery_id"]
 
     # The converged state is the newer (live) event's values, with the
-    # replay-only key filled forward.
-    assert row_a["payload"] == {
+    # replay-only key filled forward.  Each order's last delivery id is its
+    # own live delivery; the ids deliberately differ to avoid dedup no-ops.
+    assert _without_resource(row_a["payload"]) == {
         "status": "closed",
         "title": "done",
         "labels": ["bug"],
     }
     assert row_a["last_delivery_id"] == live["delivery_id"]
+    assert row_b["last_delivery_id"] == live2["delivery_id"]
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_three_event_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -451,9 +437,11 @@ async def test_three_event_merge_converges_across_arrival_orders(
         )
 
     assert len(rows) == 6
-    first = rows[0]["payload"]
+    # Each permutation writes its own resource number into ``payload.resource``;
+    # compare only the converged state portion.
+    first = _without_resource(rows[0]["payload"])
     for row in rows:
-        assert row["payload"] == first
+        assert _without_resource(row["payload"]) == first
     # The converged state takes the newest value per key: y written by e3
     # (newer than e2), x written by e1 — independent of arrival order.
     assert first["x"] == 1
@@ -461,7 +449,7 @@ async def test_three_event_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_none_key_merge_converges_across_arrival_orders(
     db_pool: asyncpg.Pool,
 ) -> None:
@@ -518,9 +506,6 @@ async def test_none_key_merge_converges_across_arrival_orders(
     # The ``resource`` object is the aggregate identity and therefore carries
     # a different ``resource_number`` per permutation; strip it so the *state*
     # portion of each row can be compared for convergence.
-    def _without_resource(payload: dict) -> dict:
-        return {k: v for k, v in payload.items() if k != "resource"}
-
     first = _without_resource(rows[0]["payload"])
     first_last_occurred_at = rows[0]["last_occurred_at"]
     assert first == {"a": 7, "b": 1}
@@ -530,7 +515,7 @@ async def test_none_key_merge_converges_across_arrival_orders(
 
 
 @pytest.mark.integration
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_unique_identity_constraint_enforced(db_pool: asyncpg.Pool) -> None:
     """A second direct INSERT of the same identity key is rejected."""
     async with db_pool.acquire() as conn:
