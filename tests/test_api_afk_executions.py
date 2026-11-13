@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock  # noqa: F811
 
@@ -1831,7 +1831,7 @@ class TestTwoPhaseLifecycle:
         from tests.conftest import create_client
 
         conn = _mk_conn()
-        finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
+        finished = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
         terminal_row = _update_row(outcome="completed", finished_at=finished)
         read_row = _mk_binding_row(
             awx_job_id=42, outcome="completed", finished_at=finished

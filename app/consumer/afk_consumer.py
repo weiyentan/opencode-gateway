@@ -58,15 +58,6 @@ from afk_outcomes.models import (
 )
 from afk_outcomes.providers.github_http import GitHubHttpApi
 from afk_outcomes.repository import AsyncpgOutcomeRepository
-from app.core.metrics import (
-    DEFAULT_REGISTRY,
-    METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES,
-    METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS,
-    MetricsRegistry,
-    register_closure_projection_metrics,
-)
-from app.core.repository import normalize_repository_url
-from scripts.afk_backfill import PrefetchedWindow, run_backfill
 from app.consumer.dlq_sweep import (
     _DEFAULT_DLQ_ESCALATION_TOPIC,  # noqa: F401 (re-exported for backward compatibility)
     _DEFAULT_DLQ_MAX_AGE_DAYS,
@@ -85,6 +76,15 @@ from app.consumer.dlq_sweep import (
     run_dlq_sweep,  # noqa: F401 (re-exported for backward compatibility)
     sweep_dlq,  # noqa: F401 (re-exported for backward compatibility)
 )
+from app.core.metrics import (
+    DEFAULT_REGISTRY,
+    METRIC_CLOSURE_PROJECTION_RECOMPUTE_FAILURES,
+    METRIC_CLOSURE_PROJECTION_RECOMPUTE_LAST_SUCCESS,
+    MetricsRegistry,
+    register_closure_projection_metrics,
+)
+from app.core.repository import normalize_repository_url
+from scripts.afk_backfill import PrefetchedWindow, run_backfill
 
 logger = logging.getLogger(__name__)
 

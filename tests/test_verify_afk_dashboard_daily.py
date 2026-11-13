@@ -370,8 +370,9 @@ class TestReadOnlySql:
 
     def test_no_write_statements_in_helpers(self):
         """The shared helpers contain no SQL — it's a pure-Python module."""
-        from scripts import verify_helpers as mod
         import inspect
+
+        from scripts import verify_helpers as mod
 
         for name, obj in inspect.getmembers(mod):
             if isinstance(obj, str) and obj.lstrip().upper().startswith(

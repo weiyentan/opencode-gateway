@@ -43,8 +43,8 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Sequence
 from datetime import date
-from typing import Sequence
 
 import asyncpg
 
@@ -58,10 +58,14 @@ from scripts.verify_helpers import (  # noqa: E402
     Mismatch,
     VerificationWindow,
     compare_reporting_aggregates,
-    exit_code as _exit_code,
-    format_mismatch as _format_mismatch,
     group_mismatches,
     parse_window,
+)
+from scripts.verify_helpers import (
+    exit_code as _exit_code,
+)
+from scripts.verify_helpers import (
+    format_mismatch as _format_mismatch,
 )
 
 logger = logging.getLogger("verify_reporting_resource_aggregates")

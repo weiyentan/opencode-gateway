@@ -4,10 +4,10 @@ Revision ID: 0044
 Revises:     0043
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
+from typing import Union
 
 from alembic import op
-
 
 revision: str = "0044"
 down_revision: Union[str, None] = "0043"  # noqa: UP007

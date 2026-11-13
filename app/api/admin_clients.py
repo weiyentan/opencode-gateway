@@ -6,7 +6,7 @@ separate dependency used by future collector-facing endpoints.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -32,7 +32,7 @@ router = APIRouter(prefix="/admin/clients", tags=["admin"])
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _row_to_client_read(row: asyncpg.Record) -> ClientRead:

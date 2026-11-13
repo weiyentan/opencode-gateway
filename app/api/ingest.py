@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, NotRequired, TypedDict, cast
 
@@ -337,7 +337,7 @@ class _CanonicalEventResult(TypedDict):
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _decimal_equal(a: Decimal | None, b: Decimal | None) -> bool:
@@ -931,7 +931,7 @@ def _normalise_ms_to_datetime(ms: int | None) -> datetime | None:
     """
     if ms is None:
         return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
 
 
 async def _resolve_internal_session_id(
