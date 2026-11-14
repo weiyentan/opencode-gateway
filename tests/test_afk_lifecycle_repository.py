@@ -81,6 +81,7 @@ def _existing_row(
             "trigger_type": trigger_type,
             "title": title,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
+            "logical_target": None,
         }
     )
 
@@ -668,6 +669,7 @@ def _lifecycle_row(**overrides) -> MagicMock:
         "change_request_repository": None,
         "change_request_external_id": None,
         "recovered_from_afk_run_id": None,
+        "logical_target": None,
         "first_seen_at": None,
         "last_seen_at": None,
     }

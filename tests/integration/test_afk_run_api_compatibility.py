@@ -63,6 +63,7 @@ def _mk_run_row(
     change_request_repository: str | None = None,
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
+    logical_target: str | None = None,
 ):
     """Build a mock ``afk_runs`` row covering every column the API reads."""
     return mock_row(
@@ -83,6 +84,8 @@ def _mk_run_row(
             "change_request_repository": change_request_repository,
             "change_request_external_id": change_request_external_id,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
+            # Immutable logical execution target (migration 0051, issue #856).
+            "logical_target": logical_target,
         }
     )
 
@@ -1000,6 +1003,7 @@ class TestExecutionApiCompatibility:
                     "change_request_repository": None,
                     "change_request_external_id": None,
                     "recovered_from_afk_run_id": None,
+                    "logical_target": None,
                     "first_seen_at": _A_TS,
                     "last_seen_at": _A_TS,
                 }

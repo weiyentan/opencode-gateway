@@ -2592,6 +2592,7 @@ class TestGetExecutionBindingsForRun:
                 "change_request_repository": None,
                 "change_request_external_id": None,
                 "recovered_from_afk_run_id": None,
+                "logical_target": None,
                 "first_seen_at": _A_TS,
                 "last_seen_at": _A_TS,
             }

@@ -91,6 +91,7 @@ def _existing_key_row(**overrides) -> MagicMock:
         "title": "Implement auth",
         "recovered_from_afk_run_id": None,
         "first_delivery_id": None,
+        "logical_target": None,
     }
     row.update(overrides)
     return mock_row(row)
@@ -458,6 +459,7 @@ def _mk_lifecycle_row(**overrides) -> MagicMock:
         "change_request_repository": None,
         "change_request_external_id": None,
         "recovered_from_afk_run_id": None,
+        "logical_target": None,
         "first_seen_at": None,
         "last_seen_at": None,
     }

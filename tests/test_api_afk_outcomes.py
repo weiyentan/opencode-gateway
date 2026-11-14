@@ -84,6 +84,7 @@ def _mk_run_row(
             "change_request_repository": None,
             "change_request_external_id": None,
             "recovered_from_afk_run_id": None,
+            "logical_target": None,
         }
     )
 

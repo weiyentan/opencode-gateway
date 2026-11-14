@@ -102,6 +102,7 @@ def _existing_key_row(**overrides) -> MagicMock:
         "trigger_type": "eda",
         "title": "Implement auth",
         "recovered_from_afk_run_id": None,
+        "logical_target": None,
     }
     row.update(overrides)
     return mock_row(row)
