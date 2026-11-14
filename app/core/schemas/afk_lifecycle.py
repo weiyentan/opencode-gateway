@@ -245,9 +245,12 @@ class AFKRunLifecycleResponse(BaseModel):
         batch records via the optional ``first_delivery_id`` /
         ``delivery_ids`` arguments (issue #595); ``None`` arguments render
         the legacy empty-batch shape.  The immutable logical execution
-        target is surfaced from the stored ``afk_runs.logical_target`` via
-        the optional ``logical_target`` argument (issue #856) — ``None``
-        for runs provisioned without a target and for legacy rows.
+        target (issue #856) is surfaced from the optional ``logical_target``
+        argument when supplied — the explicit argument stays authoritative
+        for existing callers — and otherwise falls back to the domain
+        ``AFKRunLifecycle.logical_target`` carried by the lifecycle
+        readback; ``None`` for runs provisioned without a target and for
+        legacy rows (never fabricated).
         """
         return cls(
             afk_run_id=lifecycle.afk_run_id,
@@ -257,7 +260,11 @@ class AFKRunLifecycleResponse(BaseModel):
             repository=lifecycle.repository,
             trigger_type=lifecycle.trigger_type,
             title=lifecycle.title,
-            logical_target=logical_target,
+            logical_target=(
+                logical_target
+                if logical_target is not None
+                else lifecycle.logical_target
+            ),
             first_delivery_id=first_delivery_id,
             delivery_ids=delivery_ids or [],
             change_request=lifecycle.change_request_identity(),

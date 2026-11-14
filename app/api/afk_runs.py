@@ -253,6 +253,7 @@ def _afk_run_summary(row: asyncpg.Record) -> AFKRunSummary:
         title=row["title"],
         repository=row["repository"],
         trigger_type=row["trigger_type"],
+        logical_target=row["logical_target"],
         recovered_from_afk_run_id=row["recovered_from_afk_run_id"],
         change_request=change_request,
         started_at=row["started_at"],
@@ -343,7 +344,7 @@ async def _fetch_canonical_runs(
 
     data_sql = f"""
         SELECT r.afk_run_id, r.provider, r.title, r.repository,
-               r.trigger_type, r.recovered_from_afk_run_id,
+               r.trigger_type, r.logical_target, r.recovered_from_afk_run_id,
                r.change_request_provider, r.change_request_repository,
                r.change_request_external_id,
                r.started_at, r.finished_at, r.outcome_status,
@@ -381,7 +382,8 @@ async def _fetch_canonical_run_detail(
                 """
                 SELECT afk_run_id, provider, title, started_at, finished_at,
                        outcome_status, outcome, first_seen_at, last_seen_at,
-                       repository, trigger_type, recovered_from_afk_run_id,
+                       repository, trigger_type, logical_target,
+                       recovered_from_afk_run_id,
                        change_request_provider, change_request_repository,
                        change_request_external_id
                 FROM afk_runs
@@ -748,7 +750,8 @@ async def update_run(
                 row = await conn.fetchrow(
                     """
                     SELECT afk_run_id, provider, title, repository,
-                           trigger_type, recovered_from_afk_run_id,
+                           trigger_type, logical_target,
+                           recovered_from_afk_run_id,
                            change_request_provider, change_request_repository,
                            change_request_external_id,
                            started_at, finished_at, outcome_status,

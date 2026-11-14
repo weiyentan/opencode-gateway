@@ -15,6 +15,17 @@ provisioned by a client that does not send a target) reads back as
 Downgrade drops the nullable column, restoring the migration 0050 shape;
 historic rows are untouched.
 
+Validation layering (issue #856 review): the target is deliberately NOT
+guarded by a database CHECK constraint.  This schema has no CHECK-constraint
+precedent on any table, and the column has exactly one writer — the
+provisioning authority ``provision_afk_run`` — reachable only through
+``POST /api/v1/afk/executions/runs``, whose Pydantic request model
+(``AFKRunProvisionRequest.logical_target``) enforces the anchored shape
+(``^[A-Za-z0-9][A-Za-z0-9._:-]*$``, max length 100) before the repository
+layer ever sees the value.  API-layer validation therefore covers every
+write path; a DB-level CHECK would duplicate that rule in a second language
+without an additional writer to protect against.
+
 Revision ID: 0051
 Revises:     0050
 Create Date: 2026-11-15

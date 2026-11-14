@@ -730,15 +730,19 @@ class _LifecycleRepositoryMixin:
 
         Legacy ``afk_runs`` rows (backfill/reconstruction, migration 0026)
         predate the lifecycle columns; for them ``host``,
-        ``source_event_id``, ``repository``, and ``trigger_type`` read back
-        as ``None`` (the domain model is lenient on readback).
+        ``source_event_id``, ``repository``, ``trigger_type``, and
+        ``logical_target`` read back as ``None`` (the domain model is lenient
+        on readback).  The immutable logical execution target (issue #856)
+        is carried on the returned lifecycle so callers reading the whole
+        lifecycle need no separate round-trip for it.
         """
         row = await self._conn.fetchrow(
             """
             SELECT afk_run_id, provider, host, source_event_id, repository,
                    trigger_type, title, change_request_provider,
                    change_request_repository, change_request_external_id,
-                   recovered_from_afk_run_id, first_seen_at, last_seen_at
+                   recovered_from_afk_run_id, logical_target,
+                   first_seen_at, last_seen_at
             FROM afk_runs
             WHERE afk_run_id = $1
             """,
@@ -762,6 +766,7 @@ class _LifecycleRepositoryMixin:
             change_request_repository=row.get("change_request_repository"),
             change_request_external_id=row.get("change_request_external_id"),
             recovered_from_afk_run_id=row.get("recovered_from_afk_run_id"),
+            logical_target=row.get("logical_target"),
             first_seen_at=row.get("first_seen_at"),
             last_seen_at=row.get("last_seen_at"),
         )

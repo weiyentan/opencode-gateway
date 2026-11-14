@@ -947,7 +947,10 @@ async def provision_afk_run_lifecycle(
     first_delivery_id, delivery_ids = await repo.get_afk_run_batch_provenance(
         result.afk_run_id
     )
-    logical_target = await repo.get_afk_run_logical_target(result.afk_run_id)
+
+    # The immutable logical target (issue #856) rides the lifecycle SELECT
+    # above — one afk_runs read carries the whole lifecycle, so no separate
+    # target round-trip is issued here (single-read consistency).
 
     if result.is_created:
         response.status_code = status.HTTP_201_CREATED
@@ -955,7 +958,6 @@ async def provision_afk_run_lifecycle(
         lifecycle,
         first_delivery_id=first_delivery_id,
         delivery_ids=delivery_ids,
-        logical_target=logical_target,
     )
 
 
@@ -1031,11 +1033,10 @@ async def bind_lifecycle_change_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve lifecycle after change-request binding",
         )
-    logical_target = await repo.get_afk_run_logical_target(afk_run_id)
-    return AFKRunLifecycleResponse.from_domain(
-        lifecycle,
-        logical_target=logical_target,
-    )
+    # The immutable logical target (issue #856) rides the lifecycle SELECT
+    # above — one afk_runs read carries the whole lifecycle, so no separate
+    # target round-trip is issued here (single-read consistency).
+    return AFKRunLifecycleResponse.from_domain(lifecycle)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1175,13 +1176,15 @@ async def get_afk_run_lifecycle_readback(
                 first_delivery_id, delivery_ids = await repo.get_afk_run_batch_provenance(
                     afk_run_id
                 )
-                logical_target = await repo.get_afk_run_logical_target(afk_run_id)
+                # The immutable logical target (issue #856) rides the
+                # lifecycle SELECT above — one afk_runs read carries the
+                # whole lifecycle inside the request/db timeout budget, so
+                # no separate target round-trip is issued here.
 
     return AFKRunLifecycleResponse.from_domain(
         lifecycle,
         first_delivery_id=first_delivery_id,
         delivery_ids=delivery_ids,
-        logical_target=logical_target,
     )
 
 

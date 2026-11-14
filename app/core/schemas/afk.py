@@ -68,6 +68,10 @@ class AFKRunSummary(RunSummary):
         default=None,
         description="eda | manual | scheduled | backfill | recovery",
     )
+    logical_target: str | None = Field(
+        default=None,
+        description="Immutable logical execution target; null for legacy rows",
+    )
     recovered_from_afk_run_id: str | None = Field(
         default=None,
         description="Gateway ULID of the recovery predecessor run, if any",

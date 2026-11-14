@@ -120,4 +120,20 @@ def test_legacy_row_readback_allows_null_lifecycle_fields() -> None:
     assert lifecycle.source_event_id is None
     assert lifecycle.repository is None
     assert lifecycle.trigger_type is None
+    assert lifecycle.logical_target is None
     assert lifecycle.change_request_identity() is None
+
+
+# ── Immutable logical execution target (issue #856) ─────────────────────────
+
+
+def test_logical_target_defaults_to_none() -> None:
+    """Omitting logical_target reads back as None — backwards compatible."""
+    lifecycle = AFKRunLifecycle(**_lifecycle())
+    assert lifecycle.logical_target is None
+
+
+def test_logical_target_carries_provided_value() -> None:
+    """A provisioned target is carried verbatim on the lifecycle."""
+    lifecycle = AFKRunLifecycle(**_lifecycle(logical_target="runner-vm-01"))
+    assert lifecycle.logical_target == "runner-vm-01"

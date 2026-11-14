@@ -57,6 +57,7 @@ def _mk_run_row(
     change_request_repository: str | None = None,
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
+    logical_target: str | None = None,
 ):
     return mock_row(
         {
@@ -87,6 +88,8 @@ def _mk_run_row(
             "change_request_repository": change_request_repository,
             "change_request_external_id": change_request_external_id,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
+            # Immutable logical execution target (migration 0051, issue #856).
+            "logical_target": logical_target,
         }
     )
 
@@ -259,6 +262,41 @@ class TestCanonicalListRuns:
             "repository": "acme/proj",
             "external_id": "442",
         }
+
+    @pytest.mark.asyncio
+    async def test_items_carry_logical_target(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """List items expose the immutable logical execution target
+        (issue #856) — the same value the execution-scoped lifecycle
+        readback surfaces for the same run."""
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[_mk_run_row(logical_target="runner-vm-7")]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk/runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["logical_target"] == "runner-vm-7"
+
+    @pytest.mark.asyncio
+    async def test_items_logical_target_null_for_legacy_row(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A legacy row (no bound target) surfaces logical_target as null —
+        never a fabricated value."""
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(return_value=[_mk_run_row()])
+
+        async with client as c:
+            response = await c.get("/api/v1/afk/runs")
+
+        assert response.status_code == 200
+        item = response.json()["data"]["items"][0]
+        assert item["logical_target"] is None
 
     @pytest.mark.asyncio
     async def test_has_change_request_true_filters_bound(
@@ -547,6 +585,41 @@ class TestCanonicalRunDetail:
             "repository": "acme/proj",
             "external_id": "442",
         }
+
+    @pytest.mark.asyncio
+    async def test_run_block_carries_logical_target(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """The canonical detail run block exposes the immutable logical
+        execution target (issue #856) — the same value the execution-scoped
+        lifecycle readback surfaces for the same run."""
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_mk_run_row(logical_target="runner-vm-7")
+        )
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 200
+        run = response.json()["data"]["run"]
+        assert run["logical_target"] == "runner-vm-7"
+
+    @pytest.mark.asyncio
+    async def test_run_block_logical_target_null_for_legacy_row(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        """A legacy row (no bound target) surfaces logical_target as null —
+        never a fabricated value."""
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 200
+        run = response.json()["data"]["run"]
+        assert run["logical_target"] is None
 
     @pytest.mark.asyncio
     async def test_unknown_run_returns_404(

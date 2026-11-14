@@ -146,6 +146,7 @@ lifecycle fields. The outcomes endpoints keep their exact current
 | `title` | string \| null | |
 | `repository` | string \| null | Normalized identity; `null` for legacy rows |
 | `trigger_type` | string \| null | `eda` \| `manual` \| `scheduled` \| `backfill` \| `recovery` |
+| `logical_target` | string \| null | Immutable logical execution target; `null` for legacy rows and runs provisioned without one — never fabricated |
 | `recovered_from_afk_run_id` | string \| null | Recovery predecessor |
 | `change_request` | object \| null | `{provider, repository, external_id}` when bound; `null` when unbound |
 | `started_at` / `finished_at` | datetime \| null | |
