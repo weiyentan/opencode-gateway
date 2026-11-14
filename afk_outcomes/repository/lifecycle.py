@@ -159,8 +159,10 @@ class _LifecycleRepositoryMixin:
         any field differs (indicating a conflict rather than a replay).
 
         The comparison covers the fields that define the provisioning contract:
-        ``repository``, ``trigger_type``, ``title``, and
-        ``recovered_from_afk_run_id``.  The idempotency key fields
+        ``repository``, ``trigger_type``, ``title``, ``recovered_from_afk_run_id``,
+        and the immutable ``logical_target`` (issue #856 — a bound target is
+        never reassigned, and omitting one against a stored target is a
+        conflict, never an erasure).  The idempotency key fields
         (``provider``, ``host``, ``source_event_id``) are assumed to already
         match — the caller is responsible for selecting the existing row by
         those fields.
@@ -188,6 +190,7 @@ class _LifecycleRepositoryMixin:
             and existing.get("title") == requested.get("title")
             and existing.get("recovered_from_afk_run_id")
             == requested.get("recovered_from_afk_run_id")
+            and existing.get("logical_target") == requested.get("logical_target")
         )
 
     async def provision_afk_run(
@@ -201,6 +204,7 @@ class _LifecycleRepositoryMixin:
         title: str | None = None,
         recovered_from_afk_run_id: str | None = None,
         deliveries: list[str] | None = None,
+        logical_target: str | None = None,
         ulid_source: ULIDSource,
     ) -> ProvisionAFKRunResult:
         """Idempotently provision one provisional AFK run lifecycle.
@@ -225,6 +229,15 @@ class _LifecycleRepositoryMixin:
         * **Missing predecessor** — a ``recovered_from_afk_run_id`` that
           references no existing run returns ``predecessor_missing=True``
           without inserting anything.
+
+        ``logical_target`` (issue #856) is the explicitly selected logical
+        execution target.  It is optional for backward compatibility (old
+        clients omit it and the run carries ``NULL``); when supplied it is
+        persisted on the run and becomes **immutable**.  An identical replay
+        (same target) returns the same run and target; any different target —
+        including omitting one against a bound target — is a conflict with no
+        reassignment.  The provisioning authority is the only writer; no
+        other path sets or clears the target.
 
         Creating a recovery lifecycle (``recovered_from_afk_run_id`` set)
         never mutates the predecessor row — the predecessor is only read.
@@ -255,13 +268,15 @@ class _LifecycleRepositoryMixin:
                 "title": title,
                 "recovered_from_afk_run_id": recovered_from_afk_run_id,
                 "first_delivery_id": first_delivery_id,
+                "logical_target": logical_target,
             }
 
         async with self._conn.transaction():
             existing = await self._conn.fetchrow(
                 """
                 SELECT afk_run_id, provider, repository, trigger_type, title,
-                       recovered_from_afk_run_id, first_delivery_id
+                       recovered_from_afk_run_id, first_delivery_id,
+                       logical_target
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -301,9 +316,9 @@ class _LifecycleRepositoryMixin:
                      outcome_status, outcome, host, source_event_id, repository,
                      trigger_type, change_request_provider, change_request_repository,
                      change_request_external_id, recovered_from_afk_run_id,
-                     first_delivery_id, first_seen_at, last_seen_at)
+                     first_delivery_id, logical_target, first_seen_at, last_seen_at)
                 VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
-                        NULL, NULL, NULL, $8, $9, now(), now())
+                        NULL, NULL, NULL, $8, $9, $10, now(), now())
                 ON CONFLICT (provider, host, source_event_id)
                     WHERE host IS NOT NULL AND source_event_id IS NOT NULL
                     DO NOTHING
@@ -318,6 +333,7 @@ class _LifecycleRepositoryMixin:
                 trigger_type.value,
                 recovered_from_afk_run_id,
                 first_delivery_id,
+                logical_target,
             )
             if rows:
                 run_id = rows[0]["afk_run_id"]
@@ -332,7 +348,8 @@ class _LifecycleRepositoryMixin:
             winner = await self._conn.fetchrow(
                 """
                 SELECT afk_run_id, provider, repository, trigger_type, title,
-                       recovered_from_afk_run_id, first_delivery_id
+                       recovered_from_afk_run_id, first_delivery_id,
+                       logical_target
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -439,6 +456,27 @@ class _LifecycleRepositoryMixin:
             if row.get("delivery_id") is not None
         ]
         return (first_delivery_id, delivery_ids)
+
+    async def get_afk_run_logical_target(self, afk_run_id: str) -> str | None:
+        """Return the stored logical execution target for ``afk_run_id``.
+
+        The target is the explicitly selected worker target bound once at
+        provisioning (issue #856).  Unknown runs, runs provisioned without a
+        target (legacy clients), and historic ``afk_runs`` rows all read back
+        as ``None`` — no target is ever fabricated.  The column is nullable
+        text, so any non-text driver value is treated as no target rather
+        than leaking an unserialisable value into the response.  Read-only:
+        issues no writes.
+        """
+        target = await self._conn.fetchval(
+            """
+            SELECT logical_target
+            FROM afk_runs
+            WHERE afk_run_id = $1
+            """,
+            afk_run_id,
+        )
+        return target if isinstance(target, str) else None
 
     async def _apply_change_request_binding(
         self,

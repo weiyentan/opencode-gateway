@@ -31,7 +31,13 @@ Provisional AFK run lifecycle endpoints (mounted on this router as
 - ``POST /runs`` — provision one provisional lifecycle.  Idempotent on
   ``provider + host + source_event_id``; a conflicting replay returns 409.
   ``recovered_from_afk_run_id`` provisions a recovery lifecycle without
-  mutating its predecessor.
+  mutating its predecessor.  An optional explicit ``logical_target`` is
+  bound once to the canonical ``afk_run_id`` and is immutable thereafter
+  (issue #856) — an identical replay returns the same target, a different
+  target is a 409 conflict with no reassignment.
+- ``GET /runs/{afk_run_id}/lifecycle`` — read the durable lifecycle back,
+  including the immutable ``logical_target`` (null for runs provisioned
+  without one and for legacy rows).
 - ``POST /runs/{afk_run_id}/change-request`` — bind one change request to a
   lifecycle.  Idempotent per lifecycle (the 1:1 lifecycle<->change_request
   invariant); conflicts return 409.
@@ -882,6 +888,13 @@ async def provision_afk_run_lifecycle(
     **Recovery** — ``recovered_from_afk_run_id`` provisions a recovery
     lifecycle that references its predecessor without mutating it; a
     missing predecessor returns ``404``.
+
+    **Logical execution target (issue #856)** — the optional explicit
+    ``logical_target`` is persisted on the canonical ``afk_run_id`` and is
+    immutable: an identical retry returns the same run and target; any
+    different target (including omitting a bound one) is a ``409`` conflict
+    with no reassignment.  Omitting the field preserves the legacy shape —
+    the run carries no target and reads back ``null``.
     """
     # Normalize the repository identity at the API boundary before any
     # persistence or conflict comparison (same helper as execution bindings).
@@ -906,6 +919,7 @@ async def provision_afk_run_lifecycle(
                     title=body.title,
                     recovered_from_afk_run_id=body.recovered_from_afk_run_id,
                     deliveries=body.deliveries,
+                    logical_target=body.logical_target,
                     ulid_source=MonotonicULID(),
                 )
 
@@ -933,6 +947,7 @@ async def provision_afk_run_lifecycle(
     first_delivery_id, delivery_ids = await repo.get_afk_run_batch_provenance(
         result.afk_run_id
     )
+    logical_target = await repo.get_afk_run_logical_target(result.afk_run_id)
 
     if result.is_created:
         response.status_code = status.HTTP_201_CREATED
@@ -940,6 +955,7 @@ async def provision_afk_run_lifecycle(
         lifecycle,
         first_delivery_id=first_delivery_id,
         delivery_ids=delivery_ids,
+        logical_target=logical_target,
     )
 
 
@@ -1015,7 +1031,11 @@ async def bind_lifecycle_change_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve lifecycle after change-request binding",
         )
-    return AFKRunLifecycleResponse.from_domain(lifecycle)
+    logical_target = await repo.get_afk_run_logical_target(afk_run_id)
+    return AFKRunLifecycleResponse.from_domain(
+        lifecycle,
+        logical_target=logical_target,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1111,6 +1131,57 @@ async def get_run_by_change_request(
             resource_type=EntityType.CHANGE_REQUEST,
             resource_number=external_id,
         ),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/{afk_run_id}/lifecycle — durable readback
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/runs/{afk_run_id}/lifecycle",
+    response_model=AFKRunLifecycleResponse,
+)
+async def get_afk_run_lifecycle_readback(
+    request: Request,
+    afk_run_id: str,
+    conn: asyncpg.Connection = Depends(get_session),
+) -> AFKRunLifecycleResponse:
+    """Read one provisional lifecycle back from durable storage (issue #856).
+
+    The read counterpart of ``POST /runs``: source provenance, repository
+    identity, trigger metadata, batch provenance, and the immutable
+    ``logical_target`` (``null`` for runs provisioned without one and for
+    legacy rows — never fabricated).  Read-only (API-key auth only, no
+    collector token); an unknown lifecycle returns ``404``.
+
+    Persistence is database-backed, so the answer is identical after a
+    Gateway restart and across concurrent provisioning replays.
+    """
+    settings = get_settings()
+    async with _request_timeout(settings.total_request_timeout_seconds):
+        repo = AsyncpgOutcomeRepository(conn)
+        async with timed_operation("db.query.afk_run.lifecycle", "db"):
+            async with _db_timeout(
+                "db.query.afk_run.lifecycle", settings.database_timeout_seconds
+            ):
+                lifecycle = await repo.get_afk_run_lifecycle(afk_run_id)
+                if lifecycle is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Provisional lifecycle not found: {afk_run_id}",
+                    )
+                first_delivery_id, delivery_ids = await repo.get_afk_run_batch_provenance(
+                    afk_run_id
+                )
+                logical_target = await repo.get_afk_run_logical_target(afk_run_id)
+
+    return AFKRunLifecycleResponse.from_domain(
+        lifecycle,
+        first_delivery_id=first_delivery_id,
+        delivery_ids=delivery_ids,
+        logical_target=logical_target,
     )
 
 
