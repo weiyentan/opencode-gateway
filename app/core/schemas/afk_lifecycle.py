@@ -68,6 +68,20 @@ class AFKRunProvisionRequest(BaseModel):
         ),
     )
     title: str | None = Field(default=None, description="Optional lifecycle title")
+    logical_target: str | None = Field(
+        default=None,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        description=(
+            "Explicit logical execution target selected for this run (an "
+            "opaque worker/target label, 1-100 chars, alphanumeric first "
+            "character followed by alphanumerics, '.', '_', ':' or '-').  "
+            "Bound once at provisioning and immutable thereafter: an "
+            "identical retry returns the same target, any different target "
+            "(including omitting a bound one) is a 409 conflict.  Optional — "
+            "legacy clients omit it and runs carry no target."
+        ),
+    )
     deliveries: list[str] = Field(
         default_factory=list,
         description=(
@@ -180,6 +194,14 @@ class AFKRunLifecycleResponse(BaseModel):
         ),
     )
     title: str | None = Field(default=None, description="Lifecycle title")
+    logical_target: str | None = Field(
+        default=None,
+        description=(
+            "Immutable logical execution target bound to this run at "
+            "provisioning (None for runs provisioned without one and for "
+            "legacy rows — never fabricated)"
+        ),
+    )
     first_delivery_id: str | None = Field(
         default=None,
         description=(
@@ -213,6 +235,7 @@ class AFKRunLifecycleResponse(BaseModel):
         *,
         first_delivery_id: str | None = None,
         delivery_ids: list[str] | None = None,
+        logical_target: str | None = None,
     ) -> AFKRunLifecycleResponse:
         """Build the response from a domain :class:`AFKRunLifecycle`.
 
@@ -221,7 +244,13 @@ class AFKRunLifecycleResponse(BaseModel):
         flattened columns).  Batch provenance is surfaced from the stored
         batch records via the optional ``first_delivery_id`` /
         ``delivery_ids`` arguments (issue #595); ``None`` arguments render
-        the legacy empty-batch shape.
+        the legacy empty-batch shape.  The immutable logical execution
+        target (issue #856) is surfaced from the optional ``logical_target``
+        argument when supplied — the explicit argument stays authoritative
+        for existing callers — and otherwise falls back to the domain
+        ``AFKRunLifecycle.logical_target`` carried by the lifecycle
+        readback; ``None`` for runs provisioned without a target and for
+        legacy rows (never fabricated).
         """
         return cls(
             afk_run_id=lifecycle.afk_run_id,
@@ -231,6 +260,11 @@ class AFKRunLifecycleResponse(BaseModel):
             repository=lifecycle.repository,
             trigger_type=lifecycle.trigger_type,
             title=lifecycle.title,
+            logical_target=(
+                logical_target
+                if logical_target is not None
+                else lifecycle.logical_target
+            ),
             first_delivery_id=first_delivery_id,
             delivery_ids=delivery_ids or [],
             change_request=lifecycle.change_request_identity(),

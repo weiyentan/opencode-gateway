@@ -167,6 +167,9 @@ class AFKRun(Base):
         String, nullable=True
     )
 
+    # ── Immutable logical execution target (migration 0051, issue #856) ──
+    logical_target: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
 
 class AFKRunSessionLink(Base):
     """An association between an AFK run and an OpenCode session.

@@ -81,6 +81,7 @@ def _existing_row(
             "trigger_type": trigger_type,
             "title": title,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
+            "logical_target": None,
         }
     )
 
@@ -668,6 +669,7 @@ def _lifecycle_row(**overrides) -> MagicMock:
         "change_request_repository": None,
         "change_request_external_id": None,
         "recovered_from_afk_run_id": None,
+        "logical_target": None,
         "first_seen_at": None,
         "last_seen_at": None,
     }
@@ -728,7 +730,21 @@ def test_get_lifecycle_maps_legacy_row_leniently(mock_conn: AsyncMock) -> None:
     assert lifecycle.source_event_id is None
     assert lifecycle.repository is None
     assert lifecycle.trigger_type is None
+    assert lifecycle.logical_target is None
     assert lifecycle.change_request_identity() is None
+
+
+def test_get_lifecycle_maps_logical_target(mock_conn: AsyncMock) -> None:
+    """The stored logical execution target is carried on the readback (issue #856)."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_lifecycle_row(logical_target="runner-vm-01")
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    lifecycle = _run(repo.get_afk_run_lifecycle(_NEW_ULID))
+
+    assert lifecycle is not None
+    assert lifecycle.logical_target == "runner-vm-01"
 
 
 def test_get_lifecycle_select_includes_all_lifecycle_columns(
@@ -750,6 +766,7 @@ def test_get_lifecycle_select_includes_all_lifecycle_columns(
         "change_request_repository",
         "change_request_external_id",
         "recovered_from_afk_run_id",
+        "logical_target",
     ):
         assert col in sql, f"SELECT missing column: {col}"
     assert "WHERE afk_run_id = $1" in sql
@@ -845,3 +862,65 @@ async def test_lookup_is_read_only(mock_conn: AsyncMock) -> None:
 
     assert mock_conn.execute.call_count == 0
     assert mock_conn.fetchrow.call_count == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  get_afk_run_logical_target — immutable logical execution target (issue #856)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_get_logical_target_returns_stored_target(
+    mock_conn: AsyncMock,
+) -> None:
+    """A run with a bound target reads back exactly the stored value."""
+    mock_conn.fetchval = AsyncMock(return_value="runner-vm-01")
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    target = await repo.get_afk_run_logical_target(_NEW_ULID)
+
+    assert target == "runner-vm-01"
+
+
+@pytest.mark.asyncio
+async def test_get_logical_target_returns_none_when_missing(
+    mock_conn: AsyncMock,
+) -> None:
+    """An unknown run id reads back as no target (never fabricated)."""
+    mock_conn.fetchval = AsyncMock(return_value=None)
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    target = await repo.get_afk_run_logical_target("01HMISSING0000000000000001")
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_get_logical_target_treats_non_text_as_none(
+    mock_conn: AsyncMock,
+) -> None:
+    """A non-text driver value is treated as no target, never leaked."""
+    mock_conn.fetchval = AsyncMock(return_value=12345)
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    target = await repo.get_afk_run_logical_target(_NEW_ULID)
+
+    assert target is None
+
+
+@pytest.mark.asyncio
+async def test_get_logical_target_select_is_scoped_and_read_only(
+    mock_conn: AsyncMock,
+) -> None:
+    """The SELECT reads only the target column, scoped to one run."""
+    mock_conn.fetchval = AsyncMock(return_value=None)
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    await repo.get_afk_run_logical_target(_NEW_ULID)
+
+    sql, *args = mock_conn.fetchval.call_args[0]
+    assert "SELECT logical_target" in sql
+    assert "FROM afk_runs" in sql
+    assert "WHERE afk_run_id = $1" in sql
+    assert tuple(args) == (_NEW_ULID,)
+    assert mock_conn.execute.call_count == 0

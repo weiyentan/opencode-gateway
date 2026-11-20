@@ -70,6 +70,7 @@ def _mk_lifecycle_row(
     change_request_repository: str | None = None,
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
+    logical_target: str | None = None,
 ) -> MagicMock:
     """Build a mock asyncpg Record for an afk_runs lifecycle row."""
     return mock_row(
@@ -85,6 +86,8 @@ def _mk_lifecycle_row(
             "change_request_repository": change_request_repository,
             "change_request_external_id": change_request_external_id,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
+            # Immutable logical execution target (migration 0051, issue #856).
+            "logical_target": logical_target,
             "first_seen_at": None,
             "last_seen_at": None,
         }
@@ -99,6 +102,7 @@ def _existing_key_row(**overrides) -> MagicMock:
         "trigger_type": "eda",
         "title": "Implement auth",
         "recovered_from_afk_run_id": None,
+        "logical_target": None,
     }
     row.update(overrides)
     return mock_row(row)
@@ -547,3 +551,110 @@ class TestBindChangeRequest:
             json=_binding_payload(),
         )
         assert resp.status_code in (401, 403)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GET /api/v1/afk/executions/runs/{afk_run_id}/lifecycle — durable readback
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestLifecycleReadback:
+    """GET /runs/{id}/lifecycle — read one lifecycle back from storage (#856)."""
+
+    @pytest.mark.asyncio
+    async def test_readback_returns_persisted_lifecycle_and_target(self) -> None:
+        """A stored lifecycle reads back with its immutable logical target."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        # readback lifecycle row (carries the target) → batch provenance
+        conn.fetchrow = AsyncMock(
+            return_value=_mk_lifecycle_row(logical_target="runner-vm-01")
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(
+            f"/api/v1/afk/executions/runs/{_RUN_ID}/lifecycle"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        lifecycle = data["data"]
+        assert lifecycle["afk_run_id"] == _RUN_ID
+        assert lifecycle["logical_target"] == "runner-vm-01"
+        assert lifecycle["host"] == "awx-01.internal"
+        assert lifecycle["source_event_id"] == "eda-1234"
+        assert lifecycle["delivery_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_readback_legacy_row_surfaces_null_target(self) -> None:
+        """A legacy row (no routing metadata) reads back null — never fabricated."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=_mk_lifecycle_row(
+                host=None,
+                source_event_id=None,
+                repository=None,
+                trigger_type=None,
+                logical_target=None,
+            )
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(
+            f"/api/v1/afk/executions/runs/{_RUN_ID}/lifecycle"
+        )
+        assert resp.status_code == 200
+        lifecycle = resp.json()["data"]
+        assert lifecycle["logical_target"] is None
+        assert lifecycle["host"] is None
+        assert lifecycle["source_event_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_readback_missing_lifecycle_returns_404(self) -> None:
+        """An unknown lifecycle id returns 404."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=None)
+        client = create_client(conn)
+
+        resp = await client.get(
+            "/api/v1/afk/executions/runs/01HMISSING0000000000000001/lifecycle"
+        )
+        assert resp.status_code == 404
+        data = resp.json()
+        assert data["status"] == "error"
+        assert "not found" in data["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_readback_carries_target_without_separate_round_trip(
+        self,
+    ) -> None:
+        """The target rides the lifecycle SELECT — no second afk_runs read.
+
+        The lifecycle readback and the immutable logical target are read in
+        ONE statement (issue #856 review): the lifecycle row already carries
+        ``logical_target``, so the endpoint must not issue a separate
+        ``afk_runs`` round-trip for it.
+        """
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=_mk_lifecycle_row(logical_target="runner-vm-01")
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(
+            f"/api/v1/afk/executions/runs/{_RUN_ID}/lifecycle"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["logical_target"] == "runner-vm-01"
+        # The single-read contract: no separate afk_runs target probe.
+        assert conn.fetchval.await_count == 0

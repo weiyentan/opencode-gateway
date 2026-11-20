@@ -340,6 +340,55 @@ jobs:
           )
           PY
 
+      # Required gate: the immutable logical-target lifecycle suite (issue
+      # #856) migrates the schema, can drop every public table, and cycles a
+      # migration downgrade/upgrade, so it runs on the dedicated disposable
+      # postgres-isolated service in its own step after the gates above
+      # (GitHub Actions runs steps sequentially, so the schema cycle cannot
+      # race a sibling suite).  ADR 0032 execution contract: the disposable
+      # attestation guard fails closed when the database is missing, and the
+      # JUnit report must prove every case executed and passed — a missing
+      # report, a collection error, any skip/failure/error, or fewer than
+      # the module's eight cases fails CI.
+      - name: Run AFK logical target lifecycle tests
+        env:
+          GATEWAY_ENV: development
+          GATEWAY_DATABASE_HOST: localhost
+          GATEWAY_DATABASE_PORT: "5433"
+          GATEWAY_DATABASE_NAME: opencode_gateway_disposable_test
+          GATEWAY_DATABASE_USER: test
+          GATEWAY_DATABASE_PASSWORD: test
+          GATEWAY_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          pytest \
+            tests/integration/test_afk_logical_target.py \
+            -v -m integration \
+            -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/afk-logical-target-report.xml"
+
+      - name: Verify AFK logical target tests executed and passed
+        if: always()
+        env:
+          AFK_LOGICAL_TARGET_JUNIT: ${{ runner.temp }}/afk-logical-target-report.xml
+        run: |
+          python - <<'PY'
+          import os
+
+          from tests.integration._disposable_postgres import (
+              verify_required_test_report,
+          )
+
+          summary = verify_required_test_report(
+              os.environ["AFK_LOGICAL_TARGET_JUNIT"], minimum_executed=8
+          )
+          print(
+              "AFK logical target gate: "
+              f"{summary.total} collected, {summary.passed} passed, "
+              f"{summary.failed} failed, {summary.skipped} skipped"
+          )
+          PY
+
       - name: Lint Python
         run: ruff check .
 
