@@ -123,6 +123,27 @@ timeline, not an accounting summary. Exposed read-only via the
 `/api/v1/execution` endpoints (ADR 0016).
 _Avoid_: replay blob, transcript (in the usage-aggregate sense)
 
+**AFK Trigger Actor**:
+The provider-qualified username of the account whose authenticated,
+authorised provider event first triggered an AFK Run. For GitHub, the value
+comes from the validated event sender's `login`; for GitLab, it comes from
+the validated event user's `username`. It identifies the triggering
+account, not the issue or change-request author and not the AWX service
+account. The proposed actor-to-target mapping uses keys such as
+`github:<username>` and `gitlab:<username>`. See proposed ADR 0031.
+
+**Logical Execution Target Resolution**:
+The AFK Run's immutable `logical_target` (migration 0051) is selected by
+FastAPI EDA Gateway from the original AFK Trigger Actor's configured mapping.
+For an authenticated and authorised AFK trigger with no actor mapping, the
+target resolves to `default`. Authorization happens before fallback;
+unauthorized or unidentified actors are rejected. Later lifecycle stages
+reuse the target already stored on the AFK Run. If a legacy run has no
+stored target, resolve its original actor using the current mapping and use
+`default` if that mapping is absent. EDA separately maps
+`(logical target, lifecycle stage)` to an AWX job template. See proposed
+ADR 0031.
+
 **AWX Execution Binding**:
 A durable Gateway association between one **AFK Run** (`afk_run_id`) and one
 **AWX Execution**, identified by its `awx_job_id`. One AFK Run may have many
