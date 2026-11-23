@@ -66,6 +66,18 @@ paths. A well-formed but unknown `afk_run_id` is **`404 NOT_FOUND`**.
   `uq_afk_runs_change_request_identity`).
 * **Provider** — `github | gitlab`. **Trigger type** — `eda | manual |
   scheduled | backfill | recovery` (`null` for legacy reconstruction rows).
+* **Original trigger actor** — the provider-qualified username of the account
+  that originally triggered the run (`github:login` / `gitlab:username`).
+  Bound once at provisioning (`POST /api/v1/afk/executions/runs`, issue
+  #859) and immutable thereafter; `null` for legacy rows and runs
+  provisioned without one. It records the requesting human identity — never a
+  credential, token, or AWX service identity, and later reviewers,
+  developers, or AWX service accounts never replace it. The provisioning
+  field validates `^(github|gitlab):[A-Za-z0-9_.-]+$` with length 3-255.
+  Provisioning conflict/idempotency semantics mirror `logical_target`: an
+  identical replay (same actor) returns the same run unchanged; a different
+  actor for the same provisioning key — or omitting an actor against a stored
+  one — is `409 CONFLICT` with no reassignment and no erasure.
 
 ---
 
@@ -147,6 +159,7 @@ lifecycle fields. The outcomes endpoints keep their exact current
 | `repository` | string \| null | Normalized identity; `null` for legacy rows |
 | `trigger_type` | string \| null | `eda` \| `manual` \| `scheduled` \| `backfill` \| `recovery` |
 | `logical_target` | string \| null | Immutable logical execution target; `null` for legacy rows and runs provisioned without one — never fabricated |
+| `actor` | string \| null | Immutable original trigger actor (`github:login` \| `gitlab:username`); `null` for legacy rows and runs provisioned without one — never fabricated, never replaced by later lifecycle identities |
 | `recovered_from_afk_run_id` | string \| null | Recovery predecessor |
 | `change_request` | object \| null | `{provider, repository, external_id}` when bound; `null` when unbound |
 | `started_at` / `finished_at` | datetime \| null | |

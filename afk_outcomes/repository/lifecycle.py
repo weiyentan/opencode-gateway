@@ -160,9 +160,12 @@ class _LifecycleRepositoryMixin:
 
         The comparison covers the fields that define the provisioning contract:
         ``repository``, ``trigger_type``, ``title``, ``recovered_from_afk_run_id``,
-        and the immutable ``logical_target`` (issue #856 — a bound target is
+        the immutable ``logical_target`` (issue #856 — a bound target is
         never reassigned, and omitting one against a stored target is a
-        conflict, never an erasure).  The idempotency key fields
+        conflict, never an erasure), and the immutable ``actor`` (issue #859
+        — the original trigger actor is never replaced by a later identity,
+        and omitting it against a stored actor is a conflict, never an
+        erasure).  The idempotency key fields
         (``provider``, ``host``, ``source_event_id``) are assumed to already
         match — the caller is responsible for selecting the existing row by
         those fields.
@@ -191,6 +194,7 @@ class _LifecycleRepositoryMixin:
             and existing.get("recovered_from_afk_run_id")
             == requested.get("recovered_from_afk_run_id")
             and existing.get("logical_target") == requested.get("logical_target")
+            and existing.get("actor") == requested.get("actor")
         )
 
     async def provision_afk_run(
@@ -205,6 +209,7 @@ class _LifecycleRepositoryMixin:
         recovered_from_afk_run_id: str | None = None,
         deliveries: list[str] | None = None,
         logical_target: str | None = None,
+        actor: str | None = None,
         ulid_source: ULIDSource,
     ) -> ProvisionAFKRunResult:
         """Idempotently provision one provisional AFK run lifecycle.
@@ -239,6 +244,17 @@ class _LifecycleRepositoryMixin:
         reassignment.  The provisioning authority is the only writer; no
         other path sets or clears the target.
 
+        ``actor`` (issue #859) is the provider-qualified username of the
+        account that originally triggered the run.  It is optional for
+        backward compatibility (old clients omit it and the run carries
+        ``NULL``); when supplied it is persisted on the run and becomes
+        **immutable**.  An identical replay (same actor) returns the same
+        run and actor; any different actor — including omitting one against
+        a stored actor — is a conflict with no reassignment and no erasure.
+        Later lifecycle operations (change-request binding, execution
+        bindings, recoveries, reviewer/developer/AWX identities) never
+        update it.
+
         Creating a recovery lifecycle (``recovered_from_afk_run_id`` set)
         never mutates the predecessor row — the predecessor is only read.
 
@@ -269,6 +285,7 @@ class _LifecycleRepositoryMixin:
                 "recovered_from_afk_run_id": recovered_from_afk_run_id,
                 "first_delivery_id": first_delivery_id,
                 "logical_target": logical_target,
+                "actor": actor,
             }
 
         async with self._conn.transaction():
@@ -276,7 +293,7 @@ class _LifecycleRepositoryMixin:
                 """
                 SELECT afk_run_id, provider, repository, trigger_type, title,
                        recovered_from_afk_run_id, first_delivery_id,
-                       logical_target
+                       logical_target, actor
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -316,9 +333,10 @@ class _LifecycleRepositoryMixin:
                      outcome_status, outcome, host, source_event_id, repository,
                      trigger_type, change_request_provider, change_request_repository,
                      change_request_external_id, recovered_from_afk_run_id,
-                     first_delivery_id, logical_target, first_seen_at, last_seen_at)
+                     first_delivery_id, logical_target, actor,
+                     first_seen_at, last_seen_at)
                 VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4, $5, $6, $7,
-                        NULL, NULL, NULL, $8, $9, $10, now(), now())
+                        NULL, NULL, NULL, $8, $9, $10, $11, now(), now())
                 ON CONFLICT (provider, host, source_event_id)
                     WHERE host IS NOT NULL AND source_event_id IS NOT NULL
                     DO NOTHING
@@ -334,6 +352,7 @@ class _LifecycleRepositoryMixin:
                 recovered_from_afk_run_id,
                 first_delivery_id,
                 logical_target,
+                actor,
             )
             if rows:
                 run_id = rows[0]["afk_run_id"]
@@ -349,7 +368,7 @@ class _LifecycleRepositoryMixin:
                 """
                 SELECT afk_run_id, provider, repository, trigger_type, title,
                        recovered_from_afk_run_id, first_delivery_id,
-                       logical_target
+                       logical_target, actor
                 FROM afk_runs
                 WHERE provider = $1 AND host = $2 AND source_event_id = $3
                 """,
@@ -730,18 +749,19 @@ class _LifecycleRepositoryMixin:
 
         Legacy ``afk_runs`` rows (backfill/reconstruction, migration 0026)
         predate the lifecycle columns; for them ``host``,
-        ``source_event_id``, ``repository``, ``trigger_type``, and
-        ``logical_target`` read back as ``None`` (the domain model is lenient
-        on readback).  The immutable logical execution target (issue #856)
-        is carried on the returned lifecycle so callers reading the whole
-        lifecycle need no separate round-trip for it.
+        ``source_event_id``, ``repository``, ``trigger_type``,
+        ``logical_target``, and ``actor`` read back as ``None`` (the domain
+        model is lenient on readback).  The immutable logical execution
+        target (issue #856) and the original trigger actor (issue #859) are
+        carried on the returned lifecycle so callers reading the whole
+        lifecycle need no separate round-trip for them.
         """
         row = await self._conn.fetchrow(
             """
             SELECT afk_run_id, provider, host, source_event_id, repository,
                    trigger_type, title, change_request_provider,
                    change_request_repository, change_request_external_id,
-                   recovered_from_afk_run_id, logical_target,
+                   recovered_from_afk_run_id, logical_target, actor,
                    first_seen_at, last_seen_at
             FROM afk_runs
             WHERE afk_run_id = $1
@@ -767,6 +787,7 @@ class _LifecycleRepositoryMixin:
             change_request_external_id=row.get("change_request_external_id"),
             recovered_from_afk_run_id=row.get("recovered_from_afk_run_id"),
             logical_target=row.get("logical_target"),
+            actor=row.get("actor"),
             first_seen_at=row.get("first_seen_at"),
             last_seen_at=row.get("last_seen_at"),
         )

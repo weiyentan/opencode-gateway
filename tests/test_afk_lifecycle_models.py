@@ -121,6 +121,7 @@ def test_legacy_row_readback_allows_null_lifecycle_fields() -> None:
     assert lifecycle.repository is None
     assert lifecycle.trigger_type is None
     assert lifecycle.logical_target is None
+    assert lifecycle.actor is None
     assert lifecycle.change_request_identity() is None
 
 
@@ -137,3 +138,18 @@ def test_logical_target_carries_provided_value() -> None:
     """A provisioned target is carried verbatim on the lifecycle."""
     lifecycle = AFKRunLifecycle(**_lifecycle(logical_target="runner-vm-01"))
     assert lifecycle.logical_target == "runner-vm-01"
+
+
+# ── Original trigger actor (issue #859) ─────────────────────────────────────
+
+
+def test_actor_defaults_to_none() -> None:
+    """Omitting actor reads back as None — backwards compatible."""
+    lifecycle = AFKRunLifecycle(**_lifecycle())
+    assert lifecycle.actor is None
+
+
+def test_actor_carries_provided_provider_qualified_value() -> None:
+    """A provisioned actor is carried verbatim on the lifecycle."""
+    lifecycle = AFKRunLifecycle(**_lifecycle(actor="github:octocat"))
+    assert lifecycle.actor == "github:octocat"

@@ -64,6 +64,7 @@ def _mk_run_row(
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
     logical_target: str | None = None,
+    actor: str | None = None,
 ):
     """Build a mock ``afk_runs`` row covering every column the API reads."""
     return mock_row(
@@ -86,6 +87,8 @@ def _mk_run_row(
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
             # Immutable logical execution target (migration 0051, issue #856).
             "logical_target": logical_target,
+            # Original trigger actor (migration 0052, issue #859).
+            "actor": actor,
         }
     )
 

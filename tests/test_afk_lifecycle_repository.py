@@ -52,6 +52,8 @@ def _provision_payload(
     trigger_type: TriggerType = TriggerType.EDA,
     title: str | None = "Implement auth",
     recovered_from_afk_run_id: str | None = None,
+    logical_target: str | None = None,
+    actor: str | None = None,
 ) -> dict:
     """Build keyword arguments for ``provision_afk_run``."""
     return {
@@ -62,6 +64,8 @@ def _provision_payload(
         "trigger_type": trigger_type,
         "title": title,
         "recovered_from_afk_run_id": recovered_from_afk_run_id,
+        "logical_target": logical_target,
+        "actor": actor,
         "ulid_source": _ULID_SOURCE,
     }
 
@@ -73,6 +77,8 @@ def _existing_row(
     trigger_type: str = "eda",
     title: str | None = "Implement auth",
     recovered_from_afk_run_id: str | None = None,
+    logical_target: str | None = None,
+    actor: str | None = None,
 ) -> MagicMock:
     return mock_row(
         {
@@ -81,7 +87,8 @@ def _existing_row(
             "trigger_type": trigger_type,
             "title": title,
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
-            "logical_target": None,
+            "logical_target": logical_target,
+            "actor": actor,
         }
     )
 
@@ -670,6 +677,7 @@ def _lifecycle_row(**overrides) -> MagicMock:
         "change_request_external_id": None,
         "recovered_from_afk_run_id": None,
         "logical_target": None,
+        "actor": None,
         "first_seen_at": None,
         "last_seen_at": None,
     }
@@ -731,6 +739,7 @@ def test_get_lifecycle_maps_legacy_row_leniently(mock_conn: AsyncMock) -> None:
     assert lifecycle.repository is None
     assert lifecycle.trigger_type is None
     assert lifecycle.logical_target is None
+    assert lifecycle.actor is None
     assert lifecycle.change_request_identity() is None
 
 
@@ -767,6 +776,7 @@ def test_get_lifecycle_select_includes_all_lifecycle_columns(
         "change_request_external_id",
         "recovered_from_afk_run_id",
         "logical_target",
+        "actor",
     ):
         assert col in sql, f"SELECT missing column: {col}"
     assert "WHERE afk_run_id = $1" in sql
@@ -924,3 +934,92 @@ async def test_get_logical_target_select_is_scoped_and_read_only(
     assert "WHERE afk_run_id = $1" in sql
     assert tuple(args) == (_NEW_ULID,)
     assert mock_conn.execute.call_count == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  provision_afk_run / get_afk_run_lifecycle — original trigger actor (#859)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_provision_inserts_original_actor(mock_conn: AsyncMock) -> None:
+    """The INSERT persists the provider-qualified actor on the new run."""
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetch = AsyncMock(
+        return_value=[mock_row({"afk_run_id": _NEW_ULID})]
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    _run(repo.provision_afk_run(**_provision_payload(actor="github:octocat")))
+
+    calls = _insert_calls(mock_conn)
+    assert len(calls) == 1
+    sql, args = calls[0]
+    assert "actor" in sql
+    assert args[-1] == "github:octocat"
+
+
+def test_provision_replay_with_same_actor_is_idempotent(
+    mock_conn: AsyncMock,
+) -> None:
+    """An identical retry preserves the original actor without mutation."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_existing_row(actor="github:octocat")
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(
+        repo.provision_afk_run(**_provision_payload(actor="github:octocat"))
+    )
+
+    assert result.is_conflict is False
+    assert result.is_created is False
+    assert _insert_calls(mock_conn) == []
+    assert _update_calls(mock_conn) == []
+
+
+def test_provision_replay_with_different_actor_is_conflict(
+    mock_conn: AsyncMock,
+) -> None:
+    """A retry carrying a different actor is a conflict; the original stands."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_existing_row(actor="github:octocat")
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(
+        repo.provision_afk_run(**_provision_payload(actor="gitlab:reviewer"))
+    )
+
+    assert result.is_conflict is True
+    assert result.is_created is False
+    assert _insert_calls(mock_conn) == []
+    assert _update_calls(mock_conn) == []
+
+
+def test_provision_replay_omitting_bound_actor_is_conflict(
+    mock_conn: AsyncMock,
+) -> None:
+    """A replay that omits a stored actor is a conflict, never an erasure."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_existing_row(actor="github:octocat")
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    result = _run(repo.provision_afk_run(**_provision_payload(actor=None)))
+
+    assert result.is_conflict is True
+    assert _insert_calls(mock_conn) == []
+    assert _update_calls(mock_conn) == []
+
+
+def test_get_lifecycle_maps_actor(mock_conn: AsyncMock) -> None:
+    """The stored original actor is carried on the lifecycle readback."""
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_lifecycle_row(actor="github:octocat")
+    )
+
+    repo = AsyncpgOutcomeRepository(mock_conn)
+    lifecycle = _run(repo.get_afk_run_lifecycle(_NEW_ULID))
+
+    assert lifecycle is not None
+    assert lifecycle.actor == "github:octocat"

@@ -58,6 +58,7 @@ def _mk_run_row(
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
     logical_target: str | None = None,
+    actor: str | None = None,
 ):
     return mock_row(
         {
@@ -90,6 +91,8 @@ def _mk_run_row(
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
             # Immutable logical execution target (migration 0051, issue #856).
             "logical_target": logical_target,
+            # Original trigger actor (migration 0052, issue #859).
+            "actor": actor,
         }
     )
 
@@ -1259,3 +1262,69 @@ class TestRouteCoexistence:
         # Execution-scoped routes (unchanged, issues #549/#589/#590/#626).
         assert "/api/v1/afk/executions" in paths
         assert "/api/v1/afk/executions/runs/{afk_run_id}" in paths
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Original trigger actor (issue #859) — canonical readback
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCanonicalRunActor:
+    """The canonical list/detail surface the original trigger actor."""
+
+    @pytest.mark.asyncio
+    async def test_list_items_carry_actor(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(
+            return_value=[_mk_run_row(actor="github:octocat")]
+        )
+
+        async with client as c:
+            response = await c.get("/api/v1/afk/runs")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["items"][0]["actor"] == "github:octocat"
+
+    @pytest.mark.asyncio
+    async def test_list_items_actor_null_for_legacy_row(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchval = AsyncMock(return_value=1)
+        mock_conn.fetch = AsyncMock(return_value=[_mk_run_row()])
+
+        async with client as c:
+            response = await c.get("/api/v1/afk/runs")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["items"][0]["actor"] is None
+
+    @pytest.mark.asyncio
+    async def test_detail_run_block_carries_actor(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_mk_run_row(actor="gitlab:some.user_name-1")
+        )
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 200
+        run = response.json()["data"]["run"]
+        assert run["actor"] == "gitlab:some.user_name-1"
+
+    @pytest.mark.asyncio
+    async def test_detail_run_block_actor_null_for_legacy_row(
+        self, client: AsyncClient, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(return_value=_mk_run_row())
+        mock_conn.fetch = AsyncMock(side_effect=[[], []])
+
+        async with client as c:
+            response = await c.get(f"/api/v1/afk/runs/{_RUN_ID}")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["run"]["actor"] is None

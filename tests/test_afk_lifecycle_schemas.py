@@ -49,3 +49,29 @@ def test_from_domain_renders_none_for_targetless_runs() -> None:
     """Runs provisioned without a target (and legacy rows) render null."""
     response = AFKRunLifecycleResponse.from_domain(_lifecycle())
     assert response.logical_target is None
+
+
+# ── Original trigger actor (issue #859) ─────────────────────────────────────
+
+
+def test_from_domain_explicit_actor_argument_is_authoritative() -> None:
+    """An explicitly supplied actor wins (existing callers unchanged)."""
+    response = AFKRunLifecycleResponse.from_domain(
+        _lifecycle(actor="github:domain-actor"),
+        actor="gitlab:explicit-actor",
+    )
+    assert response.actor == "gitlab:explicit-actor"
+
+
+def test_from_domain_falls_back_to_domain_actor() -> None:
+    """Omitting the argument surfaces the domain lifecycle's stored actor."""
+    response = AFKRunLifecycleResponse.from_domain(
+        _lifecycle(actor="github:octocat"),
+    )
+    assert response.actor == "github:octocat"
+
+
+def test_from_domain_renders_none_for_actorless_runs() -> None:
+    """Runs provisioned without an actor (and legacy rows) render null."""
+    response = AFKRunLifecycleResponse.from_domain(_lifecycle())
+    assert response.actor is None

@@ -71,6 +71,7 @@ def _mk_lifecycle_row(
     change_request_external_id: str | None = None,
     recovered_from_afk_run_id: str | None = None,
     logical_target: str | None = None,
+    actor: str | None = None,
 ) -> MagicMock:
     """Build a mock asyncpg Record for an afk_runs lifecycle row."""
     return mock_row(
@@ -88,6 +89,8 @@ def _mk_lifecycle_row(
             "recovered_from_afk_run_id": recovered_from_afk_run_id,
             # Immutable logical execution target (migration 0051, issue #856).
             "logical_target": logical_target,
+            # Original trigger actor (migration 0052, issue #859).
+            "actor": actor,
             "first_seen_at": None,
             "last_seen_at": None,
         }
@@ -103,6 +106,7 @@ def _existing_key_row(**overrides) -> MagicMock:
         "title": "Implement auth",
         "recovered_from_afk_run_id": None,
         "logical_target": None,
+        "actor": None,
     }
     row.update(overrides)
     return mock_row(row)
@@ -658,3 +662,181 @@ class TestLifecycleReadback:
         assert resp.json()["data"]["logical_target"] == "runner-vm-01"
         # The single-read contract: no separate afk_runs target probe.
         assert conn.fetchval.await_count == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Original trigger actor (issue #859) — provisioning and readback
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestProvisionAndReadActor:
+    """Optional provider-qualified actor rides provisioning and readback."""
+
+    @pytest.mark.asyncio
+    async def test_provision_surfaces_actor(self) -> None:
+        """A provisioned actor is returned on the created lifecycle."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                None,
+                _mk_lifecycle_row(actor="github:octocat"),
+            ]
+        )
+        conn.fetch = AsyncMock(
+            return_value=[mock_row({"afk_run_id": _RUN_ID})]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/runs",
+            json=_provision_payload(actor="github:octocat"),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["actor"] == "github:octocat"
+
+    @pytest.mark.asyncio
+    async def test_provision_omitting_actor_surfaces_null(self) -> None:
+        """Legacy clients omit the field; the run carries no actor."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[_auth_row(), None, _mk_lifecycle_row(actor=None)]
+        )
+        conn.fetch = AsyncMock(
+            return_value=[mock_row({"afk_run_id": _RUN_ID})]
+        )
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/runs", json=_provision_payload()
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["data"]["actor"] is None
+
+    @pytest.mark.asyncio
+    async def test_identical_replay_preserves_original_actor(self) -> None:
+        """An identical retry returns the original actor unchanged."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                _existing_key_row(actor="github:octocat"),
+                _mk_lifecycle_row(actor="github:octocat"),
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/runs",
+            json=_provision_payload(actor="github:octocat"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["actor"] == "github:octocat"
+
+    @pytest.mark.asyncio
+    async def test_changed_actor_on_replay_is_conflict(self) -> None:
+        """A later identity cannot replace the original actor (409)."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            side_effect=[
+                _auth_row(),
+                _existing_key_row(actor="github:octocat"),
+            ]
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/runs",
+            json=_provision_payload(actor="gitlab:reviewer"),
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["code"] == "CONFLICT"
+        # No INSERT ran against afk_runs (the conflict returns before any
+        # write; the auth dependency may still touch its credential row).
+        assert conn.fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_readback_returns_actor(self) -> None:
+        """The durable lifecycle readback surfaces the stored actor."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=_mk_lifecycle_row(actor="gitlab:some.user_name-1")
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(
+            f"/api/v1/afk/executions/runs/{_RUN_ID}/lifecycle"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["actor"] == "gitlab:some.user_name-1"
+
+    @pytest.mark.asyncio
+    async def test_readback_legacy_row_surfaces_null_actor(self) -> None:
+        """A legacy row (no actor) reads back null — never fabricated."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(
+            return_value=_mk_lifecycle_row(
+                host=None,
+                source_event_id=None,
+                repository=None,
+                trigger_type=None,
+                actor=None,
+            )
+        )
+        conn.fetch = AsyncMock(return_value=[])
+        client = create_client(conn)
+
+        resp = await client.get(
+            f"/api/v1/afk/executions/runs/{_RUN_ID}/lifecycle"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["actor"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "actor",
+        [
+            "octocat",
+            "github:",
+            "bitbucket:bob",
+            "github:bad name",
+            "github:" + "a" * 249,
+        ],
+    )
+    async def test_invalid_actor_is_rejected_before_storage(self, actor: str) -> None:
+        """Malformed actors are rejected with 422 before any DB access."""
+        from tests.conftest import create_client
+
+        conn = _mk_conn()
+        conn.fetchrow = AsyncMock(return_value=_auth_row())
+        conn.fetch = AsyncMock(return_value=[])
+        conn.execute = AsyncMock()
+        client = create_client(conn)
+
+        resp = await client.post(
+            "/api/v1/afk/executions/runs",
+            json=_provision_payload(actor=actor),
+        )
+        assert resp.status_code == 422, resp.text
+        # No provisioning INSERT happens for a malformed actor (the AWX
+        # collector-credential auth dependency still touches its own row).
+        assert conn.fetch.await_count == 0
