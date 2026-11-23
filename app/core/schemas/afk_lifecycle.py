@@ -82,6 +82,21 @@ class AFKRunProvisionRequest(BaseModel):
             "legacy clients omit it and runs carry no target."
         ),
     )
+    actor: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=255,
+        pattern=r"^(github|gitlab):[A-Za-z0-9_.-]+$",
+        description=(
+            "Provider-qualified username of the account that originally "
+            "triggered the run (``github:login`` / ``gitlab:username``, "
+            "3-255 chars).  Bound once at provisioning and immutable "
+            "thereafter: an identical retry returns the same actor, any "
+            "different actor (including omitting a bound one) is a 409 "
+            "conflict.  Optional — legacy clients omit it and runs carry "
+            "no actor.  Never a credential or token."
+        ),
+    )
     deliveries: list[str] = Field(
         default_factory=list,
         description=(
@@ -202,6 +217,15 @@ class AFKRunLifecycleResponse(BaseModel):
             "legacy rows — never fabricated)"
         ),
     )
+    actor: str | None = Field(
+        default=None,
+        description=(
+            "Provider-qualified username of the account that originally "
+            "triggered the run (None for runs provisioned without one and "
+            "for legacy rows — never fabricated; never replaced by later "
+            "lifecycle identities)"
+        ),
+    )
     first_delivery_id: str | None = Field(
         default=None,
         description=(
@@ -236,6 +260,7 @@ class AFKRunLifecycleResponse(BaseModel):
         first_delivery_id: str | None = None,
         delivery_ids: list[str] | None = None,
         logical_target: str | None = None,
+        actor: str | None = None,
     ) -> AFKRunLifecycleResponse:
         """Build the response from a domain :class:`AFKRunLifecycle`.
 
@@ -251,6 +276,11 @@ class AFKRunLifecycleResponse(BaseModel):
         ``AFKRunLifecycle.logical_target`` carried by the lifecycle
         readback; ``None`` for runs provisioned without a target and for
         legacy rows (never fabricated).
+
+        The original trigger actor (issue #859) follows the same pattern:
+        the explicit ``actor`` argument is authoritative when supplied,
+        otherwise the domain ``AFKRunLifecycle.actor`` is surfaced —
+        ``None`` for runs provisioned without an actor and for legacy rows.
         """
         return cls(
             afk_run_id=lifecycle.afk_run_id,
@@ -265,6 +295,7 @@ class AFKRunLifecycleResponse(BaseModel):
                 if logical_target is not None
                 else lifecycle.logical_target
             ),
+            actor=(actor if actor is not None else lifecycle.actor),
             first_delivery_id=first_delivery_id,
             delivery_ids=delivery_ids or [],
             change_request=lifecycle.change_request_identity(),

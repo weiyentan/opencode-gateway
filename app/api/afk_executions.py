@@ -895,6 +895,13 @@ async def provision_afk_run_lifecycle(
     different target (including omitting a bound one) is a ``409`` conflict
     with no reassignment.  Omitting the field preserves the legacy shape —
     the run carries no target and reads back ``null``.
+
+    **Original trigger actor (issue #859)** — the optional provider-qualified
+    ``actor`` (``github:login`` / ``gitlab:username``) is persisted on the
+    canonical ``afk_run_id`` and is immutable: an identical retry preserves
+    the original actor; a different actor, or omitting a bound one, is a
+    ``409`` conflict with no reassignment.  Later lifecycle identities
+    (reviewers, developers, AWX service accounts) never replace it.
     """
     # Normalize the repository identity at the API boundary before any
     # persistence or conflict comparison (same helper as execution bindings).
@@ -920,6 +927,7 @@ async def provision_afk_run_lifecycle(
                     recovered_from_afk_run_id=body.recovered_from_afk_run_id,
                     deliveries=body.deliveries,
                     logical_target=body.logical_target,
+                    actor=body.actor,
                     ulid_source=MonotonicULID(),
                 )
 
@@ -948,9 +956,10 @@ async def provision_afk_run_lifecycle(
         result.afk_run_id
     )
 
-    # The immutable logical target (issue #856) rides the lifecycle SELECT
-    # above — one afk_runs read carries the whole lifecycle, so no separate
-    # target round-trip is issued here (single-read consistency).
+    # The immutable logical target (issue #856) and the original trigger
+    # actor (issue #859) ride the lifecycle SELECT above — one afk_runs read
+    # carries the whole lifecycle, so no separate round-trip is issued here
+    # (single-read consistency).
 
     if result.is_created:
         response.status_code = status.HTTP_201_CREATED
@@ -1033,9 +1042,10 @@ async def bind_lifecycle_change_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve lifecycle after change-request binding",
         )
-    # The immutable logical target (issue #856) rides the lifecycle SELECT
-    # above — one afk_runs read carries the whole lifecycle, so no separate
-    # target round-trip is issued here (single-read consistency).
+    # The immutable logical target (issue #856) and the original trigger
+    # actor (issue #859) ride the lifecycle SELECT above — one afk_runs read
+    # carries the whole lifecycle, so no separate round-trip is issued here
+    # (single-read consistency).
     return AFKRunLifecycleResponse.from_domain(lifecycle)
 
 
@@ -1152,10 +1162,11 @@ async def get_afk_run_lifecycle_readback(
     """Read one provisional lifecycle back from durable storage (issue #856).
 
     The read counterpart of ``POST /runs``: source provenance, repository
-    identity, trigger metadata, batch provenance, and the immutable
-    ``logical_target`` (``null`` for runs provisioned without one and for
-    legacy rows — never fabricated).  Read-only (API-key auth only, no
-    collector token); an unknown lifecycle returns ``404``.
+    identity, trigger metadata, batch provenance, the immutable
+    ``logical_target``, and the original trigger ``actor`` (``null`` for
+    runs provisioned without one and for legacy rows — never fabricated).
+    Read-only (API-key auth only, no collector token); an unknown lifecycle
+    returns ``404``.
 
     Persistence is database-backed, so the answer is identical after a
     Gateway restart and across concurrent provisioning replays.

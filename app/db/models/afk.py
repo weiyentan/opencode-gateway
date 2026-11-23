@@ -170,6 +170,12 @@ class AFKRun(Base):
     # ── Immutable logical execution target (migration 0051, issue #856) ──
     logical_target: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
+    # ── Original trigger actor (migration 0052, issue #859) ──
+    # Provider-qualified username of the account that originally triggered
+    # the run (``github:login`` / ``gitlab:username``).  Bound once at
+    # provisioning and never replaced by later lifecycle identities.
+    actor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
 
 class AFKRunSessionLink(Base):
     """An association between an AFK run and an OpenCode session.

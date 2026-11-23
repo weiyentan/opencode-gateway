@@ -883,11 +883,11 @@ class AFKRunLifecycle(BaseModel):
 
     Readback is deliberately lenient: legacy ``afk_runs`` rows
     (backfill/reconstruction, migration 0026) predate these columns, so
-    ``host``, ``source_event_id``, ``repository``, ``trigger_type``, and
-    ``logical_target`` read back as ``None`` for them — mirroring the
-    nullable readback of the execution-binding columns.  The provisioning
-    contract (all four required) is enforced by the API write schema and the
-    repository provisioning method, never by this read model.
+    ``host``, ``source_event_id``, ``repository``, ``trigger_type``,
+    ``logical_target``, and ``actor`` read back as ``None`` for them —
+    mirroring the nullable readback of the execution-binding columns.  The
+    provisioning contract (all four required) is enforced by the API write
+    schema and the repository provisioning method, never by this read model.
     """
 
     afk_run_id: str = Field(description="ULID primary key of the run")
@@ -937,6 +937,16 @@ class AFKRunLifecycle(BaseModel):
             "Immutable logical execution target bound to this run at "
             "provisioning (issue #856); None for runs provisioned without "
             "one and for legacy rows — never fabricated"
+        ),
+    )
+    actor: str | None = Field(
+        default=None,
+        description=(
+            "Provider-qualified username of the account that originally "
+            "triggered the run (issue #859, e.g. ``github:login`` / "
+            "``gitlab:username``), bound immutably at provisioning; None "
+            "for runs provisioned without one and for legacy rows — never "
+            "fabricated and never replaced by later lifecycle identities"
         ),
     )
     first_seen_at: datetime | None = None

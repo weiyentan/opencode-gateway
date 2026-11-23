@@ -72,6 +72,14 @@ class AFKRunSummary(RunSummary):
         default=None,
         description="Immutable logical execution target; null for legacy rows",
     )
+    actor: str | None = Field(
+        default=None,
+        description=(
+            "Provider-qualified username of the account that originally "
+            "triggered the run (github:login | gitlab:username); null for "
+            "legacy rows and runs provisioned without one"
+        ),
+    )
     recovered_from_afk_run_id: str | None = Field(
         default=None,
         description="Gateway ULID of the recovery predecessor run, if any",
