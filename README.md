@@ -211,7 +211,7 @@ sessions, N entities, 0..1 change request).
 ### Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/weiyentan/opencode-gateway.git
 cd opencode-gateway
 python -m venv .venv
 
