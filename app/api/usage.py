@@ -14,7 +14,6 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Union
 
 import asyncpg
 from fastapi import (
@@ -26,6 +25,8 @@ from fastapi import (
     Response,
     status,
 )
+from pydantic import BaseModel as _BaseModel
+from pydantic import Field as _Field
 
 from app.core.config import Settings, get_settings
 from app.core.formatting import format_model_output
@@ -43,7 +44,6 @@ from app.core.telemetry import timed_operation, timeout_operation
 from app.core.timeouts import db_timeout as _db_timeout
 from app.core.timeouts import request_timeout as _request_timeout
 from app.db.session import get_session
-from pydantic import BaseModel as _BaseModel, Field as _Field
 
 logger = logging.getLogger(__name__)
 
@@ -2450,7 +2450,10 @@ async def _fetch_records_with_context_grouped(
 # ── Records-with-context endpoint ─────────────────────────────────────────
 
 
-@router.get("/records-with-context", response_model=Union[PaginatedResponse, list[RecordWithContextGroupedRow]])
+@router.get(
+    "/records-with-context",
+    response_model=PaginatedResponse | list[RecordWithContextGroupedRow],
+)
 async def get_records_with_context(
     request: Request,
     response: Response,

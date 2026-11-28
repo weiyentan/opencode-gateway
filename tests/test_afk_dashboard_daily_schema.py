@@ -27,6 +27,7 @@ import re
 from pathlib import Path
 
 from alembic.config import Config
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent

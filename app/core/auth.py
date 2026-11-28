@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from datetime import UTC
 
 import asyncpg
 from fastapi import Depends, HTTPException, Request, status
@@ -190,7 +191,7 @@ async def require_collector_token(
         )
 
     # Synchronous last_used_at update (the UPDATE is fast — safe within request lifecycle)
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     async def _touch_last_used() -> None:
         """Update last_used_at for this credential synchronously.
@@ -202,7 +203,7 @@ async def require_collector_token(
         try:
             await conn.execute(
                 "UPDATE collector_credentials SET last_used_at = $1 WHERE id = $2",
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 row["credential_id"],
             )
         except Exception:

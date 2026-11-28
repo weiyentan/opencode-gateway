@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from afk_outcomes.models import ExecutionOutcome, PROVISIONAL_RUN_STATUS
+from afk_outcomes.models import PROVISIONAL_RUN_STATUS, ExecutionOutcome
 
 # The four execution outcomes that are valid inputs.  Kept as plain strings for
 # fast membership checks after normalisation.

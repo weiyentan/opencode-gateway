@@ -59,8 +59,9 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import quote, urlsplit
 
 import asyncpg
@@ -95,8 +96,8 @@ _OPT_IN_VALUES = frozenset({"1", "true", "yes", "on"})
 
 # asyncpg binds ``timestamptz`` parameters from timezone-aware datetimes,
 # not ISO strings; the fixed dashboard window from ADR 0017.
-_START = datetime(2025, 7, 1, tzinfo=timezone.utc)
-_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=timezone.utc)
+_START = datetime(2025, 7, 1, tzinfo=UTC)
+_END = datetime(2025, 7, 31, 23, 59, 59, tzinfo=UTC)
 
 # Warm-up + measured iterations, mirroring ADR 0017 ("10 warm-cache
 # executions").  More samples make p95 less sensitive to a single pause.

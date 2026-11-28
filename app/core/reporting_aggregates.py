@@ -450,6 +450,14 @@ async def enrich_aggregate(
     stored_occurred_at: datetime = current["last_occurred_at"]
     stored_delivery_id: str = current["last_delivery_id"]
     stored_payload: Mapping[str, Any] = current["payload"] or {}
+    if isinstance(stored_payload, str):
+        # asyncpg returns ``jsonb`` columns as JSON strings — production
+        # registers no type codec (see ``app/db/session.py``), so the stored
+        # payload must be decoded here, mirroring ``_deserialize_provenance``.
+        stored_payload = json.loads(stored_payload)
+    if not isinstance(stored_payload, Mapping):
+        # A JSON ``null`` (or any non-object) payload merges as empty.
+        stored_payload = {}
     stored_provenance = _deserialize_provenance(current["key_provenance"])
 
     merged, merged_provenance = forward_merge(

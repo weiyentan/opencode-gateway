@@ -36,8 +36,8 @@ from afk_outcomes.models import (
     ClosureLinkKind,
     ClosureLinkState,
     EntityType,
-    IssueLinkTarget,
     IssueLinksSnapshot,
+    IssueLinkTarget,
     Provider,
 )
 

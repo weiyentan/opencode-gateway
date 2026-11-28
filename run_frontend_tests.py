@@ -1,7 +1,7 @@
 """Run the JS frontend tests via subprocess."""
+import os
 import subprocess
 import sys
-import os
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 

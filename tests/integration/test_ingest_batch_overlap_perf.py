@@ -80,7 +80,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -240,11 +240,11 @@ def _dsn() -> str:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
-    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 async def _drop_all_tables() -> None:

@@ -8,7 +8,7 @@ the existing test conventions (httpx AsyncClient + mock asyncpg).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -34,12 +34,12 @@ from app.core.identity import (
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mk_ts() -> datetime:
     """Return a fixed timestamp for predictable test assertions."""
-    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
+    return datetime(2025, 7, 16, 12, 0, 0, tzinfo=UTC)
 
 
 _CLIENT_ID = uuid.uuid4()

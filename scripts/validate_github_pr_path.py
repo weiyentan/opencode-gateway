@@ -31,7 +31,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ def step_2_create_disposable_pr(dry_run: bool) -> tuple[bool, str | None, str | 
     """Create a disposable non-draft PR and return (success, pr_number, branch_name)."""
     section("Step 2: Create disposable non-draft PR")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     branch_name = f"{BRANCH_PREFIX}-{timestamp}"
     pr_number: str | None = None
 
@@ -139,7 +139,7 @@ def step_2_create_disposable_pr(dry_run: bool) -> tuple[bool, str | None, str | 
     marker_content = f"""# Validation Marker — Issue #515
 
 This file is part of the automated validation for issue #515.
-Created: {datetime.now(timezone.utc).isoformat()}
+Created: {datetime.now(UTC).isoformat()}
 Purpose: Trigger a GitHub pull_request.opened webhook for observation path validation.
 
 This PR will be closed without merging.
@@ -510,7 +510,7 @@ def main() -> int:
     print("Issue #515 — GitHub PR Observation Path Validation")
     print(f"Repository: {REPO}")
     print(f"Dry run:    {args.dry_run}")
-    print(f"Timestamp:  {datetime.now(timezone.utc).isoformat()}")
+    print(f"Timestamp:  {datetime.now(UTC).isoformat()}")
 
     results: list[tuple[str, bool]] = []
 

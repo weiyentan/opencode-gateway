@@ -96,7 +96,6 @@ from app.core.afk_dashboard_daily import (  # noqa: E402
     recompute_bucket,
 )
 
-
 # ---------------------------------------------------------------------------
 # SQL
 #

@@ -14,18 +14,17 @@ retried recomputation can never double-count.
 Metric sources and event-time bucketing (all UTC calendar days)
 ---------------------------------------------------------------
 
-====================================  ==========================  ====================================
-Metric                                Canonical table             Event-time column
-====================================  ==========================  ====================================
-``input_tokens``                      ``usage_events``            ``reported_at``
-``output_tokens``                     ``usage_events``            ``reported_at``
-``cache_read_tokens``                 ``usage_events``            ``reported_at``
-``cache_write_tokens``                ``usage_events``            ``reported_at``
-``reasoning_tokens``                  ``usage_events``            ``reported_at``
-``cached_tokens``                     ``usage_events``            ``reported_at``
-``estimated_cost_usd``                ``usage_events``            ``reported_at``
-``record_count``                      ``usage_events``            ``reported_at``
-====================================  ==========================  ====================================
+Metric                  Canonical table   Event-time column
+======================  ================  ===============
+``input_tokens``        ``usage_events``  ``reported_at``
+``output_tokens``       ``usage_events``  ``reported_at``
+``cache_read_tokens``   ``usage_events``  ``reported_at``
+``cache_write_tokens``  ``usage_events``  ``reported_at``
+``reasoning_tokens``    ``usage_events``  ``reported_at``
+``cached_tokens``       ``usage_events``  ``reported_at``
+``estimated_cost_usd``  ``usage_events``  ``reported_at``
+``record_count``        ``usage_events``  ``reported_at``
+======================  ================  ===============
 
 The module opens no transaction of its own (mirroring
 ``app.core.reconciliation``): the caller owns the transaction, so

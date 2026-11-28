@@ -137,6 +137,7 @@ class TestDevelopmentMode:
 
         # Reimport config so pydantic-settings picks up the new env vars
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -159,6 +160,7 @@ class TestDevelopmentMode:
         monkeypatch.delenv("GATEWAY_ALLOW_INSECURE_AUTH", raising=False)
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -188,6 +190,7 @@ class TestAuthInvalidKey:
         monkeypatch.setenv("GATEWAY_ENV", "production")
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -210,6 +213,7 @@ class TestAuthInvalidKey:
         monkeypatch.setenv("GATEWAY_ENV", "production")
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -231,6 +235,7 @@ class TestAuthInvalidKey:
         monkeypatch.setenv("GATEWAY_ENV", "production")
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -297,6 +302,7 @@ class TestInsecureAuthOptIn:
         monkeypatch.setenv("GATEWAY_ENV", "production")
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 
@@ -319,6 +325,7 @@ class TestInsecureAuthOptIn:
         monkeypatch.setenv("GATEWAY_ENV", "production")
 
         import importlib
+
         import app.core.config
         importlib.reload(app.core.config)
 

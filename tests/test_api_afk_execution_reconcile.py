@@ -27,6 +27,8 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from afk_outcomes.service.execution_reconciliation import AWXJobState
+from app.api import admin_afk_reconcile
 from app.core.factory import create_app
 from app.db.session import get_session
 from tests.conftest import create_client
@@ -35,9 +37,6 @@ from tests.test_afk_execution_reconciliation import (  # noqa: F401
     FakeRepository,
     _running_binding,
 )
-from afk_outcomes.service.execution_reconciliation import AWXJobState
-
-from app.api import admin_afk_reconcile
 
 _FINISHED = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)  # noqa: UP017
 

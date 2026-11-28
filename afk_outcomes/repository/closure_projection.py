@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
 
 from afk_outcomes.closure_episodes import ClosureFact, project_closure_episodes
 from afk_outcomes.models import (
@@ -27,8 +27,8 @@ from afk_outcomes.models import (
     EngineeringEntity,
     EngineeringEvent,
     EntityType,
-    IssueLinkTarget,
     IssueLinksSnapshot,
+    IssueLinkTarget,
     Provider,
 )
 from afk_outcomes.repository.crud import _split_entity_id

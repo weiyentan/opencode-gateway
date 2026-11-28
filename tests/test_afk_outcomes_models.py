@@ -7,7 +7,7 @@ identical key whether it arrives naive, as UTC, or with any other UTC offset
 — and distinct instants must derive distinct keys.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from afk_outcomes.models import build_observation_key
 
@@ -34,7 +34,7 @@ def _key(occurred_at: datetime) -> str:
 def test_naive_occurred_at_matches_aware_utc() -> None:
     """A naive timestamp is interpreted as UTC: the key matches aware-UTC."""
     naive = datetime(2026, 8, 1, 10, 30, 0)
-    aware_utc = datetime(2026, 8, 1, 10, 30, 0, tzinfo=timezone.utc)
+    aware_utc = datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC)
     assert _key(naive) == _key(aware_utc)
 
 
@@ -47,6 +47,6 @@ def test_naive_occurred_at_matches_same_instant_with_offset() -> None:
 
 def test_distinct_instants_derive_distinct_keys() -> None:
     """Different occurrence times must never collide on the same key."""
-    first = _key(datetime(2026, 8, 1, 10, 30, 0, tzinfo=timezone.utc))
-    second = _key(datetime(2026, 8, 1, 10, 30, 1, tzinfo=timezone.utc))
+    first = _key(datetime(2026, 8, 1, 10, 30, 0, tzinfo=UTC))
+    second = _key(datetime(2026, 8, 1, 10, 30, 1, tzinfo=UTC))
     assert first != second

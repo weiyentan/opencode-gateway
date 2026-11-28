@@ -17,15 +17,16 @@ from datetime import datetime
 import asyncpg
 
 from afk_outcomes.models import (
+    EntityType,
     ExecutionBinding,
     ExecutionOutcome,
-    EntityType,
     Provider,
     RecoveryCheckpoint,
     RunSessionLink,
 )
 from afk_outcomes.serialization import ULIDSource
 from afk_outcomes.repository_identity import normalize_repository_key
+
 
 def _parse_awx_job_id(awx_job_id: str) -> int:
     """Coerce an AWX job id string to int, rejecting non-numeric values.
